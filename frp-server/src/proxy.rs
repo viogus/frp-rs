@@ -66,7 +66,6 @@ impl ProxyManager {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn list(&self) -> Vec<ProxyInfo> {
         self.proxies.read().await.values().cloned().collect()
     }

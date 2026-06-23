@@ -18,3 +18,4 @@ hyper.workspace = true
 hyper-util.workspace = true
 pin-project.workspace = true
 tokio-rustls.workspace = true
+axum = "0.8.9"

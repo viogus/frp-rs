@@ -51,6 +51,7 @@ pub struct AppState {
     pub vhost_manager: Arc<VhostManager>,
     pub vhost_http_port: u16,
     pub encryption_key: [u8; 32],
+    pub dashboard_start: std::time::Instant,
 }
 
 impl AppState {
@@ -64,6 +65,7 @@ impl AppState {
             vhost_manager: Arc::new(VhostManager::new()),
             vhost_http_port: 0,
             encryption_key,
+            dashboard_start: std::time::Instant::now(),
         }
     }
 }
@@ -160,6 +162,19 @@ impl Service {
                 }
             });
             info!("HTTPS VHost listener starting on {}", https_addr2);
+        }
+
+        // Start dashboard server if configured
+        if self.cfg.web_server.port > 0 {
+            let dash_addr = format!("{}:{}", self.cfg.web_server.addr, self.cfg.web_server.port);
+            let dash_addr2 = dash_addr.clone();
+            let dash_state = self.state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::dashboard::run_dashboard(dash_addr, dash_state).await {
+                    tracing::error!("Dashboard server failed: {}", e);
+                }
+            });
+            tracing::info!("Dashboard web UI starting on {}", dash_addr2);
         }
 
         // Main accept loop
