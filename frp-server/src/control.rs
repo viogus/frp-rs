@@ -103,6 +103,23 @@ pub async fn handle_control<S>(
                             debug!("Work conn pooled for {} (pool size: {})", run_id, work_pool.len());
                         }
                     }
+                    Some(InternalMsg::VisitorConn { proxy_name, visitor_conn }) => {
+                        debug!("STCP visitor conn for proxy {} on run_id {}", proxy_name, run_id);
+                        let tcp = match visitor_conn {
+                            IoStream::Tcp(s) => s,
+                            _ => { warn!("STCP visitor requires TCP stream"); return; }
+                        };
+                        if let Some(work_conn) = work_pool.pop_front() {
+                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: tcp, pre_read: Vec::new(), use_encryption: false }).await;
+                        } else {
+                            debug!("No pooled work conn for STCP, sending ReqWorkConn");
+                            if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
+                                warn!("Failed to send ReqWorkConn: {}", e);
+                                break;
+                            }
+                            pending_requests.push_back(PendingRequest { proxy_name, user_conn: tcp, pre_read: Vec::new(), use_encryption: false });
+                        }
+                    }
                     Some(InternalMsg::ProxyUserConn { proxy_name, user_conn, pre_read }) => {
                         // Extract TcpStream from IoStream for PendingRequest
                         let tcp = match user_conn {

@@ -26,6 +26,10 @@ use crate::vhost::VhostManager;
 #[derive(Debug)]
 pub enum InternalMsg {
     NewWorkConn(IoStream),
+    VisitorConn {
+        proxy_name: String,
+        visitor_conn: IoStream,
+    },
     ProxyUserConn {
         proxy_name: String,
         user_conn: IoStream,
