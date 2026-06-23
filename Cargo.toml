@@ -31,7 +31,8 @@ hyper = "1"
 hyper-util = "0.1"
 pin-project = "1"
 futures-util = "0.3"
- 
+webpki-roots = "0.26"
+
 [profile.release]
 opt-level = "z"
 lto = true

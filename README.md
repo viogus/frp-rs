@@ -202,7 +202,7 @@ use_compression = false
 | `tls_server_name` | `""` | Server name for TLS SNI |
 | `log.level` | `"info"` | Log level |
 | `login_fail_exit` | `true` | Exit on login failure; false to keep retrying |
-| `pool_count` | `0` | Number of pre-established work connections |
+| `pool_count` | `0` | Number of pre-established work connections (pooled on the server) |
 | `tcp_mux` | `true` | Enable TCP multiplexing |
 
 #### Proxy entries (`[[proxies]]`)
@@ -247,19 +247,96 @@ JSON framing over TCP.
 
 ### Message Types
 
-| Type Byte | Message         | Direction      | Purpose                      |
-|-----------|-----------------|----------------|------------------------------|
-| 'o'       | Login           | Client to Server| Authenticate and register   |
-| '1'       | LoginResp       | Server to Client| Login result + run_id        |
-| 'p'       | NewProxy        | Client to Server| Register a new proxy         |
-| '2'       | NewProxyResp    | Server to Client| Proxy registration result    |
-| 'c'       | CloseProxy      | Client to Server| Unregister a proxy           |
-| 'w'       | NewWorkConn     | Client to Server| Announce a work connection   |
-| 'r'       | ReqWorkConn     | Server to Client| Request a work connection    |
-| 's'       | StartWorkConn   | Server to Client| Assign work to a proxy       |
-| 'h'       | Ping            | Bidirectional  | Keepalive heartbeat          |
-| '4'       | Pong            | Bidirectional  | Heartbeat response           |
-| 'u'       | UDPPacket       | Bidirectional  | Encapsulated UDP data        |
+| Type Byte | Message         | Direction      | Purpose |
+|-----------|-----------------|----------------|---------|
+| 'o'       | Login           | Client to Server | Authenticate and register |
+| '1'       | LoginResp       | Server to Client | Login result + run_id |
+
+After login, the server reads the first frame from every new TCP connection to
+dispatch it:
+- A `Login` frame means a new control connection.
+- A `NewWorkConn` frame means a work connection and is routed to the correct
+  control handler via `run_id`.
+
+| Type Byte | Message         | Direction      | Purpose |
+|-----------|-----------------|----------------|---------|
+| 'p'       | NewProxy        | Client to Server | Register a new proxy |
+| '2'       | NewProxyResp    | Server to Client | Proxy registration result |
+| 'c'       | CloseProxy      | Client to Server | Unregister a proxy |
+| 'w'       | NewWorkConn     | Client to Server | Announce a work connection (with run_id for routing) |
+| 'r'       | ReqWorkConn     | Server to Client | Request a work connection |
+| 's'       | StartWorkConn   | Server to Client | Assign work connection to a specific proxy |
+| 'h'       | Ping            | Bidirectional  | Keepalive heartbeat |
+| '4'       | Pong            | Bidirectional  | Heartbeat response |
+| 'u'       | UDPPacket       | Bidirectional  | Encapsulated UDP data |
+
+### Work Connection Lifecycle
+
+The work connection flow is the critical path for proxying traffic:
+
+```
+User                   frps                          frpc              Local
+ |                      |                             |                  |
+ |  connect to proxy    |                             |                  |
+ |  port (6000)         |                             |                  |
+ |--------------------->|                             |                  |
+ |                      |  InternalMsg::ProxyUserConn |                  |
+ |                      | (to control handler)        |                  |
+ |                      |---------------------------->|                  |
+ |                      |                             |                  |
+ |                      |  ReqWorkConn (if no pooled  |                  |
+ |                      |  connection available)      |                  |
+ |                      |<----------------------------|                  |
+ |                      |                             |                  |
+ |                      |              NewWorkConn    |                  |
+ |                      |      (dials server, sends   |                  |
+ |                      |       run_id for routing)   |                  |
+ |                      |<----------------------------|                  |
+ |                      |                             |                  |
+ |                      |  StartWorkConn              |                  |
+ |                      |---------------------------->|                  |
+ |                      |                             | connect local    |
+ |                      |                             |----------------->|
+ |                      |                             |<-----------------|
+ |                      |          data bridge        |                  |
+ |<==================================================>|                  |
+ |                      |                             |                  |
+```
+
+The server maintains a per-client work connection pool (`work_pool`) and a queue
+of pending proxy requests (`pending_requests`). If a pooled connection is
+available when a user connects, it is assigned immediately without sending
+`ReqWorkConn`.
+
+### Internal Messaging (Server)
+
+The server uses an `InternalMsg` channel for cross-task communication:
+
+```
+                 ┌─────────────────────┐
+                 │    AppState          │
+                 │  run_id_to_ctl_tx   │
+                 │  (run_id -> sender) │
+                 └──────┬──────────────┘
+                        │ lookup
+          ┌─────────────┼─────────────┐
+          │             │             │
+          ▼             ▼             ▼
+   ┌──────────┐  ┌──────────┐  ┌──────────┐
+   │Control   │  │Control   │  │Work Conn │
+   │Handler A │  │Handler B │  │Handler   │
+   │          │  │          │  │          │
+   │work_pool │  │work_pool │  │          │
+   │pending_q │  │pending_q │  │          │
+   └──────────┘  └──────────┘  └──────────┘
+```
+
+- **Proxy listeners** send `InternalMsg::ProxyUserConn` to the control handler
+  for the owning client.
+- **Work connection handlers** send `InternalMsg::NewWorkConn` to the control
+  handler, which either assigns it to a pending request or pools it.
+- The `accept` loop reads the first frame from every new connection to dispatch
+  it to the correct handler (control vs work).
 
 ### Authentication
 
@@ -272,37 +349,45 @@ privilege_key = hex(HMAC-SHA256(token, timestamp))
 The server computes the expected key from its token and the timestamp sent in
 the Login message, then compares in constant time.
 
----
-
 ## Project Structure
+
 
 ```
 frp-rs/
   Cargo.toml              Workspace manifest
   frp-core/               Shared library
+    Cargo.toml
     src/
       lib.rs              Error types, Result, VERSION
       auth.rs             HMAC-SHA256 token auth
-      config.rs           TOML config structs (server + client)
-      msg.rs              Wire protocol message structs + FrpMessage enum
-      protocol.rs         V1/V2 frame read/write, magic detection
+      config.rs           TOML config structs
+      msg.rs              Wire protocol message structs
+      protocol.rs         V1/V2 frame read/write
       transport.rs        TCP/WebSocket/QUIC dial + accept abstractions
   frp-server/             Server library
+    Cargo.toml
     src/
       lib.rs
-      service.rs          Main service: listener loop, task spawn
-      control.rs          Per-client control connection handler
-      proxy.rs            ProxyManager, ProxyEntry, port allocation, bridging
-  frps/                   Server binary (src/main.rs)
+      service.rs          AppState, InternalMsg, accept loop with frame dispatch
+      control.rs          Per-client control handler, work pool, pending queue
+      proxy.rs            ProxyManager, ProxyInfo, port allocation
+  frps/                   Server binary
+    Cargo.toml
+    src/main.rs
   frp-client/             Client library
+    Cargo.toml
     src/
       lib.rs
-      service.rs          Main service: login, proxy registration, heartbeat
-      control.rs          ControlConnection: login handshake, send ping
-      proxy.rs            NewProxy message builder, local connect, bridge
-  frpc/                   Client binary (src/main.rs)
+      service.rs          Login, proxy registration, message/select loop,
+                          work connection spawning
+      control.rs          ControlConnection, login handshake, ping
+      proxy.rs            NewProxy message builder, local TCP connect, bridge
+  frpc/                   Client binary
+    Cargo.toml
+    src/main.rs
   frps.toml               Example server config
   frpc.toml               Example client config
+  README.md               This file
 ```
 
 ### Crate Dependency Graph

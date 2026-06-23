@@ -1,6 +1,11 @@
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+
+use std::sync::Arc;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::TlsConnector;
+
 /// The WebSocket path used by frp (matching the Go version).
 pub const FRP_WEBSOCKET_PATH: &str = "/~!frp";
 
@@ -109,4 +114,80 @@ pub struct TlsConfig {
     pub cert_file: Option<String>,
     pub key_file: Option<String>,
     pub ca_file: Option<String>,
+}
+
+/// Create a TLS acceptor from PEM-encoded cert and key files.
+pub fn build_tls_acceptor(
+    cert_file: &str,
+    key_file: &str,
+) -> Result<TlsAcceptor, crate::Error> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let cert_file = File::open(cert_file)
+        .map_err(|e| crate::Error::Other(format!("open cert file: {e}")))?;
+    let mut reader = BufReader::new(cert_file);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| crate::Error::Other(format!("read certs: {e}")))?;
+
+    let key_file = File::open(key_file)
+        .map_err(|e| crate::Error::Other(format!("open key file: {e}")))?;
+    let mut reader = BufReader::new(key_file);
+    let key = rustls_pemfile::private_key(&mut reader)
+        .map_err(|e| crate::Error::Other(format!("read private key: {e}")))?
+        .ok_or_else(|| crate::Error::Other("no private key found".into()))?;
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| crate::Error::Other(format!("build TLS config: {e}")))?;
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Create a TLS connector for client-side TLS.
+/// If ca_file is provided, use it as a custom root CA; otherwise use webpki roots.
+pub fn build_tls_connector(
+    ca_file: Option<&str>,
+) -> Result<TlsConnector, crate::Error> {
+    let mut root_store = rustls::RootCertStore::empty();
+
+    if let Some(ca_path) = ca_file {
+        let file = std::fs::File::open(ca_path)
+            .map_err(|e| crate::Error::Other(format!("open CA file: {e}")))?;
+        let mut reader = std::io::BufReader::new(file);
+        let certs = rustls_pemfile::certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| crate::Error::Other(format!("read CA certs: {e}")))?;
+        root_store.add_parsable_certificates(certs);
+    } else {
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_tls_connector_with_default_roots() {
+        let result = build_tls_connector(None);
+        assert!(result.is_ok(), "TLS connector with default roots should build");
+    }
+
+    #[test]
+    fn test_build_tls_acceptor_missing_cert() {
+        let result = build_tls_acceptor(
+            "/nonexistent/cert.pem",
+            "/nonexistent/key.pem",
+        );
+        assert!(result.is_err(), "TLS acceptor with missing files should fail");
+    }
 }

@@ -1,49 +1,36 @@
 use std::sync::Arc;
-use std::collections::HashMap;
-use tokio::sync::{RwLock, mpsc};
+use std::collections::VecDeque;
+use tokio::sync::mpsc;
 use tokio::net::TcpStream;
 use tokio::net::TcpListener;
+use tokio::io::AsyncWriteExt;
 use tracing::{info, warn, error, debug};
 
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
-use frp_core::auth::AuthConfig;
 use frp_core::transport::IoStream;
 
-use crate::proxy::{ProxyManager, ProxyInfo, ProxyEntry, allocate_port};
+use crate::proxy::{ProxyInfo, allocate_port};
+use crate::service::{AppState, InternalMsg, ControlTx};
 
-/// Handle a single control connection from a frpc client.
+/// A pending request from a proxy listener waiting for a work connection.
+struct PendingRequest {
+    proxy_name: String,
+    user_conn: TcpStream,
+}
+
+/// Handle a control connection from a frpc client.
+/// The login message has already been consumed from the stream.
 pub async fn handle_control(
     stream: TcpStream,
-    proxy_manager: Arc<ProxyManager>,
-    auth_cfg: Arc<AuthConfig>,
-    proxy_table: Arc<RwLock<HashMap<String, ProxyEntry>>>,
-    used_ports: Arc<RwLock<std::collections::HashSet<u16>>>,
+    login: msg::Login,
+    state: Arc<AppState>,
 ) {
     let peer = stream.peer_addr().ok();
     info!("New control connection from {:?}", peer);
 
-    let (mut reader, mut writer) = stream.into_split();
-
-    // --- Login ---
-    let login_msg = match read_msg_v1(&mut reader).await {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("Failed to read login from {:?}: {}", peer, e);
-            return;
-        }
-    };
-
-    let login = match &login_msg {
-        FrpMessage::Login(l) => l.clone(),
-        _ => {
-            warn!("Expected login message from {:?}", peer);
-            return;
-        }
-    };
-
-    // Authenticate
-    if let Err(e) = auth_cfg.validate_login(
+    // --- Authenticate ---
+    if let Err(e) = state.auth_cfg.validate_login(
         login.privilege_key.as_deref(),
         login.timestamp,
     ) {
@@ -54,6 +41,7 @@ pub async fn handle_control(
             server_udp_port: None,
             error: Some(e),
         });
+        let (_, mut writer) = stream.into_split();
         let _ = write_msg_v1(&mut writer, &resp).await;
         return;
     }
@@ -62,7 +50,19 @@ pub async fn handle_control(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     info!("Client {:?} logged in with run_id: {}", peer, run_id);
 
-    // Send login response
+    // --- Set up internal channel ---
+    let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<InternalMsg>();
+
+    // Register control channel so work-conn and proxy listeners can reach us
+    {
+        let mut map = state.run_id_to_ctl_tx.write().await;
+        map.insert(run_id.clone(), ControlTx { tx: internal_tx.clone() });
+    }
+
+    // --- Split stream for reading/writing ---
+    let (mut reader, mut writer) = stream.into_split();
+
+    // --- Send login response ---
     let resp = FrpMessage::LoginResp(msg::LoginResp {
         version: Some(frp_core::VERSION.into()),
         run_id: Some(run_id.clone()),
@@ -71,61 +71,148 @@ pub async fn handle_control(
     });
     if let Err(e) = write_msg_v1(&mut writer, &resp).await {
         warn!("Failed to send login response to {:?}: {}", peer, e);
+        unregister_control(&state, &run_id).await;
         return;
     }
 
-    // --- Message loop ---
-    loop {
-        let msg = match read_msg_v1(&mut reader).await {
-            Ok(m) => m,
-            Err(e) => {
-                info!("Control connection {:?} closed: {}", peer, e);
-                break;
-            }
-        };
+    // --- Per-client state ---
+    let mut work_pool: VecDeque<IoStream> = VecDeque::new();
+    let mut pending_requests: VecDeque<PendingRequest> = VecDeque::new();
 
-        match msg {
-            FrpMessage::NewProxy(np) => {
-                handle_new_proxy(
-                    np, &run_id, &proxy_manager,
-                    &proxy_table, &used_ports, &mut writer,
-                ).await;
-            }
-            FrpMessage::CloseProxy(cp) => {
-                proxy_manager.remove(&cp.proxy_name).await;
-                proxy_table.write().await.remove(&cp.proxy_name);
-                info!("Proxy closed: {}", cp.proxy_name);
-            }
-            FrpMessage::Ping(_) => {
-                let pong = FrpMessage::Pong(msg::Pong {});
-                if let Err(e) = write_msg_v1(&mut writer, &pong).await {
-                    warn!("Failed to send pong: {}", e);
-                    break;
+    // --- Main select loop ---
+    loop {
+        tokio::select! {
+            biased;
+
+            // Prefer internal messages to reduce latency for proxy connections
+            internal = internal_rx.recv() => {
+                match internal {
+                    Some(InternalMsg::NewWorkConn(stream)) => {
+                        debug!("Got work conn for run_id {}", run_id);
+                        if let Some(req) = pending_requests.pop_front() {
+                            // Assign this work connection to the pending proxy
+                            assign_work_to_proxy(stream, req).await;
+                        } else {
+                            work_pool.push_back(stream);
+                            debug!("Work conn pooled for {} (pool size: {})", run_id, work_pool.len());
+                        }
+                    }
+                    Some(InternalMsg::ProxyUserConn { proxy_name, user_conn }) => {
+                        debug!("User conn for proxy {} on run_id {}", proxy_name, run_id);
+                        if let Some(work_conn) = work_pool.pop_front() {
+                            // Pooled work connection available — use it directly
+                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn }).await;
+                        } else {
+                            // No pooled conn — send ReqWorkConn and queue
+                            debug!("No pooled work conn, sending ReqWorkConn for {}", proxy_name);
+                            if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
+                                warn!("Failed to send ReqWorkConn: {}", e);
+                                break;
+                            }
+                            pending_requests.push_back(PendingRequest { proxy_name, user_conn });
+                        }
+                    }
+                    None => {
+                        info!("Control channel closed for {:?}", peer);
+                        break;
+                    }
                 }
-                debug!("Ping from {:?}", peer);
             }
-            _ => {
-                debug!("Unhandled message from {:?}", peer);
+
+            msg = read_msg_v1(&mut reader) => {
+                match msg {
+                    Ok(FrpMessage::NewProxy(np)) => {
+                        handle_new_proxy(np, &run_id, &state, &mut writer, &internal_tx).await;
+                    }
+                    Ok(FrpMessage::CloseProxy(cp)) => {
+                        state.proxy_manager.remove(&cp.proxy_name).await;
+                        info!("Proxy closed: {}", cp.proxy_name);
+                    }
+                    Ok(FrpMessage::Ping(_)) => {
+                        let pong = FrpMessage::Pong(msg::Pong {});
+                        if let Err(e) = write_msg_v1(&mut writer, &pong).await {
+                            warn!("Failed to send pong: {}", e);
+                            break;
+                        }
+                        debug!("Ping from {:?}", peer);
+                    }
+                    Ok(_) => {
+                        debug!("Unhandled message from {:?}", peer);
+                    }
+                    Err(e) => {
+                        info!("Control connection {:?} closed: {}", peer, e);
+                        break;
+                    }
+                }
             }
         }
     }
 
-    proxy_manager.remove_client(&run_id).await;
-    info!("Control connection {:?} removed", peer);
+    // Cleanup
+    unregister_control(&state, &run_id).await;
+    state.proxy_manager.remove_client(&run_id).await;
+    info!("Control connection {} removed", run_id);
 }
 
+/// Assign a work connection to a pending proxy request:
+/// 1. Send StartWorkConn on the work connection
+/// 2. Bridge user and work streams
+async fn assign_work_to_proxy(
+    mut work_conn: IoStream,
+    req: PendingRequest,
+) {
+    let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
+        proxy_name: req.proxy_name.clone(),
+        dst_addr: None,
+        dst_port: None,
+        error: None,
+    });
+
+    // Write StartWorkConn on the work connection
+    let write_result = match &mut work_conn {
+        IoStream::Tcp(ref mut s) => write_msg_v1(s, &swc).await,
+        IoStream::WebSocket(_) => {
+            warn!("WebSocket work conn not yet supported for bridging");
+            return;
+        }
+    };
+
+    if let Err(e) = write_result {
+        warn!("Failed to send StartWorkConn: {}", e);
+        return;
+    }
+
+    info!("Bridging user conn to work conn for proxy '{}'", req.proxy_name);
+
+    // Bridge user connection and work connection
+    tokio::spawn(async move {
+        match work_conn {
+            IoStream::Tcp(mut work) => {
+                let mut user = req.user_conn;
+                if let Err(e) = tokio::io::copy_bidirectional(&mut user, &mut work).await {
+                    debug!("Proxy '{}' bridge closed: {}", req.proxy_name, e);
+                }
+            }
+            IoStream::WebSocket(_) => {
+                warn!("WebSocket bridging not implemented");
+            }
+        }
+        info!("Proxy '{}' bridge completed", req.proxy_name);
+    });
+}
+
+/// Register a new proxy and start listening on its assigned port.
 async fn handle_new_proxy(
     np: msg::NewProxy,
     run_id: &str,
-    proxy_manager: &ProxyManager,
-    proxy_table: &Arc<RwLock<HashMap<String, ProxyEntry>>>,
-    used_ports: &Arc<RwLock<std::collections::HashSet<u16>>>,
-    writer: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+    state: &Arc<AppState>,
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    internal_tx: &mpsc::UnboundedSender<InternalMsg>,
 ) {
     let remote_port = np.remote_port.unwrap_or(0) as u16;
 
     let allocated_port = {
-        let mut ports = used_ports.write().await;
+        let mut ports = state.used_ports.write().await;
         allocate_port(&mut ports, remote_port, 100, 10000)
     };
 
@@ -142,7 +229,7 @@ async fn handle_new_proxy(
                 local_addr: np.local_str.clone(),
             };
 
-            if let Err(e) = proxy_manager.register(run_id.to_string(), info).await {
+            if let Err(e) = state.proxy_manager.register(run_id.to_string(), info.clone()).await {
                 let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
                     proxy_name: np.proxy_name.clone(),
                     remote_port: None,
@@ -152,24 +239,15 @@ async fn handle_new_proxy(
                 return;
             }
 
-            let (_tx, rx) = mpsc::unbounded_channel::<IoStream>();
-            let entry = ProxyEntry {
-                info: ProxyInfo {
-                    name: np.proxy_name.clone(),
-                    proxy_type: np.proxy_type.clone(),
-                    run_id: run_id.to_string(),
-                    remote_port: Some(port),
-                    sk: np.sk.clone(),
-                    group: np.group.clone(),
-                    group_key: np.group_key.clone(),
-                    local_addr: np.local_str.clone(),
-                },
-                work_conn_rx: Arc::new(tokio::sync::Mutex::new(rx)),
-            };
+            // Spawn proxy listener for this port
+            let pn = np.proxy_name.clone();
+            let itx = internal_tx.clone();
 
-            proxy_table.write().await.insert(np.proxy_name.clone(), entry);
+            tokio::spawn(async move {
+                listen_and_proxy(port, pn, itx).await;
+            });
 
-            info!("Proxy registered: {} on port {}", np.proxy_name, port);
+            info!("Proxy '{}' registered on port {} (run_id: {})", np.proxy_name, port, run_id);
             let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
                 proxy_name: np.proxy_name.clone(),
                 remote_port: Some(port as i32),
@@ -178,6 +256,7 @@ async fn handle_new_proxy(
             let _ = write_msg_v1(writer, &resp).await;
         }
         None => {
+            warn!("No available port for proxy '{}'", np.proxy_name);
             let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
                 proxy_name: np.proxy_name.clone(),
                 remote_port: None,
@@ -188,17 +267,16 @@ async fn handle_new_proxy(
     }
 }
 
-/// Listen on the proxy port and bridge incoming connections to work connections.
-pub async fn listen_and_proxy(
+/// Listen on a proxy port and forward incoming connections to the control handler.
+async fn listen_and_proxy(
     port: u16,
     proxy_name: String,
-    proxy_table: Arc<RwLock<HashMap<String, ProxyEntry>>>,
-    bind_addr: &str,
+    internal_tx: mpsc::UnboundedSender<InternalMsg>,
 ) {
-    let addr = format!("{}:{}", bind_addr, port);
+    let addr = format!("0.0.0.0:{}", port);
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => {
-            info!("Proxy listener started on {}", addr);
+            info!("Proxy listener started on {} for '{}'", addr, proxy_name);
             l
         }
         Err(e) => {
@@ -209,12 +287,15 @@ pub async fn listen_and_proxy(
 
     loop {
         match listener.accept().await {
-            Ok((user_conn, _)) => {
-                let pn = proxy_name.clone();
-                let pt = proxy_table.clone();
-                tokio::spawn(async move {
-                    crate::proxy::proxy_pair(user_conn, pn, pt).await;
-                });
+            Ok((user_conn, addr)) => {
+                debug!("User connected to proxy '{}' from {}", proxy_name, addr);
+                if internal_tx.send(InternalMsg::ProxyUserConn {
+                    proxy_name: proxy_name.clone(),
+                    user_conn,
+                }).is_err() {
+                    warn!("Control handler gone, stopping proxy listener for '{}'", proxy_name);
+                    break;
+                }
             }
             Err(e) => {
                 error!("Accept error on proxy port {}: {}", port, e);
@@ -222,4 +303,10 @@ pub async fn listen_and_proxy(
             }
         }
     }
+}
+
+/// Remove the control handler registration from AppState.
+async fn unregister_control(state: &Arc<AppState>, run_id: &str) {
+    let mut map = state.run_id_to_ctl_tx.write().await;
+    map.remove(run_id);
 }

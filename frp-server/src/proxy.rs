@@ -1,10 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{RwLock, Mutex, mpsc};
-use tokio::net::TcpStream;
-use tracing::{info, warn, error, debug};
-
-use frp_core::transport::IoStream;
+use tokio::sync::RwLock;
 
 /// A registered proxy on the server side.
 #[derive(Debug, Clone)]
@@ -75,44 +70,11 @@ impl ProxyManager {
     }
 }
 
-/// Data associated with a registered proxy (work connection receiver).
+/// Entry stored in the per-proxy table (simplified — work connections
+/// are managed per-client in the control handler).
+#[derive(Debug, Clone)]
 pub struct ProxyEntry {
     pub info: ProxyInfo,
-    pub work_conn_rx: Arc<Mutex<mpsc::UnboundedReceiver<IoStream>>>,
-}
-
-/// Bridge a user connection and a work connection for a proxy.
-pub async fn proxy_pair(
-    mut user_conn: TcpStream,
-    proxy_name: String,
-    proxy_table: Arc<RwLock<HashMap<String, ProxyEntry>>>,
-) {
-    let work_conn = {
-        let table = proxy_table.read().await;
-        table.get(&proxy_name).and_then(|entry| {
-            entry.work_conn_rx.try_lock().ok().and_then(|mut rx| rx.try_recv().ok())
-        })
-    };
-
-    match work_conn {
-        Some(mut wc) => {
-            match &mut wc {
-                IoStream::Tcp(ws) => {
-                    debug!("Bridging user conn to work conn for proxy: {}", proxy_name);
-                    if let Err(e) = tokio::io::copy_bidirectional(&mut user_conn, ws).await {
-                        error!("Proxy pair error for {}: {}", proxy_name, e);
-                    }
-                }
-                IoStream::WebSocket(_ws) => {
-                    warn!("WebSocket work connection bridging not implemented yet");
-                }
-            }
-            info!("Proxy pair completed for: {}", proxy_name);
-        }
-        None => {
-            warn!("No work connection available for proxy: {}", proxy_name);
-        }
-    }
 }
 
 /// Allocate a port for a proxy, auto-assigning if port is 0.
