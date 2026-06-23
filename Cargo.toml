@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "frp-core",
+    "frp-server",
+    "frp-client",
+    "frps",
+    "frpc",
+]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls"] }
+futures-util = "0.3"
+futures = "0.3"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"

@@ -1,0 +1,14 @@
+server_addr = "127.0.0.1"
+server_port = 7000
+token = "my-frp-token"
+transport_protocol = "tcp"
+tcp_mux = true
+pool_count = 1
+login_fail_exit = false
+
+[[proxies]]
+name = "ssh"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 22
+remote_port = 6000

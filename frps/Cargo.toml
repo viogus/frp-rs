@@ -1,0 +1,19 @@
+[package]
+name = "frps"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+frp-core = { path = "../frp-core" }
+frp-server = { path = "../frp-server" }
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+toml.workspace = true
+serde.workspace = true
+
+[[bin]]
+name = "frps"
+path = "src/main.rs"
