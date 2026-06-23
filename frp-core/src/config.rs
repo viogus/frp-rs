@@ -311,6 +311,7 @@ fn collect_config_files_inner(dir: &Path, files: &mut Vec<std::path::PathBuf>) -
 /// Load server configs from a directory, merging all `.toml` files.
 pub fn load_server_config_from_dir(dir: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let files = collect_config_files(Path::new(dir))?;
+    let files: Vec<_> = files.into_iter().filter(|p| p.extension().map_or(false, |ext| ext == "toml")).collect();
     if files.is_empty() {
         return Err(format!("no .toml files found in directory: {dir}").into());
     }

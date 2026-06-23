@@ -3,7 +3,7 @@ use std::process;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use frp_core::config::load_server_config;
+use frp_core::config::{load_server_config, load_server_config_from_dir};
 use frp_server::service::Service;
 
 #[derive(Parser)]
@@ -11,6 +11,10 @@ use frp_server::service::Service;
 struct Cli {
     #[arg(short, long, default_value = "frps.toml")]
     config: String,
+
+    /// Directory containing .toml config files; all files are merged into one server config
+    #[arg(long, conflicts_with = "config")]
+    config_dir: Option<String>,
 }
 
 #[tokio::main]
@@ -23,12 +27,21 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    let cfg = match load_server_config(&cli.config) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            tracing::error!("Failed to load config: {}", e);
-            process::exit(1);
-        }
+    let cfg = match &cli.config_dir {
+        Some(dir) => match load_server_config_from_dir(dir) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::error!("Failed to load config from dir: {}", e);
+                process::exit(1);
+            }
+        },
+        None => match load_server_config(&cli.config) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::error!("Failed to load config: {}", e);
+                process::exit(1);
+            }
+        },
     };
 
     tracing::info!("frps (Rust) v{} starting...", frp_core::VERSION);
