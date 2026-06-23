@@ -25,6 +25,8 @@ impl Service {
         let auth_cfg = AuthConfig {
             method: AuthMethod::Token,
             token: cfg.token.clone(),
+            oidc_issuer: String::new(),
+            oidc_audience: String::new(),
             additional_data: None,
         };
 

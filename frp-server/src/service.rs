@@ -87,6 +87,8 @@ impl Service {
                 _ => AuthMethod::Token,
             },
             token: cfg.auth.token.clone(),
+            oidc_issuer: cfg.auth.oidc_issuer.clone(),
+            oidc_audience: cfg.auth.oidc_audience.clone(),
             additional_data: None,
         };
         let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
