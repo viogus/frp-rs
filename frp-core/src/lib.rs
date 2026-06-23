@@ -4,6 +4,7 @@ pub mod transport;
 pub mod auth;
 pub mod config;
 pub mod encryption;
+pub mod bridge;
 
 use thiserror::Error;
 

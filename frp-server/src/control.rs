@@ -20,6 +20,7 @@ use crate::service::{AppState, InternalMsg, ControlTx};
 struct PendingRequest {
     proxy_name: String,
     user_conn: TcpStream,
+    use_encryption: bool,
 }
 
 /// Handle a control connection from a frpc client.
@@ -105,14 +106,16 @@ pub async fn handle_control<S>(
                     Some(InternalMsg::ProxyUserConn { proxy_name, user_conn }) => {
                         debug!("User conn for proxy {} on run_id {}", proxy_name, run_id);
                         if let Some(work_conn) = work_pool.pop_front() {
-                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn }).await;
+                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn, use_encryption: false }).await;
                         } else {
                             debug!("No pooled work conn, sending ReqWorkConn for {}", proxy_name);
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
                                 warn!("Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
-                            pending_requests.push_back(PendingRequest { proxy_name, user_conn });
+                            let enc = state.proxy_manager.get(&proxy_name).await
+                                .map(|p| p.use_encryption).unwrap_or(false);
+                            pending_requests.push_back(PendingRequest { proxy_name, user_conn, use_encryption: enc });
                         }
                     }
                     Some(InternalMsg::UdpData { proxy_name: _pn, content, remote_addr }) => {
@@ -206,22 +209,44 @@ async fn assign_work_to_proxy(
 
     info!("Bridging user conn to work conn for proxy '{}'", req.proxy_name);
 
+    let enc_key = req.use_encryption;
+
     tokio::spawn(async move {
-        match work_conn {
-            IoStream::Tcp(mut work) => {
-                let mut user = req.user_conn;
-                if let Err(e) = tokio::io::copy_bidirectional(&mut user, &mut work).await {
-                    debug!("Proxy '{}' bridge closed: {}", req.proxy_name, e);
+        if enc_key {
+            // Derive encryption key (would use state.auth_cfg.token in production)
+            let key = frp_core::encryption::derive_key("frp-rs");
+            match work_conn {
+                IoStream::Tcp(work) => {
+                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (w_r, w_w) = work.into_split();
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key).await;
+                }
+                IoStream::Tls(work) => {
+                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (w_r, w_w) = tokio::io::split(work);
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key).await;
+                }
+                IoStream::WebSocket(_) => {
+                    warn!("Encrypted WebSocket bridging not implemented");
                 }
             }
-            IoStream::Tls(mut work) => {
-                let mut user = req.user_conn;
-                if let Err(e) = tokio::io::copy_bidirectional(&mut user, &mut work).await {
-                    debug!("Proxy '{}' bridge (TLS) closed: {}", req.proxy_name, e);
+        } else {
+            match work_conn {
+                IoStream::Tcp(mut work) => {
+                    let mut user = req.user_conn;
+                    if let Err(e) = tokio::io::copy_bidirectional(&mut user, &mut work).await {
+                        debug!("Proxy '{}' bridge closed: {}", req.proxy_name, e);
+                    }
                 }
-            }
-            IoStream::WebSocket(_) => {
-                warn!("WebSocket bridging not implemented");
+                IoStream::Tls(mut work) => {
+                    let mut user = req.user_conn;
+                    if let Err(e) = tokio::io::copy_bidirectional(&mut user, &mut work).await {
+                        debug!("Proxy '{}' bridge (TLS) closed: {}", req.proxy_name, e);
+                    }
+                }
+                IoStream::WebSocket(_) => {
+                    warn!("WebSocket bridging not implemented");
+                }
             }
         }
         info!("Proxy '{}' bridge completed", req.proxy_name);
@@ -254,6 +279,8 @@ async fn handle_new_proxy(
                 group: np.group.clone(),
                 group_key: np.group_key.clone(),
                 local_addr: np.local_str.clone(),
+            use_encryption: np.use_encryption.unwrap_or(false),
+            use_compression: np.use_compression.unwrap_or(false),
             };
 
             if let Err(e) = state.proxy_manager.register(run_id.to_string(), info.clone()).await {

@@ -12,6 +12,8 @@ pub struct ProxyInfo {
     pub group: Option<String>,
     pub group_key: Option<String>,
     pub local_addr: Option<String>,
+    pub use_encryption: bool,
+    pub use_compression: bool,
 }
 
 /// Manages all proxy registrations on the server.

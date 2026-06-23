@@ -50,10 +50,11 @@ pub struct AppState {
     pub proxy_bind_addr: String,
     pub vhost_manager: Arc<VhostManager>,
     pub vhost_http_port: u16,
+    pub encryption_key: [u8; 32],
 }
 
 impl AppState {
-    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String) -> Self {
+    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 32]) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             auth_cfg: Arc::new(auth_cfg),
@@ -62,6 +63,7 @@ impl AppState {
             proxy_bind_addr,
             vhost_manager: Arc::new(VhostManager::new()),
             vhost_http_port: 0,
+            encryption_key,
         }
     }
 }
@@ -85,6 +87,7 @@ impl Service {
             token: cfg.auth.token.clone(),
             additional_data: None,
         };
+        let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
         Self {
             state: Arc::new(AppState::new(
             auth_cfg,
@@ -93,6 +96,7 @@ impl Service {
             } else {
                 cfg.proxy_bind_addr.clone()
             },
+            enc_key,
         )),
             cfg,
         }
