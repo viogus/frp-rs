@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Linux: cross-compile with cargo-zigbuild ──────────
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+          - arm-unknown-linux-gnueabihf
+          - i686-unknown-linux-gnu
+          - riscv64gc-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build
+        run: cargo zigbuild --target ${{ matrix.target }} --release
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/frps dist/
+          cp target/${{ matrix.target }}/release/frpc dist/
+          cd dist
+          tar czf frp-rs_${{ github.ref_name }}_${{ matrix.target }}.tar.gz frps frpc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.target }}
+          path: dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}.tar.gz
+
+  # ── macOS: native builds ─────────────────────────────
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --target ${{ matrix.target }} --release
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/frps dist/
+          cp target/${{ matrix.target }}/release/frpc dist/
+          cd dist
+          tar czf frp-rs_${{ github.ref_name }}_${{ matrix.target }}.tar.gz frps frpc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.target }}
+          path: dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}.tar.gz
+
+  # ── Windows: native builds ──────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - i686-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --target ${{ matrix.target }} --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force
+          Copy-Item target/${{ matrix.target }}/release/frps.exe dist/
+          Copy-Item target/${{ matrix.target }}/release/frpc.exe dist/
+          Compress-Archive -Path dist/frps.exe, dist/frpc.exe -DestinationPath dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.target }}
+          path: dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}.zip
+
+  # ── collect & upload to release ──────────────────────
+  publish:
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Upload assets to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -e
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) | while read asset; do
+            echo "Uploading: ${asset}"
+            gh release upload "${{ github.ref_name }}" "${asset}" --clobber
+          done
