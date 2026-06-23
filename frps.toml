@@ -1,7 +1,78 @@
+# =============================================================================
+# frp-rs Server Configuration (frps)
+# Compatible with Go frp v0.69.1 TOML format
+# =============================================================================
+# Two formats are supported:
+# 1. [common] section (Go frp compatible) — recommended for cross-compatibility
+# 2. Direct top-level fields (frp-rs native)
+
+[common]
+## Core
 bind_addr = "0.0.0.0"
 bind_port = 7000
-websocket_port = 7001
+proxy_bind_addr = ""            # Separate bind address for proxy ports ("" = same as bind_addr)
 
-[auth]
-method = "token"
-token = "my-frp-token"
+## HTTP/HTTPS VHost
+vhost_http_port = 0              # 0 = disabled
+vhost_https_port = 0             # 0 = disabled
+subdomain_host = ""              # Host for sub-domain proxy support
+
+## Alternative transports
+kcp_bind_port = 0                # KCP port (0 = disabled)
+quic_bind_port = 0               # QUIC port (0 = disabled)
+websocket_port = 0               # WebSocket listener port (0 = disabled)
+
+## TLS
+tls_enable = false
+tls_cert_file = ""
+tls_key_file = ""
+tls_trusted_ca_file = ""         # Note: maps to tls_ca_file internally
+
+## Authentication (flat format, Go frp compatible)
+auth_method = "token"            # "token" or "oidc"
+token = ""                       # Shared secret (also settable as auth_token)
+# OIDC settings
+# oidc_issuer = ""
+# oidc_audience = ""
+# oidc_token_endpoint = ""
+
+## Logging (flat format, Go frp compatible)
+log_level = "info"               # trace, debug, info, warn, error
+log_file = ""                    # "" = stderr
+log_max_days = 3
+
+## Dashboard / Web API
+web_server_addr = ""             # "" = disabled
+web_server_port = 0
+web_server_user = "admin"
+web_server_password = "admin"
+
+## Transport
+tcp_mux = true                   # Flat format (also settable as transport.tcp_mux)
+# tcp_mux_keepalive_interval = 30
+
+# =============================================================================
+# frp-rs native format (alternative to [common] above)
+# Uncomment and remove [common] to use this format:
+# =============================================================================
+# bind_addr = "0.0.0.0"
+# bind_port = 7000
+# 
+# [auth]
+# method = "token"
+# token = ""
+# 
+# [log]
+# level = "info"
+# file = ""
+# max_days = 3
+# 
+# [web_server]
+# addr = ""
+# port = 0
+# user = "admin"
+# password = "admin"
+# 
+# [transport]
+# tcp_mux = true
+# tcp_mux_keepalive_interval = 30

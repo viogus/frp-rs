@@ -1,14 +1,108 @@
+# =============================================================================
+# frp-rs Client Configuration (frpc)
+# Compatible with Go frp v0.69.1 TOML format
+# =============================================================================
+# Two formats are supported:
+# 1. [common] section (Go frp compatible) — recommended for cross-compatibility
+# 2. Direct top-level fields (frp-rs native)
+
+[common]
+## Server connection
 server_addr = "127.0.0.1"
 server_port = 7000
-token = "my-frp-token"
-transport_protocol = "tcp"
+token = ""                       # Must match server's token
+user = ""                        # Multi-tenant user identity
+protocol = "tcp"                 # tcp, websocket/ws, wss (maps to transport_protocol)
 tcp_mux = true
-pool_count = 1
-login_fail_exit = false
+login_fail_exit = false          # true = exit on login failure; false = keep retrying
+pool_count = 1                   # Pre-established work connections
 
+## TLS
+tls_enable = false
+tls_cert_file = ""
+tls_key_file = ""
+tls_trusted_ca_file = ""         # Maps to tls_ca_file
+tls_server_name = ""
+
+## Logging (flat format)
+# log_level = "info"
+# log_file = ""
+# log_max_days = 3
+
+## Network
+# dns_server = ""
+
+## Proxies — TCP example
 [[proxies]]
 name = "ssh"
 type = "tcp"
 local_ip = "127.0.0.1"
 local_port = 22
 remote_port = 6000
+use_encryption = false
+use_compression = false
+# sk = ""                        # Secret key for STCP
+# custom_domains = []            # HTTP VHost domains
+# subdomain = ""
+# http_user = ""
+# http_password = ""
+# host_header_rewrite = ""
+# group = ""
+# group_key = ""
+# health_check_type = ""         # "tcp" or "http" ("" = disabled)
+# health_check_interval_seconds = 10
+# health_check_timeout_seconds = 3
+# health_check_max_failed = 1
+
+## Proxy — HTTP example
+# [[proxies]]
+# name = "web-http"
+# type = "http"
+# local_ip = "127.0.0.1"
+# local_port = 8080
+# custom_domains = ["example.com"]
+# http_user = ""
+# http_password = ""
+# host_header_rewrite = "example.com"
+
+## Proxy — HTTPS example
+# [[proxies]]
+# name = "web-https"
+# type = "https"
+# local_ip = "127.0.0.1"
+# local_port = 443
+# custom_domains = ["example.com"]
+
+## Proxy — UDP example
+# [[proxies]]
+# name = "dns"
+# type = "udp"
+# local_ip = "127.0.0.1"
+# local_port = 53
+# remote_port = 5300
+
+## Proxy — STCP (secret TCP) example
+# [[proxies]]
+# name = "secretservice"
+# type = "stcp"
+# local_ip = "127.0.0.1"
+# local_port = 9000
+# sk = "my-secret-key"
+
+# =============================================================================
+# frp-rs native format (alternative to [common] above)
+# =============================================================================
+# server_addr = "127.0.0.1"
+# server_port = 7000
+# token = ""
+# transport_protocol = "tcp"
+# tcp_mux = true
+# pool_count = 1
+# login_fail_exit = false
+# 
+# [[proxies]]
+# name = "ssh"
+# type = "tcp"
+# local_ip = "127.0.0.1"
+# local_port = 22
+# remote_port = 6000

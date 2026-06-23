@@ -287,11 +287,7 @@ pub fn load_server_config_from_str(content: &str) -> Result<ServerConfig, Box<dy
 pub fn load_client_config_from_str(content: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
     let mut value: toml::Value = toml::from_str(content)?;
     normalize_client_config(&mut value);
-    let table = match value {
-        toml::Value::Table(t) => t,
-        _ => return Err("expected a table".into()),
-    };
-    let cfg: ClientConfig = toml::from_str(&toml::to_string(&table)?)?;
+    let cfg: ClientConfig = serde_json::from_value(toml_to_json(value))?;
     Ok(cfg)
 }
 
@@ -461,11 +457,7 @@ pub fn load_server_config(path: &str) -> Result<ServerConfig, Box<dyn std::error
     let content = std::fs::read_to_string(path)?;
     let mut value: toml::Value = toml::from_str(&content)?;
     normalize_server_config(&mut value);
-    let table = match value {
-        toml::Value::Table(t) => t,
-        _ => return Err("expected a table".into()),
-    };
-    let cfg: ServerConfig = toml::from_str(&toml::to_string(&table)?)?;
+    let cfg: ServerConfig = serde_json::from_value(toml_to_json(value))?;
     Ok(cfg)
 }
 
@@ -475,11 +467,7 @@ pub fn load_client_config(path: &str) -> Result<ClientConfig, Box<dyn std::error
     let content = std::fs::read_to_string(path)?;
     let mut value: toml::Value = toml::from_str(&content)?;
     normalize_client_config(&mut value);
-    let table = match value {
-        toml::Value::Table(t) => t,
-        _ => return Err("expected a table".into()),
-    };
-    let cfg: ClientConfig = toml::from_str(&toml::to_string(&table)?)?;
+    let cfg: ClientConfig = serde_json::from_value(toml_to_json(value))?;
     Ok(cfg)
 }
 
