@@ -35,6 +35,11 @@ jobs:
         with:
           tool: cargo-zigbuild
 
+      - name: Install zig
+        uses: taiki-e/install-action@v2
+        with:
+          tool: zig
+
       - name: Build
         run: cargo zigbuild --target ${{ matrix.target }} --release
 
