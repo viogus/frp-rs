@@ -7,7 +7,6 @@ edition = "2021"
 frp-core = { path = "../frp-core" }
 frp-server = { path = "../frp-server" }
 tokio.workspace = true
-clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

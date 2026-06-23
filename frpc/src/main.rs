@@ -2,22 +2,10 @@ use std::process;
 use std::path::Path;
 use std::time::Duration;
 
-use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use frp_client::service::Service;
 use frp_core::config::{load_client_config, collect_config_files};
-
-#[derive(Parser)]
-#[command(name = "frpc", about = "frp client (Rust rewrite)")]
-struct Cli {
-    #[arg(short, long, default_value = "frpc.toml")]
-    config: String,
-
-    /// Directory containing config files; one frpc service is started per file
-    #[arg(long, conflicts_with = "config")]
-    config_dir: Option<String>,
-}
 
 #[tokio::main]
 async fn main() {
@@ -27,10 +15,9 @@ async fn main() {
         )
         .init();
 
-    let cli = Cli::parse();
+    let (config, config_dir) = parse_args();
 
-    if let Some(ref dir) = cli.config_dir {
-        // --config-dir mode: one independent frpc service per file (matching original frp behavior)
+    if let Some(ref dir) = config_dir {
         let files = match collect_config_files(Path::new(dir)) {
             Ok(files) => files,
             Err(e) => {
@@ -69,8 +56,7 @@ async fn main() {
             let _ = handle.await;
         }
     } else {
-        // Single config file mode
-        let cfg = match load_client_config(&cli.config) {
+        let cfg = match load_client_config(&config) {
             Ok(cfg) => cfg,
             Err(e) => {
                 tracing::error!("Failed to load config: {}", e);
@@ -83,5 +69,51 @@ async fn main() {
             tracing::error!("frpc error: {}", e);
             process::exit(1);
         }
+    }
+}
+
+fn parse_args() -> (String, Option<String>) {
+    let mut args = std::env::args().skip(1).peekable();
+    let mut config = "frpc.toml".to_string();
+    let mut config_dir: Option<String> = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-c" | "--config" => {
+                if let Some(val) = args.next() {
+                    config = val;
+                } else {
+                    eprintln!("error: --config requires a value");
+                    process::exit(1);
+                }
+            }
+            "--config-dir" => {
+                if let Some(val) = args.next() {
+                    config_dir = Some(val);
+                } else {
+                    eprintln!("error: --config-dir requires a value");
+                    process::exit(1);
+                }
+            }
+            "-h" | "--help" => {
+                eprintln!("Usage: frpc [OPTIONS]");
+                eprintln!("");
+                eprintln!("Options:");
+                eprintln!("  -c, --config <FILE>        Config file path [default: frpc.toml]");
+                eprintln!("      --config-dir <DIR>     Directory containing config files");
+                eprintln!("  -h, --help                 Print help");
+                process::exit(0);
+            }
+            _ => {
+                eprintln!("error: unknown option `{arg}`");
+                process::exit(1);
+            }
+        }
+    }
+
+    if config_dir.is_some() {
+        (String::new(), config_dir)
+    } else {
+        (config, None)
     }
 }
