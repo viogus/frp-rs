@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::{RwLock, mpsc};
 use tokio::net::TcpStream;
-use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tracing::{info, warn, error, debug};
 
 use frp_core::msg::{self, FrpMessage};
@@ -120,7 +120,7 @@ async fn handle_new_proxy(
     proxy_manager: &ProxyManager,
     proxy_table: &Arc<RwLock<HashMap<String, ProxyEntry>>>,
     used_ports: &Arc<RwLock<std::collections::HashSet<u16>>>,
-    writer: &mut tokio::io::WriteHalf<TcpStream>,
+    writer: &mut (impl tokio::io::AsyncWriteExt + Unpin),
 ) {
     let remote_port = np.remote_port.unwrap_or(0) as u16;
 
@@ -152,7 +152,7 @@ async fn handle_new_proxy(
                 return;
             }
 
-            let (tx, _rx) = mpsc::unbounded_channel::<IoStream>();
+            let (_tx, rx) = mpsc::unbounded_channel::<IoStream>();
             let entry = ProxyEntry {
                 info: ProxyInfo {
                     name: np.proxy_name.clone(),
@@ -164,7 +164,7 @@ async fn handle_new_proxy(
                     group_key: np.group_key.clone(),
                     local_addr: np.local_str.clone(),
                 },
-                work_conn_tx: tx,
+                work_conn_rx: Arc::new(tokio::sync::Mutex::new(rx)),
             };
 
             proxy_table.write().await.insert(np.proxy_name.clone(), entry);

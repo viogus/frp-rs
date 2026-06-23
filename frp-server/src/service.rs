@@ -2,11 +2,11 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tokio::net::TcpListener;
-use tracing::{info, warn, error};
+use tracing::{info, error};
 
 use frp_core::config::ServerConfig;
 use frp_core::auth::{AuthConfig, AuthMethod};
-use frp_core::transport::{IoStream, TlsConfig};
+use frp_core::transport::TlsConfig;
 
 use crate::proxy::{ProxyManager, ProxyEntry};
 use crate::control;
@@ -68,12 +68,22 @@ impl Service {
 
         if self.cfg.websocket_port > 0 {
             let ws_addr = format!("{}:{}", self.cfg.bind_addr, self.cfg.websocket_port);
-            let pm = self.proxy_manager.clone();
-            let ac = self.auth_cfg.clone();
-            let pt = self.proxy_table.clone();
-            let up = self.used_ports.clone();
+            let ws_addr2 = ws_addr.clone();
             tokio::spawn(async move {
-                ws_listener(&ws_addr, pm, ac, pt, up).await;
+                if let Ok(listener) = TcpListener::bind(&ws_addr2).await {
+                    info!("WebSocket listener ready on {}", ws_addr2);
+                    loop {
+                        if let Ok((stream, addr)) = listener.accept().await {
+                            info!("New WebSocket connection from {}", addr);
+                            tokio::spawn(async move {
+                                if let Ok(ws) = frp_core::transport::accept_websocket(stream).await {
+                                    info!("WebSocket upgrade completed for {}", addr);
+                                    drop(ws);
+                                }
+                            });
+                        }
+                    }
+                }
             });
             info!("WebSocket listener started on {}", ws_addr);
         }
@@ -94,46 +104,6 @@ impl Service {
                     error!("Failed to accept connection: {}", e);
                 }
             }
-        }
-    }
-}
-
-async fn ws_listener(
-    addr: &str,
-    proxy_manager: Arc<ProxyManager>,
-    auth_cfg: Arc<AuthConfig>,
-    proxy_table: Arc<RwLock<HashMap<String, ProxyEntry>>>,
-    used_ports: Arc<RwLock<std::collections::HashSet<u16>>>,
-) {
-    let listener = match TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!("Failed to bind WebSocket listener: {}", e);
-            return;
-        }
-    };
-    info!("WebSocket listener ready on {}", addr);
-
-    loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                info!("New WebSocket connection from {}", addr);
-                let pm = proxy_manager.clone();
-                let ac = auth_cfg.clone();
-                let pt = proxy_table.clone();
-                let up = used_ports.clone();
-                tokio::spawn(async move {
-                    let io = frp_core::transport::accept_websocket(stream).await;
-                    match io {
-                        Ok(ws_stream) => {
-                            info!("WebSocket upgrade completed for {}", addr);
-                            drop(ws_stream);
-                        }
-                        Err(e) => warn!("WebSocket upgrade failed: {}", e),
-                    }
-                });
-            }
-            Err(e) => error!("WebSocket accept error: {}", e),
         }
     }
 }

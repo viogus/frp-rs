@@ -110,11 +110,11 @@ async fn handle_work_connections(
     local_addr: &str,
     server_addr: &str,
     server_port: u16,
-    auth_cfg: Arc<AuthConfig>,
+    _auth_cfg: Arc<AuthConfig>,
     protocol: TransportProtocol,
 ) {
     loop {
-        let work = match dial_server(&DialOptions {
+        let mut work = match dial_server(&DialOptions {
             server_addr: server_addr.to_string(),
             server_port,
             protocol: protocol.clone(),
@@ -133,26 +133,24 @@ async fn handle_work_connections(
             }
         };
 
-        let (mut reader, mut writer) = work.into_split();
 
         // Send NewWorkConn
         let nwc = FrpMessage::NewWorkConn(msg::NewWorkConn {
             run_id: None, timestamp: None, privilege_key: None,
         });
-        if let Err(e) = write_msg_v1(&mut writer, &nwc).await {
+        if let Err(e) = write_msg_v1(&mut work, &nwc).await {
             warn!("Failed to send NewWorkConn: {}", e);
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
 
         // Read StartWorkConn
-        match read_msg_v1(&mut reader).await {
+        match read_msg_v1(&mut work).await {
             Ok(FrpMessage::StartWorkConn(swc)) => {
                 info!("Work conn assigned to proxy '{}'", swc.proxy_name);
                 match proxy::connect_local(local_addr).await {
                     Ok(local) => {
-                        let stream = reader.unsplit(writer);
-                        proxy::bridge_streams(local, stream, proxy_name).await;
+                        proxy::bridge_streams(local, work, proxy_name).await;
                     }
                     Err(e) => {
                         warn!("Failed to connect to local {}: {}", local_addr, e);

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, warn};
+use tokio::io::AsyncWriteExt;
+use tracing::info;
 
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
@@ -53,8 +53,8 @@ impl ControlConnection {
 
         let io_stream = dial_server(&opts).await?;
 
-        let (mut reader, mut writer) = match io_stream {
-            IoStream::Tcp(s) => s.into_split(),
+        let mut stream = match io_stream {
+            IoStream::Tcp(s) => s,
             IoStream::WebSocket(ref _ws) => {
                 return Err(frp_core::Error::Transport(
                     "WebSocket control connection not yet fully supported".into()
@@ -82,17 +82,15 @@ impl ControlConnection {
             metadatas: None,
         });
 
-        write_msg_v1(&mut writer, &login).await?;
+        write_msg_v1(&mut stream, &login).await?;
 
-        let resp_msg = read_msg_v1(&mut reader).await?;
+        let resp_msg = read_msg_v1(&mut stream).await?;
         match resp_msg {
             FrpMessage::LoginResp(resp) => {
                 if let Some(err) = resp.error {
                     return Err(frp_core::Error::Auth(format!("Login failed: {}", err)));
                 }
                 self.run_id = resp.run_id.clone().unwrap_or_default();
-                info!("Logged in to frps (run_id: {})", self.run_id);
-                let stream = reader.unsplit(writer);
                 Ok((stream, self.run_id.clone()))
             }
             _ => Err(frp_core::Error::Protocol("Unexpected response to login".into())),
@@ -111,12 +109,10 @@ impl ControlConnection {
         sk: &str,
         stream: &mut TcpStream,
     ) -> Result<msg::NewProxyResp, frp_core::Error> {
-        let (mut reader, mut writer) = stream.into_split();
-
         let np = proxy::create_new_proxy_msg(name, proxy_type, local_addr, remote_port, use_encryption, use_compression, sk);
-        write_msg_v1(&mut writer, &np).await?;
+        write_msg_v1(stream, &np).await?;
 
-        let resp_msg = read_msg_v1(&mut reader).await?;
+        let resp_msg = read_msg_v1(stream).await?;
         match resp_msg {
             FrpMessage::NewProxyResp(resp) => {
                 if let Some(err) = resp.error {

@@ -1,5 +1,5 @@
 use tokio::net::TcpStream;
-use tracing::{info, debug, warn};
+use tracing::{info, debug};
 
 use frp_core::msg::{self, FrpMessage};
 

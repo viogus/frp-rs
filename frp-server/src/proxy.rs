@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, Mutex, mpsc};
 use tokio::net::TcpStream;
 use tracing::{info, warn, error, debug};
 
@@ -75,11 +75,10 @@ impl ProxyManager {
     }
 }
 
-/// Data associated with a registered proxy for work connection handling.
-#[derive(Clone)]
+/// Data associated with a registered proxy (work connection receiver).
 pub struct ProxyEntry {
     pub info: ProxyInfo,
-    pub work_conn_tx: mpsc::UnboundedSender<IoStream>,
+    pub work_conn_rx: Arc<Mutex<mpsc::UnboundedReceiver<IoStream>>>,
 }
 
 /// Bridge a user connection and a work connection for a proxy.
@@ -91,7 +90,7 @@ pub async fn proxy_pair(
     let work_conn = {
         let table = proxy_table.read().await;
         table.get(&proxy_name).and_then(|entry| {
-            entry.work_conn_tx.try_recv().ok()
+            entry.work_conn_rx.try_lock().ok().and_then(|mut rx| rx.try_recv().ok())
         })
     };
 
