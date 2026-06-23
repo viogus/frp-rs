@@ -125,6 +125,27 @@ impl Service {
                 }
             }
 
+            // Spawn health checks for proxies with health check enabled
+            for p in &proxies {
+                if !p.health_check_type.is_empty() && p.health_check_type != "tcp" {
+                    warn!("Health check type '{}' not yet supported for '{}'", p.health_check_type, p.name);
+                }
+                if p.health_check_type == "tcp" {
+                    let la = format!("{}:{}", p.local_ip, p.local_port);
+                    let pn = p.name.clone();
+                    let interval = std::time::Duration::from_secs(
+                        p.health_check_interval_seconds.max(10)
+                    );
+                    let timeout = std::time::Duration::from_secs(
+                        p.health_check_timeout_seconds.max(3)
+                    );
+                    let max_failed = p.health_check_max_failed.max(1);
+                    tokio::spawn(async move {
+                        run_health_check(pn, la, interval, timeout, max_failed).await;
+                    });
+                }
+            }
+
             // --- Message loop ---
             let mut ping_interval = interval(Duration::from_secs(30));
             #[allow(unused_assignments)]
@@ -303,6 +324,49 @@ fn spawn_work_conn(
 
         debug!("Work conn {} completed", label);
     });
+}
+
+/// Run a health check for a TCP proxy.
+/// Periodically connects to the local service and reports status.
+async fn run_health_check(
+    proxy_name: String,
+    local_addr: String,
+    interval: std::time::Duration,
+    timeout: std::time::Duration,
+    max_failed: u32,
+) {
+    info!("Health check started for '{}' -> {} (interval: {:?}, timeout: {:?})",
+        proxy_name, local_addr, interval, timeout);
+    
+    let mut failures: u32 = 0;
+    
+    loop {
+        tokio::time::sleep(interval).await;
+        
+        let result = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&local_addr)).await;
+        
+        match result {
+            Ok(Ok(_)) => {
+                failures = 0;
+                debug!("Health check OK for '{}'", proxy_name);
+            }
+            Ok(Err(e)) => {
+                failures += 1;
+                warn!("Health check FAIL for '{}' ({}): {}", proxy_name, failures, e);
+            }
+            Err(_) => {
+                failures += 1;
+                warn!("Health check TIMEOUT for '{}' ({})", proxy_name, failures);
+            }
+        }
+        
+        if failures >= max_failed {
+            warn!("Health check: proxy '{}' exceeded max failures ({}), marking unhealthy",
+                proxy_name, max_failed);
+            // TODO: Send CloseProxy to server
+            failures = 0; // Reset to avoid repeated warnings
+        }
+    }
 }
 
 /// Run a UDP work connection: dedicated TCP tunnel for UDP traffic.
