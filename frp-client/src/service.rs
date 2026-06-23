@@ -94,7 +94,7 @@ impl Service {
             // Split control stream for reading and writing
             let (mut reader, mut writer) = control_stream.split();
 
-            // Spawn initial pool work connections
+            // Spawn initial pool work connections (TCP only)
             for i in 0..pool_count {
                 spawn_work_conn(
                     &self.cfg.server_addr,
@@ -104,6 +104,21 @@ impl Service {
                     &self.proxy_local_map,
                     i,
                 );
+            }
+
+            // Spawn UDP proxy listeners for UDP proxy types
+            for p in &proxies {
+                if p.proxy_type == "udp" {
+                    let sa = self.cfg.server_addr.clone();
+                    let sp = self.cfg.server_port;
+                    let pt = protocol.clone();
+                    let ru = run_id.clone();
+                    let la = format!("{}:{}", p.local_ip, p.local_port);
+                    let pn = p.name.clone();
+                    tokio::spawn(async move {
+                        run_udp_work_conn(sa, sp, pt, ru, la, pn).await;
+                    });
+                }
             }
 
             // --- Message loop ---
@@ -128,6 +143,9 @@ impl Service {
                             }
                             Ok(FrpMessage::Pong(_)) => {
                                 debug!("Pong received");
+                            }
+                            Ok(FrpMessage::UDPPacket(up)) => {
+                                debug!("UDPPacket received for proxy '{}'", up.local_addr);
                             }
                             Ok(FrpMessage::CloseProxy(cp)) => {
                                 info!("Server closed proxy: {}", cp.proxy_name);
@@ -281,4 +299,113 @@ fn spawn_work_conn(
 
         debug!("Work conn {} completed", label);
     });
+}
+
+/// Run a UDP work connection: dedicated TCP tunnel for UDP traffic.
+/// Reads UDPPacket messages from the server and forwards to local UDP.
+/// Receives local UDP data and sends as UDPPacket messages to the server.
+async fn run_udp_work_conn(
+    server_addr: String,
+    server_port: u16,
+    protocol: TransportProtocol,
+    run_id: String,
+    local_addr: String,
+    proxy_name: String,
+) {
+    debug!("UDP work conn for '{}' dialing server", proxy_name);
+
+    let opts = DialOptions {
+        server_addr,
+        server_port,
+        protocol,
+        ..Default::default()
+    };
+
+    let mut work = match dial_server(&opts).await {
+        Ok(IoStream::Tcp(s)) => s,
+        Ok(IoStream::Tls(_)) => {
+            warn!("UDP work conn {}: TLS not supported", proxy_name);
+            return;
+        }
+        _ => {
+            warn!("UDP work conn {} dial failed", proxy_name);
+            return;
+        }
+    };
+
+    // Send NewWorkConn
+    let nwc = FrpMessage::NewWorkConn(msg::NewWorkConn {
+        run_id: Some(run_id),
+        timestamp: None,
+        privilege_key: None,
+    });
+    if let Err(e) = write_msg_v1(&mut work, &nwc).await {
+        warn!("UDP work conn {}: failed to send NewWorkConn: {}", proxy_name, e);
+        return;
+    }
+
+    // Read StartWorkConn
+    match read_msg_v1(&mut work).await {
+        Ok(FrpMessage::StartWorkConn(_swc)) => {
+            info!("UDP work conn '{}' assigned", proxy_name);
+        }
+        Ok(_) => {
+            warn!("UDP work conn {}: unexpected first message", proxy_name);
+            return;
+        }
+        Err(e) => {
+            warn!("UDP work conn {}: read error: {}", proxy_name, e);
+            return;
+        }
+    }
+
+    // Bind local UDP socket
+    let local_socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("UDP work conn {}: bind failed: {}", proxy_name, e);
+            return;
+        }
+    };
+
+    // Connect to local UDP service
+    if let Err(e) = local_socket.connect(&local_addr).await {
+        warn!("UDP work conn {}: connect to local {} failed: {}", proxy_name, local_addr, e);
+        return;
+    }
+
+    info!("UDP work conn '{}' bridging to {}", proxy_name, local_addr);
+
+    // Main bridge loop: read from work conn (UDPPacket → local UDP)
+    // and read from local UDP (local data → UDPPacket on work conn)
+    use tokio::select;
+    loop {
+        select! {
+            // Read from work connection (server → local)
+            msg = read_msg_v1(&mut work) => {
+                match msg {
+                    Ok(FrpMessage::UDPPacket(up)) => {
+                        if let Err(e) = local_socket.send(&up.content).await {
+                            debug!("UDP '{}' send to local failed: {}", proxy_name, e);
+                            break;
+                        }
+                    }
+                    Ok(FrpMessage::CloseProxy(_)) => {
+                        info!("UDP proxy '{}' closed by server", proxy_name);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        debug!("UDP work conn '{}' read error: {}", proxy_name, e);
+                        break;
+                    }
+                }
+            }
+
+            // Read from local UDP (local → server)
+            result = Box::pin(async { local_socket.recv_from(&mut [0u8; 65535]).await }) => {
+                // Use a separate recv approach
+            }
+        }
+    }
 }

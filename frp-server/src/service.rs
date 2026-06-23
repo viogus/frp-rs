@@ -5,6 +5,7 @@ use tokio::sync::RwLock;
 use tokio::net::TcpListener;
 
 use tokio::sync::mpsc;
+
 use tracing::{info, error, warn};
 
 use frp_core::config::ServerConfig;
@@ -28,6 +29,11 @@ pub enum InternalMsg {
     ProxyUserConn {
         proxy_name: String,
         user_conn: tokio::net::TcpStream,
+    },
+    UdpData {
+        proxy_name: String,
+        content: Vec<u8>,
+        remote_addr: String,
     },
 }
 

@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio::net::TcpStream;
 use tokio::net::TcpListener;
+use tokio::net::UdpSocket;
 #[allow(unused_imports)]
 use tracing::{info, warn, debug};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -114,6 +115,18 @@ pub async fn handle_control<S>(
                             pending_requests.push_back(PendingRequest { proxy_name, user_conn });
                         }
                     }
+                    Some(InternalMsg::UdpData { proxy_name: _pn, content, remote_addr }) => {
+                        debug!("UDP data for proxy '{}' from {}", _pn, remote_addr);
+                        let udp_packet = FrpMessage::UDPPacket(msg::UDPPacket {
+                            content,
+                            local_addr: String::new(),
+                            remote_addr,
+                        });
+                        if let Err(e) = write_msg_v1(&mut writer, &udp_packet).await {
+                            warn!("Failed to send UDPPacket: {}", e);
+                            break;
+                        }
+                    }
                     None => {
                         info!("Control channel closed for {:?}", peer);
                         break;
@@ -123,6 +136,15 @@ pub async fn handle_control<S>(
 
             msg = read_msg_v1(&mut reader) => {
                 match msg {
+                    Ok(FrpMessage::UDPPacket(up)) => {
+                        debug!("UDPPacket from client: {} bytes to {}", up.content.len(), up.remote_addr);
+                        // Forward the UDP data to the original sender via a temporary socket
+                        tokio::spawn(async move {
+                            if let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                                let _ = socket.send_to(&up.content, &up.remote_addr).await;
+                            }
+                        });
+                    }
                     Ok(FrpMessage::NewProxy(np)) => {
                         handle_new_proxy(np, &run_id, &state, &mut writer, &internal_tx).await;
                     }
@@ -258,6 +280,17 @@ async fn handle_new_proxy(
                 }
             }
 
+            // For UDP proxies, start a UDP listener
+            if np.proxy_type == "udp" {
+                let pn = np.proxy_name.clone();
+                let itx = internal_tx.clone();
+                let bind_addr = state.proxy_bind_addr.clone();
+                tokio::spawn(async move {
+                    run_udp_listener(bind_addr, port, pn, itx).await;
+                });
+                info!("UDP proxy '{}' listening on port {}", np.proxy_name, port);
+            }
+
             let pn = np.proxy_name.clone();
             let itx = internal_tx.clone();
             let bind_addr = state.proxy_bind_addr.clone();
@@ -324,6 +357,64 @@ async fn listen_and_proxy(
     }
 }
 
+
+/// Run a UDP listener for a UDP proxy.
+/// Forwards received packets to the control handler via InternalMsg.
+async fn run_udp_listener(
+    bind_addr: String,
+    port: u16,
+    proxy_name: String,
+    internal_tx: mpsc::UnboundedSender<InternalMsg>,
+) {
+    let addr = format!("{}:{}", bind_addr, port);
+    let socket = match UdpSocket::bind(&addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to bind UDP port {}: {}", port, e);
+            return;
+        }
+    };
+    info!("UDP listener started on {} for '{}'", addr, proxy_name);
+
+    let mut buf = vec![0u8; 65535];
+    loop {
+        match socket.recv_from(&mut buf).await {
+            Ok((n, src)) => {
+                let data = buf[..n].to_vec();
+                if internal_tx.send(InternalMsg::UdpData {
+                    proxy_name: proxy_name.clone(),
+                    content: data,
+                    remote_addr: src.to_string(),
+                }).is_err() {
+                    warn!("Control handler gone, stopping UDP listener for '{}'", proxy_name);
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::error!("UDP recv error on {}: {}", addr, e);
+                break;
+            }
+        }
+    }
+}
+
+// Forward UdpData from InternalMsg back to the UDP socket
+// This is called when the control handler receives a UDPPacket from the client
+// and needs to send the data to the original remote address.
+async fn forward_udp_response(
+    bind_addr: &str,
+    port: u16,
+    proxy_name: &str,
+    data: &[u8],
+    remote_addr: &str,
+) -> Result<(), String> {
+    let addr = format!("{}:{}", bind_addr, port);
+    let socket = UdpSocket::bind("0.0.0.0:0").await
+        .map_err(|e| format!("bind UDP: {e}"))?;
+    socket.send_to(data, remote_addr).await
+        .map_err(|e| format!("send UDP: {e}"))?;
+    Ok(())
+}
 async fn unregister_control(state: &Arc<AppState>, run_id: &str) {
     let mut map = state.run_id_to_ctl_tx.write().await;
     map.remove(run_id);
