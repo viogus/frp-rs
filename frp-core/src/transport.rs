@@ -45,7 +45,7 @@ impl IoStream {
     pub fn peer_addr(&self) -> Result<std::net::SocketAddr, std::io::Error> {
         match self {
             IoStream::Tcp(s) => s.peer_addr(),
-            IoStream::WebSocket(ws) => ws.get_ref().peer_addr(),
+            IoStream::WebSocket(ws) => ws.get_ref().get_ref().peer_addr(),
         }
     }
 }
