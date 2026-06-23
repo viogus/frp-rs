@@ -1,3 +1,10 @@
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_tungstenite::tungstenite::Message;
+use futures_util::stream::Stream;
+use futures_util::sink::Sink;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -47,6 +54,120 @@ impl std::fmt::Debug for IoStream {
     }
 }
 
+/// A WebSocket-to-byte-stream adapter that implements AsyncRead/AsyncWrite.
+/// Converts between WebSocket binary messages and a byte stream suitable
+/// for use with the V1 protocol functions.
+pub struct WsByteStream {
+    inner: Pin<Box<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+    read_buf: Vec<u8>,
+    read_pos: usize,
+}
+
+impl WsByteStream {
+    pub fn new(ws: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
+        Self {
+            inner: Box::pin(ws),
+            read_buf: Vec::new(),
+            read_pos: 0,
+        }
+    }
+}
+
+impl AsyncRead for WsByteStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+
+        // If we have buffered data, return it
+        if this.read_pos < this.read_buf.len() {
+            let available = &this.read_buf[this.read_pos..];
+            let len = available.len().min(buf.remaining());
+            buf.put_slice(&available[..len]);
+            this.read_pos += len;
+            if this.read_pos >= this.read_buf.len() {
+                this.read_buf.clear();
+                this.read_pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        // Read the next WS message
+        loop {
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(Message::Binary(data)))) => {
+                    let len = data.len().min(buf.remaining());
+                    buf.put_slice(&data[..len]);
+                    if len < data.len() {
+                        this.read_buf = data[len..].to_vec();
+                        this.read_pos = 0;
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Some(Ok(Message::Text(text)))) => {
+                    let data = text.into_bytes();
+                    let len = data.len().min(buf.remaining());
+                    buf.put_slice(&data[..len]);
+                    if len < data.len() {
+                        this.read_buf = data[len..].to_vec();
+                        this.read_pos = 0;
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Some(Ok(Message::Ping(_)))) => {
+                    // Ignore ping (tungstenite handles pong automatically)
+                    continue;
+                }
+                Poll::Ready(Some(Ok(_))) => continue,
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)));
+                }
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for WsByteStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = &mut *self;
+        match this.inner.as_mut().poll_ready(cx) {
+            Poll::Ready(Ok(())) => {
+                match this.inner.as_mut().start_send(Message::Binary(buf.to_vec())) {
+                    Ok(()) => Poll::Ready(Ok(buf.len())),
+                    Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+                }
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.inner.as_mut().poll_flush(cx)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.inner.as_mut().poll_close(cx)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }
+}
+
+
 impl IoStream {
     /// Get the peer address of this stream, if available.
     pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
@@ -75,8 +196,10 @@ impl IoStream {
                 let (r, w) = tokio::io::split(s);
                 (Box::new(r), Box::new(w))
             }
-            IoStream::WebSocket(_) => {
-                panic!("WebSocket into_split not yet supported");
+            IoStream::WebSocket(ws) => {
+                let adapter = WsByteStream::new(ws);
+                let (r, w) = tokio::io::split(adapter);
+                (Box::new(r), Box::new(w))
             }
         }
     }

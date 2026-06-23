@@ -19,6 +19,7 @@ hmac.workspace = true
 hex.workspace = true
 aes-gcm.workspace = true
 flate2.workspace = true
+futures-util.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
