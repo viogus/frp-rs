@@ -309,36 +309,6 @@ fn collect_config_files_inner(dir: &Path, files: &mut Vec<std::path::PathBuf>) -
 }
 
 /// Load server configs from a directory, merging all `.toml` files.
-pub fn load_server_config_from_dir(dir: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
-    let files = collect_config_files(Path::new(dir))?;
-    let files: Vec<_> = files.into_iter().filter(|p| p.extension().map_or(false, |ext| ext == "toml")).collect();
-    if files.is_empty() {
-        return Err(format!("no .toml files found in directory: {dir}").into());
-    }
-    // First file is the primary config
-    let mut cfg: ServerConfig = toml::from_str(&std::fs::read_to_string(&files[0])?)?;
-    for path in &files[1..] {
-        let content = std::fs::read_to_string(path)?;
-        let extra: ServerConfig = toml::from_str(&content)?;
-        merge_server_config(&mut cfg, extra);
-    }
-    Ok(cfg)
-}
-
-fn merge_server_config(base: &mut ServerConfig, extra: ServerConfig) {
-    if !extra.proxy_bind_addr.is_empty() { base.proxy_bind_addr = extra.proxy_bind_addr; }
-    if extra.vhost_http_port != 0 { base.vhost_http_port = extra.vhost_http_port; }
-    if extra.vhost_https_port != 0 { base.vhost_https_port = extra.vhost_https_port; }
-    if extra.kcp_bind_port != 0 { base.kcp_bind_port = extra.kcp_bind_port; }
-    if extra.quic_bind_port != 0 { base.quic_bind_port = extra.quic_bind_port; }
-    if !extra.sub_domain_host.is_empty() { base.sub_domain_host = extra.sub_domain_host; }
-    if extra.websocket_port != 0 { base.websocket_port = extra.websocket_port; }
-    base.tls_enable |= extra.tls_enable;
-    if !extra.tls_cert_file.is_empty() { base.tls_cert_file = extra.tls_cert_file; }
-    if !extra.tls_key_file.is_empty() { base.tls_key_file = extra.tls_key_file; }
-    if !extra.tls_ca_file.is_empty() { base.tls_ca_file = extra.tls_ca_file; }
-    if !extra.auth.token.is_empty() { base.auth.token = extra.auth.token; }
-}
 
 #[cfg(test)]
 mod tests {
