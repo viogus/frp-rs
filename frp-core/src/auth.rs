@@ -156,6 +156,8 @@ mod tests {
         let cfg = AuthConfig {
             method: AuthMethod::Token,
             token: "secret".into(),
+            oidc_issuer: String::new(),
+            oidc_audience: String::new(),
             additional_data: None,
         };
         let ts = 100i64;

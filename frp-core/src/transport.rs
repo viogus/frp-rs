@@ -40,6 +40,7 @@ impl TransportProtocol {
 pub enum IoStream {
     Tcp(TcpStream),
     Tls(tokio_rustls::TlsStream<TcpStream>),
+    Kcp(tokio::io::DuplexStream),
     WebSocket(WebSocketStream<MaybeTlsStream<TcpStream>>),
 }
 
@@ -49,6 +50,7 @@ impl std::fmt::Debug for IoStream {
         match self {
             IoStream::Tcp(_) => f.debug_struct("IoStream::Tcp").finish_non_exhaustive(),
             IoStream::Tls(_) => f.debug_struct("IoStream::Tls").finish_non_exhaustive(),
+            IoStream::Kcp(_) => f.debug_struct("IoStream::Kcp").finish_non_exhaustive(),
             IoStream::WebSocket(_) => f.debug_struct("IoStream::WebSocket").finish_non_exhaustive(),
         }
     }
@@ -174,6 +176,7 @@ impl IoStream {
         match self {
             IoStream::Tcp(s) => s.peer_addr().ok(),
             IoStream::Tls(_) => None,
+            IoStream::Kcp(_) => None,
             IoStream::WebSocket(_) => None,
         }
     }
@@ -194,6 +197,10 @@ impl IoStream {
             }
             IoStream::Tls(s) => {
                 let (r, w) = tokio::io::split(s);
+                (Box::new(r), Box::new(w))
+            }
+            IoStream::Kcp(stream) => {
+                let (r, w) = tokio::io::split(stream);
                 (Box::new(r), Box::new(w))
             }
             IoStream::WebSocket(ws) => {

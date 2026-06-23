@@ -123,6 +123,16 @@ fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate::Er
                 .map_err(|e| crate::Error::Protocol(format!("deserialize Pong: {e}")))?;
             FrpMessage::Pong(v)
         }
+        msg::TYPE_NEW_VISITOR_CONN => {
+            let v: msg::NewVisitorConn = serde_json::from_slice(payload)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConn: {e}")))?;
+            FrpMessage::NewVisitorConn(v)
+        }
+        msg::TYPE_NEW_VISITOR_CONN_RESP => {
+            let v: msg::NewVisitorConnResp = serde_json::from_slice(payload)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConnResp: {e}")))?;
+            FrpMessage::NewVisitorConnResp(v)
+        }
         msg::TYPE_UDP_PACKET => {
             let v: msg::UDPPacket = serde_json::from_slice(payload)
                 .map_err(|e| crate::Error::Protocol(format!("deserialize UDPPacket: {e}")))?;

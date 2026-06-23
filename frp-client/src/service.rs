@@ -263,12 +263,19 @@ fn spawn_work_conn(
 
         let mut work = match dial_server(&opts).await {
             Ok(IoStream::Tcp(s)) => s,
+            Ok(IoStream::Kcp(_)) => {
+                return;
+            }
             Ok(IoStream::WebSocket(_)) => {
                 warn!("Work conn {}: WebSocket not supported for work conns", label);
                 return;
             }
             Ok(IoStream::Tls(_)) => {
                 warn!("Work conn {}: TLS not yet supported for work conns", label);
+                return;
+            }
+            Ok(IoStream::Kcp(_)) => {
+                warn!("Work conn {}: KCP not yet supported for work conns", label);
                 return;
             }
             Err(e) => {

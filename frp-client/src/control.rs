@@ -60,6 +60,11 @@ impl ControlConnection {
                     "TLS control connection client-side not yet fully supported".into()
                 ));
             }
+            IoStream::Kcp(_) => {
+                return Err(frp_core::Error::Transport(
+                    "KCP control connection not yet supported".into(),
+                ));
+            }
             IoStream::WebSocket(ref _ws) => {
                 return Err(frp_core::Error::Transport(
                     "WebSocket control connection not yet fully supported".into()

@@ -27,6 +27,8 @@ pub const V2_TYPE_START_WORK_CONN: u16 = 8;
 pub const V2_TYPE_PING: u16 = 11;
 pub const V2_TYPE_PONG: u16 = 12;
 pub const V2_TYPE_UDP_PACKET: u16 = 13;
+pub const V2_TYPE_NEW_VISITOR_CONN: u16 = 14;
+pub const V2_TYPE_NEW_VISITOR_CONN_RESP: u16 = 15;
 
 // ---------------------------------------------------------------
 // Concrete message structs – all derive Serialize + Deserialize
@@ -144,6 +146,24 @@ pub struct Ping {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pong {}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewVisitorConn {
+    pub proxy_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sk: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub privilege_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewVisitorConnResp {
+    pub proxy_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UDPPacket {
@@ -169,6 +189,8 @@ pub enum FrpMessage {
     StartWorkConn(StartWorkConn),
     Ping(Ping),
     Pong(Pong),
+    NewVisitorConn(NewVisitorConn),
+    NewVisitorConnResp(NewVisitorConnResp),
     UDPPacket(UDPPacket),
 }
 
@@ -185,6 +207,8 @@ impl FrpMessage {
             FrpMessage::StartWorkConn(_) => TYPE_START_WORK_CONN,
             FrpMessage::Ping(_)          => TYPE_PING,
             FrpMessage::Pong(_)          => TYPE_PONG,
+            FrpMessage::NewVisitorConn(_) => TYPE_NEW_VISITOR_CONN,
+            FrpMessage::NewVisitorConnResp(_) => TYPE_NEW_VISITOR_CONN_RESP,
             FrpMessage::UDPPacket(_)     => TYPE_UDP_PACKET,
         }
     }
@@ -202,6 +226,8 @@ impl FrpMessage {
             FrpMessage::Ping(_)          => V2_TYPE_PING,
             FrpMessage::Pong(_)          => V2_TYPE_PONG,
             FrpMessage::UDPPacket(_)     => V2_TYPE_UDP_PACKET,
+            FrpMessage::NewVisitorConn(_) => V2_TYPE_NEW_VISITOR_CONN,
+            FrpMessage::NewVisitorConnResp(_) => V2_TYPE_NEW_VISITOR_CONN_RESP,
         }
     }
 
@@ -230,6 +256,12 @@ impl FrpMessage {
     }
     pub fn as_ping(&self) -> &Ping {
         match self { FrpMessage::Ping(v) => v, _ => panic!("not a Ping") }
+    }
+    pub fn as_new_visitor_conn(&self) -> &NewVisitorConn {
+        match self { FrpMessage::NewVisitorConn(v) => v, _ => panic!("not a NewVisitorConn") }
+    }
+    pub fn as_new_visitor_conn_resp(&self) -> &NewVisitorConnResp {
+        match self { FrpMessage::NewVisitorConnResp(v) => v, _ => panic!("not a NewVisitorConnResp") }
     }
     pub fn as_pong(&self) -> &Pong {
         match self { FrpMessage::Pong(v) => v, _ => panic!("not a Pong") }
@@ -267,6 +299,12 @@ impl FrpMessage {
             })),
             TYPE_PING          => Some(FrpMessage::Ping(Ping { privilege_key: None, timestamp: None })),
             TYPE_PONG          => Some(FrpMessage::Pong(Pong {})),
+            TYPE_NEW_VISITOR_CONN => Some(FrpMessage::NewVisitorConn(NewVisitorConn {
+                proxy_name: String::new(), sk: None, timestamp: None, privilege_key: None,
+            })),
+            TYPE_NEW_VISITOR_CONN_RESP => Some(FrpMessage::NewVisitorConnResp(NewVisitorConnResp {
+                proxy_name: String::new(), error: None,
+            })),
             TYPE_UDP_PACKET    => Some(FrpMessage::UDPPacket(UDPPacket {
                 content: vec![], local_addr: String::new(), remote_addr: String::new(),
             })),

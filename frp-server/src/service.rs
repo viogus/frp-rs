@@ -51,6 +51,7 @@ pub struct AppState {
     pub vhost_manager: Arc<VhostManager>,
     pub vhost_http_port: u16,
     pub encryption_key: [u8; 32],
+    pub sk_index: Arc<RwLock<HashMap<String, String>>>,
     pub dashboard_start: std::time::Instant,
 }
 
@@ -66,6 +67,7 @@ impl AppState {
             vhost_http_port: 0,
             encryption_key,
             dashboard_start: std::time::Instant::now(),
+            sk_index: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }

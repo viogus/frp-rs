@@ -147,6 +147,22 @@ pub async fn handle_control<S>(
 
             msg = read_msg_v1(&mut reader) => {
                 match msg {
+                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                        debug!("NewVisitorConn for proxy '{}'", nvc.proxy_name);
+                        let sk = nvc.sk.as_deref().unwrap_or("");
+                        let proxy_name = state.sk_index.read().await.get(sk).cloned();
+                        let resp = match proxy_name {
+                            Some(pn) => FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
+                                proxy_name: pn,
+                                error: None,
+                            }),
+                            None => FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
+                                proxy_name: nvc.proxy_name.clone(),
+                                error: Some("no matching STCP proxy found for sk".into()),
+                            }),
+                        };
+                        let _ = write_msg_v1(&mut writer, &resp).await;
+                    }
                     Ok(FrpMessage::UDPPacket(up)) => {
                         debug!("UDPPacket from client: {} bytes to {}", up.content.len(), up.remote_addr);
                         // Forward the UDP data to the original sender via a temporary socket
@@ -204,7 +220,8 @@ async fn assign_work_to_proxy(
     let write_result = match &mut work_conn {
         IoStream::Tcp(ref mut s) => write_msg_v1(s, &swc).await,
         IoStream::Tls(ref mut s) => write_msg_v1(s, &swc).await,
-        IoStream::WebSocket(_) => {
+        IoStream::Kcp(_) => { warn!("Kcp streaming not yet supported"); return; }
+            IoStream::WebSocket(_) => {
             warn!("WebSocket work conn not supported for bridging");
             return;
         }
@@ -234,7 +251,8 @@ async fn assign_work_to_proxy(
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key).await;
                 }
-                IoStream::WebSocket(_) => {
+                IoStream::Kcp(_) => { warn!("Kcp streaming not yet supported"); return; }
+            IoStream::WebSocket(_) => {
                     warn!("Encrypted WebSocket bridging not implemented");
                 }
             }
@@ -252,7 +270,8 @@ async fn assign_work_to_proxy(
                         debug!("Proxy '{}' bridge (TLS) closed: {}", req.proxy_name, e);
                     }
                 }
-                IoStream::WebSocket(_) => {
+                IoStream::Kcp(_) => { warn!("Kcp streaming not yet supported"); return; }
+            IoStream::WebSocket(_) => {
                     warn!("WebSocket bridging not implemented");
                 }
             }
@@ -299,6 +318,16 @@ async fn handle_new_proxy(
                 });
                 let _ = write_msg_v1(writer, &resp).await;
                 return;
+            }
+
+            // Register STCP proxies in sk_index
+            if np.proxy_type == "stcp" {
+                if let Some(ref sk) = np.sk {
+                    if !sk.is_empty() {
+                        state.sk_index.write().await.insert(sk.clone(), np.proxy_name.clone());
+                        info!("STCP proxy '{}' registered with sk", np.proxy_name);
+                    }
+                }
             }
 
             // Register HTTP proxies with VhostManager
