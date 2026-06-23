@@ -74,25 +74,29 @@ impl Service {
             info!("Logged in. run_id: {}", run_id);
 
             // Register proxies
-            for p in &proxies {
-                let local_addr = format!("{}:{}", p.local_ip, p.local_port);
-                match ctl.register_proxy(
-                    &p.name, &p.proxy_type, &local_addr, p.remote_port,
-                    p.use_encryption, p.use_compression, &p.sk,
-                    &p.custom_domains,
-                    &mut control_stream,
-                ).await {
-                    Ok(resp) => {
-                        info!("Proxy '{}' registered on remote port {:?}", p.name, resp.remote_port);
-                    }
-                    Err(e) => {
-                        warn!("Failed to register proxy '{}': {}", p.name, e);
+            if let IoStream::Tcp(ref mut tcp) = control_stream {
+                for p in &proxies {
+                    let local_addr = format!("{}:{}", p.local_ip, p.local_port);
+                    match ctl.register_proxy(
+                        &p.name, &p.proxy_type, &local_addr, p.remote_port,
+                        p.use_encryption, p.use_compression, &p.sk,
+                        &p.custom_domains,
+                        tcp,
+                    ).await {
+                        Ok(resp) => {
+                            info!("Proxy '{}' registered on remote port {:?}", p.name, resp.remote_port);
+                        }
+                        Err(e) => {
+                            warn!("Failed to register proxy '{}': {}", p.name, e);
+                        }
                     }
                 }
+            } else {
+                warn!("TLS control connection: proxy registration not yet supported");
             }
 
             // Split control stream for reading and writing
-            let (mut reader, mut writer) = control_stream.split();
+            let (mut reader, mut writer) = control_stream.into_split();
 
             // Spawn initial pool work connections (TCP only)
             for i in 0..pool_count {

@@ -90,6 +90,7 @@ pub struct DialOptions {
     pub protocol: TransportProtocol,
     pub tls_enable: bool,
     pub tls_server_name: String,
+    pub tls_ca_file: Option<String>,
     pub dial_timeout_secs: u64,
 }
 
@@ -101,6 +102,7 @@ impl Default for DialOptions {
             protocol: TransportProtocol::Tcp,
             tls_enable: false,
             tls_server_name: String::new(),
+            tls_ca_file: None,
             dial_timeout_secs: 10,
         }
     }
@@ -118,6 +120,26 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
     .await
     .map_err(|_| crate::Error::Transport(format!("dial timeout to {addr}")))?
     .map_err(|e| crate::Error::Transport(format!("dial to {addr}: {e}")))?;
+
+    // Wrap with TLS if enabled
+    let stream = if opts.tls_enable {
+        let connector = build_tls_connector(None)?;
+        let server_name = if !opts.tls_server_name.is_empty() {
+            opts.tls_server_name.clone()
+        } else {
+            opts.server_addr.clone()
+        };
+        let server_name = rustls::pki_types::ServerName::try_from(server_name)
+            .map_err(|e| crate::Error::Transport(format!("invalid server name: {e}")))?;
+        match connector.connect(server_name, stream).await {
+            Ok(tls) => {
+                return Ok(IoStream::Tls(tokio_rustls::TlsStream::Client(tls)));
+            }
+            Err(e) => return Err(crate::Error::Transport(format!("TLS connect: {e}"))),
+        }
+    } else {
+        stream
+    };
 
     match opts.protocol {
         TransportProtocol::Tcp => Ok(IoStream::Tcp(stream)),

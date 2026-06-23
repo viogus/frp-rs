@@ -43,7 +43,7 @@ impl ControlConnection {
     }
 
     /// Connect to the server and login.
-    pub async fn login(&mut self) -> Result<(TcpStream, String), frp_core::Error> {
+    pub async fn login(&mut self) -> Result<(IoStream, String), frp_core::Error> {
         let opts = DialOptions {
             server_addr: self.server_addr.clone(),
             server_port: self.server_port,
@@ -96,7 +96,7 @@ impl ControlConnection {
                     return Err(frp_core::Error::Auth(format!("Login failed: {}", err)));
                 }
                 self.run_id = resp.run_id.clone().unwrap_or_default();
-                Ok((stream, self.run_id.clone()))
+                Ok((IoStream::Tcp(stream), self.run_id.clone()))
             }
             _ => Err(frp_core::Error::Protocol("Unexpected response to login".into())),
         }
@@ -140,6 +140,46 @@ impl ControlConnection {
             timestamp: None,
         });
         write_msg_v1(writer, &ping).await
+    }
+}
+
+
+/// Shared login handshake: works with both TcpStream and TlsStream.
+async fn perform_login_handshake<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    ctl: &ControlConnection,
+) -> Result<String, frp_core::Error> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let privilege_key = ctl.auth_cfg.generate_login_key(timestamp);
+
+    let login = FrpMessage::Login(msg::Login {
+        version: Some(VERSION.into()),
+        hostname: Some(hostname().unwrap_or_default()),
+        os: Some(std::env::consts::OS.into()),
+        arch: Some(std::env::consts::ARCH.into()),
+        user: if ctl.user.is_empty() { None } else { Some(ctl.user.clone()) },
+        run_id: None,
+        pool_count: Some(ctl.pool_count),
+        timestamp: Some(timestamp),
+        privilege_key,
+        metadatas: None,
+    });
+
+    write_msg_v1(stream, &login).await?;
+
+    let resp_msg = read_msg_v1(stream).await?;
+    match resp_msg {
+        FrpMessage::LoginResp(resp) => {
+            if let Some(err) = resp.error {
+                return Err(frp_core::Error::Auth(format!("Login failed: {}", err)));
+            }
+            Ok(resp.run_id.clone().unwrap_or_default())
+        }
+        _ => Err(frp_core::Error::Protocol("Unexpected response to login".into())),
     }
 }
 
