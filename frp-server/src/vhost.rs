@@ -106,7 +106,7 @@ pub async fn run_vhost_http_listener(
                     // existing ProxyUserConn mechanism.
                     let _ = ctl_tx.tx.send(InternalMsg::ProxyUserConn {
                         proxy_name: _route.proxy_name.clone(),
-                        user_conn: stream,
+                        user_conn: frp_core::transport::IoStream::Tcp(stream),
                     }).ok();
                 }
             } else {
@@ -118,6 +118,76 @@ pub async fn run_vhost_http_listener(
 }
 
 /// Extract the Host header from an HTTP request string.
+
+/// Run an HTTPS VHost listener on the given address.
+/// Performs TLS handshake, then extracts Host header and routes via InternalMsg.
+pub async fn run_vhost_https_listener(
+    addr: String,
+    tls_cert_file: String,
+    tls_key_file: String,
+    state: std::sync::Arc<crate::service::AppState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use frp_core::transport::build_tls_acceptor;
+    use tokio::net::TcpListener;
+    use tokio::io::AsyncReadExt;
+    use tracing::{info, warn, debug};
+
+    let acceptor = build_tls_acceptor(&tls_cert_file, &tls_key_file)?;
+    let listener = TcpListener::bind(&addr).await?;
+    info!("HTTPS VHost listener started on {}", addr);
+
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let state = state.clone();
+        let acceptor = acceptor.clone();
+
+        tokio::spawn(async move {
+            let mut tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("TLS handshake failed from {}: {}", peer, e);
+                    return;
+                }
+            };
+
+            let mut buf = [0u8; 4096];
+            let n = match tls_stream.read(&mut buf).await {
+                Ok(n) if n > 0 => n,
+                _ => return,
+            };
+
+            let request_text = String::from_utf8_lossy(&buf[..n]);
+            let host = match extract_host_header(&request_text) {
+                Some(h) => h.to_string(),
+                None => {
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut tls_stream, b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+                    return;
+                }
+            };
+
+            debug!("HTTPS VHost request for '{}' from {}", host, peer);
+
+            if let Some(route) = state.vhost_manager.lookup(&host).await {
+                let internal_tx = {
+                    let map = state.run_id_to_ctl_tx.read().await;
+                    map.get(&route.run_id).cloned()
+                };
+                if let Some(ctl_tx) = internal_tx {
+                    let _ = ctl_tx.tx.send(crate::service::InternalMsg::ProxyUserConn {
+                        proxy_name: route.proxy_name.clone(),
+                        user_conn: frp_core::transport::IoStream::Tls(
+                            tokio_rustls::TlsStream::Server(tls_stream)
+                        ),
+                    }).ok();
+                }
+            } else {
+                warn!("No VHost route for '{}' from {}", host, peer);
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut tls_stream, b"HTTP/1.1 404 Not Found\r\n\r\n").await;
+            }
+        });
+    }
+}
+
 fn extract_host_header(request: &str) -> Option<&str> {
     for line in request.lines() {
         let lower = line.to_lowercase();

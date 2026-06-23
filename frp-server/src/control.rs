@@ -104,9 +104,17 @@ pub async fn handle_control<S>(
                         }
                     }
                     Some(InternalMsg::ProxyUserConn { proxy_name, user_conn }) => {
+                        // Extract TcpStream from IoStream for PendingRequest
+                        let tcp = match user_conn {
+                            IoStream::Tcp(s) => s,
+                            _ => {
+                                warn!("Unsupported user connection type for proxy {}", proxy_name);
+                                return;
+                            }
+                        };
                         debug!("User conn for proxy {} on run_id {}", proxy_name, run_id);
                         if let Some(work_conn) = work_pool.pop_front() {
-                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn, use_encryption: false }).await;
+                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: tcp, use_encryption: false }).await;
                         } else {
                             debug!("No pooled work conn, sending ReqWorkConn for {}", proxy_name);
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
@@ -115,7 +123,7 @@ pub async fn handle_control<S>(
                             }
                             let enc = state.proxy_manager.get(&proxy_name).await
                                 .map(|p| p.use_encryption).unwrap_or(false);
-                            pending_requests.push_back(PendingRequest { proxy_name, user_conn, use_encryption: enc });
+                            pending_requests.push_back(PendingRequest { proxy_name, user_conn: tcp, use_encryption: enc });
                         }
                     }
                     Some(InternalMsg::UdpData { proxy_name: _pn, content, remote_addr }) => {
@@ -370,7 +378,7 @@ async fn listen_and_proxy(
             Ok((user_conn, _addr)) => {
                 if internal_tx.send(InternalMsg::ProxyUserConn {
                     proxy_name: proxy_name.clone(),
-                    user_conn,
+                    user_conn: IoStream::Tcp(user_conn),
                 }).is_err() {
                     warn!("Control handler gone, stopping proxy listener for '{}'", proxy_name);
                     break;

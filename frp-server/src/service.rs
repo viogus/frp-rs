@@ -28,7 +28,7 @@ pub enum InternalMsg {
     NewWorkConn(IoStream),
     ProxyUserConn {
         proxy_name: String,
-        user_conn: tokio::net::TcpStream,
+        user_conn: IoStream,
     },
     UdpData {
         proxy_name: String,
@@ -144,6 +144,22 @@ impl Service {
                 }
             });
             info!("WebSocket listener started on {}", ws_addr);
+        }
+
+
+        // Start HTTPS VHost listener if configured
+        if self.cfg.vhost_https_port > 0 && self.cfg.tls_enable {
+            let https_addr = format!("{}:{}", self.cfg.bind_addr, self.cfg.vhost_https_port);
+            let https_addr2 = https_addr.clone();
+            let https_state = self.state.clone();
+            let cert = self.cfg.tls_cert_file.clone();
+            let key = self.cfg.tls_key_file.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::vhost::run_vhost_https_listener(https_addr, cert, key, https_state).await {
+                    error!("HTTPS VHost listener failed: {}", e);
+                }
+            });
+            info!("HTTPS VHost listener starting on {}", https_addr2);
         }
 
         // Main accept loop
