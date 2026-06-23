@@ -1,9 +1,10 @@
 use std::sync::Arc;
+use std::net::SocketAddr;
 use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio::net::TcpStream;
 use tokio::net::TcpListener;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{info, warn, error, debug};
 
 use frp_core::msg::{self, FrpMessage};
@@ -21,12 +22,15 @@ struct PendingRequest {
 
 /// Handle a control connection from a frpc client.
 /// The login message has already been consumed from the stream.
-pub async fn handle_control(
-    stream: TcpStream,
+/// `peer` is passed separately because generic stream types don't have peer_addr().
+pub async fn handle_control<S>(
+    stream: S,
     login: msg::Login,
     state: Arc<AppState>,
-) {
-    let peer = stream.peer_addr().ok();
+    peer: Option<SocketAddr>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     info!("New control connection from {:?}", peer);
 
     // --- Authenticate ---
@@ -41,7 +45,7 @@ pub async fn handle_control(
             server_udp_port: None,
             error: Some(e),
         });
-        let (_, mut writer) = stream.into_split();
+        let (_, mut writer) = tokio::io::split(stream);
         let _ = write_msg_v1(&mut writer, &resp).await;
         return;
     }
@@ -60,7 +64,7 @@ pub async fn handle_control(
     }
 
     // --- Split stream for reading/writing ---
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = tokio::io::split(stream);
 
     // --- Send login response ---
     let resp = FrpMessage::LoginResp(msg::LoginResp {
@@ -90,7 +94,6 @@ pub async fn handle_control(
                     Some(InternalMsg::NewWorkConn(stream)) => {
                         debug!("Got work conn for run_id {}", run_id);
                         if let Some(req) = pending_requests.pop_front() {
-                            // Assign this work connection to the pending proxy
                             assign_work_to_proxy(stream, req).await;
                         } else {
                             work_pool.push_back(stream);
@@ -100,10 +103,8 @@ pub async fn handle_control(
                     Some(InternalMsg::ProxyUserConn { proxy_name, user_conn }) => {
                         debug!("User conn for proxy {} on run_id {}", proxy_name, run_id);
                         if let Some(work_conn) = work_pool.pop_front() {
-                            // Pooled work connection available — use it directly
                             assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn }).await;
                         } else {
-                            // No pooled conn — send ReqWorkConn and queue
                             debug!("No pooled work conn, sending ReqWorkConn for {}", proxy_name);
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
                                 warn!("Failed to send ReqWorkConn: {}", e);
@@ -154,9 +155,7 @@ pub async fn handle_control(
     info!("Control connection {} removed", run_id);
 }
 
-/// Assign a work connection to a pending proxy request:
-/// 1. Send StartWorkConn on the work connection
-/// 2. Bridge user and work streams
+/// Assign a work connection to a pending proxy request.
 async fn assign_work_to_proxy(
     mut work_conn: IoStream,
     req: PendingRequest,
@@ -168,11 +167,11 @@ async fn assign_work_to_proxy(
         error: None,
     });
 
-    // Write StartWorkConn on the work connection
     let write_result = match &mut work_conn {
         IoStream::Tcp(ref mut s) => write_msg_v1(s, &swc).await,
+        IoStream::Tls(ref mut s) => write_msg_v1(s, &swc).await,
         IoStream::WebSocket(_) => {
-            warn!("WebSocket work conn not yet supported for bridging");
+            warn!("WebSocket work conn not supported for bridging");
             return;
         }
     };
@@ -184,13 +183,18 @@ async fn assign_work_to_proxy(
 
     info!("Bridging user conn to work conn for proxy '{}'", req.proxy_name);
 
-    // Bridge user connection and work connection
     tokio::spawn(async move {
         match work_conn {
             IoStream::Tcp(mut work) => {
                 let mut user = req.user_conn;
                 if let Err(e) = tokio::io::copy_bidirectional(&mut user, &mut work).await {
                     debug!("Proxy '{}' bridge closed: {}", req.proxy_name, e);
+                }
+            }
+            IoStream::Tls(mut work) => {
+                let mut user = req.user_conn;
+                if let Err(e) = tokio::io::copy_bidirectional(&mut user, &mut work).await {
+                    debug!("Proxy '{}' bridge (TLS) closed: {}", req.proxy_name, e);
                 }
             }
             IoStream::WebSocket(_) => {
@@ -239,7 +243,6 @@ async fn handle_new_proxy(
                 return;
             }
 
-            // Spawn proxy listener for this port
             let pn = np.proxy_name.clone();
             let itx = internal_tx.clone();
 
@@ -287,8 +290,7 @@ async fn listen_and_proxy(
 
     loop {
         match listener.accept().await {
-            Ok((user_conn, addr)) => {
-                debug!("User connected to proxy '{}' from {}", proxy_name, addr);
+            Ok((user_conn, _addr)) => {
                 if internal_tx.send(InternalMsg::ProxyUserConn {
                     proxy_name: proxy_name.clone(),
                     user_conn,
@@ -305,7 +307,6 @@ async fn listen_and_proxy(
     }
 }
 
-/// Remove the control handler registration from AppState.
 async fn unregister_control(state: &Arc<AppState>, run_id: &str) {
     let mut map = state.run_id_to_ctl_tx.write().await;
     map.remove(run_id);

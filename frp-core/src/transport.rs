@@ -32,7 +32,54 @@ impl TransportProtocol {
 /// Unified stream type for TCP and WebSocket.
 pub enum IoStream {
     Tcp(TcpStream),
+    Tls(tokio_rustls::TlsStream<TcpStream>),
     WebSocket(WebSocketStream<MaybeTlsStream<TcpStream>>),
+}
+
+
+impl std::fmt::Debug for IoStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IoStream::Tcp(_) => f.debug_struct("IoStream::Tcp").finish_non_exhaustive(),
+            IoStream::Tls(_) => f.debug_struct("IoStream::Tls").finish_non_exhaustive(),
+            IoStream::WebSocket(_) => f.debug_struct("IoStream::WebSocket").finish_non_exhaustive(),
+        }
+    }
+}
+
+impl IoStream {
+    /// Get the peer address of this stream, if available.
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            IoStream::Tcp(s) => s.peer_addr().ok(),
+            IoStream::Tls(_) => None,
+            IoStream::WebSocket(_) => None,
+        }
+    }
+
+    /// Split the stream into owned read and write halves.
+    /// The halves are boxed so different stream variants (TCP, TLS)
+    /// can be returned from a single method.
+    pub fn into_split(
+        self,
+    ) -> (
+        Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    ) {
+        match self {
+            IoStream::Tcp(s) => {
+                let (r, w) = tokio::io::split(s);
+                (Box::new(r), Box::new(w))
+            }
+            IoStream::Tls(s) => {
+                let (r, w) = tokio::io::split(s);
+                (Box::new(r), Box::new(w))
+            }
+            IoStream::WebSocket(_) => {
+                panic!("WebSocket into_split not yet supported");
+            }
+        }
+    }
 }
 
 /// Options for dialing the server.

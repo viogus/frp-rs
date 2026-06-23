@@ -17,3 +17,4 @@ http.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 pin-project.workspace = true
+tokio-rustls.workspace = true

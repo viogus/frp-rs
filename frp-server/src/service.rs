@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use tokio::sync::RwLock;
 use tokio::net::TcpListener;
+
 use tokio::sync::mpsc;
 use tracing::{info, error, warn};
 
@@ -10,6 +12,7 @@ use frp_core::auth::{AuthConfig, AuthMethod};
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::read_msg_v1;
 use frp_core::transport::IoStream;
+use frp_core::transport::build_tls_acceptor;
 
 use crate::proxy::ProxyManager;
 use crate::control;
@@ -18,30 +21,24 @@ use crate::control;
 // Shared state for cross-task communication
 // ---------------------------------------------------------------
 
-/// Messages sent between the control handler, proxy listeners, and work-conn handlers.
 #[derive(Debug)]
 pub enum InternalMsg {
-    /// A new work connection (IoStream) has arrived.
     NewWorkConn(IoStream),
-    /// A user has connected to a proxy port and needs a work connection.
     ProxyUserConn {
         proxy_name: String,
         user_conn: tokio::net::TcpStream,
     },
 }
 
-/// A sender handle for sending InternalMsg to a control handler.
 #[derive(Debug, Clone)]
 pub struct ControlTx {
     pub tx: mpsc::UnboundedSender<InternalMsg>,
 }
 
-/// Global application state shared across all server tasks.
 pub struct AppState {
     pub proxy_manager: Arc<ProxyManager>,
     pub auth_cfg: Arc<AuthConfig>,
     pub used_ports: Arc<RwLock<std::collections::HashSet<u16>>>,
-    /// Map from run_id to the control handler's internal message sender.
     pub run_id_to_ctl_tx: Arc<RwLock<HashMap<String, ControlTx>>>,
 }
 
@@ -60,7 +57,6 @@ impl AppState {
 // Service
 // ---------------------------------------------------------------
 
-/// The main frps service.
 pub struct Service {
     cfg: ServerConfig,
     state: Arc<AppState>,
@@ -85,6 +81,21 @@ impl Service {
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let bind_addr = format!("{}:{}", self.cfg.bind_addr, self.cfg.bind_port);
         info!("frps starting on {}", bind_addr);
+
+        let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = if self.cfg.tls_enable {
+            match build_tls_acceptor(&self.cfg.tls_cert_file, &self.cfg.tls_key_file) {
+                Ok(acc) => {
+                    info!("TLS enabled with cert: {}", self.cfg.tls_cert_file);
+                    Some(acc)
+                }
+                Err(e) => {
+                    error!("Failed to initialize TLS: {}", e);
+                    return Err(e.into());
+                }
+            }
+        } else {
+            None
+        };
 
         let listener = TcpListener::bind(&bind_addr).await?;
         info!("frps listener started on {}", bind_addr);
@@ -111,28 +122,18 @@ impl Service {
             info!("WebSocket listener started on {}", ws_addr);
         }
 
-        // Main accept loop — dispatch on first message type
+        // Main accept loop
         loop {
             match listener.accept().await {
-                Ok((mut stream, addr)) => {
+                Ok((stream, addr)) => {
                     let state = self.state.clone();
+                    let acceptor = tls_acceptor.clone();
+
                     tokio::spawn(async move {
-                        // Read the first V1 frame to determine connection type
-                        match read_msg_v1(&mut stream).await {
-                            Ok(FrpMessage::Login(login)) => {
-                                info!("New control connection from {}", addr);
-                                control::handle_control(stream, login, state).await;
-                            }
-                            Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                info!("New work connection from {}", addr);
-                                handle_work_conn(stream, nwc, state).await;
-                            }
-                            Ok(other) => {
-                                warn!("Unexpected first message type from {}: {:?}", addr, other.v1_type_byte());
-                            }
-                            Err(e) => {
-                                warn!("Failed to read first message from {}: {}", addr, e);
-                            }
+                        if let Some(acceptor) = acceptor {
+                            handle_tls_connection(stream, state, addr, acceptor).await;
+                        } else {
+                            handle_plain_connection(stream, state, addr).await;
                         }
                     });
                 }
@@ -144,10 +145,69 @@ impl Service {
     }
 }
 
-/// Handle an incoming work connection (NewWorkConn message).
-/// Routes the IoStream to the appropriate control handler via InternalMsg.
-async fn handle_work_conn(
+/// Handle a TLS connection: handshake, read first V1 frame, dispatch.
+async fn handle_tls_connection(
     stream: tokio::net::TcpStream,
+    state: Arc<AppState>,
+    addr: SocketAddr,
+    acceptor: tokio_rustls::TlsAcceptor,
+) {
+    let tls_stream = match acceptor.accept(stream).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("TLS handshake failed from {}: {}", addr, e);
+            return;
+        }
+    };
+
+    info!("TLS connection from {}", addr);
+    let mut tls = tls_stream;
+
+    match read_msg_v1(&mut tls).await {
+        Ok(FrpMessage::Login(login)) => {
+            control::handle_control(tls, login, state, Some(addr)).await;
+        }
+        Ok(FrpMessage::NewWorkConn(nwc)) => {
+            // TLS work connection: wrap in IoStream::Tls for pooling
+            let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
+            handle_work_conn_inner(io, nwc, state).await;
+        }
+        Ok(other) => {
+            warn!("Unexpected first message from {}: {:?}", addr, other.v1_type_byte());
+        }
+        Err(e) => {
+            warn!("Failed to read first message from {}: {}", addr, e);
+        }
+    }
+}
+
+/// Handle a non-TLS connection: read first V1 frame, dispatch.
+async fn handle_plain_connection(
+    mut stream: tokio::net::TcpStream,
+    state: Arc<AppState>,
+    addr: SocketAddr,
+) {
+    match read_msg_v1(&mut stream).await {
+        Ok(FrpMessage::Login(login)) => {
+            control::handle_control(stream, login, state, Some(addr)).await;
+        }
+        Ok(FrpMessage::NewWorkConn(nwc)) => {
+            let io = IoStream::Tcp(stream);
+            handle_work_conn_inner(io, nwc, state).await;
+        }
+        Ok(other) => {
+            warn!("Unexpected first message from {}: {:?}", addr, other.v1_type_byte());
+        }
+        Err(e) => {
+            warn!("Failed to read first message from {}: {}", addr, e);
+        }
+    }
+}
+
+/// Handle an incoming work connection. Routes the IoStream to the
+/// appropriate control handler via InternalMsg.
+async fn handle_work_conn_inner(
+    stream: IoStream,
     msg: msg::NewWorkConn,
     state: Arc<AppState>,
 ) {
@@ -166,7 +226,7 @@ async fn handle_work_conn(
 
     match ctl_tx {
         Some(ctl) => {
-            if ctl.tx.send(InternalMsg::NewWorkConn(IoStream::Tcp(stream))).is_err() {
+            if ctl.tx.send(InternalMsg::NewWorkConn(stream)).is_err() {
                 warn!("Control handler for {} has gone away", run_id);
             }
         }

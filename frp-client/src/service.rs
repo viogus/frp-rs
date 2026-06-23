@@ -221,6 +221,10 @@ fn spawn_work_conn(
                 warn!("Work conn {}: WebSocket not supported for work conns", label);
                 return;
             }
+            Ok(IoStream::Tls(_)) => {
+                warn!("Work conn {}: TLS not yet supported for work conns", label);
+                return;
+            }
             Err(e) => {
                 warn!("Work conn {} dial failed: {}", label, e);
                 return;

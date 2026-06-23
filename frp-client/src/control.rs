@@ -55,6 +55,11 @@ impl ControlConnection {
 
         let mut stream = match io_stream {
             IoStream::Tcp(s) => s,
+            IoStream::Tls(ref _tls) => {
+                return Err(frp_core::Error::Transport(
+                    "TLS control connection client-side not yet fully supported".into()
+                ));
+            }
             IoStream::WebSocket(ref _ws) => {
                 return Err(frp_core::Error::Transport(
                     "WebSocket control connection not yet fully supported".into()
