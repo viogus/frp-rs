@@ -20,7 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls"] }
+tokio-tungstenite = "0.24"
 futures-util = "0.3"
 futures = "0.3"
 sha2 = "0.10"
