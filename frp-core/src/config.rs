@@ -158,6 +158,48 @@ impl Default for ServerTransportConfig {
         }
     }
 }
+// ---------------------------------------------------------------
+// Plugin Configuration
+// ---------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginConfig {
+    #[serde(rename = "type")]
+    pub plugin_type: String,
+    #[serde(default, alias = "httpUser")]
+    pub http_user: String,
+    #[serde(default, alias = "httpPassword")]
+    pub http_password: String,
+    #[serde(default, alias = "localAddr")]
+    pub local_addr: String,
+    #[serde(default, alias = "localPath")]
+    pub local_path: String,
+    #[serde(default, alias = "stripPrefix")]
+    pub strip_prefix: String,
+    #[serde(default, alias = "hostHeaderRewrite")]
+    pub host_header_rewrite: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self {
+            plugin_type: String::new(),
+            http_user: String::new(),
+            http_password: String::new(),
+            local_addr: String::new(),
+            local_path: String::new(),
+            strip_prefix: String::new(),
+            host_header_rewrite: String::new(),
+            username: String::new(),
+            password: String::new(),
+        }
+    }
+}
+
 
 // ---------------------------------------------------------------
 // Client Configuration
@@ -229,11 +271,11 @@ pub struct ProxyConfig {
     pub name: String,
     #[serde(rename = "type")]
     pub proxy_type: String,
-    #[serde(default)]
+    #[serde(default, alias = "localIp")]
     pub local_ip: String,
     #[serde(default)]
     pub local_port: u16,
-    #[serde(default)]
+    #[serde(default, alias = "remotePort")]
     pub remote_port: u16,
     #[serde(default)]
     pub use_encryption: bool,
@@ -242,18 +284,18 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub sk: String,
     #[serde(default)]
-    pub plugin: String,
+    pub plugin: Option<PluginConfig>,
     #[serde(default)]
     pub custom_domains: Vec<String>,
     #[serde(default)]
     pub subdomain: String,
-    #[serde(default)]
+    #[serde(default, alias = "httpUser")]
     pub http_user: String,
-    #[serde(default)]
+    #[serde(default, alias = "httpPassword")]
     pub http_password: String,
     #[serde(default)]
     pub locations: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "hostHeaderRewrite")]
     pub host_header_rewrite: String,
     #[serde(default)]
     pub group: String,
@@ -432,6 +474,23 @@ fn normalize_client_config(value: &mut toml::Value) {
             table.entry("tls_ca_file").or_insert(v);
         }
 
+        // Rename serverAddr → server_addr, serverPort → server_port (Go frp uses camelCase)
+        if let Some(v) = table.remove("serverAddr") {
+            table.entry("server_addr").or_insert(v);
+        }
+        if let Some(v) = table.remove("serverPort") {
+            table.entry("server_port").or_insert(v);
+        }
+
+        // Extract token from [auth] table (Go frp uses auth.token, auth.method)
+        if let Some(v) = table.remove("auth") {
+            if let Value::Table(auth_table) = v {
+                if let Some(token_val) = auth_table.get("token") {
+                    table.entry("token").or_insert(token_val.clone());
+                }
+            }
+        }
+
         // Flatten log_* fields into log table (client side)
         let mut log_items: Vec<(String, Value)> = Vec::new();
         for key in ["log_file", "log_level", "log_max_days"] {
@@ -539,6 +598,35 @@ log_level = "info"
         assert_eq!(cfg.bind_port, 7000);
         assert_eq!(cfg.auth.token, "my-token");
         assert_eq!(cfg.auth.method, "token");
+    }
+
+    #[test]
+    fn test_go_format_client_with_plugin_toml() {
+        let toml_str = r#"
+serverAddr = "140.245.66.216"
+serverPort = 7000
+auth.method = "token"
+auth.token = "my-secret-token"
+
+[[proxies]]
+name = "home-arm-qb-proxy"
+type = "tcp"
+remotePort = 10081
+[proxies.plugin]
+type = "http_proxy"
+httpUser = "cdf"
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+        assert_eq!(cfg.server_addr, "140.245.66.216");
+        assert_eq!(cfg.server_port, 7000);
+        assert_eq!(cfg.token, "my-secret-token");
+        assert_eq!(cfg.proxies.len(), 1);
+        assert_eq!(cfg.proxies[0].name, "home-arm-qb-proxy");
+        assert_eq!(cfg.proxies[0].proxy_type, "tcp");
+        assert_eq!(cfg.proxies[0].remote_port, 10081);
+        let plugin = cfg.proxies[0].plugin.as_ref().unwrap();
+        assert_eq!(plugin.plugin_type, "http_proxy");
+        assert_eq!(plugin.http_user, "cdf");
     }
 
     #[test]
