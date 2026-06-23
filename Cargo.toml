@@ -27,15 +27,14 @@ data-encoding = "2"
 aes-gcm = { version = "0.10", features = ["aes"] }
 flate2 = "1.0"
 tokio-rustls = "0.26"
-rustls = "0.23"
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
 rustls-pemfile = "2"
-http = "1"
 futures-util = "0.3"
 webpki-roots = "0.26"
 
 [profile.release]
 opt-level = "z"
-lto = true
+lto = "fat"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
