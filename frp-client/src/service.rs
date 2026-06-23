@@ -264,6 +264,7 @@ fn spawn_work_conn(
         let mut work = match dial_server(&opts).await {
             Ok(IoStream::Tcp(s)) => s,
             Ok(IoStream::Kcp(_)) => {
+                warn!("Work conn {}: KCP not yet supported for work conns", label);
                 return;
             }
             Ok(IoStream::WebSocket(_)) => {
@@ -272,10 +273,6 @@ fn spawn_work_conn(
             }
             Ok(IoStream::Tls(_)) => {
                 warn!("Work conn {}: TLS not yet supported for work conns", label);
-                return;
-            }
-            Ok(IoStream::Kcp(_)) => {
-                warn!("Work conn {}: KCP not yet supported for work conns", label);
                 return;
             }
             Err(e) => {
@@ -480,7 +477,7 @@ async fn run_udp_work_conn(
             }
 
             // Read from local UDP (local → server)
-            result = Box::pin(async { local_socket.recv_from(&mut [0u8; 65535]).await }) => {
+            _result = Box::pin(async { local_socket.recv_from(&mut [0u8; 65535]).await }) => {
                 // Use a separate recv approach
             }
         }

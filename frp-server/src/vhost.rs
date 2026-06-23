@@ -79,6 +79,7 @@ pub async fn run_vhost_http_listener(
                 _ => return,
             };
 
+            let pre_read = buf[..n].to_vec();
             let request_text = String::from_utf8_lossy(&buf[..n]);
             let host = match extract_host_header(&request_text) {
                 Some(h) => h.to_string(),
@@ -107,6 +108,7 @@ pub async fn run_vhost_http_listener(
                     let _ = ctl_tx.tx.send(InternalMsg::ProxyUserConn {
                         proxy_name: _route.proxy_name.clone(),
                         user_conn: frp_core::transport::IoStream::Tcp(stream),
+                        pre_read,
                     }).ok();
                 }
             } else {
@@ -156,6 +158,7 @@ pub async fn run_vhost_https_listener(
                 _ => return,
             };
 
+            let pre_read = buf[..n].to_vec();
             let request_text = String::from_utf8_lossy(&buf[..n]);
             let host = match extract_host_header(&request_text) {
                 Some(h) => h.to_string(),
@@ -178,6 +181,7 @@ pub async fn run_vhost_https_listener(
                         user_conn: frp_core::transport::IoStream::Tls(
                             tokio_rustls::TlsStream::Server(tls_stream)
                         ),
+                        pre_read,
                     }).ok();
                 }
             } else {

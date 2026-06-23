@@ -66,6 +66,12 @@ impl ProxyManager {
         }
     }
 
+    pub async fn list_client(&self, run_id: &str) -> Vec<ProxyInfo> {
+        self.by_client.read().await.get(run_id)
+            .map(|proxies| proxies.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub async fn list(&self) -> Vec<ProxyInfo> {
         self.proxies.read().await.values().cloned().collect()
     }

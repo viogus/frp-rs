@@ -5,7 +5,6 @@ use tokio::sync::mpsc;
 use tokio::net::TcpStream;
 use tokio::net::TcpListener;
 use tokio::net::UdpSocket;
-#[allow(unused_imports)]
 use tracing::{info, warn, debug};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -20,6 +19,7 @@ use crate::service::{AppState, InternalMsg, ControlTx};
 struct PendingRequest {
     proxy_name: String,
     user_conn: TcpStream,
+    pre_read: Vec<u8>,
     use_encryption: bool,
 }
 
@@ -103,7 +103,7 @@ pub async fn handle_control<S>(
                             debug!("Work conn pooled for {} (pool size: {})", run_id, work_pool.len());
                         }
                     }
-                    Some(InternalMsg::ProxyUserConn { proxy_name, user_conn }) => {
+                    Some(InternalMsg::ProxyUserConn { proxy_name, user_conn, pre_read }) => {
                         // Extract TcpStream from IoStream for PendingRequest
                         let tcp = match user_conn {
                             IoStream::Tcp(s) => s,
@@ -114,7 +114,7 @@ pub async fn handle_control<S>(
                         };
                         debug!("User conn for proxy {} on run_id {}", proxy_name, run_id);
                         if let Some(work_conn) = work_pool.pop_front() {
-                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: tcp, use_encryption: false }).await;
+                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: tcp, pre_read, use_encryption: false }).await;
                         } else {
                             debug!("No pooled work conn, sending ReqWorkConn for {}", proxy_name);
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
@@ -123,7 +123,7 @@ pub async fn handle_control<S>(
                             }
                             let enc = state.proxy_manager.get(&proxy_name).await
                                 .map(|p| p.use_encryption).unwrap_or(false);
-                            pending_requests.push_back(PendingRequest { proxy_name, user_conn: tcp, use_encryption: enc });
+                            pending_requests.push_back(PendingRequest { proxy_name, user_conn: tcp, pre_read, use_encryption: enc });
                         }
                     }
                     Some(InternalMsg::UdpData { proxy_name: _pn, content, remote_addr }) => {
@@ -176,6 +176,11 @@ pub async fn handle_control<S>(
                         handle_new_proxy(np, &run_id, &state, &mut writer, &internal_tx).await;
                     }
                     Ok(FrpMessage::CloseProxy(cp)) => {
+                        if let Some(info) = state.proxy_manager.get(&cp.proxy_name).await {
+                            if let Some(port) = info.remote_port {
+                                state.used_ports.write().await.remove(&port);
+                            }
+                        }
                         state.proxy_manager.remove(&cp.proxy_name).await;
                         info!("Proxy closed: {}", cp.proxy_name);
                     }
@@ -234,9 +239,23 @@ async fn assign_work_to_proxy(
 
     info!("Bridging user conn to work conn for proxy '{}'", req.proxy_name);
 
+    let pre_read = req.pre_read;
     let enc_key = req.use_encryption;
 
     tokio::spawn(async move {
+        // Write VHost pre-read bytes to work connection first
+        if !pre_read.is_empty() {
+            match &mut work_conn {
+                IoStream::Tcp(ref mut s) => {
+                    let _ = s.write_all(&pre_read).await;
+                }
+                IoStream::Tls(ref mut s) => {
+                    let _ = s.write_all(&pre_read).await;
+                }
+                _ => {}
+            }
+        }
+
         if enc_key {
             // Derive encryption key (would use state.auth_cfg.token in production)
             let key = frp_core::encryption::derive_key("frp-rs");
@@ -408,6 +427,7 @@ async fn listen_and_proxy(
                 if internal_tx.send(InternalMsg::ProxyUserConn {
                     proxy_name: proxy_name.clone(),
                     user_conn: IoStream::Tcp(user_conn),
+                    pre_read: vec![],
                 }).is_err() {
                     warn!("Control handler gone, stopping proxy listener for '{}'", proxy_name);
                     break;
@@ -462,24 +482,17 @@ async fn run_udp_listener(
     }
 }
 
-// Forward UdpData from InternalMsg back to the UDP socket
-// This is called when the control handler receives a UDPPacket from the client
-// and needs to send the data to the original remote address.
-async fn forward_udp_response(
-    bind_addr: &str,
-    port: u16,
-    proxy_name: &str,
-    data: &[u8],
-    remote_addr: &str,
-) -> Result<(), String> {
-    let addr = format!("{}:{}", bind_addr, port);
-    let socket = UdpSocket::bind("0.0.0.0:0").await
-        .map_err(|e| format!("bind UDP: {e}"))?;
-    socket.send_to(data, remote_addr).await
-        .map_err(|e| format!("send UDP: {e}"))?;
-    Ok(())
-}
 async fn unregister_control(state: &Arc<AppState>, run_id: &str) {
     let mut map = state.run_id_to_ctl_tx.write().await;
     map.remove(run_id);
+    // Release allocated ports for this client
+    let used = &state.used_ports;
+    let pm = &state.proxy_manager;
+    let proxies = pm.list_client(run_id).await;
+    let mut ports = used.write().await;
+    for p in &proxies {
+        if let Some(port) = p.remote_port {
+            ports.remove(&port);
+        }
+    }
 }

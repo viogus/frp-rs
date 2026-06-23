@@ -29,6 +29,7 @@ pub enum InternalMsg {
     ProxyUserConn {
         proxy_name: String,
         user_conn: IoStream,
+        pre_read: Vec<u8>,
     },
     UdpData {
         proxy_name: String,

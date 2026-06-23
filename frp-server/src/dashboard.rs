@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::net::SocketAddr;
 use axum::{Router, Json, extract::State, response::Html};
 use serde::Serialize;
 use crate::service::AppState;
