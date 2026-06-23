@@ -1,7 +1,7 @@
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-/// The WebSocket path used by frp (matches the Go version).
+/// The WebSocket path used by frp (matching the Go version).
 pub const FRP_WEBSOCKET_PATH: &str = "/~!frp";
 
 /// Transport protocol variant.
@@ -22,32 +22,12 @@ impl TransportProtocol {
             _ => TransportProtocol::Tcp,
         }
     }
-
-    #[allow(dead_code)]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TransportProtocol::Tcp => "tcp",
-            TransportProtocol::WebSocket => "websocket",
-            TransportProtocol::Wss => "wss",
-            TransportProtocol::Quic => "quic",
-        }
-    }
 }
 
 /// Unified stream type for TCP and WebSocket.
 pub enum IoStream {
     Tcp(TcpStream),
     WebSocket(WebSocketStream<MaybeTlsStream<TcpStream>>),
-}
-
-impl IoStream {
-    #[allow(dead_code)]
-    pub fn peer_addr(&self) -> Result<std::net::SocketAddr, std::io::Error> {
-        match self {
-            IoStream::Tcp(s) => s.peer_addr(),
-            IoStream::WebSocket(ws) => ws.get_ref().get_ref().peer_addr(),
-        }
-    }
 }
 
 /// Options for dialing the server.
