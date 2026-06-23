@@ -16,6 +16,7 @@ use frp_core::transport::build_tls_acceptor;
 
 use crate::proxy::ProxyManager;
 use crate::control;
+use crate::vhost::VhostManager;
 
 // ---------------------------------------------------------------
 // Shared state for cross-task communication
@@ -41,6 +42,8 @@ pub struct AppState {
     pub used_ports: Arc<RwLock<std::collections::HashSet<u16>>>,
     pub run_id_to_ctl_tx: Arc<RwLock<HashMap<String, ControlTx>>>,
     pub proxy_bind_addr: String,
+    pub vhost_manager: Arc<VhostManager>,
+    pub vhost_http_port: u16,
 }
 
 impl AppState {
@@ -51,6 +54,8 @@ impl AppState {
             used_ports: Arc::new(RwLock::new(std::collections::HashSet::new())),
             run_id_to_ctl_tx: Arc::new(RwLock::new(HashMap::new())),
             proxy_bind_addr,
+            vhost_manager: Arc::new(VhostManager::new()),
+            vhost_http_port: 0,
         }
     }
 }

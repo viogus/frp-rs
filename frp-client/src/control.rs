@@ -112,9 +112,10 @@ impl ControlConnection {
         use_encryption: bool,
         use_compression: bool,
         sk: &str,
+        custom_domains: &[String],
         stream: &mut TcpStream,
     ) -> Result<msg::NewProxyResp, frp_core::Error> {
-        let np = proxy::create_new_proxy_msg(name, proxy_type, local_addr, remote_port, use_encryption, use_compression, sk);
+        let np = proxy::create_new_proxy_msg(name, proxy_type, local_addr, remote_port, use_encryption, use_compression, sk, custom_domains);
         write_msg_v1(stream, &np).await?;
 
         let resp_msg = read_msg_v1(stream).await?;

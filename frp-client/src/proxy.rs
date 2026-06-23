@@ -12,6 +12,7 @@ pub fn create_new_proxy_msg(
     use_encryption: bool,
     use_compression: bool,
     sk: &str,
+    custom_domains: &[String],
 ) -> FrpMessage {
     FrpMessage::NewProxy(msg::NewProxy {
         proxy_name: name.to_string(),
@@ -23,6 +24,7 @@ pub fn create_new_proxy_msg(
         local_str: Some(local_addr.to_string()),
         remote_port: Some(remote_port as i32),
         sk: if sk.is_empty() { None } else { Some(sk.to_string()) },
+        custom_domains: if custom_domains.is_empty() { None } else { Some(custom_domains.to_vec()) },
         metadatas: None,
     })
 }

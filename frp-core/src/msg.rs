@@ -89,6 +89,8 @@ pub struct NewProxy {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sk: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_domains: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadatas: Option<std::collections::HashMap<String, String>>,
 }
 
@@ -248,7 +250,7 @@ impl FrpMessage {
                 proxy_name: String::new(), proxy_type: String::new(),
                 use_encryption: None, use_compression: None,
                 group: None, group_key: None, local_str: None,
-                remote_port: None, sk: None, metadatas: None,
+                remote_port: None, sk: None, custom_domains: None, metadatas: None,
             })),
             TYPE_NEW_PROXY_RESP => Some(FrpMessage::NewProxyResp(NewProxyResp {
                 proxy_name: String::new(), remote_port: None, error: None,

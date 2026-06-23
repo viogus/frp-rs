@@ -79,6 +79,7 @@ impl Service {
                 match ctl.register_proxy(
                     &p.name, &p.proxy_type, &local_addr, p.remote_port,
                     p.use_encryption, p.use_compression, &p.sk,
+                    &p.custom_domains,
                     &mut control_stream,
                 ).await {
                     Ok(resp) => {

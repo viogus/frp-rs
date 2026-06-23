@@ -243,6 +243,20 @@ async fn handle_new_proxy(
                 return;
             }
 
+            // Register HTTP proxies with VhostManager
+            if np.proxy_type == "http" {
+                if let Some(ref domains) = np.custom_domains {
+                    if !domains.is_empty() {
+                        state.vhost_manager.register(
+                            &np.proxy_name,
+                            domains,
+                            run_id,
+                        ).await;
+                        info!("VHost routes registered for '{}': {:?}", np.proxy_name, domains);
+                    }
+                }
+            }
+
             let pn = np.proxy_name.clone();
             let itx = internal_tx.clone();
             let bind_addr = state.proxy_bind_addr.clone();
