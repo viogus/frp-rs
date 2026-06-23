@@ -3,6 +3,7 @@ pub mod protocol;
 pub mod transport;
 pub mod auth;
 pub mod config;
+pub mod encryption;
 
 use thiserror::Error;
 

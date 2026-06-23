@@ -23,6 +23,8 @@ tokio-tungstenite = "0.24"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
+aes-gcm = { version = "0.10", features = ["aes"] }
+flate2 = "1.0"
 tokio-rustls = "0.26"
 rustls = "0.23"
 rustls-pemfile = "2"
