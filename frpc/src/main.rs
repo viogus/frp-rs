@@ -15,7 +15,12 @@ async fn main() {
         )
         .init();
 
-    let (config, config_dir) = parse_args();
+    let (config, config_dir, cli_log_level, cli_log_file, show_version) = parse_args();
+
+    if show_version {
+        println!("frpc {}", frp_core::VERSION);
+        process::exit(0);
+    }
 
     if let Some(ref dir) = config_dir {
         let files = match collect_config_files(Path::new(dir)) {
@@ -72,10 +77,13 @@ async fn main() {
     }
 }
 
-fn parse_args() -> (String, Option<String>) {
+fn parse_args() -> (String, Option<String>, Option<String>, Option<String>, bool) {
     let mut args = std::env::args().skip(1).peekable();
     let mut config = "frpc.toml".to_string();
     let mut config_dir: Option<String> = None;
+    let mut log_file: Option<String> = None;
+    let mut log_level: Option<String> = None;
+    let mut show_version = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -86,6 +94,17 @@ fn parse_args() -> (String, Option<String>) {
                     eprintln!("error: --config requires a value");
                     process::exit(1);
                 }
+            }
+            "--log-file" => {
+                if let Some(val) = args.next() { log_file = Some(val); }
+                else { eprintln!("error: --log-file requires a value"); process::exit(1); }
+            }
+            "--log-level" => {
+                if let Some(val) = args.next() { log_level = Some(val); }
+                else { eprintln!("error: --log-level requires a value"); process::exit(1); }
+            }
+            "-v" | "--version" => {
+                show_version = true;
             }
             "--config-dir" => {
                 if let Some(val) = args.next() {
@@ -101,6 +120,9 @@ fn parse_args() -> (String, Option<String>) {
                 eprintln!("Options:");
                 eprintln!("  -c, --config <FILE>        Config file path [default: frpc.toml]");
                 eprintln!("      --config-dir <DIR>     Directory containing config files");
+                eprintln!("      --log-file <FILE>      Log file path (appends)");
+                eprintln!("      --log-level <LEVEL>    Log level (trace/debug/info/warn/error)");
+                eprintln!("  -v, --version              Print version");
                 eprintln!("  -h, --help                 Print help");
                 process::exit(0);
             }
@@ -112,8 +134,8 @@ fn parse_args() -> (String, Option<String>) {
     }
 
     if config_dir.is_some() {
-        (String::new(), config_dir)
+        (String::new(), config_dir, log_level, log_file, show_version)
     } else {
-        (config, None)
+        (config, None, log_level, log_file, show_version)
     }
 }

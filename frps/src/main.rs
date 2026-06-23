@@ -9,14 +9,52 @@ use frp_server::service::Service;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    let (config, config_dir, cli_log_level, cli_log_file, show_version) = parse_args();
 
-    let (config, config_dir) = parse_args();
+    if show_version {
+        println!("frps {}", frp_core::VERSION);
+        process::exit(0);
+    }
 
+    // Set log level from CLI if provided (overrides RUST_LOG)
+    if let Some(ref level) = cli_log_level {
+        if std::env::var("RUST_LOG").is_err() {
+            std::env::set_var("RUST_LOG", level);
+        }
+    }
+
+    // Initialize tracing (will use RUST_LOG env var if set)
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| {
+            if let Some(ref level) = cli_log_level {
+                EnvFilter::new(level)
+            } else {
+                EnvFilter::new("info")
+            }
+        });
+
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+
+    if let Some(ref file) = cli_log_file {
+        // Use a simple rolling file appender
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file)
+        {
+            Ok(f) => {
+                builder.with_writer(std::sync::Mutex::new(f)).init();
+            }
+            Err(e) => {
+                eprintln!("Warning: could not open log file {}: {}. Using stderr.", file, e);
+                builder.init();
+            }
+        }
+    } else {
+        builder.init();
+    }
+
+    // Rest of the function unchanged
     if let Some(ref dir) = config_dir {
         let files = match collect_config_files(Path::new(dir)) {
             Ok(files) => files,
@@ -72,10 +110,13 @@ async fn main() {
     }
 }
 
-fn parse_args() -> (String, Option<String>) {
+fn parse_args() -> (String, Option<String>, Option<String>, Option<String>, bool) {
     let mut args = std::env::args().skip(1).peekable();
     let mut config = "frps.toml".to_string();
     let mut config_dir: Option<String> = None;
+    let mut log_file: Option<String> = None;
+    let mut log_level: Option<String> = None;
+    let mut show_version = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -95,12 +136,34 @@ fn parse_args() -> (String, Option<String>) {
                     process::exit(1);
                 }
             }
+            "--log-file" => {
+                if let Some(val) = args.next() {
+                    log_file = Some(val);
+                } else {
+                    eprintln!("error: --log-file requires a value");
+                    process::exit(1);
+                }
+            }
+            "--log-level" => {
+                if let Some(val) = args.next() {
+                    log_level = Some(val);
+                } else {
+                    eprintln!("error: --log-level requires a value");
+                    process::exit(1);
+                }
+            }
+            "-v" | "--version" => {
+                show_version = true;
+            }
             "-h" | "--help" => {
                 eprintln!("Usage: frps [OPTIONS]");
                 eprintln!("");
                 eprintln!("Options:");
                 eprintln!("  -c, --config <FILE>        Config file path [default: frps.toml]");
                 eprintln!("      --config-dir <DIR>     Directory containing config files");
+                eprintln!("      --log-file <FILE>      Log file path (appends)");
+                eprintln!("      --log-level <LEVEL>    Log level (trace/debug/info/warn/error)");
+                eprintln!("  -v, --version              Print version");
                 eprintln!("  -h, --help                 Print help");
                 process::exit(0);
             }
@@ -111,9 +174,5 @@ fn parse_args() -> (String, Option<String>) {
         }
     }
 
-    if config_dir.is_some() {
-        (String::new(), config_dir)
-    } else {
-        (config, None)
-    }
+    (config, config_dir, log_level, log_file, show_version)
 }
