@@ -1,4 +1,5 @@
 use std::process;
+
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -8,7 +9,6 @@ use frp_server::service::Service;
 #[derive(Parser)]
 #[command(name = "frps", about = "frp server (Rust rewrite)")]
 struct Cli {
-    /// Path to the configuration file.
     #[arg(short, long, default_value = "frps.toml")]
     config: String,
 }
@@ -17,8 +17,7 @@ struct Cli {
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 

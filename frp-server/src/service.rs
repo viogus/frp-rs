@@ -39,9 +39,21 @@ impl Service {
             used_ports: Arc::new(RwLock::new(std::collections::HashSet::new())),
             _tls_cfg: TlsConfig {
                 enable: cfg.tls_enable,
-                cert_file: if cfg.tls_cert_file.is_empty() { None } else { Some(cfg.tls_cert_file.clone()) },
-                key_file: if cfg.tls_key_file.is_empty() { None } else { Some(cfg.tls_key_file.clone()) },
-                ca_file: if cfg.tls_ca_file.is_empty() { None } else { Some(cfg.tls_ca_file.clone()) },
+                cert_file: if cfg.tls_cert_file.is_empty() {
+                    None
+                } else {
+                    Some(cfg.tls_cert_file.clone())
+                },
+                key_file: if cfg.tls_key_file.is_empty() {
+                    None
+                } else {
+                    Some(cfg.tls_key_file.clone())
+                },
+                ca_file: if cfg.tls_ca_file.is_empty() {
+                    None
+                } else {
+                    Some(cfg.tls_ca_file.clone())
+                },
             },
             cfg,
         }
@@ -54,7 +66,6 @@ impl Service {
         let listener = TcpListener::bind(&bind_addr).await?;
         info!("frps listener started on {}", bind_addr);
 
-        // If websocket port is configured, start a WS listener
         if self.cfg.websocket_port > 0 {
             let ws_addr = format!("{}:{}", self.cfg.bind_addr, self.cfg.websocket_port);
             let pm = self.proxy_manager.clone();
@@ -116,9 +127,7 @@ async fn ws_listener(
                     match io {
                         Ok(ws_stream) => {
                             info!("WebSocket upgrade completed for {}", addr);
-                            // For WebSocket, we handle via the TCP stream
-                            // since the WebSocket frames carry raw binary data.
-                            drop(ws_stream); // placeholder
+                            drop(ws_stream);
                         }
                         Err(e) => warn!("WebSocket upgrade failed: {}", e),
                     }
