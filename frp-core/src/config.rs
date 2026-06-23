@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 // ---------------------------------------------------------------
 // Server Configuration
@@ -280,6 +281,62 @@ pub fn load_client_config(path: &str) -> Result<ClientConfig, Box<dyn std::error
     let content = std::fs::read_to_string(path)?;
     let cfg: ClientConfig = toml::from_str(&content)?;
     Ok(cfg)
+}
+
+/// Collect all non-directory entries from a directory tree (recursive walk).
+/// Returns file paths in sorted order. Used for `--config-dir` mode.
+pub fn collect_config_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
+    let mut files = Vec::new();
+    collect_config_files_inner(dir, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_config_files_inner(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    if !dir.is_dir() {
+        return Err(format!("not a directory: {}", dir.display()).into());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_config_files_inner(&path, files)?;
+        } else {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Load server configs from a directory, merging all `.toml` files.
+pub fn load_server_config_from_dir(dir: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+    let files = collect_config_files(Path::new(dir))?;
+    if files.is_empty() {
+        return Err(format!("no .toml files found in directory: {dir}").into());
+    }
+    // First file is the primary config
+    let mut cfg: ServerConfig = toml::from_str(&std::fs::read_to_string(&files[0])?)?;
+    for path in &files[1..] {
+        let content = std::fs::read_to_string(path)?;
+        let extra: ServerConfig = toml::from_str(&content)?;
+        merge_server_config(&mut cfg, extra);
+    }
+    Ok(cfg)
+}
+
+fn merge_server_config(base: &mut ServerConfig, extra: ServerConfig) {
+    if !extra.proxy_bind_addr.is_empty() { base.proxy_bind_addr = extra.proxy_bind_addr; }
+    if extra.vhost_http_port != 0 { base.vhost_http_port = extra.vhost_http_port; }
+    if extra.vhost_https_port != 0 { base.vhost_https_port = extra.vhost_https_port; }
+    if extra.kcp_bind_port != 0 { base.kcp_bind_port = extra.kcp_bind_port; }
+    if extra.quic_bind_port != 0 { base.quic_bind_port = extra.quic_bind_port; }
+    if !extra.sub_domain_host.is_empty() { base.sub_domain_host = extra.sub_domain_host; }
+    if extra.websocket_port != 0 { base.websocket_port = extra.websocket_port; }
+    base.tls_enable |= extra.tls_enable;
+    if !extra.tls_cert_file.is_empty() { base.tls_cert_file = extra.tls_cert_file; }
+    if !extra.tls_key_file.is_empty() { base.tls_key_file = extra.tls_key_file; }
+    if !extra.tls_ca_file.is_empty() { base.tls_ca_file = extra.tls_ca_file; }
+    if !extra.auth.token.is_empty() { base.auth.token = extra.auth.token; }
 }
 
 #[cfg(test)]
