@@ -40,15 +40,17 @@ pub struct AppState {
     pub auth_cfg: Arc<AuthConfig>,
     pub used_ports: Arc<RwLock<std::collections::HashSet<u16>>>,
     pub run_id_to_ctl_tx: Arc<RwLock<HashMap<String, ControlTx>>>,
+    pub proxy_bind_addr: String,
 }
 
 impl AppState {
-    pub fn new(auth_cfg: AuthConfig) -> Self {
+    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             auth_cfg: Arc::new(auth_cfg),
             used_ports: Arc::new(RwLock::new(std::collections::HashSet::new())),
             run_id_to_ctl_tx: Arc::new(RwLock::new(HashMap::new())),
+            proxy_bind_addr,
         }
     }
 }
@@ -73,7 +75,14 @@ impl Service {
             additional_data: None,
         };
         Self {
-            state: Arc::new(AppState::new(auth_cfg)),
+            state: Arc::new(AppState::new(
+            auth_cfg,
+            if cfg.proxy_bind_addr.is_empty() {
+                cfg.bind_addr.clone()
+            } else {
+                cfg.proxy_bind_addr.clone()
+            },
+        )),
             cfg,
         }
     }

@@ -245,9 +245,10 @@ async fn handle_new_proxy(
 
             let pn = np.proxy_name.clone();
             let itx = internal_tx.clone();
+            let bind_addr = state.proxy_bind_addr.clone();
 
             tokio::spawn(async move {
-                listen_and_proxy(port, pn, itx).await;
+                listen_and_proxy(bind_addr, port, pn, itx).await;
             });
 
             info!("Proxy '{}' registered on port {} (run_id: {})", np.proxy_name, port, run_id);
@@ -272,11 +273,12 @@ async fn handle_new_proxy(
 
 /// Listen on a proxy port and forward incoming connections to the control handler.
 async fn listen_and_proxy(
+    bind_addr: String,
     port: u16,
     proxy_name: String,
     internal_tx: mpsc::UnboundedSender<InternalMsg>,
 ) {
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("{}:{}", bind_addr, port);
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => {
             info!("Proxy listener started on {} for '{}'", addr, proxy_name);
