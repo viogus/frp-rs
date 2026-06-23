@@ -4,8 +4,9 @@ use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio::net::TcpStream;
 use tokio::net::TcpListener;
+#[allow(unused_imports)]
+use tracing::{info, warn, debug};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tracing::{info, warn, error, debug};
 
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
@@ -299,7 +300,7 @@ async fn listen_and_proxy(
             l
         }
         Err(e) => {
-            error!("Failed to bind proxy port {}: {}", port, e);
+            tracing::error!("Failed to bind proxy port {}: {}", port, e);
             return;
         }
     };
@@ -316,7 +317,7 @@ async fn listen_and_proxy(
                 }
             }
             Err(e) => {
-                error!("Accept error on proxy port {}: {}", port, e);
+                tracing::error!("Accept error on proxy port {}: {}", port, e);
                 break;
             }
         }

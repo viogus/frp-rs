@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, debug};
 
 use crate::service::{AppState, InternalMsg};
 

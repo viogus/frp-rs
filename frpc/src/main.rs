@@ -9,12 +9,6 @@ use frp_core::config::{load_client_config, collect_config_files};
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
     let (config, config_dir, cli_log_level, cli_log_file, show_version) = parse_args();
 
     if show_version {
@@ -22,6 +16,44 @@ async fn main() {
         process::exit(0);
     }
 
+    // Set log level from CLI if provided
+    if let Some(ref level) = cli_log_level {
+        if std::env::var("RUST_LOG").is_err() {
+            std::env::set_var("RUST_LOG", level);
+        }
+    }
+
+    // Initialize tracing
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| {
+            if let Some(ref level) = cli_log_level {
+                EnvFilter::new(level)
+            } else {
+                EnvFilter::new("info")
+            }
+        });
+
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+
+    if let Some(ref file) = cli_log_file {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file)
+        {
+            Ok(f) => {
+                builder.with_writer(std::sync::Mutex::new(f)).init();
+            }
+            Err(e) => {
+                eprintln!("Warning: could not open log file {}: {}. Using stderr.", file, e);
+                builder.init();
+            }
+        }
+    } else {
+        builder.init();
+    }
+
+    // --- Config directory mode ---
     if let Some(ref dir) = config_dir {
         let files = match collect_config_files(Path::new(dir)) {
             Ok(files) => files,
@@ -88,12 +120,12 @@ fn parse_args() -> (String, Option<String>, Option<String>, Option<String>, bool
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-c" | "--config" => {
-                if let Some(val) = args.next() {
-                    config = val;
-                } else {
-                    eprintln!("error: --config requires a value");
-                    process::exit(1);
-                }
+                if let Some(val) = args.next() { config = val; }
+                else { eprintln!("error: --config requires a value"); process::exit(1); }
+            }
+            "--config-dir" => {
+                if let Some(val) = args.next() { config_dir = Some(val); }
+                else { eprintln!("error: --config-dir requires a value"); process::exit(1); }
             }
             "--log-file" => {
                 if let Some(val) = args.next() { log_file = Some(val); }
@@ -105,14 +137,6 @@ fn parse_args() -> (String, Option<String>, Option<String>, Option<String>, bool
             }
             "-v" | "--version" => {
                 show_version = true;
-            }
-            "--config-dir" => {
-                if let Some(val) = args.next() {
-                    config_dir = Some(val);
-                } else {
-                    eprintln!("error: --config-dir requires a value");
-                    process::exit(1);
-                }
             }
             "-h" | "--help" => {
                 eprintln!("Usage: frpc [OPTIONS]");
