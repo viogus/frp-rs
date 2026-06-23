@@ -279,7 +279,12 @@ async fn assign_work_to_proxy(
             match work_conn {
                 IoStream::Tcp(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
-                    let (w_r, w_w) = work.into_split();
+                    let (w_r, w_w) = tokio::io::split(work);
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key).await;
+                }
+                IoStream::Kcp(work) => {
+                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key).await;
                 }
                 IoStream::Tls(work) => {
