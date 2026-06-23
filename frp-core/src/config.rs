@@ -269,19 +269,220 @@ pub struct ProxyConfig {
     pub health_check_max_failed: u32,
 }
 
+
+/// Normalize a parsed TOML value from Go frp format to frp-rs format.
+/// Handles:
+/// - `[common]` section → flatten to top level
+/// - Flat auth_*, log_*, web_server_*, transport_* → nested structs
+/// - Field name differences (protocol → transport_protocol, etc.)
+
+pub fn load_server_config_from_str(content: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+    let mut value: toml::Value = toml::from_str(content)?;
+    normalize_server_config(&mut value);
+    let json_value = toml_to_json(value);
+    let cfg: ServerConfig = serde_json::from_value(json_value)?;
+    Ok(cfg)
+}
+
+pub fn load_client_config_from_str(content: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
+    let mut value: toml::Value = toml::from_str(content)?;
+    normalize_client_config(&mut value);
+    let table = match value {
+        toml::Value::Table(t) => t,
+        _ => return Err("expected a table".into()),
+    };
+    let cfg: ClientConfig = toml::from_str(&toml::to_string(&table)?)?;
+    Ok(cfg)
+}
+
+
+/// Convert a toml::Value to a serde_json::Value for deserialization.
+/// This is needed because toml::Value can't be directly deserialized into
+/// arbitrary Rust types (the round-trip through toml::to_string produces
+/// invalid TOML for inline tables).
+fn toml_to_json(v: toml::Value) -> serde_json::Value {
+    match v {
+        toml::Value::String(s) => serde_json::Value::String(s),
+        toml::Value::Integer(i) => serde_json::Value::Number(i.into()),
+        toml::Value::Float(f) => {
+            serde_json::Number::from_f64(f)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null)
+        }
+        toml::Value::Boolean(b) => serde_json::Value::Bool(b),
+        toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
+        toml::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(toml_to_json).collect())
+        }
+        toml::Value::Table(table) => {
+            let map: serde_json::Map<String, serde_json::Value> = table
+                .into_iter()
+                .map(|(k, v)| (k, toml_to_json(v)))
+                .collect();
+            serde_json::Value::Object(map)
+        }
+    }
+}
+
+fn normalize_server_config(value: &mut toml::Value) {
+    use toml::Value;
+    if let Some(table) = value.as_table_mut() {
+        // Handle [common] section: merge into top level
+        if let Some(common) = table.remove("common") {
+            if let Value::Table(common_table) = common {
+                for (k, v) in common_table {
+                    table.entry(k).or_insert(v);
+                }
+            }
+        }
+
+        // Move bare `token` into [auth] table as well
+        if let Some(v) = table.remove("token") {
+            let auth_table = table.entry("auth").or_insert_with(|| toml::Value::Table(Default::default()));
+            if let toml::Value::Table(ref mut t) = auth_table {
+                t.entry("token".to_string()).or_insert(v);
+            }
+        }
+
+        // Flatten auth_* fields into auth table
+        let mut auth_items: Vec<(String, Value)> = Vec::new();
+        for key in ["auth_method", "auth_token", "token", "oidc_issuer", "oidc_audience", "oidc_token_endpoint"] {
+            if let Some(v) = table.remove(key) {
+                let sub_key = key.strip_prefix("auth_").or_else(|| key.strip_prefix("oidc_")).unwrap_or(key);
+                auth_items.push((sub_key.to_string(), v));
+            }
+        }
+        if !auth_items.is_empty() {
+            let auth_table = table.entry("auth").or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(ref mut t) = auth_table {
+                for (k, v) in auth_items {
+                    t.entry(k).or_insert(v);
+                }
+            }
+        }
+
+        // Flatten log_* fields into log table
+        let mut log_items: Vec<(String, Value)> = Vec::new();
+        for key in ["log_file", "log_level", "log_max_days"] {
+            if let Some(v) = table.remove(key) {
+                let sub_key = key.strip_prefix("log_").unwrap_or(key);
+                log_items.push((sub_key.to_string(), v));
+            }
+        }
+        if !log_items.is_empty() {
+            let log_table = table.entry("log").or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(ref mut t) = log_table {
+                for (k, v) in log_items {
+                    t.entry(k).or_insert(v);
+                }
+            }
+        }
+
+        // Flatten web_server_* fields into web_server table
+        let mut ws_items: Vec<(String, Value)> = Vec::new();
+        for key in ["web_server_addr", "web_server_port", "web_server_user", "web_server_password"] {
+            if let Some(v) = table.remove(key) {
+                let sub_key = key.strip_prefix("web_server_").unwrap_or(key);
+                ws_items.push((sub_key.to_string(), v));
+            }
+        }
+        if !ws_items.is_empty() {
+            let ws_table = table.entry("web_server").or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(ref mut t) = ws_table {
+                for (k, v) in ws_items {
+                    t.entry(k).or_insert(v);
+                }
+            }
+        }
+
+        // Flatten transport_* fields into transport table
+        // Also handle flat tcp_mux, tcp_mux_keepalive_interval at top level
+        let mut tr_items: Vec<(String, Value)> = Vec::new();
+        for key in ["tcp_mux", "tcp_mux_keepalive_interval"] {
+            if let Some(v) = table.remove(key) {
+                tr_items.push((key.to_string(), v));
+            }
+        }
+        if !tr_items.is_empty() {
+            let tr_table = table.entry("transport").or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(ref mut t) = tr_table {
+                for (k, v) in tr_items {
+                    t.entry(k).or_insert(v);
+                }
+            }
+        }
+    }
+}
+
+fn normalize_client_config(value: &mut toml::Value) {
+    use toml::Value;
+    if let Some(table) = value.as_table_mut() {
+        // Handle [common] section
+        if let Some(common) = table.remove("common") {
+            if let Value::Table(common_table) = common {
+                for (k, v) in common_table {
+                    table.entry(k).or_insert(v);
+                }
+            }
+        }
+
+        // Rename protocol → transport_protocol (Go frp uses "protocol")
+        if let Some(v) = table.remove("protocol") {
+            table.entry("transport_protocol").or_insert(v);
+        }
+
+        // Rename tls_trusted_ca_file → tls_ca_file
+        if let Some(v) = table.remove("tls_trusted_ca_file") {
+            table.entry("tls_ca_file").or_insert(v);
+        }
+
+        // Flatten log_* fields into log table (client side)
+        let mut log_items: Vec<(String, Value)> = Vec::new();
+        for key in ["log_file", "log_level", "log_max_days"] {
+            if let Some(v) = table.remove(key) {
+                let sub_key = key.strip_prefix("log_").unwrap_or(key);
+                log_items.push((sub_key.to_string(), v));
+            }
+        }
+        if !log_items.is_empty() {
+            let log_table = table.entry("log").or_insert_with(|| Value::Table(Default::default()));
+            if let Value::Table(ref mut t) = log_table {
+                for (k, v) in log_items {
+                    t.entry(k).or_insert(v);
+                }
+            }
+        }
+    }
+}
+
 /// Load a TOML server configuration from a file path.
+/// Supports both Go frp format ([common] section, flat fields) and frp-rs format.
 pub fn load_server_config(path: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)?;
-    let cfg: ServerConfig = toml::from_str(&content)?;
+    let mut value: toml::Value = toml::from_str(&content)?;
+    normalize_server_config(&mut value);
+    let table = match value {
+        toml::Value::Table(t) => t,
+        _ => return Err("expected a table".into()),
+    };
+    let cfg: ServerConfig = toml::from_str(&toml::to_string(&table)?)?;
     Ok(cfg)
 }
 
 /// Load a TOML client configuration from a file path.
+/// Supports both Go frp format ([common] section, flat fields) and frp-rs format.
 pub fn load_client_config(path: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)?;
-    let cfg: ClientConfig = toml::from_str(&content)?;
+    let mut value: toml::Value = toml::from_str(&content)?;
+    normalize_client_config(&mut value);
+    let table = match value {
+        toml::Value::Table(t) => t,
+        _ => return Err("expected a table".into()),
+    };
+    let cfg: ClientConfig = toml::from_str(&toml::to_string(&table)?)?;
     Ok(cfg)
 }
+
 
 /// Collect all non-directory entries from a directory tree (recursive walk).
 /// Returns file paths in sorted order. Used for `--config-dir` mode.
@@ -311,8 +512,10 @@ fn collect_config_files_inner(dir: &Path, files: &mut Vec<std::path::PathBuf>) -
 /// Load server configs from a directory, merging all `.toml` files.
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use toml::Value;
 
     #[test]
     fn test_parse_client_toml() {
@@ -331,5 +534,45 @@ remote_port = 7001
         let cfg: ClientConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.proxies.len(), 1);
         assert_eq!(cfg.proxies[0].proxy_type, "tcp");
+    }
+
+    #[test]
+    fn test_go_format_server_toml() {
+        let toml_str = r#"
+[common]
+bind_addr = "0.0.0.0"
+bind_port = 7000
+auth_method = "token"
+token = "my-token"
+log_file = "./frps.log"
+log_level = "info"
+"#;
+        let cfg: ServerConfig = load_server_config_from_str(toml_str).unwrap();
+        assert_eq!(cfg.bind_port, 7000);
+        assert_eq!(cfg.auth.token, "my-token");
+        assert_eq!(cfg.auth.method, "token");
+    }
+
+    #[test]
+    fn test_go_format_client_toml() {
+        let toml_str = r#"
+[common]
+server_addr = "127.0.0.1"
+server_port = 7000
+token = "my-token"
+protocol = "tcp"
+pool_count = 1
+
+[[proxies]]
+name = "test-tcp"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 80
+remote_port = 7001
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+        assert_eq!(cfg.server_port, 7000);
+        assert_eq!(cfg.transport_protocol, "tcp");
+        assert_eq!(cfg.proxies.len(), 1);
     }
 }
