@@ -1,0 +1,7 @@
+.git/
+target/
+*.tar.gz
+.DS_Store
+docker/
+docs/
+.github/

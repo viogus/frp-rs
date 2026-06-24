@@ -1,0 +1,56 @@
+FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm AS builder
+ARG TARGETARCH
+ARG FRP_COMPONENT=frps
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libc6-dev
+
+# arm64 cross-compilation toolchain
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+      apt-get install -y --no-install-recommends \
+        gcc-aarch64-linux-gnu libc6-dev-arm64-cross && \
+      rustup target add aarch64-unknown-linux-gnu; \
+    fi
+
+WORKDIR /build
+
+# Copy source — selective to avoid target/ and .git/
+COPY Cargo.toml Cargo.lock* ./
+COPY frp-core/ frp-core/
+COPY frp-server/ frp-server/
+COPY frp-client/ frp-client/
+COPY frps/ frps/
+COPY frpc/ frpc/
+
+# Build Rust binary (native or cross-compiled)
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+      CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+      RUSTFLAGS="-C link-arg=-static-libgcc" \
+      cargo build --release --target aarch64-unknown-linux-gnu; \
+    else \
+      RUSTFLAGS="-C link-arg=-static-libgcc" \
+      cargo build --release; \
+    fi
+
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+      cp target/aarch64-unknown-linux-gnu/release/${FRP_COMPONENT} /usr/bin/frp; \
+    else \
+      cp target/release/${FRP_COMPONENT} /usr/bin/frp; \
+    fi && strip /usr/bin/frp || true
+
+# Compile entrypoint
+COPY docker/entrypoint.c /tmp/entrypoint.c
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+      aarch64-linux-gnu-gcc -static -s -O2 -DFRP_MODE=\"${FRP_COMPONENT}\" -o /entrypoint /tmp/entrypoint.c; \
+    else \
+      gcc -static -s -O2 -DFRP_MODE=\"${FRP_COMPONENT}\" -o /entrypoint /tmp/entrypoint.c; \
+    fi
+
+# --- Runtime stage ---
+FROM alpine:3.21
+RUN apk add --no-cache gcompat ca-certificates
+COPY --from=builder /usr/bin/frp /usr/bin/frp
+COPY --from=builder /entrypoint /entrypoint
+ENV FRP_CONF=/app/frp.toml
+ENTRYPOINT ["/entrypoint"]
