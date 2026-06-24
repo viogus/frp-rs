@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::collections::HashMap;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{interval, Duration};
@@ -94,24 +95,28 @@ impl Service {
 
         // Spawn health checks once, outside reconnect loop (they are per-proxy, not per-session)
         for p in &proxies {
-            if !p.health_check_type.is_empty() && p.health_check_type != "tcp" {
-                warn!("Health check type '{}' not yet supported for '{}'", p.health_check_type, p.name);
+            let hc_type = p.health_check_type.clone();
+            if hc_type.is_empty() {
+                continue;
             }
-            if p.health_check_type == "tcp" {
-                let la = format!("{}:{}", p.local_ip, p.local_port);
-                let pn = p.name.clone();
-                let interval = std::time::Duration::from_secs(
-                    p.health_check_interval_seconds.max(10)
-                );
-                let timeout = std::time::Duration::from_secs(
-                    p.health_check_timeout_seconds.max(3)
-                );
-                let max_failed = p.health_check_max_failed.max(1);
-                let tx = health_tx.clone();
-                tokio::spawn(async move {
-                    run_health_check(pn, la, interval, timeout, max_failed, tx).await;
-                });
+            if hc_type != "tcp" && hc_type != "http" {
+                warn!("Health check type '{}' not yet supported for '{}'", hc_type, p.name);
+                continue;
             }
+            let la = format!("{}:{}", p.local_ip, p.local_port);
+            let pn = p.name.clone();
+            let interval = std::time::Duration::from_secs(
+                p.health_check_interval_seconds.max(10)
+            );
+            let timeout = std::time::Duration::from_secs(
+                p.health_check_timeout_seconds.max(3)
+            );
+            let max_failed = p.health_check_max_failed.max(1);
+            let tx = health_tx.clone();
+            let hc_url = if hc_type == "http" { p.health_check_url.clone() } else { String::new() };
+            tokio::spawn(async move {
+                run_health_check(pn, la, hc_type, hc_url, interval, timeout, max_failed, tx).await;
+            });
         }
 
         // Main session loop with reconnection
@@ -570,50 +575,107 @@ fn spawn_work_conn(
     });
 }
 
-/// Run a health check for a TCP proxy.
-/// Periodically connects to the local service and reports status.
+/// Run a health check for a proxy.
+/// Supports "tcp" (connect only) and "http" (GET + check 2xx status).
 /// When the local service exceeds max_failed consecutive failures, sends
 /// the proxy name on `health_tx` so the control loop can send CloseProxy
 /// to the server.
 async fn run_health_check(
     proxy_name: String,
     local_addr: String,
+    check_type: String,
+    check_url: String,
     interval: std::time::Duration,
     timeout: std::time::Duration,
     max_failed: u32,
     health_tx: mpsc::UnboundedSender<String>,
 ) {
-    info!("Health check started for '{}' -> {} (interval: {:?}, timeout: {:?})",
-        proxy_name, local_addr, interval, timeout);
-    
+    info!("Health check ({}) started for '{}' -> {} (interval: {:?}, timeout: {:?})",
+        check_type, proxy_name, local_addr, interval, timeout);
+
     let mut failures: u32 = 0;
-    
+
     loop {
         tokio::time::sleep(interval).await;
-        
-        let result = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&local_addr)).await;
-        
+
+        let result = if check_type == "http" {
+            run_http_check(&local_addr, &check_url, timeout).await
+        } else {
+            run_tcp_check(&local_addr, timeout).await
+        };
+
         match result {
-            Ok(Ok(_)) => {
+            Ok(()) => {
                 failures = 0;
                 debug!("Health check OK for '{}'", proxy_name);
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 failures += 1;
                 warn!("Health check FAIL for '{}' ({}): {}", proxy_name, failures, e);
             }
-            Err(_) => {
-                failures += 1;
-                warn!("Health check TIMEOUT for '{}' ({})", proxy_name, failures);
-            }
         }
-        
+
         if failures >= max_failed {
             warn!("Health check: proxy '{}' exceeded max failures ({}), sending CloseProxy",
                 proxy_name, max_failed);
             let _ = health_tx.send(proxy_name.clone());
             failures = 0; // Reset to avoid repeated warnings
         }
+    }
+}
+
+/// TCP health check: connect to addr, then close. Success = connection established.
+async fn run_tcp_check(addr: &str, timeout: std::time::Duration) -> Result<(), String> {
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(format!("TCP connect: {e}")),
+        Err(_) => Err("timeout".into()),
+    }
+}
+
+/// HTTP health check: connect, send GET, verify 2xx status code.
+/// Uses raw TCP to avoid adding an HTTP client dependency.
+async fn run_http_check(addr: &str, url: &str, timeout: std::time::Duration) -> Result<(), String> {
+    let mut stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
+        .await
+        .map_err(|_| "connect timeout".to_string())?
+        .map_err(|e| format!("TCP connect: {e}"))?;
+
+    // Extract host from addr (strip port for Host header)
+    let host = addr.split(':').next().unwrap_or(addr);
+    let req = format!(
+        "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        url, host
+    );
+
+    tokio::time::timeout(timeout, stream.write_all(req.as_bytes()))
+        .await
+        .map_err(|_| "write timeout".to_string())?
+        .map_err(|e| format!("write: {e}"))?;
+
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(timeout, stream.read(&mut buf))
+        .await
+        .map_err(|_| "read timeout".to_string())?
+        .map_err(|e| format!("read: {e}"))?;
+
+    if n == 0 {
+        return Err("empty response".into());
+    }
+
+    // Parse status line: "HTTP/1.x NNN ..."
+    let response = std::str::from_utf8(&buf[..n]).map_err(|e| format!("utf8: {e}"))?;
+    let status_line = response.lines().next().ok_or("no status line")?;
+    let parts: Vec<&str> = status_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return Err(format!("bad status line: {status_line}"));
+    }
+    let code: u16 = parts[1].parse().map_err(|_| format!("bad status code: {}", parts[1]))?;
+
+    if (200..300).contains(&code) {
+        Ok(())
+    } else {
+        Err(format!("HTTP {code}"))
     }
 }
 

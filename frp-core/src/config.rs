@@ -205,6 +205,7 @@ impl Default for LogConfig {
 }
 
 fn default_log_level() -> String { "info".into() }
+fn default_health_check_url() -> String { "/".into() }
 fn default_max_days() -> i32 { 3 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -417,6 +418,8 @@ pub struct ProxyConfig {
     pub group_key: String,
     #[serde(default)]
     pub health_check_type: String,
+    #[serde(default = "default_health_check_url")]
+    pub health_check_url: String,
     #[serde(default)]
     pub health_check_interval_seconds: u64,
     #[serde(default)]

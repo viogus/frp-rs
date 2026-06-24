@@ -69,6 +69,7 @@ async fn test_stcp_e2e_relay() {
             group: String::new(),
             group_key: String::new(),
             health_check_type: String::new(),
+            health_check_url: String::new(),
             health_check_interval_seconds: 0,
             health_check_timeout_seconds: 0,
             health_check_max_failed: 0,
