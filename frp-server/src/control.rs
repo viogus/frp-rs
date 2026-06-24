@@ -227,11 +227,16 @@ pub async fn handle_control<S>(
                             pending_requests.push_back(PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() });
                         }
                     }
-                    Some(InternalMsg::UdpData { proxy_name: _pn, content, remote_addr }) => {
+                    Some(InternalMsg::UdpData { proxy_name: ref _pn, content, remote_addr }) => {
                         debug!("UDP data for proxy '{}' from {}", _pn, remote_addr);
+                        // Include proxy's local_str so the client can route to the correct local UDP socket
+                        let local_str = udp_local_to_proxy.iter()
+                            .find(|(_, pn)| *pn == _pn)
+                            .map(|(ls, _)| ls.clone())
+                            .unwrap_or_default();
                         let udp_packet = FrpMessage::UDPPacket(msg::UDPPacket {
                             content,
-                            local_addr: String::new(),
+                            local_addr: local_str,
                             remote_addr,
                         });
                         if let Err(e) = write_msg_v1(&mut writer, &udp_packet).await {
