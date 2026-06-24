@@ -3,6 +3,10 @@ name = "frp-client"
 version = "0.1.4"
 edition = "2021"
 
+[dev-dependencies]
+frp-server = { path = "../frp-server" }
+tracing-subscriber.workspace = true
+
 [dependencies]
 frp-core = { path = "../frp-core" }
 tokio.workspace = true
