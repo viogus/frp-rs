@@ -19,10 +19,12 @@ static int is_help_or_version(const char *arg) {
          !strcmp(arg, "--version") || !strcmp(arg, "-v");
 }
 
-static int has_config_arg(int argc, char **argv) {
+static int has_config_or_dir_arg(int argc, char **argv) {
   for (int i = 0; i < argc; i++) {
     if (!strcmp(argv[i], "-c") || !strcmp(argv[i], "--config")) return 1;
     if (!strncmp(argv[i], "--config=", 9)) return 1;
+    if (!strcmp(argv[i], "--config-dir")) return 1;
+    if (!strncmp(argv[i], "--config-dir=", 13)) return 1;
   }
   return 0;
 }
@@ -177,7 +179,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[frp-rs] config generated\n");
   }
 
-  int inject_c = !has_config_arg(argc - 1, argv + 1);
+  int inject_c = !has_config_or_dir_arg(argc - 1, argv + 1);
 
   char **new_argv = calloc(argc + 3, sizeof(char *));
   if (!new_argv) { perror("calloc"); return 1; }

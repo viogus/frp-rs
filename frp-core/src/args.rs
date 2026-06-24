@@ -78,10 +78,10 @@ pub fn parse_args(default_config: &str, bin_name: &str) -> CliArgs {
         }
     }
 
-    // --config-dir conflicts with an explicit -c/--config value
+    // --config-dir takes priority over -c/--config.
+    // Warn but don't error — Docker entrypoint may inject -c by default.
     if config_dir.is_some() && config_explicit {
-        eprintln!("error: --config-dir and --config are mutually exclusive");
-        std::process::exit(1);
+        eprintln!("warning: --config-dir overrides --config; using config directory mode");
     }
 
     CliArgs { config, config_dir, log_level, log_file, show_version }
