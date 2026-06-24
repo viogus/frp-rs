@@ -33,6 +33,11 @@ pub struct ServerConfig {
     pub tls_key_file: String,
     #[serde(default)]
     pub tls_ca_file: String,
+    /// When true, the main bind_port only accepts TLS connections.
+    /// Plain TCP and WebSocket upgrades are rejected.
+    /// The client must have tls_enable = true to connect.
+    #[serde(default)]
+    pub tls_only: bool,
     #[serde(default)]
     pub auth: AuthServerConfig,
     #[serde(default)]
@@ -138,6 +143,7 @@ impl Default for ServerConfig {
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             tls_ca_file: String::new(),
+            tls_only: false,
             auth: AuthServerConfig::default(),
             log: LogConfig::default(),
             web_server: WebServerConfig::default(),

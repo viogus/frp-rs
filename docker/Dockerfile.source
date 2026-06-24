@@ -10,11 +10,15 @@ FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm AS builder
 ARG TARGETARCH
 ARG FRP_COMPONENT=frps
 
-# Map Docker TARGETARCH to Rust target triple
+# Map Docker TARGETARCH to Rust target triple (for cargo-zigbuild)
+# and Zig target triple (for zig cc).
 RUN case "${TARGETARCH}" in \
-      amd64) echo "x86_64-unknown-linux-gnu"  > /tmp/rust_target ;; \
-      arm64) echo "aarch64-unknown-linux-gnu" > /tmp/rust_target ;; \
-      arm)   echo "armv7-unknown-linux-gnueabihf" > /tmp/rust_target ;; \
+      amd64) echo "x86_64-unknown-linux-gnu"  > /tmp/rust_target ; \
+             echo "x86_64-linux-gnu"          > /tmp/zig_target  ;; \
+      arm64) echo "aarch64-unknown-linux-gnu" > /tmp/rust_target ; \
+             echo "aarch64-linux-gnu"         > /tmp/zig_target  ;; \
+      arm)   echo "armv7-unknown-linux-gnueabihf" > /tmp/rust_target ; \
+             echo "arm-linux-gnueabihf"            > /tmp/zig_target  ;; \
       *)     echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac
 
@@ -55,9 +59,9 @@ RUN cargo zigbuild --target $(cat /tmp/rust_target) --release && \
     cp target/$(cat /tmp/rust_target)/release/${FRP_COMPONENT} /usr/bin/frp && \
     strip /usr/bin/frp || true
 
-# Cross-compile the C entrypoint with zig cc
+# Cross-compile the C entrypoint with zig cc (uses zig target, not Rust target)
 COPY docker/entrypoint.c /tmp/entrypoint.c
-RUN zig cc -target $(cat /tmp/rust_target) -static -O2 \
+RUN zig cc -target $(cat /tmp/zig_target) -static -O2 \
     -DFRP_MODE=\"${FRP_COMPONENT}\" -o /entrypoint /tmp/entrypoint.c
 
 # ── Runtime stage ──────────────────────────────────────────

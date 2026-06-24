@@ -31,7 +31,7 @@ suitable as a drop-in replacement for either the client or server side.
 | Auto port allocation | —      | ✅     |
 | Encryption (AES-128-CFB) | ✅  | ✅     |
 | WebSocket transport  | 🚧     | ✅     |
-| TLS transport        | 🚧     | 🚧     |
+| TLS transport        | ✅     | ✅     |
 | STCP / sk routing    | ✅     | ✅     |
 | HTTP VHost routing   | —      | ✅     |
 | HTTPS VHost routing  | —      | ✅     |

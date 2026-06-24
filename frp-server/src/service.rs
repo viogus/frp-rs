@@ -67,10 +67,11 @@ pub struct AppState {
     pub sub_domain_host: String,
     pub tcp_mux: bool,
     pub tcp_mux_keepalive: i64,
+    pub tls_only: bool,
 }
 
 impl AppState {
-    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64) -> Self {
+    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, tls_only: bool) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             auth_cfg: Arc::new(auth_cfg),
@@ -86,6 +87,7 @@ impl AppState {
             sub_domain_host,
             tcp_mux,
             tcp_mux_keepalive,
+            tls_only,
         }
     }
 }
@@ -131,6 +133,7 @@ impl Service {
             sub_host,
             cfg.transport.tcp_mux,
             cfg.transport.tcp_mux_keepalive_interval,
+            cfg.tls_only,
         )),
             cfg,
         }
@@ -308,6 +311,10 @@ impl Service {
                             }
 
                             ConnectionType::WebSocket => {
+                                if state.tls_only {
+                                    warn!("TLS-only mode: rejected WebSocket from {}", addr);
+                                    return;
+                                }
                                 // Byte is still in buffer (MSG_PEEK), WS upgrade directly.
                                 // accept_websocket returns IoStream::WebSocket(WsByteStream)
                                 // — ready for read_msg_v1/write_msg_v1 directly.
@@ -339,6 +346,10 @@ impl Service {
                             }
 
                             ConnectionType::V1(_byte) => {
+                                if state.tls_only {
+                                    warn!("TLS-only mode: rejected plain TCP from {}", addr);
+                                    return;
+                                }
                                 // Byte is still in buffer, read_msg_v1 will consume it
                                 match read_msg_v1(&mut stream).await {
                                     Ok(FrpMessage::Login(login)) => {
