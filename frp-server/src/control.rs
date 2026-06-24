@@ -503,14 +503,20 @@ async fn handle_new_proxy(
                 let locations: Vec<String> = np.locations.clone().unwrap_or_default();
 
                 if !domains.is_empty() || !locations.is_empty() {
+                    let hhr = np.host_header_rewrite.as_deref().unwrap_or("");
+                    let http_user = np.http_user.as_deref().unwrap_or("");
+                    let http_pwd = np.http_pwd.as_deref().unwrap_or("");
                     state.vhost_manager.register(
                         &np.proxy_name,
                         &domains,
                         &locations,
                         run_id,
+                        hhr,
+                        http_user,
+                        http_pwd,
                     ).await;
-                    info!("VHost routes registered for '{}': domains={:?}, locations={:?}",
-                        np.proxy_name, domains, locations);
+                    info!("VHost routes registered for '{}': domains={:?}, locations={:?}, rewrite={:?}",
+                        np.proxy_name, domains, locations, hhr);
                 }
             }
 

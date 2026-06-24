@@ -14,6 +14,11 @@ pub struct VhostRoute {
     pub run_id: String,
     /// Location prefixes for this proxy (empty = host-only routing).
     pub locations: Vec<String>,
+    /// Rewrite Host header to this value before forwarding (Go frp compat).
+    pub host_header_rewrite: String,
+    /// HTTP Basic Auth credentials (empty = no auth).
+    pub http_user: String,
+    pub http_pwd: String,
 }
 
 /// Manages HTTP VHost routing table (domain + location → proxy).
@@ -44,11 +49,17 @@ impl VhostManager {
         domains: &[String],
         locations: &[String],
         run_id: &str,
+        host_header_rewrite: &str,
+        http_user: &str,
+        http_pwd: &str,
     ) {
         let route = VhostRoute {
             proxy_name: proxy_name.to_string(),
             run_id: run_id.to_string(),
             locations: locations.to_vec(),
+            host_header_rewrite: host_header_rewrite.to_string(),
+            http_user: http_user.to_string(),
+            http_pwd: http_pwd.to_string(),
         };
 
         let mut routes = self.routes.write().await;
@@ -179,6 +190,26 @@ pub async fn run_vhost_http_listener(
             debug!("HTTP VHost request for '{}' path '{}' from {}", host, path, peer);
 
             if let Some(route) = state.vhost_manager.lookup_combined(&host, path).await {
+                // HTTP Basic Auth check (Go frp compat)
+                if !route.http_user.is_empty() {
+                    let auth_ok = extract_basic_auth(&request_text)
+                        .map(|(u, p)| u == route.http_user && p == route.http_pwd)
+                        .unwrap_or(false);
+                    if !auth_ok {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"frp\"\r\n\r\n"
+                        ).await;
+                        return;
+                    }
+                }
+
+                // Apply host_header_rewrite if configured
+                let pre_read = if !route.host_header_rewrite.is_empty() {
+                    rewrite_host_header(&pre_read, &route.host_header_rewrite)
+                } else {
+                    pre_read
+                };
+
                 let internal_tx = {
                     let map = state.run_id_to_ctl_tx.read().await;
                     map.get(&route.run_id).cloned()
@@ -249,6 +280,27 @@ pub async fn run_vhost_https_listener(
             debug!("HTTPS VHost request for '{}' path '{}' from {}", host, path, peer);
 
             if let Some(route) = state.vhost_manager.lookup_combined(&host, path).await {
+                // HTTP Basic Auth check (Go frp compat)
+                if !route.http_user.is_empty() {
+                    let auth_ok = extract_basic_auth(&request_text)
+                        .map(|(u, p)| u == route.http_user && p == route.http_pwd)
+                        .unwrap_or(false);
+                    if !auth_ok {
+                        let _ = tokio::io::AsyncWriteExt::write_all(
+                            &mut tls_stream,
+                            b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"frp\"\r\n\r\n"
+                        ).await;
+                        return;
+                    }
+                }
+
+                // Apply host_header_rewrite if configured
+                let pre_read = if !route.host_header_rewrite.is_empty() {
+                    rewrite_host_header(&pre_read, &route.host_header_rewrite)
+                } else {
+                    pre_read
+                };
+
                 let internal_tx = {
                     let map = state.run_id_to_ctl_tx.read().await;
                     map.get(&route.run_id).cloned()
@@ -280,6 +332,50 @@ fn extract_path(request: &str) -> Option<&str> {
     let mut parts = first_line.split_whitespace();
     parts.next()?; // method
     parts.next() // path
+}
+
+/// Rewrite the Host header in an HTTP request's raw bytes.
+/// Finds the first `Host:` or `host:` line and replaces it with the given value.
+/// Returns a new Vec<u8> with the rewritten header.
+fn rewrite_host_header(data: &[u8], new_host: &str) -> Vec<u8> {
+    let text = String::from_utf8_lossy(data);
+    let mut result = String::with_capacity(data.len() + new_host.len());
+
+    for line in text.lines() {
+        if line.len() >= 5 && line[..5].eq_ignore_ascii_case("host:") {
+            result.push_str(&format!("Host: {}\r\n", new_host));
+        } else {
+            result.push_str(line);
+            result.push_str("\r\n");
+        }
+    }
+
+    // Preserve trailing double-CRLF (end of headers) that lines() strips
+    if text.ends_with("\r\n\r\n") {
+        if !result.ends_with("\r\n\r\n") {
+            if result.ends_with("\r\n") {
+                result.push_str("\r\n");
+            } else {
+                result.push_str("\r\n\r\n");
+            }
+        }
+    }
+
+    result.into_bytes()
+}
+
+/// Extract HTTP Basic Auth credentials from the Authorization header.
+/// Returns Some((username, password)) or None if no/invalid auth header.
+fn extract_basic_auth(request: &str) -> Option<(String, String)> {
+    let auth_line = request.lines().find(|line| {
+        line.len() >= 14 && line[..14].eq_ignore_ascii_case("authorization:")
+    })?;
+    let value = auth_line[14..].trim();
+    let encoded = value.strip_prefix("Basic ")?.trim();
+    let decoded = data_encoding::BASE64.decode(encoded.as_bytes()).ok()?;
+    let creds = String::from_utf8(decoded).ok()?;
+    let (user, pwd) = creds.split_once(':')?;
+    Some((user.to_string(), pwd.to_string()))
 }
 
 /// Extract the Host header value from an HTTP request (hostname only, no port).
