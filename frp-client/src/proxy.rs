@@ -4,6 +4,22 @@ use tracing::{info, warn, debug};
 use frp_core::msg::{self, FrpMessage};
 use frp_core::bridge;
 
+/// Build a NewVisitorConn message for an STCP/XTCP visitor connection.
+pub fn create_visitor_conn_msg(server_name: &str, secret_key: &str, use_encryption: bool, use_compression: bool) -> FrpMessage {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    FrpMessage::NewVisitorConn(msg::NewVisitorConn {
+        proxy_name: server_name.to_string(),
+        sign_key: if secret_key.is_empty() { None } else { Some(secret_key.to_string()) },
+        timestamp: Some(timestamp),
+        run_id: None,
+        use_encryption: Some(use_encryption),
+        use_compression: Some(use_compression),
+    })
+}
+
 /// Creates the NewProxy message for registering a proxy with the server.
 /// All relevant fields from ProxyConfig are wired through (Go frp v0.69.1 compat).
 pub fn create_new_proxy_msg(

@@ -32,7 +32,7 @@ suitable as a drop-in replacement for either the client or server side.
 | Encryption (AES-128-CFB) | ✅  | ✅     |
 | WebSocket transport  | 🚧     | ✅     |
 | TLS transport        | 🚧     | 🚧     |
-| STCP / sk routing    | ❌     | 🚧     |
+| STCP / sk routing    | ✅     | ✅     |
 | HTTP VHost routing   | —      | ✅     |
 | HTTPS VHost routing  | —      | ✅     |
 | TCP health checks    | ✅     | —      |
@@ -41,7 +41,7 @@ suitable as a drop-in replacement for either the client or server side.
 | Compression (Snappy) | ✅     | ✅     |
 | OIDC authentication  | ❌     | ❌     |
 | Dashboard (web UI)   | —      | ❌     |
-| NAT hole punching    | ❌     | ❌     |
+| NAT hole punching (XTCP) | ❌ | ❌     |
 
 ---
 

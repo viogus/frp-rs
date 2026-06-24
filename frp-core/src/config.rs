@@ -249,6 +249,8 @@ pub struct ClientConfig {
     pub tcp_mux: bool,
     #[serde(default)]
     pub proxies: Vec<ProxyConfig>,
+    #[serde(default)]
+    pub visitors: Vec<VisitorConfig>,
 }
 
 impl Default for ClientConfig {
@@ -271,6 +273,7 @@ impl Default for ClientConfig {
             dns_server: String::new(),
             tcp_mux: true,
             proxies: vec![],
+            visitors: vec![],
         }
     }
 }
@@ -341,6 +344,42 @@ pub struct ProxyConfig {
     pub health_check_timeout_seconds: u64,
     #[serde(default)]
     pub health_check_max_failed: u32,
+}
+
+/// STCP/XTCP visitor configuration — used by frpc to expose a local port
+/// that tunnels traffic to a remote STCP/XTCP proxy through the frps server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisitorConfig {
+    /// Name for this visitor (used in logs).
+    #[serde(default)]
+    pub name: String,
+    /// Proxy type: "stcp" or "xtcp".
+    #[serde(rename = "type", default)]
+    pub visitor_type: String,
+    /// The STCP/XTCP proxy name to connect to (maps to proxy_name in NewVisitorConn).
+    #[serde(default, alias = "serverName")]
+    pub server_name: String,
+    /// Shared secret key — must match the STCP proxy's `sk`.
+    #[serde(default, alias = "secretKey")]
+    pub secret_key: String,
+    /// Optional server user for auth matching.
+    #[serde(default, alias = "serverUser")]
+    pub server_user: String,
+    /// Local address to bind for accepting connections.
+    #[serde(default = "default_bind_addr")]
+    pub bind_addr: String,
+    /// Local port for the visitor listener (0 = disabled).
+    #[serde(default, alias = "bindPort")]
+    pub bind_port: u16,
+    /// Fallback visitor name if this one fails.
+    #[serde(default, alias = "fallbackTo")]
+    pub fallback_to: String,
+    /// Encrypt the tunnel traffic.
+    #[serde(default)]
+    pub use_encryption: bool,
+    /// Compress the tunnel traffic.
+    #[serde(default)]
+    pub use_compression: bool,
 }
 
 

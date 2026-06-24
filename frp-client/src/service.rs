@@ -167,6 +167,25 @@ impl Service {
                 );
             }
 
+            // Spawn STCP/XTCP visitor listeners
+            for v in &self.cfg.visitors {
+                if v.bind_port == 0 {
+                    continue;
+                }
+                let sa = self.cfg.server_addr.clone();
+                let sp = self.cfg.server_port;
+                let pt = protocol.clone();
+                let server_name = v.server_name.clone();
+                let secret_key = v.secret_key.clone();
+                let bind_addr = format!("{}:{}", v.bind_addr, v.bind_port);
+                let use_enc = v.use_encryption;
+                let use_comp = v.use_compression;
+                let name = v.name.clone();
+                tokio::spawn(async move {
+                    run_visitor_listener(sa, sp, pt, server_name, secret_key, bind_addr, use_enc, use_comp, name).await;
+                });
+            }
+
             // Spawn UDP proxy listeners for UDP proxy types
             for p in &proxies {
                 if p.proxy_type == "udp" {
@@ -590,6 +609,90 @@ async fn run_udp_work_conn(
                         break;
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Run an STCP/XTCP visitor listener.
+/// Binds a local port, accepts connections, and tunnels them
+/// through the frps server to the remote STCP proxy.
+async fn run_visitor_listener(
+    server_addr: String,
+    server_port: u16,
+    protocol: TransportProtocol,
+    server_name: String,
+    secret_key: String,
+    bind_addr: String,
+    use_encryption: bool,
+    use_compression: bool,
+    name: String,
+) {
+    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("Visitor '{}': bind {} failed: {}", name, bind_addr, e);
+            return;
+        }
+    };
+    info!("Visitor '{}' listening on {}", name, bind_addr);
+
+    loop {
+        match listener.accept().await {
+            Ok((user_conn, peer)) => {
+                debug!("Visitor '{}': user connection from {}", name, peer);
+
+                let sa = server_addr.clone();
+                let sp = server_port;
+                let pt = protocol.clone();
+                let sn = server_name.clone();
+                let sk = secret_key.clone();
+                let visitor_name = name.clone();
+
+                tokio::spawn(async move {
+                    // Connect to the server
+                    let opts = DialOptions {
+                        server_addr: sa.clone(),
+                        server_port: sp,
+                        protocol: pt.clone(),
+                        ..Default::default()
+                    };
+                    let mut server_conn = match dial_server(&opts).await {
+                        Ok(IoStream::Tcp(s)) => s,
+                        Ok(other) => {
+                            warn!("Visitor '{}': unexpected transport {:?}", visitor_name, other);
+                            return;
+                        }
+                        Err(e) => {
+                            warn!("Visitor '{}': dial server failed: {}", visitor_name, e);
+                            return;
+                        }
+                    };
+
+                    // Send NewVisitorConn
+                    let nvc = crate::proxy::create_visitor_conn_msg(&sn, &sk, use_encryption, use_compression);
+                    if let Err(e) = write_msg_v1(&mut server_conn, &nvc).await {
+                        warn!("Visitor '{}': send NewVisitorConn failed: {}", visitor_name, e);
+                        return;
+                    }
+                    debug!("Visitor '{}': sent NewVisitorConn for '{}'", visitor_name, sn);
+
+                    // Bridge user connection ↔ server connection
+                    // The server will relay to the STCP provider.
+                    let mut user = user_conn;
+                    match tokio::io::copy_bidirectional(&mut user, &mut server_conn).await {
+                        Ok((to_server, to_user)) => {
+                            debug!("Visitor '{}' closed: {}B to server, {}B to user", visitor_name, to_server, to_user);
+                        }
+                        Err(e) => {
+                            debug!("Visitor '{}' bridge error: {}", visitor_name, e);
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                warn!("Visitor '{}': accept error: {}", name, e);
+                break;
             }
         }
     }

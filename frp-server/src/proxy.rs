@@ -82,6 +82,10 @@ impl ProxyManager {
             .unwrap_or_default()
     }
 
+    pub async fn get_run_id(&self, name: &str) -> Option<String> {
+        self.proxies.read().await.get(name).map(|p| p.run_id.clone())
+    }
+
     pub async fn list(&self) -> Vec<ProxyInfo> {
         self.proxies.read().await.values().cloned().collect()
     }

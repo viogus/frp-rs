@@ -341,6 +341,10 @@ impl Service {
                                         let io = IoStream::Tcp(stream);
                                         handle_work_conn_inner(io, nwc, state).await;
                                     }
+                                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                        let io = IoStream::Tcp(stream);
+                                        handle_visitor_conn_inner(io, nvc, state).await;
+                                    }
                                     Ok(other) => {
                                         warn!("Unexpected first message from {}: {:?}", addr, other.v1_type_byte());
                                     }
@@ -356,6 +360,63 @@ impl Service {
                     error!("Failed to accept connection: {}", e);
                 }
             }
+        }
+    }
+}
+
+/// Handle an incoming STCP visitor connection. Looks up the proxy via
+/// the secret key (sk → proxy_name → run_id) and routes the IoStream
+/// to the provider's control handler via InternalMsg::VisitorConn.
+async fn handle_visitor_conn_inner(
+    stream: IoStream,
+    msg: msg::NewVisitorConn,
+    state: Arc<AppState>,
+) {
+    let sk = msg.sign_key.unwrap_or_default();
+    if sk.is_empty() {
+        warn!("NewVisitorConn without sign_key, ignoring");
+        return;
+    }
+
+    // Look up proxy name from sk_index
+    let proxy_name = {
+        state.sk_index.read().await.get(&sk).cloned()
+    };
+    let proxy_name = match proxy_name {
+        Some(pn) => pn,
+        None => {
+            warn!("NewVisitorConn: no STCP proxy found for sk");
+            return;
+        }
+    };
+
+    // Look up the provider's run_id from proxy_manager
+    let run_id = state.proxy_manager.get_run_id(&proxy_name).await;
+    let run_id = match run_id {
+        Some(id) => id,
+        None => {
+            warn!("NewVisitorConn: no run_id found for proxy '{}'", proxy_name);
+            return;
+        }
+    };
+
+    let ctl_tx = {
+        let map = state.run_id_to_ctl_tx.read().await;
+        map.get(&run_id).cloned()
+    };
+
+    match ctl_tx {
+        Some(ctl) => {
+            info!("STCP visitor for proxy '{}' routed to provider {}", proxy_name, run_id);
+            if ctl.tx.send(InternalMsg::VisitorConn {
+                proxy_name,
+                visitor_conn: stream,
+            }).is_err() {
+                warn!("Provider for run_id {} has gone away", run_id);
+            }
+        }
+        None => {
+            warn!("No provider found for run_id {}", run_id);
         }
     }
 }
