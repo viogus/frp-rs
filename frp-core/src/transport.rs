@@ -281,9 +281,10 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 opts.server_addr.clone()
             };
             let url = format!(
-                "{}://{}{}",
+                "{}://{}:{}{}",
                 if is_wss { "wss" } else { "ws" },
                 host,
+                opts.server_port,
                 FRP_WEBSOCKET_PATH
             );
             let (ws_stream, _) = tokio_tungstenite::connect_async(url)

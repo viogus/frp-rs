@@ -549,7 +549,7 @@ fn collect_config_files_inner(dir: &Path, files: &mut Vec<std::path::PathBuf>) -
         let path = entry.path();
         if path.is_dir() {
             collect_config_files_inner(&path, files)?;
-        } else {
+        } else if path.extension().map_or(false, |ext| ext == "toml" || ext == "ini") {
             files.push(path);
         }
     }

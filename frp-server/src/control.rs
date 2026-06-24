@@ -11,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
+use frp_core::format_socket_addr;
 
 use crate::proxy::{ProxyInfo, allocate_port};
 use crate::service::{AppState, InternalMsg, ControlTx};
@@ -97,7 +98,7 @@ pub async fn handle_control<S>(
                     Some(InternalMsg::NewWorkConn(stream)) => {
                         debug!("Got work conn for run_id {}", run_id);
                         if let Some(req) = pending_requests.pop_front() {
-                            assign_work_to_proxy(stream, req).await;
+                            assign_work_to_proxy(stream, req, state.encryption_key).await;
                         } else {
                             work_pool.push_back(stream);
                             debug!("Work conn pooled for {} (pool size: {})", run_id, work_pool.len());
@@ -110,7 +111,7 @@ pub async fn handle_control<S>(
                             _ => { warn!("STCP visitor requires TCP stream"); return; }
                         };
                         if let Some(work_conn) = work_pool.pop_front() {
-                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: tcp, pre_read: Vec::new(), use_encryption: false }).await;
+                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: tcp, pre_read: Vec::new(), use_encryption: false }, state.encryption_key).await;
                         } else {
                             debug!("No pooled work conn for STCP, sending ReqWorkConn");
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
@@ -131,7 +132,7 @@ pub async fn handle_control<S>(
                         };
                         debug!("User conn for proxy {} on run_id {}", proxy_name, run_id);
                         if let Some(work_conn) = work_pool.pop_front() {
-                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: tcp, pre_read, use_encryption: false }).await;
+                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: tcp, pre_read, use_encryption: false }, state.encryption_key).await;
                         } else {
                             debug!("No pooled work conn, sending ReqWorkConn for {}", proxy_name);
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
@@ -231,6 +232,7 @@ pub async fn handle_control<S>(
 async fn assign_work_to_proxy(
     mut work_conn: IoStream,
     req: PendingRequest,
+    encryption_key: [u8; 32],
 ) {
     let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
         proxy_name: req.proxy_name.clone(),
@@ -274,8 +276,7 @@ async fn assign_work_to_proxy(
         }
 
         if enc_key {
-            // Derive encryption key (would use state.auth_cfg.token in production)
-            let key = frp_core::encryption::derive_key("frp-rs");
+            let key = encryption_key;
             match work_conn {
                 IoStream::Tcp(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
@@ -430,7 +431,7 @@ async fn listen_and_proxy(
     proxy_name: String,
     internal_tx: mpsc::UnboundedSender<InternalMsg>,
 ) {
-    let addr = format!("{}:{}", bind_addr, port);
+    let addr = format_socket_addr(&bind_addr, port);
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => {
             info!("Proxy listener started on {} for '{}'", addr, proxy_name);
@@ -471,7 +472,7 @@ async fn run_udp_listener(
     proxy_name: String,
     internal_tx: mpsc::UnboundedSender<InternalMsg>,
 ) {
-    let addr = format!("{}:{}", bind_addr, port);
+    let addr = format_socket_addr(&bind_addr, port);
     let socket = match UdpSocket::bind(&addr).await {
         Ok(s) => s,
         Err(e) => {

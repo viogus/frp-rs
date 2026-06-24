@@ -452,9 +452,9 @@ async fn run_udp_work_conn(
 
     // Main bridge loop: read from work conn (UDPPacket → local UDP)
     // and read from local UDP (local data → UDPPacket on work conn)
-    use tokio::select;
+    let mut udp_buf = vec![0u8; 65535];
     loop {
-        select! {
+        tokio::select! {
             // Read from work connection (server → local)
             msg = read_msg_v1(&mut work) => {
                 match msg {
@@ -477,8 +477,24 @@ async fn run_udp_work_conn(
             }
 
             // Read from local UDP (local → server)
-            _result = Box::pin(async { local_socket.recv_from(&mut [0u8; 65535]).await }) => {
-                // Use a separate recv approach
+            result = local_socket.recv_from(&mut udp_buf) => {
+                match result {
+                    Ok((n, src)) => {
+                        let udp_packet = FrpMessage::UDPPacket(msg::UDPPacket {
+                            content: udp_buf[..n].to_vec(),
+                            local_addr: local_addr.clone(),
+                            remote_addr: src.to_string(),
+                        });
+                        if let Err(e) = write_msg_v1(&mut work, &udp_packet).await {
+                            debug!("UDP '{}' send to server failed: {}", proxy_name, e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        debug!("UDP '{}' recv from local failed: {}", proxy_name, e);
+                        break;
+                    }
+                }
             }
         }
     }

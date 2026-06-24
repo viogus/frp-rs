@@ -14,6 +14,7 @@ use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::read_msg_v1;
 use frp_core::transport::IoStream;
 use frp_core::transport::build_tls_acceptor;
+use frp_core::format_socket_addr;
 
 use crate::proxy::ProxyManager;
 use crate::control;
@@ -114,7 +115,7 @@ impl Service {
     }
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let bind_addr = format!("{}:{}", self.cfg.bind_addr, self.cfg.bind_port);
+        let bind_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.bind_port);
         info!("frps starting on {}", bind_addr);
 
         let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = if self.cfg.tls_enable {
@@ -137,7 +138,7 @@ impl Service {
 
         // Optional WebSocket listener
         if self.cfg.websocket_port > 0 {
-            let ws_addr = format!("{}:{}", self.cfg.bind_addr, self.cfg.websocket_port);
+            let ws_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.websocket_port);
             let ws_addr2 = ws_addr.clone();
             tokio::spawn(async move {
                 if let Ok(listener) = TcpListener::bind(&ws_addr2).await {
@@ -160,7 +161,7 @@ impl Service {
 
         // Start HTTPS VHost listener if configured
         if self.cfg.vhost_https_port > 0 && self.cfg.tls_enable {
-            let https_addr = format!("{}:{}", self.cfg.bind_addr, self.cfg.vhost_https_port);
+            let https_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.vhost_https_port);
             let https_addr2 = https_addr.clone();
             let https_state = self.state.clone();
             let cert = self.cfg.tls_cert_file.clone();
@@ -175,7 +176,7 @@ impl Service {
 
         // Start dashboard server if configured
         if self.cfg.web_server.port > 0 {
-            let dash_addr = format!("{}:{}", self.cfg.web_server.addr, self.cfg.web_server.port);
+            let dash_addr = format_socket_addr(&self.cfg.web_server.addr, self.cfg.web_server.port);
             let dash_addr2 = dash_addr.clone();
             let dash_state = self.state.clone();
             tokio::spawn(async move {
