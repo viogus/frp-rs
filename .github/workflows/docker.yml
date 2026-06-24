@@ -6,6 +6,10 @@ on:
     paths:
       - 'docker/**'
       - '.github/workflows/docker.yml'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**/*.rs'
+      - '**/*.c'
   release:
     types: [published]
   workflow_dispatch:
