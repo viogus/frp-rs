@@ -47,8 +47,11 @@ impl ProxyManager {
     }
 
     pub async fn remove(&self, name: &str) {
+        // Lock proxies first, then by_client — consistent order with remove_client
         let mut proxies = self.proxies.write().await;
         if let Some(info) = proxies.remove(name) {
+            // Drop proxies lock before acquiring by_client to avoid holding both
+            drop(proxies);
             let mut by_client = self.by_client.write().await;
             if let Some(client_proxies) = by_client.get_mut(&info.run_id) {
                 client_proxies.remove(name);
@@ -57,11 +60,12 @@ impl ProxyManager {
     }
 
     pub async fn remove_client(&self, run_id: &str) {
+        // Lock proxies first, then by_client — consistent order with remove
+        let mut proxies = self.proxies.write().await;
         let mut by_client = self.by_client.write().await;
-        if let Some(proxies) = by_client.remove(run_id) {
-            let mut all_proxies = self.proxies.write().await;
-            for name in proxies.keys() {
-                all_proxies.remove(name);
+        if let Some(client_proxies) = by_client.remove(run_id) {
+            for name in client_proxies.keys() {
+                proxies.remove(name);
             }
         }
     }

@@ -12,12 +12,20 @@ use frp_core::transport::{TransportProtocol, DialOptions, dial_server, IoStream}
 use crate::proxy;
 use crate::control::ControlConnection;
 
+/// Proxy config needed at runtime for work connections.
+#[derive(Clone)]
+struct ProxyRuntimeInfo {
+    local_addr: String,
+    use_encryption: bool,
+}
+
 /// The main frpc service.
 pub struct Service {
     cfg: ClientConfig,
     auth_cfg: Arc<AuthConfig>,
-    /// Map proxy_name -> local_addr for looking up where to connect
-    proxy_local_map: HashMap<String, String>,
+    encryption_key: [u8; 32],
+    /// Map proxy_name -> runtime info for looking up where to connect
+    proxy_info_map: HashMap<String, ProxyRuntimeInfo>,
 }
 
 impl Service {
@@ -30,11 +38,16 @@ impl Service {
             additional_data: None,
         };
 
-        let proxy_local_map: HashMap<String, String> = cfg.proxies.iter()
-            .map(|p| (p.name.clone(), format!("{}:{}", p.local_ip, p.local_port)))
+        let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
+
+        let proxy_info_map: HashMap<String, ProxyRuntimeInfo> = cfg.proxies.iter()
+            .map(|p| (p.name.clone(), ProxyRuntimeInfo {
+                local_addr: format!("{}:{}", p.local_ip, p.local_port),
+                use_encryption: p.use_encryption,
+            }))
             .collect();
 
-        Self { cfg, auth_cfg: Arc::new(auth_cfg), proxy_local_map }
+        Self { cfg, auth_cfg: Arc::new(auth_cfg), encryption_key: enc_key, proxy_info_map }
     }
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -43,8 +56,8 @@ impl Service {
             frp_core::VERSION, self.cfg.server_addr, self.cfg.server_port
         );
 
-        let protocol = TransportProtocol::from_str(&self.cfg.transport_protocol);
-        let pool_count = self.cfg.pool_count;
+        let protocol: TransportProtocol = self.cfg.transport_protocol.parse().unwrap_or(TransportProtocol::Tcp);
+        let pool_count = self.cfg.pool_count.max(0);
         let proxies = self.cfg.proxies.clone();
 
         if proxies.is_empty() {
@@ -76,26 +89,31 @@ impl Service {
             };
             info!("Logged in. run_id: {}", run_id);
 
-            // Register proxies
-            if let IoStream::Tcp(ref mut tcp) = control_stream {
-                for p in &proxies {
-                    let local_addr = format!("{}:{}", p.local_ip, p.local_port);
-                    match ctl.register_proxy(
-                        &p.name, &p.proxy_type, &local_addr, p.remote_port,
-                        p.use_encryption, p.use_compression, &p.sk,
-                        &p.custom_domains,
-                        tcp,
-                    ).await {
-                        Ok(resp) => {
-                            info!("Proxy '{}' registered on remote port {:?}", p.name, resp.remote_port);
-                        }
-                        Err(e) => {
-                            warn!("Failed to register proxy '{}': {}", p.name, e);
-                        }
+            // Register proxies — extract TcpStream, warn if TLS/WS used for control
+            let mut tcp = match &mut control_stream {
+                IoStream::Tcp(ref mut s) => s,
+                _ => {
+                    warn!("Non-TCP control connection: proxy registration not yet supported");
+                    // Register with write_msg_v1 directly since IoStream isn't TcpStream
+                    // This path currently unreachable; add proper impl when TLS/WS control lands
+                    continue;
+                }
+            };
+            for p in &proxies {
+                let local_addr = format!("{}:{}", p.local_ip, p.local_port);
+                match ctl.register_proxy(
+                    &p.name, &p.proxy_type, &local_addr, p.remote_port,
+                    p.use_encryption, p.use_compression, &p.sk,
+                    &p.custom_domains,
+                    &mut tcp,
+                ).await {
+                    Ok(resp) => {
+                        info!("Proxy '{}' registered on remote port {:?}", p.name, resp.remote_port);
+                    }
+                    Err(e) => {
+                        warn!("Failed to register proxy '{}': {}", p.name, e);
                     }
                 }
-            } else {
-                warn!("TLS control connection: proxy registration not yet supported");
             }
 
             // Split control stream for reading and writing
@@ -108,7 +126,8 @@ impl Service {
                     self.cfg.server_port,
                     &protocol,
                     &run_id,
-                    &self.proxy_local_map,
+                    &self.proxy_info_map,
+                    self.encryption_key,
                     i,
                 );
             }
@@ -151,8 +170,6 @@ impl Service {
 
             // --- Message loop ---
             let mut ping_interval = interval(Duration::from_secs(30));
-            #[allow(unused_assignments)]
-            let mut should_reconnect = false;
 
             loop {
                 tokio::select! {
@@ -165,7 +182,8 @@ impl Service {
                                     self.cfg.server_port,
                                     &protocol,
                                     &run_id,
-                                    &self.proxy_local_map,
+                                    &self.proxy_info_map,
+                                    self.encryption_key,
                                     -1, // on-demand, not pool
                                 );
                             }
@@ -173,7 +191,7 @@ impl Service {
                                 debug!("Pong received");
                             }
                             Ok(FrpMessage::UDPPacket(up)) => {
-                                debug!("UDPPacket received for proxy '{}'", up.local_addr);
+                                warn!("UDPPacket received on control connection for proxy '{}' — UDP should use dedicated work conn", up.local_addr);
                             }
                             Ok(FrpMessage::CloseProxy(cp)) => {
                                 info!("Server closed proxy: {}", cp.proxy_name);
@@ -188,7 +206,6 @@ impl Service {
                             }
                             Err(e) => {
                                 warn!("Control read error: {}. Reconnecting...", e);
-                                should_reconnect = true;
                                 break;
                             }
                         }
@@ -201,7 +218,6 @@ impl Service {
                         });
                         if let Err(e) = write_msg_v1(&mut writer, &ping).await {
                             warn!("Ping failed: {}. Reconnecting...", e);
-                            should_reconnect = true;
                             break;
                         }
                         debug!("Ping sent");
@@ -209,7 +225,7 @@ impl Service {
                 }
             }
 
-            if self.cfg.login_fail_exit && should_reconnect {
+            if self.cfg.login_fail_exit {
                 return Err("connection lost".into());
             }
 
@@ -238,13 +254,14 @@ fn spawn_work_conn(
     server_port: u16,
     protocol: &TransportProtocol,
     run_id: &str,
-    proxy_local_map: &HashMap<String, String>,
+    proxy_info_map: &HashMap<String, ProxyRuntimeInfo>,
+    enc_key: [u8; 32],
     pool_id: i32,
 ) {
     let server_addr = server_addr.to_string();
     let run_id = run_id.to_string();
     let protocol = protocol.clone();
-    let proxy_local_map = proxy_local_map.clone();
+    let proxy_info_map = proxy_info_map.clone();
 
     tokio::spawn(async move {
         let label = if pool_id >= 0 {
@@ -302,9 +319,9 @@ fn spawn_work_conn(
                 let proxy_name = &swc.proxy_name;
                 info!("Work conn {} assigned to proxy '{}'", label, proxy_name);
 
-                // Look up the local address for this proxy
-                let local_addr = match proxy_local_map.get(proxy_name) {
-                    Some(addr) => addr.clone(),
+                // Look up the proxy runtime info
+                let info = match proxy_info_map.get(proxy_name) {
+                    Some(info) => info,
                     None => {
                         warn!("Work conn {}: unknown proxy '{}'", label, proxy_name);
                         return;
@@ -312,12 +329,13 @@ fn spawn_work_conn(
                 };
 
                 // Connect to local service
-                match proxy::connect_local(&local_addr).await {
+                match proxy::connect_local(&info.local_addr).await {
                     Ok(local) => {
-                        proxy::bridge_streams(local, work, proxy_name).await;
+                        let enc = if info.use_encryption { Some(&enc_key) } else { None };
+                        proxy::bridge_streams(local, work, proxy_name, info.use_encryption, enc).await;
                     }
                     Err(e) => {
-                        warn!("Work conn {}: failed to connect to local {}: {}", label, local_addr, e);
+                        warn!("Work conn {}: failed to connect to local {}: {}", label, info.local_addr, e);
                     }
                 }
             }

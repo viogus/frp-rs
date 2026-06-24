@@ -66,56 +66,6 @@ impl AuthConfig {
         }
     }
 
-    
-/// Validate an OIDC JWT token (claims-only validation, no signature verification).
-pub fn validate_oidc_token(token: &str, expected_issuer: &str, expected_audience: &str) -> Result<String, String> {
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return Err("invalid JWT format".into());
-    }
-    // Decode base64url payload
-    fn decode_b64url(s: &str) -> Result<Vec<u8>, String> {
-        let mut s = s.to_string();
-        while s.len() % 4 != 0 { s.push('='); }
-        s = s.replace('-', "+").replace('_', "/");
-        data_encoding::BASE64URL.decode(s.as_bytes())
-            .or_else(|_| data_encoding::BASE64.decode(s.as_bytes()))
-            .map_err(|e| format!("base64 decode: {e}"))
-    }
-    let payload_bytes = decode_b64url(parts[1])?;
-    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)
-        .map_err(|e| format!("JSON parse: {e}"))?;
-    // Check exp
-    if let Some(exp) = payload.get("exp").and_then(|v| v.as_i64()) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap().as_secs() as i64;
-        if exp < now { return Err("token expired".into()); }
-    }
-    // Check iss
-    if let Some(iss) = payload.get("iss").and_then(|v| v.as_str()) {
-        if !expected_issuer.is_empty() && iss != expected_issuer {
-            return Err(format!("issuer mismatch: got '{iss}', expected '{expected_issuer}'"));
-        }
-    } else if !expected_issuer.is_empty() {
-        return Err("missing iss claim".into());
-    }
-    // Check aud
-    if let Some(aud) = payload.get("aud") {
-        if !expected_audience.is_empty() {
-            let aud_str = aud.as_str().unwrap_or("");
-            if aud_str != expected_audience {
-                return Err(format!("audience mismatch: got '{aud_str}', expected '{expected_audience}'"));
-            }
-        }
-    }
-    // Return subject
-    payload.get("sub")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "missing sub claim".into())
-}
-
 /// Generate the privilege_key for a login message.
     pub fn generate_login_key(&self, timestamp: i64) -> Option<String> {
         if self.token.is_empty() {

@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::time::Duration;
 use std::process;
 
 use tracing_subscriber::EnvFilter;
@@ -20,21 +19,10 @@ async fn run(cli: CliArgs) {
         process::exit(0);
     }
 
-    // Set log level from CLI if provided (overrides RUST_LOG)
-    if let Some(ref level) = cli.log_level {
-        if std::env::var("RUST_LOG").is_err() {
-            std::env::set_var("RUST_LOG", level);
-        }
-    }
-
-    // Initialize tracing (will use RUST_LOG env var if set)
+    // Build EnvFilter: respect RUST_LOG env, fall back to CLI flag, then default
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| {
-            if let Some(ref level) = cli.log_level {
-                EnvFilter::new(level)
-            } else {
-                EnvFilter::new("info")
-            }
+            EnvFilter::new(cli.log_level.as_deref().unwrap_or("info"))
         });
 
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
@@ -85,15 +73,20 @@ async fn run(cli: CliArgs) {
                             tracing::error!("frps service error for config file [{}]: {}", path_str, e);
                         }
                     }));
-                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
                 Err(e) => {
                     tracing::error!("Failed to load config from [{}]: {}", path_str, e);
                 }
             }
         }
+        if handles.is_empty() {
+            tracing::error!("No services started — all config files failed to load");
+            process::exit(1);
+        }
         for handle in handles {
-            let _ = handle.await;
+            if let Err(e) = handle.await {
+                tracing::error!("frps service task panicked: {}", e);
+            }
         }
     } else {
         let cfg = match load_server_config(&cli.config) {

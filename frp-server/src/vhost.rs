@@ -71,11 +71,11 @@ pub async fn run_vhost_http_listener(
         let state = state.clone();
 
         tokio::spawn(async move {
-            // Read the first 4096 bytes to extract Host header
+            // Read the first 4096 bytes to extract Host header (with 10s timeout)
             let mut buf = [0u8; 4096];
             let mut stream = stream;
-            let n = match stream.read(&mut buf).await {
-                Ok(n) if n > 0 => n,
+            let n = match tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => n,
                 _ => return,
             };
 
@@ -146,8 +146,8 @@ pub async fn run_vhost_https_listener(
             };
 
             let mut buf = [0u8; 4096];
-            let n = match tls_stream.read(&mut buf).await {
-                Ok(n) if n > 0 => n,
+            let n = match tokio::time::timeout(std::time::Duration::from_secs(10), tls_stream.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => n,
                 _ => return,
             };
 

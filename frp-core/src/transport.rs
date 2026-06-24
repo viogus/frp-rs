@@ -25,14 +25,15 @@ pub enum TransportProtocol {
     Quic,
 }
 
-impl TransportProtocol {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+impl std::str::FromStr for TransportProtocol {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
             "websocket" | "ws" => TransportProtocol::WebSocket,
             "wss" => TransportProtocol::Wss,
             "quic" => TransportProtocol::Quic,
             _ => TransportProtocol::Tcp,
-        }
+        })
     }
 }
 
@@ -72,6 +73,11 @@ impl WsByteStream {
             read_buf: Vec::new(),
             read_pos: 0,
         }
+    }
+
+    /// Consume the adapter and return the underlying WebSocket stream.
+    pub fn into_inner(self) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
+        *Pin::into_inner(self.inner)
     }
 }
 
@@ -121,6 +127,9 @@ impl AsyncRead for WsByteStream {
                 Poll::Ready(Some(Ok(Message::Ping(_)))) => {
                     // Ignore ping (tungstenite handles pong automatically)
                     continue;
+                }
+                Poll::Ready(Some(Ok(Message::Close(_)))) => {
+                    return Poll::Ready(Ok(()));
                 }
                 Poll::Ready(Some(Ok(_))) => continue,
                 Poll::Ready(Some(Err(e))) => {
@@ -251,30 +260,26 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
     .map_err(|_| crate::Error::Transport(format!("dial timeout to {addr}")))?
     .map_err(|e| crate::Error::Transport(format!("dial to {addr}: {e}")))?;
 
-    // Wrap with TLS if enabled
-    let stream = if opts.tls_enable {
-        let connector = build_tls_connector(None)?;
-        let server_name = if !opts.tls_server_name.is_empty() {
-            opts.tls_server_name.clone()
-        } else {
-            opts.server_addr.clone()
-        };
-        let server_name = rustls::pki_types::ServerName::try_from(server_name)
-            .map_err(|e| crate::Error::Transport(format!("invalid server name: {e}")))?;
-        match connector.connect(server_name, stream).await {
-            Ok(tls) => {
-                return Ok(IoStream::Tls(tokio_rustls::TlsStream::Client(tls)));
-            }
-            Err(e) => return Err(crate::Error::Transport(format!("TLS connect: {e}"))),
-        }
-    } else {
-        stream
-    };
-
     match opts.protocol {
-        TransportProtocol::Tcp => Ok(IoStream::Tcp(stream)),
+        TransportProtocol::Tcp => {
+            if opts.tls_enable {
+                let connector = build_tls_connector(None)?;
+                let server_name = if !opts.tls_server_name.is_empty() {
+                    opts.tls_server_name.clone()
+                } else {
+                    opts.server_addr.clone()
+                };
+                let server_name = rustls::pki_types::ServerName::try_from(server_name)
+                    .map_err(|e| crate::Error::Transport(format!("invalid server name: {e}")))?;
+                let tls = connector.connect(server_name, stream).await
+                    .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}")))?;
+                Ok(IoStream::Tls(tokio_rustls::TlsStream::Client(tls)))
+            } else {
+                Ok(IoStream::Tcp(stream))
+            }
+        }
         TransportProtocol::WebSocket | TransportProtocol::Wss => {
-            let is_wss = opts.protocol == TransportProtocol::Wss;
+            let is_wss = opts.protocol == TransportProtocol::Wss || opts.tls_enable;
             let host = if !opts.tls_server_name.is_empty() {
                 opts.tls_server_name.clone()
             } else {

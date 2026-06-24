@@ -77,7 +77,7 @@ impl ControlConnection {
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
 
         let privilege_key = self.auth_cfg.generate_login_key(timestamp);
@@ -154,15 +154,22 @@ impl ControlConnection {
 }
 
 
-/// Resolve the local hostname. Delegates blocking I/O to spawn_blocking.
+/// Resolve the local hostname. All blocking I/O delegated to spawn_blocking.
 async fn hostname() -> Option<String> {
-    // Fast path: read /etc/hostname (most Linux systems)
-    if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
-        let s = s.trim().to_string();
-        if !s.is_empty() {
-            return Some(s);
-        }
+    // Read /etc/hostname on a blocking thread
+    let etc_result = tokio::task::spawn_blocking(|| {
+        std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+    .await
+    .unwrap_or(None);
+
+    if let Some(s) = etc_result {
+        return Some(s);
     }
+
     // Fallback: run hostname command on a blocking thread
     let result = tokio::task::spawn_blocking(|| {
         std::process::Command::new("hostname")

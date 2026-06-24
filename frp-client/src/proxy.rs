@@ -2,6 +2,7 @@ use tokio::net::TcpStream;
 use tracing::{info, debug};
 
 use frp_core::msg::{self, FrpMessage};
+use frp_core::bridge;
 
 /// Creates the NewProxy message for registering a proxy with the server.
 pub fn create_new_proxy_msg(
@@ -36,10 +37,28 @@ pub async fn connect_local(addr: &str) -> Result<TcpStream, frp_core::Error> {
         .map_err(|e| frp_core::Error::Transport(format!("connect to local {}: {}", addr, e)))
 }
 
-/// Bridge data between two streams (bidirectional copy).
-pub async fn bridge_streams(mut a: TcpStream, mut b: TcpStream, name: &str) {
-    info!("Bridging streams for proxy: {}", name);
-    match tokio::io::copy_bidirectional(&mut a, &mut b).await {
+/// Bridge data between two streams with optional encryption.
+pub async fn bridge_streams(
+    local: TcpStream,
+    work: TcpStream,
+    name: &str,
+    use_encryption: bool,
+    enc_key: Option<&[u8; 32]>,
+) {
+    info!("Bridging streams for proxy: {} (encrypted: {})", name, use_encryption);
+    if use_encryption {
+        if let Some(key) = enc_key {
+            let (l_r, l_w) = tokio::io::split(local);
+            let (w_r, w_w) = tokio::io::split(work);
+            bridge::bridge_encrypted(l_r, l_w, w_r, w_w, key).await;
+            debug!("Proxy {} encrypted bridge closed", name);
+            return;
+        }
+        debug!("Proxy {}: encryption requested but no key available, falling back to plain", name);
+    }
+    let mut local = local;
+    let mut work = work;
+    match tokio::io::copy_bidirectional(&mut local, &mut work).await {
         Ok((to_a, to_b)) => {
             debug!("Proxy {} closed: {}B to server, {}B to local", name, to_a, to_b);
         }

@@ -562,10 +562,8 @@ fn collect_config_files_inner(dir: &Path, files: &mut Vec<std::path::PathBuf>) -
 /// Load server configs from a directory, merging all `.toml` files.
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
-    use toml::Value;
 
     #[test]
     fn test_parse_client_toml() {

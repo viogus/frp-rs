@@ -108,17 +108,19 @@ pub async fn handle_control<S>(
                         debug!("STCP visitor conn for proxy {} on run_id {}", proxy_name, run_id);
                         let tcp = match visitor_conn {
                             IoStream::Tcp(s) => s,
-                            _ => { warn!("STCP visitor requires TCP stream"); return; }
+                            _ => { warn!("STCP visitor requires TCP stream"); continue; }
                         };
+                        let enc = state.proxy_manager.get(&proxy_name).await
+                            .map(|p| p.use_encryption).unwrap_or(false);
                         if let Some(work_conn) = work_pool.pop_front() {
-                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: tcp, pre_read: Vec::new(), use_encryption: false }, state.encryption_key).await;
+                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: tcp, pre_read: Vec::new(), use_encryption: enc }, state.encryption_key).await;
                         } else {
                             debug!("No pooled work conn for STCP, sending ReqWorkConn");
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
                                 warn!("Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
-                            pending_requests.push_back(PendingRequest { proxy_name, user_conn: tcp, pre_read: Vec::new(), use_encryption: false });
+                            pending_requests.push_back(PendingRequest { proxy_name, user_conn: tcp, pre_read: Vec::new(), use_encryption: enc });
                         }
                     }
                     Some(InternalMsg::ProxyUserConn { proxy_name, user_conn, pre_read }) => {
@@ -127,7 +129,7 @@ pub async fn handle_control<S>(
                             IoStream::Tcp(s) => s,
                             _ => {
                                 warn!("Unsupported user connection type for proxy {}", proxy_name);
-                                return;
+                                continue;
                             }
                         };
                         debug!("User conn for proxy {} on run_id {}", proxy_name, run_id);
@@ -245,7 +247,7 @@ async fn assign_work_to_proxy(
         IoStream::Tcp(ref mut s) => write_msg_v1(s, &swc).await,
         IoStream::Tls(ref mut s) => write_msg_v1(s, &swc).await,
         IoStream::Kcp(_) => { warn!("Kcp streaming not yet supported"); return; }
-            IoStream::WebSocket(_) => {
+        IoStream::WebSocket(_) => {
             warn!("WebSocket work conn not supported for bridging");
             return;
         }
@@ -329,7 +331,17 @@ async fn handle_new_proxy(
     writer: &mut (impl AsyncWriteExt + Unpin),
     internal_tx: &mpsc::UnboundedSender<InternalMsg>,
 ) {
-    let remote_port = np.remote_port.unwrap_or(0) as u16;
+    let raw_port = np.remote_port.unwrap_or(0);
+    if raw_port < 0 || raw_port > u16::MAX as i32 {
+        let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
+            proxy_name: np.proxy_name.clone(),
+            remote_port: None,
+            error: Some(format!("remote_port {} out of valid range (0-65535)", raw_port)),
+        });
+        let _ = write_msg_v1(writer, &resp).await;
+        return;
+    }
+    let remote_port = raw_port as u16;
 
     let allocated_port = {
         let mut ports = state.used_ports.write().await;
@@ -507,14 +519,21 @@ async fn run_udp_listener(
 async fn unregister_control(state: &Arc<AppState>, run_id: &str) {
     let mut map = state.run_id_to_ctl_tx.write().await;
     map.remove(run_id);
-    // Release allocated ports for this client
-    let used = &state.used_ports;
-    let pm = &state.proxy_manager;
-    let proxies = pm.list_client(run_id).await;
-    let mut ports = used.write().await;
+    // Release allocated ports and clean up sk/vhost entries for this client
+    let proxies = state.proxy_manager.list_client(run_id).await;
+    let mut ports = state.used_ports.write().await;
     for p in &proxies {
         if let Some(port) = p.remote_port {
             ports.remove(&port);
         }
+        // Clean up STCP sk_index
+        if let Some(ref sk) = p.sk {
+            if !sk.is_empty() {
+                state.sk_index.write().await.remove(sk);
+            }
+        }
+        // Clean up VHost routes
+        state.vhost_manager.unregister(&p.name).await;
     }
+    drop(ports);
 }

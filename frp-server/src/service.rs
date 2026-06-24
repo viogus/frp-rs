@@ -140,15 +140,43 @@ impl Service {
         if self.cfg.websocket_port > 0 {
             let ws_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.websocket_port);
             let ws_addr2 = ws_addr.clone();
+            let ws_state = self.state.clone();
             tokio::spawn(async move {
                 if let Ok(listener) = TcpListener::bind(&ws_addr2).await {
                     info!("WebSocket listener ready on {}", ws_addr2);
                     loop {
                         if let Ok((stream, addr)) = listener.accept().await {
                             info!("New WebSocket connection from {}", addr);
+                            let state = ws_state.clone();
                             tokio::spawn(async move {
-                                if let Ok(_ws) = frp_core::transport::accept_websocket(stream).await {
-                                    info!("WebSocket upgrade completed for {}", addr);
+                                match frp_core::transport::accept_websocket(stream).await {
+                                    Ok(ws) => {
+                                        info!("WebSocket upgrade completed for {}", addr);
+                                        // Read first frame to dispatch
+                                        let ws_inner = match ws {
+                                            IoStream::WebSocket(inner) => inner,
+                                            _ => unreachable!(),
+                                        };
+                                        let mut adapter = frp_core::transport::WsByteStream::new(ws_inner);
+                                        match read_msg_v1(&mut adapter).await {
+                                            Ok(FrpMessage::Login(login)) => {
+                                                control::handle_control(adapter, login, state.clone(), Some(addr)).await;
+                                            }
+                                            Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                let io = IoStream::WebSocket(adapter.into_inner());
+                                                handle_work_conn_inner(io, nwc, state.clone()).await;
+                                            }
+                                            Ok(other) => {
+                                                warn!("Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
+                                            }
+                                            Err(e) => {
+                                                warn!("WS read error from {}: {}", addr, e);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("WebSocket upgrade failed for {}: {}", addr, e);
+                                    }
                                 }
                             });
                         }
@@ -158,6 +186,18 @@ impl Service {
             info!("WebSocket listener started on {}", ws_addr);
         }
 
+
+        // Start HTTP VHost listener if configured
+        if self.cfg.vhost_http_port > 0 {
+            let http_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.vhost_http_port);
+            let http_state = self.state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::vhost::run_vhost_http_listener(http_addr, http_state).await {
+                    error!("HTTP VHost listener failed: {}", e);
+                }
+            });
+            info!("HTTP VHost listener starting on port {}", self.cfg.vhost_http_port);
+        }
 
         // Start HTTPS VHost listener if configured
         if self.cfg.vhost_https_port > 0 && self.cfg.tls_enable {

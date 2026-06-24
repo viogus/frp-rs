@@ -27,7 +27,7 @@ pub async fn bridge_encrypted(
             let payload = &buf[..n];
             match encryption::encrypt(payload, key) {
                 Ok(encrypted) => {
-                    let len = (encrypted.len() as u32).to_be_bytes();
+                    let len = u32::try_from(encrypted.len()).unwrap_or(u32::MAX).to_be_bytes();
                     if work_w.write_all(&len).await.is_err() { break; }
                     if work_w.write_all(&encrypted).await.is_err() { break; }
                     if work_w.flush().await.is_err() { break; }
@@ -70,8 +70,8 @@ async fn read_frame_length(
 ) -> Option<usize> {
     reader.read_exact(buf).await.ok()?;
     let len = u32::from_be_bytes(*buf) as usize;
-    if len > 1024 * 1024 {
-        return None; // sanity check: max 1MB per frame
+    if len == 0 || len > 1024 * 1024 {
+        return None; // reject zero-length frames and frames > 1MB
     }
     Some(len)
 }

@@ -29,8 +29,8 @@ pub fn encrypt(data: &[u8], key_bytes: &[u8; 32]) -> Result<Vec<u8>, String> {
 /// Decrypt data using AES-256-GCM.
 /// Input: 12-byte nonce || ciphertext || 16-byte tag
 pub fn decrypt(data: &[u8], key_bytes: &[u8; 32]) -> Result<Vec<u8>, String> {
-    if data.len() < 12 {
-        return Err("data too short for AES-GCM".into());
+    if data.len() < 28 {
+        return Err("data too short for AES-GCM (need at least 12-byte nonce + 16-byte tag)".into());
     }
     let key = Key::<Aes256Gcm>::from_slice(key_bytes);
     let cipher = Aes256Gcm::new(key);
