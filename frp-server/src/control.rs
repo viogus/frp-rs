@@ -292,7 +292,6 @@ async fn assign_work_to_proxy(
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key).await;
                 }
-                IoStream::Kcp(_) => { warn!("Kcp streaming not yet supported"); return; }
             IoStream::WebSocket(_) => {
                     warn!("Encrypted WebSocket bridging not implemented");
                 }
