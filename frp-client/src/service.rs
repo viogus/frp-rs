@@ -7,6 +7,7 @@ use frp_core::auth::{AuthConfig, AuthMethod};
 use frp_core::config::ClientConfig;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
+use frp_core::mux::YamuxSession;
 use frp_core::transport::{TransportProtocol, DialOptions, dial_server, IoStream};
 
 use crate::proxy;
@@ -121,9 +122,10 @@ impl Service {
                 self.cfg.tls_enable,
                 self.cfg.tls_server_name.clone(),
                 if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
+                self.cfg.tcp_mux,
             );
 
-            let (mut control_stream, run_id) = match ctl.login().await {
+            let (mut control_stream, run_id, yamux_session) = match ctl.login().await {
                 Ok(r) => {
                     did_login_once = true;
                     r
@@ -137,6 +139,7 @@ impl Service {
                     continue;
                 }
             };
+            let yamux = yamux_session.map(|s| std::sync::Arc::new(s));
             info!("Logged in. run_id: {}", run_id);
 
             // Register proxies using IoStream directly (supports TCP and TLS)
@@ -170,6 +173,7 @@ impl Service {
                     self.cfg.tls_enable,
                     self.cfg.tls_server_name.clone(),
                     if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
+                    yamux.clone(),
                 );
             }
 
@@ -238,6 +242,7 @@ impl Service {
                                     self.cfg.tls_enable,
                                     self.cfg.tls_server_name.clone(),
                                     if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
+                                    yamux.clone(),
                                 );
                             }
                             Ok(FrpMessage::Pong(_)) => {
@@ -248,6 +253,12 @@ impl Service {
                             }
                             Ok(FrpMessage::CloseProxy(cp)) => {
                                 info!("Server closed proxy: {}", cp.proxy_name);
+                            }
+                            Ok(FrpMessage::CloseProxyResp(cpr)) => {
+                                info!("Server confirmed proxy close: {}", cpr.proxy_name);
+                            }
+                            Ok(FrpMessage::Error(err)) => {
+                                warn!("Server error: {}", err.error);
                             }
                             Ok(FrpMessage::NewProxyResp(resp)) => {
                                 if let Some(err) = resp.error {
@@ -302,8 +313,9 @@ impl Service {
 /// Spawn a single work connection task.
 ///
 /// The task:
-/// 1. Dials the server
-/// 2. Sends NewWorkConn (with run_id + auth)
+/// 1. Under TcpMux: opens a yamux stream on the shared session
+///    Without TcpMux: dials the server via TCP/TLS/WS
+/// 2. Without TcpMux: sends NewWorkConn (with run_id + auth)
 /// 3. Reads StartWorkConn from the server
 /// 4. Connects to the local service
 /// 5. Bridges data bidirectionally
@@ -321,6 +333,7 @@ fn spawn_work_conn(
     tls_enable: bool,
     tls_server_name: String,
     tls_ca_file: Option<String>,
+    yamux: Option<std::sync::Arc<YamuxSession>>,
 ) {
     let server_addr = server_addr.to_string();
     let run_id = run_id.to_string();
@@ -335,64 +348,72 @@ fn spawn_work_conn(
             "on-demand".to_string()
         };
 
-        debug!("Work conn {} dialing server", label);
-
-        let opts = DialOptions {
-            server_addr: server_addr.clone(),
-            server_port,
-            protocol: protocol.clone(),
-            tls_enable,
-            tls_server_name: tls_server_name.clone(),
-            tls_ca_file: tls_ca_file.clone(),
-            ..Default::default()
-        };
-
-        let mut work = match dial_server(&opts).await {
-            Ok(io) => io,
-            Err(e) => {
-                warn!("Work conn {} dial failed: {}", label, e);
+        // Under TcpMux: open yamux stream instead of dialing new TCP
+        let mut work = if let Some(ref yamux) = yamux {
+            match yamux.open_stream().await {
+                Some(stream) => {
+                    debug!("Work conn {} opened yamux stream", label);
+                    IoStream::Yamux(stream)
+                }
+                None => {
+                    warn!("Work conn {}: yamux open stream failed, session closed?", label);
+                    return;
+                }
+            }
+        } else {
+            debug!("Work conn {} dialing server", label);
+            let opts = DialOptions {
+                server_addr: server_addr.clone(),
+                server_port,
+                protocol: protocol.clone(),
+                tls_enable,
+                tls_server_name: tls_server_name.clone(),
+                tls_ca_file: tls_ca_file.clone(),
+                ..Default::default()
+            };
+            let mut work = match dial_server(&opts).await {
+                Ok(io) => io,
+                Err(e) => {
+                    warn!("Work conn {} dial failed: {}", label, e);
+                    return;
+                }
+            };
+            // Reject unsupported transports for work conns
+            match &work {
+                IoStream::Kcp(_) => {
+                    warn!("Work conn {}: KCP not yet supported", label);
+                    return;
+                }
+                _ => {}
+            }
+            // Build auth and send NewWorkConn (not needed under yamux)
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let auth_cfg = frp_core::auth::AuthConfig {
+                method: frp_core::auth::AuthMethod::Token,
+                token: auth_token.clone(),
+                oidc_issuer: String::new(),
+                oidc_audience: String::new(),
+                additional_data: None,
+            };
+            let privilege_key = auth_cfg.generate_login_key(timestamp);
+            let nwc = FrpMessage::NewWorkConn(msg::NewWorkConn {
+                run_id: Some(run_id.clone()),
+                timestamp: Some(timestamp),
+                privilege_key,
+            });
+            if let Err(e) = work.write_v1_frame(&nwc).await {
+                warn!("Work conn {} failed to send NewWorkConn: {}", label, e);
                 return;
             }
+            debug!("Work conn {} sent NewWorkConn, waiting for StartWorkConn", label);
+            work
         };
 
-        // Reject unsupported transports for work conns
-        match &work {
-            IoStream::Kcp(_) => {
-                warn!("Work conn {}: KCP not yet supported", label);
-                return;
-            }
-            _ => {} // Tcp, Tls, and WebSocket are supported
-        }
-
-        // Build auth for work conn (Go frp v0.69.1 compat: server verifies auth on NewWorkConn)
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let auth_cfg = frp_core::auth::AuthConfig {
-            method: frp_core::auth::AuthMethod::Token,
-            token: auth_token.clone(),
-            oidc_issuer: String::new(),
-            oidc_audience: String::new(),
-            additional_data: None,
-        };
-        let privilege_key = auth_cfg.generate_login_key(timestamp);
-
-        // Send NewWorkConn with run_id and auth so the server can route and verify it
-        let nwc = FrpMessage::NewWorkConn(msg::NewWorkConn {
-            run_id: Some(run_id.clone()),
-            timestamp: Some(timestamp),
-            privilege_key,
-        });
-
-        if let Err(e) = work.write_v1_frame(&nwc).await {
-            warn!("Work conn {} failed to send NewWorkConn: {}", label, e);
-            return;
-        }
-
-        debug!("Work conn {} sent NewWorkConn, waiting for StartWorkConn", label);
-
-        // Read StartWorkConn
+        // Read StartWorkConn (under yamux, no NewWorkConn was sent, so the
+        // first frame from the server should still be StartWorkConn)
         match work.read_v1_frame().await {
             Ok(FrpMessage::StartWorkConn(swc)) => {
                 let proxy_name = &swc.proxy_name;
@@ -443,6 +464,7 @@ fn spawn_work_conn(
                 tls_enable,
                 tls_server_name,
                 tls_ca_file,
+                yamux,
             );
         }
     });

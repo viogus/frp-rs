@@ -1,11 +1,12 @@
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tracing::info;
+use tracing::{info, warn};
 
 use frp_core::config::ProxyConfig;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::write_msg_v1;
 use frp_core::auth::AuthConfig;
+use frp_core::mux::{self, YamuxSession};
 use frp_core::transport::{IoStream, TransportProtocol, DialOptions, dial_server};
 use frp_core::VERSION;
 
@@ -24,6 +25,7 @@ pub struct ControlConnection {
     tls_enable: bool,
     tls_server_name: String,
     tls_ca_file: Option<String>,
+    tcp_mux: bool,
 }
 
 impl ControlConnection {
@@ -38,6 +40,7 @@ impl ControlConnection {
         tls_enable: bool,
         tls_server_name: String,
         tls_ca_file: Option<String>,
+        tcp_mux: bool,
     ) -> Self {
         Self {
             server_addr,
@@ -51,11 +54,13 @@ impl ControlConnection {
             tls_enable,
             tls_server_name,
             tls_ca_file,
+            tcp_mux,
         }
     }
 
     /// Connect to the server and login.
-    pub async fn login(&mut self) -> Result<(IoStream, String), frp_core::Error> {
+    /// Returns the control stream, run_id, and optional yamux session.
+    pub async fn login(&mut self) -> Result<(IoStream, String, Option<YamuxSession>), frp_core::Error> {
         let opts = DialOptions {
             server_addr: self.server_addr.clone(),
             server_port: self.server_port,
@@ -85,6 +90,9 @@ impl ControlConnection {
 
         let privilege_key = self.auth_cfg.generate_login_key(timestamp);
 
+        let propose_mux = self.tcp_mux
+            && matches!(&io_stream, IoStream::Tcp(_)); // yamux only over plain TCP
+
         let login = FrpMessage::Login(msg::Login {
             version: Some(VERSION.into()),
             hostname: Some(hostname().await.unwrap_or_default()),
@@ -98,6 +106,7 @@ impl ControlConnection {
             privilege_key,
             metas: None,
             client_spec: None,
+            multiplexer: None,
         });
 
         io_stream.write_v1_frame(&login).await?;
@@ -110,7 +119,30 @@ impl ControlConnection {
                 }
                 self.run_id = resp.run_id.clone().unwrap_or_default();
                 info!("Logged in. run_id: {}", self.run_id);
-                Ok((io_stream, self.run_id.clone()))
+
+                // Wrap in yamux if we proposed it (server accepted)
+                if propose_mux {
+                    // Extract inner TcpStream from IoStream::Tcp
+                    match io_stream {
+                        IoStream::Tcp(tcp_stream) => {
+                            let mux_cfg = mux::TcpMuxConfig::default();
+                            match mux::client_mux(tcp_stream, &mux_cfg).await {
+                                Ok((control_stream, session)) => {
+                                    info!("Yamux session established (run_id {})", self.run_id);
+                                    Ok((IoStream::Yamux(control_stream), self.run_id.clone(), Some(session)))
+                                }
+                                Err(e) => {
+                                    warn!("Failed to start yamux: {}. Falling back to plain TCP.", e);
+                                    // Can't recover — stream is consumed by client_mux
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        _ => unreachable!("yamux only proposed for plain TCP"),
+                    }
+                } else {
+                    Ok((io_stream, self.run_id.clone(), None))
+                }
             }
             _ => Err(frp_core::Error::Protocol("Unexpected response to login".into())),
         }

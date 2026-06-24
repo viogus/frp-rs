@@ -12,6 +12,8 @@ use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
+use crate::mux::YamuxStream;
+
 /// Go frp v0.69.1 FRPTLSHeadByte — sent before TLS handshake to allow
 /// mixed TLS/plaintext on the same port.
 pub const FRP_TLS_HEAD_BYTE: u8 = 0x17;
@@ -225,6 +227,7 @@ pub enum IoStream {
     Tls(tokio_rustls::TlsStream<TcpStream>),
     Kcp(tokio::io::DuplexStream),
     WebSocket(WsByteStream),
+    Yamux(YamuxStream),
 }
 
 impl std::fmt::Debug for IoStream {
@@ -234,6 +237,7 @@ impl std::fmt::Debug for IoStream {
             IoStream::Tls(_) => f.debug_struct("IoStream::Tls").finish_non_exhaustive(),
             IoStream::Kcp(_) => f.debug_struct("IoStream::Kcp").finish_non_exhaustive(),
             IoStream::WebSocket(_) => f.debug_struct("IoStream::WebSocket").finish_non_exhaustive(),
+            IoStream::Yamux(_) => f.debug_struct("IoStream::Yamux").finish_non_exhaustive(),
         }
     }
 }
@@ -250,6 +254,7 @@ impl tokio::io::AsyncRead for IoStream {
             IoStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Kcp(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::WebSocket(s) => Pin::new(s).poll_read(cx, buf),
+            IoStream::Yamux(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -265,6 +270,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::Kcp(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::WebSocket(s) => Pin::new(s).poll_write(cx, buf),
+            IoStream::Yamux(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -274,6 +280,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Tls(s) => Pin::new(s).poll_flush(cx),
             IoStream::Kcp(s) => Pin::new(s).poll_flush(cx),
             IoStream::WebSocket(s) => Pin::new(s).poll_flush(cx),
+            IoStream::Yamux(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -283,6 +290,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::Kcp(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::WebSocket(s) => Pin::new(s).poll_shutdown(cx),
+            IoStream::Yamux(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -295,6 +303,7 @@ impl IoStream {
             IoStream::Tls(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::Kcp(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::WebSocket(s) => crate::protocol::write_msg_v1(s, msg).await,
+            IoStream::Yamux(s) => crate::protocol::write_msg_v1(s, msg).await,
         }
     }
 
@@ -305,6 +314,7 @@ impl IoStream {
             IoStream::Tls(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Kcp(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::WebSocket(s) => crate::protocol::read_msg_v1(s).await,
+            IoStream::Yamux(s) => crate::protocol::read_msg_v1(s).await,
         }
     }
 
@@ -312,7 +322,7 @@ impl IoStream {
     pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         match self {
             IoStream::Tcp(s) => s.peer_addr().ok(),
-            IoStream::Tls(_) | IoStream::Kcp(_) | IoStream::WebSocket(_) => None,
+            IoStream::Tls(_) | IoStream::Kcp(_) | IoStream::WebSocket(_) | IoStream::Yamux(_) => None,
         }
     }
 
@@ -338,6 +348,10 @@ impl IoStream {
             }
             IoStream::WebSocket(adapter) => {
                 let (r, w) = tokio::io::split(adapter);
+                (Box::new(r), Box::new(w))
+            }
+            IoStream::Yamux(stream) => {
+                let (r, w) = tokio::io::split(stream);
                 (Box::new(r), Box::new(w))
             }
         }

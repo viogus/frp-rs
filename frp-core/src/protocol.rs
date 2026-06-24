@@ -105,6 +105,16 @@ fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate::Er
                 .map_err(|e| crate::Error::Protocol(format!("deserialize CloseProxy: {e}")))?;
             FrpMessage::CloseProxy(v)
         }
+        msg::TYPE_CLOSE_PROXY_RESP => {
+            let v: msg::CloseProxyResp = serde_json::from_slice(payload)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize CloseProxyResp: {e}")))?;
+            FrpMessage::CloseProxyResp(v)
+        }
+        msg::TYPE_ERROR => {
+            let v: msg::Error = serde_json::from_slice(payload)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize Error: {e}")))?;
+            FrpMessage::Error(v)
+        }
         msg::TYPE_NEW_WORK_CONN => {
             let v: msg::NewWorkConn = serde_json::from_slice(payload)
                 .map_err(|e| crate::Error::Protocol(format!("deserialize NewWorkConn: {e}")))?;
@@ -198,4 +208,116 @@ pub async fn write_v2_magic<W: AsyncWriteExt + Unpin>(
         .await
         .map_err(|e| crate::Error::Protocol(format!("write V2 magic: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::msg;
+    use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn test_v1_frame_roundtrip() {
+        let (mut client, mut server) = duplex(65536);
+        let msg = FrpMessage::Login(msg::Login {
+            version: Some("0.69.1".into()),
+            hostname: Some("testhost".into()),
+            os: Some("linux".into()),
+            arch: None,
+            user: None,
+            run_id: None,
+            client_id: None,
+            pool_count: Some(3),
+            timestamp: Some(1234567890),
+            privilege_key: Some("abc123".into()),
+            metas: None,
+            client_spec: None,
+            multiplexer: Some("yamux".into()),
+        });
+        write_v1_frame(&mut client, &msg).await.expect("write");
+        let result = read_msg_v1(&mut server).await.expect("read");
+        match result {
+            FrpMessage::Login(login) => {
+                assert_eq!(login.version.as_deref(), Some("0.69.1"));
+                assert_eq!(login.hostname.as_deref(), Some("testhost"));
+                assert_eq!(login.pool_count, Some(3));
+                assert_eq!(login.multiplexer.as_deref(), Some("yamux"));
+            }
+            _ => panic!("expected Login, got {:?}", result),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v1_frame_max_payload() {
+        // 65535-byte payload should be accepted
+        let payload = vec![b'x'; 65535];
+        let (mut client, mut server) = duplex(131072);
+        // Write manually a 65535-byte payload with type byte = Ping
+        let mut header = vec![msg::TYPE_PING];
+        header.extend_from_slice(&65535i64.to_be_bytes());
+        client.write_all(&header).await.expect("write header");
+        client.write_all(&payload).await.expect("write payload");
+        let (_ty, data) = read_v1_frame(&mut server).await.expect("read");
+        assert_eq!(data.len(), 65535);
+        assert_eq!(&data, &payload);
+    }
+
+    #[tokio::test]
+    async fn test_v1_frame_truncated_header() {
+        let (mut client, mut server) = duplex(1024);
+        // Write only 3 bytes (incomplete header)
+        client.write_all(&[msg::TYPE_PING, 0x00, 0x00]).await.expect("write partial");
+        drop(client); // close write side
+        let result = read_v1_frame(&mut server).await;
+        assert!(result.is_err(), "truncated header should error");
+    }
+
+    #[tokio::test]
+    async fn test_v1_frame_truncated_payload() {
+        let (mut client, mut server) = duplex(1024);
+        // Write header claiming 100 bytes, but only 50 bytes follow
+        let mut header = vec![msg::TYPE_PING];
+        header.extend_from_slice(&100i64.to_be_bytes());
+        client.write_all(&header).await.expect("write header");
+        client.write_all(&vec![0u8; 50]).await.expect("write partial payload");
+        drop(client);
+        let result = read_v1_frame(&mut server).await;
+        assert!(result.is_err(), "truncated payload should error");
+    }
+
+    #[tokio::test]
+    async fn test_v1_frame_oversized() {
+        // Writing a message > 64KB should fail
+        let big = crate::msg::UDPPacket {
+            content: vec![b'x'; 70000],
+            local_addr: "0.0.0.0:0".into(),
+            remote_addr: "0.0.0.0:0".into(),
+        };
+        let msg = FrpMessage::UDPPacket(big);
+        let (mut client, _server) = duplex(131072);
+        let result = write_v1_frame(&mut client, &msg).await;
+        assert!(result.is_err(), "oversized payload should error");
+    }
+
+    #[tokio::test]
+    async fn test_v1_frame_invalid_length() {
+        let (mut client, mut server) = duplex(1024);
+        // Write a negative length value
+        let mut header = vec![msg::TYPE_PING];
+        header.extend_from_slice(&(-1i64).to_be_bytes());
+        client.write_all(&header).await.expect("write");
+        let result = read_v1_frame(&mut server).await;
+        assert!(result.is_err(), "negative length should error");
+    }
+
+    #[tokio::test]
+    async fn test_v1_frame_unknown_type_byte() {
+        let (mut client, mut server) = duplex(1024);
+        // Type byte 0x00 with empty payload
+        let mut header = vec![0x00u8];
+        header.extend_from_slice(&0i64.to_be_bytes());
+        client.write_all(&header).await.expect("write");
+        let result = read_msg_v1(&mut server).await;
+        assert!(result.is_err(), "unknown type byte should error");
+    }
 }

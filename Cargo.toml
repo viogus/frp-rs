@@ -39,6 +39,8 @@ futures-util = "0.3"
 webpki-roots = "0.26"
 axum = "0.8.9"
 libc = "0.2"
+yamux = "0.14"
+tokio-util = { version = "0.7", features = ["compat"] }
 
 [profile.release]
 opt-level = "z"

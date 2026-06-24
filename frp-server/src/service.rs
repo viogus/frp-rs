@@ -11,6 +11,8 @@ use frp_core::config::ServerConfig;
 use frp_core::auth::{AuthConfig, AuthMethod};
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::read_msg_v1;
+use frp_core::mux;
+use frp_core::protocol::write_msg_v1;
 use frp_core::transport::{IoStream, ConnectionType, peek_connection_type, consume_tls_head_byte};
 use frp_core::transport::{build_tls_acceptor, accept_websocket};
 use frp_core::format_socket_addr;
@@ -63,10 +65,12 @@ pub struct AppState {
     pub dashboard_start: std::time::Instant,
     pub allow_ports: Vec<(u16, u16)>,
     pub sub_domain_host: String,
+    pub tcp_mux: bool,
+    pub tcp_mux_keepalive: i64,
 }
 
 impl AppState {
-    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String) -> Self {
+    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             auth_cfg: Arc::new(auth_cfg),
@@ -80,6 +84,8 @@ impl AppState {
             sk_index: Arc::new(RwLock::new(HashMap::new())),
             allow_ports,
             sub_domain_host,
+            tcp_mux,
+            tcp_mux_keepalive,
         }
     }
 }
@@ -123,6 +129,8 @@ impl Service {
             enc_key,
             allow_ports,
             sub_host,
+            cfg.transport.tcp_mux,
+            cfg.transport.tcp_mux_keepalive_interval,
         )),
             cfg,
         }
@@ -168,7 +176,7 @@ impl Service {
                                         info!("WebSocket upgrade completed for {}", addr);
                                         match read_msg_v1(&mut ws).await {
                                             Ok(FrpMessage::Login(login)) => {
-                                                control::handle_control(ws, login, state.clone(), Some(addr)).await;
+                                                control::handle_control(ws, login, state.clone(), Some(addr), None).await;
                                             }
                                             Ok(FrpMessage::NewWorkConn(nwc)) => {
                                                 handle_work_conn_inner(ws, nwc, state.clone()).await;
@@ -280,7 +288,7 @@ impl Service {
                                 let mut tls = tls_stream;
                                 match read_msg_v1(&mut tls).await {
                                     Ok(FrpMessage::Login(login)) => {
-                                        control::handle_control(tls, login, state, Some(addr)).await;
+                                        control::handle_control(tls, login, state, Some(addr), None).await;
                                     }
                                     Ok(FrpMessage::NewWorkConn(nwc)) => {
                                         let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
@@ -308,7 +316,7 @@ impl Service {
                                         info!("WebSocket upgrade on main port for {}", addr);
                                         match read_msg_v1(&mut ws).await {
                                             Ok(FrpMessage::Login(login)) => {
-                                                control::handle_control(ws, login, state.clone(), Some(addr)).await;
+                                                control::handle_control(ws, login, state.clone(), Some(addr), None).await;
                                             }
                                             Ok(FrpMessage::NewWorkConn(nwc)) => {
                                                 handle_work_conn_inner(ws, nwc, state.clone()).await;
@@ -334,7 +342,53 @@ impl Service {
                                 // Byte is still in buffer, read_msg_v1 will consume it
                                 match read_msg_v1(&mut stream).await {
                                     Ok(FrpMessage::Login(login)) => {
-                                        control::handle_control(stream, login, state, Some(addr)).await;
+                                        let use_mux = state.tcp_mux;
+                                        if use_mux {
+                                            // Validate auth inline (matches handle_control)
+                                            if let Err(e) = state.auth_cfg.validate_login(
+                                                login.privilege_key.as_deref(),
+                                                login.timestamp,
+                                            ) {
+                                                warn!("Auth failed for yamux client {:?}: {}", addr, e);
+                                                let resp = FrpMessage::LoginResp(msg::LoginResp {
+                                                    version: Some(frp_core::VERSION.into()),
+                                                    run_id: None,
+                                                    error: Some(e),
+                                                });
+                                                let _ = write_msg_v1(&mut stream, &resp).await;
+                                            } else {
+                                                // Send LoginResp on raw TCP before yamux wrapping
+                                                let run_id = login.run_id.clone()
+                                                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                                                let log_run_id = run_id.clone();
+                                                let resp = FrpMessage::LoginResp(msg::LoginResp {
+                                                    version: Some(frp_core::VERSION.into()),
+                                                    run_id: Some(run_id),
+                                                    error: None,
+                                                });
+                                                if let Err(e) = write_msg_v1(&mut stream, &resp).await {
+                                                    warn!("Failed to send LoginResp to yamux client {:?}: {}", addr, e);
+                                                } else {
+                                                    let mux_cfg = mux::TcpMuxConfig {
+                                                        keepalive_interval: std::time::Duration::from_secs(
+                                                            state.tcp_mux_keepalive.max(1) as u64
+                                                        ),
+                                                    };
+                                                    match mux::server_mux(stream, &mux_cfg).await {
+                                                        Ok((control_stream, incoming)) => {
+                                                            let io = IoStream::Yamux(control_stream);
+                                                            info!("Yamux session established for {:?} (run_id {})", addr, log_run_id);
+                                                            control::handle_control(io, login, state, Some(addr), Some(incoming)).await;
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("Failed to start yamux server for {:?}: {}", addr, e);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            control::handle_control(stream, login, state, Some(addr), None).await;
+                                        }
                                     }
                                     Ok(FrpMessage::NewWorkConn(nwc)) => {
                                         let io = IoStream::Tcp(stream);

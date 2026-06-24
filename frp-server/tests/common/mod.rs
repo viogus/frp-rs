@@ -52,6 +52,7 @@ pub async fn raw_login(
         privilege_key,
         metas: None,
         client_spec: None,
+        multiplexer: None,
     });
 
     write_msg_v1(&mut stream, &login).await?;

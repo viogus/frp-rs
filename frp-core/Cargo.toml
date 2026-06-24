@@ -32,3 +32,5 @@ rustls.workspace = true
 rustls-pemfile.workspace = true
 webpki-roots.workspace = true
 libc.workspace = true
+yamux.workspace = true
+tokio-util.workspace = true

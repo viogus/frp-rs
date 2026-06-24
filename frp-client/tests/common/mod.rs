@@ -68,6 +68,10 @@ pub fn start_frps(port: u16, token: &str) -> JoinHandle<()> {
         },
         allow_port_start: port.saturating_sub(50),
         allow_port_end: port.saturating_add(50).min(u16::MAX),
+        transport: frp_core::config::ServerTransportConfig {
+            tcp_mux: false,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let service = ServerService::new(cfg);
@@ -135,6 +139,7 @@ impl TestHarness {
             token: token.to_string(),
             login_fail_exit: false,
             pool_count: 1,
+            tcp_mux: false,
             proxies: vec![ProxyConfig {
                 name: "e2e-test".into(),
                 proxy_type: "tcp".into(),

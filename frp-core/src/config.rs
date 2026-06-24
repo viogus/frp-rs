@@ -235,7 +235,7 @@ pub struct ServerTransportConfig {
 impl Default for ServerTransportConfig {
     fn default() -> Self {
         Self {
-            tcp_mux: true,
+            tcp_mux: false,
             tcp_mux_keepalive_interval: 30,
         }
     }
@@ -344,7 +344,7 @@ impl Default for ClientConfig {
             login_fail_exit: true,
             pool_count: 0,
             dns_server: String::new(),
-            tcp_mux: true,
+            tcp_mux: false,
             proxies: vec![],
             visitors: vec![],
         }
@@ -818,5 +818,68 @@ remote_port = 7001
         assert_eq!(cfg.server_port, 7000);
         assert_eq!(cfg.transport_protocol, "tcp");
         assert_eq!(cfg.proxies.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_allow_ports_edge_cases() {
+        // Empty string
+        let result = parse_allow_ports("");
+        assert!(result.is_empty());
+
+        // Garbage input
+        let result = parse_allow_ports("not-a-port");
+        assert!(result.is_empty());
+
+        // Single port
+        let result = parse_allow_ports("8080");
+        assert_eq!(result, vec![(8080, 8080)]);
+
+        // Two single ports (parsed individually)
+        let result = parse_allow_ports("9000,8000");
+        assert_eq!(result, vec![(9000, 9000), (8000, 8000)]);
+
+        // Mixed ranges and single ports
+        let result = parse_allow_ports("1000-2000,3000,5000-6000");
+        assert_eq!(result, vec![(1000, 2000), (3000, 3000), (5000, 6000)]);
+
+        // Whitespace handling
+        let result = parse_allow_ports(" 1000 , 2000-3000 ");
+        assert_eq!(result, vec![(1000, 1000), (2000, 3000)]);
+
+        // Out of range values filtered (returns empty vec via None from parse)
+        let result = parse_allow_ports("99999"); // > u16::MAX
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_bandwidth_limit_edge_cases() {
+        // Empty/zero → None (no limit)
+        assert_eq!(parse_bandwidth_limit(""), None);
+        assert_eq!(parse_bandwidth_limit("0"), None);
+
+        // KB variants (decimal: 1KB = 1000)
+        assert_eq!(parse_bandwidth_limit("1KB"), Some(1000));
+        assert_eq!(parse_bandwidth_limit("1K"), Some(1000));
+
+        // MB variants
+        assert_eq!(parse_bandwidth_limit("1MB"), Some(1_000_000));
+        assert_eq!(parse_bandwidth_limit("1M"), Some(1_000_000));
+
+        // GB variant
+        assert_eq!(parse_bandwidth_limit("1GB"), Some(1_000_000_000));
+
+        // Plain bytes
+        assert_eq!(parse_bandwidth_limit("500"), Some(500));
+
+        // Case insensitive (input uppercased internally)
+        assert_eq!(parse_bandwidth_limit("1mb"), Some(1_000_000));
+        assert_eq!(parse_bandwidth_limit("1kb"), Some(1000));
+
+        // Garbage → None
+        assert_eq!(parse_bandwidth_limit("not-a-number"), None);
+        assert_eq!(parse_bandwidth_limit("abc"), None);
+
+        // Large value doesn't overflow
+        assert!(parse_bandwidth_limit("999MB").is_some());
     }
 }

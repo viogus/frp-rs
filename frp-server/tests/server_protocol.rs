@@ -503,6 +503,7 @@ async fn test_login_via_websocket() {
         privilege_key: None,
         metas: None,
         client_spec: None,
+        multiplexer: None,
     });
     io.write_v1_frame(&login).await.expect("send login over WS");
 
@@ -566,6 +567,7 @@ async fn test_login_via_tls() {
         privilege_key: None,
         metas: None,
         client_spec: None,
+        multiplexer: None,
     });
     io.write_v1_frame(&login).await.expect("send login over TLS");
 

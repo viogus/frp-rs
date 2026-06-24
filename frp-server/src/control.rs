@@ -9,6 +9,7 @@ use tracing::{info, warn, debug};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use frp_core::msg::{self, FrpMessage};
+use frp_core::mux::IncomingStreams;
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
 use frp_core::format_socket_addr;
@@ -43,6 +44,7 @@ pub async fn handle_control<S>(
     login: msg::Login,
     state: Arc<AppState>,
     peer: Option<SocketAddr>,
+    mut incoming: Option<IncomingStreams>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -85,16 +87,18 @@ pub async fn handle_control<S>(
     // --- Split stream for reading/writing ---
     let (mut reader, mut writer) = tokio::io::split(stream);
 
-    // --- Send login response ---
-    let resp = FrpMessage::LoginResp(msg::LoginResp {
-        version: Some(frp_core::VERSION.into()),
-        run_id: Some(run_id.clone()),
-        error: None,
-    });
-    if let Err(e) = write_msg_v1(&mut writer, &resp).await {
-        warn!("Failed to send login response to {:?}: {}", peer, e);
-        unregister_control(&state, &run_id).await;
-        return;
+    // --- Send login response (skip if yamux already sent it in accept loop) ---
+    if incoming.is_none() {
+        let resp = FrpMessage::LoginResp(msg::LoginResp {
+            version: Some(frp_core::VERSION.into()),
+            run_id: Some(run_id.clone()),
+            error: None,
+        });
+        if let Err(e) = write_msg_v1(&mut writer, &resp).await {
+            warn!("Failed to send login response to {:?}: {}", peer, e);
+            unregister_control(&state, &run_id).await;
+            return;
+        }
     }
 
     // --- Per-client state ---
@@ -246,6 +250,34 @@ pub async fn handle_control<S>(
                 }
             }
 
+            // Accept yamux streams (TcpMux work connections)
+            incoming_msg = async {
+                match &mut incoming {
+                    Some(inc) => inc.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(stream) = incoming_msg {
+                    debug!("Yamux work conn for run_id {}", run_id);
+                    let stream = IoStream::Yamux(stream);
+                    while let Some(req) = pending_requests.front() {
+                        if req.created_at.elapsed() > PENDING_REQUEST_TIMEOUT {
+                            pending_requests.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Some(req) = pending_requests.pop_front() {
+                        assign_work_to_proxy(stream, req, state.encryption_key).await;
+                    } else if work_pool.len() < pool_cap {
+                        work_pool.push_back(stream);
+                        debug!("Yamux work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
+                    } else {
+                        debug!("Work pool full for {} ({}/{}), dropping yamux work conn", run_id, work_pool.len(), pool_cap);
+                    }
+                }
+            }
+
             msg = read_msg_v1(&mut reader) => {
                 match msg {
                     Ok(FrpMessage::UDPPacket(up)) => {
@@ -290,6 +322,11 @@ pub async fn handle_control<S>(
                         }
                         state.proxy_manager.remove(&cp.proxy_name).await;
                         info!("Proxy closed: {}", cp.proxy_name);
+                        // Send CloseProxyResp back to client (Go frp compat)
+                        let cpr = FrpMessage::CloseProxyResp(msg::CloseProxyResp {
+                            proxy_name: cp.proxy_name.clone(),
+                        });
+                        let _ = write_msg_v1(&mut writer, &cpr).await;
                     }
                     Ok(FrpMessage::Ping(ref ping_msg)) => {
                         // Validate ping auth (Go frp v0.69.1 compat)
@@ -350,6 +387,7 @@ async fn assign_work_to_proxy(
         IoStream::Tcp(ref mut s) => write_msg_v1(s, &swc).await,
         IoStream::Tls(ref mut s) => write_msg_v1(s, &swc).await,
         IoStream::WebSocket(ref mut s) => write_msg_v1(s, &swc).await,
+        IoStream::Yamux(ref mut s) => write_msg_v1(s, &swc).await,
         IoStream::Kcp(_) => { warn!("Kcp streaming not yet supported"); return; }
     };
 
@@ -430,6 +468,11 @@ async fn assign_work_to_proxy(
                     frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key).await;
                 }
                 IoStream::WebSocket(work) => {
+                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (w_r, w_w) = tokio::io::split(work);
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key).await;
+                }
+                IoStream::Yamux(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key).await;
