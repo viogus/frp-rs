@@ -514,23 +514,15 @@ fn normalize_client_config(value: &mut toml::Value) {
 }
 
 /// Load a TOML server configuration from a file path.
-/// Supports both Go frp format ([common] section, flat fields) and frp-rs format.
 pub fn load_server_config(path: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)?;
-    let mut value: toml::Value = toml::from_str(&content)?;
-    normalize_server_config(&mut value);
-    let cfg: ServerConfig = serde_json::from_value(toml_to_json(value))?;
-    Ok(cfg)
+    load_server_config_from_str(&content)
 }
 
 /// Load a TOML client configuration from a file path.
-/// Supports both Go frp format ([common] section, flat fields) and frp-rs format.
 pub fn load_client_config(path: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)?;
-    let mut value: toml::Value = toml::from_str(&content)?;
-    normalize_client_config(&mut value);
-    let cfg: ClientConfig = serde_json::from_value(toml_to_json(value))?;
-    Ok(cfg)
+    load_client_config_from_str(&content)
 }
 
 

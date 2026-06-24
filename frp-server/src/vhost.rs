@@ -115,8 +115,6 @@ pub async fn run_vhost_http_listener(
     }
 }
 
-/// Extract the Host header from an HTTP request string.
-
 /// Run an HTTPS VHost listener on the given address.
 /// Performs TLS handshake, then extracts Host header and routes via InternalMsg.
 pub async fn run_vhost_https_listener(
@@ -179,6 +177,9 @@ pub async fn run_vhost_https_listener(
                         ),
                         pre_read,
                     }).ok();
+                } else {
+                    warn!("HTTPS VHost route for '{}' found but control handler gone", host);
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut tls_stream, b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                 }
             } else {
                 warn!("No VHost route for '{}' from {}", host, peer);
@@ -188,12 +189,17 @@ pub async fn run_vhost_https_listener(
     }
 }
 
+/// Extract the Host header value from an HTTP request (hostname only, no port).
 fn extract_host_header(request: &str) -> Option<&str> {
     for line in request.lines() {
         let lower = line.to_lowercase();
         if lower.starts_with("host:") {
             let value = line[5..].trim();
-            return Some(value.split(':').next().unwrap_or(value));
+            // Handle IPv6: [::1]:8080 → ::1, example.com:8080 → example.com
+            if value.starts_with('[') {
+                return value.find(']').map(|end| &value[1..end]);
+            }
+            return Some(value.rsplitn(2, ':').next().unwrap_or(value));
         }
     }
     None

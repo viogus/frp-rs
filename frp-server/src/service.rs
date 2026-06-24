@@ -70,7 +70,7 @@ impl AppState {
             run_id_to_ctl_tx: Arc::new(RwLock::new(HashMap::new())),
             proxy_bind_addr,
             vhost_manager: Arc::new(VhostManager::new()),
-            vhost_http_port: 0,
+            vhost_http_port: 0, // set by Service::run() before starting listeners
             encryption_key,
             dashboard_start: std::time::Instant::now(),
             sk_index: Arc::new(RwLock::new(HashMap::new())),

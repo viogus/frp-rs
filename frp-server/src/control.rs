@@ -86,6 +86,7 @@ pub async fn handle_control<S>(
     // --- Per-client state ---
     let mut work_pool: VecDeque<IoStream> = VecDeque::new();
     let mut pending_requests: VecDeque<PendingRequest> = VecDeque::new();
+    let mut listener_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> = std::collections::HashMap::new();
 
     // --- Main select loop ---
     loop {
@@ -193,7 +194,7 @@ pub async fn handle_control<S>(
                         });
                     }
                     Ok(FrpMessage::NewProxy(np)) => {
-                        handle_new_proxy(np, &run_id, &state, &mut writer, &internal_tx).await;
+                        handle_new_proxy(np, &run_id, &state, &mut writer, &internal_tx, &mut listener_handles).await;
                     }
                     Ok(FrpMessage::CloseProxy(cp)) => {
                         if let Some(info) = state.proxy_manager.get(&cp.proxy_name).await {
@@ -208,6 +209,10 @@ pub async fn handle_control<S>(
                             }
                             // Clean up VHost routes
                             state.vhost_manager.unregister(&cp.proxy_name).await;
+                        }
+                        // Stop the listener task
+                        if let Some(handle) = listener_handles.remove(&cp.proxy_name) {
+                            handle.abort();
                         }
                         state.proxy_manager.remove(&cp.proxy_name).await;
                         info!("Proxy closed: {}", cp.proxy_name);
@@ -233,6 +238,9 @@ pub async fn handle_control<S>(
     }
 
     // Cleanup
+    for (_, handle) in listener_handles.drain() {
+        handle.abort();
+    }
     unregister_control(&state, &run_id).await;
     state.proxy_manager.remove_client(&run_id).await;
     info!("Control connection {} removed", run_id);
@@ -274,14 +282,14 @@ async fn assign_work_to_proxy(
     tokio::spawn(async move {
         // Write VHost pre-read bytes to work connection first
         if !pre_read.is_empty() {
-            match &mut work_conn {
-                IoStream::Tcp(ref mut s) => {
-                    let _ = s.write_all(&pre_read).await;
-                }
-                IoStream::Tls(ref mut s) => {
-                    let _ = s.write_all(&pre_read).await;
-                }
-                _ => {}
+            let write_result = match &mut work_conn {
+                IoStream::Tcp(ref mut s) => s.write_all(&pre_read).await,
+                IoStream::Tls(ref mut s) => s.write_all(&pre_read).await,
+                _ => Ok(()),
+            };
+            if let Err(e) = write_result {
+                warn!("Failed to write VHost pre-read bytes: {}", e);
+                return;
             }
         }
 
@@ -338,6 +346,7 @@ async fn handle_new_proxy(
     state: &Arc<AppState>,
     writer: &mut (impl AsyncWriteExt + Unpin),
     internal_tx: &mpsc::UnboundedSender<InternalMsg>,
+    listener_handles: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
 ) {
     let raw_port = np.remote_port.unwrap_or(0);
     if raw_port < 0 || raw_port > u16::MAX as i32 {
@@ -405,24 +414,23 @@ async fn handle_new_proxy(
                 }
             }
 
-            // For UDP proxies, start a UDP listener
-            if np.proxy_type == "udp" {
-                let pn = np.proxy_name.clone();
-                let itx = internal_tx.clone();
-                let bind_addr = state.proxy_bind_addr.clone();
-                tokio::spawn(async move {
-                    run_udp_listener(bind_addr, port, pn, itx).await;
-                });
-                info!("UDP proxy '{}' listening on port {}", np.proxy_name, port);
-            }
-
+            // Start the appropriate listener for this proxy type
             let pn = np.proxy_name.clone();
             let itx = internal_tx.clone();
             let bind_addr = state.proxy_bind_addr.clone();
 
-            tokio::spawn(async move {
-                listen_and_proxy(bind_addr, port, pn, itx).await;
-            });
+            if np.proxy_type == "udp" {
+                let handle = tokio::spawn(async move {
+                    run_udp_listener(bind_addr, port, pn, itx).await;
+                });
+                listener_handles.insert(np.proxy_name.clone(), handle);
+                info!("UDP proxy '{}' listening on port {}", np.proxy_name, port);
+            } else {
+                let handle = tokio::spawn(async move {
+                    listen_and_proxy(bind_addr, port, pn, itx).await;
+                });
+                listener_handles.insert(np.proxy_name.clone(), handle);
+            }
 
             info!("Proxy '{}' registered on port {} (run_id: {})", np.proxy_name, port, run_id);
             let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {

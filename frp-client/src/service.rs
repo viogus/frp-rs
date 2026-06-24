@@ -40,12 +40,17 @@ impl Service {
 
         let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
 
-        let proxy_info_map: HashMap<String, ProxyRuntimeInfo> = cfg.proxies.iter()
-            .map(|p| (p.name.clone(), ProxyRuntimeInfo {
+        let mut proxy_info_map: HashMap<String, ProxyRuntimeInfo> = HashMap::new();
+        for p in &cfg.proxies {
+            if proxy_info_map.contains_key(&p.name) {
+                warn!("Duplicate proxy name '{}' — only the first entry will be used", p.name);
+                continue;
+            }
+            proxy_info_map.insert(p.name.clone(), ProxyRuntimeInfo {
                 local_addr: format!("{}:{}", p.local_ip, p.local_port),
                 use_encryption: p.use_encryption,
-            }))
-            .collect();
+            });
+        }
 
         Self { cfg, auth_cfg: Arc::new(auth_cfg), encryption_key: enc_key, proxy_info_map }
     }
