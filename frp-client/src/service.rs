@@ -144,7 +144,7 @@ impl Service {
                     &mut tcp,
                 ).await {
                     Ok(resp) => {
-                        info!("Proxy '{}' registered on remote port {:?}", p.name, resp.remote_port);
+                        info!("Proxy '{}' registered on remote port {:?}", p.name, resp.remote_addr);
                     }
                     Err(e) => {
                         warn!("Failed to register proxy '{}': {}", p.name, e);

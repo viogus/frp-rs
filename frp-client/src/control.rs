@@ -136,7 +136,7 @@ impl ControlConnection {
                         "Proxy '{name}' registration failed: {err}"
                     )));
                 }
-                info!("Proxy '{name}' registered on remote port {:?}", resp.remote_port);
+                info!("Proxy '{name}' registered on remote port {:?}", resp.remote_addr);
                 Ok(resp)
             }
             _ => Err(frp_core::Error::Protocol("Unexpected response to NewProxy".into())),

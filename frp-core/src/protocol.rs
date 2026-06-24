@@ -145,7 +145,32 @@ fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate::Er
                 .map_err(|e| crate::Error::Protocol(format!("deserialize UDPPacket: {e}")))?;
             FrpMessage::UDPPacket(v)
         }
-        _ => return Err(crate::Error::Protocol(format!("unknown V1 type: {type_byte}"))),
+        msg::TYPE_NAT_HOLE_VISITOR => {
+            let v: msg::NatHoleVisitor = serde_json::from_slice(payload)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleVisitor: {e}")))?;
+            FrpMessage::NatHoleVisitor(v)
+        }
+        msg::TYPE_NAT_HOLE_CLIENT => {
+            let v: msg::NatHoleClient = serde_json::from_slice(payload)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleClient: {e}")))?;
+            FrpMessage::NatHoleClient(v)
+        }
+        msg::TYPE_NAT_HOLE_RESP => {
+            let v: msg::NatHoleResp = serde_json::from_slice(payload)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleResp: {e}")))?;
+            FrpMessage::NatHoleResp(v)
+        }
+        msg::TYPE_NAT_HOLE_SID => {
+            let v: msg::NatHoleSid = serde_json::from_slice(payload)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleSid: {e}")))?;
+            FrpMessage::NatHoleSid(v)
+        }
+        msg::TYPE_NAT_HOLE_REPORT => {
+            let v: msg::NatHoleReport = serde_json::from_slice(payload)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleReport: {e}")))?;
+            FrpMessage::NatHoleReport(v)
+        }
+        _ => return Err(crate::Error::Protocol(format!("unknown V1 type byte: 0x{type_byte:02x}"))),
     };
     Ok(msg)
 }

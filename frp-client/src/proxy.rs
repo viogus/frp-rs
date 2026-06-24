@@ -26,7 +26,20 @@ pub fn create_new_proxy_msg(
         remote_port: Some(remote_port as i32),
         sk: if sk.is_empty() { None } else { Some(sk.to_string()) },
         custom_domains: if custom_domains.is_empty() { None } else { Some(custom_domains.to_vec()) },
+        subdomain: None,
+        locations: None,
+        http_user: None,
+        http_pwd: None,
+        host_header_rewrite: None,
+        headers: None,
+        response_headers: None,
+        route_by_http_user: None,
+        allow_users: None,
+        bandwidth_limit: None,
+        bandwidth_limit_mode: None,
+        annotations: None,
         metas: None,
+        multiplexer: None,
     })
 }
 

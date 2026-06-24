@@ -45,7 +45,6 @@ pub async fn handle_control<S>(
         let resp = FrpMessage::LoginResp(msg::LoginResp {
             version: Some(frp_core::VERSION.into()),
             run_id: None,
-            server_udp_port: None,
             error: Some(e),
         });
         let (_, mut writer) = tokio::io::split(stream);
@@ -73,7 +72,6 @@ pub async fn handle_control<S>(
     let resp = FrpMessage::LoginResp(msg::LoginResp {
         version: Some(frp_core::VERSION.into()),
         run_id: Some(run_id.clone()),
-        server_udp_port: None,
         error: None,
     });
     if let Err(e) = write_msg_v1(&mut writer, &resp).await {
@@ -157,7 +155,7 @@ pub async fn handle_control<S>(
                 match msg {
                     Ok(FrpMessage::NewVisitorConn(nvc)) => {
                         debug!("NewVisitorConn for proxy '{}'", nvc.proxy_name);
-                        let sk = nvc.sk.as_deref().unwrap_or("");
+                        let sk = nvc.sign_key.as_deref().unwrap_or("");
                         let proxy_name = state.sk_index.read().await.get(sk).cloned();
                         let resp = match proxy_name {
                             Some(pn) => FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
@@ -205,7 +203,7 @@ pub async fn handle_control<S>(
                         info!("Proxy closed: {}", cp.proxy_name);
                     }
                     Ok(FrpMessage::Ping(_)) => {
-                        let pong = FrpMessage::Pong(msg::Pong {});
+                        let pong = FrpMessage::Pong(msg::Pong { error: None });
                         if let Err(e) = write_msg_v1(&mut writer, &pong).await {
                             warn!("Failed to send pong: {}", e);
                             break;
@@ -241,6 +239,8 @@ async fn assign_work_to_proxy(
 ) {
     let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
         proxy_name: req.proxy_name.clone(),
+        src_addr: None,
+        src_port: None,
         dst_addr: None,
         dst_port: None,
         error: None,
@@ -361,7 +361,7 @@ async fn handle_new_proxy(
     if raw_port < 0 || raw_port > u16::MAX as i32 {
         let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
             proxy_name: np.proxy_name.clone(),
-            remote_port: None,
+            remote_addr: None,
             error: Some(format!("remote_port {} out of valid range (0-65535)", raw_port)),
         });
         let _ = write_msg_v1(writer, &resp).await;
@@ -392,7 +392,7 @@ async fn handle_new_proxy(
             if let Err(e) = state.proxy_manager.register(run_id.to_string(), info.clone()).await {
                 let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
                     proxy_name: np.proxy_name.clone(),
-                    remote_port: None,
+                    remote_addr: None,
                     error: Some(e),
                 });
                 let _ = write_msg_v1(writer, &resp).await;
@@ -442,9 +442,10 @@ async fn handle_new_proxy(
             }
 
             info!("Proxy '{}' registered on port {} (run_id: {})", np.proxy_name, port, run_id);
+            let remote_addr_str = format!(":{}", port);
             let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
                 proxy_name: np.proxy_name.clone(),
-                remote_port: Some(port as i32),
+                remote_addr: Some(remote_addr_str),
                 error: None,
             });
             let _ = write_msg_v1(writer, &resp).await;
@@ -453,7 +454,7 @@ async fn handle_new_proxy(
             warn!("No available port for proxy '{}'", np.proxy_name);
             let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
                 proxy_name: np.proxy_name.clone(),
-                remote_port: None,
+                remote_addr: None,
                 error: Some("no available port".into()),
             });
             let _ = write_msg_v1(writer, &resp).await;
