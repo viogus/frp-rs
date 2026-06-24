@@ -235,6 +235,52 @@ impl Service {
             info!("HTTPS VHost listener starting on {}", https_addr2);
         }
 
+        // Start KCP listener if configured
+        if self.cfg.kcp_bind_port > 0 {
+            let kcp_state = self.state.clone();
+            let kcp_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.kcp_bind_port);
+            let kcp_addr2 = kcp_addr.clone();
+            tokio::spawn(async move {
+                let mut listener = match frp_core::kcp::KcpListener::bind(&kcp_addr2, Default::default()).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::error!("KCP listener bind failed: {}", e);
+                        return;
+                    }
+                };
+                tracing::info!("KCP listener started on {}", kcp_addr2);
+                loop {
+                    match listener.accept().await {
+                        Ok(stream) => {
+                            let state = kcp_state.clone();
+                            tokio::spawn(async move {
+                                let mut ctl = frp_core::transport::IoStream::Kcp(stream);
+                                match frp_core::protocol::read_msg_v1(&mut ctl).await {
+                                    Ok(frp_core::msg::FrpMessage::Login(login)) => {
+                                        control::handle_control(ctl, login, state, None, None).await;
+                                    }
+                                    Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                                        handle_work_conn_inner(ctl, nwc, state).await;
+                                    }
+                                    Ok(other) => {
+                                        tracing::warn!("Unexpected KCP message: {:?}", other.v1_type_byte());
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("KCP read error: {}", e);
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!("KCP accept error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+            tracing::info!("KCP listener starting on {}", kcp_addr);
+        }
+
         // Start dashboard server if configured
         if self.cfg.web_server.port > 0 {
             let dash_addr = format_socket_addr(&self.cfg.web_server.addr, self.cfg.web_server.port);

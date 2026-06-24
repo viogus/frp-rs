@@ -7,6 +7,7 @@ use futures_util::stream::Stream;
 use futures_util::sink::Sink;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use crate::kcp::KcpStream;
 
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
@@ -36,6 +37,7 @@ pub const FRP_WEBSOCKET_PATH: &str = "/~!frp";
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransportProtocol {
     Tcp,
+    Kcp,
     WebSocket,
     Wss,
     Quic,
@@ -45,6 +47,7 @@ impl std::str::FromStr for TransportProtocol {
     type Err = ();
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s.to_lowercase().as_str() {
+            "kcp" => TransportProtocol::Kcp,
             "websocket" | "ws" => TransportProtocol::WebSocket,
             "wss" => TransportProtocol::Wss,
             "quic" => TransportProtocol::Quic,
@@ -225,7 +228,7 @@ impl AsyncWrite for WsByteStream {
 pub enum IoStream {
     Tcp(TcpStream),
     Tls(tokio_rustls::TlsStream<TcpStream>),
-    Kcp(tokio::io::DuplexStream),
+    Kcp(KcpStream),
     WebSocket(WsByteStream),
     Yamux(YamuxStream),
 }
@@ -437,6 +440,12 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 .await
                 .map_err(|e| crate::Error::Transport(format!("WebSocket connect: {e}")))?;
             Ok(IoStream::WebSocket(WsByteStream::new(ws_stream)))
+        }
+        TransportProtocol::Kcp => {
+            let addr = format!("{}:{}", opts.server_addr, opts.server_port);
+            let stream = crate::kcp::dial_kcp(&addr, Default::default()).await
+                .map_err(|e| crate::Error::Transport(format!("KCP dial: {e}")))?;
+            Ok(IoStream::Kcp(stream))
         }
         TransportProtocol::Quic => {
             Err(crate::Error::Transport("QUIC not yet implemented".into()))

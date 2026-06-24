@@ -73,14 +73,9 @@ impl ControlConnection {
 
         let mut io_stream = dial_server(&opts).await?;
 
-        // Reject transports that aren't yet supported for the control channel
+        // Verify transport is supported for the control channel
         match &io_stream {
-            IoStream::Kcp(_) => {
-                return Err(frp_core::Error::Transport(
-                    "KCP control connection not yet supported".into(),
-                ));
-            }
-            _ => {} // Tcp, Tls, and WebSocket are supported
+            _ => {} // Tcp, Tls, KCP, and WebSocket are all supported
         }
 
         let timestamp = std::time::SystemTime::now()

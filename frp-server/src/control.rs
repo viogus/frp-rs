@@ -424,7 +424,7 @@ async fn assign_work_to_proxy(
         IoStream::Tls(ref mut s) => write_msg_v1(s, &swc).await,
         IoStream::WebSocket(ref mut s) => write_msg_v1(s, &swc).await,
         IoStream::Yamux(ref mut s) => write_msg_v1(s, &swc).await,
-        IoStream::Kcp(_) => { warn!("Kcp streaming not yet supported"); return; }
+        IoStream::Kcp(ref mut s) => write_msg_v1(s, &swc).await,
     };
 
     if let Err(e) = write_result {

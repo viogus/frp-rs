@@ -8,6 +8,7 @@ pub mod mux;
 pub mod bridge;
 pub mod bandwidth;
 pub mod args;
+pub mod kcp;
 
 use thiserror::Error;
 

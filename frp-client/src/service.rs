@@ -483,14 +483,7 @@ fn spawn_work_conn(
                     return;
                 }
             };
-            // Reject unsupported transports for work conns
-            match &work {
-                IoStream::Kcp(_) => {
-                    warn!("Work conn {}: KCP not yet supported", label);
-                    return;
-                }
-                _ => {}
-            }
+            // All transport variants (Tcp, Tls, KCP, WebSocket, Yamux) are supported
             // Build auth and send NewWorkConn (not needed under yamux)
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

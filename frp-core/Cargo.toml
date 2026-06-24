@@ -34,3 +34,4 @@ webpki-roots.workspace = true
 libc.workspace = true
 yamux.workspace = true
 tokio-util.workspace = true
+kcp.workspace = true
