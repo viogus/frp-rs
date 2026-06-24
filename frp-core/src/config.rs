@@ -325,7 +325,7 @@ pub struct ClientConfig {
     pub pool_count: i32,
     #[serde(default)]
     pub dns_server: String,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub tcp_mux: bool,
     #[serde(default)]
     pub proxies: Vec<ProxyConfig>,
@@ -360,6 +360,7 @@ impl Default for ClientConfig {
 
 fn default_server_port() -> u16 { 7000 }
 fn default_transport_protocol() -> String { "tcp".into() }
+fn default_true() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
