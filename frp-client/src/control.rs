@@ -75,12 +75,7 @@ impl ControlConnection {
                     "KCP control connection not yet supported".into(),
                 ));
             }
-            IoStream::WebSocket(_) => {
-                return Err(frp_core::Error::Transport(
-                    "WebSocket control connection not yet fully supported".into(),
-                ));
-            }
-            _ => {} // Tcp and Tls are supported
+            _ => {} // Tcp, Tls, and WebSocket are supported
         }
 
         let timestamp = std::time::SystemTime::now()

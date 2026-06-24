@@ -8,7 +8,6 @@ use futures_util::sink::Sink;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
@@ -52,25 +51,10 @@ impl std::str::FromStr for TransportProtocol {
     }
 }
 
-/// Unified stream type for TCP and WebSocket.
-pub enum IoStream {
-    Tcp(TcpStream),
-    Tls(tokio_rustls::TlsStream<TcpStream>),
-    Kcp(tokio::io::DuplexStream),
-    WebSocket(WebSocketStream<MaybeTlsStream<TcpStream>>),
-}
-
-
-impl std::fmt::Debug for IoStream {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IoStream::Tcp(_) => f.debug_struct("IoStream::Tcp").finish_non_exhaustive(),
-            IoStream::Tls(_) => f.debug_struct("IoStream::Tls").finish_non_exhaustive(),
-            IoStream::Kcp(_) => f.debug_struct("IoStream::Kcp").finish_non_exhaustive(),
-            IoStream::WebSocket(_) => f.debug_struct("IoStream::WebSocket").finish_non_exhaustive(),
-        }
-    }
-}
+// ---------------------------------------------------------------
+// WsByteStream — WebSocket-to-byte-stream adapter
+// Defined BEFORE IoStream so IoStream can hold it as a variant.
+// ---------------------------------------------------------------
 
 /// A WebSocket-to-byte-stream adapter that implements AsyncRead/AsyncWrite.
 /// Converts between WebSocket binary messages and a byte stream suitable
@@ -79,6 +63,7 @@ pub struct WsByteStream {
     inner: Pin<Box<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
     read_buf: Vec<u8>,
     read_pos: usize,
+    needs_flush: bool,
 }
 
 impl WsByteStream {
@@ -87,6 +72,7 @@ impl WsByteStream {
             inner: Box::pin(ws),
             read_buf: Vec::new(),
             read_pos: 0,
+            needs_flush: false,
         }
     }
 
@@ -164,15 +150,39 @@ impl AsyncWrite for WsByteStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
-        match this.inner.as_mut().poll_ready(cx) {
-            Poll::Ready(Ok(())) => {
-                match this.inner.as_mut().start_send(Message::Binary(buf.to_vec())) {
-                    Ok(()) => Poll::Ready(Ok(buf.len())),
-                    Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+        // If we have unflushed data, flush it first before accepting more.
+        // This prevents duplicate messages when write_all re-polls after Pending.
+        if !this.needs_flush && !buf.is_empty() {
+            match this.inner.as_mut().poll_ready(cx) {
+                Poll::Ready(Ok(())) => {
+                    match this.inner.as_mut().start_send(Message::Binary(buf.to_vec())) {
+                        Ok(()) => {
+                            this.needs_flush = true;
+                            // Fall through to flush below
+                        }
+                        Err(e) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+                    }
                 }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
-            Poll::Pending => Poll::Pending,
+        }
+        // Flush queued data so write_all (which may not call poll_flush) works.
+        // tokio's write_all only loops poll_write; it doesn't call poll_flush.
+        if this.needs_flush {
+            match this.inner.as_mut().poll_flush(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.needs_flush = false;
+                    Poll::Ready(Ok(buf.len()))
+                }
+                Poll::Ready(Err(e)) => {
+                    this.needs_flush = false;
+                    Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            Poll::Ready(Ok(0))
         }
     }
 
@@ -180,8 +190,18 @@ impl AsyncWrite for WsByteStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        self.inner.as_mut().poll_flush(cx)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        if self.needs_flush {
+            match self.inner.as_mut().poll_flush(cx) {
+                Poll::Ready(Ok(())) => {
+                    self.needs_flush = false;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            Poll::Ready(Ok(()))
+        }
     }
 
     fn poll_shutdown(
@@ -193,10 +213,32 @@ impl AsyncWrite for WsByteStream {
     }
 }
 
+// ---------------------------------------------------------------
+// IoStream — unified stream type over TCP, TLS, KCP, WebSocket
+// ---------------------------------------------------------------
 
-// IoStream delegates AsyncRead/AsyncWrite to inner types.
-// All concrete stream types (TcpStream, TlsStream, DuplexStream) are Unpin,
-// so Pin::new() is sound.
+/// Unified stream type for TCP, TLS, KCP, and WebSocket.
+/// WebSocket variant wraps a WsByteStream adapter so all variants
+/// transparently support AsyncRead/AsyncWrite and V1 frame I/O.
+pub enum IoStream {
+    Tcp(TcpStream),
+    Tls(tokio_rustls::TlsStream<TcpStream>),
+    Kcp(tokio::io::DuplexStream),
+    WebSocket(WsByteStream),
+}
+
+impl std::fmt::Debug for IoStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IoStream::Tcp(_) => f.debug_struct("IoStream::Tcp").finish_non_exhaustive(),
+            IoStream::Tls(_) => f.debug_struct("IoStream::Tls").finish_non_exhaustive(),
+            IoStream::Kcp(_) => f.debug_struct("IoStream::Kcp").finish_non_exhaustive(),
+            IoStream::WebSocket(_) => f.debug_struct("IoStream::WebSocket").finish_non_exhaustive(),
+        }
+    }
+}
+
+// All inner types (TcpStream, TlsStream, DuplexStream, WsByteStream) are Unpin.
 impl tokio::io::AsyncRead for IoStream {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -207,10 +249,7 @@ impl tokio::io::AsyncRead for IoStream {
             IoStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Kcp(s) => Pin::new(s).poll_read(cx, buf),
-            IoStream::WebSocket(_) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                "WebSocket requires WsByteStream adapter for byte I/O",
-            ))),
+            IoStream::WebSocket(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -225,10 +264,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::Kcp(s) => Pin::new(s).poll_write(cx, buf),
-            IoStream::WebSocket(_) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                "WebSocket requires WsByteStream adapter for byte I/O",
-            ))),
+            IoStream::WebSocket(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -237,7 +273,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Tcp(s) => Pin::new(s).poll_flush(cx),
             IoStream::Tls(s) => Pin::new(s).poll_flush(cx),
             IoStream::Kcp(s) => Pin::new(s).poll_flush(cx),
-            IoStream::WebSocket(_) => Poll::Ready(Ok(())),
+            IoStream::WebSocket(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -246,35 +282,29 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::Kcp(s) => Pin::new(s).poll_shutdown(cx),
-            IoStream::WebSocket(_) => Poll::Ready(Ok(())),
+            IoStream::WebSocket(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
 
 impl IoStream {
     /// Write a V1 protocol frame to this stream.
-    /// Delegates to the inner stream type. WebSocket requires WsByteStream adapter.
     pub async fn write_v1_frame(&mut self, msg: &crate::msg::FrpMessage) -> Result<(), crate::Error> {
         match self {
             IoStream::Tcp(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::Tls(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::Kcp(s) => crate::protocol::write_msg_v1(s, msg).await,
-            IoStream::WebSocket(_) => {
-                Err(crate::Error::Transport("WebSocket requires WsByteStream adapter".into()))
-            }
+            IoStream::WebSocket(s) => crate::protocol::write_msg_v1(s, msg).await,
         }
     }
 
     /// Read a V1 protocol frame from this stream.
-    /// Delegates to the inner stream type. WebSocket requires WsByteStream adapter.
     pub async fn read_v1_frame(&mut self) -> Result<crate::msg::FrpMessage, crate::Error> {
         match self {
             IoStream::Tcp(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Tls(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Kcp(s) => crate::protocol::read_msg_v1(s).await,
-            IoStream::WebSocket(_) => {
-                Err(crate::Error::Transport("WebSocket requires WsByteStream adapter".into()))
-            }
+            IoStream::WebSocket(s) => crate::protocol::read_msg_v1(s).await,
         }
     }
 
@@ -282,15 +312,11 @@ impl IoStream {
     pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         match self {
             IoStream::Tcp(s) => s.peer_addr().ok(),
-            IoStream::Tls(_) => None,
-            IoStream::Kcp(_) => None,
-            IoStream::WebSocket(_) => None,
+            IoStream::Tls(_) | IoStream::Kcp(_) | IoStream::WebSocket(_) => None,
         }
     }
 
     /// Split the stream into owned read and write halves.
-    /// The halves are boxed so different stream variants (TCP, TLS)
-    /// can be returned from a single method.
     pub fn into_split(
         self,
     ) -> (
@@ -310,8 +336,7 @@ impl IoStream {
                 let (r, w) = tokio::io::split(stream);
                 (Box::new(r), Box::new(w))
             }
-            IoStream::WebSocket(ws) => {
-                let adapter = WsByteStream::new(ws);
+            IoStream::WebSocket(adapter) => {
                 let (r, w) = tokio::io::split(adapter);
                 (Box::new(r), Box::new(w))
             }
@@ -397,7 +422,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             let (ws_stream, _) = tokio_tungstenite::connect_async(url)
                 .await
                 .map_err(|e| crate::Error::Transport(format!("WebSocket connect: {e}")))?;
-            Ok(IoStream::WebSocket(ws_stream))
+            Ok(IoStream::WebSocket(WsByteStream::new(ws_stream)))
         }
         TransportProtocol::Quic => {
             Err(crate::Error::Transport("QUIC not yet implemented".into()))
@@ -465,12 +490,14 @@ pub async fn consume_tls_head_byte(stream: &mut TcpStream) -> Result<(), crate::
 }
 
 /// Accept a WebSocket upgrade on the server side.
+/// Returns an IoStream with a WsByteStream adapter already applied,
+/// so callers can use read_msg_v1/write_msg_v1 directly.
 pub async fn accept_websocket(stream: TcpStream) -> Result<IoStream, crate::Error> {
     let tls_stream = MaybeTlsStream::Plain(stream);
     let ws_stream = tokio_tungstenite::accept_async(tls_stream)
         .await
         .map_err(|e| crate::Error::Transport(format!("WebSocket accept: {e}")))?;
-    Ok(IoStream::WebSocket(ws_stream))
+    Ok(IoStream::WebSocket(WsByteStream::new(ws_stream)))
 }
 
 /// TLS configuration.

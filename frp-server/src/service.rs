@@ -164,25 +164,17 @@ impl Service {
                             let state = ws_state.clone();
                             tokio::spawn(async move {
                                 match frp_core::transport::accept_websocket(stream).await {
-                                    Ok(ws) => {
+                                    Ok(mut ws) => {
                                         info!("WebSocket upgrade completed for {}", addr);
-                                        // Read first frame to dispatch
-                                        let ws_inner = match ws {
-                                            IoStream::WebSocket(inner) => inner,
-                                            _ => unreachable!(),
-                                        };
-                                        let mut adapter = frp_core::transport::WsByteStream::new(ws_inner);
-                                        match read_msg_v1(&mut adapter).await {
+                                        match read_msg_v1(&mut ws).await {
                                             Ok(FrpMessage::Login(login)) => {
-                                                control::handle_control(adapter, login, state.clone(), Some(addr)).await;
+                                                control::handle_control(ws, login, state.clone(), Some(addr)).await;
                                             }
                                             Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                let io = IoStream::WebSocket(adapter.into_inner());
-                                                handle_work_conn_inner(io, nwc, state.clone()).await;
+                                                handle_work_conn_inner(ws, nwc, state.clone()).await;
                                             }
                                             Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                let io = IoStream::WebSocket(adapter.into_inner());
-                                                handle_visitor_conn_inner(io, nvc, state.clone()).await;
+                                                handle_visitor_conn_inner(ws, nvc, state.clone()).await;
                                             }
                                             Ok(other) => {
                                                 warn!("Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
@@ -308,26 +300,21 @@ impl Service {
                             }
 
                             ConnectionType::WebSocket => {
-                                // Byte is still in buffer (MSG_PEEK), WS upgrade directly
+                                // Byte is still in buffer (MSG_PEEK), WS upgrade directly.
+                                // accept_websocket returns IoStream::WebSocket(WsByteStream)
+                                // — ready for read_msg_v1/write_msg_v1 directly.
                                 match accept_websocket(stream).await {
-                                    Ok(ws) => {
+                                    Ok(mut ws) => {
                                         info!("WebSocket upgrade on main port for {}", addr);
-                                        let ws_inner = match ws {
-                                            IoStream::WebSocket(inner) => inner,
-                                            _ => unreachable!(),
-                                        };
-                                        let mut adapter = frp_core::transport::WsByteStream::new(ws_inner);
-                                        match read_msg_v1(&mut adapter).await {
+                                        match read_msg_v1(&mut ws).await {
                                             Ok(FrpMessage::Login(login)) => {
-                                                control::handle_control(adapter, login, state.clone(), Some(addr)).await;
+                                                control::handle_control(ws, login, state.clone(), Some(addr)).await;
                                             }
                                             Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                let io = IoStream::WebSocket(adapter.into_inner());
-                                                handle_work_conn_inner(io, nwc, state.clone()).await;
+                                                handle_work_conn_inner(ws, nwc, state.clone()).await;
                                             }
                                             Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                let io = IoStream::WebSocket(adapter.into_inner());
-                                                handle_visitor_conn_inner(io, nvc, state.clone()).await;
+                                                handle_visitor_conn_inner(ws, nvc, state.clone()).await;
                                             }
                                             Ok(other) => {
                                                 warn!("Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());

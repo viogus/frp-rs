@@ -10,7 +10,8 @@ use frp_server::service::Service as ServerService;
 
 static INIT_LOG: Once = Once::new();
 
-fn init_tracing() {
+#[allow(dead_code)]
+pub fn init_tracing() {
     INIT_LOG.call_once(|| {
         tracing_subscriber::fmt()
             .with_env_filter("debug")

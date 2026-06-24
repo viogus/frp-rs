@@ -352,11 +352,7 @@ fn spawn_work_conn(
                 warn!("Work conn {}: KCP not yet supported", label);
                 return;
             }
-            IoStream::WebSocket(_) => {
-                warn!("Work conn {}: WebSocket not yet supported", label);
-                return;
-            }
-            _ => {} // Tcp and Tls are supported
+            _ => {} // Tcp, Tls, and WebSocket are supported
         }
 
         // Build auth for work conn (Go frp v0.69.1 compat: server verifies auth on NewWorkConn)

@@ -314,11 +314,8 @@ async fn assign_work_to_proxy(
     let write_result = match &mut work_conn {
         IoStream::Tcp(ref mut s) => write_msg_v1(s, &swc).await,
         IoStream::Tls(ref mut s) => write_msg_v1(s, &swc).await,
+        IoStream::WebSocket(ref mut s) => write_msg_v1(s, &swc).await,
         IoStream::Kcp(_) => { warn!("Kcp streaming not yet supported"); return; }
-        IoStream::WebSocket(_) => {
-            warn!("WebSocket work conn not supported for bridging");
-            return;
-        }
     };
 
     if let Err(e) = write_result {
@@ -349,6 +346,10 @@ async fn assign_work_to_proxy(
                                 if s.write_all(&len).await.is_err() { Err(std::io::Error::other("write failed")) }
                                 else { s.write_all(&encrypted).await }
                             }
+                            IoStream::WebSocket(ref mut s) => {
+                                if s.write_all(&len).await.is_err() { Err(std::io::Error::other("write failed")) }
+                                else { s.write_all(&encrypted).await }
+                            }
                             _ => Ok(()),
                         };
                         if let Err(e) = write_result {
@@ -365,6 +366,7 @@ async fn assign_work_to_proxy(
                 let write_result = match &mut work_conn {
                     IoStream::Tcp(ref mut s) => s.write_all(&pre_read).await,
                     IoStream::Tls(ref mut s) => s.write_all(&pre_read).await,
+                    IoStream::WebSocket(ref mut s) => s.write_all(&pre_read).await,
                     _ => Ok(()),
                 };
                 if let Err(e) = write_result {
@@ -382,18 +384,20 @@ async fn assign_work_to_proxy(
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key).await;
                 }
-                IoStream::Kcp(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split();
-                    let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key).await;
-                }
                 IoStream::Tls(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key).await;
                 }
-            IoStream::WebSocket(_) => {
-                    warn!("Encrypted WebSocket bridging not implemented");
+                IoStream::Kcp(work) => {
+                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (w_r, w_w) = tokio::io::split(work);
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key).await;
+                }
+                IoStream::WebSocket(work) => {
+                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (w_r, w_w) = tokio::io::split(work);
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key).await;
                 }
             }
         } else {

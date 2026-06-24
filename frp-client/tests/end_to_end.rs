@@ -1,6 +1,6 @@
 mod common;
 
-use common::{allocate_port, wait_for_port, start_echo_server, TestHarness};
+use common::{allocate_port, wait_for_port, start_echo_server, init_tracing, TestHarness};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -85,6 +85,105 @@ async fn test_e2e_tcp_proxy_encrypted() {
     stream.read_exact(&mut large_buf).await.expect("read large");
 
     assert_eq!(large_buf, large, "large echo through encrypted tunnel should match");
+}
+
+/// End-to-end test: TCP proxy over WebSocket transport.
+///
+/// Client connects to the server's main port via WebSocket (server detects
+/// WS via the 'G' byte in peek_connection_type). Data flows through
+/// a plain TCP proxy tunnel over WebSocket transport.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_e2e_tcp_proxy_over_websocket() {
+    init_tracing();
+    let echo_port = allocate_port();
+    let server_port = allocate_port();
+    let proxy_port = allocate_port();
+
+    // 1. Echo server
+    let _echo = start_echo_server(echo_port);
+
+    // 2. frps (main port only; WS detected via peek_connection_type)
+    let server_cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: server_port,
+        allow_port_start: proxy_port.saturating_sub(50),
+        allow_port_end: proxy_port.saturating_add(50).min(u16::MAX),
+        ..Default::default()
+    };
+    let server_svc = ServerService::new(server_cfg);
+    let _server = tokio::spawn(async move { let _ = server_svc.run().await; });
+
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
+    wait_for_port(server_addr, Duration::from_secs(5)).await.expect("server ready");
+
+    // 3. frpc with WebSocket transport pointing to main port
+    let client_cfg = ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port,
+        transport_protocol: "websocket".into(),
+        token: String::new(),
+        login_fail_exit: false,
+        pool_count: 1,
+        proxies: vec![ProxyConfig {
+            name: "e2e-ws".into(),
+            proxy_type: "tcp".into(),
+            local_ip: "127.0.0.1".into(),
+            local_port: echo_port,
+            remote_port: proxy_port,
+            use_encryption: false,
+            use_compression: false,
+            sk: String::new(),
+            plugin: None,
+            custom_domains: vec![],
+            subdomain: String::new(),
+            http_user: String::new(),
+            http_pwd: String::new(),
+            http_password: String::new(),
+            locations: vec![],
+            host_header_rewrite: String::new(),
+            headers: std::collections::HashMap::new(),
+            response_headers: std::collections::HashMap::new(),
+            route_by_http_user: String::new(),
+            allow_users: vec![],
+            bandwidth_limit: String::new(),
+            bandwidth_limit_mode: String::new(),
+            annotations: std::collections::HashMap::new(),
+            metas: std::collections::HashMap::new(),
+            multiplexer: String::new(),
+            group: String::new(),
+            group_key: String::new(),
+            health_check_type: String::new(),
+            health_check_interval_seconds: 0,
+            health_check_timeout_seconds: 0,
+            health_check_max_failed: 0,
+        }],
+        ..Default::default()
+    };
+    let client_svc = ClientService::new(client_cfg);
+    let _client = tokio::spawn(async move { let _ = client_svc.run().await; });
+
+    // 4. Wait for proxy port
+    let proxy_addr: std::net::SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
+    wait_for_port(proxy_addr, Duration::from_secs(10)).await.expect("proxy port ready");
+
+    // 5. Test data round-trip through WS transport
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.expect("connect to proxy");
+    let payload = b"websocket tunnel e2e\n";
+    stream.write_all(payload).await.expect("write");
+    stream.flush().await.expect("flush");
+
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.expect("read echo");
+    assert_eq!(&buf, payload, "echo through WS tunnel should match");
+
+    // Second round-trip
+    let payload2 = b"ws round two\n";
+    stream.write_all(payload2).await.expect("write 2");
+    stream.flush().await.expect("flush 2");
+
+    let mut buf2 = vec![0u8; payload2.len()];
+    stream.read_exact(&mut buf2).await.expect("read 2");
+    assert_eq!(&buf2, payload2, "second WS echo should match");
 }
 
 /// End-to-end test: TCP proxy over TLS transport.

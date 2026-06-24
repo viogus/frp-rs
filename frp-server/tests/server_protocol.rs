@@ -6,7 +6,7 @@ use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 
 use common::{allocate_port, raw_login, raw_login_resp, start_test_server};
-use frp_core::transport::{DialOptions, IoStream, dial_server};
+use frp_core::transport::{DialOptions, IoStream, TransportProtocol, dial_server};
 use std::path::PathBuf;
 
 fn test_cert_dir() -> PathBuf {
@@ -268,6 +268,62 @@ async fn test_new_proxy_duplicate_name_fails() {
             );
         }
         other => panic!("expected NewProxyResp, got: {:?}", other.v1_type_byte()),
+    }
+}
+
+// ---------------------------------------------------------------
+// WebSocket transport
+// ---------------------------------------------------------------
+
+#[tokio::test]
+async fn test_login_via_websocket() {
+    let port = allocate_port();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: port,
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let opts = DialOptions {
+        server_addr: "127.0.0.1".into(),
+        server_port: port,
+        protocol: TransportProtocol::WebSocket,
+        ..Default::default()
+    };
+
+    let mut io = dial_server(&opts).await.expect("WS dial");
+
+    // Verify we got a WebSocket stream
+    match &io {
+        IoStream::WebSocket(_) => {} // expected
+        other => panic!("expected IoStream::WebSocket, got: {:?}", other),
+    }
+
+    // Send login
+    let login = FrpMessage::Login(msg::Login {
+        version: Some(frp_core::VERSION.into()),
+        hostname: Some("test-ws-host".into()),
+        os: Some(std::env::consts::OS.into()),
+        arch: Some(std::env::consts::ARCH.into()),
+        user: None,
+        run_id: None,
+        client_id: None,
+        pool_count: Some(1),
+        timestamp: None,
+        privilege_key: None,
+        metas: None,
+        client_spec: None,
+    });
+    io.write_v1_frame(&login).await.expect("send login over WS");
+
+    let resp = io.read_v1_frame().await.expect("read LoginResp over WS");
+    match resp {
+        FrpMessage::LoginResp(r) => {
+            assert!(r.error.is_none(), "WS login should succeed, got: {:?}", r.error);
+            assert!(r.run_id.is_some(), "expected run_id");
+        }
+        other => panic!("expected LoginResp, got: {:?}", other.v1_type_byte()),
     }
 }
 
