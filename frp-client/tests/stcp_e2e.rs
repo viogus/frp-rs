@@ -40,6 +40,7 @@ async fn test_stcp_e2e_relay() {
         server_port,
         token: String::new(),
         login_fail_exit: false,
+        tcp_mux: false,
         pool_count: 2, // pre-spawn work connections for the STCP relay
         proxies: vec![ProxyConfig {
             name: stcp_name.into(),

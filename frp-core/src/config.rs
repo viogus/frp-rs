@@ -351,7 +351,7 @@ impl Default for ClientConfig {
             login_fail_exit: true,
             pool_count: 0,
             dns_server: String::new(),
-            tcp_mux: false,
+            tcp_mux: true,
             proxies: vec![],
             visitors: vec![],
         }

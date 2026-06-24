@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tracing::{info, warn};
+use tracing::info;
 
 use frp_core::config::ProxyConfig;
 use frp_core::msg::{self, FrpMessage};
@@ -61,6 +61,15 @@ impl ControlConnection {
     /// Connect to the server and login.
     /// Returns the control stream, run_id, and optional yamux session.
     pub async fn login(&mut self) -> Result<(IoStream, String, Option<YamuxSession>), frp_core::Error> {
+        // Yamux only applies when transport is plain TCP and TLS is off.
+        // With TLS/WS/KCP/QUIC, yamux multiplexing is not used —
+        // those protocols have their own layering.
+        // Go frp servers with tcpMux=true wrap every incoming TCP connection
+        // in yamux immediately, so the client MUST wrap BEFORE sending Login.
+        let propose_mux = self.tcp_mux
+            && matches!(self.transport_protocol, TransportProtocol::Tcp)
+            && !self.tls_enable;
+
         let opts = DialOptions {
             server_addr: self.server_addr.clone(),
             server_port: self.server_port,
@@ -71,12 +80,24 @@ impl ControlConnection {
             ..Default::default()
         };
 
-        let mut io_stream = dial_server(&opts).await?;
+        let raw_stream = dial_server(&opts).await?;
 
-        // Verify transport is supported for the control channel
-        match &io_stream {
-            _ => {} // Tcp, Tls, KCP, and WebSocket are all supported
-        }
+        // Wrap in yamux BEFORE any protocol communication if proposing mux.
+        // The Go frp server wraps its side on accept, so the client must
+        // wrap before sending its first frame.
+        let (mut io_stream, yamux_session) = if propose_mux {
+            match raw_stream {
+                IoStream::Tcp(tcp_stream) => {
+                    let mux_cfg = mux::TcpMuxConfig::default();
+                    let (control_stream, session) = mux::client_mux(tcp_stream, &mux_cfg).await?;
+                    info!("Yamux session established");
+                    (IoStream::Yamux(control_stream), Some(session))
+                }
+                _ => unreachable!("propose_mux only true for plain TCP"),
+            }
+        } else {
+            (raw_stream, None)
+        };
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -84,9 +105,6 @@ impl ControlConnection {
             .as_secs() as i64;
 
         let privilege_key = self.auth_cfg.generate_login_key(timestamp);
-
-        let propose_mux = self.tcp_mux
-            && matches!(&io_stream, IoStream::Tcp(_)); // yamux only over plain TCP
 
         let login = FrpMessage::Login(msg::Login {
             version: Some(VERSION.into()),
@@ -101,7 +119,7 @@ impl ControlConnection {
             privilege_key,
             metas: None,
             client_spec: None,
-            multiplexer: None,
+            multiplexer: if propose_mux { Some("yamux".into()) } else { None },
         });
 
         io_stream.write_v1_frame(&login).await?;
@@ -114,30 +132,7 @@ impl ControlConnection {
                 }
                 self.run_id = resp.run_id.clone().unwrap_or_default();
                 info!("Logged in. run_id: {}", self.run_id);
-
-                // Wrap in yamux if we proposed it (server accepted)
-                if propose_mux {
-                    // Extract inner TcpStream from IoStream::Tcp
-                    match io_stream {
-                        IoStream::Tcp(tcp_stream) => {
-                            let mux_cfg = mux::TcpMuxConfig::default();
-                            match mux::client_mux(tcp_stream, &mux_cfg).await {
-                                Ok((control_stream, session)) => {
-                                    info!("Yamux session established (run_id {})", self.run_id);
-                                    Ok((IoStream::Yamux(control_stream), self.run_id.clone(), Some(session)))
-                                }
-                                Err(e) => {
-                                    warn!("Failed to start yamux: {}. Falling back to plain TCP.", e);
-                                    // Can't recover — stream is consumed by client_mux
-                                    return Err(e);
-                                }
-                            }
-                        }
-                        _ => unreachable!("yamux only proposed for plain TCP"),
-                    }
-                } else {
-                    Ok((io_stream, self.run_id.clone(), None))
-                }
+                Ok((io_stream, self.run_id.clone(), yamux_session))
             }
             _ => Err(frp_core::Error::Protocol("Unexpected response to login".into())),
         }

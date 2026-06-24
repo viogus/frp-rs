@@ -86,15 +86,13 @@ impl QuicListener {
     /// Accept the next QUIC connection.
     /// Opens a single bidirectional stream for the connection.
     pub async fn accept(&self) -> io::Result<QuicStream> {
-        loop {
-            let incoming = self.endpoint.accept().await
-                .ok_or_else(|| io::Error::other("quinn endpoint closed"))?;
-            let conn = incoming.await
-                .map_err(|e| io::Error::other(format!("quinn accept conn: {e}")))?;
-            let (send, recv) = conn.accept_bi().await
-                .map_err(|e| io::Error::other(format!("quinn accept stream: {e}")))?;
-            return Ok(QuicStream::new(conn, send, recv));
-        }
+        let incoming = self.endpoint.accept().await
+            .ok_or_else(|| io::Error::other("quinn endpoint closed"))?;
+        let conn = incoming.await
+            .map_err(|e| io::Error::other(format!("quinn accept conn: {e}")))?;
+        let (send, recv) = conn.accept_bi().await
+            .map_err(|e| io::Error::other(format!("quinn accept stream: {e}")))?;
+        Ok(QuicStream::new(conn, send, recv))
     }
 }
 
@@ -105,7 +103,7 @@ pub async fn dial_quic(addr: &str, server_name: &str) -> io::Result<QuicStream> 
 
     // Use webpki roots for server certificate verification,
     // matching the TLS connector behaviour in frp-core.
-    let mut roots = rustls::RootCertStore {
+    let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
     let tls_config = rustls::ClientConfig::builder()

@@ -12,7 +12,6 @@ use frp_core::auth::{AuthConfig, AuthMethod};
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::read_msg_v1;
 use frp_core::mux;
-use frp_core::protocol::write_msg_v1;
 use frp_core::transport::{IoStream, ConnectionType, peek_connection_type, consume_tls_head_byte};
 use frp_core::transport::{build_tls_acceptor, accept_websocket};
 use frp_core::format_socket_addr;
@@ -465,70 +464,62 @@ impl Service {
                                     warn!("TLS-only mode: rejected plain TCP from {}", addr);
                                     return;
                                 }
-                                // Byte is still in buffer, read_msg_v1 will consume it
-                                match read_msg_v1(&mut stream).await {
-                                    Ok(FrpMessage::Login(login)) => {
-                                        let use_mux = state.tcp_mux;
-                                        if use_mux {
-                                            // Validate auth inline (matches handle_control)
-                                            if let Err(e) = state.auth_cfg.validate_login(
-                                                login.privilege_key.as_deref(),
-                                                login.timestamp,
-                                            ) {
-                                                warn!("Auth failed for yamux client {:?}: {}", addr, e);
-                                                let resp = FrpMessage::LoginResp(msg::LoginResp {
-                                                    version: Some(frp_core::VERSION.into()),
-                                                    run_id: None,
-                                                    error: Some(e),
-                                                });
-                                                let _ = write_msg_v1(&mut stream, &resp).await;
-                                            } else {
-                                                // Send LoginResp on raw TCP before yamux wrapping
-                                                let run_id = login.run_id.clone()
-                                                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                                                let log_run_id = run_id.clone();
-                                                let resp = FrpMessage::LoginResp(msg::LoginResp {
-                                                    version: Some(frp_core::VERSION.into()),
-                                                    run_id: Some(run_id),
-                                                    error: None,
-                                                });
-                                                if let Err(e) = write_msg_v1(&mut stream, &resp).await {
-                                                    warn!("Failed to send LoginResp to yamux client {:?}: {}", addr, e);
-                                                } else {
-                                                    let mux_cfg = mux::TcpMuxConfig {
-                                                        keepalive_interval: std::time::Duration::from_secs(
-                                                            state.tcp_mux_keepalive.max(1) as u64
-                                                        ),
-                                                    };
-                                                    match mux::server_mux(stream, &mux_cfg).await {
-                                                        Ok((control_stream, incoming)) => {
-                                                            let io = IoStream::Yamux(control_stream);
-                                                            info!("Yamux session established for {:?} (run_id {})", addr, log_run_id);
-                                                            control::handle_control(io, login, state, Some(addr), Some(incoming)).await;
-                                                        }
-                                                        Err(e) => {
-                                                            warn!("Failed to start yamux server for {:?}: {}", addr, e);
-                                                        }
-                                                    }
+                                // When tcp_mux is enabled, wrap in yamux BEFORE reading
+                                // the first message. This matches Go frp v0.69.1 behaviour:
+                                // both sides wrap immediately, then Login flows through
+                                // a yamux stream — not on raw TCP.
+                                if state.tcp_mux {
+                                    let mux_cfg = mux::TcpMuxConfig {
+                                        keepalive_interval: std::time::Duration::from_secs(
+                                            state.tcp_mux_keepalive.max(1) as u64
+                                        ),
+                                    };
+                                    match mux::server_mux(stream, &mux_cfg).await {
+                                        Ok((control_stream, incoming)) => {
+                                            let mut io = IoStream::Yamux(control_stream);
+                                            info!("Yamux session established for {:?}", addr);
+                                            match read_msg_v1(&mut io).await {
+                                                Ok(FrpMessage::Login(login)) => {
+                                                    control::handle_control(io, login, state, Some(addr), Some(incoming)).await;
+                                                }
+                                                Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                    handle_work_conn_inner(io, nwc, state).await;
+                                                }
+                                                Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                    handle_visitor_conn_inner(io, nvc, state).await;
+                                                }
+                                                Ok(other) => {
+                                                    warn!("Unexpected yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to read yamux first message from {}: {}", addr, e);
                                                 }
                                             }
-                                        } else {
-                                            control::handle_control(stream, login, state, Some(addr), None).await;
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to start yamux server for {:?}: {}", addr, e);
                                         }
                                     }
-                                    Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                        let io = IoStream::Tcp(stream);
-                                        handle_work_conn_inner(io, nwc, state).await;
-                                    }
-                                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                        let io = IoStream::Tcp(stream);
-                                        handle_visitor_conn_inner(io, nvc, state).await;
-                                    }
-                                    Ok(other) => {
-                                        warn!("Unexpected first message from {}: {:?}", addr, other.v1_type_byte());
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to read first message from {}: {}", addr, e);
+                                } else {
+                                    // Byte is still in buffer, read_msg_v1 will consume it
+                                    match read_msg_v1(&mut stream).await {
+                                        Ok(FrpMessage::Login(login)) => {
+                                            control::handle_control(stream, login, state, Some(addr), None).await;
+                                        }
+                                        Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                            let io = IoStream::Tcp(stream);
+                                            handle_work_conn_inner(io, nwc, state).await;
+                                        }
+                                        Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                            let io = IoStream::Tcp(stream);
+                                            handle_visitor_conn_inner(io, nvc, state).await;
+                                        }
+                                        Ok(other) => {
+                                            warn!("Unexpected first message from {}: {:?}", addr, other.v1_type_byte());
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to read first message from {}: {}", addr, e);
+                                        }
                                     }
                                 }
                             }
