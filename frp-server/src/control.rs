@@ -21,6 +21,7 @@ struct PendingRequest {
     user_conn: IoStream,
     pre_read: Vec<u8>,
     use_encryption: bool,
+    use_compression: bool,
 }
 
 /// Handle a control connection from a frpc client.
@@ -104,32 +105,40 @@ pub async fn handle_control<S>(
                     }
                     Some(InternalMsg::VisitorConn { proxy_name, visitor_conn }) => {
                         debug!("STCP visitor conn for proxy {} on run_id {}", proxy_name, run_id);
-                        let enc = state.proxy_manager.get(&proxy_name).await
-                            .map(|p| p.use_encryption).unwrap_or(false);
+                        let (enc, comp) = {
+                            let p = state.proxy_manager.get(&proxy_name).await;
+                            let e = p.as_ref().map(|p| p.use_encryption).unwrap_or(false);
+                            let c = p.as_ref().map(|p| p.use_compression).unwrap_or(false);
+                            (e, c)
+                        };
                         if let Some(work_conn) = work_pool.pop_front() {
-                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc }, state.encryption_key).await;
+                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp }, state.encryption_key).await;
                         } else {
                             debug!("No pooled work conn for STCP, sending ReqWorkConn");
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
                                 warn!("Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
-                            pending_requests.push_back(PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc });
+                            pending_requests.push_back(PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp });
                         }
                     }
                     Some(InternalMsg::ProxyUserConn { proxy_name, user_conn, pre_read }) => {
                         debug!("User conn for proxy {} on run_id {}", proxy_name, run_id);
-                        let enc = state.proxy_manager.get(&proxy_name).await
-                            .map(|p| p.use_encryption).unwrap_or(false);
+                        let (enc, comp) = {
+                            let p = state.proxy_manager.get(&proxy_name).await;
+                            let e = p.as_ref().map(|p| p.use_encryption).unwrap_or(false);
+                            let c = p.as_ref().map(|p| p.use_compression).unwrap_or(false);
+                            (e, c)
+                        };
                         if let Some(work_conn) = work_pool.pop_front() {
-                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn, pre_read, use_encryption: enc }, state.encryption_key).await;
+                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn, pre_read, use_encryption: enc, use_compression: comp }, state.encryption_key).await;
                         } else {
                             debug!("No pooled work conn, sending ReqWorkConn for {}", proxy_name);
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
                                 warn!("Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
-                            pending_requests.push_back(PendingRequest { proxy_name, user_conn, pre_read, use_encryption: enc });
+                            pending_requests.push_back(PendingRequest { proxy_name, user_conn, pre_read, use_encryption: enc, use_compression: comp });
                         }
                     }
                     Some(InternalMsg::UdpData { proxy_name: _pn, content, remote_addr }) => {
@@ -235,7 +244,7 @@ pub async fn handle_control<S>(
 async fn assign_work_to_proxy(
     mut work_conn: IoStream,
     req: PendingRequest,
-    encryption_key: [u8; 32],
+    encryption_key: [u8; 16],
 ) {
     let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
         proxy_name: req.proxy_name.clone(),
@@ -265,6 +274,7 @@ async fn assign_work_to_proxy(
 
     let pre_read = req.pre_read;
     let enc_key = req.use_encryption;
+    let comp_key = req.use_compression;
 
     tokio::spawn(async move {
         // Write VHost pre-read bytes to work connection first.
@@ -314,17 +324,17 @@ async fn assign_work_to_proxy(
                 IoStream::Tcp(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key).await;
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key).await;
                 }
                 IoStream::Kcp(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key).await;
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key).await;
                 }
                 IoStream::Tls(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key).await;
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key).await;
                 }
             IoStream::WebSocket(_) => {
                     warn!("Encrypted WebSocket bridging not implemented");

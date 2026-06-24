@@ -23,7 +23,7 @@ struct ProxyRuntimeInfo {
 pub struct Service {
     cfg: ClientConfig,
     auth_cfg: Arc<AuthConfig>,
-    encryption_key: [u8; 32],
+    encryption_key: [u8; 16],
     /// Map proxy_name -> runtime info for looking up where to connect
     proxy_info_map: HashMap<String, ProxyRuntimeInfo>,
 }
@@ -268,7 +268,7 @@ fn spawn_work_conn(
     protocol: &TransportProtocol,
     run_id: &str,
     proxy_info_map: &HashMap<String, ProxyRuntimeInfo>,
-    enc_key: [u8; 32],
+    enc_key: [u8; 16],
     pool_id: i32,
 ) {
     let server_addr = server_addr.to_string();
@@ -418,7 +418,7 @@ async fn run_udp_work_conn(
     local_addr: String,
     proxy_name: String,
     use_encryption: bool,
-    #[allow(unused_variables)] enc_key: [u8; 32],
+    #[allow(unused_variables)] enc_key: [u8; 16],
 ) {
     if use_encryption {
         warn!("UDP work conn '{}': encryption not yet implemented for UDP tunnels", proxy_name);

@@ -56,13 +56,13 @@ pub struct AppState {
     pub proxy_bind_addr: String,
     pub vhost_manager: Arc<VhostManager>,
     pub vhost_http_port: u16,
-    pub encryption_key: [u8; 32],
+    pub encryption_key: [u8; 16],
     pub sk_index: Arc<RwLock<HashMap<String, String>>>,
     pub dashboard_start: std::time::Instant,
 }
 
 impl AppState {
-    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 32]) -> Self {
+    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16]) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             auth_cfg: Arc::new(auth_cfg),

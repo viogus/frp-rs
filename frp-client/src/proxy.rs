@@ -56,14 +56,14 @@ pub async fn bridge_streams(
     work: TcpStream,
     name: &str,
     use_encryption: bool,
-    enc_key: Option<&[u8; 32]>,
+    enc_key: Option<&[u8; 16]>,
 ) {
     info!("Bridging streams for proxy: {} (encrypted: {})", name, use_encryption);
     if use_encryption {
         if let Some(key) = enc_key {
             let (l_r, l_w) = tokio::io::split(local);
             let (w_r, w_w) = tokio::io::split(work);
-            bridge::bridge_encrypted(l_r, l_w, w_r, w_w, key).await;
+            bridge::bridge_encrypted(l_r, l_w, w_r, w_w, key, false).await;
             debug!("Proxy {} encrypted bridge closed", name);
             return;
         }
