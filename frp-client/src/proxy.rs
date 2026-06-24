@@ -1,5 +1,5 @@
 use tokio::net::TcpStream;
-use tracing::{info, debug};
+use tracing::{info, warn, debug};
 
 use frp_core::msg::{self, FrpMessage};
 use frp_core::bridge;
@@ -54,7 +54,7 @@ pub async fn bridge_streams(
             debug!("Proxy {} encrypted bridge closed", name);
             return;
         }
-        debug!("Proxy {}: encryption requested but no key available, falling back to plain", name);
+        warn!("Proxy {}: encryption requested but no key available, falling back to plain", name);
     }
     let mut local = local;
     let mut work = work;

@@ -133,16 +133,16 @@ pub async fn handle_control<S>(
                             }
                         };
                         debug!("User conn for proxy {} on run_id {}", proxy_name, run_id);
+                        let enc = state.proxy_manager.get(&proxy_name).await
+                            .map(|p| p.use_encryption).unwrap_or(false);
                         if let Some(work_conn) = work_pool.pop_front() {
-                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: tcp, pre_read, use_encryption: false }, state.encryption_key).await;
+                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: tcp, pre_read, use_encryption: enc }, state.encryption_key).await;
                         } else {
                             debug!("No pooled work conn, sending ReqWorkConn for {}", proxy_name);
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
                                 warn!("Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
-                            let enc = state.proxy_manager.get(&proxy_name).await
-                                .map(|p| p.use_encryption).unwrap_or(false);
                             pending_requests.push_back(PendingRequest { proxy_name, user_conn: tcp, pre_read, use_encryption: enc });
                         }
                     }
@@ -200,6 +200,14 @@ pub async fn handle_control<S>(
                             if let Some(port) = info.remote_port {
                                 state.used_ports.write().await.remove(&port);
                             }
+                            // Clean up STCP sk_index
+                            if let Some(ref sk) = info.sk {
+                                if !sk.is_empty() {
+                                    state.sk_index.write().await.remove(sk);
+                                }
+                            }
+                            // Clean up VHost routes
+                            state.vhost_manager.unregister(&cp.proxy_name).await;
                         }
                         state.proxy_manager.remove(&cp.proxy_name).await;
                         info!("Proxy closed: {}", cp.proxy_name);
@@ -517,8 +525,11 @@ async fn run_udp_listener(
 }
 
 async fn unregister_control(state: &Arc<AppState>, run_id: &str) {
-    let mut map = state.run_id_to_ctl_tx.write().await;
-    map.remove(run_id);
+    // Scope the run_id_to_ctl_tx lock to just the remove call
+    {
+        let mut map = state.run_id_to_ctl_tx.write().await;
+        map.remove(run_id);
+    }
     // Release allocated ports and clean up sk/vhost entries for this client
     let proxies = state.proxy_manager.list_client(run_id).await;
     let mut ports = state.used_ports.write().await;
@@ -532,8 +543,10 @@ async fn unregister_control(state: &Arc<AppState>, run_id: &str) {
                 state.sk_index.write().await.remove(sk);
             }
         }
-        // Clean up VHost routes
-        state.vhost_manager.unregister(&p.name).await;
     }
     drop(ports);
+    // VHost unregister outside port lock to avoid holding it across awaits
+    for p in &proxies {
+        state.vhost_manager.unregister(&p.name).await;
+    }
 }

@@ -75,5 +75,11 @@ pub fn parse_args(default_config: &str, bin_name: &str) -> CliArgs {
         }
     }
 
+    // --config-dir conflicts with an explicit -c/--config value
+    if config_dir.is_some() && config != default_config {
+        eprintln!("error: --config-dir and --config are mutually exclusive");
+        std::process::exit(1);
+    }
+
     CliArgs { config, config_dir, log_level, log_file, show_version }
 }

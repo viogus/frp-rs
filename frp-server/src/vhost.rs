@@ -103,6 +103,9 @@ pub async fn run_vhost_http_listener(
                         user_conn: frp_core::transport::IoStream::Tcp(stream),
                         pre_read,
                     }).ok();
+                } else {
+                    warn!("VHost route for '{}' found but control handler gone", host);
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                 }
             } else {
                 warn!("No VHost route for '{}' from {}", host, peer);

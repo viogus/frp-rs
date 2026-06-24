@@ -64,6 +64,27 @@ impl Service {
             warn!("No proxies configured");
         }
 
+        // Spawn health checks once, outside reconnect loop (they are per-proxy, not per-session)
+        for p in &proxies {
+            if !p.health_check_type.is_empty() && p.health_check_type != "tcp" {
+                warn!("Health check type '{}' not yet supported for '{}'", p.health_check_type, p.name);
+            }
+            if p.health_check_type == "tcp" {
+                let la = format!("{}:{}", p.local_ip, p.local_port);
+                let pn = p.name.clone();
+                let interval = std::time::Duration::from_secs(
+                    p.health_check_interval_seconds.max(10)
+                );
+                let timeout = std::time::Duration::from_secs(
+                    p.health_check_timeout_seconds.max(3)
+                );
+                let max_failed = p.health_check_max_failed.max(1);
+                tokio::spawn(async move {
+                    run_health_check(pn, la, interval, timeout, max_failed).await;
+                });
+            }
+        }
+
         // Main session loop with reconnection
         loop {
             let mut ctl = ControlConnection::new(
@@ -141,29 +162,10 @@ impl Service {
                     let ru = run_id.clone();
                     let la = format!("{}:{}", p.local_ip, p.local_port);
                     let pn = p.name.clone();
+                    let enc = p.use_encryption;
+                    let ek = self.encryption_key;
                     tokio::spawn(async move {
-                        run_udp_work_conn(sa, sp, pt, ru, la, pn).await;
-                    });
-                }
-            }
-
-            // Spawn health checks for proxies with health check enabled
-            for p in &proxies {
-                if !p.health_check_type.is_empty() && p.health_check_type != "tcp" {
-                    warn!("Health check type '{}' not yet supported for '{}'", p.health_check_type, p.name);
-                }
-                if p.health_check_type == "tcp" {
-                    let la = format!("{}:{}", p.local_ip, p.local_port);
-                    let pn = p.name.clone();
-                    let interval = std::time::Duration::from_secs(
-                        p.health_check_interval_seconds.max(10)
-                    );
-                    let timeout = std::time::Duration::from_secs(
-                        p.health_check_timeout_seconds.max(3)
-                    );
-                    let max_failed = p.health_check_max_failed.max(1);
-                    tokio::spawn(async move {
-                        run_health_check(pn, la, interval, timeout, max_failed).await;
+                        run_udp_work_conn(sa, sp, pt, ru, la, pn, enc, ek).await;
                     });
                 }
             }
@@ -225,11 +227,7 @@ impl Service {
                 }
             }
 
-            if self.cfg.login_fail_exit {
-                return Err("connection lost".into());
-            }
-
-            // Reconnect delay
+            // Reconnect delay (login_fail_exit only applies to initial login, not session drops)
             tokio::time::sleep(Duration::from_secs(10)).await;
         }
     }
@@ -404,7 +402,13 @@ async fn run_udp_work_conn(
     run_id: String,
     local_addr: String,
     proxy_name: String,
+    use_encryption: bool,
+    #[allow(unused_variables)] enc_key: [u8; 32],
 ) {
+    if use_encryption {
+        warn!("UDP work conn '{}': encryption not yet implemented for UDP tunnels", proxy_name);
+        // TODO: wrap the TCP stream with AES-GCM framing before V1 protocol reads/writes
+    }
     debug!("UDP work conn for '{}' dialing server", proxy_name);
 
     let opts = DialOptions {
