@@ -34,6 +34,15 @@ pub const V2_TYPE_NEW_VISITOR_CONN_RESP: u16 = 15;
 // Concrete message structs – all derive Serialize + Deserialize
 // ---------------------------------------------------------------
 
+/// ClientSpec carries client-specific metadata (Go frp compat).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClientSpec {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub always_auth_pass: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Login {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -49,13 +58,17 @@ pub struct Login {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_count: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub privilege_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadatas: Option<std::collections::HashMap<String, String>>,
+    pub metas: Option<std::collections::HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_spec: Option<ClientSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,7 +106,7 @@ pub struct NewProxy {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_domains: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadatas: Option<std::collections::HashMap<String, String>>,
+    pub metas: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,8 +285,8 @@ impl FrpMessage {
         match ty {
             TYPE_LOGIN         => Some(FrpMessage::Login(Login {
                 version: None, hostname: None, os: None, arch: None,
-                user: None, run_id: None, pool_count: None,
-                timestamp: None, privilege_key: None, metadatas: None,
+                user: None, run_id: None, client_id: None, pool_count: None,
+                timestamp: None, privilege_key: None, metas: None, client_spec: None,
             })),
             TYPE_LOGIN_RESP    => Some(FrpMessage::LoginResp(LoginResp {
                 version: None, run_id: None, server_udp_port: None, error: None,
@@ -282,7 +295,7 @@ impl FrpMessage {
                 proxy_name: String::new(), proxy_type: String::new(),
                 use_encryption: None, use_compression: None,
                 group: None, group_key: None, local_str: None,
-                remote_port: None, sk: None, custom_domains: None, metadatas: None,
+                remote_port: None, sk: None, custom_domains: None, metas: None,
             })),
             TYPE_NEW_PROXY_RESP => Some(FrpMessage::NewProxyResp(NewProxyResp {
                 proxy_name: String::new(), remote_port: None, error: None,

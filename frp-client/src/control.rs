@@ -19,6 +19,7 @@ pub struct ControlConnection {
     transport_protocol: TransportProtocol,
     pool_count: i32,
     user: String,
+    client_id: String,
     run_id: String,
 }
 
@@ -30,6 +31,7 @@ impl ControlConnection {
         transport_protocol: TransportProtocol,
         pool_count: i32,
         user: String,
+        client_id: String,
     ) -> Self {
         Self {
             server_addr,
@@ -38,6 +40,7 @@ impl ControlConnection {
             transport_protocol,
             pool_count,
             user,
+            client_id,
             run_id: String::new(),
         }
     }
@@ -86,10 +89,12 @@ impl ControlConnection {
             arch: Some(std::env::consts::ARCH.into()),
             user: if self.user.is_empty() { None } else { Some(self.user.clone()) },
             run_id: None,
+            client_id: if self.client_id.is_empty() { None } else { Some(self.client_id.clone()) },
             pool_count: Some(self.pool_count),
             timestamp: Some(timestamp),
             privilege_key,
-            metadatas: None,
+            metas: None,
+            client_spec: None,
         });
 
         write_msg_v1(&mut stream, &login).await?;

@@ -217,6 +217,8 @@ pub struct ClientConfig {
     #[serde(default)]
     pub user: String,
     #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
     pub tls_enable: bool,
     #[serde(default)]
     pub tls_cert_file: String,
@@ -248,6 +250,7 @@ impl Default for ClientConfig {
             transport_protocol: default_transport_protocol(),
             token: String::new(),
             user: String::new(),
+            client_id: String::new(),
             tls_enable: false,
             tls_cert_file: String::new(),
             tls_key_file: String::new(),

@@ -60,6 +60,7 @@ impl Service {
                 protocol.clone(),
                 pool_count,
                 self.cfg.user.clone(),
+                self.cfg.client_id.clone(),
             );
 
             let (mut control_stream, run_id) = match ctl.login().await {
