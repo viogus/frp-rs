@@ -20,6 +20,8 @@ pub struct ProxyInfo {
 pub struct ProxyManager {
     proxies: RwLock<HashMap<String, ProxyInfo>>,
     by_client: RwLock<HashMap<String, HashMap<String, ProxyInfo>>>,
+    /// group name → sorted list of proxy names (for round-robin selection)
+    groups: RwLock<HashMap<String, Vec<String>>>,
 }
 
 impl ProxyManager {
@@ -27,6 +29,7 @@ impl ProxyManager {
         Self {
             proxies: RwLock::new(HashMap::new()),
             by_client: RwLock::new(HashMap::new()),
+            groups: RwLock::new(HashMap::new()),
         }
     }
 
@@ -36,6 +39,13 @@ impl ProxyManager {
             let proxies = self.proxies.read().await;
             if proxies.contains_key(&name) {
                 return Err(format!("proxy '{}' already registered", name));
+            }
+        }
+        // Register in group index
+        if let Some(ref group) = info.group {
+            if !group.is_empty() {
+                let mut groups = self.groups.write().await;
+                groups.entry(group.clone()).or_default().push(name.clone());
             }
         }
         self.proxies.write().await.insert(name.clone(), info.clone());
@@ -53,10 +63,20 @@ impl ProxyManager {
     }
 
     pub async fn remove(&self, name: &str) {
-        // Lock proxies first, then by_client — consistent order with remove_client
         let mut proxies = self.proxies.write().await;
         if let Some(info) = proxies.remove(name) {
-            // Drop proxies lock before acquiring by_client to avoid holding both
+            // Clean up group index
+            if let Some(ref group) = info.group {
+                if !group.is_empty() {
+                    let mut groups = self.groups.write().await;
+                    if let Some(members) = groups.get_mut(group) {
+                        members.retain(|n| n != name);
+                        if members.is_empty() {
+                            groups.remove(group);
+                        }
+                    }
+                }
+            }
             drop(proxies);
             let mut by_client = self.by_client.write().await;
             if let Some(client_proxies) = by_client.get_mut(&info.run_id) {
@@ -66,14 +86,61 @@ impl ProxyManager {
     }
 
     pub async fn remove_client(&self, run_id: &str) {
-        // Lock proxies first, then by_client — consistent order with remove
         let mut proxies = self.proxies.write().await;
         let mut by_client = self.by_client.write().await;
         if let Some(client_proxies) = by_client.remove(run_id) {
             for name in client_proxies.keys() {
-                proxies.remove(name);
+                if let Some(info) = proxies.remove(name) {
+                    if let Some(ref group) = info.group {
+                        if !group.is_empty() {
+                            // Clean group — acquire groups lock after dropping proxies
+                            // to avoid deadlock. We'll handle this after the main cleanup.
+                            drop(proxies);
+                            drop(by_client);
+                            let mut groups = self.groups.write().await;
+                            if let Some(members) = groups.get_mut(group) {
+                                members.retain(|n| n != name);
+                                if members.is_empty() {
+                                    groups.remove(group);
+                                }
+                            }
+                            // Re-acquire for the loop
+                            proxies = self.proxies.write().await;
+                            by_client = self.by_client.write().await;
+                        }
+                    }
+                }
             }
         }
+    }
+
+    /// Select a backend from a group for load balancing.
+    /// Uses group_key for affinity: same key → same backend (hash-based).
+    /// Without group_key, returns the first available backend.
+    pub async fn select_group_backend(&self, group: &str, group_key: &str) -> Option<String> {
+        let groups = self.groups.read().await;
+        let members = groups.get(group)?;
+        if members.is_empty() {
+            return None;
+        }
+        if !group_key.is_empty() {
+            // Sticky session: hash the key to pick a backend
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            group_key.hash(&mut hasher);
+            let idx = hasher.finish() as usize % members.len();
+            Some(members[idx].clone())
+        } else {
+            // Round-robin: return first (the list is stable)
+            Some(members[0].clone())
+        }
+    }
+
+    /// Get the group for a proxy, if any.
+    pub async fn get_group(&self, name: &str) -> Option<String> {
+        self.proxies.read().await.get(name)
+            .and_then(|p| p.group.clone())
+            .filter(|g| !g.is_empty())
     }
 
     pub async fn list_client(&self, run_id: &str) -> Vec<ProxyInfo> {

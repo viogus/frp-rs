@@ -171,21 +171,56 @@ pub async fn handle_control<S>(
                     }
                     Some(InternalMsg::ProxyUserConn { proxy_name, user_conn, pre_read }) => {
                         debug!("User conn for proxy {} on run_id {}", proxy_name, run_id);
-                        let (enc, comp) = {
+                        // Group load balancing: if proxy belongs to a group,
+                        // select a backend (possibly on a different run_id).
+                        let (target_proxy, target_run_id) = {
                             let p = state.proxy_manager.get(&proxy_name).await;
+                            let group = p.as_ref().and_then(|p| p.group.clone()).filter(|g| !g.is_empty());
+                            let group_key = p.as_ref().and_then(|p| p.group_key.clone()).unwrap_or_default();
+                            if let Some(ref group_name) = group {
+                                if let Some(backend) = state.proxy_manager.select_group_backend(group_name, &group_key).await {
+                                    let backend_run_id = state.proxy_manager.get_run_id(&backend).await.unwrap_or_default();
+                                    info!("Group LB: {} -> backend {} (run_id {})", proxy_name, backend, backend_run_id);
+                                    (backend, backend_run_id)
+                                } else {
+                                    (proxy_name.clone(), run_id.clone())
+                                }
+                            } else {
+                                (proxy_name.clone(), run_id.clone())
+                            }
+                        };
+                        // If backend is on a different run_id, forward to that handler
+                        if target_run_id != run_id {
+                            let ctl_tx = {
+                                let map = state.run_id_to_ctl_tx.read().await;
+                                map.get(&target_run_id).cloned()
+                            };
+                            if let Some(ctl) = ctl_tx {
+                                let _ = ctl.tx.send(InternalMsg::ProxyUserConn {
+                                    proxy_name: target_proxy,
+                                    user_conn,
+                                    pre_read,
+                                });
+                                continue;
+                            }
+                            warn!("Group backend run_id {} not found for proxy {}", target_run_id, target_proxy);
+                            continue;
+                        }
+                        let (enc, comp) = {
+                            let p = state.proxy_manager.get(&target_proxy).await;
                             let e = p.as_ref().map(|p| p.use_encryption).unwrap_or(false);
                             let c = p.as_ref().map(|p| p.use_compression).unwrap_or(false);
                             (e, c)
                         };
                         if let Some(work_conn) = work_pool.pop_front() {
-                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() }, state.encryption_key).await;
+                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() }, state.encryption_key).await;
                         } else {
-                            debug!("No pooled work conn, sending ReqWorkConn for {}", proxy_name);
+                            debug!("No pooled work conn, sending ReqWorkConn for {}", target_proxy);
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
                                 warn!("Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
-                            pending_requests.push_back(PendingRequest { proxy_name, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() });
+                            pending_requests.push_back(PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() });
                         }
                     }
                     Some(InternalMsg::UdpData { proxy_name: _pn, content, remote_addr }) => {

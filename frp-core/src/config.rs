@@ -55,6 +55,36 @@ pub struct ServerConfig {
 fn default_allow_port_start() -> u16 { 10000 }
 fn default_allow_port_end() -> u16 { 50000 }
 
+/// Parse a bandwidth limit string like "1MB", "500KB", "100K".
+/// Returns bytes per second, or None if unparseable.
+/// Supports suffixes: K/KB, M/MB, G/GB (case-insensitive).
+pub fn parse_bandwidth_limit(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let s = s.trim().to_uppercase();
+    let (num_str, mult) = if let Some(rest) = s.strip_suffix("GB") {
+        (rest.trim(), 1_000_000_000u64)
+    } else if let Some(rest) = s.strip_suffix('G') {
+        (rest.trim(), 1_000_000_000u64)
+    } else if let Some(rest) = s.strip_suffix("MB") {
+        (rest.trim(), 1_000_000u64)
+    } else if let Some(rest) = s.strip_suffix('M') {
+        (rest.trim(), 1_000_000u64)
+    } else if let Some(rest) = s.strip_suffix("KB") {
+        (rest.trim(), 1000u64)
+    } else if let Some(rest) = s.strip_suffix('K') {
+        (rest.trim(), 1000u64)
+    } else {
+        (&s[..], 1u64)
+    };
+    let num: f64 = num_str.parse().ok()?;
+    if num <= 0.0 {
+        return None;
+    }
+    Some((num * mult as f64) as u64)
+}
+
 /// Parse a comma-separated port range string into a list of (start, end) pairs.
 /// e.g. "10000-20000,30000-40000" → [(10000, 20000), (30000, 40000)]
 /// Returns empty vec if the string is empty.

@@ -18,6 +18,12 @@ struct ProxyRuntimeInfo {
     local_addr: String,
     use_encryption: bool,
     use_compression: bool,
+    /// Bandwidth limit in bytes/sec (0 = unlimited). Enforcement TODO.
+    #[allow(dead_code)]
+    bandwidth_limit: u64,
+    /// Bandwidth limit mode: "client", "server", or "both". Enforcement TODO.
+    #[allow(dead_code)]
+    bandwidth_limit_mode: String,
 }
 
 /// The main frpc service.
@@ -47,10 +53,13 @@ impl Service {
                 warn!("Duplicate proxy name '{}' — only the first entry will be used", p.name);
                 continue;
             }
+            let bw_limit = frp_core::config::parse_bandwidth_limit(&p.bandwidth_limit).unwrap_or(0);
             proxy_info_map.insert(p.name.clone(), ProxyRuntimeInfo {
                 local_addr: format!("{}:{}", p.local_ip, p.local_port),
                 use_encryption: p.use_encryption,
                 use_compression: p.use_compression,
+                bandwidth_limit: bw_limit,
+                bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
             });
         }
 
