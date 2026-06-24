@@ -1,20 +1,49 @@
+# syntax=docker/dockerfile:1
+# Multi-arch source build for frp-rs Docker images.
+# Supports linux/amd64, linux/arm64, linux/arm/v7 via cargo-zigbuild.
+#
+# Usage:
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#     --build-arg FRP_COMPONENT=frps -f docker/Dockerfile.source .
+
 FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm AS builder
 ARG TARGETARCH
 ARG FRP_COMPONENT=frps
 
+# Map Docker TARGETARCH to Rust target triple
+RUN case "${TARGETARCH}" in \
+      amd64) echo "x86_64-unknown-linux-gnu"  > /tmp/rust_target ;; \
+      arm64) echo "aarch64-unknown-linux-gnu" > /tmp/rust_target ;; \
+      arm)   echo "armv7-unknown-linux-gnueabihf" > /tmp/rust_target ;; \
+      *)     echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac
+
+# Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libc6-dev
+    gcc libc6-dev curl xz-utils && \
+    rm -rf /var/lib/apt/lists/*
 
-# arm64 cross-compilation toolchain
-RUN if [ "$TARGETARCH" = "arm64" ]; then \
-      apt-get install -y --no-install-recommends \
-        gcc-aarch64-linux-gnu libc6-dev-arm64-cross && \
-      rustup target add aarch64-unknown-linux-gnu; \
-    fi
+# Install zig 0.14.0 (matches release workflow version)
+RUN curl -sSfL https://ziglang.org/download/0.14.0/zig-linux-$(uname -m)-0.14.0.tar.xz \
+    | tar xJ -C /usr/local && \
+    ln -s /usr/local/zig-linux-$(uname -m)-0.14.0/zig /usr/local/bin/zig
 
+# Install cargo-zigbuild (pre-built binary, faster than compiling from source)
+RUN ARCH="$(uname -m)" && \
+    case "${ARCH}" in \
+      x86_64) ZB_TARGET="x86_64-unknown-linux-musl" ;; \
+      aarch64) ZB_TARGET="aarch64-unknown-linux-musl" ;; \
+      *) echo "Unsupported builder arch: ${ARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -sSfL "https://github.com/rust-lang/cargo-zigbuild/releases/download/v0.19.7/cargo-zigbuild-v0.19.7.${ZB_TARGET}.tar.gz" \
+    | tar xz -C /usr/local/cargo/bin && \
+    chmod +x /usr/local/cargo/bin/cargo-zigbuild
+
+# Add the cross-compilation target
+RUN rustup target add $(cat /tmp/rust_target)
+
+# Build frp-rs from source
 WORKDIR /build
-
-# Copy source — selective to avoid target/ and .git/
 COPY Cargo.toml Cargo.lock* ./
 COPY frp-core/ frp-core/
 COPY frp-server/ frp-server/
@@ -22,34 +51,17 @@ COPY frp-client/ frp-client/
 COPY frps/ frps/
 COPY frpc/ frpc/
 
-# Build Rust binary (native or cross-compiled)
-RUN if [ "$TARGETARCH" = "arm64" ]; then \
-      CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
-      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-      RUSTFLAGS="-C link-arg=-static-libgcc" \
-      cargo build --release --target aarch64-unknown-linux-gnu; \
-    else \
-      RUSTFLAGS="-C link-arg=-static-libgcc" \
-      cargo build --release; \
-    fi
+RUN cargo zigbuild --target $(cat /tmp/rust_target) --release && \
+    cp target/$(cat /tmp/rust_target)/release/${FRP_COMPONENT} /usr/bin/frp && \
+    strip /usr/bin/frp || true
 
-RUN if [ "$TARGETARCH" = "arm64" ]; then \
-      cp target/aarch64-unknown-linux-gnu/release/${FRP_COMPONENT} /usr/bin/frp; \
-    else \
-      cp target/release/${FRP_COMPONENT} /usr/bin/frp; \
-    fi && strip /usr/bin/frp || true
-
-# Compile entrypoint
+# Cross-compile the C entrypoint with zig cc
 COPY docker/entrypoint.c /tmp/entrypoint.c
-RUN if [ "$TARGETARCH" = "arm64" ]; then \
-      aarch64-linux-gnu-gcc -static -s -O2 -DFRP_MODE=\"${FRP_COMPONENT}\" -o /entrypoint /tmp/entrypoint.c; \
-    else \
-      gcc -static -s -O2 -DFRP_MODE=\"${FRP_COMPONENT}\" -o /entrypoint /tmp/entrypoint.c; \
-    fi
+RUN zig cc -target $(cat /tmp/rust_target) -static -O2 \
+    -DFRP_MODE=\"${FRP_COMPONENT}\" -o /entrypoint /tmp/entrypoint.c
 
-# --- Runtime stage (Debian slim, matches builder libc) ---
+# ── Runtime stage ──────────────────────────────────────────
 FROM --platform=$TARGETPLATFORM debian:bookworm-slim
-ARG TARGETPLATFORM
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/bin/frp /usr/bin/frp

@@ -13,20 +13,6 @@ on:
   release:
     types: [published]
   workflow_dispatch:
-    inputs:
-      mode:
-        description: 'Build mode'
-        required: true
-        default: 'source'
-        type: choice
-        options:
-          - source
-          - release
-      version:
-        description: 'Version to build (release mode only, e.g. 0.1.4)'
-        required: false
-        default: ''
-        type: string
 
 permissions:
   contents: read
@@ -38,7 +24,6 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     strategy:
       fail-fast: false
       matrix:
@@ -49,26 +34,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Determine mode and version
-        id: mode
+      - name: Determine tags and version
+        id: meta
         run: |
+          OWNER="${{ github.repository_owner }}"
+          # Lowercase the owner for Docker image names (GitHub may have uppercase)
+          OWNER_LOWER="$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')"
+          IMAGE="${REGISTRY}/${OWNER_LOWER}/${{ matrix.component }}"
+
           if [ "${{ github.event_name }}" = "release" ]; then
-            echo "mode=release" >> $GITHUB_OUTPUT
-            TAG="${{ github.event.release.tag_name }}"
-            VER="${TAG#v}"
-            echo "version=$VER" >> $GITHUB_OUTPUT
-            echo "dockerfile=docker/Dockerfile" >> $GITHUB_OUTPUT
-            echo "platforms=linux/amd64,linux/arm64" >> $GITHUB_OUTPUT
-          elif [ "${{ inputs.mode }}" = "release" ]; then
-            echo "mode=release" >> $GITHUB_OUTPUT
-            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
-            echo "dockerfile=docker/Dockerfile" >> $GITHUB_OUTPUT
-            echo "platforms=linux/amd64,linux/arm64" >> $GITHUB_OUTPUT
+            # Release: tag with version (e.g. v0.1.4) and update latest
+            VER="${{ github.event.release.tag_name }}"
+            echo "version=${VER}" >> $GITHUB_OUTPUT
+            echo "tags=${IMAGE}:${VER},${IMAGE}:latest" >> $GITHUB_OUTPUT
           else
-            echo "mode=source" >> $GITHUB_OUTPUT
+            # Push / manual: tag as test
             echo "version=test" >> $GITHUB_OUTPUT
-            echo "dockerfile=docker/Dockerfile.source" >> $GITHUB_OUTPUT
-            echo "platforms=linux/amd64" >> $GITHUB_OUTPUT
+            echo "tags=${IMAGE}:test" >> $GITHUB_OUTPUT
           fi
 
       - name: Set up QEMU
@@ -84,26 +66,16 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.component }}-rs
-          tags: |
-            type=raw,value=latest,enable=${{ steps.mode.outputs.mode == 'release' }}
-            type=raw,value=${{ steps.mode.outputs.version }},enable=${{ steps.mode.outputs.mode == 'release' }}
-            type=raw,value=test,enable=${{ steps.mode.outputs.mode == 'source' }}
-
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ steps.mode.outputs.dockerfile }}
-          platforms: ${{ steps.mode.outputs.platforms }}
+          file: docker/Dockerfile.source
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           build-args: |
-            FRP_VERSION=${{ steps.mode.outputs.version }}
             FRP_COMPONENT=${{ matrix.component }}
-          labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.meta.outputs.tags }}
           push: true
           provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
