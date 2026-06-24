@@ -17,6 +17,7 @@ anyhow = "1"
 tracing = "0.1"
 thiserror = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
 tokio-tungstenite = "0.24"

@@ -4,7 +4,7 @@ use std::process;
 use tracing_subscriber::EnvFilter;
 
 use frp_core::args::{parse_args, CliArgs};
-use frp_core::config::{load_client_config, collect_config_files};
+use frp_core::config::{load_client_config, collect_config_files, ClientConfig};
 use frp_client::service::Service;
 
 #[tokio::main]
@@ -13,41 +13,41 @@ async fn main() {
     run(cli).await;
 }
 
+fn init_logging(cli: &CliArgs, cfg: Option<&ClientConfig>) {
+    // Merge log settings: CLI > config [log] > defaults
+    let level = cli.log_level.as_deref().unwrap_or_else(|| {
+        cfg.map(|c| c.log.level.as_str()).unwrap_or("info")
+    });
+    let file = cli.log_file.as_deref().or_else(|| {
+        cfg.and_then(|c| if c.log.file.is_empty() { None } else { Some(c.log.file.as_str()) })
+    });
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(level));
+
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+
+    if let Some(path) = file {
+        let file_appender = tracing_appender::rolling::daily(
+            Path::new(path).parent().unwrap_or(Path::new(".")),
+            Path::new(path).file_name().unwrap_or(std::ffi::OsStr::new("frpc.log")),
+        );
+        builder.with_writer(file_appender).init();
+    } else {
+        builder.init();
+    }
+}
+
 async fn run(cli: CliArgs) {
     if cli.show_version {
         println!("frpc {}", frp_core::VERSION);
         process::exit(0);
     }
 
-    // Build EnvFilter: respect RUST_LOG env, fall back to CLI flag, then default
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            EnvFilter::new(cli.log_level.as_deref().unwrap_or("info"))
-        });
-
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
-
-    if let Some(ref file) = cli.log_file {
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(file)
-        {
-            Ok(f) => {
-                builder.with_writer(std::sync::Mutex::new(f)).init();
-            }
-            Err(e) => {
-                eprintln!("Warning: could not open log file {}: {}. Using stderr.", file, e);
-                builder.init();
-            }
-        }
-    } else {
-        builder.init();
-    }
-
-    // --- Config directory mode ---
+    // Config directory mode: init logging from CLI only
     if let Some(ref dir) = cli.config_dir {
-        // In config-dir mode, config path is unused
+        init_logging(&cli, None);
+
         let files = match collect_config_files(Path::new(dir)) {
             Ok(files) => files,
             Err(e) => {
@@ -90,19 +90,25 @@ async fn run(cli: CliArgs) {
                 tracing::error!("frpc service task panicked: {}", e);
             }
         }
-    } else {
-        let cfg = match load_client_config(&cli.config) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                tracing::error!("Failed to load config: {}", e);
-                process::exit(1);
-            }
-        };
-        tracing::info!("frpc (Rust) v{} connecting...", frp_core::VERSION);
-        let service = Service::new(cfg);
-        if let Err(e) = service.run().await {
-            tracing::error!("frpc error: {}", e);
+        return;
+    }
+
+    // Single config mode: load config first, then init logging with [log] fallback
+    let cfg = match load_client_config(&cli.config) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            init_logging(&cli, None);
+            tracing::error!("Failed to load config: {}", e);
             process::exit(1);
         }
+    };
+
+    init_logging(&cli, Some(&cfg));
+
+    tracing::info!("frpc (Rust) v{} connecting...", frp_core::VERSION);
+    let service = Service::new(cfg);
+    if let Err(e) = service.run().await {
+        tracing::error!("frpc error: {}", e);
+        process::exit(1);
     }
 }
