@@ -13,6 +13,21 @@ use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
+/// Go frp v0.69.1 FRPTLSHeadByte — sent before TLS handshake to allow
+/// mixed TLS/plaintext on the same port.
+pub const FRP_TLS_HEAD_BYTE: u8 = 0x17;
+
+/// Result of peeking the first byte on the main accept port.
+#[derive(Debug, PartialEq)]
+pub enum ConnectionType {
+    /// 0x17 byte → route to TLS
+    Tls,
+    /// 'G' (GET) → HTTP WebSocket upgrade
+    WebSocket,
+    /// V1 type byte → plain frp protocol (the byte is the V1 message type)
+    V1(u8),
+}
+
 /// The WebSocket path used by frp (matching the Go version).
 pub const FRP_WEBSOCKET_PATH: &str = "/~!frp";
 
@@ -249,10 +264,11 @@ impl Default for DialOptions {
 
 /// Connect to the server with the given options.
 pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
+    use tokio::io::AsyncWriteExt;
     use tokio::time::{timeout, Duration};
 
     let addr = format!("{}:{}", opts.server_addr, opts.server_port);
-    let stream = timeout(
+    let mut stream = timeout(
         Duration::from_secs(opts.dial_timeout_secs),
         TcpStream::connect(&addr),
     )
@@ -263,6 +279,9 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
     match opts.protocol {
         TransportProtocol::Tcp => {
             if opts.tls_enable {
+                // Write FRPTLSHeadByte (0x17) before TLS handshake, matching Go frp v0.69.1
+                stream.write_all(&[FRP_TLS_HEAD_BYTE]).await
+                    .map_err(|e| crate::Error::Transport(format!("write TLS head byte: {e}")))?;
                 let connector = build_tls_connector(None)?;
                 let server_name = if !opts.tls_server_name.is_empty() {
                     opts.tls_server_name.clone()
@@ -301,6 +320,42 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             Err(crate::Error::Transport("QUIC not yet implemented".into()))
         }
     }
+}
+
+/// Peek the first byte of a TCP stream to determine connection type.
+/// Uses MSG_PEEK so the byte remains in the socket buffer — the caller
+/// uses the existing stream directly without needing to prepend bytes.
+///
+/// Returns:
+/// - `Tls` if first byte is 0x17 (TLS head byte, must be consumed before TLS handshake)
+/// - `WebSocket` if first byte is 'G' (HTTP GET for WS upgrade)
+/// - `V1(byte)` otherwise (frp protocol, byte is V1 message type byte)
+pub async fn peek_connection_type(stream: &TcpStream) -> Result<ConnectionType, crate::Error> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut buf = [0u8; 1];
+    let n = unsafe {
+        libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK)
+    };
+    if n <= 0 {
+        return Err(crate::Error::Transport("peek connection type: stream closed".into()));
+    }
+    match buf[0] {
+        FRP_TLS_HEAD_BYTE => Ok(ConnectionType::Tls),
+        b'G' => Ok(ConnectionType::WebSocket),
+        b => Ok(ConnectionType::V1(b)),
+    }
+}
+
+/// After peeking ConnectionType::Tls, consume the 0x17 head byte from the stream.
+/// Must be called before TLS handshake.
+pub async fn consume_tls_head_byte(stream: &mut TcpStream) -> Result<(), crate::Error> {
+    let mut buf = [0u8; 1];
+    tokio::io::AsyncReadExt::read_exact(stream, &mut buf)
+        .await
+        .map_err(|e| crate::Error::Transport(format!("consume TLS head byte: {e}")))?;
+    debug_assert_eq!(buf[0], FRP_TLS_HEAD_BYTE, "expected TLS head byte 0x17");
+    Ok(())
 }
 
 /// Accept a WebSocket upgrade on the server side.

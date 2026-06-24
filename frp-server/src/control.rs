@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio::net::TcpListener;
 use tokio::net::UdpSocket;
+use tokio::time::{Duration, Instant};
 use tracing::{info, warn, debug};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -15,6 +16,15 @@ use frp_core::format_socket_addr;
 use crate::proxy::{ProxyInfo, allocate_port};
 use crate::service::{AppState, InternalMsg, ControlTx};
 
+/// Max age of a pending request before it is dropped (Go frp: 10s default).
+const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Max time without receiving a ping before the server closes the connection (Go frp: 90s).
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Max work connections to pool beyond what the client requested (Go frp: poolCount + 10).
+const WORK_POOL_EXTRA: usize = 10;
+
 /// A pending request from a proxy listener waiting for a work connection.
 struct PendingRequest {
     proxy_name: String,
@@ -22,6 +32,7 @@ struct PendingRequest {
     pre_read: Vec<u8>,
     use_encryption: bool,
     use_compression: bool,
+    created_at: Instant,
 }
 
 /// Handle a control connection from a frpc client.
@@ -82,12 +93,30 @@ pub async fn handle_control<S>(
     }
 
     // --- Per-client state ---
+    let pool_cap = login.pool_count.unwrap_or(1).max(0) as usize + WORK_POOL_EXTRA;
     let mut work_pool: VecDeque<IoStream> = VecDeque::new();
     let mut pending_requests: VecDeque<PendingRequest> = VecDeque::new();
     let mut listener_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> = std::collections::HashMap::new();
+    let mut last_ping = Instant::now();
 
     // --- Main select loop ---
     loop {
+        // Expire stale pending requests
+        while let Some(req) = pending_requests.front() {
+            if req.created_at.elapsed() > PENDING_REQUEST_TIMEOUT {
+                let expired = pending_requests.pop_front().unwrap();
+                warn!("Pending request for proxy '{}' timed out after {:?}", expired.proxy_name, PENDING_REQUEST_TIMEOUT);
+            } else {
+                break;
+            }
+        }
+
+        // Heartbeat check: if no ping in HEARTBEAT_TIMEOUT, disconnect
+        if last_ping.elapsed() > HEARTBEAT_TIMEOUT {
+            warn!("Heartbeat timeout for {:?} (no ping in {:?}), disconnecting", peer, HEARTBEAT_TIMEOUT);
+            break;
+        }
+
         tokio::select! {
             biased;
 
@@ -96,11 +125,21 @@ pub async fn handle_control<S>(
                 match internal {
                     Some(InternalMsg::NewWorkConn(stream)) => {
                         debug!("Got work conn for run_id {}", run_id);
+                        // Drain expired requests first
+                        while let Some(req) = pending_requests.front() {
+                            if req.created_at.elapsed() > PENDING_REQUEST_TIMEOUT {
+                                pending_requests.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
                         if let Some(req) = pending_requests.pop_front() {
                             assign_work_to_proxy(stream, req, state.encryption_key).await;
-                        } else {
+                        } else if work_pool.len() < pool_cap {
                             work_pool.push_back(stream);
-                            debug!("Work conn pooled for {} (pool size: {})", run_id, work_pool.len());
+                            debug!("Work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
+                        } else {
+                            debug!("Work pool full for {} ({}/{}), dropping work conn", run_id, work_pool.len(), pool_cap);
                         }
                     }
                     Some(InternalMsg::VisitorConn { proxy_name, visitor_conn }) => {
@@ -112,14 +151,14 @@ pub async fn handle_control<S>(
                             (e, c)
                         };
                         if let Some(work_conn) = work_pool.pop_front() {
-                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp }, state.encryption_key).await;
+                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now() }, state.encryption_key).await;
                         } else {
                             debug!("No pooled work conn for STCP, sending ReqWorkConn");
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
                                 warn!("Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
-                            pending_requests.push_back(PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp });
+                            pending_requests.push_back(PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now() });
                         }
                     }
                     Some(InternalMsg::ProxyUserConn { proxy_name, user_conn, pre_read }) => {
@@ -131,14 +170,14 @@ pub async fn handle_control<S>(
                             (e, c)
                         };
                         if let Some(work_conn) = work_pool.pop_front() {
-                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn, pre_read, use_encryption: enc, use_compression: comp }, state.encryption_key).await;
+                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() }, state.encryption_key).await;
                         } else {
                             debug!("No pooled work conn, sending ReqWorkConn for {}", proxy_name);
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
                                 warn!("Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
-                            pending_requests.push_back(PendingRequest { proxy_name, user_conn, pre_read, use_encryption: enc, use_compression: comp });
+                            pending_requests.push_back(PendingRequest { proxy_name, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() });
                         }
                     }
                     Some(InternalMsg::UdpData { proxy_name: _pn, content, remote_addr }) => {
@@ -212,6 +251,7 @@ pub async fn handle_control<S>(
                         info!("Proxy closed: {}", cp.proxy_name);
                     }
                     Ok(FrpMessage::Ping(_)) => {
+                        last_ping = Instant::now();
                         let pong = FrpMessage::Pong(msg::Pong { error: None });
                         if let Err(e) = write_msg_v1(&mut writer, &pong).await {
                             warn!("Failed to send pong: {}", e);

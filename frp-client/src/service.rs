@@ -156,6 +156,7 @@ impl Service {
             let (mut reader, mut writer) = control_stream.into_split();
 
             // Spawn initial pool work connections (TCP only)
+            let auth_token = self.auth_cfg.token.clone();
             for i in 0..pool_count {
                 spawn_work_conn(
                     &self.cfg.server_addr,
@@ -165,6 +166,7 @@ impl Service {
                     &self.proxy_info_map,
                     self.encryption_key,
                     i,
+                    auth_token.clone(),
                 );
             }
 
@@ -179,8 +181,9 @@ impl Service {
                     let pn = p.name.clone();
                     let enc = p.use_encryption;
                     let ek = self.encryption_key;
+                    let tk = auth_token.clone();
                     tokio::spawn(async move {
-                        run_udp_work_conn(sa, sp, pt, ru, la, pn, enc, ek).await;
+                        run_udp_work_conn(sa, sp, pt, ru, la, pn, enc, ek, tk).await;
                     });
                 }
             }
@@ -202,6 +205,7 @@ impl Service {
                                     &self.proxy_info_map,
                                     self.encryption_key,
                                     -1, // on-demand, not pool
+                                    auth_token.clone(),
                                 );
                             }
                             Ok(FrpMessage::Pong(_)) => {
@@ -256,7 +260,7 @@ impl Service {
 ///
 /// The task:
 /// 1. Dials the server
-/// 2. Sends NewWorkConn (with run_id)
+/// 2. Sends NewWorkConn (with run_id + auth)
 /// 3. Reads StartWorkConn from the server
 /// 4. Connects to the local service
 /// 5. Bridges data bidirectionally
@@ -270,6 +274,7 @@ fn spawn_work_conn(
     proxy_info_map: &HashMap<String, ProxyRuntimeInfo>,
     enc_key: [u8; 16],
     pool_id: i32,
+    auth_token: String,
 ) {
     let server_addr = server_addr.to_string();
     let run_id = run_id.to_string();
@@ -312,11 +317,25 @@ fn spawn_work_conn(
             }
         };
 
-        // Send NewWorkConn with run_id so the server can route it
+        // Build auth for work conn (Go frp v0.69.1 compat: server verifies auth on NewWorkConn)
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let auth_cfg = frp_core::auth::AuthConfig {
+            method: frp_core::auth::AuthMethod::Token,
+            token: auth_token,
+            oidc_issuer: String::new(),
+            oidc_audience: String::new(),
+            additional_data: None,
+        };
+        let privilege_key = auth_cfg.generate_login_key(timestamp);
+
+        // Send NewWorkConn with run_id and auth so the server can route and verify it
         let nwc = FrpMessage::NewWorkConn(msg::NewWorkConn {
             run_id: Some(run_id.clone()),
-            timestamp: None,
-            privilege_key: None,
+            timestamp: Some(timestamp),
+            privilege_key,
         });
 
         if let Err(e) = write_msg_v1(&mut work, &nwc).await {
@@ -419,6 +438,7 @@ async fn run_udp_work_conn(
     proxy_name: String,
     use_encryption: bool,
     #[allow(unused_variables)] enc_key: [u8; 16],
+    auth_token: String,
 ) {
     if use_encryption {
         warn!("UDP work conn '{}': encryption not yet implemented for UDP tunnels", proxy_name);
@@ -445,11 +465,25 @@ async fn run_udp_work_conn(
         }
     };
 
-    // Send NewWorkConn
+    // Build auth for work conn
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let auth_cfg = frp_core::auth::AuthConfig {
+        method: frp_core::auth::AuthMethod::Token,
+        token: auth_token,
+        oidc_issuer: String::new(),
+        oidc_audience: String::new(),
+        additional_data: None,
+    };
+    let privilege_key = auth_cfg.generate_login_key(timestamp);
+
+    // Send NewWorkConn with auth
     let nwc = FrpMessage::NewWorkConn(msg::NewWorkConn {
         run_id: Some(run_id),
-        timestamp: None,
-        privilege_key: None,
+        timestamp: Some(timestamp),
+        privilege_key,
     });
     if let Err(e) = write_msg_v1(&mut work, &nwc).await {
         warn!("UDP work conn {}: failed to send NewWorkConn: {}", proxy_name, e);

@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use tokio::sync::RwLock;
 use tokio::net::TcpListener;
 
@@ -12,8 +11,8 @@ use frp_core::config::ServerConfig;
 use frp_core::auth::{AuthConfig, AuthMethod};
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::read_msg_v1;
-use frp_core::transport::IoStream;
-use frp_core::transport::build_tls_acceptor;
+use frp_core::transport::{IoStream, ConnectionType, peek_connection_type, consume_tls_head_byte};
+use frp_core::transport::{build_tls_acceptor, accept_websocket};
 use frp_core::format_socket_addr;
 
 use crate::proxy::ProxyManager;
@@ -227,18 +226,114 @@ impl Service {
             tracing::info!("Dashboard web UI starting on {}", dash_addr2);
         }
 
-        // Main accept loop
+        // Main accept loop — mixed-mode: TLS, WebSocket, and V1 on same port.
+        // Uses MSG_PEEK to detect connection type without consuming bytes,
+        // matching Go frp v0.69.1 behavior.
         loop {
             match listener.accept().await {
-                Ok((stream, addr)) => {
+                Ok((mut stream, addr)) => {
                     let state = self.state.clone();
                     let acceptor = tls_acceptor.clone();
 
                     tokio::spawn(async move {
-                        if let Some(acceptor) = acceptor {
-                            handle_tls_connection(stream, state, addr, acceptor).await;
-                        } else {
-                            handle_plain_connection(stream, state, addr).await;
+                        let ct = match peek_connection_type(&stream).await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                warn!("Failed to peek connection type from {}: {}", addr, e);
+                                return;
+                            }
+                        };
+
+                        match ct {
+                            ConnectionType::Tls => {
+                                // Consume 0x17 head byte, then TLS handshake
+                                if let Err(e) = consume_tls_head_byte(&mut stream).await {
+                                    warn!("Failed to consume TLS head byte from {}: {}", addr, e);
+                                    return;
+                                }
+                                let acceptor = match acceptor {
+                                    Some(a) => a,
+                                    None => {
+                                        warn!("TLS connection from {} but TLS not configured", addr);
+                                        return;
+                                    }
+                                };
+                                let tls_stream = match acceptor.accept(stream).await {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        warn!("TLS handshake failed from {}: {}", addr, e);
+                                        return;
+                                    }
+                                };
+                                info!("TLS connection from {}", addr);
+                                let mut tls = tls_stream;
+                                match read_msg_v1(&mut tls).await {
+                                    Ok(FrpMessage::Login(login)) => {
+                                        control::handle_control(tls, login, state, Some(addr)).await;
+                                    }
+                                    Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                        let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
+                                        handle_work_conn_inner(io, nwc, state).await;
+                                    }
+                                    Ok(other) => {
+                                        warn!("Unexpected TLS first message from {}: {:?}", addr, other.v1_type_byte());
+                                    }
+                                    Err(e) => {
+                                        warn!("TLS read error from {}: {}", addr, e);
+                                    }
+                                }
+                            }
+
+                            ConnectionType::WebSocket => {
+                                // Byte is still in buffer (MSG_PEEK), WS upgrade directly
+                                match accept_websocket(stream).await {
+                                    Ok(ws) => {
+                                        info!("WebSocket upgrade on main port for {}", addr);
+                                        let ws_inner = match ws {
+                                            IoStream::WebSocket(inner) => inner,
+                                            _ => unreachable!(),
+                                        };
+                                        let mut adapter = frp_core::transport::WsByteStream::new(ws_inner);
+                                        match read_msg_v1(&mut adapter).await {
+                                            Ok(FrpMessage::Login(login)) => {
+                                                control::handle_control(adapter, login, state.clone(), Some(addr)).await;
+                                            }
+                                            Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                let io = IoStream::WebSocket(adapter.into_inner());
+                                                handle_work_conn_inner(io, nwc, state.clone()).await;
+                                            }
+                                            Ok(other) => {
+                                                warn!("Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
+                                            }
+                                            Err(e) => {
+                                                warn!("WS read error from {}: {}", addr, e);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("WebSocket upgrade failed for {}: {}", addr, e);
+                                    }
+                                }
+                            }
+
+                            ConnectionType::V1(_byte) => {
+                                // Byte is still in buffer, read_msg_v1 will consume it
+                                match read_msg_v1(&mut stream).await {
+                                    Ok(FrpMessage::Login(login)) => {
+                                        control::handle_control(stream, login, state, Some(addr)).await;
+                                    }
+                                    Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                        let io = IoStream::Tcp(stream);
+                                        handle_work_conn_inner(io, nwc, state).await;
+                                    }
+                                    Ok(other) => {
+                                        warn!("Unexpected first message from {}: {:?}", addr, other.v1_type_byte());
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to read first message from {}: {}", addr, e);
+                                    }
+                                }
+                            }
                         }
                     });
                 }
@@ -250,67 +345,8 @@ impl Service {
     }
 }
 
-/// Handle a TLS connection: handshake, read first V1 frame, dispatch.
-async fn handle_tls_connection(
-    stream: tokio::net::TcpStream,
-    state: Arc<AppState>,
-    addr: SocketAddr,
-    acceptor: tokio_rustls::TlsAcceptor,
-) {
-    let tls_stream = match acceptor.accept(stream).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("TLS handshake failed from {}: {}", addr, e);
-            return;
-        }
-    };
-
-    info!("TLS connection from {}", addr);
-    let mut tls = tls_stream;
-
-    match read_msg_v1(&mut tls).await {
-        Ok(FrpMessage::Login(login)) => {
-            control::handle_control(tls, login, state, Some(addr)).await;
-        }
-        Ok(FrpMessage::NewWorkConn(nwc)) => {
-            // TLS work connection: wrap in IoStream::Tls for pooling
-            let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
-            handle_work_conn_inner(io, nwc, state).await;
-        }
-        Ok(other) => {
-            warn!("Unexpected first message from {}: {:?}", addr, other.v1_type_byte());
-        }
-        Err(e) => {
-            warn!("Failed to read first message from {}: {}", addr, e);
-        }
-    }
-}
-
-/// Handle a non-TLS connection: read first V1 frame, dispatch.
-async fn handle_plain_connection(
-    mut stream: tokio::net::TcpStream,
-    state: Arc<AppState>,
-    addr: SocketAddr,
-) {
-    match read_msg_v1(&mut stream).await {
-        Ok(FrpMessage::Login(login)) => {
-            control::handle_control(stream, login, state, Some(addr)).await;
-        }
-        Ok(FrpMessage::NewWorkConn(nwc)) => {
-            let io = IoStream::Tcp(stream);
-            handle_work_conn_inner(io, nwc, state).await;
-        }
-        Ok(other) => {
-            warn!("Unexpected first message from {}: {:?}", addr, other.v1_type_byte());
-        }
-        Err(e) => {
-            warn!("Failed to read first message from {}: {}", addr, e);
-        }
-    }
-}
-
-/// Handle an incoming work connection. Routes the IoStream to the
-/// appropriate control handler via InternalMsg.
+/// Handle an incoming work connection. Verifies auth, then routes the
+/// IoStream to the appropriate control handler via InternalMsg.
 async fn handle_work_conn_inner(
     stream: IoStream,
     msg: msg::NewWorkConn,
@@ -323,6 +359,15 @@ async fn handle_work_conn_inner(
             return;
         }
     };
+
+    // Verify work connection auth (Go frp v0.69.1 compat)
+    if let Err(e) = state.auth_cfg.validate_login(
+        msg.privilege_key.as_deref(),
+        msg.timestamp,
+    ) {
+        warn!("Work conn auth failed for run_id {}: {}", run_id, e);
+        return;
+    }
 
     let ctl_tx = {
         let map = state.run_id_to_ctl_tx.read().await;
