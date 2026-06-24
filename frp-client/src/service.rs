@@ -19,11 +19,9 @@ struct ProxyRuntimeInfo {
     local_addr: String,
     use_encryption: bool,
     use_compression: bool,
-    /// Bandwidth limit in bytes/sec (0 = unlimited). Enforcement TODO.
-    #[allow(dead_code)]
+    /// Bandwidth limit in bytes/sec (0 = unlimited).
     bandwidth_limit: u64,
-    /// Bandwidth limit mode: "client", "server", or "both". Enforcement TODO.
-    #[allow(dead_code)]
+    /// Bandwidth limit mode: "client", "server", or "both".
     bandwidth_limit_mode: String,
 }
 
@@ -432,7 +430,7 @@ fn spawn_work_conn(
                 match proxy::connect_local(&info.local_addr).await {
                     Ok(local) => {
                         let enc = if info.use_encryption { Some(&enc_key) } else { None };
-                        proxy::bridge_streams(local, work, proxy_name, info.use_encryption, info.use_compression, enc).await;
+                        proxy::bridge_streams(local, work, proxy_name, info.use_encryption, info.use_compression, enc, info.bandwidth_limit, &info.bandwidth_limit_mode).await;
                     }
                     Err(e) => {
                         warn!("Work conn {}: failed to connect to local {}: {}", label, info.local_addr, e);

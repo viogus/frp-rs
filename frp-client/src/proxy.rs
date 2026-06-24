@@ -1,6 +1,7 @@
 use tokio::net::TcpStream;
 use tracing::{info, warn, debug};
 
+use frp_core::bandwidth::BandwidthLimiter;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::bridge;
 use frp_core::transport::IoStream;
@@ -66,7 +67,11 @@ pub async fn connect_local(addr: &str) -> Result<TcpStream, frp_core::Error> {
         .map_err(|e| frp_core::Error::Transport(format!("connect to local {}: {}", addr, e)))
 }
 
-/// Bridge data between two streams with optional encryption and compression.
+/// Bridge data between two streams with optional encryption, compression,
+/// and bandwidth limiting.
+///
+/// `bandwidth_limit` is in bytes/sec (0 = unlimited).
+/// `bandwidth_limit_mode` is "client" (upload), "server" (download), or "both".
 pub async fn bridge_streams(
     local: tokio::net::TcpStream,
     work: IoStream,
@@ -74,26 +79,60 @@ pub async fn bridge_streams(
     use_encryption: bool,
     use_compression: bool,
     enc_key: Option<&[u8; 16]>,
+    bandwidth_limit: u64,
+    bandwidth_limit_mode: &str,
 ) {
-    info!("Bridging streams for proxy: {} (encrypted: {}, compressed: {})", name, use_encryption, use_compression);
+    info!("Bridging streams for proxy: {} (encrypted: {}, compressed: {}, bw_limit: {} {})",
+        name, use_encryption, use_compression, bandwidth_limit, bandwidth_limit_mode);
+
+    // Build bandwidth limiters per direction.
+    // "client" throttles upload (local→server, write to work).
+    // "server" throttles download (server→local, read from work).
+    let mut read_lim = if bandwidth_limit > 0 && (bandwidth_limit_mode == "server" || bandwidth_limit_mode == "both") {
+        Some(BandwidthLimiter::new(bandwidth_limit))
+    } else {
+        None
+    };
+    let mut write_lim = if bandwidth_limit > 0 && (bandwidth_limit_mode == "client" || bandwidth_limit_mode == "both") {
+        Some(BandwidthLimiter::new(bandwidth_limit))
+    } else {
+        None
+    };
+
     if use_encryption {
         if let Some(key) = enc_key {
             let (l_r, l_w) = tokio::io::split(local);
             let (w_r, w_w) = work.into_split();
-            bridge::bridge_encrypted(l_r, l_w, w_r, w_w, key, use_compression).await;
+            bridge::bridge_encrypted(
+                l_r, l_w, w_r, w_w, key, use_compression,
+                read_lim.as_mut(), write_lim.as_mut(),
+            ).await;
             debug!("Proxy {} encrypted bridge closed", name);
             return;
         }
         warn!("Proxy {}: encryption requested but no key available, falling back to plain", name);
     }
-    let mut local = local;
-    let mut work = work;
-    match tokio::io::copy_bidirectional(&mut local, &mut work).await {
-        Ok((to_a, to_b)) => {
-            debug!("Proxy {} closed: {}B to server, {}B to local", name, to_a, to_b);
-        }
-        Err(e) => {
-            debug!("Proxy {} bridge error: {}", name, e);
+
+    // Plain path: use rate-limited bridge when bandwidth limiting is active,
+    // otherwise use the fast copy_bidirectional path.
+    if read_lim.is_some() || write_lim.is_some() {
+        let (l_r, l_w) = tokio::io::split(local);
+        let (w_r, w_w) = work.into_split();
+        bridge::bridge_plain_rate_limited(
+            l_r, l_w, w_r, w_w,
+            read_lim.as_mut(), write_lim.as_mut(),
+        ).await;
+        debug!("Proxy {} rate-limited bridge closed", name);
+    } else {
+        let mut local = local;
+        let mut work = work;
+        match tokio::io::copy_bidirectional(&mut local, &mut work).await {
+            Ok((to_a, to_b)) => {
+                debug!("Proxy {} closed: {}B to server, {}B to local", name, to_a, to_b);
+            }
+            Err(e) => {
+                debug!("Proxy {} bridge error: {}", name, e);
+            }
         }
     }
 }

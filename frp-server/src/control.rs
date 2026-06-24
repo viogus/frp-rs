@@ -455,27 +455,27 @@ async fn assign_work_to_proxy(
                 IoStream::Tcp(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key).await;
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, None, None).await;
                 }
                 IoStream::Tls(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key).await;
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, None, None).await;
                 }
                 IoStream::Kcp(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key).await;
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, None, None).await;
                 }
                 IoStream::WebSocket(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key).await;
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, None, None).await;
                 }
                 IoStream::Yamux(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key).await;
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, None, None).await;
                 }
             }
         } else {
