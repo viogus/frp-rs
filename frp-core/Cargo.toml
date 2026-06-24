@@ -15,6 +15,7 @@ bytes.workspace = true
 uuid.workspace = true
 tokio-tungstenite.workspace = true
 sha2.workspace = true
+md-5.workspace = true
 hmac.workspace = true
 hex.workspace = true
 data-encoding.workspace = true

@@ -20,8 +20,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
 tokio-tungstenite = "0.24"
-sha2 = "0.10"
-hmac = "0.12"
+   sha2 = "0.10"
+  md-5 = "0.10"
+   hmac = "0.12"
 hex = "0.4"
 data-encoding = "2"
 aes-gcm = { version = "0.10", features = ["aes"] }

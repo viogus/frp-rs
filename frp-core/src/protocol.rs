@@ -19,12 +19,19 @@ pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
 
     let mut buf = Vec::with_capacity(V1_HEADER_LEN + payload.len());
     buf.push(type_byte);
-    buf.extend_from_slice(&(payload.len() as i64).to_be_bytes());
-    buf.extend_from_slice(&payload);
+   buf.extend_from_slice(&(payload.len() as i64).to_be_bytes());
+   buf.extend_from_slice(&payload);
 
-    writer
-        .write_all(&buf)
-        .await
+    tracing::debug!(
+        "V1 frame: type=0x{:02x} len={} payload={}",
+        type_byte,
+        payload.len(),
+        String::from_utf8_lossy(&payload)
+    );
+
+   writer
+       .write_all(&buf)
+       .await
         .map_err(|e| crate::Error::Protocol(format!("write V1 frame: {e}")))?;
     Ok(())
 }

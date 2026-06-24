@@ -1,27 +1,17 @@
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use md5::{Md5, Digest};
 
-type HmacSha256 = Hmac<Sha256>;
-
-/// Generate a token for authentication using HMAC-SHA256.
+/// Generate a token for authentication using MD5 (matching Go frp v0.69.1).
 /// The message is typically the timestamp as a string.
 pub fn generate_token(token: &str, timestamp: i64) -> String {
-    let mut mac = HmacSha256::new_from_slice(token.as_bytes())
-        .expect("HMAC can take key of any size");
-    mac.update(timestamp.to_string().as_bytes());
-    hex::encode(mac.finalize().into_bytes())
+    let mut hasher = Md5::new();
+    hasher.update(token.as_bytes());
+    hasher.update(timestamp.to_string().as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// Verify a token against a known secret and timestamp.
 pub fn verify_token(token: &str, timestamp: i64, expected_hex: &str) -> bool {
-    let computed = generate_token(token, timestamp);
-    // Constant-time comparison
-    computed.len() == expected_hex.len()
-        && computed
-            .as_bytes()
-            .iter()
-            .zip(expected_hex.as_bytes())
-            .all(|(a, b)| a == b)
+    generate_token(token, timestamp) == expected_hex
 }
 
 /// Authentication configuration.
