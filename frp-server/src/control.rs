@@ -8,6 +8,7 @@ use tokio::time::{Duration, Instant};
 use tracing::{info, warn, debug};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::IncomingStreams;
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
@@ -234,8 +235,22 @@ pub async fn handle_control<S>(
                             .find(|(_, pn)| *pn == _pn)
                             .map(|(ls, _)| ls.clone())
                             .unwrap_or_default();
+                        // Encrypt/compress if the proxy requires it (Go frp v0.69.1 compat)
+                        let mut payload = content;
+                        if let Some(proxy_info) = state.proxy_manager.get(_pn).await {
+                            if proxy_info.use_compression {
+                                if let Ok(compressed) = encryption::compress(&payload) {
+                                    payload = compressed;
+                                }
+                            }
+                            if proxy_info.use_encryption {
+                                if let Ok(encrypted) = encryption::encrypt(&payload, &state.encryption_key) {
+                                    payload = encrypted;
+                                }
+                            }
+                        }
                         let udp_packet = FrpMessage::UDPPacket(msg::UDPPacket {
-                            content,
+                            content: payload,
                             local_addr: local_str,
                             remote_addr,
                         });
@@ -290,12 +305,28 @@ pub async fn handle_control<S>(
                         // Forward via the proxy's UDP socket (bidirectional NAT, Go frp compat).
                         // Lookup: local_addr → proxy_name → socket, fallback to first socket.
                         let proxy_name = udp_local_to_proxy.get(&up.local_addr);
+                        // Decrypt/decompress if the proxy requires it
+                        let mut payload = up.content.clone();
+                        if let Some(pn) = proxy_name {
+                            if let Some(proxy_info) = state.proxy_manager.get(pn).await {
+                                if proxy_info.use_encryption {
+                                    if let Ok(decrypted) = encryption::decrypt(&payload, &state.encryption_key) {
+                                        payload = decrypted;
+                                    }
+                                }
+                                if proxy_info.use_compression {
+                                    if let Ok(decompressed) = encryption::decompress(&payload) {
+                                        payload = decompressed;
+                                    }
+                                }
+                            }
+                        }
                         let sock_opt = proxy_name
                             .and_then(|pn| udp_sockets.get(pn))
                             .or_else(|| udp_sockets.iter().next().map(|(_, s)| s));
                         if let Some(sock) = sock_opt {
                             let sock = sock.clone();
-                            let content = up.content.clone();
+                            let content = payload;
                             let remote_addr = up.remote_addr.clone();
                             tokio::spawn(async move {
                                 let _ = sock.send_to(&content, &remote_addr).await;

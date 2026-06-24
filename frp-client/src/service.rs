@@ -7,6 +7,7 @@ use tracing::{info, warn, debug};
 
 use frp_core::auth::{AuthConfig, AuthMethod};
 use frp_core::config::ClientConfig;
+use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::mux::YamuxSession;
@@ -209,12 +210,10 @@ impl Service {
             // Bind local UDP sockets for UDP proxies and spawn sender tasks
             // (UDP traffic flows over the control connection, Go frp v0.69.1 compat)
             let mut udp_sockets: HashMap<String, Arc<UdpSocket>> = HashMap::new();
+            // Per-proxy encryption config: keyed by local_addr and proxy name
+            let mut udp_enc_cfg: HashMap<String, (bool, bool)> = HashMap::new();
             for p in &proxies {
                 if p.proxy_type == "udp" {
-                    if p.use_encryption {
-                        warn!("UDP proxy '{}': encryption not yet supported for UDP tunnels", p.name);
-                        continue;
-                    }
                     let local_addr = format!("{}:{}", p.local_ip, p.local_port);
                     let socket = match UdpSocket::bind("0.0.0.0:0").await {
                         Ok(s) => Arc::new(s),
@@ -231,19 +230,39 @@ impl Service {
                     // Map by local_str (matches UDPPacket.local_addr from server) and by name
                     udp_sockets.insert(local_addr.clone(), socket.clone());
                     udp_sockets.insert(p.name.clone(), socket.clone());
+                    // Store encryption config for both lookup keys
+                    let enc_cfg = (p.use_encryption, p.use_compression);
+                    udp_enc_cfg.insert(local_addr.clone(), enc_cfg);
+                    udp_enc_cfg.insert(p.name.clone(), enc_cfg);
 
                     // Spawn task: read from local UDP → send UDPPacket to server
                     let sock = socket;
                     let w = writer.clone();
                     let pn = p.name.clone();
                     let la = local_addr.clone();
+                    let use_enc = p.use_encryption;
+                    let use_comp = p.use_compression;
+                    let enc_key = self.encryption_key;
                     tokio::spawn(async move {
                         let mut buf = vec![0u8; 65535];
                         loop {
                             match sock.recv_from(&mut buf).await {
                                 Ok((n, src)) => {
+                                    let mut payload = buf[..n].to_vec();
+                                    // Encrypt/compress on the client→server path
+                                    // (server decrypts before forwarding to remote)
+                                    if use_comp {
+                                        if let Ok(compressed) = encryption::compress(&payload) {
+                                            payload = compressed;
+                                        }
+                                    }
+                                    if use_enc {
+                                        if let Ok(encrypted) = encryption::encrypt(&payload, &enc_key) {
+                                            payload = encrypted;
+                                        }
+                                    }
                                     let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
-                                        content: buf[..n].to_vec(),
+                                        content: payload,
                                         local_addr: la.clone(),
                                         remote_addr: src.to_string(),
                                     });
@@ -260,7 +279,8 @@ impl Service {
                             }
                         }
                     });
-                    info!("UDP proxy '{}' bridging to {}", p.name, local_addr);
+                    let enc_label = if use_enc { "encrypted" } else { "plain" };
+                    info!("UDP proxy '{}' bridging to {} ({})", p.name, local_addr, enc_label);
                 }
             }
 
@@ -297,13 +317,28 @@ impl Service {
                                 let sock = udp_sockets.get(&up.local_addr)
                                     .or_else(|| udp_sockets.values().next())
                                     .cloned();
+                                // Decrypt/decompress if the proxy requires it
+                                let content_len = up.content.len();
+                                let mut payload = up.content;
+                                if let Some(&(use_enc, use_comp)) = udp_enc_cfg.get(&up.local_addr) {
+                                    if use_enc {
+                                        if let Ok(decrypted) = encryption::decrypt(&payload, &self.encryption_key) {
+                                            payload = decrypted;
+                                        }
+                                    }
+                                    if use_comp {
+                                        if let Ok(decompressed) = encryption::decompress(&payload) {
+                                            payload = decompressed;
+                                        }
+                                    }
+                                }
                                 if let Some(sock) = sock {
-                                    let content = up.content;
+                                    let content = payload;
                                     tokio::spawn(async move {
                                         let _ = sock.send(&content).await;
                                     });
                                 } else {
-                                    warn!("No UDP socket for proxy, dropping {} bytes", up.content.len());
+                                    warn!("No UDP socket for proxy, dropping {} bytes", content_len);
                                 }
                             }
                             Ok(FrpMessage::CloseProxy(cp)) => {
