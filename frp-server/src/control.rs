@@ -213,22 +213,6 @@ pub async fn handle_control<S>(
 
             msg = read_msg_v1(&mut reader) => {
                 match msg {
-                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                        debug!("NewVisitorConn for proxy '{}'", nvc.proxy_name);
-                        let sk = nvc.sign_key.as_deref().unwrap_or("");
-                        let proxy_name = state.sk_index.read().await.get(sk).cloned();
-                        let resp = match proxy_name {
-                            Some(pn) => FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
-                                proxy_name: pn,
-                                error: None,
-                            }),
-                            None => FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
-                                proxy_name: nvc.proxy_name.clone(),
-                                error: Some("no matching STCP proxy found for sk".into()),
-                            }),
-                        };
-                        let _ = write_msg_v1(&mut writer, &resp).await;
-                    }
                     Ok(FrpMessage::UDPPacket(up)) => {
                         debug!("UDPPacket from client: {} bytes to {}", up.content.len(), up.remote_addr);
                         // Forward via the proxy's UDP socket (bidirectional NAT, Go frp compat).
