@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::collections::HashMap;
+use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 use tracing::{info, warn, debug};
 
@@ -85,6 +86,10 @@ impl Service {
             warn!("No proxies configured");
         }
 
+        // Channel for health checks to signal unhealthy proxies.
+        // Health checks send the proxy name; the control loop sends CloseProxy to the server.
+        let (health_tx, mut health_rx) = mpsc::unbounded_channel::<String>();
+
         // Spawn health checks once, outside reconnect loop (they are per-proxy, not per-session)
         for p in &proxies {
             if !p.health_check_type.is_empty() && p.health_check_type != "tcp" {
@@ -100,8 +105,9 @@ impl Service {
                     p.health_check_timeout_seconds.max(3)
                 );
                 let max_failed = p.health_check_max_failed.max(1);
+                let tx = health_tx.clone();
                 tokio::spawn(async move {
-                    run_health_check(pn, la, interval, timeout, max_failed).await;
+                    run_health_check(pn, la, interval, timeout, max_failed, tx).await;
                 });
             }
         }
@@ -295,6 +301,16 @@ impl Service {
                         }
                         debug!("Ping sent");
                     }
+
+                    Some(proxy_name) = health_rx.recv() => {
+                        info!("Health check sending CloseProxy for unhealthy proxy: {}", proxy_name);
+                        let close = FrpMessage::CloseProxy(msg::CloseProxy {
+                            proxy_name: proxy_name.clone(),
+                        });
+                        if let Err(e) = write_msg_v1(&mut writer, &close).await {
+                            warn!("Failed to send CloseProxy for {}: {}", proxy_name, e);
+                        }
+                    }
                 }
             }
 
@@ -470,12 +486,16 @@ fn spawn_work_conn(
 
 /// Run a health check for a TCP proxy.
 /// Periodically connects to the local service and reports status.
+/// When the local service exceeds max_failed consecutive failures, sends
+/// the proxy name on `health_tx` so the control loop can send CloseProxy
+/// to the server.
 async fn run_health_check(
     proxy_name: String,
     local_addr: String,
     interval: std::time::Duration,
     timeout: std::time::Duration,
     max_failed: u32,
+    health_tx: mpsc::UnboundedSender<String>,
 ) {
     info!("Health check started for '{}' -> {} (interval: {:?}, timeout: {:?})",
         proxy_name, local_addr, interval, timeout);
@@ -503,9 +523,9 @@ async fn run_health_check(
         }
         
         if failures >= max_failed {
-            warn!("Health check: proxy '{}' exceeded max failures ({}), marking unhealthy",
+            warn!("Health check: proxy '{}' exceeded max failures ({}), sending CloseProxy",
                 proxy_name, max_failed);
-            // TODO: Send CloseProxy to server
+            let _ = health_tx.send(proxy_name.clone());
             failures = 0; // Reset to avoid repeated warnings
         }
     }
