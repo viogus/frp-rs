@@ -421,7 +421,9 @@ async fn handle_new_proxy(
 
     let allocated_port = {
         let mut ports = state.used_ports.write().await;
-        allocate_port(&mut ports, remote_port, 100, 10000)
+        let base = state.allow_port_start;
+        let count = state.allow_port_end.saturating_sub(base).max(100);
+        allocate_port(&mut ports, remote_port, count, base)
     };
 
     match allocated_port {
@@ -461,22 +463,39 @@ async fn handle_new_proxy(
 
             // Register HTTP proxies with VhostManager
             if np.proxy_type == "http" {
-                if let Some(ref domains) = np.custom_domains {
-                    if !domains.is_empty() {
-                        state.vhost_manager.register(
-                            &np.proxy_name,
-                            domains,
-                            run_id,
-                        ).await;
-                        info!("VHost routes registered for '{}': {:?}", np.proxy_name, domains);
+                let mut domains: Vec<String> = np.custom_domains.clone().unwrap_or_default();
+
+                // Subdomain routing: {subdomain}.{sub_domain_host}
+                if let Some(ref subdomain) = np.subdomain {
+                    if !subdomain.is_empty() {
+                        let sub_host = &state.sub_domain_host;
+                        if !sub_host.is_empty() {
+                            let full_domain = format!("{}.{}", subdomain, sub_host);
+                            info!("Subdomain route: {} → {}", full_domain, np.proxy_name);
+                            if !domains.contains(&full_domain) {
+                                domains.push(full_domain);
+                            }
+                        }
                     }
+                }
+
+                if !domains.is_empty() {
+                    state.vhost_manager.register(
+                        &np.proxy_name,
+                        &domains,
+                        run_id,
+                    ).await;
+                    info!("VHost routes registered for '{}': {:?}", np.proxy_name, domains);
                 }
             }
 
-            // Start the appropriate listener for this proxy type
+            // Start the appropriate listener for this proxy type.
+            // STCP/XTCP use NAT hole punching — no listener port needed.
             let pn = np.proxy_name.clone();
             let itx = internal_tx.clone();
             let bind_addr = state.proxy_bind_addr.clone();
+
+            let is_nat_hole = np.proxy_type == "stcp" || np.proxy_type == "xtcp";
 
             if np.proxy_type == "udp" {
                 let handle = tokio::spawn(async move {
@@ -484,6 +503,8 @@ async fn handle_new_proxy(
                 });
                 listener_handles.insert(np.proxy_name.clone(), handle);
                 info!("UDP proxy '{}' listening on port {}", np.proxy_name, port);
+            } else if is_nat_hole {
+                info!("{} proxy '{}' registered (no listener, NAT hole punch)", np.proxy_type, np.proxy_name);
             } else {
                 let handle = tokio::spawn(async move {
                     listen_and_proxy(bind_addr, port, pn, itx).await;

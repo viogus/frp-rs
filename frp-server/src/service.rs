@@ -58,10 +58,13 @@ pub struct AppState {
     pub encryption_key: [u8; 16],
     pub sk_index: Arc<RwLock<HashMap<String, String>>>,
     pub dashboard_start: std::time::Instant,
+    pub allow_port_start: u16,
+    pub allow_port_end: u16,
+    pub sub_domain_host: String,
 }
 
 impl AppState {
-    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16]) -> Self {
+    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_port_start: u16, allow_port_end: u16, sub_domain_host: String) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             auth_cfg: Arc::new(auth_cfg),
@@ -73,6 +76,9 @@ impl AppState {
             encryption_key,
             dashboard_start: std::time::Instant::now(),
             sk_index: Arc::new(RwLock::new(HashMap::new())),
+            allow_port_start,
+            allow_port_end,
+            sub_domain_host,
         }
     }
 }
@@ -99,6 +105,9 @@ impl Service {
             additional_data: None,
         };
         let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
+        let allow_start = cfg.allow_port_start;
+        let allow_end = cfg.allow_port_end;
+        let sub_host = cfg.sub_domain_host.clone();
         Self {
             state: Arc::new(AppState::new(
             auth_cfg,
@@ -108,6 +117,9 @@ impl Service {
                 cfg.proxy_bind_addr.clone()
             },
             enc_key,
+            allow_start,
+            allow_end,
+            sub_host,
         )),
             cfg,
         }

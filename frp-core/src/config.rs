@@ -41,7 +41,14 @@ pub struct ServerConfig {
     pub web_server: WebServerConfig,
     #[serde(default)]
     pub transport: ServerTransportConfig,
+    #[serde(default = "default_allow_port_start")]
+    pub allow_port_start: u16,
+    #[serde(default = "default_allow_port_end")]
+    pub allow_port_end: u16,
 }
+
+fn default_allow_port_start() -> u16 { 10000 }
+fn default_allow_port_end() -> u16 { 50000 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -63,6 +70,8 @@ impl Default for ServerConfig {
             log: LogConfig::default(),
             web_server: WebServerConfig::default(),
             transport: ServerTransportConfig::default(),
+            allow_port_start: default_allow_port_start(),
+            allow_port_end: default_allow_port_end(),
         }
     }
 }

@@ -324,7 +324,7 @@ fn spawn_work_conn(
             .as_secs() as i64;
         let auth_cfg = frp_core::auth::AuthConfig {
             method: frp_core::auth::AuthMethod::Token,
-            token: auth_token,
+            token: auth_token.clone(),
             oidc_issuer: String::new(),
             oidc_audience: String::new(),
             additional_data: None,
@@ -380,6 +380,21 @@ fn spawn_work_conn(
         }
 
         debug!("Work conn {} completed", label);
+
+        // Replenish pool: spawn replacement to maintain pool_count
+        // (Go frp v0.69.1 compat — idle work conns refilled after use)
+        if pool_id >= 0 {
+            spawn_work_conn(
+                &server_addr,
+                server_port,
+                &protocol,
+                &run_id,
+                &proxy_info_map,
+                enc_key,
+                pool_id,
+                auth_token,
+            );
+        }
     });
 }
 
