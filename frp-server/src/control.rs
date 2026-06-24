@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::net::SocketAddr;
 use std::collections::VecDeque;
 use tokio::sync::mpsc;
-use tokio::net::TcpStream;
 use tokio::net::TcpListener;
 use tokio::net::UdpSocket;
 use tracing::{info, warn, debug};
@@ -19,7 +18,7 @@ use crate::service::{AppState, InternalMsg, ControlTx};
 /// A pending request from a proxy listener waiting for a work connection.
 struct PendingRequest {
     proxy_name: String,
-    user_conn: TcpStream,
+    user_conn: IoStream,
     pre_read: Vec<u8>,
     use_encryption: bool,
 }
@@ -107,44 +106,32 @@ pub async fn handle_control<S>(
                     }
                     Some(InternalMsg::VisitorConn { proxy_name, visitor_conn }) => {
                         debug!("STCP visitor conn for proxy {} on run_id {}", proxy_name, run_id);
-                        let tcp = match visitor_conn {
-                            IoStream::Tcp(s) => s,
-                            _ => { warn!("STCP visitor requires TCP stream"); continue; }
-                        };
                         let enc = state.proxy_manager.get(&proxy_name).await
                             .map(|p| p.use_encryption).unwrap_or(false);
                         if let Some(work_conn) = work_pool.pop_front() {
-                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: tcp, pre_read: Vec::new(), use_encryption: enc }, state.encryption_key).await;
+                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc }, state.encryption_key).await;
                         } else {
                             debug!("No pooled work conn for STCP, sending ReqWorkConn");
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
                                 warn!("Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
-                            pending_requests.push_back(PendingRequest { proxy_name, user_conn: tcp, pre_read: Vec::new(), use_encryption: enc });
+                            pending_requests.push_back(PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc });
                         }
                     }
                     Some(InternalMsg::ProxyUserConn { proxy_name, user_conn, pre_read }) => {
-                        // Extract TcpStream from IoStream for PendingRequest
-                        let tcp = match user_conn {
-                            IoStream::Tcp(s) => s,
-                            _ => {
-                                warn!("Unsupported user connection type for proxy {}", proxy_name);
-                                continue;
-                            }
-                        };
                         debug!("User conn for proxy {} on run_id {}", proxy_name, run_id);
                         let enc = state.proxy_manager.get(&proxy_name).await
                             .map(|p| p.use_encryption).unwrap_or(false);
                         if let Some(work_conn) = work_pool.pop_front() {
-                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: tcp, pre_read, use_encryption: enc }, state.encryption_key).await;
+                            assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn, pre_read, use_encryption: enc }, state.encryption_key).await;
                         } else {
                             debug!("No pooled work conn, sending ReqWorkConn for {}", proxy_name);
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
                                 warn!("Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
-                            pending_requests.push_back(PendingRequest { proxy_name, user_conn: tcp, pre_read, use_encryption: enc });
+                            pending_requests.push_back(PendingRequest { proxy_name, user_conn, pre_read, use_encryption: enc });
                         }
                     }
                     Some(InternalMsg::UdpData { proxy_name: _pn, content, remote_addr }) => {
@@ -280,16 +267,44 @@ async fn assign_work_to_proxy(
     let enc_key = req.use_encryption;
 
     tokio::spawn(async move {
-        // Write VHost pre-read bytes to work connection first
+        // Write VHost pre-read bytes to work connection first.
+        // For encrypted bridges, send through encryption framing as the first frame.
         if !pre_read.is_empty() {
-            let write_result = match &mut work_conn {
-                IoStream::Tcp(ref mut s) => s.write_all(&pre_read).await,
-                IoStream::Tls(ref mut s) => s.write_all(&pre_read).await,
-                _ => Ok(()),
-            };
-            if let Err(e) = write_result {
-                warn!("Failed to write VHost pre-read bytes: {}", e);
-                return;
+            if enc_key {
+                match frp_core::encryption::encrypt(&pre_read, &encryption_key) {
+                    Ok(encrypted) => {
+                        let len = u32::try_from(encrypted.len()).unwrap_or(u32::MAX).to_be_bytes();
+                        let write_result = match &mut work_conn {
+                            IoStream::Tcp(ref mut s) => {
+                                if s.write_all(&len).await.is_err() { Err(std::io::Error::other("write failed")) }
+                                else { s.write_all(&encrypted).await }
+                            }
+                            IoStream::Tls(ref mut s) => {
+                                if s.write_all(&len).await.is_err() { Err(std::io::Error::other("write failed")) }
+                                else { s.write_all(&encrypted).await }
+                            }
+                            _ => Ok(()),
+                        };
+                        if let Err(e) = write_result {
+                            warn!("Failed to write encrypted VHost pre-read: {}", e);
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to encrypt VHost pre-read: {}", e);
+                        return;
+                    }
+                }
+            } else {
+                let write_result = match &mut work_conn {
+                    IoStream::Tcp(ref mut s) => s.write_all(&pre_read).await,
+                    IoStream::Tls(ref mut s) => s.write_all(&pre_read).await,
+                    _ => Ok(()),
+                };
+                if let Err(e) = write_result {
+                    warn!("Failed to write VHost pre-read bytes: {}", e);
+                    return;
+                }
             }
         }
 
@@ -316,23 +331,17 @@ async fn assign_work_to_proxy(
                 }
             }
         } else {
-            match work_conn {
-                IoStream::Tcp(mut work) => {
-                    let mut user = req.user_conn;
-                    if let Err(e) = tokio::io::copy_bidirectional(&mut user, &mut work).await {
-                        debug!("Proxy '{}' bridge closed: {}", req.proxy_name, e);
-                    }
-                }
-                IoStream::Tls(mut work) => {
-                    let mut user = req.user_conn;
-                    if let Err(e) = tokio::io::copy_bidirectional(&mut user, &mut work).await {
-                        debug!("Proxy '{}' bridge (TLS) closed: {}", req.proxy_name, e);
-                    }
-                }
-                IoStream::Kcp(_) => { warn!("Kcp streaming not yet supported"); return; }
-            IoStream::WebSocket(_) => {
-                    warn!("WebSocket bridging not implemented");
-                }
+            // Plain bridge: split both sides and copy bidirectionally
+            let (mut u_r, mut u_w) = req.user_conn.into_split();
+            let (mut w_r, mut w_w) = work_conn.into_split();
+            let to_work = tokio::io::copy(&mut u_r, &mut w_w);
+            let to_user = tokio::io::copy(&mut w_r, &mut u_w);
+            let result = tokio::join!(to_work, to_user);
+            if let Err(e) = result.0 {
+                debug!("Proxy '{}' user→work closed: {}", req.proxy_name, e);
+            }
+            if let Err(e) = result.1 {
+                debug!("Proxy '{}' work→user closed: {}", req.proxy_name, e);
             }
         }
         info!("Proxy '{}' bridge completed", req.proxy_name);

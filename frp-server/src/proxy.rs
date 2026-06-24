@@ -32,6 +32,12 @@ impl ProxyManager {
 
     pub async fn register(&self, run_id: String, info: ProxyInfo) -> Result<(), String> {
         let name = info.name.clone();
+        {
+            let proxies = self.proxies.read().await;
+            if proxies.contains_key(&name) {
+                return Err(format!("proxy '{}' already registered", name));
+            }
+        }
         self.proxies.write().await.insert(name.clone(), info.clone());
         self.by_client
             .write()

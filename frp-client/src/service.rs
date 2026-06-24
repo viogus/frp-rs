@@ -61,7 +61,13 @@ impl Service {
             frp_core::VERSION, self.cfg.server_addr, self.cfg.server_port
         );
 
-        let protocol: TransportProtocol = self.cfg.transport_protocol.parse().unwrap_or(TransportProtocol::Tcp);
+        let protocol: TransportProtocol = match self.cfg.transport_protocol.parse() {
+            Ok(p) => p,
+            Err(_) => {
+                warn!("Unknown transport protocol '{}', falling back to tcp", self.cfg.transport_protocol);
+                TransportProtocol::Tcp
+            }
+        };
         let pool_count = self.cfg.pool_count.max(0);
         let proxies = self.cfg.proxies.clone();
 
@@ -91,6 +97,7 @@ impl Service {
         }
 
         // Main session loop with reconnection
+        let mut did_login_once = false;
         loop {
             let mut ctl = ControlConnection::new(
                 self.cfg.server_addr.clone(),
@@ -103,10 +110,13 @@ impl Service {
             );
 
             let (mut control_stream, run_id) = match ctl.login().await {
-                Ok(r) => r,
+                Ok(r) => {
+                    did_login_once = true;
+                    r
+                }
                 Err(e) => {
                     warn!("Login failed: {}", e);
-                    if self.cfg.login_fail_exit {
+                    if self.cfg.login_fail_exit && !did_login_once {
                         return Err(e.into());
                     }
                     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -412,7 +422,7 @@ async fn run_udp_work_conn(
 ) {
     if use_encryption {
         warn!("UDP work conn '{}': encryption not yet implemented for UDP tunnels", proxy_name);
-        // TODO: wrap the TCP stream with AES-GCM framing before V1 protocol reads/writes
+        return;
     }
     debug!("UDP work conn for '{}' dialing server", proxy_name);
 

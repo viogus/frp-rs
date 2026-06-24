@@ -51,13 +51,35 @@ static int mkdir_p(const char *path) {
   return 0;
 }
 
+/* Write a TOML string value, escaping \, ", and control characters. */
+static void write_toml_str(FILE *f, const char *s) {
+  fputc('"', f);
+  for (; *s; s++) {
+    switch (*s) {
+      case '\\': fputs("\\\\", f); break;
+      case '"':  fputs("\\\"", f); break;
+      case '\n': fputs("\\n", f);  break;
+      case '\r': fputs("\\r", f);  break;
+      case '\t': fputs("\\t", f);  break;
+      default:   fputc(*s, f);    break;
+    }
+  }
+  fputc('"', f);
+}
+
 static void write_kv(FILE *f, const char *key, const char *val) {
-  fprintf(f, "%s = \"%s\"\n", key, val);
+  fprintf(f, "%s = ", key);
+  write_toml_str(f, val);
+  fputc('\n', f);
 }
 
 static void write_opt(FILE *f, const char *key, const char *env) {
   const char *v = getenv(env);
-  if (v && v[0]) fprintf(f, "%s = \"%s\"\n", key, v);
+  if (v && v[0]) {
+    fprintf(f, "%s = ", key);
+    write_toml_str(f, v);
+    fputc('\n', f);
+  }
 }
 
 static int generate_frps_config(const char *path) {

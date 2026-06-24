@@ -124,10 +124,6 @@ pub async fn run_vhost_https_listener(
     state: std::sync::Arc<crate::service::AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use frp_core::transport::build_tls_acceptor;
-    use tokio::net::TcpListener;
-    use tokio::io::AsyncReadExt;
-    use tracing::{info, warn, debug};
-
     let acceptor = build_tls_acceptor(&tls_cert_file, &tls_key_file)?;
     let listener = TcpListener::bind(&addr).await?;
     info!("HTTPS VHost listener started on {}", addr);
@@ -192,15 +188,14 @@ pub async fn run_vhost_https_listener(
 /// Extract the Host header value from an HTTP request (hostname only, no port).
 fn extract_host_header(request: &str) -> Option<&str> {
     for line in request.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("host:") {
-            let value = line[5..].trim();
-            // Handle IPv6: [::1]:8080 → ::1, example.com:8080 → example.com
-            if value.starts_with('[') {
-                return value.find(']').map(|end| &value[1..end]);
-            }
-            return Some(value.rsplitn(2, ':').next().unwrap_or(value));
+        if line.len() < 6 { continue; }
+        if !line[..5].eq_ignore_ascii_case("host:") { continue; }
+        let value = line[5..].trim();
+        // Handle IPv6: [::1]:8080 → ::1, example.com:8080 → example.com
+        if value.starts_with('[') {
+            return value.find(']').map(|end| &value[1..end]);
         }
+        return Some(value.rsplitn(2, ':').next().unwrap_or(value));
     }
     None
 }

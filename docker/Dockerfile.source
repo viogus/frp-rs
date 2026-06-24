@@ -47,9 +47,10 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
       gcc -static -s -O2 -DFRP_MODE=\"${FRP_COMPONENT}\" -o /entrypoint /tmp/entrypoint.c; \
     fi
 
-# --- Runtime stage ---
-FROM alpine:3.21
-RUN apk add --no-cache gcompat ca-certificates
+# --- Runtime stage (Debian slim, matches builder libc) ---
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/bin/frp /usr/bin/frp
 COPY --from=builder /entrypoint /entrypoint
 ENV FRP_CONF=/app/frp.toml

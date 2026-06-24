@@ -19,9 +19,12 @@ pub fn parse_args(default_config: &str, bin_name: &str) -> CliArgs {
     let mut log_level: Option<String> = None;
     let mut show_version = false;
 
+    let mut config_explicit = false;
+
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-c" | "--config" => {
+                config_explicit = true;
                 if let Some(val) = args.next() {
                     config = val;
                 } else {
@@ -76,7 +79,7 @@ pub fn parse_args(default_config: &str, bin_name: &str) -> CliArgs {
     }
 
     // --config-dir conflicts with an explicit -c/--config value
-    if config_dir.is_some() && config != default_config {
+    if config_dir.is_some() && config_explicit {
         eprintln!("error: --config-dir and --config are mutually exclusive");
         std::process::exit(1);
     }
