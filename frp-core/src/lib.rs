@@ -6,6 +6,7 @@ pub mod config;
 pub mod encryption;
 pub mod mux;
 pub mod bridge;
+pub mod args;
 
 use thiserror::Error;
 

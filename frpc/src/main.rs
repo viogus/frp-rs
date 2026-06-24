@@ -1,23 +1,27 @@
-use std::process;
 use std::path::Path;
 use std::time::Duration;
+use std::process;
 
 use tracing_subscriber::EnvFilter;
 
-use frp_client::service::Service;
+use frp_core::args::{parse_args, CliArgs};
 use frp_core::config::{load_client_config, collect_config_files};
+use frp_client::service::Service;
 
 #[tokio::main]
 async fn main() {
-    let (config, config_dir, cli_log_level, cli_log_file, show_version) = parse_args();
+    let cli = parse_args("frpc.toml", "frpc");
+    run(cli).await;
+}
 
-    if show_version {
+async fn run(cli: CliArgs) {
+    if cli.show_version {
         println!("frpc {}", frp_core::VERSION);
         process::exit(0);
     }
 
     // Set log level from CLI if provided
-    if let Some(ref level) = cli_log_level {
+    if let Some(ref level) = cli.log_level {
         if std::env::var("RUST_LOG").is_err() {
             std::env::set_var("RUST_LOG", level);
         }
@@ -26,7 +30,7 @@ async fn main() {
     // Initialize tracing
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| {
-            if let Some(ref level) = cli_log_level {
+            if let Some(ref level) = cli.log_level {
                 EnvFilter::new(level)
             } else {
                 EnvFilter::new("info")
@@ -35,7 +39,7 @@ async fn main() {
 
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
 
-    if let Some(ref file) = cli_log_file {
+    if let Some(ref file) = cli.log_file {
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -54,7 +58,8 @@ async fn main() {
     }
 
     // --- Config directory mode ---
-    if let Some(ref dir) = config_dir {
+    if let Some(ref dir) = cli.config_dir {
+        // In config-dir mode, config path is unused
         let files = match collect_config_files(Path::new(dir)) {
             Ok(files) => files,
             Err(e) => {
@@ -93,7 +98,7 @@ async fn main() {
             let _ = handle.await;
         }
     } else {
-        let cfg = match load_client_config(&config) {
+        let cfg = match load_client_config(&cli.config) {
             Ok(cfg) => cfg,
             Err(e) => {
                 tracing::error!("Failed to load config: {}", e);
@@ -106,60 +111,5 @@ async fn main() {
             tracing::error!("frpc error: {}", e);
             process::exit(1);
         }
-    }
-}
-
-fn parse_args() -> (String, Option<String>, Option<String>, Option<String>, bool) {
-    let mut args = std::env::args().skip(1).peekable();
-    let mut config = "frpc.toml".to_string();
-    let mut config_dir: Option<String> = None;
-    let mut log_file: Option<String> = None;
-    let mut log_level: Option<String> = None;
-    let mut show_version = false;
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-c" | "--config" => {
-                if let Some(val) = args.next() { config = val; }
-                else { eprintln!("error: --config requires a value"); process::exit(1); }
-            }
-            "--config-dir" => {
-                if let Some(val) = args.next() { config_dir = Some(val); }
-                else { eprintln!("error: --config-dir requires a value"); process::exit(1); }
-            }
-            "--log-file" => {
-                if let Some(val) = args.next() { log_file = Some(val); }
-                else { eprintln!("error: --log-file requires a value"); process::exit(1); }
-            }
-            "--log-level" => {
-                if let Some(val) = args.next() { log_level = Some(val); }
-                else { eprintln!("error: --log-level requires a value"); process::exit(1); }
-            }
-            "-v" | "--version" => {
-                show_version = true;
-            }
-            "-h" | "--help" => {
-                eprintln!("Usage: frpc [OPTIONS]");
-                eprintln!("");
-                eprintln!("Options:");
-                eprintln!("  -c, --config <FILE>        Config file path [default: frpc.toml]");
-                eprintln!("      --config-dir <DIR>     Directory containing config files");
-                eprintln!("      --log-file <FILE>      Log file path (appends)");
-                eprintln!("      --log-level <LEVEL>    Log level (trace/debug/info/warn/error)");
-                eprintln!("  -v, --version              Print version");
-                eprintln!("  -h, --help                 Print help");
-                process::exit(0);
-            }
-            _ => {
-                eprintln!("error: unknown option `{arg}`");
-                process::exit(1);
-            }
-        }
-    }
-
-    if config_dir.is_some() {
-        (String::new(), config_dir, log_level, log_file, show_version)
-    } else {
-        (config, None, log_level, log_file, show_version)
     }
 }

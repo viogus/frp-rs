@@ -84,7 +84,7 @@ impl ControlConnection {
 
         let login = FrpMessage::Login(msg::Login {
             version: Some(VERSION.into()),
-            hostname: Some(hostname().unwrap_or_default()),
+            hostname: Some(hostname().await.unwrap_or_default()),
             os: Some(std::env::consts::OS.into()),
             arch: Some(std::env::consts::ARCH.into()),
             user: if self.user.is_empty() { None } else { Some(self.user.clone()) },
@@ -154,16 +154,30 @@ impl ControlConnection {
 }
 
 
-/// Shared login handshake: works with both TcpStream and TlsStream.
-fn hostname() -> Option<String> {
-    std::fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .or_else(|| {
-            std::process::Command::new("hostname")
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string()))
-        })
-        .or_else(|| Some("unknown".into()))
+/// Resolve the local hostname. Delegates blocking I/O to spawn_blocking.
+async fn hostname() -> Option<String> {
+    // Fast path: read /etc/hostname (most Linux systems)
+    if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
+        let s = s.trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    // Fallback: run hostname command on a blocking thread
+    let result = tokio::task::spawn_blocking(|| {
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+    })
+    .await
+    .unwrap_or(None);
+
+    if let Some(s) = result {
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    Some("unknown".into())
 }

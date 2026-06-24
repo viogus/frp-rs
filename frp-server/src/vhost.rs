@@ -91,22 +91,15 @@ pub async fn run_vhost_http_listener(
 
             debug!("HTTP VHost request for '{}' from {}", host, peer);
 
-            if let Some(_route) = state.vhost_manager.lookup(&host).await {
-                // Route the connection via the work connection pool
+            if let Some(route) = state.vhost_manager.lookup(&host).await {
                 let internal_tx = {
                     let map = state.run_id_to_ctl_tx.read().await;
-                    map.get(&_route.run_id).cloned()
+                    map.get(&route.run_id).cloned()
                 };
 
                 if let Some(ctl_tx) = internal_tx {
-                    // We need to prepend the already-read bytes.
-                    // For a simple HTTP proxy, the client side will read the
-                    // first request from the front of the stream.
-                    // For the initial implementation, the pre-read bytes are
-                    // sent as part of the bridged data stream via the
-                    // existing ProxyUserConn mechanism.
                     let _ = ctl_tx.tx.send(InternalMsg::ProxyUserConn {
-                        proxy_name: _route.proxy_name.clone(),
+                        proxy_name: route.proxy_name.clone(),
                         user_conn: frp_core::transport::IoStream::Tcp(stream),
                         pre_read,
                     }).ok();
