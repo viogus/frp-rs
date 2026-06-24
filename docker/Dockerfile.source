@@ -48,7 +48,8 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
     fi
 
 # --- Runtime stage (Debian slim, matches builder libc) ---
-FROM debian:bookworm-slim
+FROM --platform=$TARGETPLATFORM debian:bookworm-slim
+ARG TARGETPLATFORM
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/bin/frp /usr/bin/frp
