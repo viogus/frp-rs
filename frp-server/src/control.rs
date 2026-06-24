@@ -102,6 +102,7 @@ pub async fn handle_control<S>(
     let mut work_pool: VecDeque<IoStream> = VecDeque::new();
     let mut pending_requests: VecDeque<PendingRequest> = VecDeque::new();
     let mut listener_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> = std::collections::HashMap::new();
+    let mut udp_sockets: std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>> = std::collections::HashMap::new();
     let mut last_ping = Instant::now();
 
     // --- Main select loop ---
@@ -228,15 +229,30 @@ pub async fn handle_control<S>(
                     }
                     Ok(FrpMessage::UDPPacket(up)) => {
                         debug!("UDPPacket from client: {} bytes to {}", up.content.len(), up.remote_addr);
-                        // Forward the UDP data to the original sender via a temporary socket
-                        tokio::spawn(async move {
-                            if let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-                                let _ = socket.send_to(&up.content, &up.remote_addr).await;
+                        // Forward via the proxy's UDP socket so responses come back to the same port.
+                        // The socket is shared with run_udp_listener for bidirectional NAT (Go frp compat).
+                        let proxy_name = &up.local_addr;
+                        if proxy_name.is_empty() {
+                            // Fallback: try the first UDP socket for this client
+                            if let Some((_name, sock)) = udp_sockets.iter().next() {
+                                let sock = sock.clone();
+                                let content = up.content.clone();
+                                let remote_addr = up.remote_addr.clone();
+                                tokio::spawn(async move {
+                                    let _ = sock.send_to(&content, &remote_addr).await;
+                                });
                             }
-                        });
+                        } else if let Some(sock) = udp_sockets.get(proxy_name) {
+                            let sock = sock.clone();
+                            let content = up.content.clone();
+                            let remote_addr = up.remote_addr.clone();
+                            tokio::spawn(async move {
+                                let _ = sock.send_to(&content, &remote_addr).await;
+                            });
+                        }
                     }
                     Ok(FrpMessage::NewProxy(np)) => {
-                        handle_new_proxy(np, &run_id, &state, &mut writer, &internal_tx, &mut listener_handles).await;
+                        handle_new_proxy(np, &run_id, &state, &mut writer, &internal_tx, &mut listener_handles, &mut udp_sockets).await;
                     }
                     Ok(FrpMessage::CloseProxy(cp)) => {
                         if let Some(info) = state.proxy_manager.get(&cp.proxy_name).await {
@@ -259,7 +275,17 @@ pub async fn handle_control<S>(
                         state.proxy_manager.remove(&cp.proxy_name).await;
                         info!("Proxy closed: {}", cp.proxy_name);
                     }
-                    Ok(FrpMessage::Ping(_)) => {
+                    Ok(FrpMessage::Ping(ref ping_msg)) => {
+                        // Validate ping auth (Go frp v0.69.1 compat)
+                        if let Err(e) = state.auth_cfg.validate_login(
+                            ping_msg.privilege_key.as_deref(),
+                            ping_msg.timestamp,
+                        ) {
+                            warn!("Ping auth failed from {:?}: {}", peer, e);
+                            let pong = FrpMessage::Pong(msg::Pong { error: Some(e) });
+                            let _ = write_msg_v1(&mut writer, &pong).await;
+                            break;
+                        }
                         last_ping = Instant::now();
                         let pong = FrpMessage::Pong(msg::Pong { error: None });
                         if let Err(e) = write_msg_v1(&mut writer, &pong).await {
@@ -415,6 +441,7 @@ async fn handle_new_proxy(
     writer: &mut (impl AsyncWriteExt + Unpin),
     internal_tx: &mpsc::UnboundedSender<InternalMsg>,
     listener_handles: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    udp_sockets: &mut std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
 ) {
     let raw_port = np.remote_port.unwrap_or(0);
     if raw_port < 0 || raw_port > u16::MAX as i32 {
@@ -507,8 +534,24 @@ async fn handle_new_proxy(
             let is_nat_hole = np.proxy_type == "stcp" || np.proxy_type == "xtcp";
 
             if np.proxy_type == "udp" {
+                let addr = format_socket_addr(&bind_addr, port);
+                let socket = match UdpSocket::bind(&addr).await {
+                    Ok(s) => std::sync::Arc::new(s),
+                    Err(e) => {
+                        tracing::error!("Failed to bind UDP port {}: {}", port, e);
+                        let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
+                            proxy_name: np.proxy_name.clone(),
+                            remote_addr: None,
+                            error: Some(format!("UDP bind failed: {e}")),
+                        });
+                        let _ = write_msg_v1(writer, &resp).await;
+                        return;
+                    }
+                };
+                let sock = socket.clone();
+                udp_sockets.insert(np.proxy_name.clone(), socket);
                 let handle = tokio::spawn(async move {
-                    run_udp_listener(bind_addr, port, pn, itx).await;
+                    run_udp_listener(sock, pn, itx).await;
                 });
                 listener_handles.insert(np.proxy_name.clone(), handle);
                 info!("UDP proxy '{}' listening on port {}", np.proxy_name, port);
@@ -584,21 +627,14 @@ async fn listen_and_proxy(
 
 /// Run a UDP listener for a UDP proxy.
 /// Forwards received packets to the control handler via InternalMsg.
+/// Uses a shared Arc<UdpSocket> so the control handler can send responses
+/// through the same socket (bidirectional NAT, Go frp v0.69.1 compat).
 async fn run_udp_listener(
-    bind_addr: String,
-    port: u16,
+    socket: std::sync::Arc<tokio::net::UdpSocket>,
     proxy_name: String,
     internal_tx: mpsc::UnboundedSender<InternalMsg>,
 ) {
-    let addr = format_socket_addr(&bind_addr, port);
-    let socket = match UdpSocket::bind(&addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("Failed to bind UDP port {}: {}", port, e);
-            return;
-        }
-    };
-    info!("UDP listener started on {} for '{}'", addr, proxy_name);
+    info!("UDP listener started for '{}'", proxy_name);
 
     let mut buf = vec![0u8; 65535];
     loop {
@@ -615,7 +651,7 @@ async fn run_udp_listener(
                 }
             }
             Err(e) => {
-                tracing::error!("UDP recv error on {}: {}", addr, e);
+                tracing::error!("UDP recv error for '{}': {}", proxy_name, e);
                 break;
             }
         }

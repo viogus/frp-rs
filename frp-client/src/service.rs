@@ -230,9 +230,20 @@ impl Service {
                     }
 
                     _ = ping_interval.tick() => {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        let ping_auth = AuthConfig {
+                            method: AuthMethod::Token,
+                            token: auth_token.clone(),
+                            oidc_issuer: String::new(),
+                            oidc_audience: String::new(),
+                            additional_data: None,
+                        };
                         let ping = FrpMessage::Ping(msg::Ping {
-                            privilege_key: None,
-                            timestamp: None,
+                            privilege_key: ping_auth.generate_login_key(ts),
+                            timestamp: Some(ts),
                         });
                         if let Err(e) = write_msg_v1(&mut writer, &ping).await {
                             warn!("Ping failed: {}. Reconnecting...", e);
