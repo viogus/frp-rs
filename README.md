@@ -25,14 +25,20 @@ suitable as a drop-in replacement for either the client or server side.
 | Feature              | Client | Server |
 |----------------------|--------|--------|
 | TCP proxy            | ✅     | ✅     |
+| UDP proxy            | ✅     | ✅     |
 | Token authentication  | ✅     | ✅     |
 | Heartbeat (ping/pong)| ✅     | ✅     |
 | Auto port allocation | —      | ✅     |
-| WebSocket transport  | 🚧     | 🚧     |
+| Encryption (AES-GCM) | ✅     | ✅     |
+| WebSocket transport  | 🚧     | ✅     |
 | TLS transport        | 🚧     | 🚧     |
+| STCP / sk routing    | ❌     | 🚧     |
+| HTTP VHost routing   | ❌     | 🚧     |
+| HTTPS VHost routing  | ❌     | 🚧     |
+| TCP health checks    | ✅     | —      |
 | QUIC transport       | ❌     | ❌     |
-| KCP / STCP / SUDP    | ❌     | ❌     |
-| HTTP(S) VHost        | ❌     | ❌     |
+| KCP / SUDP           | ❌     | ❌     |
+| Compression          | ❌     | ❌     |
 | OIDC authentication  | ❌     | ❌     |
 | Dashboard (web UI)   | —      | ❌     |
 
@@ -195,6 +201,7 @@ use_compression = false
 | `transport_protocol` | `"tcp"` | Transport: tcp, websocket/ws, wss, quic |
 | `token` | `""` | Authentication token (must match server) |
 | `user` | `""` | User identity for multi-tenant setups |
+| `client_id` | `""` | Unique client identifier (auto-generated if empty) |
 | `tls_enable` | `false` | Enable TLS |
 | `tls_cert_file` | `""` | Client TLS certificate |
 | `tls_key_file` | `""` | Client TLS private key |
@@ -223,6 +230,10 @@ use_compression = false
 | `host_header_rewrite` | `""` | Rewrite the Host header |
 | `group` / `group_key` | `""` | Proxy group for load balancing |
 | `health_check_type` | `""` | Health check: tcp or http |
+| `health_check_interval_seconds` | `0` | Seconds between health checks (min 10) |
+| `health_check_timeout_seconds` | `0` | Health check connect timeout (min 3) |
+| `health_check_max_failed` | `0` | Consecutive failures before marking unhealthy (min 1) |
+| `use_compression` | `false` | Compress proxy traffic (not yet wired into bridge) |
 
 ---
 
@@ -340,14 +351,33 @@ The server uses an `InternalMsg` channel for cross-task communication:
 
 ### Authentication
 
-Authentication uses **HMAC-SHA256** with the shared token:
+Authentication uses **MD5(token + timestamp)** → hex string, matching Go frp v0.69.1:
 
 ```
-privilege_key = hex(HMAC-SHA256(token, timestamp))
+privilege_key = hex(MD5(token + timestamp))
 ```
 
 The server computes the expected key from its token and the timestamp sent in
-the Login message, then compares in constant time.
+the Login message, then compares directly.
+
+### Encryption
+
+When `use_encryption = true` on a proxy, data between frps and frpc is encrypted
+with **AES-256-GCM**. The encryption key is derived from the auth token via SHA-256:
+
+```
+encryption_key = SHA-256(auth_token)
+```
+
+Encrypted data is framed with a 4-byte big-endian length prefix:
+```
+[4-byte len][AES-GCM: 12-byte nonce || ciphertext || 16-byte tag]
+```
+
+- Supported for TCP proxies (both client and server bridge paths).
+- UDP proxy encryption not yet implemented.
+- Compression (`use_compression`) is not yet wired into the bridge; the flag is
+  accepted but data is sent uncompressed.
 
 ## Project Structure
 
@@ -359,18 +389,24 @@ frp-rs/
     Cargo.toml
     src/
       lib.rs              Error types, Result, VERSION
-      auth.rs             HMAC-SHA256 token auth
-      config.rs           TOML config structs
+      args.rs             CLI argument parsing (shared by frps + frpc)
+      auth.rs             MD5 token authentication
+      bridge.rs           Encrypted data bridge (AES-256-GCM framed)
+      config.rs           TOML config structs + Go frp compat normalization
+      encryption.rs       AES-256-GCM encrypt/decrypt + zlib compress/decompress
       msg.rs              Wire protocol message structs
+      mux.rs              TCP multiplexing (placeholder)
       protocol.rs         V1/V2 frame read/write
-      transport.rs        TCP/WebSocket/QUIC dial + accept abstractions
+      transport.rs        TCP/TLS/WebSocket dial + accept + IoStream abstraction
   frp-server/             Server library
     Cargo.toml
     src/
       lib.rs
       service.rs          AppState, InternalMsg, accept loop with frame dispatch
-      control.rs          Per-client control handler, work pool, pending queue
+      control.rs          Per-client control handler, work pool, listener registry
       proxy.rs            ProxyManager, ProxyInfo, port allocation
+      vhost.rs            HTTP/HTTPS VHost routing + Host header parsing
+      dashboard.rs        Dashboard web UI (stub)
   frps/                   Server binary
     Cargo.toml
     src/main.rs
@@ -379,14 +415,20 @@ frp-rs/
     src/
       lib.rs
       service.rs          Login, proxy registration, message/select loop,
-                          work connection spawning
-      control.rs          ControlConnection, login handshake, ping
+                          work connection spawning, health checks, UDP work conns
+      control.rs          ControlConnection, login handshake, hostname resolution
       proxy.rs            NewProxy message builder, local TCP connect, bridge
   frpc/                   Client binary
     Cargo.toml
     src/main.rs
+  docker/                 Docker build infrastructure
+    Dockerfile             Multi-stage image (downloads release binary)
+    Dockerfile.source      Multi-stage image (builds from Rust source)
+    build.sh               Release binary download + verification script
+    entrypoint.c           Minimal static entrypoint (FRP_MODE, conf path)
   frps.toml               Example server config
   frpc.toml               Example client config
+  CLAUDE.md               Claude Code project instructions
   README.md               This file
 ```
 
@@ -402,6 +444,26 @@ that both ends build on.
 
 ---
 
+## Docker
+
+Pre-built Docker images are published to GitHub Container Registry on every push to `main`:
+
+```bash
+# Server (built from source)
+docker pull ghcr.io/viogus/frps-rs:latest
+
+# Client (built from source)
+docker pull ghcr.io/viogus/frpc-rs:latest
+
+docker run -d -p 7000:7000 -v $(pwd)/frps.toml:/app/frp.toml ghcr.io/viogus/frps-rs:latest
+```
+
+Two Dockerfile variants in `docker/`:
+- `Dockerfile` — downloads pre-built release binary
+- `Dockerfile.source` — builds from source via multi-stage Rust image (used for CI auto-builds)
+
+---
+
 ## Developing
 
 ```bash
@@ -409,7 +471,7 @@ that both ends build on.
 cargo build
 
 # Run tests
-cargo test
+cargo test --workspace
 
 # Lint
 cargo clippy
@@ -419,6 +481,12 @@ RUST_LOG=debug cargo run --bin frps -- -c frps.toml
 
 # Start the client (in another terminal)
 RUST_LOG=debug cargo run --bin frpc -- -c frpc.toml
+
+# Run multiple services from a config directory
+cargo run --bin frps -- --config-dir /etc/frp/conf.d
+
+# Build Docker image locally
+docker build -f docker/Dockerfile.source --build-arg FRP_COMPONENT=frps -t frps-rs:local .
 ```
 
 ---
