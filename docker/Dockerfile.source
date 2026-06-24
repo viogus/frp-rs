@@ -36,7 +36,7 @@ RUN ARCH="$(uname -m)" && \
       *) echo "Unsupported builder arch: ${ARCH}" >&2; exit 1 ;; \
     esac && \
     curl -sSfL "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.23.0/cargo-zigbuild-${ZB_TARGET}.tar.xz" \
-    | tar xJ -C /usr/local/cargo/bin && \
+    | tar xJ --strip-components=1 -C /usr/local/cargo/bin && \
     chmod +x /usr/local/cargo/bin/cargo-zigbuild
 
 # Add the cross-compilation target
