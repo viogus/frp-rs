@@ -39,12 +39,9 @@ jobs:
         id: meta
         run: |
           OWNER="${{ github.repository_owner }}"
-          REPO="${{ github.event.repository.name }}"
           # Lowercase the owner for Docker image names (GitHub may have uppercase)
           OWNER_LOWER="$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')"
-          # Repo-scoped image: ghcr.io/owner/repo/component — required for
-          # GITHUB_TOKEN push access on first package creation.
-          IMAGE="${REGISTRY}/${OWNER_LOWER}/${REPO}/${{ matrix.component }}"
+          IMAGE="${REGISTRY}/${OWNER_LOWER}/${{ matrix.component }}-rs"
 
           if [ "${{ github.event_name }}" = "release" ]; then
             # Release: tag with version (e.g. v0.1.4) and update latest
