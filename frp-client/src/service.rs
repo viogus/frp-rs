@@ -453,7 +453,8 @@ fn spawn_work_conn(
             "on-demand".to_string()
         };
 
-        // Under TcpMux: open yamux stream instead of dialing new TCP
+        // Acquire the underlying transport stream.
+        // Under TcpMux: open a yamux stream instead of dialing new TCP.
         let mut work = if let Some(ref yamux) = yamux {
             match yamux.open_stream().await {
                 Some(stream) => {
@@ -476,15 +477,18 @@ fn spawn_work_conn(
                 tls_ca_file: tls_ca_file.clone(),
                 ..Default::default()
             };
-            let mut work = match dial_server(&opts).await {
+            match dial_server(&opts).await {
                 Ok(io) => io,
                 Err(e) => {
                     warn!("Work conn {} dial failed: {}", label, e);
                     return;
                 }
-            };
-            // All transport variants (Tcp, Tls, KCP, WebSocket, Yamux) are supported
-            // Build auth and send NewWorkConn (not needed under yamux)
+            }
+        };
+
+        // Send NewWorkConn — required for both yamux and raw transports.
+        // Go frps needs the run_id and auth to associate the stream.
+        {
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -507,11 +511,9 @@ fn spawn_work_conn(
                 return;
             }
             debug!("Work conn {} sent NewWorkConn, waiting for StartWorkConn", label);
-            work
-        };
+        }
 
-        // Read StartWorkConn (under yamux, no NewWorkConn was sent, so the
-        // first frame from the server should still be StartWorkConn)
+        // Read StartWorkConn
         match work.read_v1_frame().await {
             Ok(FrpMessage::StartWorkConn(swc)) => {
                 let proxy_name = &swc.proxy_name;

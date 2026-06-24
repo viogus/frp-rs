@@ -270,7 +270,9 @@ pub async fn handle_control<S>(
                 }
             }
 
-            // Accept yamux streams (TcpMux work connections)
+            // Accept yamux streams (TcpMux work connections).
+            // Go frp compat: client sends NewWorkConn on each yamux stream.
+            // Read it to validate, then pool or assign.
             incoming_msg = async {
                 match &mut incoming {
                     Some(inc) => inc.recv().await,
@@ -278,8 +280,25 @@ pub async fn handle_control<S>(
                 }
             } => {
                 if let Some(stream) = incoming_msg {
+                    let mut io = IoStream::Yamux(stream);
+                    match read_msg_v1(&mut io).await {
+                        Ok(FrpMessage::NewWorkConn(nwc)) => {
+                            let stream_run_id = nwc.run_id.as_deref().unwrap_or("");
+                            if stream_run_id != run_id {
+                                debug!("Yamux work conn run_id mismatch: expected {run_id}, got {stream_run_id}");
+                                continue;
+                            }
+                        }
+                        Ok(other) => {
+                            debug!("Unexpected yamux stream message for {run_id}: {:?}", other.v1_type_byte());
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!("Failed to read from yamux stream for {run_id}: {e}");
+                            continue;
+                        }
+                    }
                     debug!("Yamux work conn for run_id {}", run_id);
-                    let stream = IoStream::Yamux(stream);
                     while let Some(req) = pending_requests.front() {
                         if req.created_at.elapsed() > PENDING_REQUEST_TIMEOUT {
                             pending_requests.pop_front();
@@ -288,9 +307,9 @@ pub async fn handle_control<S>(
                         }
                     }
                     if let Some(req) = pending_requests.pop_front() {
-                        assign_work_to_proxy(stream, req, state.encryption_key).await;
+                        assign_work_to_proxy(io, req, state.encryption_key).await;
                     } else if work_pool.len() < pool_cap {
-                        work_pool.push_back(stream);
+                        work_pool.push_back(io);
                         debug!("Yamux work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
                     } else {
                         debug!("Work pool full for {} ({}/{}), dropping yamux work conn", run_id, work_pool.len(), pool_cap);
