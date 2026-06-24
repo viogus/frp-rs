@@ -31,12 +31,12 @@ RUN curl -sSfL https://ziglang.org/download/0.14.0/zig-linux-$(uname -m)-0.14.0.
 # Install cargo-zigbuild (pre-built binary, faster than compiling from source)
 RUN ARCH="$(uname -m)" && \
     case "${ARCH}" in \
-      x86_64) ZB_TARGET="x86_64-unknown-linux-musl" ;; \
-      aarch64) ZB_TARGET="aarch64-unknown-linux-musl" ;; \
+      x86_64) ZB_TARGET="x86_64-unknown-linux-gnu" ;; \
+      aarch64) ZB_TARGET="aarch64-unknown-linux-gnu" ;; \
       *) echo "Unsupported builder arch: ${ARCH}" >&2; exit 1 ;; \
     esac && \
-    curl -sSfL "https://github.com/rust-lang/cargo-zigbuild/releases/download/v0.19.7/cargo-zigbuild-v0.19.7.${ZB_TARGET}.tar.gz" \
-    | tar xz -C /usr/local/cargo/bin && \
+    curl -sSfL "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.23.0/cargo-zigbuild-${ZB_TARGET}.tar.xz" \
+    | tar xJ -C /usr/local/cargo/bin && \
     chmod +x /usr/local/cargo/bin/cargo-zigbuild
 
 # Add the cross-compilation target
