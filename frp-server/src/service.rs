@@ -180,6 +180,10 @@ impl Service {
                                                 let io = IoStream::WebSocket(adapter.into_inner());
                                                 handle_work_conn_inner(io, nwc, state.clone()).await;
                                             }
+                                            Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                let io = IoStream::WebSocket(adapter.into_inner());
+                                                handle_visitor_conn_inner(io, nvc, state.clone()).await;
+                                            }
                                             Ok(other) => {
                                                 warn!("Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
                                             }
@@ -290,6 +294,10 @@ impl Service {
                                         let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
                                         handle_work_conn_inner(io, nwc, state).await;
                                     }
+                                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                        let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
+                                        handle_visitor_conn_inner(io, nvc, state).await;
+                                    }
                                     Ok(other) => {
                                         warn!("Unexpected TLS first message from {}: {:?}", addr, other.v1_type_byte());
                                     }
@@ -316,6 +324,10 @@ impl Service {
                                             Ok(FrpMessage::NewWorkConn(nwc)) => {
                                                 let io = IoStream::WebSocket(adapter.into_inner());
                                                 handle_work_conn_inner(io, nwc, state.clone()).await;
+                                            }
+                                            Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                let io = IoStream::WebSocket(adapter.into_inner());
+                                                handle_visitor_conn_inner(io, nvc, state.clone()).await;
                                             }
                                             Ok(other) => {
                                                 warn!("Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());

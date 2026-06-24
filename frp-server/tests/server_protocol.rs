@@ -6,6 +6,17 @@ use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 
 use common::{allocate_port, raw_login, raw_login_resp, start_test_server};
+use frp_core::transport::{DialOptions, IoStream, dial_server};
+use std::path::PathBuf;
+
+fn test_cert_dir() -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.pop(); // workspace root
+    p.push("frp-core");
+    p.push("tests");
+    p.push("certs");
+    p
+}
 
 // ---------------------------------------------------------------
 // Login / Authentication
@@ -257,5 +268,68 @@ async fn test_new_proxy_duplicate_name_fails() {
             );
         }
         other => panic!("expected NewProxyResp, got: {:?}", other.v1_type_byte()),
+    }
+}
+
+// ---------------------------------------------------------------
+// TLS transport
+// ---------------------------------------------------------------
+
+#[tokio::test]
+async fn test_login_via_tls() {
+    let port = allocate_port();
+    let cert_dir = test_cert_dir();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: port,
+        tls_enable: true,
+        tls_cert_file: cert_dir.join("server.crt").to_string_lossy().into(),
+        tls_key_file: cert_dir.join("server.key").to_string_lossy().into(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+
+    // Connect via TLS using dial_server (trust the CA that signed server cert)
+    let opts = DialOptions {
+        server_addr: "127.0.0.1".into(),
+        server_port: port,
+        tls_enable: true,
+        tls_server_name: "localhost".into(),
+        tls_ca_file: Some(cert_dir.join("ca.crt").to_string_lossy().into()),
+        ..Default::default()
+    };
+
+    let mut io = dial_server(&opts).await.expect("TLS dial");
+
+    // Verify we got a TLS stream
+    match &io {
+        IoStream::Tls(_) => {} // expected
+        other => panic!("expected IoStream::Tls, got: {:?}", other),
+    }
+
+    // Send login
+    let login = FrpMessage::Login(msg::Login {
+        version: Some(frp_core::VERSION.into()),
+        hostname: Some("test-tls-host".into()),
+        os: Some(std::env::consts::OS.into()),
+        arch: Some(std::env::consts::ARCH.into()),
+        user: None,
+        run_id: None,
+        client_id: None,
+        pool_count: Some(1),
+        timestamp: None,
+        privilege_key: None,
+        metas: None,
+        client_spec: None,
+    });
+    io.write_v1_frame(&login).await.expect("send login over TLS");
+
+    let resp = io.read_v1_frame().await.expect("read LoginResp over TLS");
+    match resp {
+        FrpMessage::LoginResp(r) => {
+            assert!(r.error.is_none(), "TLS login should succeed, got: {:?}", r.error);
+            assert!(r.run_id.is_some(), "expected run_id");
+        }
+        other => panic!("expected LoginResp, got: {:?}", other.v1_type_byte()),
     }
 }

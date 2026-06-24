@@ -194,7 +194,90 @@ impl AsyncWrite for WsByteStream {
 }
 
 
+// IoStream delegates AsyncRead/AsyncWrite to inner types.
+// All concrete stream types (TcpStream, TlsStream, DuplexStream) are Unpin,
+// so Pin::new() is sound.
+impl tokio::io::AsyncRead for IoStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            IoStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            IoStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            IoStream::Kcp(s) => Pin::new(s).poll_read(cx, buf),
+            IoStream::WebSocket(_) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Other,
+                "WebSocket requires WsByteStream adapter for byte I/O",
+            ))),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for IoStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            IoStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            IoStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            IoStream::Kcp(s) => Pin::new(s).poll_write(cx, buf),
+            IoStream::WebSocket(_) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Other,
+                "WebSocket requires WsByteStream adapter for byte I/O",
+            ))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            IoStream::Tcp(s) => Pin::new(s).poll_flush(cx),
+            IoStream::Tls(s) => Pin::new(s).poll_flush(cx),
+            IoStream::Kcp(s) => Pin::new(s).poll_flush(cx),
+            IoStream::WebSocket(_) => Poll::Ready(Ok(())),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            IoStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            IoStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            IoStream::Kcp(s) => Pin::new(s).poll_shutdown(cx),
+            IoStream::WebSocket(_) => Poll::Ready(Ok(())),
+        }
+    }
+}
+
 impl IoStream {
+    /// Write a V1 protocol frame to this stream.
+    /// Delegates to the inner stream type. WebSocket requires WsByteStream adapter.
+    pub async fn write_v1_frame(&mut self, msg: &crate::msg::FrpMessage) -> Result<(), crate::Error> {
+        match self {
+            IoStream::Tcp(s) => crate::protocol::write_msg_v1(s, msg).await,
+            IoStream::Tls(s) => crate::protocol::write_msg_v1(s, msg).await,
+            IoStream::Kcp(s) => crate::protocol::write_msg_v1(s, msg).await,
+            IoStream::WebSocket(_) => {
+                Err(crate::Error::Transport("WebSocket requires WsByteStream adapter".into()))
+            }
+        }
+    }
+
+    /// Read a V1 protocol frame from this stream.
+    /// Delegates to the inner stream type. WebSocket requires WsByteStream adapter.
+    pub async fn read_v1_frame(&mut self) -> Result<crate::msg::FrpMessage, crate::Error> {
+        match self {
+            IoStream::Tcp(s) => crate::protocol::read_msg_v1(s).await,
+            IoStream::Tls(s) => crate::protocol::read_msg_v1(s).await,
+            IoStream::Kcp(s) => crate::protocol::read_msg_v1(s).await,
+            IoStream::WebSocket(_) => {
+                Err(crate::Error::Transport("WebSocket requires WsByteStream adapter".into()))
+            }
+        }
+    }
+
     /// Get the peer address of this stream, if available.
     pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         match self {
@@ -282,7 +365,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 // Write FRPTLSHeadByte (0x17) before TLS handshake, matching Go frp v0.69.1
                 stream.write_all(&[FRP_TLS_HEAD_BYTE]).await
                     .map_err(|e| crate::Error::Transport(format!("write TLS head byte: {e}")))?;
-                let connector = build_tls_connector(None)?;
+                let connector = build_tls_connector(opts.tls_ca_file.as_deref())?;
                 let server_name = if !opts.tls_server_name.is_empty() {
                     opts.tls_server_name.clone()
                 } else {

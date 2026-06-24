@@ -1,11 +1,10 @@
 use std::sync::Arc;
-use tokio::net::TcpStream;
 use tokio::io::AsyncWriteExt;
 use tracing::info;
 
 use frp_core::config::ProxyConfig;
 use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::{read_msg_v1, write_msg_v1};
+use frp_core::protocol::write_msg_v1;
 use frp_core::auth::AuthConfig;
 use frp_core::transport::{IoStream, TransportProtocol, DialOptions, dial_server};
 use frp_core::VERSION;
@@ -22,6 +21,9 @@ pub struct ControlConnection {
     user: String,
     client_id: String,
     run_id: String,
+    tls_enable: bool,
+    tls_server_name: String,
+    tls_ca_file: Option<String>,
 }
 
 impl ControlConnection {
@@ -33,6 +35,9 @@ impl ControlConnection {
         pool_count: i32,
         user: String,
         client_id: String,
+        tls_enable: bool,
+        tls_server_name: String,
+        tls_ca_file: Option<String>,
     ) -> Self {
         Self {
             server_addr,
@@ -43,6 +48,9 @@ impl ControlConnection {
             user,
             client_id,
             run_id: String::new(),
+            tls_enable,
+            tls_server_name,
+            tls_ca_file,
         }
     }
 
@@ -52,29 +60,28 @@ impl ControlConnection {
             server_addr: self.server_addr.clone(),
             server_port: self.server_port,
             protocol: self.transport_protocol.clone(),
+            tls_enable: self.tls_enable,
+            tls_server_name: self.tls_server_name.clone(),
+            tls_ca_file: self.tls_ca_file.clone(),
             ..Default::default()
         };
 
-        let io_stream = dial_server(&opts).await?;
+        let mut io_stream = dial_server(&opts).await?;
 
-        let mut stream = match io_stream {
-            IoStream::Tcp(s) => s,
-            IoStream::Tls(ref _tls) => {
-                return Err(frp_core::Error::Transport(
-                    "TLS control connection client-side not yet fully supported".into()
-                ));
-            }
+        // Reject transports that aren't yet supported for the control channel
+        match &io_stream {
             IoStream::Kcp(_) => {
                 return Err(frp_core::Error::Transport(
                     "KCP control connection not yet supported".into(),
                 ));
             }
-            IoStream::WebSocket(ref _ws) => {
+            IoStream::WebSocket(_) => {
                 return Err(frp_core::Error::Transport(
-                    "WebSocket control connection not yet fully supported".into()
+                    "WebSocket control connection not yet fully supported".into(),
                 ));
             }
-        };
+            _ => {} // Tcp and Tls are supported
+        }
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -98,16 +105,17 @@ impl ControlConnection {
             client_spec: None,
         });
 
-        write_msg_v1(&mut stream, &login).await?;
+        io_stream.write_v1_frame(&login).await?;
 
-        let resp_msg = read_msg_v1(&mut stream).await?;
+        let resp_msg = io_stream.read_v1_frame().await?;
         match resp_msg {
             FrpMessage::LoginResp(resp) => {
                 if let Some(err) = resp.error {
                     return Err(frp_core::Error::Auth(format!("Login failed: {}", err)));
                 }
                 self.run_id = resp.run_id.clone().unwrap_or_default();
-                Ok((IoStream::Tcp(stream), self.run_id.clone()))
+                info!("Logged in. run_id: {}", self.run_id);
+                Ok((io_stream, self.run_id.clone()))
             }
             _ => Err(frp_core::Error::Protocol("Unexpected response to login".into())),
         }
@@ -118,12 +126,11 @@ impl ControlConnection {
         &self,
         p: &ProxyConfig,
         local_addr: &str,
-        stream: &mut TcpStream,
+        stream: &mut IoStream,
     ) -> Result<msg::NewProxyResp, frp_core::Error> {
         let np = proxy::create_new_proxy_msg(p, local_addr);
-        write_msg_v1(stream, &np).await?;
-
-        let resp_msg = read_msg_v1(stream).await?;
+        stream.write_v1_frame(&np).await?;
+        let resp_msg = stream.read_v1_frame().await?;
         match resp_msg {
             FrpMessage::NewProxyResp(resp) => {
                 if let Some(err) = resp.error {

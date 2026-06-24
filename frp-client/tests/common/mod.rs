@@ -65,8 +65,8 @@ pub fn start_frps(port: u16, token: &str) -> JoinHandle<()> {
             oidc_audience: String::new(),
             oidc_token_endpoint: String::new(),
         },
-        allow_port_start: port,     // reuse server port range for proxy ports
-        allow_port_end: port + 100,
+        allow_port_start: port.saturating_sub(50),
+        allow_port_end: port.saturating_add(50).min(u16::MAX),
         ..Default::default()
     };
     let service = ServerService::new(cfg);

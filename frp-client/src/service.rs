@@ -109,6 +109,9 @@ impl Service {
                 pool_count,
                 self.cfg.user.clone(),
                 self.cfg.client_id.clone(),
+                self.cfg.tls_enable,
+                self.cfg.tls_server_name.clone(),
+                if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
             );
 
             let (mut control_stream, run_id) = match ctl.login().await {
@@ -127,19 +130,10 @@ impl Service {
             };
             info!("Logged in. run_id: {}", run_id);
 
-            // Register proxies — extract TcpStream, warn if TLS/WS used for control
-            let mut tcp = match &mut control_stream {
-                IoStream::Tcp(ref mut s) => s,
-                _ => {
-                    warn!("Non-TCP control connection: proxy registration not yet supported");
-                    // Register with write_msg_v1 directly since IoStream isn't TcpStream
-                    // This path currently unreachable; add proper impl when TLS/WS control lands
-                    continue;
-                }
-            };
+            // Register proxies using IoStream directly (supports TCP and TLS)
             for p in &proxies {
                 let local_addr = format!("{}:{}", p.local_ip, p.local_port);
-                match ctl.register_proxy(p, &local_addr, &mut tcp).await {
+                match ctl.register_proxy(p, &local_addr, &mut control_stream).await {
                     Ok(resp) => {
                         info!("Proxy '{}' registered on remote port {:?}", p.name, resp.remote_addr);
                     }
@@ -152,7 +146,7 @@ impl Service {
             // Split control stream for reading and writing
             let (mut reader, mut writer) = control_stream.into_split();
 
-            // Spawn initial pool work connections (TCP only)
+            // Spawn initial pool work connections
             let auth_token = self.auth_cfg.token.clone();
             for i in 0..pool_count {
                 spawn_work_conn(
@@ -164,6 +158,9 @@ impl Service {
                     self.encryption_key,
                     i,
                     auth_token.clone(),
+                    self.cfg.tls_enable,
+                    self.cfg.tls_server_name.clone(),
+                    if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
                 );
             }
 
@@ -181,8 +178,12 @@ impl Service {
                 let use_enc = v.use_encryption;
                 let use_comp = v.use_compression;
                 let name = v.name.clone();
+                let tls_enable = self.cfg.tls_enable;
+                let tls_server_name = self.cfg.tls_server_name.clone();
+                let tls_ca_file = if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) };
                 tokio::spawn(async move {
-                    run_visitor_listener(sa, sp, pt, server_name, secret_key, bind_addr, use_enc, use_comp, name).await;
+                    run_visitor_listener(sa, sp, pt, server_name, secret_key, bind_addr, use_enc, use_comp, name,
+                        tls_enable, tls_server_name, tls_ca_file).await;
                 });
             }
 
@@ -198,8 +199,11 @@ impl Service {
                     let enc = p.use_encryption;
                     let ek = self.encryption_key;
                     let tk = auth_token.clone();
+                    let tls_en = self.cfg.tls_enable;
+                    let tls_sn = self.cfg.tls_server_name.clone();
+                    let tls_ca = if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) };
                     tokio::spawn(async move {
-                        run_udp_work_conn(sa, sp, pt, ru, la, pn, enc, ek, tk).await;
+                        run_udp_work_conn(sa, sp, pt, ru, la, pn, enc, ek, tk, tls_en, tls_sn, tls_ca).await;
                     });
                 }
             }
@@ -222,6 +226,9 @@ impl Service {
                                     self.encryption_key,
                                     -1, // on-demand, not pool
                                     auth_token.clone(),
+                                    self.cfg.tls_enable,
+                                    self.cfg.tls_server_name.clone(),
+                                    if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
                                 );
                             }
                             Ok(FrpMessage::Pong(_)) => {
@@ -302,11 +309,15 @@ fn spawn_work_conn(
     enc_key: [u8; 16],
     pool_id: i32,
     auth_token: String,
+    tls_enable: bool,
+    tls_server_name: String,
+    tls_ca_file: Option<String>,
 ) {
     let server_addr = server_addr.to_string();
     let run_id = run_id.to_string();
     let protocol = protocol.clone();
     let proxy_info_map = proxy_info_map.clone();
+    let tls_server_name = tls_server_name.clone();
 
     tokio::spawn(async move {
         let label = if pool_id >= 0 {
@@ -321,28 +332,32 @@ fn spawn_work_conn(
             server_addr: server_addr.clone(),
             server_port,
             protocol: protocol.clone(),
+            tls_enable,
+            tls_server_name: tls_server_name.clone(),
+            tls_ca_file: tls_ca_file.clone(),
             ..Default::default()
         };
 
         let mut work = match dial_server(&opts).await {
-            Ok(IoStream::Tcp(s)) => s,
-            Ok(IoStream::Kcp(_)) => {
-                warn!("Work conn {}: KCP not yet supported for work conns", label);
-                return;
-            }
-            Ok(IoStream::WebSocket(_)) => {
-                warn!("Work conn {}: WebSocket not supported for work conns", label);
-                return;
-            }
-            Ok(IoStream::Tls(_)) => {
-                warn!("Work conn {}: TLS not yet supported for work conns", label);
-                return;
-            }
+            Ok(io) => io,
             Err(e) => {
                 warn!("Work conn {} dial failed: {}", label, e);
                 return;
             }
         };
+
+        // Reject unsupported transports for work conns
+        match &work {
+            IoStream::Kcp(_) => {
+                warn!("Work conn {}: KCP not yet supported", label);
+                return;
+            }
+            IoStream::WebSocket(_) => {
+                warn!("Work conn {}: WebSocket not yet supported", label);
+                return;
+            }
+            _ => {} // Tcp and Tls are supported
+        }
 
         // Build auth for work conn (Go frp v0.69.1 compat: server verifies auth on NewWorkConn)
         let timestamp = std::time::SystemTime::now()
@@ -365,7 +380,7 @@ fn spawn_work_conn(
             privilege_key,
         });
 
-        if let Err(e) = write_msg_v1(&mut work, &nwc).await {
+        if let Err(e) = work.write_v1_frame(&nwc).await {
             warn!("Work conn {} failed to send NewWorkConn: {}", label, e);
             return;
         }
@@ -373,7 +388,7 @@ fn spawn_work_conn(
         debug!("Work conn {} sent NewWorkConn, waiting for StartWorkConn", label);
 
         // Read StartWorkConn
-        match read_msg_v1(&mut work).await {
+        match work.read_v1_frame().await {
             Ok(FrpMessage::StartWorkConn(swc)) => {
                 let proxy_name = &swc.proxy_name;
                 info!("Work conn {} assigned to proxy '{}'", label, proxy_name);
@@ -420,6 +435,9 @@ fn spawn_work_conn(
                 enc_key,
                 pool_id,
                 auth_token,
+                tls_enable,
+                tls_server_name,
+                tls_ca_file,
             );
         }
     });
@@ -481,6 +499,9 @@ async fn run_udp_work_conn(
     use_encryption: bool,
     #[allow(unused_variables)] enc_key: [u8; 16],
     auth_token: String,
+    tls_enable: bool,
+    tls_server_name: String,
+    tls_ca_file: Option<String>,
 ) {
     if use_encryption {
         warn!("UDP work conn '{}': encryption not yet implemented for UDP tunnels", proxy_name);
@@ -492,17 +513,16 @@ async fn run_udp_work_conn(
         server_addr,
         server_port,
         protocol,
+        tls_enable,
+        tls_server_name,
+        tls_ca_file,
         ..Default::default()
     };
 
     let mut work = match dial_server(&opts).await {
-        Ok(IoStream::Tcp(s)) => s,
-        Ok(IoStream::Tls(_)) => {
-            warn!("UDP work conn {}: TLS not supported", proxy_name);
-            return;
-        }
-        _ => {
-            warn!("UDP work conn {} dial failed", proxy_name);
+        Ok(io) => io,
+        Err(e) => {
+            warn!("UDP work conn {} dial failed: {}", proxy_name, e);
             return;
         }
     };
@@ -627,6 +647,9 @@ async fn run_visitor_listener(
     use_encryption: bool,
     use_compression: bool,
     name: String,
+    tls_enable: bool,
+    tls_server_name: String,
+    tls_ca_file: Option<String>,
 ) {
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
@@ -648,6 +671,8 @@ async fn run_visitor_listener(
                 let sn = server_name.clone();
                 let sk = secret_key.clone();
                 let visitor_name = name.clone();
+                let tls_sn = tls_server_name.clone();
+                let tls_ca = tls_ca_file.clone();
 
                 tokio::spawn(async move {
                     // Connect to the server
@@ -655,14 +680,13 @@ async fn run_visitor_listener(
                         server_addr: sa.clone(),
                         server_port: sp,
                         protocol: pt.clone(),
+                        tls_enable,
+                        tls_server_name: tls_sn,
+                        tls_ca_file: tls_ca,
                         ..Default::default()
                     };
                     let mut server_conn = match dial_server(&opts).await {
-                        Ok(IoStream::Tcp(s)) => s,
-                        Ok(other) => {
-                            warn!("Visitor '{}': unexpected transport {:?}", visitor_name, other);
-                            return;
-                        }
+                        Ok(io) => io,
                         Err(e) => {
                             warn!("Visitor '{}': dial server failed: {}", visitor_name, e);
                             return;
@@ -671,7 +695,7 @@ async fn run_visitor_listener(
 
                     // Send NewVisitorConn
                     let nvc = crate::proxy::create_visitor_conn_msg(&sn, &sk, use_encryption, use_compression);
-                    if let Err(e) = write_msg_v1(&mut server_conn, &nvc).await {
+                    if let Err(e) = server_conn.write_v1_frame(&nvc).await {
                         warn!("Visitor '{}': send NewVisitorConn failed: {}", visitor_name, e);
                         return;
                     }

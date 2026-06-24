@@ -3,6 +3,7 @@ use tracing::{info, warn, debug};
 
 use frp_core::msg::{self, FrpMessage};
 use frp_core::bridge;
+use frp_core::transport::IoStream;
 
 /// Build a NewVisitorConn message for an STCP/XTCP visitor connection.
 pub fn create_visitor_conn_msg(server_name: &str, secret_key: &str, use_encryption: bool, use_compression: bool) -> FrpMessage {
@@ -67,8 +68,8 @@ pub async fn connect_local(addr: &str) -> Result<TcpStream, frp_core::Error> {
 
 /// Bridge data between two streams with optional encryption and compression.
 pub async fn bridge_streams(
-    local: TcpStream,
-    work: TcpStream,
+    local: tokio::net::TcpStream,
+    work: IoStream,
     name: &str,
     use_encryption: bool,
     use_compression: bool,
@@ -78,7 +79,7 @@ pub async fn bridge_streams(
     if use_encryption {
         if let Some(key) = enc_key {
             let (l_r, l_w) = tokio::io::split(local);
-            let (w_r, w_w) = tokio::io::split(work);
+            let (w_r, w_w) = work.into_split();
             bridge::bridge_encrypted(l_r, l_w, w_r, w_w, key, use_compression).await;
             debug!("Proxy {} encrypted bridge closed", name);
             return;
