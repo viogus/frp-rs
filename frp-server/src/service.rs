@@ -281,6 +281,75 @@ impl Service {
             tracing::info!("KCP listener starting on {}", kcp_addr);
         }
 
+        // Start QUIC listener if configured (requires TLS cert/key)
+        if self.cfg.quic_bind_port > 0 && self.cfg.tls_enable {
+            let quic_state = self.state.clone();
+            let quic_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.quic_bind_port);
+            let quic_addr2 = quic_addr.clone();
+            let cert_path = self.cfg.tls_cert_file.clone();
+            let key_path = self.cfg.tls_key_file.clone();
+            tokio::spawn(async move {
+                let cert_pem = match std::fs::read_to_string(&cert_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("QUIC: failed to read cert file {}: {}", cert_path, e);
+                        return;
+                    }
+                };
+                let key_pem = match std::fs::read_to_string(&key_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("QUIC: failed to read key file {}: {}", key_path, e);
+                        return;
+                    }
+                };
+                let sockaddr: std::net::SocketAddr = match quic_addr.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::error!("QUIC: invalid bind address {}: {}", quic_addr, e);
+                        return;
+                    }
+                };
+                let listener = match frp_core::quic::QuicListener::new(sockaddr, &cert_pem, &key_pem) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::error!("QUIC listener bind failed: {}", e);
+                        return;
+                    }
+                };
+                tracing::info!("QUIC listener started on {}", quic_addr);
+                loop {
+                    match listener.accept().await {
+                        Ok(stream) => {
+                            let state = quic_state.clone();
+                            tokio::spawn(async move {
+                                let mut ctl = frp_core::transport::IoStream::Quic(stream);
+                                match frp_core::protocol::read_msg_v1(&mut ctl).await {
+                                    Ok(frp_core::msg::FrpMessage::Login(login)) => {
+                                        control::handle_control(ctl, login, state, None, None).await;
+                                    }
+                                    Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                                        handle_work_conn_inner(ctl, nwc, state).await;
+                                    }
+                                    Ok(other) => {
+                                        tracing::warn!("Unexpected QUIC message: {:?}", other.v1_type_byte());
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("QUIC read error: {}", e);
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!("QUIC accept error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+            tracing::info!("QUIC listener starting on {}", quic_addr2);
+        }
+
         // Start dashboard server if configured
         if self.cfg.web_server.port > 0 {
             let dash_addr = format_socket_addr(&self.cfg.web_server.addr, self.cfg.web_server.port);

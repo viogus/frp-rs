@@ -9,6 +9,7 @@ pub mod bridge;
 pub mod bandwidth;
 pub mod args;
 pub mod kcp;
+pub mod quic;
 
 use thiserror::Error;
 

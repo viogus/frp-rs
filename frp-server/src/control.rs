@@ -425,6 +425,7 @@ async fn assign_work_to_proxy(
         IoStream::WebSocket(ref mut s) => write_msg_v1(s, &swc).await,
         IoStream::Yamux(ref mut s) => write_msg_v1(s, &swc).await,
         IoStream::Kcp(ref mut s) => write_msg_v1(s, &swc).await,
+        IoStream::Quic(ref mut s) => write_msg_v1(s, &swc).await,
     };
 
     if let Err(e) = write_result {
@@ -506,6 +507,11 @@ async fn assign_work_to_proxy(
                 IoStream::WebSocket(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, None, None).await;
+                }
+                IoStream::Quic(work) => {
+                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (w_r, w_w) = work.into_split();
                     frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, None, None).await;
                 }
                 IoStream::Yamux(work) => {

@@ -8,6 +8,7 @@ use futures_util::sink::Sink;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use crate::kcp::KcpStream;
+use crate::quic::QuicStream;
 
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
@@ -229,6 +230,7 @@ pub enum IoStream {
     Tcp(TcpStream),
     Tls(tokio_rustls::TlsStream<TcpStream>),
     Kcp(KcpStream),
+    Quic(QuicStream),
     WebSocket(WsByteStream),
     Yamux(YamuxStream),
 }
@@ -239,6 +241,7 @@ impl std::fmt::Debug for IoStream {
             IoStream::Tcp(_) => f.debug_struct("IoStream::Tcp").finish_non_exhaustive(),
             IoStream::Tls(_) => f.debug_struct("IoStream::Tls").finish_non_exhaustive(),
             IoStream::Kcp(_) => f.debug_struct("IoStream::Kcp").finish_non_exhaustive(),
+            IoStream::Quic(_) => f.debug_struct("IoStream::Quic").finish_non_exhaustive(),
             IoStream::WebSocket(_) => f.debug_struct("IoStream::WebSocket").finish_non_exhaustive(),
             IoStream::Yamux(_) => f.debug_struct("IoStream::Yamux").finish_non_exhaustive(),
         }
@@ -256,6 +259,7 @@ impl tokio::io::AsyncRead for IoStream {
             IoStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Kcp(s) => Pin::new(s).poll_read(cx, buf),
+            IoStream::Quic(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::WebSocket(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Yamux(s) => Pin::new(s).poll_read(cx, buf),
         }
@@ -272,6 +276,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::Kcp(s) => Pin::new(s).poll_write(cx, buf),
+            IoStream::Quic(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::WebSocket(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::Yamux(s) => Pin::new(s).poll_write(cx, buf),
         }
@@ -282,6 +287,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Tcp(s) => Pin::new(s).poll_flush(cx),
             IoStream::Tls(s) => Pin::new(s).poll_flush(cx),
             IoStream::Kcp(s) => Pin::new(s).poll_flush(cx),
+            IoStream::Quic(s) => Pin::new(s).poll_flush(cx),
             IoStream::WebSocket(s) => Pin::new(s).poll_flush(cx),
             IoStream::Yamux(s) => Pin::new(s).poll_flush(cx),
         }
@@ -292,6 +298,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::Kcp(s) => Pin::new(s).poll_shutdown(cx),
+            IoStream::Quic(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::WebSocket(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::Yamux(s) => Pin::new(s).poll_shutdown(cx),
         }
@@ -305,6 +312,7 @@ impl IoStream {
             IoStream::Tcp(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::Tls(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::Kcp(s) => crate::protocol::write_msg_v1(s, msg).await,
+            IoStream::Quic(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::WebSocket(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::Yamux(s) => crate::protocol::write_msg_v1(s, msg).await,
         }
@@ -316,6 +324,7 @@ impl IoStream {
             IoStream::Tcp(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Tls(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Kcp(s) => crate::protocol::read_msg_v1(s).await,
+            IoStream::Quic(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::WebSocket(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Yamux(s) => crate::protocol::read_msg_v1(s).await,
         }
@@ -325,7 +334,7 @@ impl IoStream {
     pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         match self {
             IoStream::Tcp(s) => s.peer_addr().ok(),
-            IoStream::Tls(_) | IoStream::Kcp(_) | IoStream::WebSocket(_) | IoStream::Yamux(_) => None,
+            IoStream::Tls(_) | IoStream::Kcp(_) | IoStream::Quic(_) | IoStream::WebSocket(_) | IoStream::Yamux(_) => None,
         }
     }
 
@@ -348,6 +357,9 @@ impl IoStream {
             IoStream::Kcp(stream) => {
                 let (r, w) = tokio::io::split(stream);
                 (Box::new(r), Box::new(w))
+            }
+            IoStream::Quic(stream) => {
+                stream.into_split()
             }
             IoStream::WebSocket(adapter) => {
                 let (r, w) = tokio::io::split(adapter);
@@ -448,7 +460,15 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             Ok(IoStream::Kcp(stream))
         }
         TransportProtocol::Quic => {
-            Err(crate::Error::Transport("QUIC not yet implemented".into()))
+            let addr = format!("{}:{}", opts.server_addr, opts.server_port);
+            let server_name = if !opts.tls_server_name.is_empty() {
+                &opts.tls_server_name
+            } else {
+                &opts.server_addr
+            };
+            let stream = crate::quic::dial_quic(&addr, server_name).await
+                .map_err(|e| crate::Error::Transport(format!("QUIC dial: {e}")))?;
+            Ok(IoStream::Quic(stream))
         }
     }
 }
