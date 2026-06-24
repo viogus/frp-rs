@@ -3,6 +3,7 @@ use tokio::net::TcpStream;
 use tokio::io::AsyncWriteExt;
 use tracing::info;
 
+use frp_core::config::ProxyConfig;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::auth::AuthConfig;
@@ -115,17 +116,11 @@ impl ControlConnection {
     /// Register a proxy with the server.
     pub async fn register_proxy(
         &self,
-        name: &str,
-        proxy_type: &str,
+        p: &ProxyConfig,
         local_addr: &str,
-        remote_port: u16,
-        use_encryption: bool,
-        use_compression: bool,
-        sk: &str,
-        custom_domains: &[String],
         stream: &mut TcpStream,
     ) -> Result<msg::NewProxyResp, frp_core::Error> {
-        let np = proxy::create_new_proxy_msg(name, proxy_type, local_addr, remote_port, use_encryption, use_compression, sk, custom_domains);
+        let np = proxy::create_new_proxy_msg(p, local_addr);
         write_msg_v1(stream, &np).await?;
 
         let resp_msg = read_msg_v1(stream).await?;
@@ -133,10 +128,10 @@ impl ControlConnection {
             FrpMessage::NewProxyResp(resp) => {
                 if let Some(err) = resp.error {
                     return Err(frp_core::Error::Other(format!(
-                        "Proxy '{name}' registration failed: {err}"
+                        "Proxy '{}' registration failed: {err}", p.name
                     )));
                 }
-                info!("Proxy '{name}' registered on remote port {:?}", resp.remote_addr);
+                info!("Proxy '{}' registered on remote port {:?}", p.name, resp.remote_addr);
                 Ok(resp)
             }
             _ => Err(frp_core::Error::Protocol("Unexpected response to NewProxy".into())),

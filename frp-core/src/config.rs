@@ -303,12 +303,32 @@ pub struct ProxyConfig {
     pub subdomain: String,
     #[serde(default, alias = "httpUser")]
     pub http_user: String,
+    #[serde(default, alias = "httpPwd")]
+    pub http_pwd: String,
     #[serde(default, alias = "httpPassword")]
     pub http_password: String,
     #[serde(default)]
     pub locations: Vec<String>,
     #[serde(default, alias = "hostHeaderRewrite")]
     pub host_header_rewrite: String,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    #[serde(default, alias = "responseHeaders")]
+    pub response_headers: std::collections::HashMap<String, String>,
+    #[serde(default, alias = "routeByHTTPUser")]
+    pub route_by_http_user: String,
+    #[serde(default, alias = "allowUsers")]
+    pub allow_users: Vec<String>,
+    #[serde(default, alias = "bandwidthLimit")]
+    pub bandwidth_limit: String,
+    #[serde(default, alias = "bandwidthLimitMode")]
+    pub bandwidth_limit_mode: String,
+    #[serde(default)]
+    pub annotations: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub metas: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub multiplexer: String,
     #[serde(default)]
     pub group: String,
     #[serde(default)]

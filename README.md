@@ -29,7 +29,7 @@ suitable as a drop-in replacement for either the client or server side.
 | Token authentication  | ✅     | ✅     |
 | Heartbeat (ping/pong)| ✅     | ✅     |
 | Auto port allocation | —      | ✅     |
-| Encryption (AES-GCM) | ✅     | ✅     |
+| Encryption (AES-128-CFB) | ✅  | ✅     |
 | WebSocket transport  | 🚧     | ✅     |
 | TLS transport        | 🚧     | 🚧     |
 | STCP / sk routing    | ❌     | 🚧     |
@@ -38,7 +38,7 @@ suitable as a drop-in replacement for either the client or server side.
 | TCP health checks    | ✅     | —      |
 | QUIC transport       | ❌     | ❌     |
 | KCP / SUDP           | ❌     | ❌     |
-| Compression          | ❌     | ❌     |
+| Compression (Snappy) | ✅     | ✅     |
 | OIDC authentication  | ❌     | ❌     |
 | Dashboard (web UI)   | —      | ❌     |
 
@@ -363,21 +363,31 @@ the Login message, then compares directly.
 ### Encryption
 
 When `use_encryption = true` on a proxy, data between frps and frpc is encrypted
-with **AES-256-GCM**. The encryption key is derived from the auth token via SHA-256:
+with **AES-128-CFB**, matching Go frp v0.69.1. The encryption key (16 bytes) is
+derived from the auth token via PBKDF2-SHA1:
 
 ```
-encryption_key = SHA-256(auth_token)
+encryption_key = PBKDF2(token, "crypto", iterations=64, key_len=16, hash=SHA1)
 ```
 
-Encrypted data is framed with a 4-byte big-endian length prefix:
+### Compression
+
+When `use_compression = true`, data is compressed with **Snappy** (matching Go frp
+v0.69.1) before encryption. Compression is applied first, then encryption:
+
 ```
-[4-byte len][AES-GCM: 12-byte nonce || ciphertext || 16-byte tag]
+plaintext → Snappy compress → AES-128-CFB encrypt → [4-byte BE len][encrypted frame]
+```
+
+Each encrypted frame contains a random 16-byte IV followed by the CFB-encrypted
+(possibly compressed) data:
+
+```
+[4-byte BE len][16-byte IV][AES-128-CFB encrypted (Snappy-compressed? plaintext)]
 ```
 
 - Supported for TCP proxies (both client and server bridge paths).
 - UDP proxy encryption not yet implemented.
-- Compression (`use_compression`) is not yet wired into the bridge; the flag is
-  accepted but data is sent uncompressed.
 
 ## Project Structure
 

@@ -71,9 +71,14 @@ pub async fn handle_control<S>(
     // --- Set up internal channel ---
     let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<InternalMsg>();
 
-    // Register control channel so work-conn and proxy listeners can reach us
+    // Register control channel. If a previous handler exists for this run_id,
+    // send Shutdown to it so it stops listening (Go frp v0.69.1 compat).
     {
         let mut map = state.run_id_to_ctl_tx.write().await;
+        if let Some(old_ctl) = map.get(&run_id) {
+            warn!("Duplicate run_id {}: shutting down old control handler", run_id);
+            let _ = old_ctl.tx.send(InternalMsg::Shutdown);
+        }
         map.insert(run_id.clone(), ControlTx { tx: internal_tx.clone() });
     }
 
@@ -191,6 +196,10 @@ pub async fn handle_control<S>(
                             warn!("Failed to send UDPPacket: {}", e);
                             break;
                         }
+                    }
+                    Some(InternalMsg::Shutdown) => {
+                        warn!("Shutdown received for run_id {} (replaced by new control connection)", run_id);
+                        break;
                     }
                     None => {
                         info!("Control channel closed for {:?}", peer);

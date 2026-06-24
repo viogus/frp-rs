@@ -40,6 +40,9 @@ pub enum InternalMsg {
         content: Vec<u8>,
         remote_addr: String,
     },
+    /// Sent when a new control connection claims the same run_id.
+    /// The old handler should stop listening and clean up.
+    Shutdown,
 }
 
 #[derive(Debug, Clone)]

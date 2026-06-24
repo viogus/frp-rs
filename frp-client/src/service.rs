@@ -17,6 +17,7 @@ use crate::control::ControlConnection;
 struct ProxyRuntimeInfo {
     local_addr: String,
     use_encryption: bool,
+    use_compression: bool,
 }
 
 /// The main frpc service.
@@ -49,6 +50,7 @@ impl Service {
             proxy_info_map.insert(p.name.clone(), ProxyRuntimeInfo {
                 local_addr: format!("{}:{}", p.local_ip, p.local_port),
                 use_encryption: p.use_encryption,
+                use_compression: p.use_compression,
             });
         }
 
@@ -137,12 +139,7 @@ impl Service {
             };
             for p in &proxies {
                 let local_addr = format!("{}:{}", p.local_ip, p.local_port);
-                match ctl.register_proxy(
-                    &p.name, &p.proxy_type, &local_addr, p.remote_port,
-                    p.use_encryption, p.use_compression, &p.sk,
-                    &p.custom_domains,
-                    &mut tcp,
-                ).await {
+                match ctl.register_proxy(p, &local_addr, &mut tcp).await {
                     Ok(resp) => {
                         info!("Proxy '{}' registered on remote port {:?}", p.name, resp.remote_addr);
                     }
@@ -364,7 +361,7 @@ fn spawn_work_conn(
                 match proxy::connect_local(&info.local_addr).await {
                     Ok(local) => {
                         let enc = if info.use_encryption { Some(&enc_key) } else { None };
-                        proxy::bridge_streams(local, work, proxy_name, info.use_encryption, enc).await;
+                        proxy::bridge_streams(local, work, proxy_name, info.use_encryption, info.use_compression, enc).await;
                     }
                     Err(e) => {
                         warn!("Work conn {}: failed to connect to local {}: {}", label, info.local_addr, e);
