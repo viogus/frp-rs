@@ -502,13 +502,17 @@ async fn handle_new_proxy(
                     }
                 }
 
-                if !domains.is_empty() {
+                let locations: Vec<String> = np.locations.clone().unwrap_or_default();
+
+                if !domains.is_empty() || !locations.is_empty() {
                     state.vhost_manager.register(
                         &np.proxy_name,
                         &domains,
+                        &locations,
                         run_id,
                     ).await;
-                    info!("VHost routes registered for '{}': {:?}", np.proxy_name, domains);
+                    info!("VHost routes registered for '{}': domains={:?}, locations={:?}",
+                        np.proxy_name, domains, locations);
                 }
             }
 
