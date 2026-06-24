@@ -13,7 +13,7 @@ use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
 use frp_core::format_socket_addr;
 
-use crate::proxy::{ProxyInfo, allocate_port};
+use crate::proxy::{ProxyInfo, allocate_port_multi};
 use crate::service::{AppState, InternalMsg, ControlTx};
 
 /// Max age of a pending request before it is dropped (Go frp: 10s default).
@@ -443,9 +443,7 @@ async fn handle_new_proxy(
 
     let allocated_port = {
         let mut ports = state.used_ports.write().await;
-        let base = state.allow_port_start;
-        let count = state.allow_port_end.saturating_sub(base).max(100);
-        allocate_port(&mut ports, remote_port, count, base)
+        allocate_port_multi(&mut ports, remote_port, &state.allow_ports)
     };
 
     match allocated_port {

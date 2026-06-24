@@ -45,10 +45,52 @@ pub struct ServerConfig {
     pub allow_port_start: u16,
     #[serde(default = "default_allow_port_end")]
     pub allow_port_end: u16,
+    /// Comma-separated port ranges, e.g. "10000-20000,30000-40000".
+    /// When set, this takes precedence over allow_port_start/allow_port_end.
+    /// Each range is inclusive on both ends.
+    #[serde(default)]
+    pub allow_ports: String,
 }
 
 fn default_allow_port_start() -> u16 { 10000 }
 fn default_allow_port_end() -> u16 { 50000 }
+
+/// Parse a comma-separated port range string into a list of (start, end) pairs.
+/// e.g. "10000-20000,30000-40000" → [(10000, 20000), (30000, 40000)]
+/// Returns empty vec if the string is empty.
+pub fn parse_allow_ports(s: &str) -> Vec<(u16, u16)> {
+    if s.trim().is_empty() {
+        return vec![];
+    }
+    s.split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            if let Some((a, b)) = part.split_once('-') {
+                let start: u16 = a.trim().parse().ok()?;
+                let end: u16 = b.trim().parse().ok()?;
+                if start <= end {
+                    Some((start, end))
+                } else {
+                    Some((end, start)) // swap inverted ranges
+                }
+            } else {
+                // Single port: treat as start=end
+                let p: u16 = part.parse().ok()?;
+                Some((p, p))
+            }
+        })
+        .collect()
+}
+
+/// Compute the total number of ports across all ranges.
+pub fn count_ports(ranges: &[(u16, u16)]) -> u16 {
+    ranges.iter().fold(0u32, |acc, (s, e)| {
+        acc.saturating_add(e.saturating_sub(*s) as u32 + 1)
+    }).min(u16::MAX as u32) as u16
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -72,6 +114,7 @@ impl Default for ServerConfig {
             transport: ServerTransportConfig::default(),
             allow_port_start: default_allow_port_start(),
             allow_port_end: default_allow_port_end(),
+            allow_ports: String::new(),
         }
     }
 }
@@ -688,6 +731,40 @@ httpUser = "cdf"
         let plugin = cfg.proxies[0].plugin.as_ref().unwrap();
         assert_eq!(plugin.plugin_type, "http_proxy");
         assert_eq!(plugin.http_user, "cdf");
+    }
+
+    #[test]
+    fn test_parse_allow_ports() {
+        // Empty → empty
+        assert!(parse_allow_ports("").is_empty());
+        // Single range
+        assert_eq!(parse_allow_ports("10000-20000"), vec![(10000, 20000)]);
+        // Multiple ranges
+        assert_eq!(
+            parse_allow_ports("10000-20000,30000-40000"),
+            vec![(10000, 20000), (30000, 40000)]
+        );
+        // With spaces
+        assert_eq!(
+            parse_allow_ports("10000-20000, 30000-40000"),
+            vec![(10000, 20000), (30000, 40000)]
+        );
+        // Inverted range swapped
+        assert_eq!(parse_allow_ports("20000-10000"), vec![(10000, 20000)]);
+        // Single port
+        assert_eq!(parse_allow_ports("8080"), vec![(8080, 8080)]);
+        // Mixed
+        assert_eq!(
+            parse_allow_ports("1000-2000,8080,30000-40000"),
+            vec![(1000, 2000), (8080, 8080), (30000, 40000)]
+        );
+    }
+
+    #[test]
+    fn test_count_ports() {
+        assert_eq!(count_ports(&[(10000, 10009)]), 10);
+        assert_eq!(count_ports(&[(10000, 10009), (20000, 20004)]), 15);
+        assert_eq!(count_ports(&[]), 0);
     }
 
     #[test]
