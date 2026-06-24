@@ -33,14 +33,15 @@ suitable as a drop-in replacement for either the client or server side.
 | WebSocket transport  | 🚧     | ✅     |
 | TLS transport        | 🚧     | 🚧     |
 | STCP / sk routing    | ❌     | 🚧     |
-| HTTP VHost routing   | ❌     | 🚧     |
-| HTTPS VHost routing  | ❌     | 🚧     |
+| HTTP VHost routing   | —      | ✅     |
+| HTTPS VHost routing  | —      | ✅     |
 | TCP health checks    | ✅     | —      |
 | QUIC transport       | ❌     | ❌     |
 | KCP / SUDP           | ❌     | ❌     |
 | Compression (Snappy) | ✅     | ✅     |
 | OIDC authentication  | ❌     | ❌     |
 | Dashboard (web UI)   | —      | ❌     |
+| NAT hole punching    | ❌     | ❌     |
 
 ---
 
@@ -172,6 +173,8 @@ tcp_mux_keepalive_interval = 30
 | `web_server.port` | `0` | Dashboard port (0 = disabled) |
 | `transport.tcp_mux` | `true` | Enable TCP multiplexing |
 | `transport.tcp_mux_keepalive_interval` | `30` | Keepalive interval (seconds) for mux |
+| `allow_port_start` | `10000` | Start of auto-assigned port range |
+| `allow_port_end` | `50000` | End of auto-assigned port range |
 
 ### Client (`frpc.toml`)
 
@@ -233,7 +236,17 @@ use_compression = false
 | `health_check_interval_seconds` | `0` | Seconds between health checks (min 10) |
 | `health_check_timeout_seconds` | `0` | Health check connect timeout (min 3) |
 | `health_check_max_failed` | `0` | Consecutive failures before marking unhealthy (min 1) |
-| `use_compression` | `false` | Compress proxy traffic (not yet wired into bridge) |
+| `bandwidth_limit` | `""` | Bandwidth limit (e.g. "1MB") |
+| `bandwidth_limit_mode` | `""` | Bandwidth limit mode (client/server) |
+| `multiplexer` | `""` | Multiplexer type for the proxy |
+| `metas` | `{}` | Key-value metadata for the proxy |
+| `annotations` | `{}` | Key-value annotations for the proxy |
+| `headers` | `{}` | Custom HTTP request headers |
+| `response_headers` | `{}` | Custom HTTP response headers |
+| `route_by_http_user` | `""` | Route by HTTP basic auth user |
+| `allow_users` | `[]` | Allowed HTTP basic auth users |
+| `http_pwd` | `""` | HTTP basic auth password (alias for http_password) |
+| `locations` | `[]` | URL path locations for HTTP routing |
 
 ---
 
@@ -401,9 +414,9 @@ frp-rs/
       lib.rs              Error types, Result, VERSION
       args.rs             CLI argument parsing (shared by frps + frpc)
       auth.rs             MD5 token authentication
-      bridge.rs           Encrypted data bridge (AES-256-GCM framed)
+      bridge.rs           Encrypted data bridge (AES-128-CFB framed)
       config.rs           TOML config structs + Go frp compat normalization
-      encryption.rs       AES-256-GCM encrypt/decrypt + zlib compress/decompress
+      encryption.rs       AES-128-CFB encrypt/decrypt + Snappy compress/decompress
       msg.rs              Wire protocol message structs
       mux.rs              TCP multiplexing (placeholder)
       protocol.rs         V1/V2 frame read/write

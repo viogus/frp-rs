@@ -103,6 +103,8 @@ pub async fn handle_control<S>(
     let mut pending_requests: VecDeque<PendingRequest> = VecDeque::new();
     let mut listener_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> = std::collections::HashMap::new();
     let mut udp_sockets: std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>> = std::collections::HashMap::new();
+    // Reverse mapping: local_addr → proxy_name for routing UDPPacket responses
+    let mut udp_local_to_proxy: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut last_ping = Instant::now();
 
     // --- Main select loop ---
@@ -229,30 +231,25 @@ pub async fn handle_control<S>(
                     }
                     Ok(FrpMessage::UDPPacket(up)) => {
                         debug!("UDPPacket from client: {} bytes to {}", up.content.len(), up.remote_addr);
-                        // Forward via the proxy's UDP socket so responses come back to the same port.
-                        // The socket is shared with run_udp_listener for bidirectional NAT (Go frp compat).
-                        let proxy_name = &up.local_addr;
-                        if proxy_name.is_empty() {
-                            // Fallback: try the first UDP socket for this client
-                            if let Some((_name, sock)) = udp_sockets.iter().next() {
-                                let sock = sock.clone();
-                                let content = up.content.clone();
-                                let remote_addr = up.remote_addr.clone();
-                                tokio::spawn(async move {
-                                    let _ = sock.send_to(&content, &remote_addr).await;
-                                });
-                            }
-                        } else if let Some(sock) = udp_sockets.get(proxy_name) {
+                        // Forward via the proxy's UDP socket (bidirectional NAT, Go frp compat).
+                        // Lookup: local_addr → proxy_name → socket, fallback to first socket.
+                        let proxy_name = udp_local_to_proxy.get(&up.local_addr);
+                        let sock_opt = proxy_name
+                            .and_then(|pn| udp_sockets.get(pn))
+                            .or_else(|| udp_sockets.iter().next().map(|(_, s)| s));
+                        if let Some(sock) = sock_opt {
                             let sock = sock.clone();
                             let content = up.content.clone();
                             let remote_addr = up.remote_addr.clone();
                             tokio::spawn(async move {
                                 let _ = sock.send_to(&content, &remote_addr).await;
                             });
+                        } else {
+                            warn!("No UDP socket for proxy, dropping {} bytes", up.content.len());
                         }
                     }
                     Ok(FrpMessage::NewProxy(np)) => {
-                        handle_new_proxy(np, &run_id, &state, &mut writer, &internal_tx, &mut listener_handles, &mut udp_sockets).await;
+                        handle_new_proxy(np, &run_id, &state, &mut writer, &internal_tx, &mut listener_handles, &mut udp_sockets, &mut udp_local_to_proxy).await;
                     }
                     Ok(FrpMessage::CloseProxy(cp)) => {
                         if let Some(info) = state.proxy_manager.get(&cp.proxy_name).await {
@@ -442,6 +439,7 @@ async fn handle_new_proxy(
     internal_tx: &mpsc::UnboundedSender<InternalMsg>,
     listener_handles: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
     udp_sockets: &mut std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
+    udp_local_to_proxy: &mut std::collections::HashMap<String, String>,
 ) {
     let raw_port = np.remote_port.unwrap_or(0);
     if raw_port < 0 || raw_port > u16::MAX as i32 {
@@ -478,6 +476,7 @@ async fn handle_new_proxy(
             };
 
             if let Err(e) = state.proxy_manager.register(run_id.to_string(), info.clone()).await {
+                state.used_ports.write().await.remove(&port);
                 let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
                     proxy_name: np.proxy_name.clone(),
                     remote_addr: None,
@@ -539,6 +538,8 @@ async fn handle_new_proxy(
                     Ok(s) => std::sync::Arc::new(s),
                     Err(e) => {
                         tracing::error!("Failed to bind UDP port {}: {}", port, e);
+                        state.used_ports.write().await.remove(&port);
+                        state.proxy_manager.remove(&np.proxy_name).await;
                         let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
                             proxy_name: np.proxy_name.clone(),
                             remote_addr: None,
@@ -550,6 +551,12 @@ async fn handle_new_proxy(
                 };
                 let sock = socket.clone();
                 udp_sockets.insert(np.proxy_name.clone(), socket);
+                // Build reverse lookup: local_addr → proxy_name for routing UDPPacket responses
+                if let Some(ref local_str) = np.local_str {
+                    if !local_str.is_empty() {
+                        udp_local_to_proxy.insert(local_str.clone(), np.proxy_name.clone());
+                    }
+                }
                 let handle = tokio::spawn(async move {
                     run_udp_listener(sock, pn, itx).await;
                 });
