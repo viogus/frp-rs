@@ -48,6 +48,8 @@ impl Service {
             token: cfg.token.clone(),
             oidc_issuer: String::new(),
             oidc_audience: String::new(),
+            oidc_skip_expiry: false,
+            oidc_skip_issuer: false,
             additional_data: None,
         };
 
@@ -451,6 +453,8 @@ impl Service {
                             token: auth_token.clone(),
                             oidc_issuer: String::new(),
                             oidc_audience: String::new(),
+                            oidc_skip_expiry: false,
+                            oidc_skip_issuer: false,
                             additional_data: None,
                         };
                         let ping = FrpMessage::Ping(msg::Ping {
@@ -569,6 +573,8 @@ fn spawn_work_conn(
                 token: auth_token.clone(),
                 oidc_issuer: String::new(),
                 oidc_audience: String::new(),
+                oidc_skip_expiry: false,
+                oidc_skip_issuer: false,
                 additional_data: None,
             };
             let privilege_key = auth_cfg.generate_login_key(timestamp);

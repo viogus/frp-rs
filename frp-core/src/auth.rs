@@ -21,6 +21,8 @@ pub struct AuthConfig {
     pub token: String,
     pub oidc_issuer: String,
     pub oidc_audience: String,
+    pub oidc_skip_expiry: bool,
+    pub oidc_skip_issuer: bool,
     pub additional_data: Option<String>,
 }
 
@@ -31,6 +33,8 @@ impl Default for AuthConfig {
             token: String::new(),
             oidc_issuer: String::new(),
             oidc_audience: String::new(),
+            oidc_skip_expiry: false,
+            oidc_skip_issuer: false,
             additional_data: None,
         }
     }
@@ -44,11 +48,11 @@ pub enum AuthMethod {
 }
 
 impl AuthConfig {
-    /// Validate a login attempt. Returns Ok(()) if valid, Err with reason if invalid.
-    pub fn validate_login(&self, privilege_key: Option<&str>, timestamp: Option<i64>) -> Result<(), String> {
-        if self.token.is_empty() {
-            // No token configured: always allow
-            return Ok(());
+    /// Validate a login attempt. Returns the subject string (empty for token
+    /// auth, populated from JWT 'sub' claim for OIDC). Returns Err if invalid.
+    pub fn validate_login(&self, privilege_key: Option<&str>, timestamp: Option<i64>) -> Result<String, String> {
+        if self.token.is_empty() && self.method == AuthMethod::Token {
+            return Ok(String::new());
         }
 
         let key = privilege_key.unwrap_or("");
@@ -60,13 +64,15 @@ impl AuthConfig {
                 if key != expected {
                     return Err("invalid authentication token".into());
                 }
-                Ok(())
+                Ok(String::new())
             }
-            AuthMethod::Oidc => Err("OIDC auth not implemented in Rust frp".into()),
+            AuthMethod::Oidc => {
+                Err("OIDC auth requires server-side verifier (not configured)".into())
+            }
         }
     }
 
-/// Generate the privilege_key for a login message.
+    /// Generate the privilege_key for a login message.
     pub fn generate_login_key(&self, timestamp: i64) -> Option<String> {
         if self.token.is_empty() {
             return None;
@@ -98,6 +104,8 @@ mod tests {
             token: "secret".into(),
             oidc_issuer: String::new(),
             oidc_audience: String::new(),
+            oidc_skip_expiry: false,
+            oidc_skip_issuer: false,
             additional_data: None,
         };
         let ts = 100i64;
