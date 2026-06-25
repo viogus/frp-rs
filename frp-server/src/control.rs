@@ -739,22 +739,29 @@ async fn handle_new_proxy(
 
                 let locations: Vec<String> = np.locations.clone().unwrap_or_default();
 
-                if !domains.is_empty() || !locations.is_empty() {
-                    let hhr = np.host_header_rewrite.as_deref().unwrap_or("");
-                    let http_user = np.http_user.as_deref().unwrap_or("");
-                    let http_pwd = np.http_pwd.as_deref().unwrap_or("");
-                    state.vhost_manager.register(
-                        &np.proxy_name,
-                        &domains,
-                        &locations,
-                        run_id,
-                        hhr,
-                        http_user,
-                        http_pwd,
-                    ).await;
-                    info!("VHost routes registered for '{}': domains={:?}, locations={:?}, rewrite={:?}",
-                        np.proxy_name, domains, locations, hhr);
+                // Always register HTTP proxies with VHost manager.
+                // If both domains and locations are empty, register with empty
+                // strings as catch-all routes (matches any host/path).
+                let mut domains = domains;
+                let mut locations = locations;
+                if domains.is_empty() && locations.is_empty() {
+                    domains.push(String::new());   // catch-all domain
+                    locations.push(String::new()); // catch-all path
                 }
+                let hhr = np.host_header_rewrite.as_deref().unwrap_or("");
+                let http_user = np.http_user.as_deref().unwrap_or("");
+                let http_pwd = np.http_pwd.as_deref().unwrap_or("");
+                state.vhost_manager.register(
+                    &np.proxy_name,
+                    &domains,
+                    &locations,
+                    run_id,
+                    hhr,
+                    http_user,
+                    http_pwd,
+                ).await;
+                info!("VHost routes registered for '{}': domains={:?}, locations={:?}, rewrite={:?}",
+                    np.proxy_name, domains, locations, hhr);
             }
 
             // Start the appropriate listener for this proxy type.
