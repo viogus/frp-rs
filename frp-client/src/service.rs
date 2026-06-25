@@ -308,9 +308,10 @@ impl Service {
                 let tls_enable = self.cfg.tls_enable;
                 let tls_server_name = self.cfg.tls_server_name.clone();
                 let tls_ca_file = if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) };
+                let visitor_type = v.visitor_type.clone();
                 tokio::spawn(async move {
                     run_visitor_listener(sa, sp, pt, server_name, secret_key, bind_addr, use_enc, use_comp, name,
-                        tls_enable, tls_server_name, tls_ca_file).await;
+                        tls_enable, tls_server_name, tls_ca_file, visitor_type).await;
                 });
             }
 
@@ -457,6 +458,84 @@ impl Service {
                             }
                             Ok(FrpMessage::Error(err)) => {
                                 warn!("Server error: {}", err.error);
+                            }
+                            Ok(FrpMessage::NatHoleClient(nhc)) => {
+                                debug!("Received NatHoleClient for proxy '{}'", nhc.proxy_name);
+                                let visitor_addr = nhc.visitor_addr.unwrap_or_default();
+                                let proxy_name = nhc.proxy_name.clone();
+                                let sid = nhc.sid.unwrap_or_default();
+                                let local_addr = self.proxy_info_map
+                                    .get(&proxy_name)
+                                    .and_then(|p| Some(p.local_addr.clone()));
+
+                                if visitor_addr.is_empty() {
+                                    warn!("NatHoleClient without visitor_addr for '{}'", proxy_name);
+                                    let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                                        sid: Some(sid.clone()),
+                                    });
+                                    let _ = write_msg_v1(&mut *writer.lock().await, &report).await;
+                                    continue;
+                                }
+
+                                // Send NatHoleSid FIRST — so visitor can start punching concurrently
+                                let sid_msg = FrpMessage::NatHoleSid(msg::NatHoleSid {
+                                    sid: Some(sid.clone()),
+                                    provider_addr: None, // server fills from control connection peer addr
+                                });
+                                if let Err(e) = write_msg_v1(&mut *writer.lock().await, &sid_msg).await {
+                                    warn!("Failed to send NatHoleSid: {}", e);
+                                    continue;
+                                }
+
+                                // TCP simultaneous open (visitor is punching at the same time)
+                                match tcp_simultaneous_open(&visitor_addr).await {
+                                    Ok(p2p_stream) => {
+                                        // Connect to local service and bridge
+                                        if let Some(ref local) = local_addr {
+                                            match tokio::net::TcpStream::connect(local).await {
+                                                Ok(local_stream) => {
+                                                    let _enc_key = self.encryption_key;
+                                                    tokio::spawn(async move {
+                                                        let mut p2p = p2p_stream;
+                                                        let mut local = local_stream;
+                                                        match tokio::io::copy_bidirectional(&mut p2p, &mut local).await {
+                                                            Ok((to_local, to_p2p)) => {
+                                                                debug!("XTCP provider '{}' closed: {}B to local, {}B to P2P",
+                                                                    proxy_name, to_local, to_p2p);
+                                                            }
+                                                            Err(e) => {
+                                                                debug!("XTCP provider '{}' bridge error: {}", proxy_name, e);
+                                                            }
+                                                        }
+                                                    });
+                                                    // Don't send NatHoleReport — Go frp uses implicit success.
+                                                    // If bridge fails, the TCP close propagates naturally.
+                                                }
+                                                Err(e) => {
+                                                    warn!("XTCP provider '{}': connect local failed: {}", proxy_name, e);
+                                                    let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                                                        sid: Some(sid),
+                                                    });
+                                                    let _ = write_msg_v1(&mut *writer.lock().await, &report).await;
+                                                }
+                                            }
+                                        } else {
+                                            warn!("XTCP provider '{}': no local address", proxy_name);
+                                            let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                                                sid: Some(sid),
+                                            });
+                                            let _ = write_msg_v1(&mut *writer.lock().await, &report).await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("XTCP hole punch for '{}' failed: {}", proxy_name, e);
+                                        // Report failure — triggers STCP fallback on visitor side
+                                        let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                                            sid: Some(sid),
+                                        });
+                                        let _ = write_msg_v1(&mut *writer.lock().await, &report).await;
+                                    }
+                                }
                             }
                             Ok(FrpMessage::NewProxyResp(resp)) => {
                                 if let Some(err) = resp.error {
@@ -806,6 +885,57 @@ async fn run_http_check(addr: &str, url: &str, timeout: std::time::Duration) -> 
 /// Run an STCP/XTCP visitor listener.
 /// Binds a local port, accepts connections, and tunnels them
 /// through the frps server to the remote STCP proxy.
+/// Attempt TCP simultaneous open to `peer_addr`.
+///
+/// Binds a local port with SO_REUSEADDR (required for simultaneous open),
+/// then dials the peer. When both sides do this at roughly the same time,
+/// the kernel's TCP stack matches the SYN packets and establishes a P2P
+/// connection through most NAT types.
+///
+/// Returns the connected TcpStream on success, or an error on timeout (5s)
+/// or other failures.
+async fn tcp_simultaneous_open(peer_addr: &str) -> Result<tokio::net::TcpStream, String> {
+    use std::net::SocketAddr;
+    use tokio::net::TcpSocket;
+
+    let peer: SocketAddr = peer_addr
+        .parse()
+        .map_err(|e| format!("invalid peer address '{}': {}", peer_addr, e))?;
+
+    let local = TcpSocket::new_v4().map_err(|e| format!("TcpSocket::new_v4: {}", e))?;
+
+    // SO_REUSEADDR is required for TCP simultaneous open:
+    // both sides bind to the same port they use to connect.
+    local
+        .set_reuseaddr(true)
+        .map_err(|e| format!("set_reuseaddr: {}", e))?;
+    #[cfg(unix)]
+    local.set_reuseport(true).ok();
+
+    // Bind to any available port
+    local
+        .bind("0.0.0.0:0".parse().unwrap())
+        .map_err(|e| format!("bind: {}", e))?;
+
+    debug!("TCP simultaneous open: bound to local, dialing {}", peer);
+
+    // Dial with 5-second timeout
+    match tokio::time::timeout(Duration::from_secs(5), local.connect(peer)).await {
+        Ok(Ok(stream)) => {
+            debug!("TCP simultaneous open to {} succeeded", peer);
+            Ok(stream)
+        }
+        Ok(Err(e)) => {
+            debug!("TCP simultaneous open to {} failed: {}", peer, e);
+            Err(format!("connect failed: {}", e))
+        }
+        Err(_) => {
+            debug!("TCP simultaneous open to {} timed out after 5s", peer);
+            Err("hole punch timeout".into())
+        }
+    }
+}
+
 async fn run_visitor_listener(
     server_addr: String,
     server_port: u16,
@@ -819,6 +949,7 @@ async fn run_visitor_listener(
     tls_enable: bool,
     tls_server_name: String,
     tls_ca_file: Option<String>,
+    visitor_type: String,
 ) {
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
@@ -842,6 +973,7 @@ async fn run_visitor_listener(
                 let visitor_name = name.clone();
                 let tls_sn = tls_server_name.clone();
                 let tls_ca = tls_ca_file.clone();
+                let vt = visitor_type.clone();
 
                 tokio::spawn(async move {
                     // Connect to the server
@@ -854,31 +986,154 @@ async fn run_visitor_listener(
                         tls_ca_file: tls_ca,
                         ..Default::default()
                     };
-                    let mut server_conn = match dial_server(&opts).await {
-                        Ok(io) => io,
-                        Err(e) => {
-                            warn!("Visitor '{}': dial server failed: {}", visitor_name, e);
+
+                    if vt == "xtcp" {
+                        // --- XTCP NAT hole punch path ---
+                        let mut server_conn = match dial_server(&opts).await {
+                            Ok(io) => io,
+                            Err(e) => {
+                                warn!("Visitor '{}': dial server failed: {}", visitor_name, e);
+                                return;
+                            }
+                        };
+
+                        // Build NatHoleVisitor with MD5 sign_key
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        let sign_key = if sk.is_empty() {
+                            sk.clone()
+                        } else {
+                            frp_core::auth::generate_token(&sk, timestamp)
+                        };
+                        let nhv = FrpMessage::NatHoleVisitor(msg::NatHoleVisitor {
+                            proxy_name: sn.clone(),
+                            sign_key: Some(sign_key),
+                            timestamp: Some(timestamp),
+                            run_id: None,
+                            use_encryption: Some(use_encryption),
+                            use_compression: Some(use_compression),
+                        });
+                        if let Err(e) = server_conn.write_v1_frame(&nhv).await {
+                            warn!("Visitor '{}': send NatHoleVisitor failed: {}", visitor_name, e);
                             return;
                         }
-                    };
+                        debug!("Visitor '{}': sent NatHoleVisitor for '{}'", visitor_name, sn);
 
-                    // Send NewVisitorConn
-                    let nvc = crate::proxy::create_visitor_conn_msg(&sn, &sk, use_encryption, use_compression);
-                    if let Err(e) = server_conn.write_v1_frame(&nvc).await {
-                        warn!("Visitor '{}': send NewVisitorConn failed: {}", visitor_name, e);
-                        return;
-                    }
-                    debug!("Visitor '{}': sent NewVisitorConn for '{}'", visitor_name, sn);
+                        // Read NatHoleSid (contains provider address)
+                        match server_conn.read_v1_frame().await {
+                            Ok(FrpMessage::NatHoleSid(sid_msg)) => {
+                                let provider_addr = sid_msg.provider_addr.unwrap_or_default();
+                                debug!("Visitor '{}': got provider addr '{}'", visitor_name, provider_addr);
 
-                    // Bridge user connection ↔ server connection
-                    // The server will relay to the STCP provider.
-                    let mut user = user_conn;
-                    match tokio::io::copy_bidirectional(&mut user, &mut server_conn).await {
-                        Ok((to_server, to_user)) => {
-                            debug!("Visitor '{}' closed: {}B to server, {}B to user", visitor_name, to_server, to_user);
+                                // Read NatHoleReport (provider is ready)
+                                match server_conn.read_v1_frame().await {
+                                    Ok(FrpMessage::NatHoleReport(_)) => {
+                                        debug!("Visitor '{}': provider ready, attempting P2P", visitor_name);
+
+                                        if !provider_addr.is_empty() {
+                                            match tcp_simultaneous_open(&provider_addr).await {
+                                                Ok(p2p_stream) => {
+                                                    info!("Visitor '{}': XTCP P2P connected to {}", visitor_name, provider_addr);
+                                                    let mut user = user_conn;
+                                                    let mut p2p = p2p_stream;
+                                                    match tokio::io::copy_bidirectional(&mut user, &mut p2p).await {
+                                                        Ok((to_p2p, to_user)) => {
+                                                            debug!("Visitor '{}' XTCP closed: {}B to P2P, {}B to user",
+                                                                visitor_name, to_p2p, to_user);
+                                                        }
+                                                        Err(e) => {
+                                                            debug!("Visitor '{}' XTCP bridge error: {}", visitor_name, e);
+                                                        }
+                                                    }
+                                                    return; // P2P succeeded, done
+                                                }
+                                                Err(e) => {
+                                                    warn!("Visitor '{}': XTCP hole punch failed: {}", visitor_name, e);
+                                                    // Fall through to STCP fallback
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ok(FrpMessage::NatHoleResp(resp)) => {
+                                        if let Some(err) = resp.error {
+                                            warn!("Visitor '{}': server error: {}", visitor_name, err);
+                                        }
+                                        return;
+                                    }
+                                    other => {
+                                        warn!("Visitor '{}': unexpected NatHole response: {:?}", visitor_name,
+                                            other.as_ref().map(|m| m.v1_type_byte()));
+                                        return;
+                                    }
+                                }
+                            }
+                            Ok(FrpMessage::NatHoleResp(resp)) => {
+                                if let Some(err) = resp.error {
+                                    warn!("Visitor '{}': server error: {}", visitor_name, err);
+                                }
+                                return;
+                            }
+                            other => {
+                                warn!("Visitor '{}': unexpected response to NatHoleVisitor: {:?}", visitor_name,
+                                    other.as_ref().map(|m| m.v1_type_byte()));
+                                return;
+                            }
                         }
-                        Err(e) => {
-                            debug!("Visitor '{}' bridge error: {}", visitor_name, e);
+
+                        // --- STCP fallback (hole punch failed) ---
+                        // Open a NEW connection for STCP relay
+                        let mut server_conn = match dial_server(&opts).await {
+                            Ok(io) => io,
+                            Err(e) => {
+                                warn!("Visitor '{}': STCP fallback dial failed: {}", visitor_name, e);
+                                return;
+                            }
+                        };
+
+                        let nvc = crate::proxy::create_visitor_conn_msg(&sn, &sk, use_encryption, use_compression);
+                        if let Err(e) = server_conn.write_v1_frame(&nvc).await {
+                            warn!("Visitor '{}': STCP fallback send NewVisitorConn failed: {}", visitor_name, e);
+                            return;
+                        }
+                        info!("Visitor '{}': fell back to STCP relay for '{}'", visitor_name, sn);
+
+                        let mut user = user_conn;
+                        match tokio::io::copy_bidirectional(&mut user, &mut server_conn).await {
+                            Ok((to_server, to_user)) => {
+                                debug!("Visitor '{}' STCP relay closed: {}B to server, {}B to user",
+                                    visitor_name, to_server, to_user);
+                            }
+                            Err(e) => {
+                                debug!("Visitor '{}' STCP relay bridge error: {}", visitor_name, e);
+                            }
+                        }
+                    } else {
+                        // --- STCP relay path (existing) ---
+                        let mut server_conn = match dial_server(&opts).await {
+                            Ok(io) => io,
+                            Err(e) => {
+                                warn!("Visitor '{}': dial server failed: {}", visitor_name, e);
+                                return;
+                            }
+                        };
+
+                        let nvc = crate::proxy::create_visitor_conn_msg(&sn, &sk, use_encryption, use_compression);
+                        if let Err(e) = server_conn.write_v1_frame(&nvc).await {
+                            warn!("Visitor '{}': send NewVisitorConn failed: {}", visitor_name, e);
+                            return;
+                        }
+                        debug!("Visitor '{}': sent NewVisitorConn for '{}'", visitor_name, sn);
+
+                        let mut user = user_conn;
+                        match tokio::io::copy_bidirectional(&mut user, &mut server_conn).await {
+                            Ok((to_server, to_user)) => {
+                                debug!("Visitor '{}' closed: {}B to server, {}B to user", visitor_name, to_server, to_user);
+                            }
+                            Err(e) => {
+                                debug!("Visitor '{}' bridge error: {}", visitor_name, e);
+                            }
                         }
                     }
                 });
