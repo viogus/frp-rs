@@ -70,6 +70,30 @@ impl Service {
                             warn!("Failed to start http_proxy plugin for '{}': {}", p.name, e);
                         }
                     }
+                } else if plugin_cfg.plugin_type == "socks5" {
+                    match plugin::start_socks5_proxy(plugin_cfg).await {
+                        Ok(handle) => {
+                            let addr = handle.local_addr.to_string();
+                            info!("socks5 plugin for '{}' started on {}", p.name, addr);
+                            plugin_addrs.insert(p.name.clone(), addr);
+                            plugin_handles.push(handle);
+                        }
+                        Err(e) => {
+                            warn!("Failed to start socks5 plugin for '{}': {}", p.name, e);
+                        }
+                    }
+                } else if plugin_cfg.plugin_type == "static_file" {
+                    match plugin::start_static_file_proxy(plugin_cfg).await {
+                        Ok(handle) => {
+                            let addr = handle.local_addr.to_string();
+                            info!("static_file plugin for '{}' started on {}", p.name, addr);
+                            plugin_addrs.insert(p.name.clone(), addr);
+                            plugin_handles.push(handle);
+                        }
+                        Err(e) => {
+                            warn!("Failed to start static_file plugin for '{}': {}", p.name, e);
+                        }
+                    }
                 } else {
                     warn!("Unknown plugin type '{}' for proxy '{}'", plugin_cfg.plugin_type, p.name);
                 }
