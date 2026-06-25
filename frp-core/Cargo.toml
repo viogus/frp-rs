@@ -36,3 +36,5 @@ yamux.workspace = true
 tokio-util.workspace = true
 kcp.workspace = true
 quinn.workspace = true
+jsonwebtoken.workspace = true
+reqwest.workspace = true
