@@ -96,10 +96,13 @@ struct OpenRequest {
 /// - `incoming`: channel receiver for subsequent accepted streams (work connections)
 ///
 /// Spawns a background task to manage the yamux Connection.
-pub async fn server_mux(
-    stream: TcpStream,
+pub async fn server_mux<S>(
+    stream: S,
     mux_cfg: &TcpMuxConfig,
-) -> Result<(YamuxStream, IncomingStreams), crate::Error> {
+) -> Result<(YamuxStream, IncomingStreams), crate::Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let compat = stream.compat();
     let yamux_cfg = yamux_config(mux_cfg);
     let mut conn = Connection::new(compat, yamux_cfg, Mode::Server);

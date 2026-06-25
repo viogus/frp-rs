@@ -573,6 +573,18 @@ async fn assign_work_to_proxy(
                                 if s.write_all(&len).await.is_err() { Err(std::io::Error::other("write failed")) }
                                 else { s.write_all(&encrypted).await }
                             }
+                            IoStream::Yamux(ref mut s) => {
+                                if s.write_all(&len).await.is_err() { Err(std::io::Error::other("write failed")) }
+                                else { s.write_all(&encrypted).await }
+                            }
+                            IoStream::Kcp(ref mut s) => {
+                                if s.write_all(&len).await.is_err() { Err(std::io::Error::other("write failed")) }
+                                else { s.write_all(&encrypted).await }
+                            }
+                            IoStream::Quic(ref mut s) => {
+                                if s.write_all(&len).await.is_err() { Err(std::io::Error::other("write failed")) }
+                                else { s.write_all(&encrypted).await }
+                            }
                             _ => Ok(()),
                         };
                         if let Err(e) = write_result {
@@ -590,6 +602,9 @@ async fn assign_work_to_proxy(
                     IoStream::Tcp(ref mut s) => s.write_all(&pre_read).await,
                     IoStream::Tls(ref mut s) => s.write_all(&pre_read).await,
                     IoStream::WebSocket(ref mut s) => s.write_all(&pre_read).await,
+                    IoStream::Yamux(ref mut s) => s.write_all(&pre_read).await,
+                    IoStream::Kcp(ref mut s) => s.write_all(&pre_read).await,
+                    IoStream::Quic(ref mut s) => s.write_all(&pre_read).await,
                     _ => Ok(()),
                 };
                 if let Err(e) = write_result {

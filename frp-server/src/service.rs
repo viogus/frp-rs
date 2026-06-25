@@ -438,11 +438,14 @@ impl Service {
                         };
 
                         match ct {
-                            ConnectionType::Tls => {
-                                // Consume 0x17 head byte, then TLS handshake
-                                if let Err(e) = consume_tls_head_byte(&mut stream).await {
-                                    warn!("Failed to consume TLS head byte from {}: {}", addr, e);
-                                    return;
+                            ConnectionType::Tls(first_byte) => {
+                                // 0x17 = Go frp TLS prefix (must consume before handshake)
+                                // 0x16 = standard TLS ClientHello (byte is part of TLS record)
+                                if first_byte == frp_core::transport::FRP_TLS_HEAD_BYTE {
+                                    if let Err(e) = consume_tls_head_byte(&mut stream).await {
+                                        warn!("Failed to consume TLS head byte from {}: {}", addr, e);
+                                        return;
+                                    }
                                 }
                                 let acceptor = match acceptor {
                                     Some(a) => a,
@@ -459,29 +462,69 @@ impl Service {
                                     }
                                 };
                                 info!("TLS connection from {}", addr);
-                                let mut tls = tls_stream;
-                                match read_msg_v1(&mut tls).await {
-                                    Ok(FrpMessage::Login(login)) => {
-                                        control::handle_control(tls, login, state, Some(addr), None).await;
+
+                                // When tcp_mux is enabled, wrap TLS stream in yamux
+                                // before reading the first message (matches Go frp).
+                                if state.tcp_mux {
+                                    let mux_cfg = mux::TcpMuxConfig {
+                                        keepalive_interval: std::time::Duration::from_secs(
+                                            state.tcp_mux_keepalive.max(1) as u64
+                                        ),
+                                    };
+                                    match mux::server_mux(tls_stream, &mux_cfg).await {
+                                        Ok((control_stream, incoming)) => {
+                                            let mut io = IoStream::Yamux(control_stream);
+                                            info!("Yamux over TLS session established for {:?}", addr);
+                                            match read_msg_v1(&mut io).await {
+                                                Ok(FrpMessage::Login(login)) => {
+                                                    control::handle_control(io, login, state, Some(addr), Some(incoming)).await;
+                                                }
+                                                Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                    handle_work_conn_inner(io, nwc, state).await;
+                                                }
+                                                Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                    handle_visitor_conn_inner(io, nvc, state).await;
+                                                }
+                                                Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                    handle_nat_hole_visitor(io, nhv, state, None).await;
+                                                }
+                                                Ok(other) => {
+                                                    warn!("Unexpected TLS+yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
+                                                }
+                                                Err(e) => {
+                                                    warn!("TLS+yamux read error from {}: {}", addr, e);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to start yamux over TLS for {:?}: {}", addr, e);
+                                        }
                                     }
-                                    Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                        let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
-                                        handle_work_conn_inner(io, nwc, state).await;
-                                    }
-                                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                        let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
-                                        handle_visitor_conn_inner(io, nvc, state).await;
-                                    }
-                                    Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                        let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
-                                        let visitor_addr = Some(addr.to_string());
-                                        handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
-                                    }
-                                    Ok(other) => {
-                                        warn!("Unexpected TLS first message from {}: {:?}", addr, other.v1_type_byte());
-                                    }
-                                    Err(e) => {
-                                        warn!("TLS read error from {}: {}", addr, e);
+                                } else {
+                                    let mut tls = tls_stream;
+                                    match read_msg_v1(&mut tls).await {
+                                        Ok(FrpMessage::Login(login)) => {
+                                            control::handle_control(tls, login, state, Some(addr), None).await;
+                                        }
+                                        Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                            let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
+                                            handle_work_conn_inner(io, nwc, state).await;
+                                        }
+                                        Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                            let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
+                                            handle_visitor_conn_inner(io, nvc, state).await;
+                                        }
+                                        Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                            let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
+                                            let visitor_addr = Some(addr.to_string());
+                                            handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
+                                        }
+                                        Ok(other) => {
+                                            warn!("Unexpected TLS first message from {}: {:?}", addr, other.v1_type_byte());
+                                        }
+                                        Err(e) => {
+                                            warn!("TLS read error from {}: {}", addr, e);
+                                        }
                                     }
                                 }
                             }

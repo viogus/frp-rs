@@ -221,6 +221,10 @@ async fn test_e2e_tcp_proxy_over_tls() {
         tls_key_file: cert_dir.join("server.key").to_string_lossy().into(),
         allow_port_start: proxy_port.saturating_sub(50),
         allow_port_end: proxy_port.saturating_add(50).min(u16::MAX),
+        transport: frp_core::config::ServerTransportConfig {
+            tcp_mux: false,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let server_svc = ServerService::new(server_cfg).await;

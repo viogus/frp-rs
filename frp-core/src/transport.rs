@@ -19,12 +19,16 @@ use crate::mux::YamuxStream;
 /// Go frp v0.69.1 FRPTLSHeadByte — sent before TLS handshake to allow
 /// mixed TLS/plaintext on the same port.
 pub const FRP_TLS_HEAD_BYTE: u8 = 0x17;
+/// Standard TLS ClientHello record content type (0x16).
+/// Go frp v0.69.1 clients may send this directly without the 0x17 prefix.
+pub const FRP_TLS_DIRECT_BYTE: u8 = 0x16;
 
 /// Result of peeking the first byte on the main accept port.
 #[derive(Debug, PartialEq)]
 pub enum ConnectionType {
-    /// 0x17 byte → route to TLS
-    Tls,
+    /// First byte: 0x17 (Go frp prefix) or 0x16 (standard TLS ClientHello).
+    /// The caller must check the byte to decide whether to skip it before TLS handshake.
+    Tls(u8),
     /// 'G' (GET) → HTTP WebSocket upgrade
     WebSocket,
     /// V1 type byte → plain frp protocol (the byte is the V1 message type)
@@ -589,7 +593,7 @@ pub async fn peek_connection_type(stream: &TcpStream) -> Result<ConnectionType, 
     }
 
     match buf[0] {
-        FRP_TLS_HEAD_BYTE => Ok(ConnectionType::Tls),
+        FRP_TLS_HEAD_BYTE | FRP_TLS_DIRECT_BYTE => Ok(ConnectionType::Tls(buf[0])),
         b'G' => Ok(ConnectionType::WebSocket),
         b => Ok(ConnectionType::V1(b)),
     }
