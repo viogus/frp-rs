@@ -3,6 +3,10 @@ name = "frpc"
 version = "0.1.4"
 edition = "2021"
 
+[features]
+# Enable debug/trace logging for development. Default: info only.
+debug-logs = []
+
 [dependencies]
 frp-core = { path = "../frp-core" }
 frp-client = { path = "../frp-client" }

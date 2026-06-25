@@ -16,7 +16,12 @@ async fn main() {
 fn init_logging(cli: &CliArgs, cfg: Option<&ClientConfig>) {
     // Merge log settings: CLI > config [log] > defaults
     let level = cli.log_level.as_deref().unwrap_or_else(|| {
-        cfg.map(|c| c.log.level.as_str()).unwrap_or("info,yamux=trace,frp_core=debug,frp_client=debug,frp_server=debug")
+        cfg.map(|c| c.log.level.as_str()).unwrap_or(
+            #[cfg(feature = "debug-logs")]
+            "debug,yamux=trace",
+            #[cfg(not(feature = "debug-logs"))]
+            "info",
+        )
     });
     let file = cli.log_file.as_deref().or_else(|| {
         cfg.and_then(|c| if c.log.file.is_empty() { None } else { Some(c.log.file.as_str()) })
