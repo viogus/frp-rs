@@ -405,6 +405,19 @@ impl Service {
             tracing::info!("Dashboard web UI starting on {}", dash_addr2);
         }
 
+        // Background cleanup for stale NAT hole punch sessions.
+        // Sessions should normally be completed by the provider's NatHoleReport,
+        // but if the provider crashes or the network drops, this ensures sessions
+        // older than 2 minutes don't leak memory.
+        let nat_hole = self.state.nat_hole.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                nat_hole.expire_sessions(Duration::from_secs(120)).await;
+            }
+        });
+
         // Main accept loop — mixed-mode: TLS, WebSocket, and V1 on same port.
         // Uses MSG_PEEK to detect connection type without consuming bytes,
         // matching Go frp v0.69.1 behavior.
@@ -742,8 +755,10 @@ async fn handle_nat_hole_visitor(
     // Generate session ID
     let sid = uuid::Uuid::new_v4().to_string();
 
-    // Split the stream: writer goes into session, reader is kept for
-    // potential STCP fallback read.
+    // Split the stream: writer goes into the NAT session for forwarding
+    // NatHoleSid/NatHoleReport. The reader is held as a connection-lifecycle
+    // handle — it is never read (the visitor opens a fresh connection for
+    // STCP fallback). Dropping it signals connection close.
     let (reader, writer) = stream.into_split();
 
     // Create NAT session and get report receiver

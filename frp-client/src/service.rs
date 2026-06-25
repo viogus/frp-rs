@@ -466,7 +466,7 @@ impl Service {
                                 let sid = nhc.sid.unwrap_or_default();
                                 let local_addr = self.proxy_info_map
                                     .get(&proxy_name)
-                                    .and_then(|p| Some(p.local_addr.clone()));
+                                    .map(|p| p.local_addr.clone());
 
                                 if visitor_addr.is_empty() {
                                     warn!("NatHoleClient without visitor_addr for '{}'", proxy_name);
@@ -494,7 +494,6 @@ impl Service {
                                         if let Some(ref local) = local_addr {
                                             match tokio::net::TcpStream::connect(local).await {
                                                 Ok(local_stream) => {
-                                                    let _enc_key = self.encryption_key;
                                                     tokio::spawn(async move {
                                                         let mut p2p = p2p_stream;
                                                         let mut local = local_stream;
