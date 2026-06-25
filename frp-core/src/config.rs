@@ -170,6 +170,10 @@ pub struct AuthServerConfig {
     pub oidc_audience: String,
     #[serde(default)]
     pub oidc_token_endpoint: String,
+    #[serde(default, alias = "oidcSkipExpiry")]
+    pub oidc_skip_expiry: bool,
+    #[serde(default, alias = "oidcSkipIssuer")]
+    pub oidc_skip_issuer: bool,
 }
 
 impl Default for AuthServerConfig {
@@ -180,6 +184,8 @@ impl Default for AuthServerConfig {
             oidc_issuer: String::new(),
             oidc_audience: String::new(),
             oidc_token_endpoint: String::new(),
+            oidc_skip_expiry: false,
+            oidc_skip_issuer: false,
         }
     }
 }
@@ -294,6 +300,47 @@ impl Default for PluginConfig {
 // Client Configuration
 // ---------------------------------------------------------------
 
+/// Client-side authentication configuration ([auth] section in frpc.toml).
+/// Mirrors Go frp v0.69.1 AuthClientConfig.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthClientConfig {
+    #[serde(default)]
+    pub method: String,
+    #[serde(default)]
+    pub token: String,
+    #[serde(default, alias = "oidcClientId")]
+    pub oidc_client_id: String,
+    #[serde(default, alias = "oidcClientSecret")]
+    pub oidc_client_secret: String,
+    #[serde(default, alias = "oidcAudience")]
+    pub oidc_audience: String,
+    #[serde(default, alias = "oidcTokenEndpoint")]
+    pub oidc_token_endpoint: String,
+    #[serde(default, alias = "oidcScope")]
+    pub oidc_scope: String,
+    #[serde(default, alias = "oidcIssuer")]
+    pub oidc_issuer: String,
+    /// Extra params for token endpoint (TODO: wire into OidcClient).
+    #[serde(default, alias = "additionalEndpointParams")]
+    pub additional_endpoint_params: String,
+}
+
+impl Default for AuthClientConfig {
+    fn default() -> Self {
+        Self {
+            method: "token".into(),
+            token: String::new(),
+            oidc_client_id: String::new(),
+            oidc_client_secret: String::new(),
+            oidc_audience: String::new(),
+            oidc_token_endpoint: String::new(),
+            oidc_scope: String::new(),
+            oidc_issuer: String::new(),
+            additional_endpoint_params: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     pub server_addr: String,
@@ -303,6 +350,8 @@ pub struct ClientConfig {
     pub transport_protocol: String,
     #[serde(default)]
     pub token: String,
+    #[serde(default)]
+    pub auth: Option<AuthClientConfig>,
     #[serde(default)]
     pub user: String,
     #[serde(default)]
@@ -340,6 +389,7 @@ impl Default for ClientConfig {
             server_port: default_server_port(),
             transport_protocol: default_transport_protocol(),
             token: String::new(),
+            auth: None,
             user: String::new(),
             client_id: String::new(),
             tls_enable: false,
