@@ -45,6 +45,7 @@ yamux = "0.14"
 tokio-util = { version = "0.7", features = ["compat"] }
 kcp = "0.6"
 quinn = "0.11"
+hickory-resolver = "0.24"
 
 # Release profile: slim, LTO, single codegen unit, stripped symbols, abort on panic.
 # After cargo build --release, compress further with:

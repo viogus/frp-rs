@@ -228,6 +228,7 @@ impl Service {
                 if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
                 if self.cfg.tls_cert_file.is_empty() { None } else { Some(self.cfg.tls_cert_file.clone()) },
                 if self.cfg.tls_key_file.is_empty() { None } else { Some(self.cfg.tls_key_file.clone()) },
+                if self.cfg.dns_server.is_empty() { None } else { Some(self.cfg.dns_server.clone()) },
                 self.cfg.tcp_mux,
                 self.oidc_client.clone(),
             );

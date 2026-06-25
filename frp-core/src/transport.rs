@@ -405,6 +405,7 @@ pub struct DialOptions {
     pub tls_ca_file: Option<String>,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
+    pub dns_server: Option<String>,
     pub dial_timeout_secs: u64,
 }
 
@@ -419,9 +420,50 @@ impl Default for DialOptions {
             tls_ca_file: None,
             tls_cert_file: None,
             tls_key_file: None,
+            dns_server: None,
             dial_timeout_secs: 10,
         }
     }
+}
+
+/// Resolve a hostname to an IP address using a specific DNS server.
+async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<String, crate::Error> {
+    use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
+    use hickory_resolver::TokioAsyncResolver;
+    use std::net::SocketAddr;
+    use std::str::FromStr;
+
+    // Parse DNS server address (default port 53)
+    let dns_addr = if dns_server.contains(':') {
+        SocketAddr::from_str(dns_server)
+            .map_err(|e| crate::Error::Transport(format!("invalid dns_server '{dns_server}': {e}")))?
+    } else {
+        SocketAddr::from_str(&format!("{dns_server}:53"))
+            .map_err(|e| crate::Error::Transport(format!("invalid dns_server '{dns_server}': {e}")))?
+    };
+
+    let ns_config = NameServerConfig {
+        socket_addr: dns_addr,
+        protocol: Protocol::Udp,
+        tls_dns_name: None,
+        trust_negative_responses: true,
+        bind_addr: None,
+    };
+    let config = ResolverConfig::from_parts(None, vec![], vec![ns_config]);
+    let resolver = TokioAsyncResolver::tokio(config, ResolverOpts::default());
+
+    // If host is already an IP, return it as-is
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(host.to_string());
+    }
+
+    let response = resolver.lookup_ip(host).await
+        .map_err(|e| crate::Error::Transport(format!("DNS resolve {host} via {dns_server}: {e}")))?;
+
+    response.iter()
+        .next()
+        .map(|ip| ip.to_string())
+        .ok_or_else(|| crate::Error::Transport(format!("DNS resolve {host}: no records found")))
 }
 
 /// Connect to the server with the given options.
@@ -429,7 +471,18 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
     use tokio::io::AsyncWriteExt;
     use tokio::time::{timeout, Duration};
 
-    let addr = format!("{}:{}", opts.server_addr, opts.server_port);
+    // Resolve server_addr via custom DNS server if configured.
+    // Otherwise let TcpStream::connect use system DNS.
+    let target_ip = if let Some(ref dns) = opts.dns_server {
+        if !dns.is_empty() {
+            resolve_host_with_dns(&opts.server_addr, dns).await?
+        } else {
+            opts.server_addr.clone()
+        }
+    } else {
+        opts.server_addr.clone()
+    };
+    let addr = format!("{target_ip}:{}", opts.server_port);
     let mut stream = timeout(
         Duration::from_secs(opts.dial_timeout_secs),
         TcpStream::connect(&addr),
