@@ -183,7 +183,8 @@ impl Service {
         info!("frps starting on {}", bind_addr);
 
         let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = if self.cfg.tls_enable {
-            match build_tls_acceptor(&self.cfg.tls_cert_file, &self.cfg.tls_key_file) {
+            let ca_file = if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.as_str()) };
+            match build_tls_acceptor(&self.cfg.tls_cert_file, &self.cfg.tls_key_file, ca_file) {
                 Ok(acc) => {
                     info!("TLS enabled with cert: {}", self.cfg.tls_cert_file);
                     Some(acc)

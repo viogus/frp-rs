@@ -242,7 +242,7 @@ pub async fn run_vhost_https_listener(
     state: std::sync::Arc<crate::service::AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use frp_core::transport::build_tls_acceptor;
-    let acceptor = build_tls_acceptor(&tls_cert_file, &tls_key_file)?;
+    let acceptor = build_tls_acceptor(&tls_cert_file, &tls_key_file, None)?;
     let listener = TcpListener::bind(&addr).await?;
     info!("HTTPS VHost listener started on {}", addr);
 

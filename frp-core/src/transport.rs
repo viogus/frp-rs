@@ -403,6 +403,8 @@ pub struct DialOptions {
     pub tls_enable: bool,
     pub tls_server_name: String,
     pub tls_ca_file: Option<String>,
+    pub tls_cert_file: Option<String>,
+    pub tls_key_file: Option<String>,
     pub dial_timeout_secs: u64,
 }
 
@@ -415,6 +417,8 @@ impl Default for DialOptions {
             tls_enable: false,
             tls_server_name: String::new(),
             tls_ca_file: None,
+            tls_cert_file: None,
+            tls_key_file: None,
             dial_timeout_secs: 10,
         }
     }
@@ -440,7 +444,11 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 // Write FRPTLSHeadByte (0x17) before TLS handshake, matching Go frp v0.69.1
                 stream.write_all(&[FRP_TLS_HEAD_BYTE]).await
                     .map_err(|e| crate::Error::Transport(format!("write TLS head byte: {e}")))?;
-                let connector = build_tls_connector(opts.tls_ca_file.as_deref())?;
+                let connector = build_tls_connector(
+                    opts.tls_ca_file.as_deref(),
+                    opts.tls_cert_file.as_deref(),
+                    opts.tls_key_file.as_deref(),
+                )?;
                 let server_name = if !opts.tls_server_name.is_empty() {
                     opts.tls_server_name.clone()
                 } else {
@@ -601,9 +609,11 @@ pub struct TlsConfig {
 }
 
 /// Create a TLS acceptor from PEM-encoded cert and key files.
+/// If ca_file is provided, client certificates will be verified against it (mTLS).
 pub fn build_tls_acceptor(
     cert_file: &str,
     key_file: &str,
+    ca_file: Option<&str>,
 ) -> Result<TlsAcceptor, crate::Error> {
     use std::fs::File;
     use std::io::BufReader;
@@ -622,36 +632,100 @@ pub fn build_tls_acceptor(
         .map_err(|e| crate::Error::Other(format!("read private key: {e}")))?
         .ok_or_else(|| crate::Error::Other("no private key found".into()))?;
 
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| crate::Error::Other(format!("build TLS config: {e}")))?;
+    // Build server config with optional client certificate verification (mTLS)
+    let config = if let Some(ca_path) = ca_file {
+        if !ca_path.is_empty() {
+            let mut roots = rustls::RootCertStore::empty();
+            let ca_file = File::open(ca_path)
+                .map_err(|e| crate::Error::Other(format!("open CA file: {e}")))?;
+            let mut ca_reader = BufReader::new(ca_file);
+            let ca_certs = rustls_pemfile::certs(&mut ca_reader)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| crate::Error::Other(format!("read CA certs: {e}")))?;
+            roots.add_parsable_certificates(ca_certs);
+
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|e| crate::Error::Other(format!("build client cert verifier: {e}")))?;
+
+            rustls::ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)
+                .map_err(|e| crate::Error::Other(format!("build mTLS config: {e}")))?
+        } else {
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .map_err(|e| crate::Error::Other(format!("build TLS config: {e}")))?
+        }
+    } else {
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| crate::Error::Other(format!("build TLS config: {e}")))?
+    };
 
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
 /// Create a TLS connector for client-side TLS.
 /// If ca_file is provided, use it as a custom root CA; otherwise use webpki roots.
+/// If cert_file/key_file are provided, present client certificate to server (mTLS).
 pub fn build_tls_connector(
     ca_file: Option<&str>,
+    cert_file: Option<&str>,
+    key_file: Option<&str>,
 ) -> Result<TlsConnector, crate::Error> {
     let mut root_store = rustls::RootCertStore::empty();
 
     if let Some(ca_path) = ca_file {
-        let file = std::fs::File::open(ca_path)
-            .map_err(|e| crate::Error::Other(format!("open CA file: {e}")))?;
-        let mut reader = std::io::BufReader::new(file);
-        let certs = rustls_pemfile::certs(&mut reader)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| crate::Error::Other(format!("read CA certs: {e}")))?;
-        root_store.add_parsable_certificates(certs);
+        if !ca_path.is_empty() {
+            let file = std::fs::File::open(ca_path)
+                .map_err(|e| crate::Error::Other(format!("open CA file: {e}")))?;
+            let mut reader = std::io::BufReader::new(file);
+            let certs = rustls_pemfile::certs(&mut reader)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| crate::Error::Other(format!("read CA certs: {e}")))?;
+            root_store.add_parsable_certificates(certs);
+        } else {
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
     } else {
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
 
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+    let config = if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
+        if !cert_path.is_empty() && !key_path.is_empty() {
+            // Load client certificate chain
+            let cert_file = std::fs::File::open(cert_path)
+                .map_err(|e| crate::Error::Other(format!("open client cert file: {e}")))?;
+            let mut cert_reader = std::io::BufReader::new(cert_file);
+            let client_certs = rustls_pemfile::certs(&mut cert_reader)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| crate::Error::Other(format!("read client certs: {e}")))?;
+
+            // Load client private key
+            let key_file = std::fs::File::open(key_path)
+                .map_err(|e| crate::Error::Other(format!("open client key file: {e}")))?;
+            let mut key_reader = std::io::BufReader::new(key_file);
+            let client_key = rustls_pemfile::private_key(&mut key_reader)
+                .map_err(|e| crate::Error::Other(format!("read client key: {e}")))?
+                .ok_or_else(|| crate::Error::Other("no client private key found".into()))?;
+
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_client_auth_cert(client_certs, client_key)
+                .map_err(|e| crate::Error::Other(format!("build mTLS client config: {e}")))?
+        } else {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        }
+    } else {
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
 
     Ok(TlsConnector::from(Arc::new(config)))
 }
@@ -662,7 +736,7 @@ mod tests {
 
     #[test]
     fn test_build_tls_connector_with_default_roots() {
-        let result = build_tls_connector(None);
+        let result = build_tls_connector(None, None, None);
         assert!(result.is_ok(), "TLS connector with default roots should build");
     }
 
@@ -671,6 +745,7 @@ mod tests {
         let result = build_tls_acceptor(
             "/nonexistent/cert.pem",
             "/nonexistent/key.pem",
+            None,
         );
         assert!(result.is_err(), "TLS acceptor with missing files should fail");
     }

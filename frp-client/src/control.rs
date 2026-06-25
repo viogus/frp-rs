@@ -25,6 +25,8 @@ pub struct ControlConnection {
     tls_enable: bool,
     tls_server_name: String,
     tls_ca_file: Option<String>,
+    tls_cert_file: Option<String>,
+    tls_key_file: Option<String>,
     tcp_mux: bool,
     oidc_client: Option<Arc<OidcClient>>,
 }
@@ -41,6 +43,8 @@ impl ControlConnection {
         tls_enable: bool,
         tls_server_name: String,
         tls_ca_file: Option<String>,
+        tls_cert_file: Option<String>,
+        tls_key_file: Option<String>,
         tcp_mux: bool,
         oidc_client: Option<Arc<OidcClient>>,
     ) -> Self {
@@ -56,6 +60,8 @@ impl ControlConnection {
             tls_enable,
             tls_server_name,
             tls_ca_file,
+            tls_cert_file,
+            tls_key_file,
             tcp_mux,
             oidc_client,
         }
@@ -80,6 +86,8 @@ impl ControlConnection {
             tls_enable: self.tls_enable,
             tls_server_name: self.tls_server_name.clone(),
             tls_ca_file: self.tls_ca_file.clone(),
+            tls_cert_file: self.tls_cert_file.clone(),
+            tls_key_file: self.tls_key_file.clone(),
             ..Default::default()
         };
 
