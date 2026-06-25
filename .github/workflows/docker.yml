@@ -42,16 +42,17 @@ jobs:
           # Lowercase the owner for Docker image names (GitHub may have uppercase)
           OWNER_LOWER="$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')"
           IMAGE="${REGISTRY}/${OWNER_LOWER}/${{ matrix.component }}-rs"
+          SHA="$(git rev-parse --short=7 HEAD)"
 
           if [ "${{ github.event_name }}" = "release" ]; then
-            # Release: tag with version (e.g. v0.1.4) and update latest
+            # Release: tag with version (e.g. v0.1.4), SHA, and update latest
             VER="${{ github.event.release.tag_name }}"
             echo "version=${VER}" >> $GITHUB_OUTPUT
-            echo "tags=${IMAGE}:${VER},${IMAGE}:latest" >> $GITHUB_OUTPUT
+            echo "tags=${IMAGE}:${VER},${IMAGE}:${VER}-${SHA},${IMAGE}:latest" >> $GITHUB_OUTPUT
           else
-            # Push / manual: tag as test
+            # Push / manual: tag as test-SHA
             echo "version=test" >> $GITHUB_OUTPUT
-            echo "tags=${IMAGE}:test" >> $GITHUB_OUTPUT
+            echo "tags=${IMAGE}:test,${IMAGE}:${SHA}" >> $GITHUB_OUTPUT
           fi
 
       - name: Set up QEMU
