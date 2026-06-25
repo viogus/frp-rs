@@ -14,6 +14,7 @@ use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::mux::YamuxSession;
 use frp_core::transport::{TransportProtocol, DialOptions, dial_server, IoStream};
 
+use crate::plugin::{self, PluginHandle};
 use crate::proxy;
 use crate::control::ControlConnection;
 
@@ -36,10 +37,12 @@ pub struct Service {
     encryption_key: [u8; 16],
     /// Map proxy_name -> runtime info for looking up where to connect
     proxy_info_map: HashMap<String, ProxyRuntimeInfo>,
+    /// Plugin handles kept alive for the lifetime of the service.
+    _plugin_handles: Vec<PluginHandle>,
 }
 
 impl Service {
-    pub fn new(cfg: ClientConfig) -> Self {
+    pub async fn new(cfg: ClientConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let auth_cfg = AuthConfig {
             method: AuthMethod::Token,
             token: cfg.token.clone(),
@@ -50,6 +53,29 @@ impl Service {
 
         let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
 
+        // Start plugins for proxies that have them configured.
+        let mut plugin_handles = Vec::new();
+        let mut plugin_addrs: HashMap<String, String> = HashMap::new();
+        for p in &cfg.proxies {
+            if let Some(ref plugin_cfg) = p.plugin {
+                if plugin_cfg.plugin_type == "http_proxy" {
+                    match plugin::start_http_proxy(plugin_cfg).await {
+                        Ok(handle) => {
+                            let addr = handle.local_addr.to_string();
+                            info!("http_proxy plugin for '{}' started on {}", p.name, addr);
+                            plugin_addrs.insert(p.name.clone(), addr);
+                            plugin_handles.push(handle);
+                        }
+                        Err(e) => {
+                            warn!("Failed to start http_proxy plugin for '{}': {}", p.name, e);
+                        }
+                    }
+                } else {
+                    warn!("Unknown plugin type '{}' for proxy '{}'", plugin_cfg.plugin_type, p.name);
+                }
+            }
+        }
+
         let mut proxy_info_map: HashMap<String, ProxyRuntimeInfo> = HashMap::new();
         for p in &cfg.proxies {
             if proxy_info_map.contains_key(&p.name) {
@@ -57,8 +83,13 @@ impl Service {
                 continue;
             }
             let bw_limit = frp_core::config::parse_bandwidth_limit(&p.bandwidth_limit).unwrap_or(0);
+            // Use plugin address if available, otherwise use configured local_ip:local_port
+            let local_addr = plugin_addrs
+                .get(&p.name)
+                .cloned()
+                .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
             proxy_info_map.insert(p.name.clone(), ProxyRuntimeInfo {
-                local_addr: format!("{}:{}", p.local_ip, p.local_port),
+                local_addr,
                 use_encryption: p.use_encryption,
                 use_compression: p.use_compression,
                 bandwidth_limit: bw_limit,
@@ -66,7 +97,13 @@ impl Service {
             });
         }
 
-        Self { cfg, auth_cfg: Arc::new(auth_cfg), encryption_key: enc_key, proxy_info_map }
+        Ok(Self {
+            cfg,
+            auth_cfg: Arc::new(auth_cfg),
+            encryption_key: enc_key,
+            proxy_info_map,
+            _plugin_handles: plugin_handles,
+        })
     }
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -103,7 +140,10 @@ impl Service {
                 warn!("Health check type '{}' not yet supported for '{}'", hc_type, p.name);
                 continue;
             }
-            let la = format!("{}:{}", p.local_ip, p.local_port);
+            let la = self.proxy_info_map
+                .get(&p.name)
+                .map(|info| info.local_addr.clone())
+                .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
             let pn = p.name.clone();
             let interval = std::time::Duration::from_secs(
                 p.health_check_interval_seconds.max(10)
@@ -159,7 +199,10 @@ impl Service {
 
             // Register proxies using IoStream directly (supports TCP and TLS)
             for p in &proxies {
-                let local_addr = format!("{}:{}", p.local_ip, p.local_port);
+                let local_addr = self.proxy_info_map
+                    .get(&p.name)
+                    .map(|info| info.local_addr.clone())
+                    .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
                 match ctl.register_proxy(p, &local_addr, &mut control_stream).await {
                     Ok(resp) => {
                         info!("Proxy '{}' registered on remote port {:?}", p.name, resp.remote_addr);

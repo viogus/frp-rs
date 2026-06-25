@@ -70,7 +70,13 @@ async fn run(cli: CliArgs) {
             match load_client_config(&path_str) {
                 Ok(cfg) => {
                     handles.push(tokio::spawn(async move {
-                        let service = Service::new(cfg);
+                        let service = match Service::new(cfg).await {
+                            Ok(svc) => svc,
+                            Err(e) => {
+                                tracing::error!("frpc service init error for config file [{}]: {}", path_str, e);
+                                return;
+                            }
+                        };
                         if let Err(e) = service.run().await {
                             tracing::error!("frpc service error for config file [{}]: {}", path_str, e);
                         }
@@ -106,7 +112,13 @@ async fn run(cli: CliArgs) {
     init_logging(&cli, Some(&cfg));
 
     tracing::info!("frpc (Rust) v{} connecting...", frp_core::VERSION);
-    let service = Service::new(cfg);
+    let service = match Service::new(cfg).await {
+        Ok(svc) => svc,
+        Err(e) => {
+            tracing::error!("frpc init error: {}", e);
+            process::exit(1);
+        }
+    };
     if let Err(e) = service.run().await {
         tracing::error!("frpc error: {}", e);
         process::exit(1);
