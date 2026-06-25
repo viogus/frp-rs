@@ -395,7 +395,7 @@ impl OidcClient {
         })
     }
 
-    async fn fetch_token(&self) -> Result<String, String> {
+    async fn fetch_token(&self) -> Result<(String, u64), String> {
         let params = [
             ("grant_type", "client_credentials"),
             ("client_id", self.client_id.as_str()),
@@ -425,10 +425,18 @@ impl OidcClient {
             .ok_or_else(|| "OIDC client: access_token not found in response".to_string())?
             .to_string();
 
-        Ok(token)
+        // Parse expires_in from response (default 3600s = 1 hour).
+        // Subtract 60s refresh buffer to avoid edge-of-expiry failures.
+        let expires_in: u64 = body["expires_in"]
+            .as_u64()
+            .unwrap_or(3600)
+            .saturating_sub(60);
+
+        Ok((token, expires_in))
     }
 
     /// Get a valid access token — uses cached if not expired, fetches new otherwise.
+    /// Automatically refreshes when token is within 60s of expiry.
     async fn get_token(&self) -> Result<String, String> {
         let mut cache = self.cached.lock().await;
         if let Some(ref cached) = *cache {
@@ -436,10 +444,10 @@ impl OidcClient {
                 return Ok(cached.access_token.clone());
             }
         }
-        let token = self.fetch_token().await?;
+        let (token, expires_in) = self.fetch_token().await?;
         *cache = Some(CachedOidcToken {
             access_token: token.clone(),
-            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(3000), // 50 min default
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(expires_in),
         });
         Ok(token)
     }
