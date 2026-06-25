@@ -484,7 +484,63 @@ async fn handle_socks5_conn(
     Ok(())
 }
 
-/// Parse target address from SOCKS5 request (ATYP + addr + port).
+/// Pure parser: decode a SOCKS5 address (ATYP + addr + port) from bytes.
+/// Returns (host_string, port, bytes_consumed).
+#[allow(dead_code)]
+fn parse_socks5_addr(buf: &[u8]) -> Result<(String, u16, usize), String> {
+    if buf.is_empty() {
+        return Err("empty buffer".into());
+    }
+    let atyp = buf[0];
+    match atyp {
+        ATYP_IPV4 => {
+            if buf.len() < 7 {
+                return Err("buffer too short for IPv4".into());
+            }
+            let host = format!("{}.{}.{}.{}", buf[1], buf[2], buf[3], buf[4]);
+            let port = u16::from_be_bytes([buf[5], buf[6]]);
+            Ok((host, port, 7))
+        }
+        ATYP_DOMAIN => {
+            if buf.len() < 2 {
+                return Err("buffer too short for domain length".into());
+            }
+            let dlen = buf[1] as usize;
+            if dlen > 255 {
+                return Err("domain name too long".into());
+            }
+            if buf.len() < 2 + dlen + 2 {
+                return Err("buffer too short for domain+port".into());
+            }
+            let domain = std::str::from_utf8(&buf[2..2 + dlen])
+                .map_err(|e| format!("domain utf8: {e}"))?
+                .to_string();
+            let port = u16::from_be_bytes([buf[2 + dlen], buf[2 + dlen + 1]]);
+            Ok((domain, port, 2 + dlen + 2))
+        }
+        ATYP_IPV6 => {
+            if buf.len() < 19 {
+                return Err("buffer too short for IPv6".into());
+            }
+            let host = format!(
+                "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
+                u16::from_be_bytes([buf[1], buf[2]]),
+                u16::from_be_bytes([buf[3], buf[4]]),
+                u16::from_be_bytes([buf[5], buf[6]]),
+                u16::from_be_bytes([buf[7], buf[8]]),
+                u16::from_be_bytes([buf[9], buf[10]]),
+                u16::from_be_bytes([buf[11], buf[12]]),
+                u16::from_be_bytes([buf[13], buf[14]]),
+                u16::from_be_bytes([buf[15], buf[16]]),
+            );
+            let port = u16::from_be_bytes([buf[17], buf[18]]);
+            Ok((host, port, 19))
+        }
+        _ => Err(format!("unsupported atyp: {atyp}")),
+    }
+}
+
+/// Parse target address from SOCKS5 request (ATYP + addr + port) over TCP.
 async fn parse_socks5_target(
     client: &mut TcpStream,
     atyp: u8,
@@ -868,6 +924,94 @@ mod tests {
         assert_eq!(reply.len(), 22); // 4 + 16 + 2
         assert_eq!(&reply[4..20], &addr);
         assert_eq!(u16::from_be_bytes([reply[20], reply[21]]), 443);
+    }
+
+    #[test]
+    fn test_socks5_parse_ipv4_addr() {
+        // ATYP_IPV4 + 4 bytes + 2 bytes port
+        let buf: [u8; 7] = [ATYP_IPV4, 192, 168, 1, 100, 0x1f, 0x90]; // 192.168.1.100:8080
+        let (host, port, consumed) = parse_socks5_addr(&buf).unwrap();
+        assert_eq!(host, "192.168.1.100");
+        assert_eq!(port, 8080);
+        assert_eq!(consumed, 7);
+    }
+
+    #[test]
+    fn test_socks5_parse_domain_addr() {
+        // ATYP_DOMAIN + len(11) + "example.com" + port(443)
+        let domain = b"example.com";
+        let mut buf = vec![ATYP_DOMAIN, domain.len() as u8];
+        buf.extend_from_slice(domain);
+        buf.extend_from_slice(&443u16.to_be_bytes());
+        let (host, port, consumed) = parse_socks5_addr(&buf).unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 443);
+        assert_eq!(consumed, 1 + 1 + 11 + 2); // atyp + len + domain + port
+    }
+
+    #[tokio::test]
+    async fn test_socks5_auth_negotiation_no_auth() {
+        // Start a mini socks5 handler, connect as client, verify no-auth negotiation
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // No username/password → no-auth only
+            let _ = handle_socks5_conn(stream, None, None).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // Send greeting: version=5, 1 method, method=NO_AUTH
+        client.write_all(&[SOCKS5_VERSION, 1, AUTH_NO_AUTH]).await.unwrap();
+
+        // Read auth reply
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[0], SOCKS5_VERSION);
+        assert_eq!(reply[1], AUTH_NO_AUTH, "expected no-auth method");
+
+        // Close to let server finish
+        drop(client);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_socks5_auth_negotiation_user_pass() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_socks5_conn(stream, Some("alice".into()), Some("s3cret".into())).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // Send greeting: version=5, 2 methods: USER_PASS, NO_AUTH
+        client.write_all(&[SOCKS5_VERSION, 2, AUTH_USER_PASS, AUTH_NO_AUTH]).await.unwrap();
+
+        // Server should pick USER_PASS
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[0], SOCKS5_VERSION);
+        assert_eq!(reply[1], AUTH_USER_PASS);
+
+        // Send user/pass auth: VER=1, ULEN=5, "alice", PLEN=6, "s3cret"
+        client.write_all(&[USERPASS_VERSION, 5]).await.unwrap();
+        client.write_all(b"alice").await.unwrap();
+        client.write_all(&[6]).await.unwrap();
+        client.write_all(b"s3cret").await.unwrap();
+
+        // Read auth result
+        let mut auth_result = [0u8; 2];
+        client.read_exact(&mut auth_result).await.unwrap();
+        assert_eq!(auth_result[0], USERPASS_VERSION);
+        assert_eq!(auth_result[1], USERPASS_OK, "expected auth success");
+
+        drop(client);
+        server.await.unwrap();
     }
 
     // --- static_file tests ---
