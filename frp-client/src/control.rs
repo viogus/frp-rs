@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use frp_core::config::ProxyConfig;
 use frp_core::msg::{self, FrpMessage};
@@ -151,18 +151,27 @@ impl ControlConnection {
             p.name, p.proxy_type, p.remote_port, local_addr);
         stream.write_v1_frame(&np).await?;
         info!("NewProxy sent for '{}', waiting for response...", p.name);
-        let resp_msg = stream.read_v1_frame().await?;
-        match resp_msg {
-            FrpMessage::NewProxyResp(resp) => {
-                if let Some(err) = resp.error {
-                    return Err(frp_core::Error::Other(format!(
-                        "Proxy '{}' registration failed: {err}", p.name
-                    )));
+        loop {
+            let resp_msg = stream.read_v1_frame().await?;
+            match resp_msg {
+                FrpMessage::NewProxyResp(resp) => {
+                    if let Some(err) = resp.error {
+                        return Err(frp_core::Error::Other(format!(
+                            "Proxy '{}' registration failed: {err}", p.name
+                        )));
+                    }
+                    info!("Proxy '{}' registered on remote port {:?}", p.name, resp.remote_addr);
+                    return Ok(resp);
                 }
-                info!("Proxy '{}' registered on remote port {:?}", p.name, resp.remote_addr);
-                Ok(resp)
+                FrpMessage::ReqWorkConn(_) => {
+                    debug!("Skipping ReqWorkConn during proxy registration (pool conns spawned separately)");
+                    continue;
+                }
+                other => {
+                    warn!("Unexpected message during NewProxy registration for '{}': {:?}", p.name, other);
+                    continue;
+                }
             }
-            _ => Err(frp_core::Error::Protocol("Unexpected response to NewProxy".into())),
         }
     }
 
