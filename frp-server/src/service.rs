@@ -1,16 +1,17 @@
 use std::sync::Arc;
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::net::TcpListener;
 
 use tokio::sync::mpsc;
 
-use tracing::{info, error, warn};
+use tracing::{info, error, warn, debug};
 
 use frp_core::config::ServerConfig;
 use frp_core::auth::{AuthConfig, AuthMethod, OidcVerifier};
 use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::read_msg_v1;
+use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::mux;
 use frp_core::transport::{IoStream, ConnectionType, peek_connection_type, consume_tls_head_byte};
 use frp_core::transport::{build_tls_acceptor, accept_websocket};
@@ -224,6 +225,9 @@ impl Service {
                                             }
                                             Ok(FrpMessage::NewVisitorConn(nvc)) => {
                                                 handle_visitor_conn_inner(ws, nvc, state.clone()).await;
+                                            }
+                                            Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                handle_nat_hole_visitor(ws, nhv, state.clone(), None).await;
                                             }
                                             Ok(other) => {
                                                 warn!("Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
@@ -454,6 +458,11 @@ impl Service {
                                         let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
                                         handle_visitor_conn_inner(io, nvc, state).await;
                                     }
+                                    Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                        let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
+                                        let visitor_addr = Some(addr.to_string());
+                                        handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
+                                    }
                                     Ok(other) => {
                                         warn!("Unexpected TLS first message from {}: {:?}", addr, other.v1_type_byte());
                                     }
@@ -483,6 +492,9 @@ impl Service {
                                             }
                                             Ok(FrpMessage::NewVisitorConn(nvc)) => {
                                                 handle_visitor_conn_inner(ws, nvc, state.clone()).await;
+                                            }
+                                            Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                handle_nat_hole_visitor(ws, nhv, state.clone(), None).await;
                                             }
                                             Ok(other) => {
                                                 warn!("Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
@@ -527,6 +539,9 @@ impl Service {
                                                 Ok(FrpMessage::NewVisitorConn(nvc)) => {
                                                     handle_visitor_conn_inner(io, nvc, state).await;
                                                 }
+                                                Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                    handle_nat_hole_visitor(io, nhv, state, None).await;
+                                                }
                                                 Ok(other) => {
                                                     warn!("Unexpected yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
                                                 }
@@ -552,6 +567,11 @@ impl Service {
                                         Ok(FrpMessage::NewVisitorConn(nvc)) => {
                                             let io = IoStream::Tcp(stream);
                                             handle_visitor_conn_inner(io, nvc, state).await;
+                                        }
+                                        Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                            let io = IoStream::Tcp(stream);
+                                            let visitor_addr = Some(addr.to_string());
+                                            handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
                                         }
                                         Ok(other) => {
                                             warn!("Unexpected first message from {}: {:?}", addr, other.v1_type_byte());
@@ -628,6 +648,159 @@ async fn handle_visitor_conn_inner(
             warn!("No provider found for run_id {}", run_id);
         }
     }
+}
+
+/// Handle an incoming XTCP NatHoleVisitor connection.
+///
+/// Validates sign_key (MD5(sk + timestamp)), looks up the provider,
+/// creates a NAT session, forwards NatHoleClient to the provider
+/// via InternalMsg, writes NatHoleSid + NatHoleReport to the visitor,
+/// and waits for the provider's report signal.
+async fn handle_nat_hole_visitor(
+    stream: IoStream,
+    msg: msg::NatHoleVisitor,
+    state: Arc<AppState>,
+    visitor_addr: Option<String>,
+) {
+    let sign_key = msg.sign_key.unwrap_or_default();
+    let timestamp = msg.timestamp.unwrap_or(0);
+
+    if sign_key.is_empty() {
+        warn!("NatHoleVisitor without sign_key, ignoring");
+        return;
+    }
+
+    // Look up proxy name from sk_index
+    let proxy_name = state.sk_index.read().await.get(&sign_key).cloned();
+    let proxy_name = match proxy_name {
+        Some(pn) => pn,
+        None => {
+            // Also try MD5 validation: sign_key might be MD5(sk + timestamp)
+            warn!("NatHoleVisitor: no proxy found by raw sk, trying MD5 match");
+            let found = {
+                let sk_idx = state.sk_index.read().await;
+                sk_idx.iter().find_map(|(sk, pn)| {
+                    let expected = frp_core::auth::generate_token(sk, timestamp);
+                    if expected == sign_key {
+                        Some(pn.clone())
+                    } else {
+                        None
+                    }
+                })
+            };
+            match found {
+                Some(pn) => pn,
+                None => {
+                    warn!("NatHoleVisitor: no STCP/XTCP proxy found for sign_key");
+                    let mut writer = stream.into_split().1;
+                    let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                        proxy_name: String::new(),
+                        error: Some("proxy not found".into()),
+                    });
+                    let _ = write_msg_v1(&mut writer, &resp).await;
+                    return;
+                }
+            }
+        }
+    };
+
+    // Look up the provider's run_id from proxy_manager
+    let run_id = state.proxy_manager.get_run_id(&proxy_name).await;
+    let run_id = match run_id {
+        Some(id) => id,
+        None => {
+            warn!("NatHoleVisitor: no run_id found for proxy '{}'", proxy_name);
+            let mut writer = stream.into_split().1;
+            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                proxy_name,
+                error: Some("provider offline".into()),
+            });
+            let _ = write_msg_v1(&mut writer, &resp).await;
+            return;
+        }
+    };
+
+    let ctl_tx = {
+        let map = state.run_id_to_ctl_tx.read().await;
+        map.get(&run_id).cloned()
+    };
+
+    let ctl_tx = match ctl_tx {
+        Some(ctl) => ctl,
+        None => {
+            warn!("No provider control handler for run_id {}", run_id);
+            let mut writer = stream.into_split().1;
+            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                proxy_name,
+                error: Some("provider disconnected".into()),
+            });
+            let _ = write_msg_v1(&mut writer, &resp).await;
+            return;
+        }
+    };
+
+    // Generate session ID
+    let sid = uuid::Uuid::new_v4().to_string();
+
+    // Split the stream: writer goes into session, reader is kept for
+    // potential STCP fallback read.
+    let (reader, writer) = stream.into_split();
+
+    // Create NAT session and get report receiver
+    let report_rx = state
+        .nat_hole
+        .create_session(sid.clone(), proxy_name.clone(), writer)
+        .await;
+
+    info!(
+        "NatHoleVisitor for proxy '{}': created session {}",
+        proxy_name, sid
+    );
+
+    // Send NatHoleClient to provider
+    if ctl_tx
+        .tx
+        .send(InternalMsg::NatHoleClient {
+            proxy_name: proxy_name.clone(),
+            sign_key: Some(sign_key),
+            run_id: Some(run_id.clone()),
+            sid: sid.clone(),
+            visitor_addr,
+        })
+        .is_err()
+    {
+        warn!("Provider for run_id {} has gone away", run_id);
+        state.nat_hole.remove(&sid).await;
+        return;
+    }
+
+    // Wait for the provider to complete the hole punch (via report oneshot)
+    // 30s timeout — generous to cover hole punch attempt
+    match tokio::time::timeout(Duration::from_secs(30), report_rx).await {
+        Ok(Ok(_report)) => {
+            debug!("NatHole session {}: provider completed", sid);
+            // The writer has already been dropped by complete().
+            // If visitor wants STCP fallback, it opens a new connection.
+        }
+        Ok(Err(_)) => {
+            debug!(
+                "NatHole session {}: provider dropped without report",
+                sid
+            );
+            state.nat_hole.remove(&sid).await;
+        }
+        Err(_) => {
+            warn!(
+                "NatHole session {}: timed out waiting for provider report",
+                sid
+            );
+            state.nat_hole.remove(&sid).await;
+            // Can't write back — writer is in the session which just got
+            // removed. Connection closure signals the error to the visitor.
+            drop(reader);
+        }
+    }
+    // reader is dropped here — connection closes
 }
 
 /// Handle an incoming work connection. Verifies auth, then routes the
