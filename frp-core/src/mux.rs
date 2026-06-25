@@ -40,10 +40,15 @@ impl Default for TcpMuxConfig {
 }
 
 fn yamux_config(_cfg: &TcpMuxConfig) -> Config {
-    Config::default()
-    // Go frp uses 6 MB max stream window size.
-    // yamux 0.14 default: 1 GiB connection receive window, 16 KiB split send size.
-    // These defaults are fine for frp workloads.
+    let mut cfg = Config::default();
+    // Match Go frp's hashicorp/yamux settings for compatibility.
+    // yamux-rs default: 1 GiB connection window, 512 streams.
+    // Use smaller values closer to Go yamux defaults:
+    //   256 streams * 256 KiB min per stream = 64 MiB minimum window.
+    //   Use 128 MiB for safety margin.
+    cfg.set_max_connection_receive_window(Some(128 * 1024 * 1024));
+    cfg.set_max_num_streams(256);
+    cfg
 }
 
 /// Wrapper type for a yamux stream compatible with tokio's AsyncRead/AsyncWrite.
