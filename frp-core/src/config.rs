@@ -21,6 +21,10 @@ pub struct ServerConfig {
     pub kcp_bind_port: u16,
     #[serde(default)]
     pub quic_bind_port: u16,
+    /// Shared UDP port for SUDP proxies. When > 0, SUDP proxies
+    /// share this port instead of allocating individual ports.
+    #[serde(default)]
+    pub sudp_port: u16,
     #[serde(default)]
     pub sub_domain_host: String,
     #[serde(default)]
@@ -137,6 +141,7 @@ impl Default for ServerConfig {
             vhost_https_port: 0,
             kcp_bind_port: 0,
             quic_bind_port: 0,
+            sudp_port: 0,
             sub_domain_host: String::new(),
             websocket_port: 0,
             tls_enable: false,

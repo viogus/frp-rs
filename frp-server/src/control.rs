@@ -678,7 +678,19 @@ async fn handle_new_proxy(
     }
     let remote_port = raw_port as u16;
 
-    let allocated_port = {
+    let is_sudp = np.proxy_type == "sudp";
+    let allocated_port = if is_sudp && remote_port > 0 {
+        // SUDP proxies can share ports. If the requested port is already
+        // in use, reuse it without adding to used_ports.
+        let ports = state.used_ports.read().await;
+        if ports.contains(&remote_port) {
+            Some(remote_port)
+        } else {
+            drop(ports);
+            let mut ports = state.used_ports.write().await;
+            allocate_port_multi(&mut ports, remote_port, &state.allow_ports)
+        }
+    } else {
         let mut ports = state.used_ports.write().await;
         allocate_port_multi(&mut ports, remote_port, &state.allow_ports)
     };
@@ -772,10 +784,37 @@ async fn handle_new_proxy(
 
             let is_nat_hole = np.proxy_type == "stcp" || np.proxy_type == "xtcp";
 
-            if np.proxy_type == "udp" {
+            if np.proxy_type == "udp" || np.proxy_type == "sudp" {
+                let is_sudp = np.proxy_type == "sudp";
                 let addr = format_socket_addr(&bind_addr, port);
-                let socket = match UdpSocket::bind(&addr).await {
+                let bind_result = UdpSocket::bind(&addr).await;
+                // For SUDP with an already-bound shared port, bind may fail with
+                // EADDRINUSE — that's expected, reuse existing socket for this port.
+                let socket = match bind_result {
                     Ok(s) => std::sync::Arc::new(s),
+                    Err(e) if is_sudp => {
+                        // Try to find an existing socket on this port
+                        let found = udp_sockets.iter().find_map(|(_, sock)| {
+                            sock.local_addr().ok().filter(|a| a.port() == port).map(|_| sock.clone())
+                        });
+                        match found {
+                            Some(sock) => {
+                                info!("SUDP proxy '{}' sharing port {} (reusing existing socket)", np.proxy_name, port);
+                                sock
+                            }
+                            None => {
+                                tracing::error!("SUDP port {} bind failed (no existing socket to share): {}", port, e);
+                                state.proxy_manager.remove(&np.proxy_name).await;
+                                let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
+                                    proxy_name: np.proxy_name.clone(),
+                                    remote_addr: None,
+                                    error: Some(format!("SUDP bind failed: {e}")),
+                                });
+                                let _ = write_msg_v1(writer, &resp).await;
+                                return;
+                            }
+                        }
+                    }
                     Err(e) => {
                         tracing::error!("Failed to bind UDP port {}: {}", port, e);
                         state.used_ports.write().await.remove(&port);
@@ -797,11 +836,17 @@ async fn handle_new_proxy(
                         udp_local_to_proxy.insert(local_str.clone(), np.proxy_name.clone());
                     }
                 }
-                let handle = tokio::spawn(async move {
-                    run_udp_listener(sock, pn, itx).await;
+                // For SUDP sharing existing socket, don't spawn duplicate listener
+                let should_spawn = !is_sudp || !udp_sockets.iter().any(|(n, _)| n != &np.proxy_name && {
+                    udp_sockets.get(n).and_then(|s| s.local_addr().ok()).map_or(false, |a| a.port() == port)
                 });
-                listener_handles.insert(np.proxy_name.clone(), handle);
-                info!("UDP proxy '{}' listening on port {}", np.proxy_name, port);
+                if should_spawn {
+                    let handle = tokio::spawn(async move {
+                        run_udp_listener(sock, pn, itx).await;
+                    });
+                    listener_handles.insert(np.proxy_name.clone(), handle);
+                }
+                info!("{} proxy '{}' listening on port {}", if is_sudp { "SUDP" } else { "UDP" }, np.proxy_name, port);
             } else if is_nat_hole {
                 info!("{} proxy '{}' registered (no listener, NAT hole punch)", np.proxy_type, np.proxy_name);
             } else {
