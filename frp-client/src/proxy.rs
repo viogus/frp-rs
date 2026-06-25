@@ -28,7 +28,7 @@ pub fn create_new_proxy_msg(
     p: &frp_core::config::ProxyConfig,
     local_addr: &str,
 ) -> FrpMessage {
-    FrpMessage::NewProxy(msg::NewProxy {
+    let mut result = FrpMessage::NewProxy(msg::NewProxy {
         proxy_name: p.name.clone(),
         proxy_type: p.proxy_type.clone(),
         use_encryption: Some(p.use_encryption),
@@ -57,7 +57,16 @@ pub fn create_new_proxy_msg(
         annotations: if p.annotations.is_empty() { None } else { Some(p.annotations.clone()) },
         metas: if p.metas.is_empty() { None } else { Some(p.metas.clone()) },
         multiplexer: if p.multiplexer.is_empty() { None } else { Some(p.multiplexer.clone()) },
-    })
+    });
+
+    // Strip local_str for Go frps compatibility — Go frps v0.69.1
+    // NewProxy struct does not have this field. While Go json.Unmarshal
+    // ignores unknown fields, removing it produces wire-identical JSON
+    // to Go frpc and eliminates a potential compatibility variable.
+    if let FrpMessage::NewProxy(ref mut np) = result {
+        np.local_str = None;
+    }
+    result
 }
 
 /// Connects to a local service and returns the TCP stream.
