@@ -244,7 +244,7 @@ impl Default for WebServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerTransportConfig {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub tcp_mux: bool,
     #[serde(default)]
     pub tcp_mux_keepalive_interval: i64,
@@ -253,7 +253,7 @@ pub struct ServerTransportConfig {
 impl Default for ServerTransportConfig {
     fn default() -> Self {
         Self {
-            tcp_mux: false,
+            tcp_mux: true,
             tcp_mux_keepalive_interval: 30,
         }
     }
