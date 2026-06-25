@@ -320,7 +320,7 @@ pub struct AuthClientConfig {
     pub oidc_scope: String,
     #[serde(default, alias = "oidcIssuer")]
     pub oidc_issuer: String,
-    /// Extra params for token endpoint (TODO: wire into OidcClient).
+    /// Extra params for token endpoint.
     #[serde(default, alias = "additionalEndpointParams")]
     pub additional_endpoint_params: String,
 }

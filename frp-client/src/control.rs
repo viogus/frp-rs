@@ -96,7 +96,10 @@ impl ControlConnection {
                     info!("Yamux session established");
                     (IoStream::Yamux(control_stream), Some(session))
                 }
-                _ => unreachable!("propose_mux only true for plain TCP"),
+                other => {
+                    warn!("Unexpected transport for mux proposal: {:?}", other);
+                    (other, None)
+                }
             }
         } else {
             (raw_stream, None)

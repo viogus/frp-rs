@@ -22,7 +22,7 @@ pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
    buf.extend_from_slice(&(payload.len() as i64).to_be_bytes());
    buf.extend_from_slice(&payload);
 
-    tracing::debug!(
+    tracing::trace!(
         "V1 frame: type=0x{:02x} len={} payload={}",
         type_byte,
         payload.len(),

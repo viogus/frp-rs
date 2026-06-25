@@ -535,7 +535,10 @@ async fn assign_work_to_proxy(
         IoStream::Yamux(ref mut s) => write_msg_v1(s, &swc).await,
         IoStream::Kcp(ref mut s) => write_msg_v1(s, &swc).await,
         IoStream::Quic(ref mut s) => write_msg_v1(s, &swc).await,
-        IoStream::Cipher(_) => unreachable!("Cipher stream not used on server"),
+        IoStream::Cipher(_) => {
+            warn!("Cipher stream unexpected in server StartWorkConn write");
+            return;
+        }
     };
 
     if let Err(e) = write_result {
@@ -629,7 +632,10 @@ async fn assign_work_to_proxy(
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, None, None).await;
                 }
-                IoStream::Cipher(_) => unreachable!("Cipher stream not used on server"),
+                IoStream::Cipher(_) => {
+                    warn!("Cipher stream unexpected in server bridge");
+                    return;
+                }
             }
         } else {
             // Plain bridge: split both sides and copy bidirectionally
