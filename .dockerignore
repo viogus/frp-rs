@@ -1,0 +1,21 @@
+# Rust build artifacts
+target/
+.cargo/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Docs (not needed in container)
+docs/
+
+# Test fixtures and temp files
+*.swp
+*.swo
+*~
+.DS_Store
+.worktrees/

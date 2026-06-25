@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.dependencies]
-tokio = { version = "1", default-features = false, features = ["net", "io-util", "time", "sync", "macros", "signal", "rt-multi-thread"] }
+tokio = { version = "1", default-features = false, features = ["net", "io-util", "time", "sync", "macros", "rt-multi-thread"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -32,7 +32,6 @@ cfb-mode = "0.8"
 pbkdf2 = "0.12"
 snap = "1"
 rand = "0.8"
-flate2 = "1.0"
 tokio-rustls = { version = "0.26", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
 rustls-pemfile = "2"
@@ -47,6 +46,9 @@ tokio-util = { version = "0.7", features = ["compat"] }
 kcp = "0.6"
 quinn = "0.11"
 
+# Release profile: slim, LTO, single codegen unit, stripped symbols, abort on panic.
+# After cargo build --release, compress further with:
+#   upx --best --lzma target/release/frps target/release/frpc
 [profile.release]
 opt-level = "z"
 lto = "fat"
