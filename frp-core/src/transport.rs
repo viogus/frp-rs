@@ -233,6 +233,9 @@ pub enum IoStream {
     Quic(QuicStream),
     WebSocket(WsByteStream),
     Yamux(YamuxStream),
+    /// AES-128-CFB encrypted control stream.
+    /// Created after login by wrapping the inner IoStream.
+    Cipher(crate::cipher_stream::CipherStream),
 }
 
 impl std::fmt::Debug for IoStream {
@@ -244,6 +247,7 @@ impl std::fmt::Debug for IoStream {
             IoStream::Quic(_) => f.debug_struct("IoStream::Quic").finish_non_exhaustive(),
             IoStream::WebSocket(_) => f.debug_struct("IoStream::WebSocket").finish_non_exhaustive(),
             IoStream::Yamux(_) => f.debug_struct("IoStream::Yamux").finish_non_exhaustive(),
+            IoStream::Cipher(_) => f.debug_struct("IoStream::Cipher").finish_non_exhaustive(),
         }
     }
 }
@@ -262,6 +266,7 @@ impl tokio::io::AsyncRead for IoStream {
             IoStream::Quic(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::WebSocket(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Yamux(s) => Pin::new(s).poll_read(cx, buf),
+            IoStream::Cipher(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -279,6 +284,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Quic(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::WebSocket(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::Yamux(s) => Pin::new(s).poll_write(cx, buf),
+            IoStream::Cipher(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -290,6 +296,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Quic(s) => Pin::new(s).poll_flush(cx),
             IoStream::WebSocket(s) => Pin::new(s).poll_flush(cx),
             IoStream::Yamux(s) => Pin::new(s).poll_flush(cx),
+            IoStream::Cipher(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -301,6 +308,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Quic(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::WebSocket(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::Yamux(s) => Pin::new(s).poll_shutdown(cx),
+            IoStream::Cipher(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -315,6 +323,7 @@ impl IoStream {
             IoStream::Quic(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::WebSocket(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::Yamux(s) => crate::protocol::write_msg_v1(s, msg).await,
+            IoStream::Cipher(s) => crate::protocol::write_msg_v1(s, msg).await,
         }
     }
 
@@ -327,6 +336,7 @@ impl IoStream {
             IoStream::Quic(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::WebSocket(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Yamux(s) => crate::protocol::read_msg_v1(s).await,
+            IoStream::Cipher(s) => crate::protocol::read_msg_v1(s).await,
         }
     }
 
@@ -334,7 +344,7 @@ impl IoStream {
     pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         match self {
             IoStream::Tcp(s) => s.peer_addr().ok(),
-            IoStream::Tls(_) | IoStream::Kcp(_) | IoStream::Quic(_) | IoStream::WebSocket(_) | IoStream::Yamux(_) => None,
+            IoStream::Tls(_) | IoStream::Kcp(_) | IoStream::Quic(_) | IoStream::WebSocket(_) | IoStream::Yamux(_) | IoStream::Cipher(_) => None,
         }
     }
 
@@ -369,7 +379,18 @@ impl IoStream {
                 let (r, w) = tokio::io::split(stream);
                 (Box::new(r), Box::new(w))
             }
+            IoStream::Cipher(stream) => {
+                let (r, w) = tokio::io::split(stream);
+                (Box::new(r), Box::new(w))
+            }
         }
+    }
+
+    /// Wrap this stream in AES-128-CFB encryption for control messages.
+    /// Must be called after login (the Login message is NOT encrypted).
+    pub fn into_encrypted(self, key: [u8; 16]) -> Self {
+        let c = crate::cipher_stream::CipherStream::new(Box::new(self), key);
+        IoStream::Cipher(c)
     }
 }
 

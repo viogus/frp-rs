@@ -4,6 +4,7 @@ pub mod transport;
 pub mod auth;
 pub mod config;
 pub mod encryption;
+pub mod cipher_stream;
 pub mod mux;
 pub mod bridge;
 pub mod bandwidth;

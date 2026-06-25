@@ -31,8 +31,8 @@ pub fn create_new_proxy_msg(
     let mut result = FrpMessage::NewProxy(msg::NewProxy {
         proxy_name: p.name.clone(),
         proxy_type: p.proxy_type.clone(),
-        use_encryption: Some(p.use_encryption),
-        use_compression: Some(p.use_compression),
+        use_encryption: if p.use_encryption { Some(true) } else { None },
+        use_compression: if p.use_compression { Some(true) } else { None },
         group: if p.group.is_empty() { None } else { Some(p.group.clone()) },
         group_key: if p.group_key.is_empty() { None } else { Some(p.group_key.clone()) },
         local_str: Some(local_addr.to_string()),
