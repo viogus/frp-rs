@@ -11,6 +11,7 @@ pub struct NatHoleCoordinator {
 }
 
 struct NatHoleSession {
+    #[allow(dead_code)]
     sid: String,
     proxy_name: String,
     /// Writer half of the visitor's connection — used to forward
@@ -21,11 +22,17 @@ struct NatHoleSession {
     created_at: Instant,
 }
 
-impl NatHoleCoordinator {
-    pub fn new() -> Self {
+impl Default for NatHoleCoordinator {
+    fn default() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
         }
+    }
+}
+
+impl NatHoleCoordinator {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Create a session and return the oneshot receiver for NatHoleReport.
