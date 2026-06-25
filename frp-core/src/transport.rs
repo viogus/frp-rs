@@ -485,39 +485,60 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
 /// Tokio TcpStreams are non-blocking. If no data has arrived yet, recv
 /// returns EAGAIN. We retry with short sleeps until data arrives or timeout.
 pub async fn peek_connection_type(stream: &TcpStream) -> Result<ConnectionType, crate::Error> {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
     let mut buf = [0u8; 1];
 
     // Retry loop: tokio TcpStream is non-blocking, recv may return EAGAIN
     // if the client hasn't written yet.
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
-        let n = unsafe {
-            libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK)
-        };
-        if n == 1 {
-            break;
-        }
-        if n == 0 {
-            return Err(crate::Error::Transport("peek connection type: stream closed".into()));
-        }
-        // n == -1: check errno
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::WouldBlock {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(crate::Error::Transport("peek connection type: timeout waiting for data".into()));
+        match peek_byte(stream, &mut buf) {
+            Ok(1) => break,
+            Ok(0) => return Err(crate::Error::Transport("peek connection type: stream closed".into())),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(crate::Error::Transport("peek connection type: timeout waiting for data".into()));
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                continue;
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            continue;
+            Err(e) => return Err(crate::Error::Transport(format!("peek connection type: {}", e))),
+            _ => {}
         }
-        return Err(crate::Error::Transport(format!("peek connection type: {}", err)));
     }
 
     match buf[0] {
         FRP_TLS_HEAD_BYTE => Ok(ConnectionType::Tls),
         b'G' => Ok(ConnectionType::WebSocket),
         b => Ok(ConnectionType::V1(b)),
+    }
+}
+
+/// Platform-specific peek of one byte from a TCP stream without consuming it.
+#[cfg(unix)]
+fn peek_byte(stream: &TcpStream, buf: &mut [u8; 1]) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let n = unsafe {
+        libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK)
+    };
+    if n >= 0 {
+        Ok(n as usize)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn peek_byte(stream: &TcpStream, buf: &mut [u8; 1]) -> io::Result<usize> {
+    use std::os::windows::io::AsRawSocket;
+    let socket = stream.as_raw_socket();
+    let n = unsafe {
+        libc::recv(socket as _, buf.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK)
+    };
+    if n >= 0 {
+        Ok(n as usize)
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
