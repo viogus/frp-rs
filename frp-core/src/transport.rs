@@ -531,9 +531,15 @@ fn peek_byte(stream: &TcpStream, buf: &mut [u8; 1]) -> io::Result<usize> {
 #[cfg(windows)]
 fn peek_byte(stream: &TcpStream, buf: &mut [u8; 1]) -> io::Result<usize> {
     use std::os::windows::io::AsRawSocket;
+    // libc crate does not expose recv/MSG_PEEK on Windows targets.
+    // Declare WinSock2 recv directly — ws2_32.dll is linked by std.
+    extern "system" {
+        fn recv(socket: usize, buf: *mut std::ffi::c_void, len: i32, flags: i32) -> i32;
+    }
+    const MSG_PEEK: i32 = 0x2;
     let socket = stream.as_raw_socket();
     let n = unsafe {
-        libc::recv(socket as _, buf.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK)
+        recv(socket as usize, buf.as_mut_ptr() as *mut std::ffi::c_void, 1, MSG_PEEK)
     };
     if n >= 0 {
         Ok(n as usize)
