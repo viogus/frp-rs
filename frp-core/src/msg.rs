@@ -289,6 +289,10 @@ pub struct NatHoleClient {
     pub sign_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visitor_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +306,8 @@ pub struct NatHoleResp {
 pub struct NatHoleSid {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -460,12 +466,14 @@ impl FrpMessage {
             })),
             TYPE_NAT_HOLE_CLIENT => Some(FrpMessage::NatHoleClient(NatHoleClient {
                 proxy_name: String::new(), sign_key: None, run_id: None,
+                sid: None, visitor_addr: None,
             })),
             TYPE_NAT_HOLE_RESP => Some(FrpMessage::NatHoleResp(NatHoleResp {
                 proxy_name: String::new(), error: None,
             })),
             TYPE_NAT_HOLE_SID => Some(FrpMessage::NatHoleSid(NatHoleSid {
                 sid: None,
+                provider_addr: None,
             })),
             TYPE_NAT_HOLE_REPORT => Some(FrpMessage::NatHoleReport(NatHoleReport {
                 sid: None,
