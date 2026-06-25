@@ -88,8 +88,8 @@ pub async fn handle_control<S>(
     // --- Split stream for reading/writing ---
     let (mut reader, mut writer) = tokio::io::split(stream);
 
-    // --- Send login response (skip if yamux already sent it in accept loop) ---
-    if incoming.is_none() {
+    // --- Send login response ---
+    {
         let resp = FrpMessage::LoginResp(msg::LoginResp {
             version: Some(frp_core::VERSION.into()),
             run_id: Some(run_id.clone()),
