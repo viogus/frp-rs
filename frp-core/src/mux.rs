@@ -13,6 +13,7 @@
 //!   streams on demand.
 
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
 use futures_util::future::poll_fn;
@@ -109,10 +110,25 @@ pub async fn server_mux(
     // Channel for forwarding accepted work connection streams.
     let (tx, rx) = mpsc::unbounded_channel();
 
-    // Spawn background task: continuously accept yamux streams.
+    // Spawn background task: accept yamux streams and drive connection I/O.
+    //
+    // Double-poll is required because yamux Active::poll processes
+    // StreamCommand::SendFrame AFTER draining pending_frames. The first
+    // poll picks up queued stream writes into pending_frames; the second
+    // poll actually sends them on the wire.
     tokio::task::spawn(async move {
         loop {
-            match poll_fn(|cx| conn.poll_next_inbound(cx)).await {
+            let result = poll_fn(|cx| {
+                match conn.poll_next_inbound(cx) {
+                    Poll::Ready(r) => Poll::Ready(r),
+                    Poll::Pending => {
+                        // Second poll: flush pending_frames to socket
+                        conn.poll_next_inbound(cx)
+                    }
+                }
+            }).await;
+
+            match result {
                 Some(Ok(stream)) => {
                     let compat = stream.compat();
                     if tx.send(compat).is_err() {
@@ -189,12 +205,24 @@ pub async fn client_mux(
                         }
                     }
                 }
-                // Drive connection I/O — poll_next_inbound processes inbound data
-                // frames (ACKs, window updates, received data) and routes them to
-                // stream buffers, waking stream readers. Without this, streams can
-                // never receive data.
+                // Drive connection I/O.
+                //
+                // Double-poll is required because yamux Active::poll processes
+                // StreamCommand::SendFrame (step 3) AFTER draining pending_frames
+                // (step 1). The first poll picks up queued stream writes into
+                // pending_frames; the second poll actually sends them on the wire.
+                // Without the second poll, frames sit in pending_frames until
+                // the next wake-up — which may never arrive.
                 _ = poll_fn(|cx| {
-                    bg_conn.lock().unwrap().poll_next_inbound(cx)
+                    let mut conn = bg_conn.lock().unwrap();
+                    // First poll: process stream commands → collect SendFrame
+                    // into pending_frames, read incoming data → route to streams.
+                    match conn.poll_next_inbound(cx) {
+                        Poll::Ready(r) => return Poll::Ready(r),
+                        Poll::Pending => {}
+                    }
+                    // Second poll: send pending_frames to socket, read again.
+                    conn.poll_next_inbound(cx)
                 }) => {}
             }
         }
