@@ -290,6 +290,20 @@ pub async fn handle_control<S>(
                             break;
                         }
                     }
+                    Some(InternalMsg::NatHoleClient { proxy_name, sign_key, run_id: _run_id, sid, visitor_addr }) => {
+                        debug!("Sending NatHoleClient for session {} to provider", sid);
+                        let nhc = FrpMessage::NatHoleClient(msg::NatHoleClient {
+                            proxy_name,
+                            sign_key,
+                            run_id: _run_id,
+                            sid: Some(sid),
+                            visitor_addr,
+                        });
+                        if let Err(e) = write_msg_v1(&mut writer, &nhc).await {
+                            warn!("Failed to send NatHoleClient: {}", e);
+                            break;
+                        }
+                    }
                     Some(InternalMsg::Shutdown) => {
                         warn!("Shutdown received for run_id {} (replaced by new control connection)", run_id);
                         break;

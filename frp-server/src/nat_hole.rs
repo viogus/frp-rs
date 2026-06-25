@@ -53,7 +53,8 @@ impl NatHoleCoordinator {
     pub async fn take_writer(&self, sid: &str) -> Option<Box<dyn AsyncWrite + Send + Unpin>> {
         let sessions = self.sessions.read().await;
         let session = sessions.get(sid)?;
-        session.visitor_writer.lock().await.take()
+        let writer = session.visitor_writer.lock().await.take();
+        writer
     }
 
     /// Return the writer back to the session after use.
@@ -71,7 +72,8 @@ impl NatHoleCoordinator {
         let session = sessions.remove(sid)?;
         let name = session.proxy_name.clone();
         // Drop the writer (closes visitor connection)
-        drop(session.visitor_writer.lock().await.take());
+        let _writer = session.visitor_writer.lock().await.take();
+        drop(_writer);
         // Signal the oneshot if still present (don't error if receiver gone)
         if let Some(tx) = session.report_tx.lock().await.take() {
             let _ = tx.send(msg::NatHoleReport {

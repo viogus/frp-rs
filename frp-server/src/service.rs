@@ -18,6 +18,7 @@ use frp_core::format_socket_addr;
 
 use crate::proxy::ProxyManager;
 use crate::control;
+use crate::nat_hole::NatHoleCoordinator;
 use crate::vhost::VhostManager;
 
 // ---------------------------------------------------------------
@@ -44,6 +45,14 @@ pub enum InternalMsg {
     /// Sent when a new control connection claims the same run_id.
     /// The old handler should stop listening and clean up.
     Shutdown,
+    /// NAT hole punch: server tells provider to initiate hole punch.
+    NatHoleClient {
+        proxy_name: String,
+        sign_key: Option<String>,
+        run_id: Option<String>,
+        sid: String,
+        visitor_addr: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +78,7 @@ pub struct AppState {
     pub tls_only: bool,
     pub oidc_verifier: Option<Arc<OidcVerifier>>,
     pub oidc_subjects: Arc<RwLock<HashMap<String, String>>>,
+    pub nat_hole: Arc<NatHoleCoordinator>,
 }
 
 impl AppState {
@@ -91,6 +101,7 @@ impl AppState {
             tls_only,
             oidc_verifier,
             oidc_subjects: Arc::new(RwLock::new(HashMap::new())),
+            nat_hole: Arc::new(NatHoleCoordinator::new()),
         }
     }
 }
