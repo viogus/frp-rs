@@ -170,9 +170,9 @@ pub async fn client_mux(
                 req = rx.recv() => {
                     match req {
                         Some(OpenRequest { reply }) => {
-                            let conn = bg_conn.clone();
+                            let c = bg_conn.clone();
                             let result = poll_fn(move |cx| {
-                                conn.lock().unwrap().poll_new_outbound(cx)
+                                c.lock().unwrap().poll_new_outbound(cx)
                             }).await;
                             let stream = match result {
                                 Ok(s) => Some(s.compat()),
@@ -189,6 +189,13 @@ pub async fn client_mux(
                         }
                     }
                 }
+                // Drive connection I/O — poll_next_inbound processes inbound data
+                // frames (ACKs, window updates, received data) and routes them to
+                // stream buffers, waking stream readers. Without this, streams can
+                // never receive data.
+                _ = poll_fn(|cx| {
+                    bg_conn.lock().unwrap().poll_next_inbound(cx)
+                }) => {}
             }
         }
     });
