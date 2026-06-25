@@ -123,6 +123,7 @@ impl ControlConnection {
         });
 
         io_stream.write_v1_frame(&login).await?;
+        info!("Login sent, waiting for response...");
 
         let resp_msg = io_stream.read_v1_frame().await?;
         match resp_msg {
