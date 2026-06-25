@@ -213,7 +213,7 @@ pub async fn client_mux(
                 // pending_frames; the second poll actually sends them on the wire.
                 // Without the second poll, frames sit in pending_frames until
                 // the next wake-up — which may never arrive.
-                _ = poll_fn(|cx| {
+                result = poll_fn(|cx| {
                     let mut conn = bg_conn.lock().unwrap();
                     // First poll: process stream commands → collect SendFrame
                     // into pending_frames, read incoming data → route to streams.
@@ -222,10 +222,28 @@ pub async fn client_mux(
                         Poll::Pending => {}
                     }
                     // Second poll: send pending_frames to socket, read again.
+                    debug!("yamux client: flushing pending frames");
                     conn.poll_next_inbound(cx)
-                }) => {}
+                }) => {
+                    match result {
+                        Some(Ok(_stream)) => {
+                            // New inbound stream accepted (unexpected in client mode).
+                            // Stream is dropped; server shouldn't open streams to client.
+                            debug!("yamux client: unexpected inbound stream, ignoring");
+                        }
+                        Some(Err(e)) => {
+                            warn!("yamux client: connection error: {e}");
+                            break;
+                        }
+                        None => {
+                            debug!("yamux client: connection closed");
+                            break;
+                        }
+                    }
+                }
             }
         }
+        debug!("yamux client: background task exiting");
     });
 
     Ok((control_compat, YamuxSession { tx }))

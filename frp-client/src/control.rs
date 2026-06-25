@@ -147,7 +147,10 @@ impl ControlConnection {
         stream: &mut IoStream,
     ) -> Result<msg::NewProxyResp, frp_core::Error> {
         let np = proxy::create_new_proxy_msg(p, local_addr);
+        info!("Registering proxy '{}' type={} remote_port={} local={}",
+            p.name, p.proxy_type, p.remote_port, local_addr);
         stream.write_v1_frame(&np).await?;
+        info!("NewProxy sent for '{}', waiting for response...", p.name);
         let resp_msg = stream.read_v1_frame().await?;
         match resp_msg {
             FrpMessage::NewProxyResp(resp) => {
