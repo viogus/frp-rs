@@ -6,10 +6,10 @@ type Aes128CfbEnc = cfb_mode::Encryptor<aes::Aes128>;
 type Aes128CfbDec = cfb_mode::Decryptor<aes::Aes128>;
 
 /// Derive an AES-128 key from a token using PBKDF2-SHA1.
-/// Matches Go frp v0.69.1: pbkdf2.Key(token, "frp", 64, 16, sha1.New)
+/// Matches Go frp v0.69.1: pbkdf2.Key(token, "crypto", 64, 16, sha1.New)
 pub fn derive_key(token: &str) -> [u8; 16] {
     let mut key = [0u8; 16];
-    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(token.as_bytes(), b"frp", 64, &mut key);
+    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(token.as_bytes(), b"crypto", 64, &mut key);
     key
 }
 

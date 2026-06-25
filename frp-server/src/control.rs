@@ -553,51 +553,49 @@ async fn assign_work_to_proxy(
     let comp_key = req.use_compression;
 
     tokio::spawn(async move {
-        // Write VHost pre-read bytes to work connection first.
-        // For encrypted bridges, send through encryption framing as the first frame.
-        if !pre_read.is_empty() {
-            if enc_key {
-                match frp_core::encryption::encrypt(&pre_read, &encryption_key) {
-                    Ok(encrypted) => {
-                        let len = u32::try_from(encrypted.len()).unwrap_or(u32::MAX).to_be_bytes();
-                        let write_result = match &mut work_conn {
-                            IoStream::Tcp(ref mut s) => {
-                                if s.write_all(&len).await.is_err() { Err(std::io::Error::other("write failed")) }
-                                else { s.write_all(&encrypted).await }
-                            }
-                            IoStream::Tls(ref mut s) => {
-                                if s.write_all(&len).await.is_err() { Err(std::io::Error::other("write failed")) }
-                                else { s.write_all(&encrypted).await }
-                            }
-                            IoStream::WebSocket(ref mut s) => {
-                                if s.write_all(&len).await.is_err() { Err(std::io::Error::other("write failed")) }
-                                else { s.write_all(&encrypted).await }
-                            }
-                            IoStream::Yamux(ref mut s) => {
-                                if s.write_all(&len).await.is_err() { Err(std::io::Error::other("write failed")) }
-                                else { s.write_all(&encrypted).await }
-                            }
-                            IoStream::Kcp(ref mut s) => {
-                                if s.write_all(&len).await.is_err() { Err(std::io::Error::other("write failed")) }
-                                else { s.write_all(&encrypted).await }
-                            }
-                            IoStream::Quic(ref mut s) => {
-                                if s.write_all(&len).await.is_err() { Err(std::io::Error::other("write failed")) }
-                                else { s.write_all(&encrypted).await }
-                            }
-                            _ => Ok(()),
-                        };
-                        if let Err(e) = write_result {
-                            warn!("Failed to write encrypted VHost pre-read: {}", e);
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to encrypt VHost pre-read: {}", e);
-                        return;
-                    }
+        // For encrypted bridges, pre_read bytes are passed into bridge_encrypted
+        // which writes them through the CipherWriter (matching Go frp streaming CFB).
+        if enc_key {
+            let key = encryption_key;
+            match work_conn {
+                IoStream::Tcp(work) => {
+                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (w_r, w_w) = tokio::io::split(work);
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None).await;
                 }
-            } else {
+                IoStream::Tls(work) => {
+                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (w_r, w_w) = tokio::io::split(work);
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None).await;
+                }
+                IoStream::Kcp(work) => {
+                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (w_r, w_w) = tokio::io::split(work);
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None).await;
+                }
+                IoStream::WebSocket(work) => {
+                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (w_r, w_w) = tokio::io::split(work);
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None).await;
+                }
+                IoStream::Quic(work) => {
+                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (w_r, w_w) = work.into_split();
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None).await;
+                }
+                IoStream::Yamux(work) => {
+                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (w_r, w_w) = tokio::io::split(work);
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None).await;
+                }
+                IoStream::Cipher(_) => {
+                    warn!("Cipher stream unexpected in server bridge");
+                    return;
+                }
+            }
+        } else {
+            // Write VHost pre-read bytes to work connection first (plain).
+            if !pre_read.is_empty() {
                 let write_result = match &mut work_conn {
                     IoStream::Tcp(ref mut s) => s.write_all(&pre_read).await,
                     IoStream::Tls(ref mut s) => s.write_all(&pre_read).await,
@@ -612,47 +610,7 @@ async fn assign_work_to_proxy(
                     return;
                 }
             }
-        }
-
-        if enc_key {
-            let key = encryption_key;
-            match work_conn {
-                IoStream::Tcp(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split();
-                    let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, None, None).await;
-                }
-                IoStream::Tls(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split();
-                    let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, None, None).await;
-                }
-                IoStream::Kcp(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split();
-                    let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, None, None).await;
-                }
-                IoStream::WebSocket(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split();
-                    let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, None, None).await;
-                }
-                IoStream::Quic(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split();
-                    let (w_r, w_w) = work.into_split();
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, None, None).await;
-                }
-                IoStream::Yamux(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split();
-                    let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, None, None).await;
-                }
-                IoStream::Cipher(_) => {
-                    warn!("Cipher stream unexpected in server bridge");
-                    return;
-                }
-            }
-        } else {
+            // Plain bridge: split both sides and copy bidirectionally
             // Plain bridge: split both sides and copy bidirectionally
             let (mut u_r, mut u_w) = req.user_conn.into_split();
             let (mut w_r, mut w_w) = work_conn.into_split();

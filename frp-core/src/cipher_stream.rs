@@ -1,4 +1,4 @@
-//! AES-128-CFB streaming cipher for control connection encryption.
+//! AES-128-CFB streaming cipher for control connection and bridge encryption.
 //!
 //! Matches Go frp v0.69.1 `libcrypto.NewReader` / `libcrypto.NewWriter` behavior.
 //! Each direction has its own random 16-byte IV. Cipher state is continuous.
@@ -13,6 +13,142 @@ use aes::Aes128;
 
 pub trait AsyncReadWriteUnpin: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWriteUnpin for T {}
+
+/// Streaming AES-128-CFB decrypting reader.
+///
+/// Reads 16-byte IV on first read, then decrypts all subsequent reads with
+/// continuous CFB state. Matches Go frp `crypto.NewReader`.
+pub struct CipherReader<R: AsyncRead + Unpin> {
+    inner: R,
+    state: ReadState,
+    key: [u8; 16],
+}
+
+impl<R: AsyncRead + Unpin> CipherReader<R> {
+    pub fn new(inner: R, key: [u8; 16]) -> Self {
+        Self {
+            inner,
+            key,
+            state: ReadState::ReadingIv { buf: [0u8; 16], filled: 0 },
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for CipherReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        loop {
+            match &mut this.state {
+                ReadState::Decrypting { cfb } => {
+                    let needed = buf.remaining();
+                    let mut tmp = vec![0u8; needed];
+                    let mut tmp_buf = ReadBuf::new(&mut tmp);
+                    match Pin::new(&mut this.inner).poll_read(cx, &mut tmp_buf) {
+                        Poll::Ready(Ok(())) => {
+                            let filled = tmp_buf.filled().len();
+                            if filled > 0 {
+                                cfb.decrypt(&mut tmp[..filled]);
+                                buf.put_slice(&tmp[..filled]);
+                            }
+                            return Poll::Ready(Ok(()));
+                        }
+                        other => return other,
+                    }
+                }
+                ReadState::ReadingIv { buf: iv_buf, filled } => {
+                    let mut tmp = ReadBuf::new(&mut iv_buf[*filled..]);
+                    match Pin::new(&mut this.inner).poll_read(cx, &mut tmp) {
+                        Poll::Ready(Ok(())) => {
+                            let n = tmp.filled().len();
+                            *filled += n;
+                            if *filled == 16 {
+                                let cfb = CfbState::new(&this.key, iv_buf);
+                                this.state = ReadState::Decrypting { cfb };
+                            }
+                            continue;
+                        }
+                        other => return other,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Streaming AES-128-CFB encrypting writer.
+///
+/// Writes 16-byte random IV on first write, then encrypts all subsequent
+/// writes with continuous CFB state. Matches Go frp `crypto.NewWriter`.
+pub struct CipherWriter<W: AsyncWrite + Unpin> {
+    inner: W,
+    state: WriteState,
+    key: [u8; 16],
+}
+
+impl<W: AsyncWrite + Unpin> CipherWriter<W> {
+    pub fn new(inner: W, key: [u8; 16]) -> Self {
+        Self {
+            inner,
+            key,
+            state: WriteState::Writing { buf: Vec::new(), pos: 0, cfb: None },
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = &mut *self;
+        match &mut this.state {
+            WriteState::Encrypting { cfb } => {
+                let mut encrypted = buf.to_vec();
+                cfb.encrypt(&mut encrypted);
+                Pin::new(&mut this.inner).poll_write(cx, &encrypted)
+                    .map(|r| r.map(|_| buf.len()))
+            }
+            WriteState::Writing { buf: wbuf, pos, cfb: saved_cfb } => {
+                if wbuf.is_empty() {
+                    use rand::RngCore;
+                    let mut iv = [0u8; 16];
+                    rand::rngs::OsRng.fill_bytes(&mut iv);
+                    let mut cfb = CfbState::new(&this.key, &iv);
+                    let mut encrypted = buf.to_vec();
+                    cfb.encrypt(&mut encrypted);
+                    *wbuf = iv.to_vec();
+                    wbuf.extend_from_slice(&encrypted);
+                    *pos = 0;
+                    *saved_cfb = Some(cfb);
+                }
+                match Pin::new(&mut this.inner).poll_write(cx, &wbuf[*pos..]) {
+                    Poll::Ready(Ok(n)) => {
+                        *pos += n;
+                        if *pos >= wbuf.len() {
+                            let cfb = saved_cfb.take().expect("cfb must be set after first write");
+                            this.state = WriteState::Encrypting { cfb };
+                        }
+                        Poll::Ready(Ok(buf.len()))
+                    }
+                    other => other,
+                }
+            }
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
 
 struct CfbState {
     cipher: Aes128,
@@ -235,8 +371,8 @@ mod tests {
         let token = "cc12122121212121212112565656CCtzT";
         let key = crate::encryption::derive_key(token);
         eprintln!("Key: {}", hex::encode(key));
-        // Expected from Go (salt="frp"): 004bc8379ee00e3d0c9eb0953c0b212c
-        assert_eq!(hex::encode(key), "004bc8379ee00e3d0c9eb0953c0b212c");
+        // Expected from Go (salt="crypto"): 562ff6e7fbc064e40619b1c0e262c26f
+        assert_eq!(hex::encode(key), "562ff6e7fbc064e40619b1c0e262c26f");
     }
 
     #[test]
@@ -251,7 +387,7 @@ mod tests {
         cfb.encrypt(&mut ciphertext);
         eprintln!("Ciphertext: {}", hex::encode(&ciphertext));
         // Expected from Go: 287efd63efada80f1a2a2285a904d144
-        assert_eq!(hex::encode(&ciphertext), "d0710014c7af8e001ea6bfb27e97e1f7");
+        assert_eq!(hex::encode(&ciphertext), "287efd63efada80f1a2a2285a904d144");
     }
 
     #[tokio::test]
@@ -307,3 +443,41 @@ mod tests {
         eprintln!("Ping decrypted: {}", hex::encode(&decrypted2));
         assert_eq!(decrypted2, ping, "Second message round-trip failed!");
     }
+
+#[cfg(test)]
+mod go_interop_tests {
+    use tokio::io::AsyncReadExt;
+    
+    #[tokio::test]
+    async fn test_decrypt_go_format() {
+        // Verify CipherReader can decrypt data in Go frp format:
+        //   [16-byte random IV][CFB-encrypted V1 frame]
+        // Key: PBKDF2-SHA1(token="enc-test-token-2024", salt="crypto", 64, 16)
+        //   = a58f5b6761113b3aee79551cac8842c0
+        let token = "enc-test-token-2024";
+        let key = crate::encryption::derive_key(token);
+        assert_eq!(hex::encode(key), "a58f5b6761113b3aee79551cac8842c0");
+
+        // Pre-computed: [IV=965be112...][CFB-ct of NewProxy V1 frame]
+        let wire = hex::decode(
+            "965be1126c68f86001726011ba25e3b8\
+             a11f53ebd88f99919292fd2a28ee574ba59ab6970a39bcce8e77f5963eab76fa\
+             9cddc352971223e988a3252b85549b641b06ee9e2ddba90f7416d94472329f82\
+             89686089900f14042f"
+        ).unwrap();
+
+        // Expected plaintext: V1 NewProxy frame
+        let np_json = b"{\"proxy_name\":\"enc-echo\",\"proxy_type\":\"tcp\",\"remote_port\":19902}";
+        let np_len = np_json.len() as u64;
+        let mut expected = Vec::new();
+        expected.push(0x70u8);
+        expected.extend_from_slice(&np_len.to_be_bytes());
+        expected.extend_from_slice(np_json);
+
+        let mut reader = crate::cipher_stream::CipherReader::new(wire.as_slice(), key);
+        let mut decrypted = vec![0u8; expected.len()];
+        reader.read_exact(&mut decrypted).await.unwrap();
+
+        assert_eq!(decrypted, expected, "Go-format CFB decryption must produce correct V1 frame");
+    }
+}

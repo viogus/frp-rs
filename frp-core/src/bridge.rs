@@ -1,30 +1,43 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::bandwidth::BandwidthLimiter;
+use crate::cipher_stream::{CipherReader, CipherWriter};
 use crate::encryption;
 
 /// Bridge data between user and work connections over an encrypted+compressed channel.
-/// Matches Go frp v0.69.1: compress (Snappy) → encrypt (AES-128-CFB) → frame (4-byte BE length).
+/// Matches Go frp v0.69.1: compress (Snappy) → encrypt (AES-128-CFB streaming).
 ///
-/// Protocol frame:
-///   [4-byte big-endian length][encrypted payload]
-/// Encrypted payload: [16-byte IV][CFB-encrypted(compressed plaintext)]
+/// Encryption uses streaming CFB: work_r / work_w are wrapped in
+/// `CipherReader` / `CipherWriter` internally. A single random IV is sent
+/// per direction on the first write/read, then all subsequent data is
+/// encrypted/decrypted with continuous cipher state.
 ///
-/// When bandwidth limiters are provided they throttle the corresponding direction
-/// before each write. `read_limiter` limits work→user (download), `write_limiter`
-/// limits user→work (upload).
+/// `pre_read` bytes (e.g., VHost HTTP body) are written through the encrypting
+/// writer before the main bridge loop, ensuring they share the same IV and
+/// CFB state.
+///
+/// `read_limiter` limits work→user (download). `write_limiter` limits user→work (upload).
 pub async fn bridge_encrypted(
     mut user_r: impl AsyncReadExt + Unpin,
     mut user_w: impl AsyncWriteExt + Unpin,
-    mut work_r: impl AsyncReadExt + Unpin,
-    mut work_w: impl AsyncWriteExt + Unpin,
+    work_r: impl AsyncReadExt + Unpin,
+    work_w: impl AsyncWriteExt + Unpin,
     key: &[u8; 16],
     use_compression: bool,
+    pre_read: Vec<u8>,
     mut read_limiter: Option<&mut BandwidthLimiter>,
     mut write_limiter: Option<&mut BandwidthLimiter>,
 ) {
-    // User → Work: read from user, compress, encrypt, write to work
+    let mut enc_work_r = CipherReader::new(work_r, *key);
+    let mut enc_work_w = CipherWriter::new(work_w, *key);
+
+    // User → Work: write pre_read first (through CipherWriter), then bridge
     let user_to_work = async {
+        if !pre_read.is_empty() {
+            if enc_work_w.write_all(&pre_read).await.is_err() {
+                return;
+            }
+        }
         let mut buf = vec![0u8; 65536];
         loop {
             let n = match user_r.read(&mut buf).await {
@@ -43,54 +56,43 @@ pub async fn bridge_encrypted(
                 payload.to_vec()
             };
 
-            // Apply write bandwidth limit before encrypt+send
+            // Apply write bandwidth limit before send
             if let Some(ref mut lim) = write_limiter {
                 lim.consume(processed.len()).await;
             }
 
-            match encryption::encrypt(&processed, key) {
-                Ok(encrypted) => {
-                    let len = u32::try_from(encrypted.len()).unwrap_or(u32::MAX).to_be_bytes();
-                    if work_w.write_all(&len).await.is_err() { break; }
-                    if work_w.write_all(&encrypted).await.is_err() { break; }
-                    if work_w.flush().await.is_err() { break; }
-                }
-                Err(_) => break,
-            }
+            if enc_work_w.write_all(&processed).await.is_err() { break; }
+            if enc_work_w.flush().await.is_err() { break; }
         }
     };
 
-    // Work → User: read from work, decrypt, decompress, write to user
+    // Work → User: read from work (decrypted), decompress, write to user
     let work_to_user = async {
-        let mut len_buf = [0u8; 4];
+        let mut buf = vec![0u8; 65536];
         loop {
-            let len = match read_frame_length(&mut work_r, &mut len_buf).await {
-                Some(l) => l,
-                None => break,
-            };
-            let mut enc_buf = vec![0u8; len];
-            if work_r.read_exact(&mut enc_buf).await.is_err() { break; }
-            match encryption::decrypt(&enc_buf, key) {
-                Ok(processed) => {
-                    let plaintext = if use_compression {
-                        match encryption::decompress(&processed) {
-                            Ok(p) => p,
-                            Err(_) => break,
-                        }
-                    } else {
-                        processed
-                    };
-
-                    // Apply read bandwidth limit before writing to user
-                    if let Some(ref mut lim) = read_limiter {
-                        lim.consume(plaintext.len()).await;
-                    }
-
-                    if user_w.write_all(&plaintext).await.is_err() { break; }
-                    if user_w.flush().await.is_err() { break; }
-                }
+            let n = match enc_work_r.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
                 Err(_) => break,
+            };
+            let decrypted = &buf[..n];
+
+            let plaintext = if use_compression {
+                match encryption::decompress(decrypted) {
+                    Ok(p) => p,
+                    Err(_) => break,
+                }
+            } else {
+                decrypted.to_vec()
+            };
+
+            // Apply read bandwidth limit before writing to user
+            if let Some(ref mut lim) = read_limiter {
+                lim.consume(plaintext.len()).await;
             }
+
+            if user_w.write_all(&plaintext).await.is_err() { break; }
+            if user_w.flush().await.is_err() { break; }
         }
     };
 
@@ -152,17 +154,4 @@ pub async fn bridge_plain_rate_limited(
     };
 
     let _ = tokio::join!(user_to_work, work_to_user);
-}
-
-/// Read a 4-byte big-endian length prefix from the reader.
-async fn read_frame_length(
-    reader: &mut (impl AsyncReadExt + Unpin),
-    buf: &mut [u8; 4],
-) -> Option<usize> {
-    reader.read_exact(buf).await.ok()?;
-    let len = u32::from_be_bytes(*buf) as usize;
-    if len == 0 || len > 1024 * 1024 {
-        return None; // reject zero-length frames and frames > 1MB
-    }
-    Some(len)
 }

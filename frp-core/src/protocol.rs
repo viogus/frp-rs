@@ -51,6 +51,8 @@ pub async fn read_v1_frame<R: AsyncReadExt + Unpin>(
         header[5], header[6], header[7], header[8],
     ]);
 
+    tracing::debug!("V1 header: type={:#04x} len={} raw={}", type_byte, length, hex::encode(&header));
+
     if length < 0 || length > V1_MAX_MSG_LENGTH {
         return Err(crate::Error::Protocol(format!("invalid V1 msg length: {length}")));
     }

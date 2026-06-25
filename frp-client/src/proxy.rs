@@ -113,7 +113,7 @@ pub async fn bridge_streams(
             let (l_r, l_w) = tokio::io::split(local);
             let (w_r, w_w) = work.into_split();
             bridge::bridge_encrypted(
-                l_r, l_w, w_r, w_w, key, use_compression,
+                l_r, l_w, w_r, w_w, key, use_compression, Vec::new(),
                 read_lim.as_mut(), write_lim.as_mut(),
             ).await;
             debug!("Proxy {} encrypted bridge closed", name);
