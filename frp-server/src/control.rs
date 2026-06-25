@@ -428,6 +428,40 @@ pub async fn handle_control<S>(
                         });
                         let _ = write_msg_v1(&mut writer, &cpr).await;
                     }
+                    Ok(FrpMessage::NatHoleSid(ref sid_msg)) => {
+                        debug!("Received NatHoleSid from provider: {:?}", sid_msg.sid);
+                        if let Some(ref sid) = sid_msg.sid {
+                            // Forward NatHoleSid to the visitor via the session's writer.
+                            // The server adds provider_addr to the forwarded message.
+                            if let Some(mut writer) = state.nat_hole.take_writer(sid).await {
+                                let forward = FrpMessage::NatHoleSid(msg::NatHoleSid {
+                                    sid: Some(sid.clone()),
+                                    provider_addr: peer.as_ref().map(|a| a.to_string()),
+                                });
+                                if write_msg_v1(&mut writer, &forward).await.is_ok() {
+                                    debug!("Forwarded NatHoleSid to visitor for session {}", sid);
+                                } else {
+                                    warn!("Failed to write NatHoleSid to visitor for session {}", sid);
+                                }
+                                state.nat_hole.return_writer(sid, writer).await;
+                            } else {
+                                warn!("NatHoleSid for unknown session {}", sid);
+                            }
+                        }
+                    }
+                    Ok(FrpMessage::NatHoleReport(ref report_msg)) => {
+                        debug!("Received NatHoleReport from provider: {:?}", report_msg.sid);
+                        if let Some(ref sid) = report_msg.sid {
+                            // Forward NatHoleReport to the visitor and complete the session
+                            if let Some(mut writer) = state.nat_hole.take_writer(sid).await {
+                                let forward = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                                    sid: Some(sid.clone()),
+                                });
+                                let _ = write_msg_v1(&mut writer, &forward).await;
+                            }
+                            state.nat_hole.complete(sid).await;
+                        }
+                    }
                     Ok(FrpMessage::Ping(ref ping_msg)) => {
                         // Validate ping auth (Go frp v0.69.1 compat)
                         // OIDC path: verify JWT + subject binding
@@ -670,11 +704,11 @@ async fn handle_new_proxy(
             }
 
             // Register STCP proxies in sk_index
-            if np.proxy_type == "stcp" {
+            if np.proxy_type == "stcp" || np.proxy_type == "xtcp" {
                 if let Some(ref sk) = np.sk {
                     if !sk.is_empty() {
                         state.sk_index.write().await.insert(sk.clone(), np.proxy_name.clone());
-                        info!("STCP proxy '{}' registered with sk", np.proxy_name);
+                        info!("STCP/XTCP proxy '{}' registered with sk", np.proxy_name);
                     }
                 }
             }
