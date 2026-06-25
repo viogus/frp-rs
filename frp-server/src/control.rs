@@ -52,24 +52,51 @@ pub async fn handle_control<S>(
     info!("New control connection from {:?}", peer);
 
     // --- Authenticate ---
-    if let Err(e) = state.auth_cfg.validate_login(
-        login.privilege_key.as_deref(),
-        login.timestamp,
-    ) {
-        warn!("Authentication failed for {:?}: {}", peer, e);
-        let resp = FrpMessage::LoginResp(msg::LoginResp {
-            version: Some(frp_core::VERSION.into()),
-            run_id: None,
-            error: Some(e),
-        });
-        let (_, mut writer) = tokio::io::split(stream);
-        let _ = write_msg_v1(&mut writer, &resp).await;
-        return;
-    }
+    let oidc_subject: Option<String> = if let Some(ref verifier) = state.oidc_verifier {
+        let token = login.privilege_key.as_deref().unwrap_or("");
+        match verifier.verify_login(token).await {
+            Ok(oidc_token) => {
+                info!("OIDC login verified: subject={}", oidc_token.subject);
+                Some(oidc_token.subject)
+            }
+            Err(e) => {
+                warn!("OIDC auth failed for {:?}: {}", peer, e);
+                let (_, mut writer) = tokio::io::split(stream);
+                let resp = FrpMessage::LoginResp(msg::LoginResp {
+                    version: Some(frp_core::VERSION.into()),
+                    run_id: None,
+                    error: Some(format!("OIDC authentication failed: {e}")),
+                });
+                let _ = write_msg_v1(&mut writer, &resp).await;
+                return;
+            }
+        }
+    } else {
+        if let Err(e) = state.auth_cfg.validate_login(
+            login.privilege_key.as_deref(),
+            login.timestamp,
+        ) {
+            warn!("Authentication failed for {:?}: {}", peer, e);
+            let (_, mut writer) = tokio::io::split(stream);
+            let resp = FrpMessage::LoginResp(msg::LoginResp {
+                version: Some(frp_core::VERSION.into()),
+                run_id: None,
+                error: Some(e),
+            });
+            let _ = write_msg_v1(&mut writer, &resp).await;
+            return;
+        }
+        None
+    };
 
     let run_id = login.run_id.clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     info!("Client {:?} logged in with run_id: {}", peer, run_id);
+
+    // Store OIDC subject for ping/NWC verification
+    if let Some(ref sub) = oidc_subject {
+        state.oidc_subjects.write().await.insert(run_id.clone(), sub.clone());
+    }
 
     // --- Set up internal channel ---
     let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<InternalMsg>();
@@ -389,10 +416,21 @@ pub async fn handle_control<S>(
                     }
                     Ok(FrpMessage::Ping(ref ping_msg)) => {
                         // Validate ping auth (Go frp v0.69.1 compat)
-                        if let Err(e) = state.auth_cfg.validate_login(
-                            ping_msg.privilege_key.as_deref(),
-                            ping_msg.timestamp,
-                        ) {
+                        // OIDC path: verify JWT + subject binding
+                        let ping_auth_result = if let Some(ref verifier) = state.oidc_verifier {
+                            let expected_sub = state.oidc_subjects.read().await
+                                .get(&run_id).cloned().unwrap_or_default();
+                            verifier.verify_ping(
+                                ping_msg.privilege_key.as_deref().unwrap_or(""),
+                                &expected_sub,
+                            ).await
+                        } else {
+                            state.auth_cfg.validate_login(
+                                ping_msg.privilege_key.as_deref(),
+                                ping_msg.timestamp,
+                            ).map(|_| ())
+                        };
+                        if let Err(e) = ping_auth_result {
                             warn!("Ping auth failed from {:?}: {}", peer, e);
                             let pong = FrpMessage::Pong(msg::Pong { error: Some(e) });
                             let _ = write_msg_v1(&mut writer, &pong).await;

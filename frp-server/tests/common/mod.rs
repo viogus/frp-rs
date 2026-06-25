@@ -3,8 +3,10 @@ use tokio::net::TcpSocket;
 use tokio::task::JoinHandle;
 
 use frp_core::config::ServerConfig;
+use frp_core::encryption;
 use frp_core::msg::{FrpMessage, Login, LoginResp};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
+use frp_core::transport::IoStream;
 use frp_server::service::Service;
 
 /// Bind to a random port, return the port number, then drop the socket.
@@ -19,7 +21,7 @@ pub fn allocate_port() -> u16 {
 /// The server is ready to accept connections after a short sleep.
 pub async fn start_test_server(cfg: ServerConfig) -> (JoinHandle<()>, u16) {
     let port = cfg.bind_port;
-    let service = Service::new(cfg);
+    let service = Service::new(cfg).await;
     let handle = tokio::spawn(async move {
         let _ = service.run().await;
     });
@@ -28,14 +30,17 @@ pub async fn start_test_server(cfg: ServerConfig) -> (JoinHandle<()>, u16) {
     (handle, port)
 }
 
-/// Connect to the server and send a Login message. Returns the LoginResp.
-/// Keeps the connection open (caller holds the stream for further messages).
+/// Connect to the server and send a Login message.
+/// Returns the encrypted IoStream (AES-128-CFB, matching server post-login)
+/// and the LoginResp. Caller can continue sending/receiving messages.
+/// `token` is the shared auth secret (empty = no auth); used for key derivation.
 pub async fn raw_login(
     addr: SocketAddr,
     privilege_key: Option<String>,
     timestamp: Option<i64>,
-) -> Result<(tokio::net::TcpStream, LoginResp), frp_core::Error> {
-    let mut stream = tokio::net::TcpStream::connect(addr).await.map_err(|e| {
+    token: &str,
+) -> Result<(IoStream, LoginResp), frp_core::Error> {
+    let stream = tokio::net::TcpStream::connect(addr).await.map_err(|e| {
         frp_core::Error::Transport(format!("connect to {}: {}", addr, e))
     })?;
 
@@ -55,10 +60,16 @@ pub async fn raw_login(
         multiplexer: None,
     });
 
-    write_msg_v1(&mut stream, &login).await?;
+    let mut io = IoStream::Tcp(stream);
+    write_msg_v1(&mut io, &login).await?;
 
-    match read_msg_v1(&mut stream).await? {
-        FrpMessage::LoginResp(resp) => Ok((stream, resp)),
+    match read_msg_v1(&mut io).await? {
+        FrpMessage::LoginResp(resp) => {
+            // Wrap in AES-128-CFB encryption (matches server post-login)
+            let enc_key = encryption::derive_key(token);
+            let encrypted = io.into_encrypted(enc_key);
+            Ok((encrypted, resp))
+        }
         other => Err(frp_core::Error::Protocol(format!(
             "expected LoginResp, got type byte {:?}",
             other.v1_type_byte()
@@ -71,7 +82,8 @@ pub async fn raw_login_resp(
     addr: SocketAddr,
     privilege_key: Option<String>,
     timestamp: Option<i64>,
+    token: &str,
 ) -> Result<LoginResp, frp_core::Error> {
-    let (_, resp) = raw_login(addr, privilege_key, timestamp).await?;
+    let (_, resp) = raw_login(addr, privilege_key, timestamp, token).await?;
     Ok(resp)
 }

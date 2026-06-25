@@ -25,7 +25,7 @@ async fn test_stcp_visitor_routed_to_provider() {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // --- Step 1: Provider logs in ---
-    let (mut provider, resp) = raw_login(addr, None, None).await.expect("provider login");
+    let (mut provider, resp) = raw_login(addr, None, None, "").await.expect("provider login");
     let run_id = resp.run_id.expect("provider should get run_id");
 
     // --- Step 2: Provider registers STCP proxy ---

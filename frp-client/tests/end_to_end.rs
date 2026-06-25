@@ -110,7 +110,7 @@ async fn test_e2e_tcp_proxy_over_websocket() {
         allow_port_end: proxy_port.saturating_add(50).min(u16::MAX),
         ..Default::default()
     };
-    let server_svc = ServerService::new(server_cfg);
+    let server_svc = ServerService::new(server_cfg).await;
     let _server = tokio::spawn(async move { let _ = server_svc.run().await; });
 
     let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
@@ -213,6 +213,8 @@ async fn test_e2e_tcp_proxy_over_tls() {
             oidc_issuer: String::new(),
             oidc_audience: String::new(),
             oidc_token_endpoint: String::new(),
+            oidc_skip_expiry: false,
+            oidc_skip_issuer: false,
         },
         tls_enable: true,
         tls_cert_file: cert_dir.join("server.crt").to_string_lossy().into(),
@@ -221,7 +223,7 @@ async fn test_e2e_tcp_proxy_over_tls() {
         allow_port_end: proxy_port.saturating_add(50).min(u16::MAX),
         ..Default::default()
     };
-    let server_svc = ServerService::new(server_cfg);
+    let server_svc = ServerService::new(server_cfg).await;
     let _server = tokio::spawn(async move { let _ = server_svc.run().await; });
 
     let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
@@ -319,7 +321,7 @@ async fn test_e2e_tcp_proxy_over_yamux() {
         },
         ..Default::default()
     };
-    let server_svc = ServerService::new(server_cfg);
+    let server_svc = ServerService::new(server_cfg).await;
     let _server = tokio::spawn(async move { let _ = server_svc.run().await; });
 
     let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();

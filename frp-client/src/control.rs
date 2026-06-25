@@ -5,7 +5,7 @@ use tracing::{debug, info, warn};
 use frp_core::config::ProxyConfig;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::write_msg_v1;
-use frp_core::auth::AuthConfig;
+use frp_core::auth::{AuthConfig, OidcClient};
 use frp_core::mux::{self, YamuxSession};
 use frp_core::transport::{IoStream, TransportProtocol, DialOptions, dial_server};
 use frp_core::VERSION;
@@ -26,6 +26,7 @@ pub struct ControlConnection {
     tls_server_name: String,
     tls_ca_file: Option<String>,
     tcp_mux: bool,
+    oidc_client: Option<Arc<OidcClient>>,
 }
 
 impl ControlConnection {
@@ -41,6 +42,7 @@ impl ControlConnection {
         tls_server_name: String,
         tls_ca_file: Option<String>,
         tcp_mux: bool,
+        oidc_client: Option<Arc<OidcClient>>,
     ) -> Self {
         Self {
             server_addr,
@@ -55,6 +57,7 @@ impl ControlConnection {
             tls_server_name,
             tls_ca_file,
             tcp_mux,
+            oidc_client,
         }
     }
 
@@ -104,9 +107,7 @@ impl ControlConnection {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        let privilege_key = self.auth_cfg.generate_login_key(timestamp);
-
-        let login = FrpMessage::Login(msg::Login {
+        let mut login = msg::Login {
             version: Some(VERSION.into()),
             hostname: Some(hostname().await.unwrap_or_default()),
             os: Some(std::env::consts::OS.into()),
@@ -116,11 +117,21 @@ impl ControlConnection {
             client_id: if self.client_id.is_empty() { None } else { Some(self.client_id.clone()) },
             pool_count: Some(self.pool_count),
             timestamp: Some(timestamp),
-            privilege_key,
+            privilege_key: None,
             metas: None,
             client_spec: None,
             multiplexer: if propose_mux { Some("yamux".into()) } else { None },
-        });
+        };
+
+        // Set auth: OIDC path or token path
+        if let Some(ref oidc) = self.oidc_client {
+            oidc.set_login(&mut login).await
+                .map_err(|e| frp_core::Error::Auth(format!("OIDC login: {e}")))?;
+        } else {
+            login.privilege_key = self.auth_cfg.generate_login_key(timestamp);
+        }
+
+        let login = FrpMessage::Login(login);
 
         io_stream.write_v1_frame(&login).await?;
         info!("Login sent, waiting for response...");

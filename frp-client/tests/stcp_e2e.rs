@@ -28,7 +28,7 @@ async fn test_stcp_e2e_relay() {
     let _echo_handle = start_echo_server(echo_port);
 
     // 2. Start frps
-    let _server_handle = start_frps(server_port, "");
+    let _server_handle = start_frps(server_port, "").await;
     let server_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
     wait_for_port(server_addr, Duration::from_secs(5))
         .await

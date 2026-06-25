@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tracing::{info, error, warn};
 
 use frp_core::config::ServerConfig;
-use frp_core::auth::{AuthConfig, AuthMethod};
+use frp_core::auth::{AuthConfig, AuthMethod, OidcVerifier};
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::read_msg_v1;
 use frp_core::mux;
@@ -67,10 +67,12 @@ pub struct AppState {
     pub tcp_mux: bool,
     pub tcp_mux_keepalive: i64,
     pub tls_only: bool,
+    pub oidc_verifier: Option<Arc<OidcVerifier>>,
+    pub oidc_subjects: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl AppState {
-    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, tls_only: bool) -> Self {
+    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             auth_cfg: Arc::new(auth_cfg),
@@ -87,6 +89,8 @@ impl AppState {
             tcp_mux,
             tcp_mux_keepalive,
             tls_only,
+            oidc_verifier,
+            oidc_subjects: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -101,7 +105,7 @@ pub struct Service {
 }
 
 impl Service {
-    pub fn new(cfg: ServerConfig) -> Self {
+    pub async fn new(cfg: ServerConfig) -> Self {
         let auth_cfg = AuthConfig {
             method: match cfg.auth.method.to_lowercase().as_str() {
                 "oidc" => AuthMethod::Oidc,
@@ -114,6 +118,27 @@ impl Service {
             oidc_skip_issuer: cfg.auth.oidc_skip_issuer,
             additional_data: None,
         };
+
+        let oidc_verifier = if auth_cfg.method == AuthMethod::Oidc {
+            match OidcVerifier::new(
+                auth_cfg.oidc_issuer.clone(),
+                auth_cfg.oidc_audience.clone(),
+                auth_cfg.oidc_skip_expiry,
+                auth_cfg.oidc_skip_issuer,
+            ).await {
+                Ok(v) => {
+                    info!("OIDC verifier initialized (issuer: {})", auth_cfg.oidc_issuer);
+                    Some(Arc::new(v))
+                }
+                Err(e) => {
+                    error!("OIDC verifier initialization failed: {e}");
+                    panic!("Cannot start frps with OIDC auth: {e}");
+                }
+            }
+        } else {
+            None
+        };
+
         let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
         let allow_ports = if !cfg.allow_ports.is_empty() {
             frp_core::config::parse_allow_ports(&cfg.allow_ports)
@@ -135,6 +160,7 @@ impl Service {
             cfg.transport.tcp_mux,
             cfg.transport.tcp_mux_keepalive_interval,
             cfg.tls_only,
+            oidc_verifier,
         )),
             cfg,
         }
@@ -609,10 +635,21 @@ async fn handle_work_conn_inner(
     };
 
     // Verify work connection auth (Go frp v0.69.1 compat)
-    if let Err(e) = state.auth_cfg.validate_login(
-        msg.privilege_key.as_deref(),
-        msg.timestamp,
-    ) {
+    // OIDC path: verify JWT + subject binding
+    let nwc_auth_result = if let Some(ref verifier) = state.oidc_verifier {
+        let expected_sub = state.oidc_subjects.read().await
+            .get(&run_id).cloned().unwrap_or_default();
+        verifier.verify_new_work_conn(
+            msg.privilege_key.as_deref().unwrap_or(""),
+            &expected_sub,
+        ).await
+    } else {
+        state.auth_cfg.validate_login(
+            msg.privilege_key.as_deref(),
+            msg.timestamp,
+        ).map(|_| ())
+    };
+    if let Err(e) = nwc_auth_result {
         warn!("Work conn auth failed for run_id {}: {}", run_id, e);
         return;
     }

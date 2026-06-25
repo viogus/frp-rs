@@ -51,7 +51,7 @@ pub fn start_echo_server(port: u16) -> JoinHandle<()> {
 }
 
 /// Start the frps server on the given port with an optional auth token.
-pub fn start_frps(port: u16, token: &str) -> JoinHandle<()> {
+pub async fn start_frps(port: u16, token: &str) -> JoinHandle<()> {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
@@ -65,6 +65,8 @@ pub fn start_frps(port: u16, token: &str) -> JoinHandle<()> {
             oidc_issuer: String::new(),
             oidc_audience: String::new(),
             oidc_token_endpoint: String::new(),
+            oidc_skip_expiry: false,
+            oidc_skip_issuer: false,
         },
         allow_port_start: port.saturating_sub(50),
         allow_port_end: port.saturating_add(50).min(u16::MAX),
@@ -74,7 +76,7 @@ pub fn start_frps(port: u16, token: &str) -> JoinHandle<()> {
         },
         ..Default::default()
     };
-    let service = ServerService::new(cfg);
+    let service = ServerService::new(cfg).await;
     tokio::spawn(async move {
         let _ = service.run().await;
     })
@@ -125,7 +127,7 @@ impl TestHarness {
         let echo_handle = start_echo_server(echo_port);
 
         // 2. Start frps
-        let server_handle = start_frps(server_port, token);
+        let server_handle = start_frps(server_port, token).await;
         // Wait for server to start accepting connections
         let server_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
         wait_for_port(server_addr, Duration::from_secs(5))

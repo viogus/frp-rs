@@ -942,4 +942,36 @@ remote_port = 7001
         // Large value doesn't overflow
         assert!(parse_bandwidth_limit("999MB").is_some());
     }
+
+    #[test]
+    fn test_auth_client_config_default() {
+        let cfg = AuthClientConfig::default();
+        assert_eq!(cfg.method, "token");
+        assert!(cfg.token.is_empty());
+        assert!(cfg.oidc_client_id.is_empty());
+        assert!(cfg.oidc_client_secret.is_empty());
+        assert!(cfg.oidc_audience.is_empty());
+        assert!(cfg.oidc_token_endpoint.is_empty());
+        assert!(cfg.oidc_scope.is_empty());
+        assert!(cfg.oidc_issuer.is_empty());
+        assert!(cfg.additional_endpoint_params.is_empty());
+    }
+
+    #[test]
+    fn test_auth_client_config_oidc_method() {
+        // When method is "oidc", oidc_* fields should be usable
+        let cfg = AuthClientConfig {
+            method: "oidc".into(),
+            oidc_client_id: "client-123".into(),
+            oidc_client_secret: "secret-456".into(),
+            oidc_audience: "https://api.example.com".into(),
+            oidc_issuer: "https://auth.example.com".into(),
+            oidc_scope: "openid profile".into(),
+            oidc_token_endpoint: "https://auth.example.com/token".into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.method, "oidc");
+        assert_eq!(cfg.oidc_client_id, "client-123");
+        assert_eq!(cfg.oidc_audience, "https://api.example.com");
+    }
 }

@@ -75,7 +75,7 @@ async fn run(cli: CliArgs) {
             match load_server_config(&path_str) {
                 Ok(cfg) => {
                     handles.push(tokio::spawn(async move {
-                        let service = Service::new(cfg);
+                        let service = Service::new(cfg).await;
                         if let Err(e) = service.run().await {
                             tracing::error!("frps service error for config file [{}]: {}", path_str, e);
                         }
@@ -112,7 +112,7 @@ async fn run(cli: CliArgs) {
     init_logging(&cli, Some(&cfg));
 
     tracing::info!("frps (Rust) v{} starting...", frp_core::VERSION);
-    let service = Service::new(cfg);
+    let service = Service::new(cfg).await;
     if let Err(e) = service.run().await {
         tracing::error!("frps error: {}", e);
         process::exit(1);

@@ -188,7 +188,7 @@ impl OidcVerifier {
     }
 
     /// Build a jsonwebtoken::DecodingKey from a JWKS key JSON value.
-    fn decoding_key_from_jwk(key: &serde_json::Value) -> Result<jsonwebtoken::DecodingKey, String> {
+    pub(crate) fn decoding_key_from_jwk(key: &serde_json::Value) -> Result<jsonwebtoken::DecodingKey, String> {
         let kty = key["kty"].as_str().unwrap_or("");
         match kty {
             "RSA" => {
@@ -444,6 +444,11 @@ impl OidcClient {
         Ok(token)
     }
 
+    /// Return the token endpoint URL (for logging).
+    pub fn token_endpoint(&self) -> &str {
+        &self.token_endpoint
+    }
+
     /// Set privilege_key on a Login message using an OIDC token.
     pub async fn set_login(&self, login: &mut crate::msg::Login) -> Result<(), String> {
         let token = self.get_token().await?;
@@ -501,5 +506,100 @@ mod tests {
 
         let empty_cfg = AuthConfig::default();
         assert!(empty_cfg.validate_login(None, None).is_ok());
+    }
+
+    #[test]
+    fn test_auth_config_oidc_rejects_without_verifier() {
+        let cfg = AuthConfig {
+            method: AuthMethod::Oidc,
+            token: String::new(),
+            oidc_issuer: "https://issuer.example.com".into(),
+            oidc_audience: "my-audience".into(),
+            oidc_skip_expiry: false,
+            oidc_skip_issuer: false,
+            additional_data: None,
+        };
+        // AuthConfig::validate_login for OIDC returns error when no server-side verifier
+        let result = cfg.validate_login(Some("some-jwt-token"), Some(100));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("OIDC"));
+    }
+
+    #[test]
+    fn test_decoding_key_from_rsa_jwk() {
+        // Minimal RSA JWK with known test values
+        let jwk = serde_json::json!({
+            "kty": "RSA",
+            "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+            "e": "AQAB"
+        });
+        let key = OidcVerifier::decoding_key_from_jwk(&jwk);
+        assert!(key.is_ok(), "RSA JWK should parse: {:?}", key.err());
+    }
+
+    #[test]
+    fn test_decoding_key_from_oct_jwk() {
+        // oct key for HS256 — "abcdefghijklmnopqrstuvwxyz123456" in standard base64
+        let jwk = serde_json::json!({
+            "kty": "oct",
+            "k": "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY="
+        });
+        let key = OidcVerifier::decoding_key_from_jwk(&jwk);
+        assert!(key.is_ok(), "oct JWK should parse: {:?}", key.err());
+    }
+
+    #[test]
+    fn test_decoding_key_from_ec_jwk() {
+        // EC P-256 key
+        let jwk = serde_json::json!({
+            "kty": "EC",
+            "crv": "P-256",
+            "x": "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+            "y": "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"
+        });
+        let key = OidcVerifier::decoding_key_from_jwk(&jwk);
+        assert!(key.is_ok(), "EC JWK should parse: {:?}", key.err());
+    }
+
+    #[test]
+    fn test_decoding_key_unsupported_kty() {
+        let jwk = serde_json::json!({
+            "kty": "UNKNOWN",
+            "x": "abc"
+        });
+        let result = OidcVerifier::decoding_key_from_jwk(&jwk);
+        match result {
+            Ok(_) => panic!("expected error for unsupported kty"),
+            Err(e) => assert!(e.contains("unsupported"), "got: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_auth_config_default() {
+        let cfg = AuthConfig::default();
+        assert!(matches!(cfg.method, AuthMethod::Token));
+        assert!(cfg.token.is_empty());
+        assert!(!cfg.oidc_skip_expiry);
+        assert!(!cfg.oidc_skip_issuer);
+    }
+
+    #[test]
+    fn test_generate_login_key_empty_token() {
+        let cfg = AuthConfig::default();
+        assert!(cfg.generate_login_key(100).is_none());
+    }
+
+    #[test]
+    fn test_generate_login_key_oidc_returns_none() {
+        let cfg = AuthConfig {
+            method: AuthMethod::Oidc,
+            token: "secret".into(),
+            oidc_issuer: String::new(),
+            oidc_audience: String::new(),
+            oidc_skip_expiry: false,
+            oidc_skip_issuer: false,
+            additional_data: None,
+        };
+        assert!(cfg.generate_login_key(100).is_none());
     }
 }

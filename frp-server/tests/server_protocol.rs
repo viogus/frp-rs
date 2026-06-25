@@ -33,7 +33,7 @@ async fn test_login_empty_token_succeeds() {
     let (_handle, _) = start_test_server(cfg).await;
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let resp = raw_login_resp(addr, None, None).await.expect("login should succeed");
+    let resp = raw_login_resp(addr, None, None, "").await.expect("login should succeed");
 
     assert!(resp.error.is_none(), "expected no error, got: {:?}", resp.error);
     assert!(resp.run_id.is_some(), "expected run_id to be set");
@@ -53,6 +53,8 @@ async fn test_login_wrong_token_fails() {
             oidc_issuer: String::new(),
             oidc_audience: String::new(),
             oidc_token_endpoint: String::new(),
+            oidc_skip_expiry: false,
+            oidc_skip_issuer: false,
         },
         ..Default::default()
     };
@@ -65,7 +67,7 @@ async fn test_login_wrong_token_fails() {
         .as_secs() as i64;
     let wrong_key = auth::generate_token("wrong-secret", ts);
 
-    let resp = raw_login_resp(addr, Some(wrong_key), Some(ts))
+    let resp = raw_login_resp(addr, Some(wrong_key), Some(ts), "secret")
         .await
         .expect("login should return a response");
 
@@ -88,6 +90,8 @@ async fn test_login_correct_token_succeeds() {
             oidc_issuer: String::new(),
             oidc_audience: String::new(),
             oidc_token_endpoint: String::new(),
+            oidc_skip_expiry: false,
+            oidc_skip_issuer: false,
         },
         ..Default::default()
     };
@@ -100,7 +104,7 @@ async fn test_login_correct_token_succeeds() {
         .as_secs() as i64;
     let key = auth::generate_token("secret", ts);
 
-    let resp = raw_login_resp(addr, Some(key), Some(ts))
+    let resp = raw_login_resp(addr, Some(key), Some(ts), "secret")
         .await
         .expect("login should succeed");
 
@@ -123,7 +127,7 @@ async fn test_ping_pong_no_auth() {
     let (_handle, _) = start_test_server(cfg).await;
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let (mut stream, _resp) = raw_login(addr, None, None).await.expect("login");
+    let (mut stream, _resp) = raw_login(addr, None, None, "").await.expect("login");
 
     // Send Ping
     let ping = FrpMessage::Ping(msg::Ping {
@@ -158,7 +162,7 @@ async fn test_new_proxy_registration_auto_port() {
     let (_handle, _) = start_test_server(cfg).await;
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let (mut stream, _resp) = raw_login(addr, None, None).await.expect("login");
+    let (mut stream, _resp) = raw_login(addr, None, None, "").await.expect("login");
 
     // Register a TCP proxy with auto-assign port (remote_port = 0)
     let np = FrpMessage::NewProxy(msg::NewProxy {
@@ -220,7 +224,7 @@ async fn test_new_proxy_duplicate_name_fails() {
     let (_handle, _) = start_test_server(cfg).await;
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let (mut stream, _resp) = raw_login(addr, None, None).await.expect("login");
+    let (mut stream, _resp) = raw_login(addr, None, None, "").await.expect("login");
 
     let mk_proxy = || FrpMessage::NewProxy(msg::NewProxy {
         proxy_name: "dup-tcp".into(),
@@ -306,7 +310,7 @@ async fn test_vhost_location_routing() {
     }
 
     // Provider logs in and registers HTTP proxy with locations
-    let (mut provider, resp) = raw_login(addr, None, None).await.expect("provider login");
+    let (mut provider, resp) = raw_login(addr, None, None, "").await.expect("provider login");
     let run_id = resp.run_id.expect("provider should get run_id");
 
     let np = FrpMessage::NewProxy(NewProxy {
@@ -405,7 +409,7 @@ async fn test_vhost_location_path_mismatch_404() {
     }
 
     // Provider registers HTTP proxy with locations (only /api)
-    let (mut provider, _resp) = raw_login(addr, None, None).await.expect("provider login");
+    let (mut provider, _resp) = raw_login(addr, None, None, "").await.expect("provider login");
 
     let np = FrpMessage::NewProxy(NewProxy {
         proxy_name: "http-loc-only".into(),

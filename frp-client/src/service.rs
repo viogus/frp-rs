@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::{interval, Duration};
 use tracing::{info, warn, debug};
 
-use frp_core::auth::{AuthConfig, AuthMethod};
+use frp_core::auth::{AuthConfig, AuthMethod, OidcClient};
 use frp_core::config::ClientConfig;
 use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
@@ -39,21 +39,47 @@ pub struct Service {
     proxy_info_map: HashMap<String, ProxyRuntimeInfo>,
     /// Plugin handles kept alive for the lifetime of the service.
     _plugin_handles: Vec<PluginHandle>,
+    /// OIDC client for fetching access tokens (None when auth method is Token).
+    oidc_client: Option<Arc<OidcClient>>,
 }
 
 impl Service {
     pub async fn new(cfg: ClientConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        // Determine auth method from [auth] section if present, otherwise token
+        let auth_method = if let Some(ref ac) = cfg.auth {
+            if ac.method == "oidc" { AuthMethod::Oidc } else { AuthMethod::Token }
+        } else {
+            AuthMethod::Token
+        };
+
         let auth_cfg = AuthConfig {
-            method: AuthMethod::Token,
+            method: auth_method.clone(),
             token: cfg.token.clone(),
-            oidc_issuer: String::new(),
-            oidc_audience: String::new(),
+            oidc_issuer: cfg.auth.as_ref().map(|a| a.oidc_issuer.clone()).unwrap_or_default(),
+            oidc_audience: cfg.auth.as_ref().map(|a| a.oidc_audience.clone()).unwrap_or_default(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             additional_data: None,
         };
 
         let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
+
+        // Create OIDC client if auth method is OIDC
+        let oidc_client = if auth_method == AuthMethod::Oidc {
+            let ac = cfg.auth.as_ref().ok_or("OIDC auth requires [auth] section in config")?;
+            let client = OidcClient::new(
+                ac.oidc_client_id.clone(),
+                ac.oidc_client_secret.clone(),
+                ac.oidc_audience.clone(),
+                Some(ac.oidc_token_endpoint.clone()).filter(|s| !s.is_empty()),
+                ac.oidc_scope.clone(),
+                Some(ac.oidc_issuer.clone()).filter(|s| !s.is_empty()),
+            ).await.map_err(|e| format!("OIDC client init failed: {e}"))?;
+            info!("OIDC client initialized, token endpoint: {}", client.token_endpoint());
+            Some(Arc::new(client))
+        } else {
+            None
+        };
 
         // Start plugins for proxies that have them configured.
         let mut plugin_handles = Vec::new();
@@ -129,6 +155,7 @@ impl Service {
             encryption_key: enc_key,
             proxy_info_map,
             _plugin_handles: plugin_handles,
+            oidc_client,
         })
     }
 
@@ -200,6 +227,7 @@ impl Service {
                 self.cfg.tls_server_name.clone(),
                 if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
                 self.cfg.tcp_mux,
+                self.oidc_client.clone(),
             );
 
             let (mut control_stream, run_id, yamux_session) = match ctl.login().await {
@@ -259,6 +287,7 @@ impl Service {
                     self.cfg.tls_server_name.clone(),
                     if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
                     yamux.clone(),
+                    self.oidc_client.clone(),
                 );
             }
 
@@ -384,6 +413,7 @@ impl Service {
                                     self.cfg.tls_server_name.clone(),
                                     if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
                                     yamux.clone(),
+                                    self.oidc_client.clone(),
                                 );
                             }
                             Ok(FrpMessage::Pong(_)) => {
@@ -444,23 +474,33 @@ impl Service {
                     }
 
                     _ = ping_interval.tick() => {
-                        let ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs() as i64;
-                        let ping_auth = AuthConfig {
-                            method: AuthMethod::Token,
-                            token: auth_token.clone(),
-                            oidc_issuer: String::new(),
-                            oidc_audience: String::new(),
-                            oidc_skip_expiry: false,
-                            oidc_skip_issuer: false,
-                            additional_data: None,
+                        let mut ping_msg = msg::Ping {
+                            privilege_key: None,
+                            timestamp: None,
                         };
-                        let ping = FrpMessage::Ping(msg::Ping {
-                            privilege_key: ping_auth.generate_login_key(ts),
-                            timestamp: Some(ts),
-                        });
+                        if let Some(ref oidc) = self.oidc_client {
+                            if let Err(e) = oidc.set_ping(&mut ping_msg).await {
+                                warn!("OIDC ping token failed: {}. Reconnecting...", e);
+                                break;
+                            }
+                        } else {
+                            let ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64;
+                            let ping_auth = AuthConfig {
+                                method: AuthMethod::Token,
+                                token: self.auth_cfg.token.clone(),
+                                oidc_issuer: String::new(),
+                                oidc_audience: String::new(),
+                                oidc_skip_expiry: false,
+                                oidc_skip_issuer: false,
+                                additional_data: None,
+                            };
+                            ping_msg.privilege_key = ping_auth.generate_login_key(ts);
+                            ping_msg.timestamp = Some(ts);
+                        }
+                        let ping = FrpMessage::Ping(ping_msg);
                         if let Err(e) = write_msg_v1(&mut *writer.lock().await, &ping).await {
                             warn!("Ping failed: {}. Reconnecting...", e);
                             break;
@@ -514,6 +554,7 @@ fn spawn_work_conn(
     tls_server_name: String,
     tls_ca_file: Option<String>,
     yamux: Option<std::sync::Arc<YamuxSession>>,
+    oidc_client: Option<Arc<OidcClient>>,
 ) {
     let server_addr = server_addr.to_string();
     let run_id = run_id.to_string();
@@ -564,25 +605,35 @@ fn spawn_work_conn(
         // Send NewWorkConn — required for both yamux and raw transports.
         // Go frps needs the run_id and auth to associate the stream.
         {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            let auth_cfg = frp_core::auth::AuthConfig {
-                method: frp_core::auth::AuthMethod::Token,
-                token: auth_token.clone(),
-                oidc_issuer: String::new(),
-                oidc_audience: String::new(),
-                oidc_skip_expiry: false,
-                oidc_skip_issuer: false,
-                additional_data: None,
-            };
-            let privilege_key = auth_cfg.generate_login_key(timestamp);
-            let nwc = FrpMessage::NewWorkConn(msg::NewWorkConn {
+            let nwc_token = auth_token.clone();
+            let mut nwc_msg = msg::NewWorkConn {
                 run_id: Some(run_id.clone()),
-                timestamp: Some(timestamp),
-                privilege_key,
-            });
+                timestamp: None,
+                privilege_key: None,
+            };
+            if let Some(ref oidc) = oidc_client {
+                if let Err(e) = oidc.set_new_work_conn(&mut nwc_msg).await {
+                    warn!("Work conn {} OIDC NewWorkConn auth failed: {}", label, e);
+                    return;
+                }
+            } else {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let auth_cfg = frp_core::auth::AuthConfig {
+                    method: frp_core::auth::AuthMethod::Token,
+                    token: nwc_token,
+                    oidc_issuer: String::new(),
+                    oidc_audience: String::new(),
+                    oidc_skip_expiry: false,
+                    oidc_skip_issuer: false,
+                    additional_data: None,
+                };
+                nwc_msg.privilege_key = auth_cfg.generate_login_key(timestamp);
+                nwc_msg.timestamp = Some(timestamp);
+            }
+            let nwc = FrpMessage::NewWorkConn(nwc_msg);
             if let Err(e) = work.write_v1_frame(&nwc).await {
                 warn!("Work conn {} failed to send NewWorkConn: {}", label, e);
                 return;
@@ -642,6 +693,7 @@ fn spawn_work_conn(
                 tls_server_name,
                 tls_ca_file,
                 yamux,
+                oidc_client,
             );
         }
     });
