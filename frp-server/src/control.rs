@@ -41,7 +41,7 @@ struct PendingRequest {
 /// The login message has already been consumed from the stream.
 /// `peer` is passed separately because generic stream types don't have peer_addr().
 pub async fn handle_control<S>(
-    stream: S,
+    mut stream: S,
     login: msg::Login,
     state: Arc<AppState>,
     peer: Option<SocketAddr>,
@@ -85,22 +85,26 @@ pub async fn handle_control<S>(
         map.insert(run_id.clone(), ControlTx { tx: internal_tx.clone() });
     }
 
-    // --- Split stream for reading/writing ---
-    let (mut reader, mut writer) = tokio::io::split(stream);
-
-    // --- Send login response ---
+    // --- Send login response (plain, before encryption) ---
     {
         let resp = FrpMessage::LoginResp(msg::LoginResp {
             version: Some(frp_core::VERSION.into()),
             run_id: Some(run_id.clone()),
             error: None,
         });
-        if let Err(e) = write_msg_v1(&mut writer, &resp).await {
+        if let Err(e) = write_msg_v1(&mut stream, &resp).await {
             warn!("Failed to send login response to {:?}: {}", peer, e);
             unregister_control(&state, &run_id).await;
             return;
         }
     }
+
+    // --- Wrap in AES-128-CFB encryption (matches client after login) ---
+    let enc_key = encryption::derive_key(&state.auth_cfg.token);
+    let cipher = frp_core::cipher_stream::CipherStream::new(Box::new(stream), enc_key);
+
+    // --- Split encrypted stream for reading/writing ---
+    let (mut reader, mut writer) = tokio::io::split(cipher);
 
     // --- Per-client state ---
     let pool_cap = login.pool_count.unwrap_or(1).max(0) as usize + WORK_POOL_EXTRA;
@@ -445,6 +449,7 @@ async fn assign_work_to_proxy(
         IoStream::Yamux(ref mut s) => write_msg_v1(s, &swc).await,
         IoStream::Kcp(ref mut s) => write_msg_v1(s, &swc).await,
         IoStream::Quic(ref mut s) => write_msg_v1(s, &swc).await,
+        IoStream::Cipher(_) => unreachable!("Cipher stream not used on server"),
     };
 
     if let Err(e) = write_result {
@@ -538,6 +543,7 @@ async fn assign_work_to_proxy(
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, None, None).await;
                 }
+                IoStream::Cipher(_) => unreachable!("Cipher stream not used on server"),
             }
         } else {
             // Plain bridge: split both sides and copy bidirectionally

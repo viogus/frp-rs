@@ -235,7 +235,7 @@ pub enum IoStream {
     Yamux(YamuxStream),
     /// AES-128-CFB encrypted control stream.
     /// Created after login by wrapping the inner IoStream.
-    Cipher(crate::cipher_stream::CipherStream),
+    Cipher(Box<crate::cipher_stream::CipherStream>),
 }
 
 impl std::fmt::Debug for IoStream {
@@ -390,7 +390,7 @@ impl IoStream {
     /// Must be called after login (the Login message is NOT encrypted).
     pub fn into_encrypted(self, key: [u8; 16]) -> Self {
         let c = crate::cipher_stream::CipherStream::new(Box::new(self), key);
-        IoStream::Cipher(c)
+        IoStream::Cipher(Box::new(c))
     }
 }
 

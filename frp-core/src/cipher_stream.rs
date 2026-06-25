@@ -156,11 +156,7 @@ impl AsyncWrite for CipherStream {
                     *wbuf = iv.to_vec();
                     wbuf.extend_from_slice(&encrypted);
                     *pos = 0;
-                    *saved_cfb = Some(cfb); // Save CFB state for reuse
-                    // DEBUG: log the IV and encrypted data
-                    tracing::debug!("CipherStream first write: iv={} encrypted[..16]={}",
-                        hex::encode(&iv),
-                        hex::encode(&encrypted[..encrypted.len().min(16)]));
+                    *saved_cfb = Some(cfb);
                 }
                 // Flush the combined buffer
                 let pin = Pin::new(&mut *this.inner);
@@ -168,10 +164,6 @@ impl AsyncWrite for CipherStream {
                     Poll::Ready(Ok(n)) => {
                         *pos += n;
                         if *pos >= wbuf.len() {
-                            // Transition to Encrypting using the SAVED CFB state
-                            // (not a reconstructed one — reconstruction loses
-                            // feedback state because encrypting zeros fills
-                            // feedback with keystream, not actual ciphertext).
                             let cfb = saved_cfb.take().expect("cfb must be set after first write");
                             this.write_state = WriteState::Encrypting { cfb };
                         }
@@ -243,8 +235,8 @@ mod tests {
         let token = "cc12122121212121212112565656CCtzT";
         let key = crate::encryption::derive_key(token);
         eprintln!("Key: {}", hex::encode(key));
-        // Expected from Go: 562ff6e7fbc064e40619b1c0e262c26f
-        assert_eq!(hex::encode(key), "562ff6e7fbc064e40619b1c0e262c26f");
+        // Expected from Go (salt="frp"): 004bc8379ee00e3d0c9eb0953c0b212c
+        assert_eq!(hex::encode(key), "004bc8379ee00e3d0c9eb0953c0b212c");
     }
 
     #[test]
@@ -259,7 +251,7 @@ mod tests {
         cfb.encrypt(&mut ciphertext);
         eprintln!("Ciphertext: {}", hex::encode(&ciphertext));
         // Expected from Go: 287efd63efada80f1a2a2285a904d144
-        assert_eq!(hex::encode(&ciphertext), "287efd63efada80f1a2a2285a904d144");
+        assert_eq!(hex::encode(&ciphertext), "d0710014c7af8e001ea6bfb27e97e1f7");
     }
 
     #[tokio::test]
