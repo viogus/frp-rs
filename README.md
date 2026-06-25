@@ -26,22 +26,30 @@ suitable as a drop-in replacement for either the client or server side.
 |----------------------|--------|--------|
 | TCP proxy            | ✅     | ✅     |
 | UDP proxy            | ✅     | ✅     |
-| Token authentication  | ✅     | ✅     |
+| HTTP/HTTPS proxy     | ✅     | ✅     |
+| STCP / sk routing    | ✅     | ✅     |
+| XTCP (NAT hole punch)| ❌     | ❌     |
+| Token authentication | ✅     | ✅     |
+| OIDC authentication  | ❌     | ❌     |
 | Heartbeat (ping/pong)| ✅     | ✅     |
 | Auto port allocation | —      | ✅     |
 | Encryption (AES-128-CFB) | ✅  | ✅     |
-| WebSocket transport  | 🚧     | ✅     |
+| Compression (Snappy) | ✅     | ✅     |
+| Bandwidth limiting   | ✅     | —      |
+| TCP multiplexing (yamux) | ✅ | ✅     |
+| WebSocket transport  | ✅     | ✅     |
 | TLS transport        | ✅     | ✅     |
-| STCP / sk routing    | ✅     | ✅     |
+| QUIC transport       | ✅     | ✅     |
+| KCP transport        | ✅     | ✅     |
+| TCP health checks    | ✅     | —      |
 | HTTP VHost routing   | —      | ✅     |
 | HTTPS VHost routing  | —      | ✅     |
-| TCP health checks    | ✅     | —      |
-| QUIC transport       | ❌     | ❌     |
-| KCP / SUDP           | ❌     | ❌     |
-| Compression (Snappy) | ✅     | ✅     |
-| OIDC authentication  | ❌     | ❌     |
-| Dashboard (web UI)   | —      | ❌     |
-| NAT hole punching (XTCP) | ❌ | ❌     |
+| Dashboard (web UI)   | —      | ✅     |
+| Config directory mode| ✅     | ✅     |
+| Client plugins       | ✅     | —      |
+| Visitor (STCP/XTCP)  | ✅     | —      |
+
+Client plugins: `http_proxy`, `socks5`, `static_file`.
 
 ---
 
@@ -418,7 +426,7 @@ frp-rs/
       config.rs           TOML config structs + Go frp compat normalization
       encryption.rs       AES-128-CFB encrypt/decrypt + Snappy compress/decompress
       msg.rs              Wire protocol message structs
-      mux.rs              TCP multiplexing (placeholder)
+      mux.rs              TCP multiplexing (yamux)
       protocol.rs         V1/V2 frame read/write
       transport.rs        TCP/TLS/WebSocket dial + accept + IoStream abstraction
   frp-server/             Server library
@@ -429,7 +437,7 @@ frp-rs/
       control.rs          Per-client control handler, work pool, listener registry
       proxy.rs            ProxyManager, ProxyInfo, port allocation
       vhost.rs            HTTP/HTTPS VHost routing + Host header parsing
-      dashboard.rs        Dashboard web UI (stub)
+      dashboard.rs        Dashboard web UI
   frps/                   Server binary
     Cargo.toml
     src/main.rs
@@ -500,10 +508,14 @@ cargo test --workspace
 cargo clippy
 
 # Start the server locally
-RUST_LOG=debug cargo run --bin frps -- -c frps.toml
+cargo run --bin frps -- -c frps.toml
 
 # Start the client (in another terminal)
-RUST_LOG=debug cargo run --bin frpc -- -c frpc.toml
+cargo run --bin frpc -- -c frpc.toml
+
+# Enable debug logging for development
+cargo run --features debug-logs --bin frps -- -c frps.toml
+RUST_LOG=debug cargo run --bin frps -- -c frps.toml  # or via env var
 
 # Run multiple services from a config directory
 cargo run --bin frps -- --config-dir /etc/frp/conf.d
