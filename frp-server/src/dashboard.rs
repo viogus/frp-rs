@@ -138,36 +138,7 @@ async fn handle_proxy_traffic(
 }
 
 async fn handle_root() -> Html<String> {
-    Html(format!(r##"<!DOCTYPE html>
-<html><head><title>frp-rs Dashboard</title>
-<style>
-body{{font-family:sans-serif;margin:2em;background:#111;color:#eee}}
-h1{{color:#4caf50}}
-table{{border-collapse:collapse;width:100%}}
-th,td{{text-align:left;padding:8px;border-bottom:1px solid #333}}
-th{{background:#222}}
-.card{{background:#1a1a2e;padding:1em;border-radius:8px;margin:1em 0}}
-pre{{background:#222;padding:1em;border-radius:4px}}
-</style></head><body>
-<h1>frp-rs v{}</h1>
-<div class=card><pre id=status>Loading...</pre></div>
-<div class=card><table id=proxies><tr><th>Name</th><th>Type</th><th>Status</th><th>Port</th><th>Traffic In</th><th>Traffic Out</th></tr></table></div>
-<script>
-async function load(){{try{{
-let s=await fetch('/api/status');let d=await s.json();
-document.getElementById('status').textContent=
-  'Uptime: '+d.uptime_secs+'s | Clients: '+d.client_count+' | Proxies: '+d.proxy_count;
-let p=await fetch('/api/proxies');let px=await p.json();
-let rows=px.map(x=>'<tr><td><a href="#" onclick="loadDetail(\''+x.name+'\')">'+x.name+'</a></td><td>'+x.type+'</td><td>'+x.status+'</td><td>'+(x.remote_port||'-')+'</td><td>'+formatBytes(x.traffic_in)+'</td><td>'+formatBytes(x.traffic_out)+'</td></tr>').join('');
-document.getElementById('proxies').innerHTML='<tr><th>Name</th><th>Type</th><th>Status</th><th>Port</th><th>Traffic In</th><th>Traffic Out</th></tr>'+rows;
-}}catch(e){{setTimeout(load,1000)}}}}
-async function loadDetail(name){{try{{
-let r=await fetch('/api/proxy/'+name);let d=await r.json();
-alert(JSON.stringify(d,null,2));
-}}catch(e){{}}}}
-function formatBytes(b){{if(b<1024)return b+'B';if(b<1048576)return (b/1024).toFixed(1)+'KB';return (b/1048576).toFixed(1)+'MB'}}
-load();setInterval(load,5000);
-</script></body></html>"##, frp_core::VERSION))
+    Html(include_str!("dashboard.html").replace("{version}", frp_core::VERSION))
 }
 
 pub async fn run_dashboard(

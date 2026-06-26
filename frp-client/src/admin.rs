@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use axum::{
     Router, Json,
-    extract::{State, Query},
+    extract::{State, Query, DefaultBodyLimit},
     routing::get,
     http::StatusCode,
 };
@@ -153,7 +153,11 @@ pub async fn run_admin_server(
         .route("/api/status", get(handle_status))
         .route("/api/reload", get(handle_reload))
         .route("/api/stop", axum::routing::post(handle_stop))
-        .route("/api/config", get(handle_get_config).put(handle_put_config));
+        .route("/api/config",
+            get(handle_get_config)
+                .put(handle_put_config)
+                .layer(DefaultBodyLimit::max(1024 * 1024))
+        );
 
     let app = apply_admin_auth(app, &auth_user, &auth_password);
     let app = app.with_state(state);

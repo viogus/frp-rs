@@ -784,6 +784,17 @@ impl Service {
                 self.cfg.tls_enable, new_cfg.tls_enable
             ));
         }
+        // OIDC verifier is created once at startup (async, fetches JWKS).
+        // Changes to OIDC settings require a full restart.
+        if self.cfg.auth.oidc_issuer != new_cfg.auth.oidc_issuer
+            || self.cfg.auth.oidc_audience != new_cfg.auth.oidc_audience
+            || self.cfg.auth.oidc_skip_expiry != new_cfg.auth.oidc_skip_expiry
+            || self.cfg.auth.oidc_skip_issuer != new_cfg.auth.oidc_skip_issuer
+        {
+            changes.push(format!(
+                "OIDC settings changed (restart required)"
+            ));
+        }
 
         if changes.is_empty() {
             Ok("config reloaded: no changes detected".into())

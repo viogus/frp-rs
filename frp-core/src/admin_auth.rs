@@ -20,11 +20,21 @@ struct AuthState {
 /// (pass-through). Otherwise, requests without a valid
 /// `Authorization: Basic <base64(user:pass)>` header receive
 /// 401 with `WWW-Authenticate: Basic realm="frp"`.
+///
+/// **Security note:** Basic Auth transmits credentials in plaintext
+/// (base64 is NOT encryption). Use a reverse proxy with TLS termination
+/// (nginx, Caddy) to protect credentials in production.
 pub fn apply_admin_auth<S>(router: Router<S>, user: &str, password: &str) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     let enabled = !user.is_empty() || !password.is_empty();
+    if enabled {
+        tracing::warn!(
+            "Admin API: Basic Auth enabled without TLS — credentials sent in plaintext. \
+             Use a reverse proxy with TLS termination in production."
+        );
+    }
     let expected = if enabled {
         format!(
             "Basic {}",
