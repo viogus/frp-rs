@@ -15,10 +15,12 @@ use std::net::SocketAddr;
 mod http;
 mod socks5;
 mod static_file;
+mod unix_socket;
 
 pub(crate) use http::start_http_proxy;
 pub(crate) use socks5::start_socks5_proxy;
 pub(crate) use static_file::start_static_file_proxy;
+pub(crate) use unix_socket::start_unix_socket_plugin;
 
 /// A running plugin server. Drop to shut down.
 pub struct PluginHandle {
