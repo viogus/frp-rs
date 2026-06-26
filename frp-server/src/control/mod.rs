@@ -455,6 +455,7 @@ pub async fn handle_control<S>(
                             }
                             // Clean up VHost routes
                             state.vhost_manager.unregister(&cp.proxy_name).await;
+                            state.proxy_metrics.remove(&cp.proxy_name).await;
                         }
                         // Stop the listener task
                         if let Some(handle) = listener_handles.remove(&cp.proxy_name) {
