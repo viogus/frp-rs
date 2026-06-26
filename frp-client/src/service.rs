@@ -621,7 +621,7 @@ fn spawn_work_conn(
             match dial_server(&opts).await {
                 Ok(io) => io,
                 Err(e) => {
-                    warn!("Work conn {} dial failed: {}", label, e);
+                    debug!("Work conn {} dial failed: {}", label, e);
                     return;
                 }
             }
@@ -812,7 +812,7 @@ fn spawn_work_conn(
                 warn!("Work conn {}: unexpected message: {:?}", label, other.v1_type_byte());
             }
             Err(e) => {
-                warn!("Work conn {}: read error: {}", label, e);
+                debug!("Work conn {}: read error: {}", label, e);
             }
         }
 
@@ -1146,7 +1146,7 @@ async fn run_visitor_listener(
                         let mut server_conn = match dial_server(&opts).await {
                             Ok(io) => io,
                             Err(e) => {
-                                warn!("Visitor '{}': STCP fallback dial failed: {}", visitor_name, e);
+                                debug!("Visitor '{}': STCP fallback dial failed: {}", visitor_name, e);
                                 return;
                             }
                         };

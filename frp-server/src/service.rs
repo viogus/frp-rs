@@ -248,7 +248,7 @@ impl Service {
                                                 warn!("Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
                                             }
                                             Err(e) => {
-                                                warn!("WS read error from {}: {}", addr, e);
+                                                debug!("WS read error from {}: {}", addr, e);
                                             }
                                         }
                                     }
@@ -534,10 +534,10 @@ impl Service {
                                             handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
                                         }
                                         Ok(other) => {
-                                            warn!("Unexpected TLS first message from {}: {:?}", addr, other.v1_type_byte());
+                                            debug!("Unexpected TLS first message from {}: {:?}", addr, other.v1_type_byte());
                                         }
                                         Err(e) => {
-                                            warn!("TLS read error from {}: {}", addr, e);
+                                            debug!("TLS read error from {}: {}", addr, e);
                                         }
                                     }
                                 }
@@ -571,7 +571,7 @@ impl Service {
                                                 warn!("Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
                                             }
                                             Err(e) => {
-                                                warn!("WS read error from {}: {}", addr, e);
+                                                debug!("WS read error from {}: {}", addr, e);
                                             }
                                         }
                                     }

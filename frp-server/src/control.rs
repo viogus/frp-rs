@@ -152,7 +152,7 @@ pub async fn handle_control<S>(
         while let Some(req) = pending_requests.front() {
             if req.created_at.elapsed() > PENDING_REQUEST_TIMEOUT {
                 let expired = pending_requests.pop_front().unwrap();
-                warn!("Pending request for proxy '{}' timed out after {:?}", expired.proxy_name, PENDING_REQUEST_TIMEOUT);
+                debug!("Pending request for proxy '{}' timed out after {:?}", expired.proxy_name, PENDING_REQUEST_TIMEOUT);
             } else {
                 break;
             }
@@ -176,7 +176,7 @@ pub async fn handle_control<S>(
                         while let Some((_, ts)) = pending_udp.front() {
                             if ts.elapsed() > PENDING_REQUEST_TIMEOUT {
                                 let (pn, _) = pending_udp.pop_front().unwrap();
-                                warn!("Pending UDP work conn for '{}' timed out", pn);
+                                debug!("Pending UDP work conn for '{}' timed out", pn);
                             } else {
                                 break;
                             }
@@ -623,7 +623,7 @@ pub async fn handle_control<S>(
                                     nat_hole.remove(&tid).await;
                                 }
                                 Err(_) => {
-                                    warn!("NatHole session {} (ctl path): timed out", tid);
+                                    debug!("NatHole session {} (ctl path): timed out", tid);
                                     nat_hole.remove(&tid).await;
                                 }
                             }
