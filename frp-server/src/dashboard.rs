@@ -47,6 +47,26 @@ struct ErrorResponse {
     error: String,
 }
 
+#[derive(Serialize)]
+struct ClientEntry {
+    run_id: String,
+    client_addr: Option<String>,
+    online: bool,
+    login_time_secs: u64,
+    proxy_count: usize,
+    proxies: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ClientDetail {
+    run_id: String,
+    client_addr: Option<String>,
+    online: bool,
+    login_time_secs: u64,
+    proxy_count: usize,
+    proxies: Vec<ProxyEntry>,
+}
+
 // --- Handlers ---
 
 async fn handle_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
@@ -137,6 +157,64 @@ async fn handle_proxy_traffic(
     Ok(Json(traffic))
 }
 
+async fn handle_clients(State(state): State<Arc<AppState>>) -> Json<Vec<ClientEntry>> {
+    let map = state.run_id_to_ctl_tx.read().await;
+    let mut clients = Vec::new();
+    for (run_id, ctl) in map.iter() {
+        let proxies = state.proxy_manager.list_client_proxy_names(run_id).await;
+        clients.push(ClientEntry {
+            run_id: run_id.clone(),
+            client_addr: ctl.client_addr.map(|a| a.to_string()),
+            online: true,
+            login_time_secs: ctl.login_time.elapsed().as_secs(),
+            proxy_count: proxies.len(),
+            proxies,
+        });
+    }
+    Json(clients)
+}
+
+async fn handle_client_detail(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+) -> Result<Json<ClientDetail>, (axum::http::StatusCode, Json<ErrorResponse>)> {
+    let ctl = {
+        let map = state.run_id_to_ctl_tx.read().await;
+        map.get(&run_id).cloned()
+    }.ok_or_else(|| (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(ErrorResponse { error: "client not found".into() }),
+    ))?;
+
+    let proxy_infos = state.proxy_manager.list_client(&run_id).await;
+    let mut proxies = Vec::new();
+    for p in &proxy_infos {
+        let traffic = state.proxy_metrics.get(&p.name).await
+            .map(|m| m.snapshot())
+            .unwrap_or_else(|| MetricsSnapshot {
+                bytes_in: 0, bytes_out: 0, current_conns: 0, total_conns: 0,
+            });
+        proxies.push(ProxyEntry {
+            name: p.name.clone(),
+            proxy_type: p.proxy_type.clone(),
+            status: "online".into(),
+            remote_port: p.remote_port,
+            local_addr: p.local_addr.clone(),
+            traffic_in: traffic.bytes_in,
+            traffic_out: traffic.bytes_out,
+        });
+    }
+
+    Ok(Json(ClientDetail {
+        run_id: run_id.clone(),
+        client_addr: ctl.client_addr.map(|a| a.to_string()),
+        online: true,
+        login_time_secs: ctl.login_time.elapsed().as_secs(),
+        proxy_count: proxies.len(),
+        proxies,
+    }))
+}
+
 async fn handle_root() -> Html<String> {
     Html(include_str!("dashboard.html").replace("{version}", frp_core::VERSION))
 }
@@ -156,7 +234,9 @@ pub async fn run_dashboard(
         .route("/api/status", get(handle_status))
         .route("/api/proxies", get(handle_proxies))
         .route("/api/proxy/:name", get(handle_proxy_detail))
-        .route("/api/proxy/:name/traffic", get(handle_proxy_traffic));
+        .route("/api/proxy/:name/traffic", get(handle_proxy_traffic))
+        .route("/api/clients", get(handle_clients))
+        .route("/api/clients/:run_id", get(handle_client_detail));
 
     let api_routes = apply_admin_auth(api_routes, &auth_user, &auth_password);
 

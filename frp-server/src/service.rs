@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::net::TcpListener;
 
@@ -68,6 +69,8 @@ pub enum InternalMsg {
 #[derive(Debug, Clone)]
 pub struct ControlTx {
     pub tx: mpsc::UnboundedSender<InternalMsg>,
+    pub client_addr: Option<SocketAddr>,
+    pub login_time: Instant,
 }
 
 /// Hot-reloadable server configuration subset, updated atomically on SIGUSR1.
