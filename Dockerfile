@@ -1,12 +1,17 @@
 # syntax=docker/dockerfile:1
+# Single-arch build (native target). For multi-arch see docker/Dockerfile.source.
+#
+# Pattern: alpine builder → musl-static binary → scratch runtime (~2 MB total).
+# Reference: ~/Codes/scripts/docker/frp/Dockerfile
+#
+# Usage:
+#   docker build -t frps --build-arg FRP_COMPONENT=frps .
 
 # ── Stage 1: Build ────────────────────────────────────────────
-# Use glibc builder (not alpine/musl) so the binary runs on distroless/static.
-FROM rust:1-slim-bookworm AS builder
+FROM rust:1-alpine AS builder
+ARG FRP_COMPONENT=frps
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    perl make upx-ucl && \
-    rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache musl-dev perl make upx
 
 WORKDIR /app
 
@@ -27,7 +32,7 @@ RUN mkdir -p frp-core/src frp-server/src frp-client/src frps/src frpc/src && \
     cargo build --release --bin frps --bin frpc && \
     rm -rf frp-core/src frp-server/src frp-client/src frps/src frpc/src
 
-# Build real source
+# Build real source (rust:1-alpine defaults to x86_64-unknown-linux-musl)
 COPY frp-core/src   frp-core/src/
 COPY frp-server/src frp-server/src/
 COPY frp-client/src frp-client/src/
@@ -36,16 +41,20 @@ COPY frpc/src       frpc/src/
 
 RUN cargo build --release --bin frps --bin frpc && \
     strip target/release/frps target/release/frpc && \
-    upx --best --lzma target/release/frps target/release/frpc
+    cp target/release/${FRP_COMPONENT} /usr/bin/frp && \
+    upx --best --lzma /usr/bin/frp || true
+
+# Compile entrypoint — fully static (musl, no libc dep)
+COPY docker/entrypoint.c /tmp/entrypoint.c
+RUN gcc -static -s -O2 -DFRP_MODE=\"${FRP_COMPONENT}\" \
+    -o /entrypoint /tmp/entrypoint.c && \
+    strip --strip-all /entrypoint || true
 
 # ── Stage 2: Runtime ──────────────────────────────────────────
-# distroless/base: ~20 MB base (static was too minimal — entrypoint failed).
-# Binary ~2 MB after UPX. Total ~22 MB (vs 75 MB debian-slim, vs 3 MB static).
-FROM gcr.io/distroless/base-debian12:latest
-
-COPY --from=builder /app/target/release/frps /usr/local/bin/frps
-COPY --from=builder /app/target/release/frpc /usr/local/bin/frpc
-
-# Default entrypoint: frps (override for frpc)
-ENTRYPOINT ["/usr/local/bin/frps"]
-CMD ["-c", "/etc/frp/frps.toml"]
+# scratch: 0 MB base. Binary is musl-static, entrypoint is gcc-static.
+# Total image ~2 MB (vs Go frp alpine ~15 MB).
+FROM scratch
+COPY --from=builder /usr/bin/frp /usr/bin/frp
+COPY --from=builder /entrypoint /entrypoint
+ENV FRP_CONF=/app/frp.toml
+ENTRYPOINT ["/entrypoint"]

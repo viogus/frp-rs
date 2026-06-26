@@ -2,6 +2,9 @@
 # Multi-arch source build for frp-rs Docker images.
 # Supports linux/amd64, linux/arm64, linux/arm/v7 via cargo-zigbuild.
 #
+# Pattern: alpine builder → musl-static binary → scratch runtime (~2 MB total).
+# Reference: ~/Codes/scripts/docker/frp/Dockerfile
+#
 # Usage:
 #   docker buildx build --platform linux/amd64,linux/arm64 \
 #     --build-arg FRP_COMPONENT=frps -f docker/Dockerfile.source .
@@ -10,15 +13,16 @@ FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm AS builder
 ARG TARGETARCH
 ARG FRP_COMPONENT=frps
 
-# Map Docker TARGETARCH to Rust target triple (for cargo-zigbuild)
-# and Zig target triple (for zig cc).
+# Map Docker TARGETARCH to:
+#  - Rust target triple (for cargo-zigbuild): musl, fully static
+#  - Zig target triple (for zig cc): musl, fully static entrypoint
 RUN case "${TARGETARCH}" in \
-      amd64) echo "x86_64-unknown-linux-gnu"  > /tmp/rust_target ; \
-             echo "x86_64-linux-gnu"          > /tmp/zig_target  ;; \
-      arm64) echo "aarch64-unknown-linux-gnu" > /tmp/rust_target ; \
-             echo "aarch64-linux-gnu"         > /tmp/zig_target  ;; \
-      arm)   echo "armv7-unknown-linux-gnueabihf" > /tmp/rust_target ; \
-             echo "arm-linux-gnueabihf"            > /tmp/zig_target  ;; \
+      amd64) echo "x86_64-unknown-linux-musl"  > /tmp/rust_target ; \
+             echo "x86_64-linux-musl"          > /tmp/zig_target  ;; \
+      arm64) echo "aarch64-unknown-linux-musl" > /tmp/rust_target ; \
+             echo "aarch64-linux-musl"         > /tmp/zig_target  ;; \
+      arm)   echo "armv7-unknown-linux-musleabihf" > /tmp/rust_target ; \
+             echo "arm-linux-musleabihf"            > /tmp/zig_target  ;; \
       *)     echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac
 
@@ -43,7 +47,7 @@ RUN ARCH="$(uname -m)" && \
     | tar xJ --strip-components=1 -C /usr/local/cargo/bin && \
     chmod +x /usr/local/cargo/bin/cargo-zigbuild
 
-# Add the cross-compilation target
+# Add the cross-compilation target (musl for fully static binary)
 RUN rustup target add $(cat /tmp/rust_target)
 
 # Build frp-rs from source
@@ -59,16 +63,16 @@ RUN cargo zigbuild --target $(cat /tmp/rust_target) --release && \
     cp target/$(cat /tmp/rust_target)/release/${FRP_COMPONENT} /usr/bin/frp && \
     strip /usr/bin/frp || true
 
-# Cross-compile the C entrypoint with zig cc (uses zig target, not Rust target)
+# Cross-compile the C entrypoint — fully static (musl, no libc dep)
 COPY docker/entrypoint.c /tmp/entrypoint.c
 RUN zig cc -target $(cat /tmp/zig_target) -static -O2 \
     -DFRP_MODE=\"${FRP_COMPONENT}\" -o /entrypoint /tmp/entrypoint.c
 
 # ── Runtime stage ──────────────────────────────────────────
-# distroless/base: ~20 MB (static-debian12 too minimal — entrypoint
-# failed with "no such file or directory"). Includes glibc, openssl.
-# No shell, no package manager.
-FROM --platform=$TARGETPLATFORM gcr.io/distroless/base-debian12:latest
+# scratch: 0 MB base. Both frp binary (musl-static) and entrypoint
+# (zig-static) have zero runtime deps. Total image ~3 MB.
+# Reference: ~/Codes/scripts/docker/frp/Dockerfile
+FROM scratch
 COPY --from=builder /usr/bin/frp /usr/bin/frp
 COPY --from=builder /entrypoint /entrypoint
 ENV FRP_CONF=/app/frp.toml
