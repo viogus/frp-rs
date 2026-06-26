@@ -76,6 +76,8 @@ impl ControlConnection {
         // Yamux only applies when transport is plain TCP and TLS is off.
         // With TLS/WS/KCP/QUIC, yamux multiplexing is not used —
         // those protocols have their own layering.
+        // Go frp servers with tcpMux=true wrap every incoming TCP connection
+        // in yamux immediately, so the client MUST wrap BEFORE sending Login.
         let propose_mux = self.tcp_mux
             && matches!(self.transport_protocol, TransportProtocol::Tcp)
             && !self.tls_enable;
@@ -93,7 +95,27 @@ impl ControlConnection {
             ..Default::default()
         };
 
-        let mut raw_stream = dial_server(&opts).await?;
+        let raw_stream = dial_server(&opts).await?;
+
+        // Wrap in yamux BEFORE any protocol communication if proposing mux.
+        // The Go frp server wraps its side on accept, so the client must
+        // wrap before sending its first frame.
+        let (mut io_stream, yamux_session) = if propose_mux {
+            match raw_stream {
+                IoStream::Tcp(tcp_stream) => {
+                    let mux_cfg = mux::TcpMuxConfig::default();
+                    let (control_stream, session) = mux::client_mux(tcp_stream, &mux_cfg).await?;
+                    info!("Yamux session established");
+                    (IoStream::Yamux(control_stream), Some(session))
+                }
+                other => {
+                    warn!("Unexpected transport for mux proposal: {:?}", other);
+                    (other, None)
+                }
+            }
+        } else {
+            (raw_stream, None)
+        };
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -126,13 +148,10 @@ impl ControlConnection {
 
         let login = FrpMessage::Login(login);
 
-        // Send Login on raw stream (plaintext, before yamux/encryption).
-        // Go frp v0.69.1: Login/LoginResp happen in plaintext; encryption and
-        // yamux are set up only after the login handshake.
-        raw_stream.write_v1_frame(&login).await?;
+        io_stream.write_v1_frame(&login).await?;
         info!("Login sent, waiting for response...");
 
-        let resp_msg = raw_stream.read_v1_frame().await?;
+        let resp_msg = io_stream.read_v1_frame().await?;
         match resp_msg {
             FrpMessage::LoginResp(resp) => {
                 if let Some(err) = resp.error {
@@ -140,35 +159,10 @@ impl ControlConnection {
                 }
                 self.run_id = resp.run_id.clone().unwrap_or_default();
                 info!("Logged in. run_id: {}", self.run_id);
+                Ok((io_stream, self.run_id.clone(), yamux_session))
             }
-            _ => return Err(frp_core::Error::Protocol("Unexpected response to login".into())),
+            _ => Err(frp_core::Error::Protocol("Unexpected response to login".into())),
         }
-
-        // After login: wrap in AES-128-CFB encryption (Go frp v0.69.1 always
-        // encrypts the control connection for V1).
-        let enc_key = frp_core::encryption::derive_key(&self.auth_cfg.token);
-        let encrypted = raw_stream.into_encrypted(enc_key);
-
-        // Create yamux on the encrypted stream (if proposing mux).
-        // Go frp v0.69.1: yamux runs on top of encryption, not raw transport.
-        let (io_stream, yamux_session) = if propose_mux {
-            match encrypted {
-                IoStream::Cipher(cipher_box) => {
-                    let mux_cfg = mux::TcpMuxConfig::default();
-                    let (control_stream, session) = mux::client_mux(cipher_box, &mux_cfg).await?;
-                    info!("Yamux session established over encrypted stream");
-                    (IoStream::Yamux(control_stream), Some(session))
-                }
-                other => {
-                    warn!("Expected encrypted stream for mux, got {:?}", other);
-                    (other, None)
-                }
-            }
-        } else {
-            (encrypted, None)
-        };
-
-        Ok((io_stream, self.run_id.clone(), yamux_session))
     }
 
     /// Register a proxy with the server.
