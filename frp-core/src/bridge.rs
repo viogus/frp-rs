@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::bandwidth::BandwidthLimiter;
@@ -14,10 +16,11 @@ pub async fn bridge_encrypted_io(
     pre_read: Vec<u8>,
     read_limiter: Option<&mut BandwidthLimiter>,
     write_limiter: Option<&mut BandwidthLimiter>,
+    metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
     let (u_r, u_w) = user.into_split();
     let (w_r, w_w) = work.into_split();
-    bridge_encrypted(u_r, u_w, w_r, w_w, key, use_compression, pre_read, read_limiter, write_limiter).await;
+    bridge_encrypted(u_r, u_w, w_r, w_w, key, use_compression, pre_read, read_limiter, write_limiter, metrics).await;
 }
 
 /// Bridge data between user and work connections over an encrypted+compressed channel.
@@ -43,6 +46,7 @@ pub async fn bridge_encrypted(
     pre_read: Vec<u8>,
     mut read_limiter: Option<&mut BandwidthLimiter>,
     mut write_limiter: Option<&mut BandwidthLimiter>,
+    metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
     let mut enc_work_r = CipherReader::new(work_r, *key);
     let mut enc_work_w = CipherWriter::new(work_w, *key);
@@ -58,7 +62,12 @@ pub async fn bridge_encrypted(
         loop {
             let n = match user_r.read(&mut buf).await {
                 Ok(0) => break,
-                Ok(n) => n,
+                Ok(n) => {
+                    if let Some(ref m) = metrics {
+                        m.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                    n
+                }
                 Err(_) => break,
             };
             let payload = &buf[..n];
@@ -117,6 +126,10 @@ pub async fn bridge_encrypted(
                 }
 
                 if user_w.write_all(&plaintext).await.is_err() { break; }
+                // Count bytes written to user (download)
+                if let Some(ref m) = metrics {
+                    m.bytes_out.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
+                }
                 if user_w.flush().await.is_err() { break; }
             }
         }
@@ -125,6 +138,9 @@ pub async fn bridge_encrypted(
             match dec.flush() {
                 Ok(plaintext) if !plaintext.is_empty() => {
                     let _ = user_w.write_all(&plaintext).await;
+                    if let Some(ref m) = metrics {
+                        m.bytes_out.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
+                    }
                     let _ = user_w.flush().await;
                 }
                 Err(e) => {
@@ -147,6 +163,7 @@ pub async fn bridge_plain(
     mut work_w: impl AsyncWriteExt + Unpin,
     use_compression: bool,
     pre_read: Vec<u8>,
+    metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
     let user_to_work = async {
         if !pre_read.is_empty()
@@ -157,7 +174,12 @@ pub async fn bridge_plain(
         loop {
             let n = match user_r.read(&mut buf).await {
                 Ok(0) => break,
-                Ok(n) => n,
+                Ok(n) => {
+                    if let Some(ref m) = metrics {
+                        m.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                    n
+                }
                 Err(_) => break,
             };
             let payload = &buf[..n];
@@ -200,6 +222,9 @@ pub async fn bridge_plain(
             };
             if !plaintext.is_empty() {
                 if user_w.write_all(&plaintext).await.is_err() { break; }
+                if let Some(ref m) = metrics {
+                    m.bytes_out.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
+                }
                 if user_w.flush().await.is_err() { break; }
             }
         }
@@ -208,6 +233,9 @@ pub async fn bridge_plain(
             match dec.flush() {
                 Ok(plaintext) if !plaintext.is_empty() => {
                     let _ = user_w.write_all(&plaintext).await;
+                    if let Some(ref m) = metrics {
+                        m.bytes_out.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
+                    }
                     let _ = user_w.flush().await;
                 }
                 Err(e) => {
@@ -236,6 +264,7 @@ pub async fn bridge_plain_rate_limited(
     mut work_w: impl AsyncWriteExt + Unpin,
     mut read_limiter: Option<&mut BandwidthLimiter>,
     mut write_limiter: Option<&mut BandwidthLimiter>,
+    metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
     // User → Work
     let user_to_work = async {
@@ -243,7 +272,12 @@ pub async fn bridge_plain_rate_limited(
         loop {
             let n = match user_r.read(&mut buf).await {
                 Ok(0) => break,
-                Ok(n) => n,
+                Ok(n) => {
+                    if let Some(ref m) = metrics {
+                        m.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                    n
+                }
                 Err(_) => break,
             };
             if let Some(ref mut lim) = write_limiter {
@@ -269,6 +303,9 @@ pub async fn bridge_plain_rate_limited(
                 lim.consume(n).await;
             }
             if user_w.write_all(&buf[..n]).await.is_err() { break; }
+            if let Some(ref m) = metrics {
+                m.bytes_out.fetch_add(n as u64, Ordering::Relaxed);
+            }
             if user_w.flush().await.is_err() { break; }
         }
         let _ = user_w.shutdown().await;

@@ -129,7 +129,7 @@ pub async fn bridge_streams(
             let local_io = IoStream::Tcp(local);
             frp_core::bridge::bridge_encrypted_io(
                 local_io, work, &key, use_compression, Vec::new(),
-                read_lim.as_mut(), write_lim.as_mut(),
+                read_lim.as_mut(), write_lim.as_mut(), None,
             ).await;
             debug!("Proxy {} encrypted bridge closed", name);
             return;
@@ -143,14 +143,14 @@ pub async fn bridge_streams(
     if use_compression {
         let (l_r, l_w) = tokio::io::split(local);
         let (w_r, w_w) = work.into_split();
-        bridge::bridge_plain(l_r, l_w, w_r, w_w, true, Vec::new()).await;
+        bridge::bridge_plain(l_r, l_w, w_r, w_w, true, Vec::new(), None).await;
         debug!("Proxy {} compressed plain bridge closed", name);
     } else if read_lim.is_some() || write_lim.is_some() {
         let (l_r, l_w) = tokio::io::split(local);
         let (w_r, w_w) = work.into_split();
         bridge::bridge_plain_rate_limited(
             l_r, l_w, w_r, w_w,
-            read_lim.as_mut(), write_lim.as_mut(),
+            read_lim.as_mut(), write_lim.as_mut(), None,
         ).await;
         debug!("Proxy {} rate-limited bridge closed", name);
     } else {
