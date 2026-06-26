@@ -650,29 +650,75 @@ impl Service {
     }
 }
 
-/// Handle an incoming STCP visitor connection. Looks up the proxy via
-/// the secret key (sk → proxy_name → run_id) and routes the IoStream
-/// to the provider's control handler via InternalMsg::VisitorConn.
+/// Handle an incoming STCP visitor connection. Looks up the proxy and
+/// routes the IoStream to the provider's control handler.
+///
+/// Supports two auth modes:
+/// 1. Go-compatible: sign_key = MD5(proxy.sk + timestamp), lookup by proxy_name
+///    then validate the hash against the registered sk.
+/// 2. Legacy Rust: sign_key = raw sk value, looked up directly in sk_index.
 async fn handle_visitor_conn_inner(
-    stream: IoStream,
+    mut stream: IoStream,
     msg: msg::NewVisitorConn,
     state: Arc<AppState>,
 ) {
-    let sk = msg.sign_key.unwrap_or_default();
-    if sk.is_empty() {
+    let sign_key = msg.sign_key.unwrap_or_default();
+    let timestamp = msg.timestamp.unwrap_or(0);
+
+    if sign_key.is_empty() {
         warn!("NewVisitorConn without sign_key, ignoring");
         return;
     }
 
-    // Look up proxy name from sk_index
-    let proxy_name = {
-        state.sk_index.read().await.get(&sk).cloned()
+    // --- Mode 1: Go-compatible — lookup by proxy_name, validate MD5(sk + timestamp) ---
+    let proxy_name = if let Some(proxy_info) = state.proxy_manager.get(&msg.proxy_name).await {
+        if let Some(ref sk) = proxy_info.sk {
+            if !sk.is_empty() {
+                let expected = frp_core::auth::generate_token(sk, timestamp);
+                if expected == sign_key {
+                    debug!("STCP visitor auth OK (Go-compat MD5) for proxy '{}'", msg.proxy_name);
+                    Some(msg.proxy_name.clone())
+                } else {
+                    warn!("STCP visitor MD5 auth mismatch for proxy '{}'", msg.proxy_name);
+                    None
+                }
+            } else {
+                // Proxy has no sk — no auth required (allow)
+                debug!("STCP visitor: proxy '{}' has no sk, allowing", msg.proxy_name);
+                Some(msg.proxy_name.clone())
+            }
+        } else {
+            // Proxy has no sk — no auth required (allow)
+            debug!("STCP visitor: proxy '{}' has no sk, allowing", msg.proxy_name);
+            Some(msg.proxy_name.clone())
+        }
+    } else {
+        None
     };
+
+    // --- Mode 2: Legacy Rust — raw sk_index lookup (backward compat) ---
     let proxy_name = match proxy_name {
         Some(pn) => pn,
         None => {
-            warn!("NewVisitorConn: no STCP proxy found for sk");
-            return;
+            // Fall back to raw sk lookup for old Rust clients that send raw sk as sign_key
+            let pn = state.sk_index.read().await.get(&sign_key).cloned();
+            match pn {
+                Some(pn) => {
+                    debug!("STCP visitor auth OK (raw sk_index lookup) for proxy '{}'", pn);
+                    pn
+                }
+                None => {
+                    warn!("NewVisitorConn: no STCP proxy found for proxy_name='{}', sign_key='{}...'",
+                        msg.proxy_name, &sign_key[..sign_key.len().min(8)]);
+                    // Send error response to visitor (Go frp expects NewVisitorConnResp)
+                    let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
+                        proxy_name: msg.proxy_name.clone(),
+                        error: Some("proxy not found".into()),
+                    });
+                    let _ = write_msg_v1(&mut stream, &resp).await;
+                    return;
+                }
+            }
         }
     };
 
@@ -682,7 +728,13 @@ async fn handle_visitor_conn_inner(
         Some(id) => id,
         None => {
             warn!("NewVisitorConn: no run_id found for proxy '{}'", proxy_name);
-            return;
+     // Send error response to visitor
+     let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
+         proxy_name: proxy_name.clone(),
+         error: Some("provider not found".into()),
+     });
+     let _ = write_msg_v1(&mut stream, &resp).await;
+     return;
         }
     };
 
@@ -694,6 +746,16 @@ async fn handle_visitor_conn_inner(
     match ctl_tx {
         Some(ctl) => {
             info!("STCP visitor for proxy '{}' routed to provider {}", proxy_name, run_id);
+       // Send success response to visitor BEFORE forwarding the stream
+       // (Go frp visitor expects NewVisitorConnResp on the same connection)
+       let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
+           proxy_name: proxy_name.clone(),
+           error: None,
+       });
+       if let Err(e) = write_msg_v1(&mut stream, &resp).await {
+           warn!("Failed to send NewVisitorConnResp for proxy '{}': {}", proxy_name, e);
+           return;
+       }
             if ctl.tx.send(InternalMsg::VisitorConn {
                 proxy_name,
                 visitor_conn: stream,
@@ -703,6 +765,12 @@ async fn handle_visitor_conn_inner(
         }
         None => {
             warn!("No provider found for run_id {}", run_id);
+       // Send error response to visitor
+       let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
+           proxy_name: proxy_name.clone(),
+           error: Some("provider disconnected".into()),
+       });
+       let _ = write_msg_v1(&mut stream, &resp).await;
         }
     }
 }
@@ -878,8 +946,15 @@ async fn handle_work_conn_inner(
     };
 
     // Verify work connection auth (Go frp v0.69.1 compat)
-    // OIDC path: verify JWT + subject binding
-    let nwc_auth_result = if let Some(ref verifier) = state.oidc_verifier {
+    // Go frp only sets privilege_key/timestamp when
+    // AuthScopeNewWorkConns is in additionalAuthScopes
+    // (default: empty). Skip validation otherwise.
+    let has_nwc_auth = msg.privilege_key.as_deref()
+        .map_or(false, |k| !k.is_empty())
+        || msg.timestamp.unwrap_or(0) != 0;
+    let nwc_auth_result = if !has_nwc_auth {
+        Ok(())
+    } else if let Some(ref verifier) = state.oidc_verifier {
         let expected_sub = state.oidc_subjects.read().await
             .get(&run_id).cloned().unwrap_or_default();
         verifier.verify_new_work_conn(

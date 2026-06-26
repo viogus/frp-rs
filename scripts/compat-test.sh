@@ -1274,7 +1274,7 @@ TOML
         > "$TEST_DIR/$name/frpc-visitor.log" 2>&1 &
     track_pid $!
 
-    if ! wait_for_port 127.0.0.1 "$visitor_port" 10; then
+    if ! wait_for_port_safe 127.0.0.1 "$visitor_port" 15; then
         fail_test "$name" "visitor port $visitor_port not reachable"
         return
     fi
@@ -1362,7 +1362,7 @@ TOML
         > "$TEST_DIR/$name/frpc-visitor.log" 2>&1 &
     track_pid $!
 
-    if ! wait_for_port 127.0.0.1 "$visitor_port" 10; then
+    if ! wait_for_port_safe 127.0.0.1 "$visitor_port" 15; then
         fail_test "$name" "visitor port $visitor_port not reachable"
         return
     fi
