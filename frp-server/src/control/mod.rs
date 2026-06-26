@@ -45,9 +45,6 @@ use crate::service::{AppState, InternalMsg, ControlTx};
 /// Max age of a pending request before it is dropped (Go frp: 10s default).
 pub(super) const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Max time without receiving a ping before the server closes the connection (Go frp: 90s).
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
-
 /// Max work connections to pool beyond what the client requested (Go frp: poolCount + 10).
 const WORK_POOL_EXTRA: usize = 10;
 
@@ -217,9 +214,10 @@ pub async fn handle_control<S>(
             }
         }
 
-        // Heartbeat check: if no ping in HEARTBEAT_TIMEOUT, disconnect
-        if last_ping.elapsed() > HEARTBEAT_TIMEOUT {
-            warn!("Heartbeat timeout for {:?} (no ping in {:?}), disconnecting", peer, HEARTBEAT_TIMEOUT);
+        // Heartbeat check: if no ping in heartbeat_timeout, disconnect
+        let hb_timeout = Duration::from_secs(state.heartbeat_timeout.max(1) as u64);
+        if last_ping.elapsed() > hb_timeout {
+            warn!("Heartbeat timeout for {:?} (no ping in {:?}), disconnecting", peer, hb_timeout);
             break;
         }
 
