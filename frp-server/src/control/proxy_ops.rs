@@ -35,6 +35,25 @@ pub(crate) async fn handle_new_proxy(
     }
     let remote_port = raw_port as u16;
 
+    // Server plugin: new_proxy hook (before port allocation).
+    // Control-enabled plugins can reject the proxy registration.
+    let np_content = serde_json::json!({
+        "proxy_name": np.proxy_name,
+        "proxy_type": np.proxy_type,
+        "remote_port": remote_port,
+        "custom_domains": np.custom_domains,
+        "run_id": run_id,
+    });
+    if let Err(reason) = state.plugin_manager.notify("new_proxy", np_content).await {
+        let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
+            proxy_name: np.proxy_name.clone(),
+            remote_addr: None,
+            error: Some(reason),
+        });
+        let _ = write_msg_v1(writer, &resp).await;
+        return;
+    }
+
     let is_sudp = np.proxy_type == "sudp";
     // When sudp_port is configured, force all SUDP proxies to use that port
     let remote_port = if is_sudp && state.sudp_port > 0 {

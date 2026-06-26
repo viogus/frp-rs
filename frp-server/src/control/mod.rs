@@ -98,6 +98,27 @@ pub async fn handle_control<S>(
         state.oidc_subjects.write().await.insert(run_id.clone(), sub.clone());
     }
 
+    // --- Server plugin: login hook ---
+    let login_content = serde_json::json!({
+        "version": login.version,
+        "hostname": login.hostname,
+        "os": login.os,
+        "user": login.user,
+        "run_id": run_id,
+        "remote_addr": peer.map(|a| a.to_string()),
+    });
+    if let Err(reason) = state.plugin_manager.notify("login", login_content).await {
+        warn!("Login for run_id {} rejected by server plugin: {}", run_id, reason);
+        let (_, mut writer) = tokio::io::split(stream);
+        let resp = FrpMessage::LoginResp(msg::LoginResp {
+            version: Some(frp_core::VERSION.into()),
+            run_id: None,
+            error: Some(reason),
+        });
+        let _ = write_msg_v1(&mut writer, &resp).await;
+        return;
+    }
+
     // --- Set up internal channel ---
     let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<InternalMsg>();
 
@@ -458,6 +479,16 @@ pub async fn handle_control<S>(
                         }
                         state.proxy_manager.remove(&cp.proxy_name).await;
                         info!("Proxy closed: {}", cp.proxy_name);
+                        // Server plugin: close_proxy hook (fire-and-forget)
+                        let plugin_state = state.clone();
+                        let pn = cp.proxy_name.clone();
+                        let rid = run_id.clone();
+                        tokio::spawn(async move {
+                            let _ = plugin_state.plugin_manager.notify(
+                                "close_proxy",
+                                serde_json::json!({ "proxy_name": pn, "run_id": rid }),
+                            ).await;
+                        });
                         // Send CloseProxyResp back to client (Go frp compat)
                         let cpr = FrpMessage::CloseProxyResp(msg::CloseProxyResp {
                             proxy_name: cp.proxy_name.clone(),

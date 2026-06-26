@@ -76,6 +76,11 @@ pub struct ServerConfig {
     /// Go frp compat: TCPMuxPassthrough. Default: false.
     #[serde(default)]
     pub tcp_mux_passthrough: bool,
+    /// Server-side HTTP plugin configurations. Each plugin is an external
+    /// HTTP service called on lifecycle events (login, new_proxy, close_proxy).
+    /// Go frp compat: http_plugins.
+    #[serde(default)]
+    pub http_plugins: Vec<HttpPluginConfig>,
 }
 
 fn default_allow_port_start() -> u16 { 10000 }
@@ -179,6 +184,7 @@ impl Default for ServerConfig {
             vhost_http_timeout: default_vhost_http_timeout(),
             user_conn_timeout: default_user_conn_timeout(),
             tcp_mux_passthrough: false,
+            http_plugins: Vec::new(),
         }
     }
 }
@@ -269,6 +275,31 @@ pub struct WebServerConfig {
     pub custom_404_page: String,
 }
 
+/// Server-side HTTP plugin configuration.
+/// Each plugin is an external HTTP service that frps calls on
+/// lifecycle events (login, new_proxy, close_proxy).
+/// Go frp compat: HTTPPluginOptions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpPluginConfig {
+    /// Plugin name for logging.
+    #[serde(default)]
+    pub name: String,
+    /// URL of the plugin server (e.g. "http://127.0.0.1:4000/handler").
+    pub url: String,
+    /// Operation this plugin handles: "login", "new_proxy", "close_proxy".
+    /// Empty means all operations.
+    #[serde(default)]
+    pub ops: Vec<String>,
+    /// Timeout in seconds for HTTP call (default: 5).
+    #[serde(default = "default_plugin_timeout")]
+    pub timeout: u64,
+    /// When true, the plugin response determines approve/reject.
+    /// When false (default), the plugin is notify-only.
+    #[serde(default)]
+    pub enable_control: bool,
+}
+
+fn default_plugin_timeout() -> u64 { 5 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerTransportConfig {
