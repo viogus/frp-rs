@@ -617,19 +617,10 @@ async fn assign_work_to_proxy(
                     return;
                 }
             }
-            // Plain bridge: split both sides and copy bidirectionally
-            // Plain bridge: split both sides and copy bidirectionally
-            let (mut u_r, mut u_w) = req.user_conn.into_split();
-            let (mut w_r, mut w_w) = work_conn.into_split();
-            let to_work = tokio::io::copy(&mut u_r, &mut w_w);
-            let to_user = tokio::io::copy(&mut w_r, &mut u_w);
-            let result = tokio::join!(to_work, to_user);
-            if let Err(e) = result.0 {
-                debug!("Proxy '{}' user→work closed: {}", req.proxy_name, e);
-            }
-            if let Err(e) = result.1 {
-                debug!("Proxy '{}' work→user closed: {}", req.proxy_name, e);
-            }
+            // Plain bridge with optional compression.
+            let (u_r, u_w) = req.user_conn.into_split();
+            let (w_r, w_w) = work_conn.into_split();
+            frp_core::bridge::bridge_plain(u_r, u_w, w_r, w_w, comp_key, pre_read).await;
         }
         info!("Proxy '{}' bridge completed", req.proxy_name);
     });

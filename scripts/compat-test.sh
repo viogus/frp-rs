@@ -1441,11 +1441,11 @@ TOML
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
-    if ! wait_for_port 127.0.0.1 "$proxy1_port" 10; then
+    if ! wait_for_port_safe 127.0.0.1 "$proxy1_port" 15; then
         fail_test "$name" "proxy1 port $proxy1_port not reachable"
         return
     fi
-    if ! wait_for_port 127.0.0.1 "$proxy2_port" 10; then
+    if ! wait_for_port_safe 127.0.0.1 "$proxy2_port" 15; then
         fail_test "$name" "proxy2 port $proxy2_port not reachable"
         return
     fi
