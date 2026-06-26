@@ -9,6 +9,7 @@ use frp_core::protocol::write_msg_v1;
 use frp_core::transport::IoStream;
 use frp_core::format_socket_addr;
 
+use crate::metrics::ServerMetrics;
 use crate::proxy::{ProxyInfo, allocate_port_multi};
 use crate::service::{AppState, InternalMsg};
 
@@ -269,6 +270,12 @@ pub(crate) async fn handle_new_proxy(
             }
 
             info!("Proxy '{}' registered on port {} (run_id: {})", np.proxy_name, port, run_id);
+
+            // Track new proxy in metrics
+            if let Some(ref m) = state.metrics {
+                m.new_proxy(&np.proxy_name, &np.proxy_type);
+            }
+
             let remote_addr_str = format!(":{}", port);
             let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
                 proxy_name: np.proxy_name.clone(),
@@ -359,6 +366,12 @@ pub(crate) async fn unregister_control(state: &Arc<AppState>, run_id: &str) {
         }
     }
     drop(ports);
+    // Track proxy closures in metrics
+    if let Some(ref m) = state.metrics {
+        for p in &proxies {
+            m.close_proxy(&p.name, &p.proxy_type);
+        }
+    }
     // VHost unregister outside port lock to avoid holding it across awaits
     for p in &proxies {
         state.vhost_manager.unregister(&p.name).await;

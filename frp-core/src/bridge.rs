@@ -5,7 +5,17 @@ use crate::cipher_stream::{CipherReader, CipherWriter};
 use crate::encryption;
 use crate::transport::IoStream;
 
+/// Traffic direction for the optional bridge callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeDirection {
+    /// User → Work (upload / inbound to frps).
+    In,
+    /// Work → User (download / outbound from frps).
+    Out,
+}
+
 /// Bridge encrypted data between two IoStreams, splitting them internally.
+/// No traffic callback — use `bridge_encrypted_io_with_traffic` for metrics.
 pub async fn bridge_encrypted_io(
     user: IoStream,
     work: IoStream,
@@ -17,7 +27,26 @@ pub async fn bridge_encrypted_io(
 ) {
     let (u_r, u_w) = user.into_split();
     let (w_r, w_w) = work.into_split();
-    bridge_encrypted(u_r, u_w, w_r, w_w, key, use_compression, pre_read, read_limiter, write_limiter).await;
+    bridge_encrypted(u_r, u_w, w_r, w_w, key, use_compression, pre_read, read_limiter, write_limiter, |_, _| {}).await;
+}
+
+/// Bridge encrypted data between two IoStreams with a traffic callback.
+/// `on_traffic` is called after each successful write cycle with (direction, byte_count).
+pub async fn bridge_encrypted_io_with_traffic<F>(
+    user: IoStream,
+    work: IoStream,
+    key: &[u8; 16],
+    use_compression: bool,
+    pre_read: Vec<u8>,
+    read_limiter: Option<&mut BandwidthLimiter>,
+    write_limiter: Option<&mut BandwidthLimiter>,
+    on_traffic: F,
+) where
+    F: Fn(BridgeDirection, u64) + Send + Sync + 'static,
+{
+    let (u_r, u_w) = user.into_split();
+    let (w_r, w_w) = work.into_split();
+    bridge_encrypted(u_r, u_w, w_r, w_w, key, use_compression, pre_read, read_limiter, write_limiter, on_traffic).await;
 }
 
 /// Bridge data between user and work connections over an encrypted+compressed channel.
@@ -33,7 +62,10 @@ pub async fn bridge_encrypted_io(
 /// CFB state.
 ///
 /// `read_limiter` limits work→user (download). `write_limiter` limits user→work (upload).
-pub async fn bridge_encrypted(
+///
+/// `on_traffic` is called after each successful `write_all` with (direction, byte_count).
+/// Pass `|_, _| {}` to disable traffic counting.
+pub async fn bridge_encrypted<F>(
     mut user_r: impl AsyncReadExt + Unpin,
     mut user_w: impl AsyncWriteExt + Unpin,
     work_r: impl AsyncReadExt + Unpin,
@@ -43,7 +75,10 @@ pub async fn bridge_encrypted(
     pre_read: Vec<u8>,
     mut read_limiter: Option<&mut BandwidthLimiter>,
     mut write_limiter: Option<&mut BandwidthLimiter>,
-) {
+    on_traffic: F,
+) where
+    F: Fn(BridgeDirection, u64) + Send + Sync + 'static,
+{
     let mut enc_work_r = CipherReader::new(work_r, *key);
     let mut enc_work_w = CipherWriter::new(work_w, *key);
 
@@ -53,6 +88,9 @@ pub async fn bridge_encrypted(
             && enc_work_w.write_all(&pre_read).await.is_err()
         {
             return;
+        }
+        if !pre_read.is_empty() {
+            on_traffic(BridgeDirection::In, pre_read.len() as u64);
         }
         let mut buf = vec![0u8; 65536];
         loop {
@@ -72,13 +110,16 @@ pub async fn bridge_encrypted(
                 payload.to_vec()
             };
 
+            let len = processed.len();
+
             // Apply write bandwidth limit before send
             if let Some(ref mut lim) = write_limiter {
-                lim.consume(processed.len()).await;
+                lim.consume(len).await;
             }
 
             if enc_work_w.write_all(&processed).await.is_err() { break; }
             if enc_work_w.flush().await.is_err() { break; }
+            on_traffic(BridgeDirection::In, len as u64);
         }
     };
 
@@ -111,21 +152,25 @@ pub async fn bridge_encrypted(
             };
 
             if !plaintext.is_empty() {
+                let len = plaintext.len();
                 // Apply read bandwidth limit before writing to user
                 if let Some(ref mut lim) = read_limiter {
-                    lim.consume(plaintext.len()).await;
+                    lim.consume(len).await;
                 }
 
                 if user_w.write_all(&plaintext).await.is_err() { break; }
                 if user_w.flush().await.is_err() { break; }
+                on_traffic(BridgeDirection::Out, len as u64);
             }
         }
         // Flush remaining buffered compressed data
         if let Some(ref mut dec) = decompressor {
             match dec.flush() {
                 Ok(plaintext) if !plaintext.is_empty() => {
+                    let len = plaintext.len();
                     let _ = user_w.write_all(&plaintext).await;
                     let _ = user_w.flush().await;
+                    on_traffic(BridgeDirection::Out, len as u64);
                 }
                 Err(e) => {
                     tracing::warn!("snappy flush error in encrypted bridge: {}", e);
@@ -140,19 +185,28 @@ pub async fn bridge_encrypted(
 }
 
 /// Plain (unencrypted) bidirectional bridge with optional compression.
-pub async fn bridge_plain(
+///
+/// `on_traffic` is called after each successful `write_all` with (direction, byte_count).
+/// Pass `|_, _| {}` to disable traffic counting.
+pub async fn bridge_plain<F>(
     mut user_r: impl AsyncReadExt + Unpin,
     mut user_w: impl AsyncWriteExt + Unpin,
     mut work_r: impl AsyncReadExt + Unpin,
     mut work_w: impl AsyncWriteExt + Unpin,
     use_compression: bool,
     pre_read: Vec<u8>,
-) {
+    on_traffic: F,
+) where
+    F: Fn(BridgeDirection, u64) + Send + Sync + 'static,
+{
     let user_to_work = async {
         if !pre_read.is_empty()
             && work_w.write_all(&pre_read).await.is_err() {
                 return;
             }
+        if !pre_read.is_empty() {
+            on_traffic(BridgeDirection::In, pre_read.len() as u64);
+        }
         let mut buf = vec![0u8; 65536];
         loop {
             let n = match user_r.read(&mut buf).await {
@@ -169,8 +223,10 @@ pub async fn bridge_plain(
             } else {
                 payload.to_vec()
             };
+            let len = processed.len();
             if work_w.write_all(&processed).await.is_err() { break; }
             if work_w.flush().await.is_err() { break; }
+            on_traffic(BridgeDirection::In, len as u64);
         }
         let _ = work_w.shutdown().await;
     };
@@ -199,16 +255,20 @@ pub async fn bridge_plain(
                 buf[..n].to_vec()
             };
             if !plaintext.is_empty() {
+                let len = plaintext.len();
                 if user_w.write_all(&plaintext).await.is_err() { break; }
                 if user_w.flush().await.is_err() { break; }
+                on_traffic(BridgeDirection::Out, len as u64);
             }
         }
         // Flush remaining buffered compressed data
         if let Some(ref mut dec) = decompressor {
             match dec.flush() {
                 Ok(plaintext) if !plaintext.is_empty() => {
+                    let len = plaintext.len();
                     let _ = user_w.write_all(&plaintext).await;
                     let _ = user_w.flush().await;
+                    on_traffic(BridgeDirection::Out, len as u64);
                 }
                 Err(e) => {
                     tracing::warn!("snappy flush error in bridge: {}", e);
@@ -229,14 +289,20 @@ pub async fn bridge_plain(
 ///
 /// `read_limiter` throttles work→user (download).
 /// `write_limiter` throttles user→work (upload).
-pub async fn bridge_plain_rate_limited(
+///
+/// `on_traffic` is called after each successful `write_all` with (direction, byte_count).
+/// Pass `|_, _| {}` to disable traffic counting.
+pub async fn bridge_plain_rate_limited<F>(
     mut user_r: impl AsyncReadExt + Unpin,
     mut user_w: impl AsyncWriteExt + Unpin,
     mut work_r: impl AsyncReadExt + Unpin,
     mut work_w: impl AsyncWriteExt + Unpin,
     mut read_limiter: Option<&mut BandwidthLimiter>,
     mut write_limiter: Option<&mut BandwidthLimiter>,
-) {
+    on_traffic: F,
+) where
+    F: Fn(BridgeDirection, u64) + Send + Sync + 'static,
+{
     // User → Work
     let user_to_work = async {
         let mut buf = vec![0u8; 65536];
@@ -251,6 +317,7 @@ pub async fn bridge_plain_rate_limited(
             }
             if work_w.write_all(&buf[..n]).await.is_err() { break; }
             if work_w.flush().await.is_err() { break; }
+            on_traffic(BridgeDirection::In, n as u64);
         }
         // Signal EOF to work side so the peer knows we're done writing
         let _ = work_w.shutdown().await;
@@ -270,6 +337,7 @@ pub async fn bridge_plain_rate_limited(
             }
             if user_w.write_all(&buf[..n]).await.is_err() { break; }
             if user_w.flush().await.is_err() { break; }
+            on_traffic(BridgeDirection::Out, n as u64);
         }
         let _ = user_w.shutdown().await;
     };

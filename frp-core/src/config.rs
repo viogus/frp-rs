@@ -235,6 +235,8 @@ pub struct WebServerConfig {
     pub user: String,
     #[serde(default)]
     pub password: String,
+    #[serde(default)]
+    pub enable_prometheus: bool,
 }
 
 
@@ -609,7 +611,7 @@ fn normalize_server_config(value: &mut toml::Value) {
 
         // Flatten web_server_* fields into web_server table
         let mut ws_items: Vec<(String, Value)> = Vec::new();
-        for key in ["web_server_addr", "web_server_port", "web_server_user", "web_server_password"] {
+        for key in ["web_server_addr", "web_server_port", "web_server_user", "web_server_password", "web_server_enable_prometheus", "enable_prometheus"] {
             if let Some(v) = table.remove(key) {
                 let sub_key = key.strip_prefix("web_server_").unwrap_or(key);
                 ws_items.push((sub_key.to_string(), v));

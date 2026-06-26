@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
@@ -5,17 +6,19 @@ use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
 
+use crate::metrics::{ServerMetrics, ServerMetricsAggregate};
 use super::PendingRequest;
 
-/// Assign a work connection to a pending proxy request.
 /// Assign a work connection to a UDP proxy for bidirectional data forwarding.
 /// Matches Go frp v0.69.1 behavior: sends StartWorkConn, then bridges
 /// UDP socket ↔ work connection via UDPPacket messages.
 pub(crate) async fn assign_udp_work_conn(
     work_conn: IoStream,
     proxy_name: &str,
+    proxy_type: &str,
     udp_sockets: &std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
     local_addr: Option<msg::UdpAddr>,
+    metrics: Option<Arc<ServerMetricsAggregate>>,
 ) {
     let mut work_conn = work_conn;
     let sock = match udp_sockets.get(proxy_name) {
@@ -26,6 +29,12 @@ pub(crate) async fn assign_udp_work_conn(
         }
     };
     let proxy_name = proxy_name.to_string();
+    let proxy_type = proxy_type.to_string();
+
+    // Track UDP work connection
+    if let Some(ref m) = metrics {
+        m.open_connection(&proxy_name, &proxy_type);
+    }
 
     // Send StartWorkConn to tell the client which proxy to associate
     let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
@@ -38,6 +47,9 @@ pub(crate) async fn assign_udp_work_conn(
     });
     if let Err(e) = write_msg_v1(&mut work_conn, &swc).await {
         warn!("Failed to send StartWorkConn for UDP '{}': {}", proxy_name, e);
+        if let Some(ref m) = metrics {
+            m.close_connection(&proxy_name, &proxy_type);
+        }
         return;
     }
     debug!("UDP work conn assigned to '{}', starting bridge tasks", proxy_name);
@@ -47,16 +59,23 @@ pub(crate) async fn assign_udp_work_conn(
     // Task: read UDPPacket from work conn → send to UDP socket
     let sock_w = sock.clone();
     let pn_w = proxy_name.clone();
+    let pt_w = proxy_type.clone();
+    let metrics_w = metrics.clone();
     tokio::spawn(async move {
         debug!("UDP work conn reader task started for '{}'", pn_w);
         loop {
             match read_msg_v1(&mut w_r).await {
                 Ok(FrpMessage::UDPPacket(up)) => {
+                    let content_len = up.content.len() as u64;
                     if let Some(ref remote) = up.remote_addr {
                         let remote_str = remote.to_string();
                         if let Err(e) = sock_w.send_to(&up.content, &remote_str).await {
                             debug!("UDP send_to failed for '{}': {}", pn_w, e);
                         }
+                    }
+                    // Track outbound traffic (server → user via UDP socket)
+                    if let Some(ref m) = metrics_w {
+                        m.add_traffic_out(&pn_w, &pt_w, content_len);
                     }
                 }
                 Ok(FrpMessage::Ping(_)) | Ok(FrpMessage::Pong(_)) => {
@@ -72,10 +91,15 @@ pub(crate) async fn assign_udp_work_conn(
                 }
             }
         }
+        if let Some(ref m) = metrics_w {
+            m.close_connection(&pn_w, &pt_w);
+        }
     });
 
     // Task: read from UDP socket → write UDPPacket to work conn
     let pn_w2 = proxy_name.clone();
+    let pt_w2 = proxy_type.clone();
+    let metrics_w2 = metrics.clone();
     tokio::spawn(async move {
         debug!("UDP work conn writer task started for '{}'", pn_w2);
         let mut buf = vec![0u8; 65535];
@@ -83,6 +107,10 @@ pub(crate) async fn assign_udp_work_conn(
             match sock.recv_from(&mut buf).await {
                 Ok((n, src)) => {
                     debug!("UDP writer '{}' recv'd {} bytes from {}", pn_w2, n, src);
+                    // Track inbound traffic (user → server via UDP socket)
+                    if let Some(ref m) = metrics_w2 {
+                        m.add_traffic_in(&pn_w2, &pt_w2, n as u64);
+                    }
                     let remote = msg::UdpAddr {
                         ip: src.ip().to_string(),
                         port: src.port(),
@@ -114,6 +142,7 @@ pub(crate) async fn assign_work_to_proxy(
     mut work_conn: IoStream,
     req: PendingRequest,
     encryption_key: [u8; 16],
+    metrics: Option<Arc<ServerMetricsAggregate>>,
 ) {
     let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
         proxy_name: req.proxy_name.clone(),
@@ -144,11 +173,33 @@ pub(crate) async fn assign_work_to_proxy(
 
     info!("Bridging user conn to work conn for proxy '{}'", req.proxy_name);
 
+    // Track connection open
+    if let Some(ref m) = metrics {
+        m.open_connection(&req.proxy_name, &req.proxy_type);
+    }
+
     let pre_read = req.pre_read;
     let enc_key = req.use_encryption;
     let comp_key = req.use_compression;
+    let proxy_name = req.proxy_name;
+    let proxy_type = req.proxy_type;
+    let metrics_clone = metrics.clone();
 
     tokio::spawn(async move {
+        let on_traffic = {
+            let m = metrics_clone.clone();
+            let pn = proxy_name.clone();
+            let pt = proxy_type.clone();
+            move |dir: frp_core::bridge::BridgeDirection, bytes: u64| {
+                if let Some(ref m) = m {
+                    match dir {
+                        frp_core::bridge::BridgeDirection::In => m.add_traffic_in(&pn, &pt, bytes),
+                        frp_core::bridge::BridgeDirection::Out => m.add_traffic_out(&pn, &pt, bytes),
+                    }
+                }
+            }
+        };
+
         // For encrypted bridges, pre_read bytes are passed into bridge_encrypted
         // which writes them through the CipherWriter (matching Go frp streaming CFB).
         if enc_key {
@@ -157,35 +208,38 @@ pub(crate) async fn assign_work_to_proxy(
                 IoStream::Tcp(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None).await;
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, on_traffic).await;
                 }
                 IoStream::Tls(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None).await;
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, on_traffic).await;
                 }
                 IoStream::Kcp(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None).await;
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, on_traffic).await;
                 }
                 IoStream::WebSocket(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None).await;
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, on_traffic).await;
                 }
                 IoStream::Quic(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = work.into_split();
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None).await;
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, on_traffic).await;
                 }
                 IoStream::Yamux(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None).await;
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, on_traffic).await;
                 }
                 IoStream::Cipher(_) => {
                     warn!("Cipher stream unexpected in server bridge");
+                    if let Some(ref m) = metrics_clone {
+                        m.close_connection(&proxy_name, &proxy_type);
+                    }
                     return;
                 }
             }
@@ -207,6 +261,9 @@ pub(crate) async fn assign_work_to_proxy(
                 };
                 if let Err(e) = write_result {
                     warn!("Failed to write VHost pre-read bytes: {}", e);
+                    if let Some(ref m) = metrics_clone {
+                        m.close_connection(&proxy_name, &proxy_type);
+                    }
                     return;
                 }
                 Vec::new() // already written, don't pass to bridge_plain
@@ -214,8 +271,13 @@ pub(crate) async fn assign_work_to_proxy(
             // Plain bridge with optional compression.
             let (u_r, u_w) = req.user_conn.into_split();
             let (w_r, w_w) = work_conn.into_split();
-            frp_core::bridge::bridge_plain(u_r, u_w, w_r, w_w, comp_key, bridge_pre_read).await;
+            frp_core::bridge::bridge_plain(u_r, u_w, w_r, w_w, comp_key, bridge_pre_read, on_traffic).await;
         }
-        info!("Proxy '{}' bridge completed", req.proxy_name);
+
+        // Track connection close after bridge completes
+        if let Some(ref m) = metrics_clone {
+            m.close_connection(&proxy_name, &proxy_type);
+        }
+        info!("Proxy '{}' bridge completed", proxy_name);
     });
 }

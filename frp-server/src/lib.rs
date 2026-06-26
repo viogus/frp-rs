@@ -5,3 +5,4 @@ pub mod vhost;
 pub mod dashboard;
 pub mod nat_hole;
 pub mod tcpmux;
+pub mod metrics;
