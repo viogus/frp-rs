@@ -50,7 +50,7 @@ impl Service {
 
         let auth_cfg = AuthConfig {
             method: auth_method.clone(),
-            token: cfg.token.clone(),
+            token: frp_core::auth::resolve_dynamic_token(&cfg.token),
             oidc_issuer: cfg.auth.as_ref().map(|a| a.oidc_issuer.clone()).unwrap_or_default(),
             oidc_audience: cfg.auth.as_ref().map(|a| a.oidc_audience.clone()).unwrap_or_default(),
             oidc_skip_expiry: false,
