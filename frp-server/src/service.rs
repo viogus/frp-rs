@@ -82,7 +82,6 @@ pub struct AppState {
     pub proxy_manager: Arc<ProxyManager>,
     /// Hot-reloadable config (auth, encryption, allow_ports).
     pub reloadable: RwLock<ReloadableState>,
-    pub metrics: Option<Arc<crate::metrics::ServerMetricsAggregate>>,
     pub used_ports: Arc<RwLock<std::collections::HashSet<u16>>>,
     pub run_id_to_ctl_tx: Arc<RwLock<HashMap<String, ControlTx>>>,
     pub proxy_bind_addr: String,
@@ -132,7 +131,6 @@ impl AppState {
             tcpmux_manager: Arc::new(TcpMuxManager::new()),
             proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
             sudp_port,
-            metrics: None,
         }
     }
 }
@@ -193,7 +191,7 @@ impl Service {
             vec![(cfg.allow_port_start, cfg.allow_port_end)]
         };
         let sub_host = cfg.sub_domain_host.clone();
-        let mut state = AppState::new(
+        let state = AppState::new(
             auth_cfg,
             if cfg.proxy_bind_addr.is_empty() {
                 cfg.bind_addr.clone()
@@ -210,14 +208,9 @@ impl Service {
             cfg.sudp_port,
         );
 
-        // Initialize metrics when dashboard web server is enabled
-        if cfg.web_server.port > 0 {
-            let agg = Arc::new(crate::metrics::ServerMetricsAggregate::new());
-            if cfg.web_server.enable_prometheus {
-                crate::metrics::prom::register_all();
-                agg.add_backend(Arc::new(crate::metrics::prom::PromBackend::new()));
-            }
-            state.metrics = Some(agg);
+        // Initialize prometheus registry when enabled
+        if cfg.web_server.port > 0 && cfg.web_server.enable_prometheus {
+            crate::metrics::prom::register_all();
         }
 
         Ok(Self {

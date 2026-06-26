@@ -185,9 +185,17 @@ pub async fn run_dashboard(
 
     let api_routes = apply_admin_auth(api_routes, &auth_user, &auth_password);
 
-    // /metrics is public (Prometheus scrapers don't use Basic Auth)
+    // /metrics is public (Prometheus scrapers don't use Basic Auth).
+    // Syncs gauge values from the live ProxyMetricsRegistry on each scrape.
+    let state_for_metrics = state.clone();
     let metrics_route = Router::new()
-        .route("/metrics", get(|| async { crate::metrics::prom::render_metrics_text() }));
+        .route("/metrics", get(move || {
+            let state = state_for_metrics.clone();
+            async move {
+                crate::metrics::prom::sync_from_state(&state).await;
+                crate::metrics::prom::render_metrics_text()
+            }
+        }));
 
     let app = Router::new()
         .route("/", get(handle_root))

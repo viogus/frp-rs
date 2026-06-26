@@ -1,11 +1,10 @@
-//! Prometheus backend — registers 6 metrics matching Go frp v0.69.1 exactly.
-//! Mirrors Go frp's pkg/metrics/prometheus/server.go.
+//! Prometheus metrics — mirrors Go frp v0.69.1 metric names exactly.
+//! Rendered from live AppState + ProxyMetricsRegistry data on each /metrics scrape.
+//! Same data source as the dashboard API (single metrics system).
 
-use prometheus::{
-    Encoder, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
-};
+use prometheus::{Encoder, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
 
-use super::ServerMetrics;
+use crate::service::AppState;
 
 lazy_static::lazy_static! {
     /// Registry holding all 6 frp_server metrics.
@@ -40,16 +39,16 @@ lazy_static::lazy_static! {
         .expect("metric definition must be valid");
 
     /// frp_server_traffic_in — total inbound traffic bytes per proxy.
-    static ref TRAFFIC_IN: IntCounterVec =
-        IntCounterVec::new(
+    static ref TRAFFIC_IN: IntGaugeVec =
+        IntGaugeVec::new(
             Opts::new("frp_server_traffic_in", "total inbound traffic"),
             &["name", "type"],
         )
         .expect("metric definition must be valid");
 
     /// frp_server_traffic_out — total outbound traffic bytes per proxy.
-    static ref TRAFFIC_OUT: IntCounterVec =
-        IntCounterVec::new(
+    static ref TRAFFIC_OUT: IntGaugeVec =
+        IntGaugeVec::new(
             Opts::new("frp_server_traffic_out", "total outbound traffic"),
             &["name", "type"],
         )
@@ -62,25 +61,59 @@ pub fn register_all() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        REGISTRY
-            .register(Box::new(CLIENT_COUNTS.clone()))
-            .expect("frp_server_client_counts must register once");
-        REGISTRY
-            .register(Box::new(PROXY_COUNTS.clone()))
-            .expect("frp_server_proxy_counts must register once");
-        REGISTRY
-            .register(Box::new(PROXY_COUNTS_DETAILED.clone()))
-            .expect("frp_server_proxy_counts_detailed must register once");
-        REGISTRY
-            .register(Box::new(CONNECTION_COUNTS.clone()))
-            .expect("frp_server_connection_counts must register once");
-        REGISTRY
-            .register(Box::new(TRAFFIC_IN.clone()))
-            .expect("frp_server_traffic_in must register once");
-        REGISTRY
-            .register(Box::new(TRAFFIC_OUT.clone()))
-            .expect("frp_server_traffic_out must register once");
+        REGISTRY.register(Box::new(CLIENT_COUNTS.clone())).ok();
+        REGISTRY.register(Box::new(PROXY_COUNTS.clone())).ok();
+        REGISTRY.register(Box::new(PROXY_COUNTS_DETAILED.clone())).ok();
+        REGISTRY.register(Box::new(CONNECTION_COUNTS.clone())).ok();
+        REGISTRY.register(Box::new(TRAFFIC_IN.clone())).ok();
+        REGISTRY.register(Box::new(TRAFFIC_OUT.clone())).ok();
     });
+}
+
+/// Sync prometheus gauges from live AppState data.
+/// Called on each /metrics scrape to refresh gauge values from the
+/// single source of truth (ProxyMetricsRegistry + proxy_manager).
+pub async fn sync_from_state(state: &AppState) {
+    use std::collections::HashMap;
+
+    // Client counts — from active control connections
+    let client_count = state.run_id_to_ctl_tx.read().await.len() as i64;
+    CLIENT_COUNTS.set(client_count);
+
+    // Reset all label-based metrics before rebuilding
+    PROXY_COUNTS.reset();
+    PROXY_COUNTS_DETAILED.reset();
+    CONNECTION_COUNTS.reset();
+    TRAFFIC_IN.reset();
+    TRAFFIC_OUT.reset();
+
+    let proxies = state.proxy_manager.list().await;
+    let mut type_counts: HashMap<String, i64> = HashMap::new();
+
+    for p in &proxies {
+        *type_counts.entry(p.proxy_type.clone()).or_default() += 1;
+
+        let snap = state.proxy_metrics.get(&p.name).await
+            .map(|m| m.snapshot())
+            .unwrap_or_else(|| frp_core::metrics::MetricsSnapshot {
+                bytes_in: 0,
+                bytes_out: 0,
+                current_conns: 0,
+                total_conns: 0,
+            });
+
+        let pt = &p.proxy_type;
+        let pn = &p.name;
+
+        PROXY_COUNTS_DETAILED.with_label_values(&[pt, pn]).set(1);
+        CONNECTION_COUNTS.with_label_values(&[pn, pt]).set(snap.current_conns);
+        TRAFFIC_IN.with_label_values(&[pn, pt]).set(snap.bytes_in as i64);
+        TRAFFIC_OUT.with_label_values(&[pn, pt]).set(snap.bytes_out as i64);
+    }
+
+    for (pt, count) in &type_counts {
+        PROXY_COUNTS.with_label_values(&[pt]).set(*count);
+    }
 }
 
 /// Render Prometheus text format from the frp registry.
@@ -93,64 +126,6 @@ pub fn render_metrics_text() -> String {
         .encode(&metric_families, &mut buf)
         .map(|_| String::from_utf8_lossy(&buf).to_string())
         .unwrap_or_default()
-}
-
-/// Prometheus backend for the aggregate dispatcher.
-#[derive(Clone, Default)]
-pub struct PromBackend;
-
-impl PromBackend {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl ServerMetrics for PromBackend {
-    fn new_client(&self) {
-        CLIENT_COUNTS.inc();
-    }
-
-    fn close_client(&self) {
-        CLIENT_COUNTS.dec();
-    }
-
-    fn new_proxy(&self, name: &str, proxy_type: &str) {
-        PROXY_COUNTS.with_label_values(&[proxy_type]).inc();
-        PROXY_COUNTS_DETAILED
-            .with_label_values(&[proxy_type, name])
-            .inc();
-    }
-
-    fn close_proxy(&self, name: &str, proxy_type: &str) {
-        PROXY_COUNTS.with_label_values(&[proxy_type]).dec();
-        PROXY_COUNTS_DETAILED
-            .with_label_values(&[proxy_type, name])
-            .dec();
-    }
-
-    fn open_connection(&self, name: &str, proxy_type: &str) {
-        CONNECTION_COUNTS
-            .with_label_values(&[name, proxy_type])
-            .inc();
-    }
-
-    fn close_connection(&self, name: &str, proxy_type: &str) {
-        CONNECTION_COUNTS
-            .with_label_values(&[name, proxy_type])
-            .dec();
-    }
-
-    fn add_traffic_in(&self, name: &str, proxy_type: &str, bytes: u64) {
-        TRAFFIC_IN
-            .with_label_values(&[name, proxy_type])
-            .inc_by(bytes);
-    }
-
-    fn add_traffic_out(&self, name: &str, proxy_type: &str, bytes: u64) {
-        TRAFFIC_OUT
-            .with_label_values(&[name, proxy_type])
-            .inc_by(bytes);
-    }
 }
 
 #[cfg(test)]
@@ -170,55 +145,21 @@ mod tests {
     #[test]
     fn test_render_text_format() {
         register_all();
-        // Touch a counter label so it appears in render output
-        // (CounterVec without labels is omitted by prometheus crate).
-        // Use unique proxy name to avoid cross-test pollution.
-        let b = PromBackend::new();
-        b.new_proxy("__fmt_test", "__fmt");
-        b.add_traffic_in("__fmt_test", "__fmt", 0);
-        b.add_traffic_out("__fmt_test", "__fmt", 0);
+        // Touch a gauge label so it appears in render output
+        PROXY_COUNTS.with_label_values(&["__fmt_test"]).set(1);
+        PROXY_COUNTS_DETAILED.with_label_values(&["__fmt_test", "__fmt_proxy"]).set(1);
+        TRAFFIC_IN.with_label_values(&["__fmt_proxy", "__fmt_test"]).set(0);
+        TRAFFIC_OUT.with_label_values(&["__fmt_proxy", "__fmt_test"]).set(0);
+        CONNECTION_COUNTS.with_label_values(&["__fmt_proxy", "__fmt_test"]).set(0);
         let text = render_metrics_text();
         // HEADER line present for gauge (always renders)
         assert!(text.contains("TYPE frp_server_client_counts gauge"));
-        // Counter renders now that label values exist
-        assert!(text.contains("TYPE frp_server_traffic_in counter"));
+        assert!(text.contains("TYPE frp_server_traffic_in gauge"));
         // Cleanup
-        b.close_proxy("__fmt_test", "__fmt");
-    }
-
-    #[test]
-    fn test_prom_backend_client_counts() {
-        register_all();
-        let b = PromBackend::new();
-        b.new_client();
-        b.new_client();
-        assert_eq!(CLIENT_COUNTS.get(), 2);
-        b.close_client();
-        assert_eq!(CLIENT_COUNTS.get(), 1);
-    }
-
-    #[test]
-    fn test_prom_backend_proxy_counts() {
-        register_all();
-        let b = PromBackend::new();
-        // Use unique type names to avoid cross-test pollution
-        b.new_proxy("web", "__pc_tcp");
-        b.new_proxy("ssh", "__pc_tcp");
-        b.new_proxy("api", "__pc_http");
-        assert_eq!(PROXY_COUNTS.with_label_values(&["__pc_tcp"]).get(), 2);
-        assert_eq!(PROXY_COUNTS.with_label_values(&["__pc_http"]).get(), 1);
-        b.close_proxy("web", "__pc_tcp");
-        assert_eq!(PROXY_COUNTS.with_label_values(&["__pc_tcp"]).get(), 1);
-    }
-
-    #[test]
-    fn test_prom_backend_traffic() {
-        register_all();
-        let b = PromBackend::new();
-        // Use unique type to avoid cross-test pollution
-        b.add_traffic_in("traffic_web", "__traffic", 1024);
-        b.add_traffic_out("traffic_web", "__traffic", 512);
-        assert_eq!(TRAFFIC_IN.with_label_values(&["traffic_web", "__traffic"]).get(), 1024);
-        assert_eq!(TRAFFIC_OUT.with_label_values(&["traffic_web", "__traffic"]).get(), 512);
+        PROXY_COUNTS.reset();
+        PROXY_COUNTS_DETAILED.reset();
+        TRAFFIC_IN.reset();
+        TRAFFIC_OUT.reset();
+        CONNECTION_COUNTS.reset();
     }
 }
