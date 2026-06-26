@@ -119,9 +119,14 @@ async fn handle_put_config(
     // Trigger reload after config update
     let (tx, rx) = oneshot::channel();
     let req = ReloadRequest { strict: false, reply: tx };
-    let _ = state.reload_tx.send(req);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), rx).await;
-    Ok("update success")
+    state.reload_tx.send(req).map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "reload channel closed".into())
+    })?;
+    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        Ok(Ok(_)) => Ok("update success"),
+        Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, e.to_string())),
+        Err(_) => Err((StatusCode::REQUEST_TIMEOUT, "reload timed out".into())),
+    }
 }
 
 // --- Server ---
