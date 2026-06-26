@@ -41,7 +41,12 @@ pub enum InternalMsg {
     UdpData {
         proxy_name: String,
         content: Vec<u8>,
-        remote_addr: String,
+        remote_addr: msg::UdpAddr,
+    },
+    /// UDP proxy needs a work connection for data forwarding
+    /// (Go frp v0.69.1 uses work connections, not control connection).
+    UdpNeedsWorkConn {
+        proxy_name: String,
     },
     /// Sent when a new control connection claims the same run_id.
     /// The old handler should stop listening and clean up.

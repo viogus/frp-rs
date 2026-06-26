@@ -253,14 +253,39 @@ pub struct NewVisitorConnResp {
     pub error: Option<String>,
 }
 
+/// UDP address matching Go frp v0.69.1 `net.UDPAddr` JSON representation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpAddr {
+    #[serde(rename = "IP")]
+    pub ip: String,
+    #[serde(rename = "Port")]
+    pub port: u16,
+    #[serde(rename = "Zone", skip_serializing_if = "String::is_empty", default)]
+    pub zone: String,
+}
+
+impl UdpAddr {
+    pub fn from_string(s: &str) -> Option<Self> {
+        let (ip, port_str) = s.rsplit_once(':')?;
+        Some(UdpAddr {
+            ip: ip.to_string(),
+            port: port_str.parse().ok()?,
+            zone: String::new(),
+        })
+    }
+
+    pub fn to_string(&self) -> String {
+        format!("{}:{}", self.ip, self.port)
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UDPPacket {
     #[serde(rename = "c", serialize_with = "b64_ser", deserialize_with = "b64_de")]
     pub content: Vec<u8>,
-    #[serde(rename = "l")]
-    pub local_addr: String,
-    #[serde(rename = "r")]
-    pub remote_addr: String,
+    #[serde(rename = "l", skip_serializing_if = "Option::is_none")]
+    pub local_addr: Option<UdpAddr>,
+    #[serde(rename = "r", skip_serializing_if = "Option::is_none")]
+    pub remote_addr: Option<UdpAddr>,
 }
 
 // ---------------------------------------------------------------
@@ -458,7 +483,7 @@ impl FrpMessage {
                 proxy_name: String::new(), error: None,
             })),
             TYPE_UDP_PACKET    => Some(FrpMessage::UDPPacket(UDPPacket {
-                content: vec![], local_addr: String::new(), remote_addr: String::new(),
+                content: vec![], local_addr: None, remote_addr: None,
             })),
             TYPE_NAT_HOLE_VISITOR => Some(FrpMessage::NatHoleVisitor(NatHoleVisitor {
                 proxy_name: String::new(), sign_key: None, timestamp: None,
@@ -687,18 +712,20 @@ mod tests {
         let data = vec![0, 1, 2, 255, 100];
         let pkt = UDPPacket {
             content: data.clone(),
-            local_addr: "127.0.0.1:53".into(),
-            remote_addr: "10.0.0.1:9999".into(),
+            local_addr: Some(UdpAddr { ip: "127.0.0.1".into(), port: 53, zone: String::new() }),
+            remote_addr: Some(UdpAddr { ip: "10.0.0.1".into(), port: 9999, zone: String::new() }),
         };
         let json = serde_json::to_string(&pkt).expect("serialize");
         // content field should be base64 encoded
         assert!(json.contains(r#""c":"#), "content field present");
-        assert!(json.contains(r#""l":"127.0.0.1:53""#), "local_addr present");
-        assert!(json.contains(r#""r":"10.0.0.1:9999""#), "remote_addr present");
+        assert!(json.contains(r#""l":"#), "local_addr present");
+        assert!(json.contains(r#""r":"#), "remote_addr present");
         let back: UDPPacket = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.content, data);
-        assert_eq!(back.local_addr, "127.0.0.1:53");
-        assert_eq!(back.remote_addr, "10.0.0.1:9999");
+        assert_eq!(back.local_addr.as_ref().unwrap().ip, "127.0.0.1");
+        assert_eq!(back.local_addr.as_ref().unwrap().port, 53);
+        assert_eq!(back.remote_addr.as_ref().unwrap().ip, "10.0.0.1");
+        assert_eq!(back.remote_addr.as_ref().unwrap().port, 9999);
     }
 
     #[test]

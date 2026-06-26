@@ -64,6 +64,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for CipherReader<R> {
                     match Pin::new(&mut this.inner).poll_read(cx, &mut tmp) {
                         Poll::Ready(Ok(())) => {
                             let n = tmp.filled().len();
+                            if n == 0 {
+                                // Stream closed before IV could be read
+                                return Poll::Ready(Ok(()));
+                            }
                             *filled += n;
                             if *filled == 16 {
                                 let cfb = CfbState::new(&this.key, iv_buf);
@@ -94,7 +98,7 @@ impl<W: AsyncWrite + Unpin> CipherWriter<W> {
         Self {
             inner,
             key,
-            state: WriteState::Writing { buf: Vec::new(), pos: 0, cfb: None },
+            state: WriteState::Writing { buf: Vec::new(), pos: 0, cfb: None, buf_consumed: 0 },
         }
     }
 }
@@ -107,13 +111,29 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
     ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
         match &mut this.state {
-            WriteState::Encrypting { cfb } => {
-                let mut encrypted = buf.to_vec();
-                cfb.encrypt(&mut encrypted);
-                Pin::new(&mut this.inner).poll_write(cx, &encrypted)
-                    .map(|r| r.map(|_| buf.len()))
+            WriteState::Encrypting { cfb, pending, pos } => {
+                // If no pending data, encrypt the new buf
+                if pending.is_empty() {
+                    let mut encrypted = buf.to_vec();
+                    cfb.encrypt(&mut encrypted);
+                    *pending = encrypted;
+                    *pos = 0;
+                }
+                match Pin::new(&mut this.inner).poll_write(cx, &pending[*pos..]) {
+                    Poll::Ready(Ok(n)) => {
+                        *pos += n;
+                        let consumed = n;
+                        if *pos >= pending.len() {
+                            pending.clear();
+                            *pos = 0;
+                        }
+                        Poll::Ready(Ok(consumed))
+                    }
+                    other => other,
+                }
             }
-            WriteState::Writing { buf: wbuf, pos, cfb: saved_cfb } => {
+            WriteState::Writing { buf: wbuf, pos, cfb: saved_cfb, buf_consumed } => {
+                // First write: generate IV, encrypt data, write IV+data as one buffer.
                 if wbuf.is_empty() {
                     use rand::RngCore;
                     let mut iv = [0u8; 16];
@@ -124,16 +144,35 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
                     *wbuf = iv.to_vec();
                     wbuf.extend_from_slice(&encrypted);
                     *pos = 0;
+                    *buf_consumed = 0;
                     *saved_cfb = Some(cfb);
                 }
+                // Flush the combined buffer
                 match Pin::new(&mut this.inner).poll_write(cx, &wbuf[*pos..]) {
                     Poll::Ready(Ok(n)) => {
                         *pos += n;
+                        // Calculate how many bytes of the original caller buf
+                        // have been flushed: after 16-byte IV, remaining bytes are encrypted(buf)
+                        let total_consumed = if *pos <= 16 {
+                            0
+                        } else {
+                            (*pos - 16).min(buf.len())
+                        };
+                        let incremental = total_consumed.saturating_sub(*buf_consumed);
+                        *buf_consumed = total_consumed;
                         if *pos >= wbuf.len() {
                             let cfb = saved_cfb.take().expect("cfb must be set after first write");
-                            this.state = WriteState::Encrypting { cfb };
+                            this.state = WriteState::Encrypting { cfb, pending: Vec::new(), pos: 0 };
                         }
-                        Poll::Ready(Ok(buf.len()))
+                        // If inner writer made progress but no caller bytes consumed yet
+                        // (still flushing IV prefix), signal Pending to avoid Ok(0) which
+                        // tokio's write_all/copy_buf treats as "write side closed".
+                        if n > 0 && incremental == 0 {
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        } else {
+                            Poll::Ready(Ok(incremental))
+                        }
                     }
                     other => other,
                 }
@@ -197,8 +236,8 @@ enum ReadState {
 }
 
 enum WriteState {
-    Writing { buf: Vec<u8>, pos: usize, cfb: Option<CfbState> },
-    Encrypting { cfb: CfbState },
+    Writing { buf: Vec<u8>, pos: usize, cfb: Option<CfbState>, buf_consumed: usize },
+    Encrypting { cfb: CfbState, pending: Vec<u8>, pos: usize },
 }
 
 pub struct CipherStream {
@@ -214,7 +253,7 @@ impl CipherStream {
             inner,
             key,
             read_state: ReadState::ReadingIv { buf: [0u8; 16], filled: 0 },
-            write_state: WriteState::Writing { buf: Vec::new(), pos: 0, cfb: None },
+            write_state: WriteState::Writing { buf: Vec::new(), pos: 0, cfb: None, buf_consumed: 0 },
         }
     }
 }
@@ -251,6 +290,10 @@ impl AsyncRead for CipherStream {
                     match pin.poll_read(cx, &mut tmp) {
                         Poll::Ready(Ok(())) => {
                             let n = tmp.filled().len();
+                            if n == 0 {
+                                // Stream closed before IV could be read
+                                return Poll::Ready(Ok(()));
+                            }
                             *filled += n;
                             if *filled == 16 {
                                 let cfb = CfbState::new(&this.key, iv_buf);
@@ -274,13 +317,29 @@ impl AsyncWrite for CipherStream {
     ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
         match &mut this.write_state {
-            WriteState::Encrypting { cfb } => {
-                let mut encrypted = buf.to_vec();
-                cfb.encrypt(&mut encrypted);
+            WriteState::Encrypting { cfb, pending, pos } => {
+                // If no pending data, encrypt the new buf
+                if pending.is_empty() {
+                    let mut encrypted = buf.to_vec();
+                    cfb.encrypt(&mut encrypted);
+                    *pending = encrypted;
+                    *pos = 0;
+                }
                 let pin = Pin::new(&mut *this.inner);
-                pin.poll_write(cx, &encrypted).map(|r| r.map(|_| buf.len()))
+                match pin.poll_write(cx, &pending[*pos..]) {
+                    Poll::Ready(Ok(n)) => {
+                        *pos += n;
+                        let consumed = n;
+                        if *pos >= pending.len() {
+                            pending.clear();
+                            *pos = 0;
+                        }
+                        Poll::Ready(Ok(consumed))
+                    }
+                    other => other,
+                }
             }
-            WriteState::Writing { buf: wbuf, pos, cfb: saved_cfb } => {
+            WriteState::Writing { buf: wbuf, pos, cfb: saved_cfb, buf_consumed } => {
                 // First write: generate IV, encrypt data, write IV+data as one buffer.
                 if wbuf.is_empty() {
                     use rand::RngCore;
@@ -292,6 +351,7 @@ impl AsyncWrite for CipherStream {
                     *wbuf = iv.to_vec();
                     wbuf.extend_from_slice(&encrypted);
                     *pos = 0;
+                    *buf_consumed = 0;
                     *saved_cfb = Some(cfb);
                 }
                 // Flush the combined buffer
@@ -299,11 +359,25 @@ impl AsyncWrite for CipherStream {
                 match pin.poll_write(cx, &wbuf[*pos..]) {
                     Poll::Ready(Ok(n)) => {
                         *pos += n;
+                        // Calculate how many bytes of the original caller buf
+                        // have been flushed: after 16-byte IV, remaining bytes are encrypted(buf)
+                        let total_consumed = if *pos <= 16 {
+                            0
+                        } else {
+                            (*pos - 16).min(buf.len())
+                        };
+                        let incremental = total_consumed.saturating_sub(*buf_consumed);
+                        *buf_consumed = total_consumed;
                         if *pos >= wbuf.len() {
                             let cfb = saved_cfb.take().expect("cfb must be set after first write");
-                            this.write_state = WriteState::Encrypting { cfb };
+                            this.write_state = WriteState::Encrypting { cfb, pending: Vec::new(), pos: 0 };
                         }
-                        Poll::Ready(Ok(buf.len()))
+                        if n > 0 && incremental == 0 {
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        } else {
+                            Poll::Ready(Ok(incremental))
+                        }
                     }
                     other => other,
                 }

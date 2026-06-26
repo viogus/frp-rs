@@ -137,6 +137,7 @@ pub async fn handle_control<S>(
     let pool_cap = login.pool_count.unwrap_or(1).max(0) as usize + WORK_POOL_EXTRA;
     let mut work_pool: VecDeque<IoStream> = VecDeque::new();
     let mut pending_requests: VecDeque<PendingRequest> = VecDeque::new();
+    let mut pending_udp: VecDeque<(String, Instant)> = VecDeque::new();
     let mut listener_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> = std::collections::HashMap::new();
     let mut udp_sockets: std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>> = std::collections::HashMap::new();
     // Reverse mapping: local_addr → proxy_name for routing UDPPacket responses
@@ -169,21 +170,36 @@ pub async fn handle_control<S>(
                 match internal {
                     Some(InternalMsg::NewWorkConn(stream)) => {
                         debug!("Got work conn for run_id {}", run_id);
-                        // Drain expired requests first
-                        while let Some(req) = pending_requests.front() {
-                            if req.created_at.elapsed() > PENDING_REQUEST_TIMEOUT {
-                                pending_requests.pop_front();
+                        // Expire stale pending UDP requests first
+                        while let Some((_, ts)) = pending_udp.front() {
+                            if ts.elapsed() > PENDING_REQUEST_TIMEOUT {
+                                let (pn, _) = pending_udp.pop_front().unwrap();
+                                warn!("Pending UDP work conn for '{}' timed out", pn);
                             } else {
                                 break;
                             }
                         }
-                        if let Some(req) = pending_requests.pop_front() {
-                            assign_work_to_proxy(stream, req, state.encryption_key).await;
-                        } else if work_pool.len() < pool_cap {
-                            work_pool.push_back(stream);
-                            debug!("Work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
+                        // Check if a UDP proxy needs this work connection
+                        if let Some((proxy_name, _)) = pending_udp.pop_front() {
+                            info!("Assigning work conn to UDP proxy '{}'", proxy_name);
+                            assign_udp_work_conn(stream, &proxy_name, &udp_sockets).await;
                         } else {
-                            debug!("Work pool full for {} ({}/{}), dropping work conn", run_id, work_pool.len(), pool_cap);
+                            // Drain expired TCP requests
+                            while let Some(req) = pending_requests.front() {
+                                if req.created_at.elapsed() > PENDING_REQUEST_TIMEOUT {
+                                    pending_requests.pop_front();
+                                } else {
+                                    break;
+                                }
+                            }
+                            if let Some(req) = pending_requests.pop_front() {
+                                assign_work_to_proxy(stream, req, state.encryption_key).await;
+                            } else if work_pool.len() < pool_cap {
+                                work_pool.push_back(stream);
+                                debug!("Work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
+                            } else {
+                                debug!("Work pool full for {} ({}/{}), dropping work conn", run_id, work_pool.len(), pool_cap);
+                            }
                         }
                     }
                     Some(InternalMsg::VisitorConn { proxy_name, visitor_conn }) => {
@@ -260,12 +276,18 @@ pub async fn handle_control<S>(
                         }
                     }
                     Some(InternalMsg::UdpData { proxy_name: ref _pn, content, remote_addr }) => {
-                        debug!("UDP data for proxy '{}' from {}", _pn, remote_addr);
-                        // Include proxy's local_str so the client can route to the correct local UDP socket
-                        let local_str = udp_local_to_proxy.iter()
+                        debug!("UDP data for proxy '{}' from {:?}", _pn, remote_addr);
+                        // Include proxy's local_addr so the client can route to the correct local UDP socket.
+                        // Priority: 1) learned from incoming UDPPacket, 2) local_str from NewProxy,
+                        // 3) proxy name as fallback (clients key by proxy_name too).
+                        let local_addr = match udp_local_to_proxy.iter()
                             .find(|(_, pn)| *pn == _pn)
                             .map(|(ls, _)| ls.clone())
-                            .unwrap_or_default();
+                            .or_else(|| udp_sockets.keys().next().cloned())
+                        {
+                            Some(ls) => msg::UdpAddr::from_string(&ls),
+                            None => None,
+                        };
                         // Encrypt/compress if the proxy requires it (Go frp v0.69.1 compat)
                         let mut payload = content;
                         if let Some(proxy_info) = state.proxy_manager.get(_pn).await {
@@ -282,13 +304,21 @@ pub async fn handle_control<S>(
                         }
                         let udp_packet = FrpMessage::UDPPacket(msg::UDPPacket {
                             content: payload,
-                            local_addr: local_str,
-                            remote_addr,
+                            local_addr,
+                            remote_addr: Some(remote_addr),
                         });
                         if let Err(e) = write_msg_v1(&mut writer, &udp_packet).await {
                             warn!("Failed to send UDPPacket: {}", e);
                             break;
                         }
+                    }
+                    Some(InternalMsg::UdpNeedsWorkConn { proxy_name }) => {
+                        debug!("UDP proxy '{}' needs work connection", proxy_name);
+                        if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
+                            warn!("Failed to send ReqWorkConn for UDP: {}", e);
+                            break;
+                        }
+                        pending_udp.push_back((proxy_name, Instant::now()));
                     }
                     Some(InternalMsg::NatHoleClient { proxy_name, sign_key, run_id: _run_id, sid, visitor_addr }) => {
                         debug!("Sending NatHoleClient for session {} to provider", sid);
@@ -365,14 +395,23 @@ pub async fn handle_control<S>(
             msg = read_msg_v1(&mut reader) => {
                 match msg {
                     Ok(FrpMessage::UDPPacket(up)) => {
-                        debug!("UDPPacket from client: {} bytes to {}", up.content.len(), up.remote_addr);
+                        debug!("UDPPacket from client: {} bytes to {:?}", up.content.len(), up.remote_addr);
                         // Forward via the proxy's UDP socket (bidirectional NAT, Go frp compat).
-                        // Lookup: local_addr → proxy_name → socket, fallback to first socket.
-                        let proxy_name = udp_local_to_proxy.get(&up.local_addr);
+                        let local_addr_str = up.local_addr.as_ref().map(|a| a.to_string()).unwrap_or_default();
+                        let proxy_name = udp_local_to_proxy.get(&local_addr_str).cloned();
+                        // Cache local_addr → proxy_name mapping from incoming packets
+                        if !local_addr_str.is_empty() && !udp_local_to_proxy.contains_key(&local_addr_str) {
+                            let fallback_pn = proxy_name
+                                .clone()
+                                .or_else(|| udp_sockets.keys().next().cloned());
+                            if let Some(ref pn) = fallback_pn {
+                                udp_local_to_proxy.insert(local_addr_str.clone(), pn.clone());
+                            }
+                        }
                         // Decrypt/decompress if the proxy requires it
                         let mut payload = up.content.clone();
-                        if let Some(pn) = proxy_name {
-                            if let Some(proxy_info) = state.proxy_manager.get(pn).await {
+                        if let Some(ref pn) = proxy_name {
+                            if let Some(proxy_info) = state.proxy_manager.get(pn.as_str()).await {
                                 if proxy_info.use_encryption {
                                     if let Ok(decrypted) = encryption::decrypt(&payload, &state.encryption_key) {
                                         payload = decrypted;
@@ -386,15 +425,18 @@ pub async fn handle_control<S>(
                             }
                         }
                         let sock_opt = proxy_name
-                            .and_then(|pn| udp_sockets.get(pn))
+                            .as_ref()
+                            .and_then(|pn| udp_sockets.get(pn.as_str()))
                             .or_else(|| udp_sockets.iter().next().map(|(_, s)| s));
                         if let Some(sock) = sock_opt {
                             let sock = sock.clone();
                             let content = payload;
-                            let remote_addr = up.remote_addr.clone();
-                            tokio::spawn(async move {
-                                let _ = sock.send_to(&content, &remote_addr).await;
-                            });
+                            if let Some(ref remote) = up.remote_addr {
+                                let remote_str = remote.to_string();
+                                tokio::spawn(async move {
+                                    let _ = sock.send_to(&content, &remote_str).await;
+                                });
+                            }
                         } else {
                             warn!("No UDP socket for proxy, dropping {} bytes", up.content.len());
                         }
@@ -521,6 +563,110 @@ pub async fn handle_control<S>(
 }
 
 /// Assign a work connection to a pending proxy request.
+/// Assign a work connection to a UDP proxy for bidirectional data forwarding.
+/// Matches Go frp v0.69.1 behavior: sends StartWorkConn, then bridges
+/// UDP socket ↔ work connection via UDPPacket messages.
+async fn assign_udp_work_conn(
+    work_conn: IoStream,
+    proxy_name: &str,
+    udp_sockets: &std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
+) {
+    let mut work_conn = work_conn;
+    let sock = match udp_sockets.get(proxy_name) {
+        Some(s) => s.clone(),
+        None => {
+            warn!("UDP socket not found for proxy '{}'", proxy_name);
+            return;
+        }
+    };
+    let proxy_name = proxy_name.to_string();
+
+    // Send StartWorkConn to tell the client which proxy to associate
+    let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
+        proxy_name: proxy_name.clone(),
+        src_addr: None,
+        dst_addr: None,
+        src_port: None,
+        dst_port: None,
+        error: None,
+    });
+    if let Err(e) = write_msg_v1(&mut work_conn, &swc).await {
+        warn!("Failed to send StartWorkConn for UDP '{}': {}", proxy_name, e);
+        return;
+    }
+    info!("UDP work conn assigned to '{}', starting bridge tasks", proxy_name);
+
+    let (mut w_r, mut w_w) = work_conn.into_split();
+
+    // Task: read UDPPacket from work conn → send to UDP socket
+    let sock_w = sock.clone();
+    let pn_w = proxy_name.clone();
+    tokio::spawn(async move {
+        info!("UDP work conn reader task started for '{}'", pn_w);
+        loop {
+            info!("UDP reader '{}' waiting for read_msg_v1...", pn_w);
+            match read_msg_v1(&mut w_r).await {
+                Ok(FrpMessage::UDPPacket(up)) => {
+                    if let Some(ref remote) = up.remote_addr {
+                        let remote_str = remote.to_string();
+                        if let Err(e) = sock_w.send_to(&up.content, &remote_str).await {
+                            debug!("UDP send_to failed for '{}': {}", pn_w, e);
+                        }
+                    }
+                }
+                Ok(FrpMessage::Ping(_)) | Ok(FrpMessage::Pong(_)) => {
+                    // Heartbeat on work conn (Go frp compat) — ignore
+                    continue;
+                }
+                Ok(other) => {
+                    debug!("UDP work conn for '{}': unexpected msg 0x{:02x}", pn_w, other.v1_type_byte());
+                }
+                Err(e) => {
+                    info!("UDP work conn for '{}' read closed: {}", pn_w, e);
+                    break;
+                }
+            }
+        }
+    });
+
+    // Task: read from UDP socket → write UDPPacket to work conn
+    let pn_w2 = proxy_name.clone();
+    tokio::spawn(async move {
+        info!("UDP work conn writer task started for '{}'", pn_w2);
+        let mut buf = vec![0u8; 65535];
+        loop {
+            info!("UDP writer '{}' waiting for recv_from...", pn_w2);
+            match sock.recv_from(&mut buf).await {
+                Ok((n, src)) => {
+                    info!("UDP writer '{}' recv'd {} bytes from {}", pn_w2, n, src);
+                    let remote = msg::UdpAddr {
+                        ip: src.ip().to_string(),
+                        port: src.port(),
+                        zone: String::new(),
+                    };
+                    let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
+                        content: buf[..n].to_vec(),
+                        local_addr: Some(msg::UdpAddr { ip: "0.0.0.0".into(), port: 0, zone: String::new() }),
+                        remote_addr: Some(remote),
+                    });
+                    info!("UDP writer '{}' sending UDPPacket to work conn...", pn_w2);
+                    if let Err(e) = write_msg_v1(&mut w_w, &pkt).await {
+                        info!("UDP work conn write failed for '{}': {}", pn_w2, e);
+                        break;
+                    }
+                    info!("UDP work conn wrote {} bytes for '{}'", n, pn_w2);
+                    info!("UDP writer '{}' looping back to recv_from...", pn_w2);
+                }
+                Err(e) => {
+                    info!("UDP recv_from error for '{}': {}", pn_w2, e);
+                    break;
+                }
+            }
+        }
+        info!("UDP writer '{}' task exiting", pn_w2);
+    });
+}
+
 async fn assign_work_to_proxy(
     mut work_conn: IoStream,
     req: PendingRequest,
@@ -799,7 +945,7 @@ async fn handle_new_proxy(
                         return;
                     }
                 };
-                let sock = socket.clone();
+                let _sock = socket.clone();
                 udp_sockets.insert(np.proxy_name.clone(), socket);
                 // Build reverse lookup: local_addr → proxy_name for routing UDPPacket responses
                 if let Some(ref local_str) = np.local_str {
@@ -812,10 +958,15 @@ async fn handle_new_proxy(
                     udp_sockets.get(n).and_then(|s| s.local_addr().ok()).map_or(false, |a| a.port() == port)
                 });
                 if should_spawn {
-                    let handle = tokio::spawn(async move {
-                        run_udp_listener(sock, pn, itx).await;
+                    // Go frp v0.69.1 compat: UDP data flows over work connections,
+                    // not the control connection. Request a work conn from the client.
+                    let pn_clone = np.proxy_name.clone();
+                    let itx_clone = itx.clone();
+                    tokio::spawn(async move {
+                        // Small delay to ensure NewProxyResp reaches client before ReqWorkConn
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        let _ = itx_clone.send(InternalMsg::UdpNeedsWorkConn { proxy_name: pn_clone });
                     });
-                    listener_handles.insert(np.proxy_name.clone(), handle);
                 }
                 info!("{} proxy '{}' listening on port {}", if is_sudp { "SUDP" } else { "UDP" }, np.proxy_name, port);
             } else if is_nat_hole {
@@ -907,7 +1058,11 @@ async fn run_udp_listener(
                 if internal_tx.send(InternalMsg::UdpData {
                     proxy_name: proxy_name.clone(),
                     content: data,
-                    remote_addr: src.to_string(),
+                    remote_addr: msg::UdpAddr {
+                        ip: src.ip().to_string(),
+                        port: src.port(),
+                        zone: String::new(),
+                    },
                 }).is_err() {
                     warn!("Control handler gone, stopping UDP listener for '{}'", proxy_name);
                     break;

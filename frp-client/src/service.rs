@@ -374,8 +374,12 @@ impl Service {
                                     }
                                     let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
                                         content: payload,
-                                        local_addr: la.clone(),
-                                        remote_addr: src.to_string(),
+                                        local_addr: msg::UdpAddr::from_string(&la),
+                                        remote_addr: Some(msg::UdpAddr {
+                                            ip: src.ip().to_string(),
+                                            port: src.port(),
+                                            zone: String::new(),
+                                        }),
                                     });
                                     let mut guard = w.lock().await;
                                     if let Err(e) = write_msg_v1(&mut *guard, &pkt).await {
@@ -426,13 +430,14 @@ impl Service {
                             Ok(FrpMessage::UDPPacket(up)) => {
                                 // Forward to local UDP socket (Go frp v0.69.1 compat).
                                 // Use local_addr to find the matching proxy; fall back to first socket.
-                                let sock = udp_sockets.get(&up.local_addr)
+                                let local_str = up.local_addr.as_ref().map(|a| a.to_string()).unwrap_or_default();
+                                let sock = udp_sockets.get(&local_str)
                                     .or_else(|| udp_sockets.values().next())
                                     .cloned();
                                 // Decrypt/decompress if the proxy requires it
                                 let content_len = up.content.len();
                                 let mut payload = up.content;
-                                if let Some(&(use_enc, use_comp)) = udp_enc_cfg.get(&up.local_addr) {
+                                if let Some(&(use_enc, use_comp)) = udp_enc_cfg.get(&local_str) {
                                     if use_enc {
                                         if let Ok(decrypted) = encryption::decrypt(&payload, &self.encryption_key) {
                                             payload = decrypted;
@@ -1095,11 +1100,31 @@ async fn run_visitor_listener(
                         };
 
                         let nvc = crate::proxy::create_visitor_conn_msg(&sn, &sk, use_encryption, use_compression);
+                        debug!("Visitor '{}': NewVisitorConn JSON: {}", visitor_name, serde_json::to_string(&nvc).unwrap_or_default());
                         if let Err(e) = server_conn.write_v1_frame(&nvc).await {
                             warn!("Visitor '{}': STCP fallback send NewVisitorConn failed: {}", visitor_name, e);
                             return;
                         }
                         info!("Visitor '{}': fell back to STCP relay for '{}'", visitor_name, sn);
+
+                        // Read NewVisitorConnResp before bridging
+                        match server_conn.read_v1_frame().await {
+                            Ok(FrpMessage::NewVisitorConnResp(resp)) => {
+                                if let Some(err) = resp.error {
+                                    warn!("Visitor '{}': STCP server error: {}", visitor_name, err);
+                                    return;
+                                }
+                                debug!("Visitor '{}': STCP relay ready for '{}'", visitor_name, resp.proxy_name);
+                            }
+                            Ok(other) => {
+                                warn!("Visitor '{}': unexpected response type 0x{:02x}, msg={:?}", visitor_name, other.v1_type_byte(), other);
+                                return;
+                            }
+                            Err(e) => {
+                                warn!("Visitor '{}': read NewVisitorConnResp failed: {}", visitor_name, e);
+                                return;
+                            }
+                        }
 
                         let mut user = user_conn;
                         match tokio::io::copy_bidirectional(&mut user, &mut server_conn).await {
@@ -1122,11 +1147,31 @@ async fn run_visitor_listener(
                         };
 
                         let nvc = crate::proxy::create_visitor_conn_msg(&sn, &sk, use_encryption, use_compression);
+                        debug!("Visitor '{}': NewVisitorConn JSON: {}", visitor_name, serde_json::to_string(&nvc).unwrap_or_default());
                         if let Err(e) = server_conn.write_v1_frame(&nvc).await {
                             warn!("Visitor '{}': send NewVisitorConn failed: {}", visitor_name, e);
                             return;
                         }
                         debug!("Visitor '{}': sent NewVisitorConn for '{}'", visitor_name, sn);
+
+                        // Read NewVisitorConnResp before bridging
+                        match server_conn.read_v1_frame().await {
+                            Ok(FrpMessage::NewVisitorConnResp(resp)) => {
+                                if let Some(err) = resp.error {
+                                    warn!("Visitor '{}': STCP server error: {}", visitor_name, err);
+                                    return;
+                                }
+                                debug!("Visitor '{}': STCP relay ready for '{}'", visitor_name, resp.proxy_name);
+                            }
+                            Ok(other) => {
+                                warn!("Visitor '{}': unexpected response type 0x{:02x}, msg={:?}", visitor_name, other.v1_type_byte(), other);
+                                return;
+                            }
+                            Err(e) => {
+                                warn!("Visitor '{}': read NewVisitorConnResp failed: {}", visitor_name, e);
+                                return;
+                            }
+                        }
 
                         let mut user = user_conn;
                         match tokio::io::copy_bidirectional(&mut user, &mut server_conn).await {

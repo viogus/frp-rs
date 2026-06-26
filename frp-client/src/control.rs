@@ -173,6 +173,7 @@ impl ControlConnection {
         stream: &mut IoStream,
     ) -> Result<msg::NewProxyResp, frp_core::Error> {
         let np = proxy::create_new_proxy_msg(p, local_addr);
+        debug!("NewProxy JSON: {}", serde_json::to_string(&np).unwrap_or_default());
         info!("Registering proxy '{}' type={} remote_port={} local={}",
             p.name, p.proxy_type, p.remote_port, local_addr);
         stream.write_v1_frame(&np).await?;

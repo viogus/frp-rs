@@ -498,7 +498,7 @@ pub struct VisitorConfig {
     #[serde(default, alias = "serverName")]
     pub server_name: String,
     /// Shared secret key — must match the STCP proxy's `sk`.
-    #[serde(default, alias = "secretKey")]
+    #[serde(default, alias = "secretKey", alias = "sk")]
     pub secret_key: String,
     /// Optional server user for auth matching.
     #[serde(default, alias = "serverUser")]

@@ -7,14 +7,25 @@ use frp_core::bridge;
 use frp_core::transport::IoStream;
 
 /// Build a NewVisitorConn message for an STCP/XTCP visitor connection.
+/// sign_key = MD5(sk + timestamp) matching Go frp v0.69.1 behaviour.
 pub fn create_visitor_conn_msg(server_name: &str, secret_key: &str, use_encryption: bool, use_compression: bool) -> FrpMessage {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
+    let sign_key = if secret_key.is_empty() {
+        None
+    } else {
+        let hash = frp_core::auth::generate_token(secret_key, timestamp);
+        debug!(
+            "STCP visitor auth: sk='{}' ts={} sign_key={}",
+            secret_key, timestamp, hash
+        );
+        Some(hash)
+    };
     FrpMessage::NewVisitorConn(msg::NewVisitorConn {
         proxy_name: server_name.to_string(),
-        sign_key: if secret_key.is_empty() { None } else { Some(secret_key.to_string()) },
+        sign_key,
         timestamp: Some(timestamp),
         run_id: None,
         use_encryption: Some(use_encryption),
@@ -36,8 +47,12 @@ pub fn create_new_proxy_msg(
         group: if p.group.is_empty() { None } else { Some(p.group.clone()) },
         group_key: if p.group_key.is_empty() { None } else { Some(p.group_key.clone()) },
         local_str: Some(local_addr.to_string()),
-        remote_port: Some(p.remote_port as i32),
-        sk: if p.sk.is_empty() { None } else { Some(p.sk.clone()) },
+        remote_port: if p.remote_port == 0 { None } else { Some(p.remote_port as i32) },
+        sk: {
+            let sk_val = if p.sk.is_empty() { None } else { Some(p.sk.clone()) };
+            debug!("NewProxy '{}': sk={:?}", p.name, sk_val);
+            sk_val
+        },
         custom_domains: if p.custom_domains.is_empty() { None } else { Some(p.custom_domains.clone()) },
         subdomain: if p.subdomain.is_empty() { None } else { Some(p.subdomain.clone()) },
         locations: if p.locations.is_empty() { None } else { Some(p.locations.clone()) },
@@ -110,10 +125,10 @@ pub async fn bridge_streams(
 
     if use_encryption {
         if let Some(key) = enc_key {
-            let (l_r, l_w) = tokio::io::split(local);
-            let (w_r, w_w) = work.into_split();
-            bridge::bridge_encrypted(
-                l_r, l_w, w_r, w_w, key, use_compression, Vec::new(),
+            let key = *key;
+            let local_io = IoStream::Tcp(local);
+            frp_core::bridge::bridge_encrypted_io(
+                local_io, work, &key, use_compression, Vec::new(),
                 read_lim.as_mut(), write_lim.as_mut(),
             ).await;
             debug!("Proxy {} encrypted bridge closed", name);
@@ -122,9 +137,15 @@ pub async fn bridge_streams(
         warn!("Proxy {}: encryption requested but no key available, falling back to plain", name);
     }
 
-    // Plain path: use rate-limited bridge when bandwidth limiting is active,
+    // Plain path: use compression-aware bridge when compression is on,
+    // rate-limited bridge when bandwidth limiting is active,
     // otherwise use the fast copy_bidirectional path.
-    if read_lim.is_some() || write_lim.is_some() {
+    if use_compression {
+        let (l_r, l_w) = tokio::io::split(local);
+        let (w_r, w_w) = work.into_split();
+        bridge::bridge_plain(l_r, l_w, w_r, w_w, true, Vec::new()).await;
+        debug!("Proxy {} compressed plain bridge closed", name);
+    } else if read_lim.is_some() || write_lim.is_some() {
         let (l_r, l_w) = tokio::io::split(local);
         let (w_r, w_w) = work.into_split();
         bridge::bridge_plain_rate_limited(
