@@ -65,10 +65,10 @@ RUN zig cc -target $(cat /tmp/zig_target) -static -O2 \
     -DFRP_MODE=\"${FRP_COMPONENT}\" -o /entrypoint /tmp/entrypoint.c
 
 # ── Runtime stage ──────────────────────────────────────────
-# distroless/static: ~3 MB (vs debian:bookworm-slim ~75 MB).
-# Includes glibc + ca-certificates — everything a -gnu binary needs.
-# No shell, no package manager. Go frp uses alpine (~7 MB); we go smaller.
-FROM --platform=$TARGETPLATFORM gcr.io/distroless/static-debian12:latest
+# distroless/base: ~20 MB (static-debian12 too minimal — entrypoint
+# failed with "no such file or directory"). Includes glibc, openssl.
+# No shell, no package manager.
+FROM --platform=$TARGETPLATFORM gcr.io/distroless/base-debian12:latest
 COPY --from=builder /usr/bin/frp /usr/bin/frp
 COPY --from=builder /entrypoint /entrypoint
 ENV FRP_CONF=/app/frp.toml

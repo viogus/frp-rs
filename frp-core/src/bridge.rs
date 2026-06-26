@@ -33,10 +33,10 @@ pub async fn bridge_encrypted(
 
     // User → Work: write pre_read first (through CipherWriter), then bridge
     let user_to_work = async {
-        if !pre_read.is_empty() {
-            if enc_work_w.write_all(&pre_read).await.is_err() {
-                return;
-            }
+        if !pre_read.is_empty()
+            && enc_work_w.write_all(&pre_read).await.is_err()
+        {
+            return;
         }
         let mut buf = vec![0u8; 65536];
         loop {

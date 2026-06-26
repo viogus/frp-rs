@@ -5,7 +5,7 @@
 FROM rust:1-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    musl-tools perl make upx-ucl && \
+    perl make upx-ucl && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -39,8 +39,9 @@ RUN cargo build --release --bin frps --bin frpc && \
     upx --best --lzma target/release/frps target/release/frpc
 
 # ── Stage 2: Runtime ──────────────────────────────────────────
-# distroless/static: ~3 MB base. Binary ~2 MB after UPX. Total ~5 MB.
-FROM gcr.io/distroless/static-debian12:latest
+# distroless/base: ~20 MB base (static was too minimal — entrypoint failed).
+# Binary ~2 MB after UPX. Total ~22 MB (vs 75 MB debian-slim, vs 3 MB static).
+FROM gcr.io/distroless/base-debian12:latest
 
 COPY --from=builder /app/target/release/frps /usr/local/bin/frps
 COPY --from=builder /app/target/release/frpc /usr/local/bin/frpc

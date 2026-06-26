@@ -51,7 +51,7 @@ RUN zig cc -target $(cat /tmp/rust_target) -static -O2 \
     -DFRP_MODE=\"${FRP_COMPONENT}\" -o /entrypoint /tmp/entrypoint.c
 
 # ── Runtime stage ──────────────────────────────────────────
-FROM --platform=$TARGETPLATFORM gcr.io/distroless/static-debian12:latest
+FROM --platform=$TARGETPLATFORM gcr.io/distroless/base-debian12:latest
 COPY --from=downloader /usr/bin/frp /usr/bin/frp
 COPY --from=downloader /entrypoint /entrypoint
 ENV FRP_CONF=/app/frp.toml
