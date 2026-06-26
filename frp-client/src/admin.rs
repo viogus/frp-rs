@@ -104,8 +104,15 @@ async fn handle_stop(State(state): State<AdminState>) -> &'static str {
 async fn handle_get_config(State(state): State<AdminState>) -> Result<String, (StatusCode, String)> {
     let path = state.config_path.as_ref()
         .ok_or_else(|| (StatusCode::NOT_FOUND, "no config file path stored".into()))?;
-    std::fs::read_to_string(path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read config: {e}")))
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read config: {e}")))?;
+
+    // Parse and redact sensitive fields before returning
+    let value: toml::Value = toml::from_str(&raw)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("parse config: {e}")))?;
+    let redacted = redact_sensitive(value);
+    toml::to_string(&redacted)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("serialize config: {e}")))
 }
 
 async fn handle_put_config(
@@ -155,4 +162,45 @@ pub async fn run_admin_server(
     tracing::info!("frpc admin server listening on {}", addr);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+// --- Helpers ---
+
+/// Sensitive keys that should be redacted from config responses.
+const SENSITIVE_KEYS: &[&str] = &[
+    "token", "privilege_token",
+    "http_pwd", "http_password",
+    "sk", "group_key",
+    "oidc_client_secret",
+];
+
+/// Recursively redact sensitive values in TOML, returning a copy with
+/// sensitive string values replaced by "***".
+fn redact_sensitive(value: toml::Value) -> toml::Value {
+    match value {
+        toml::Value::Table(table) => {
+            let mut redacted = toml::map::Map::new();
+            for (key, val) in table {
+                let redacted_val = if SENSITIVE_KEYS.contains(&key.as_str()) {
+                    redact_value(val)
+                } else {
+                    redact_sensitive(val)
+                };
+                redacted.insert(key, redacted_val);
+            }
+            toml::Value::Table(redacted)
+        }
+        toml::Value::Array(arr) => {
+            toml::Value::Array(arr.into_iter().map(redact_sensitive).collect())
+        }
+        other => other,
+    }
+}
+
+/// Replace a sensitive value with "***".
+fn redact_value(value: toml::Value) -> toml::Value {
+    match value {
+        toml::Value::String(_) => toml::Value::String("***".into()),
+        _ => toml::Value::String("***".into()),
+    }
 }
