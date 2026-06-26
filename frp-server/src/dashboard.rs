@@ -24,6 +24,7 @@ struct ProxyEntry {
     local_addr: Option<String>,
     traffic_in: u64,
     traffic_out: u64,
+    total_conns: u64,
 }
 
 #[derive(Serialize)]
@@ -100,6 +101,7 @@ async fn handle_proxies(State(state): State<Arc<AppState>>) -> Json<Vec<ProxyEnt
             local_addr: p.local_addr.clone(),
             traffic_in: traffic.bytes_in,
             traffic_out: traffic.bytes_out,
+            total_conns: traffic.total_conns,
         });
     }
     Json(entries)
@@ -203,6 +205,7 @@ async fn handle_client_detail(
             local_addr: p.local_addr.clone(),
             traffic_in: traffic.bytes_in,
             traffic_out: traffic.bytes_out,
+            total_conns: traffic.total_conns,
         });
     }
 
@@ -235,6 +238,8 @@ struct StoreProxyConfig {
     remote_port: Option<u16>,
     #[serde(default)]
     custom_domains: Vec<String>,
+    #[serde(default)]
+    local_addr: String,
     #[serde(default)]
     group: String,
 }
@@ -279,10 +284,19 @@ async fn handle_store_proxy_create(
             error: "proxy config already in store".into()
         })));
     }
+    let (local_ip, local_port) = if config.local_addr.is_empty() {
+        (String::new(), 0u16)
+    } else if let Some((ip, port_str)) = config.local_addr.rsplit_once(':') {
+        (ip.to_string(), port_str.parse::<u16>().unwrap_or(0))
+    } else {
+        (config.local_addr.clone(), 0u16)
+    };
     store.insert(config.name.clone(), frp_core::config::ProxyConfig {
         name: config.name.clone(),
         proxy_type: config.proxy_type.clone(),
         remote_port: config.remote_port.unwrap_or(0),
+        local_ip,
+        local_port,
         custom_domains: config.custom_domains.clone(),
         group: config.group.clone(),
         ..Default::default()
