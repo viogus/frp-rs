@@ -674,6 +674,7 @@ pub struct DialOptions {
     pub tls_key_file: Option<String>,
     pub dns_server: Option<String>,
     pub dial_timeout_secs: u64,
+    pub disable_custom_tls_first_byte: bool,
 }
 
 impl Default for DialOptions {
@@ -689,6 +690,7 @@ impl Default for DialOptions {
             tls_key_file: None,
             dns_server: None,
             dial_timeout_secs: 10,
+            disable_custom_tls_first_byte: false,
         }
     }
 }
@@ -761,9 +763,11 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
     match opts.protocol {
         TransportProtocol::Tcp => {
             if opts.tls_enable {
-                // Write FRPTLSHeadByte (0x17) before TLS handshake, matching Go frp v0.69.1
-                stream.write_all(&[FRP_TLS_HEAD_BYTE]).await
-                    .map_err(|e| crate::Error::Transport(format!("write TLS head byte: {e}")))?;
+                if !opts.disable_custom_tls_first_byte {
+                    // Write FRPTLSHeadByte (0x17) before TLS handshake, matching Go frp v0.69.1
+                    stream.write_all(&[FRP_TLS_HEAD_BYTE]).await
+                        .map_err(|e| crate::Error::Transport(format!("write TLS head byte: {e}")))?;
+                }
                 let connector = build_tls_connector(
                     opts.tls_ca_file.as_deref(),
                     opts.tls_cert_file.as_deref(),

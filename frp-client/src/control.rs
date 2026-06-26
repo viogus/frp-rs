@@ -29,6 +29,7 @@ pub struct ControlConnection {
     tls_key_file: Option<String>,
     dns_server: Option<String>,
     tcp_mux: bool,
+    disable_custom_tls_first_byte: bool,
     v2: bool,
     oidc_client: Option<Arc<OidcClient>>,
     /// Server's additional auth scopes from LoginResp. Combined with client
@@ -53,6 +54,7 @@ impl ControlConnection {
         tls_key_file: Option<String>,
         dns_server: Option<String>,
         tcp_mux: bool,
+        disable_custom_tls_first_byte: bool,
         v2: bool,
         oidc_client: Option<Arc<OidcClient>>,
         metas: std::collections::HashMap<String, String>,
@@ -73,6 +75,7 @@ impl ControlConnection {
             tls_key_file,
             dns_server,
             tcp_mux,
+            disable_custom_tls_first_byte,
             v2,
             oidc_client,
             server_auth_scopes: Vec::new(),
@@ -99,6 +102,7 @@ impl ControlConnection {
             tls_cert_file: self.tls_cert_file.clone(),
             tls_key_file: self.tls_key_file.clone(),
             dns_server: self.dns_server.clone(),
+            disable_custom_tls_first_byte: self.disable_custom_tls_first_byte,
             ..Default::default()
         };
 

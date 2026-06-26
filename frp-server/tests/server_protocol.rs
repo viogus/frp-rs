@@ -55,6 +55,7 @@ async fn test_login_wrong_token_fails() {
             oidc_token_endpoint: String::new(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+                    oidc_proxy_url: String::new(),
                     additional_auth_scopes: Vec::new(),
         },
         ..Default::default()
@@ -93,6 +94,7 @@ async fn test_login_correct_token_succeeds() {
             oidc_token_endpoint: String::new(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+                    oidc_proxy_url: String::new(),
                     additional_auth_scopes: Vec::new(),
         },
         ..Default::default()

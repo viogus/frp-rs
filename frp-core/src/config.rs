@@ -191,6 +191,7 @@ impl Default for ServerConfig {
 
 fn default_bind_addr() -> String { "0.0.0.0".into() }
 fn default_bind_port() -> u16 { 7000 }
+fn default_fallback_timeout_ms() -> u64 { 5000 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthServerConfig {
@@ -208,6 +209,10 @@ pub struct AuthServerConfig {
     pub oidc_skip_expiry: bool,
     #[serde(default, alias = "oidcSkipIssuer")]
     pub oidc_skip_issuer: bool,
+    /// HTTP/SOCKS5 proxy URL for OIDC HTTP client connections.
+    /// Go frp compat: oidcProxyURL.
+    #[serde(default, alias = "oidcProxyURL")]
+    pub oidc_proxy_url: String,
     /// Additional auth scopes: "HeartBeats", "NewWorkConns".
     /// When listed, corresponding message types require authentication.
     /// Go frp compat: additionalAuthScopes.
@@ -225,6 +230,7 @@ impl Default for AuthServerConfig {
             oidc_token_endpoint: String::new(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+            oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
         }
     }
@@ -360,6 +366,14 @@ pub struct PluginConfig {
     /// Secret key for STCP/XTCP visitor plugin auth (Go frp compat: sk).
     #[serde(default, alias = "sk")]
     pub secret_key: String,
+    /// Local address to bind for the visitor plugin listener.
+    /// Go frp compat: bindAddr.
+    #[serde(default, alias = "bindAddr")]
+    pub bind_addr: String,
+    /// Local port for the visitor plugin listener. -1 disables binding.
+    /// Go frp compat: bindPort.
+    #[serde(default, alias = "bindPort")]
+    pub bind_port: i32,
 }
 
 
@@ -399,6 +413,10 @@ pub struct AuthClientConfig {
     /// Go frp compat: insecure_skip_verify.
     #[serde(default)]
     pub oidc_tls_insecure_skip_verify: bool,
+    /// HTTP/SOCKS5 proxy URL for OIDC HTTP client connections.
+    /// Go frp compat: oidcProxyURL.
+    #[serde(default, alias = "oidcProxyURL")]
+    pub oidc_proxy_url: String,
     /// Additional auth scopes: "HeartBeats", "NewWorkConns".
     /// Client-side scopes, unioned with server's scopes.
     /// Go frp compat: additionalAuthScopes.
@@ -420,6 +438,7 @@ impl Default for AuthClientConfig {
             additional_endpoint_params: String::new(),
             oidc_tls_trusted_ca_file: String::new(),
             oidc_tls_insecure_skip_verify: false,
+            oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
         }
     }
@@ -454,6 +473,11 @@ pub struct ClientConfig {
     pub tls_ca_file: String,
     #[serde(default)]
     pub tls_server_name: String,
+    /// Disable the custom TLS head byte (0x17) written before the TLS handshake.
+    /// When true, the client skips the Go frp protocol marker and starts TLS directly.
+    /// Go frp compat: disableCustomTLSFirstByte.
+    #[serde(default, alias = "disableCustomTLSFirstByte")]
+    pub disable_custom_tls_first_byte: bool,
     #[serde(default)]
     pub log: LogConfig,
     #[serde(default)]
@@ -492,6 +516,7 @@ impl Default for ClientConfig {
             tls_key_file: String::new(),
             tls_ca_file: String::new(),
             tls_server_name: String::new(),
+            disable_custom_tls_first_byte: false,
             log: LogConfig::default(),
             login_fail_exit: true,
             pool_count: 0,
@@ -613,6 +638,10 @@ pub struct VisitorConfig {
     /// Local port for the visitor listener (0 = disabled).
     #[serde(default, alias = "bindPort")]
     pub bind_port: u16,
+    /// Fallback timeout in milliseconds before switching from XTCP to STCP.
+    /// Go frp compat: fallbackTimeoutMs. Default: 5000 (5 seconds).
+    #[serde(default = "default_fallback_timeout_ms")]
+    pub fallback_timeout_ms: u64,
     /// Fallback visitor name if this one fails.
     #[serde(default, alias = "fallbackTo")]
     pub fallback_to: String,

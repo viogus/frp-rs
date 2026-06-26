@@ -67,6 +67,7 @@ pub async fn start_frps(port: u16, token: &str) -> JoinHandle<()> {
             oidc_token_endpoint: String::new(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+                    oidc_proxy_url: String::new(),
                     additional_auth_scopes: Vec::new(),
         },
         allow_port_start: port.saturating_sub(50),

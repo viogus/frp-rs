@@ -218,6 +218,7 @@ async fn test_e2e_tcp_proxy_over_tls() {
             oidc_token_endpoint: String::new(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+                    oidc_proxy_url: String::new(),
                     additional_auth_scopes: Vec::new(),
         },
         tls_enable: true,

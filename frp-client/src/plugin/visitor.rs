@@ -14,18 +14,13 @@ use super::{PluginHandle, PluginContext};
 
 /// Start a visitor plugin that tunnels connections to a remote STCP/XTCP proxy.
 ///
-/// Binds a local TCP listener. Each accepted connection: dials frps, authenticates,
-/// sends NewVisitorConn, reads response, bridges bidirectionally.
+/// Binds a local TCP listener unless `bind_port == -1` (no-bind mode).
+/// Each accepted connection: dials frps, authenticates, sends NewVisitorConn,
+/// reads response, bridges bidirectionally.
 pub async fn start_visitor_plugin(
     cfg: &PluginConfig,
     ctx: PluginContext,
 ) -> Result<PluginHandle, frp_core::Error> {
-    let bind_addr = if !cfg.local_addr.is_empty() {
-        cfg.local_addr.clone()
-    } else {
-        "127.0.0.1:0".to_string()
-    };
-
     let server_name = cfg.server_name.clone();
     let secret_key = cfg.secret_key.clone();
 
@@ -33,6 +28,31 @@ pub async fn start_visitor_plugin(
         return Err(frp_core::Error::Config(
             "visitor_plugin: serverName is required".into()
         ));
+    }
+
+    // Determine bind address: bind_addr:bind_port takes priority.
+    // Fall back to local_addr for backward compatibility.
+    // bind_port == -1 disables the local listener (no-bind mode).
+    let no_bind = cfg.bind_port == -1;
+    let bind_addr = if no_bind {
+        String::new()
+    } else if !cfg.bind_addr.is_empty() {
+        format!("{}:{}", cfg.bind_addr, cfg.bind_port.max(0))
+    } else if !cfg.local_addr.is_empty() {
+        cfg.local_addr.clone()
+    } else {
+        "127.0.0.1:0".to_string()
+    };
+
+    // In no-bind mode, return a handle with no listener task.
+    if no_bind {
+        debug!("visitor plugin: no-bind mode (bindPort = -1), skipping listener");
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        return Ok(PluginHandle {
+            local_addr: "0.0.0.0:0".parse().unwrap(),
+            _task: tokio::spawn(std::future::ready(())),
+            shutdown: Some(shutdown_tx),
+        });
     }
 
     let listener = TcpListener::bind(&bind_addr).await.map_err(|e| {

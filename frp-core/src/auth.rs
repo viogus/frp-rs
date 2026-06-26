@@ -24,6 +24,9 @@ pub struct AuthConfig {
     pub oidc_skip_expiry: bool,
     pub oidc_skip_issuer: bool,
     pub additional_data: Option<String>,
+    /// HTTP/SOCKS5 proxy URL for OIDC HTTP client connections.
+    /// Go frp compat: oidcProxyURL.
+    pub oidc_proxy_url: String,
     /// Additional auth scopes: "HeartBeats", "NewWorkConns".
     /// When listed, corresponding message types require authentication.
     /// Go frp compat: additionalAuthScopes.
@@ -40,6 +43,7 @@ impl Default for AuthConfig {
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             additional_data: None,
+            oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
         }
     }
@@ -127,9 +131,16 @@ impl OidcVerifier {
         audience: String,
         skip_expiry: bool,
         skip_issuer: bool,
+        proxy_url: Option<String>,
     ) -> Result<Self, String> {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
+        let mut client_builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10));
+        if let Some(ref url) = proxy_url.filter(|u| !u.is_empty()) {
+            let proxy = reqwest::Proxy::all(url)
+                .map_err(|e| format!("OIDC: invalid proxy URL '{url}': {e}"))?;
+            client_builder = client_builder.proxy(proxy);
+        }
+        let http = client_builder
             .build()
             .map_err(|e| format!("OIDC: failed to create HTTP client: {e}"))?;
 
@@ -381,9 +392,16 @@ impl OidcClient {
         additional_endpoint_params: &str,
         tls_trusted_ca_file: Option<String>,
         tls_insecure_skip_verify: bool,
+        proxy_url: Option<String>,
     ) -> Result<Self, String> {
         let mut client_builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10));
+
+        if let Some(ref url) = proxy_url.filter(|u| !u.is_empty()) {
+            let proxy = reqwest::Proxy::all(url)
+                .map_err(|e| format!("OIDC client: invalid proxy URL '{url}': {e}"))?;
+            client_builder = client_builder.proxy(proxy);
+        }
 
         if let Some(ca_file) = tls_trusted_ca_file.filter(|f| !f.is_empty()) {
             let cert = std::fs::read(&ca_file)
@@ -618,6 +636,7 @@ mod tests {
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             additional_data: None,
+            oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
         };
         let ts = 100i64;
@@ -640,6 +659,7 @@ mod tests {
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             additional_data: None,
+            oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
         };
         // AuthConfig::validate_login for OIDC returns error when no server-side verifier
@@ -723,6 +743,7 @@ mod tests {
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             additional_data: None,
+            oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
         };
         assert!(cfg.generate_login_key(100).is_none());

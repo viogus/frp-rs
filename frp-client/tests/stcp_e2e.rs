@@ -88,6 +88,7 @@ async fn test_stcp_e2e_relay() {
             bind_addr: "127.0.0.1".into(),
             bind_port: visitor_port,
             fallback_to: String::new(),
+            fallback_timeout_ms: 5000,
             use_encryption: false,
             use_compression: false,
         }],

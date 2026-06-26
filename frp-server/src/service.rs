@@ -183,6 +183,7 @@ impl Service {
             oidc_skip_expiry: cfg.auth.oidc_skip_expiry,
             oidc_skip_issuer: cfg.auth.oidc_skip_issuer,
             additional_data: None,
+            oidc_proxy_url: cfg.auth.oidc_proxy_url.clone(),
             additional_auth_scopes: cfg.auth.additional_auth_scopes.clone(),
         };
 
@@ -192,6 +193,7 @@ impl Service {
                 auth_cfg.oidc_audience.clone(),
                 auth_cfg.oidc_skip_expiry,
                 auth_cfg.oidc_skip_issuer,
+                Some(auth_cfg.oidc_proxy_url.clone()).filter(|s| !s.is_empty()),
             ).await {
                 Ok(v) => {
                     info!("OIDC verifier initialized (issuer: {})", auth_cfg.oidc_issuer);
@@ -903,6 +905,7 @@ impl Service {
             oidc_skip_expiry: new_cfg.auth.oidc_skip_expiry,
             oidc_skip_issuer: new_cfg.auth.oidc_skip_issuer,
             additional_data: None,
+            oidc_proxy_url: new_cfg.auth.oidc_proxy_url.clone(),
             additional_auth_scopes: new_cfg.auth.additional_auth_scopes.clone(),
         };
         let new_enc_key = frp_core::encryption::derive_key(&new_auth_cfg.token);

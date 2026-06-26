@@ -67,6 +67,7 @@ impl Service {
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             additional_data: None,
+            oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
         };
 
@@ -85,6 +86,7 @@ impl Service {
                 &ac.additional_endpoint_params,
                 Some(ac.oidc_tls_trusted_ca_file.clone()).filter(|s| !s.is_empty()),
                 ac.oidc_tls_insecure_skip_verify,
+                Some(ac.oidc_proxy_url.clone()).filter(|s| !s.is_empty()),
             ).await.map_err(|e| format!("OIDC client init failed: {e}"))?;
             info!("OIDC client initialized, token endpoint: {}", client.token_endpoint());
             Some(Arc::new(client))
@@ -403,6 +405,7 @@ impl Service {
                 if self.cfg.tls_key_file.is_empty() { None } else { Some(self.cfg.tls_key_file.clone()) },
                 if self.cfg.dns_server.is_empty() { None } else { Some(self.cfg.dns_server.clone()) },
                 self.cfg.tcp_mux,
+                self.cfg.disable_custom_tls_first_byte,
                 self.cfg.v2,
                 self.oidc_client.clone(),
                 self.cfg.metas.clone(),
@@ -517,6 +520,7 @@ impl Service {
                     self.proxy_metrics.clone(),
                     client_scopes.clone(),
                     server_scopes.clone(),
+                    self.cfg.disable_custom_tls_first_byte,
                 );
             }
 
@@ -538,9 +542,10 @@ impl Service {
                 let tls_server_name = self.cfg.tls_server_name.clone();
                 let tls_ca_file = if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) };
                 let visitor_type = v.visitor_type.clone();
+                let fallback_timeout_ms = v.fallback_timeout_ms;
                 tokio::spawn(async move {
                     run_visitor_listener(sa, sp, pt, server_name, secret_key, bind_addr, use_enc, use_comp, name,
-                        tls_enable, tls_server_name, tls_ca_file, visitor_type).await;
+                        tls_enable, tls_server_name, tls_ca_file, visitor_type, fallback_timeout_ms).await;
                 });
             }
 
@@ -573,6 +578,7 @@ impl Service {
                                     self.proxy_metrics.clone(),
                                     client_scopes.clone(),
                                     server_scopes.clone(),
+                                    self.cfg.disable_custom_tls_first_byte,
                                 );
                             }
                             Ok(FrpMessage::Pong(_)) => {
@@ -616,7 +622,7 @@ impl Service {
                                 }
 
                                 // TCP simultaneous open (visitor is punching at the same time)
-                                match tcp_simultaneous_open(&visitor_addr).await {
+                                match tcp_simultaneous_open(&visitor_addr, 5000).await {
                                     Ok(p2p_stream) => {
                                         // Connect to local service and bridge
                                         if let Some(ref local) = local_addr {
@@ -709,6 +715,7 @@ impl Service {
                                     oidc_skip_expiry: false,
                                     oidc_skip_issuer: false,
                                     additional_data: None,
+            oidc_proxy_url: String::new(),
                                     additional_auth_scopes: Vec::new(),
                                 };
                                 ping_msg.privilege_key = ping_auth.generate_login_key(ts);
@@ -896,6 +903,7 @@ fn spawn_work_conn(
     proxy_metrics: Arc<ProxyMetricsRegistry>,
     client_auth_scopes: Vec<String>,
     server_auth_scopes: Vec<String>,
+    disable_custom_tls_first_byte: bool,
 ) {
     let server_addr = server_addr.to_string();
     let run_id = run_id.to_string();
@@ -936,6 +944,7 @@ fn spawn_work_conn(
                 tls_enable,
                 tls_server_name: tls_server_name.clone(),
                 tls_ca_file: tls_ca_file.clone(),
+                disable_custom_tls_first_byte,
                 ..Default::default()
             };
             match dial_server(&opts).await {
@@ -976,6 +985,7 @@ fn spawn_work_conn(
                         oidc_skip_expiry: false,
                         oidc_skip_issuer: false,
                         additional_data: None,
+            oidc_proxy_url: String::new(),
                         additional_auth_scopes: Vec::new(),
                     };
                     nwc_msg.privilege_key = auth_cfg.generate_login_key(timestamp);
@@ -1206,6 +1216,7 @@ fn spawn_work_conn(
                 repl_proxy_metrics,
                 client_auth_scopes.clone(),
                 server_auth_scopes.clone(),
+                disable_custom_tls_first_byte,
             );
         }
     });
@@ -1332,7 +1343,7 @@ async fn run_http_check(addr: &str, url: &str, timeout: std::time::Duration, hea
 ///
 /// Returns the connected TcpStream on success, or an error on timeout (5s)
 /// or other failures.
-async fn tcp_simultaneous_open(peer_addr: &str) -> Result<tokio::net::TcpStream, String> {
+async fn tcp_simultaneous_open(peer_addr: &str, timeout_ms: u64) -> Result<tokio::net::TcpStream, String> {
     use std::net::SocketAddr;
     use tokio::net::TcpSocket;
 
@@ -1363,8 +1374,8 @@ async fn tcp_simultaneous_open(peer_addr: &str) -> Result<tokio::net::TcpStream,
 
     debug!("TCP simultaneous open: bound to local, dialing {}", peer);
 
-    // Dial with 5-second timeout
-    match tokio::time::timeout(Duration::from_secs(5), local.connect(peer)).await {
+    // Dial with configured timeout
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), local.connect(peer)).await {
         Ok(Ok(stream)) => {
             debug!("TCP simultaneous open to {} succeeded", peer);
             Ok(stream)
@@ -1374,7 +1385,7 @@ async fn tcp_simultaneous_open(peer_addr: &str) -> Result<tokio::net::TcpStream,
             Err(format!("connect failed: {}", e))
         }
         Err(_) => {
-            debug!("TCP simultaneous open to {} timed out after 5s", peer);
+            debug!("TCP simultaneous open to {} timed out after {}ms", peer, timeout_ms);
             Err("hole punch timeout".into())
         }
     }
@@ -1394,6 +1405,7 @@ async fn run_visitor_listener(
     tls_server_name: String,
     tls_ca_file: Option<String>,
     visitor_type: String,
+    fallback_timeout_ms: u64,
 ) {
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
@@ -1466,7 +1478,7 @@ async fn run_visitor_listener(
                                         debug!("Visitor '{}': provider ready, attempting P2P", visitor_name);
 
                                         if !provider_addr.is_empty() {
-                                            match tcp_simultaneous_open(&provider_addr).await {
+                                            match tcp_simultaneous_open(&provider_addr, fallback_timeout_ms).await {
                                                 Ok(p2p_stream) => {
                                                     info!("Visitor '{}': XTCP P2P connected to {}", visitor_name, provider_addr);
                                                     let mut user = user_conn;
