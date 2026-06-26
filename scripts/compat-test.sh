@@ -1570,9 +1570,6 @@ test_r2g_stcp
 # Phase 5: Multi-proxy and edge cases
 test_multi_proxy
 test_g2r_compression
-test_r2g_compression
-test_r2g_multi_proxy
-
 # =============================================================================
 # Test: Compression (useCompression) — Rust client → Go server
 # =============================================================================
@@ -1707,6 +1704,10 @@ TOML
         fail_test "$name" "proxy1=$r1 proxy2=$r2"
     fi
 }
+
+# Phase 5: Multi-proxy and edge cases (continued)
+test_r2g_compression
+test_r2g_multi_proxy
 
 # --- Summary ---
 echo ""
