@@ -106,6 +106,7 @@ pub(crate) async fn assign_udp_work_conn(
     udp_sockets: &std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
     local_addr: Option<msg::UdpAddr>,
     v2: bool,
+    udp_packet_size: usize,
 ) {
     let mut work_conn = work_conn;
     let sock = match udp_sockets.get(proxy_name) {
@@ -178,7 +179,7 @@ pub(crate) async fn assign_udp_work_conn(
     let pn_w2 = proxy_name.clone();
     tokio::spawn(async move {
         debug!("UDP work conn writer task started for '{}'", pn_w2);
-        let mut buf = vec![0u8; 65535];
+        let mut buf = vec![0u8; udp_packet_size];
         loop {
             match sock.recv_from(&mut buf).await {
                 Ok((n, src)) => {

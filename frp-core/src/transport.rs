@@ -675,6 +675,10 @@ pub struct DialOptions {
     pub dns_server: Option<String>,
     pub dial_timeout_secs: u64,
     pub disable_custom_tls_first_byte: bool,
+    /// TCP keepalive interval in seconds for outbound connections. 0 = disabled.
+    pub keepalive_secs: u64,
+    /// Local IP address to bind before dialing. None = system default.
+    pub bind_addr: Option<String>,
 }
 
 impl Default for DialOptions {
@@ -691,6 +695,8 @@ impl Default for DialOptions {
             dns_server: None,
             dial_timeout_secs: 10,
             disable_custom_tls_first_byte: false,
+            keepalive_secs: 0,
+            bind_addr: None,
         }
     }
 }
@@ -738,6 +744,7 @@ async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<String, c
 /// Connect to the server with the given options.
 pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
     use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpSocket;
     use tokio::time::{timeout, Duration};
 
     // Resolve server_addr via custom DNS server if configured.
@@ -752,13 +759,44 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
         opts.server_addr.clone()
     };
     let addr = format!("{target_ip}:{}", opts.server_port);
+    let peer: std::net::SocketAddr = addr.parse().map_err(|e| {
+        crate::Error::Transport(format!("invalid server address '{addr}': {e}"))
+    })?;
+
+    // Create socket for optional local bind + keepalive configuration
+    let socket = if peer.is_ipv4() {
+        TcpSocket::new_v4()
+    } else {
+        TcpSocket::new_v6()
+    }.map_err(|e| crate::Error::Transport(format!("create socket: {e}")))?;
+
+    // Bind to specific local IP if configured
+    if let Some(ref bind_ip) = opts.bind_addr {
+        let bind_addr: std::net::SocketAddr = format!("{bind_ip}:0").parse().map_err(|e| {
+            crate::Error::Transport(format!("invalid bind_addr '{bind_ip}': {e}"))
+        })?;
+        socket.bind(bind_addr).map_err(|e| {
+            crate::Error::Transport(format!("bind to {bind_ip}: {e}"))
+        })?;
+    }
+
     let mut stream = timeout(
         Duration::from_secs(opts.dial_timeout_secs),
-        TcpStream::connect(&addr),
+        socket.connect(peer),
     )
     .await
     .map_err(|_| crate::Error::Transport(format!("dial timeout to {addr}")))?
     .map_err(|e| crate::Error::Transport(format!("dial to {addr}: {e}")))?;
+
+    // Configure TCP keepalive after connection
+    if opts.keepalive_secs > 0 {
+        let keepalive = socket2::SockRef::from(&stream);
+        let ka = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(opts.keepalive_secs));
+        keepalive.set_tcp_keepalive(&ka).map_err(|e| {
+            crate::Error::Transport(format!("set keepalive: {e}"))
+        })?;
+    }
 
     match opts.protocol {
         TransportProtocol::Tcp => {
