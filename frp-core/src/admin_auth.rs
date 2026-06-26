@@ -20,7 +20,10 @@ struct AuthState {
 /// (pass-through). Otherwise, requests without a valid
 /// `Authorization: Basic <base64(user:pass)>` header receive
 /// 401 with `WWW-Authenticate: Basic realm="frp"`.
-pub fn apply_admin_auth(router: Router, user: &str, password: &str) -> Router {
+pub fn apply_admin_auth<S>(router: Router<S>, user: &str, password: &str) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     let enabled = !user.is_empty() || !password.is_empty();
     let expected = if enabled {
         format!(

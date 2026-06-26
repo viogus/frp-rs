@@ -453,8 +453,10 @@ impl Service {
             let dash_addr = format_socket_addr(&self.cfg.web_server.addr, self.cfg.web_server.port);
             let dash_addr2 = dash_addr.clone();
             let dash_state = self.state.clone();
+            let dash_user = self.cfg.web_server.user.clone();
+            let dash_pwd = self.cfg.web_server.password.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::dashboard::run_dashboard(dash_addr, dash_state).await {
+                if let Err(e) = crate::dashboard::run_dashboard(dash_addr, dash_state, dash_user, dash_pwd).await {
                     tracing::error!("Dashboard server failed: {}", e);
                 }
             });
