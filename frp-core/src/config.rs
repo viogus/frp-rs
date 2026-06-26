@@ -379,6 +379,14 @@ pub struct AuthClientConfig {
     /// Extra params for token endpoint.
     #[serde(default, alias = "additionalEndpointParams")]
     pub additional_endpoint_params: String,
+    /// Path to a custom CA certificate PEM file for OIDC provider TLS.
+    /// Go frp compat: tls_trusted_ca_file.
+    #[serde(default, alias = "tls_trusted_ca_file")]
+    pub oidc_tls_trusted_ca_file: String,
+    /// Skip TLS certificate verification for OIDC (dev only).
+    /// Go frp compat: insecure_skip_verify.
+    #[serde(default)]
+    pub oidc_tls_insecure_skip_verify: bool,
 }
 
 impl Default for AuthClientConfig {
@@ -393,6 +401,8 @@ impl Default for AuthClientConfig {
             oidc_scope: String::new(),
             oidc_issuer: String::new(),
             additional_endpoint_params: String::new(),
+            oidc_tls_trusted_ca_file: String::new(),
+            oidc_tls_insecure_skip_verify: false,
         }
     }
 }

@@ -16,6 +16,9 @@ pub struct ProxyInfo {
     pub use_compression: bool,
     /// Virtual network for STCP/XTCP isolation.
     pub virtual_net: Option<String>,
+    /// Allowed visitor run_ids (STCP/XTCP access control).
+    /// Empty = all visitors allowed. Go frp compat: allow_users.
+    pub allow_users: Vec<String>,
 }
 
 /// Manages all proxy registrations on the server.

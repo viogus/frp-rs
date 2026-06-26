@@ -360,6 +360,12 @@ pub struct OidcClient {
 
 impl OidcClient {
     /// Create new OidcClient. If token_endpoint is empty, discovers from issuer.
+    ///
+    /// `tls_trusted_ca_file`: path to a custom CA certificate PEM file for
+    /// the OIDC provider's TLS. Go frp compat: tls_trusted_ca_file.
+    ///
+    /// `tls_insecure_skip_verify`: skip TLS certificate verification (dev only).
+    /// Go frp compat: insecure_skip_verify.
     pub async fn new(
         client_id: String,
         client_secret: String,
@@ -368,9 +374,25 @@ impl OidcClient {
         scope: String,
         issuer: Option<String>,
         additional_endpoint_params: &str,
+        tls_trusted_ca_file: Option<String>,
+        tls_insecure_skip_verify: bool,
     ) -> Result<Self, String> {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
+        let mut client_builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10));
+
+        if let Some(ca_file) = tls_trusted_ca_file.filter(|f| !f.is_empty()) {
+            let cert = std::fs::read(&ca_file)
+                .map_err(|e| format!("OIDC client: failed to read CA cert {ca_file}: {e}"))?;
+            let cert = reqwest::Certificate::from_pem(&cert)
+                .map_err(|e| format!("OIDC client: invalid CA cert {ca_file}: {e}"))?;
+            client_builder = client_builder.add_root_certificate(cert);
+        }
+
+        if tls_insecure_skip_verify {
+            client_builder = client_builder.danger_accept_invalid_certs(true);
+        }
+
+        let http = client_builder
             .build()
             .map_err(|e| format!("OIDC client: failed to create HTTP client: {e}"))?;
 
