@@ -471,7 +471,7 @@ fn default_server_port() -> u16 { 7000 }
 fn default_transport_protocol() -> String { "tcp".into() }
 fn default_true() -> bool { true }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProxyConfig {
     pub name: String,
     #[serde(rename = "type")]

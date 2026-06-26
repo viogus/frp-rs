@@ -112,6 +112,8 @@ pub struct AppState {
     pub custom_404_page: String,
     /// Server-side HTTP plugin manager for lifecycle hooks.
     pub plugin_manager: Arc<crate::plugin::HttpPluginManager>,
+    /// In-memory store for proxy configs submitted via dashboard Store API.
+    pub proxy_config_store: Arc<RwLock<HashMap<String, frp_core::config::ProxyConfig>>>,
     /// TCPMux HTTP CONNECT route table (domain → proxy mapping).
     pub tcpmux_manager: Arc<TcpMuxManager>,
     /// Per-proxy traffic metrics for dashboard API.
@@ -149,6 +151,7 @@ impl AppState {
             tcp_mux_passthrough,
             custom_404_page,
             plugin_manager,
+            proxy_config_store: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }

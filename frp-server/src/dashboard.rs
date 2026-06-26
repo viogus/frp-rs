@@ -1,6 +1,7 @@
 use std::sync::Arc;
-use axum::{Router, Json, extract::{State, Path}, response::Html, routing::get};
-use serde::Serialize;
+use axum::{Router, Json, extract::{State, Path}, response::Html, routing::{get, delete}};
+use axum::http::StatusCode;
+use serde::{Serialize, Deserialize};
 use crate::service::AppState;
 use frp_core::admin_auth::apply_admin_auth;
 use frp_core::metrics::MetricsSnapshot;
@@ -223,6 +224,105 @@ async fn handle_healthz() -> &'static str {
     "ok"
 }
 
+// --- Store API ---
+
+#[derive(Deserialize)]
+struct StoreProxyConfig {
+    name: String,
+    #[serde(rename = "type")]
+    proxy_type: String,
+    #[serde(default)]
+    remote_port: Option<u16>,
+    #[serde(default)]
+    custom_domains: Vec<String>,
+    #[serde(default)]
+    group: String,
+}
+
+/// GET /api/store/proxies — list all active proxies with extended config.
+async fn handle_store_proxies(State(state): State<Arc<AppState>>) -> Json<Vec<serde_json::Value>> {
+    let proxies = state.proxy_manager.list().await;
+    let result: Vec<serde_json::Value> = proxies.iter().map(|p| {
+        serde_json::json!({
+            "name": p.name,
+            "type": p.proxy_type,
+            "run_id": p.run_id,
+            "remote_port": p.remote_port,
+            "local_addr": p.local_addr,
+            "use_encryption": p.use_encryption,
+            "use_compression": p.use_compression,
+            "group": p.group,
+        })
+    }).collect();
+    Json(result)
+}
+
+/// POST /api/store/proxies — stash a proxy config in memory.
+async fn handle_store_proxy_create(
+    State(state): State<Arc<AppState>>,
+    Json(config): Json<StoreProxyConfig>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    if config.name.is_empty() || config.proxy_type.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse {
+            error: "name and type are required".into()
+        })));
+    }
+    let exists = state.proxy_manager.get(&config.name).await.is_some();
+    if exists {
+        return Err((StatusCode::CONFLICT, Json(ErrorResponse {
+            error: "proxy already exists".into()
+        })));
+    }
+    let mut store = state.proxy_config_store.write().await;
+    if store.contains_key(&config.name) {
+        return Err((StatusCode::CONFLICT, Json(ErrorResponse {
+            error: "proxy config already in store".into()
+        })));
+    }
+    store.insert(config.name.clone(), frp_core::config::ProxyConfig {
+        name: config.name.clone(),
+        proxy_type: config.proxy_type.clone(),
+        remote_port: config.remote_port.unwrap_or(0),
+        custom_domains: config.custom_domains.clone(),
+        group: config.group.clone(),
+        ..Default::default()
+    });
+    Ok(Json(serde_json::json!({"status": "created", "name": config.name})))
+}
+
+/// DELETE /api/store/proxy/:name — remove a proxy (cleans up server-side state).
+async fn handle_store_proxy_delete(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let proxy = state.proxy_manager.get(&name).await
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse {
+            error: "proxy not found".into()
+        })))?;
+
+    // Clean up port
+    if let Some(port) = proxy.remote_port {
+        state.used_ports.write().await.remove(&port);
+    }
+    // Clean up sk_index
+    if let Some(ref sk) = proxy.sk {
+        if !sk.is_empty() {
+            state.sk_index.write().await.remove(sk);
+        }
+    }
+    // Clean up VHost and TCPMux routes
+    state.vhost_manager.unregister(&name).await;
+    state.tcpmux_manager.unregister(&name).await;
+    state.proxy_metrics.remove(&name).await;
+    state.proxy_manager.remove(&name).await;
+    // Remove from store if present
+    state.proxy_config_store.write().await.remove(&name);
+
+    Ok(Json(serde_json::json!({"status": "deleted", "name": name})))
+}
+
+// --- Dashboard runner ---
+
 pub async fn run_dashboard(
     addr: String,
     state: Arc<AppState>,
@@ -238,7 +338,9 @@ pub async fn run_dashboard(
         .route("/api/proxy/:name", get(handle_proxy_detail))
         .route("/api/proxy/:name/traffic", get(handle_proxy_traffic))
         .route("/api/clients", get(handle_clients))
-        .route("/api/clients/:run_id", get(handle_client_detail));
+        .route("/api/clients/:run_id", get(handle_client_detail))
+        .route("/api/store/proxies", get(handle_store_proxies).post(handle_store_proxy_create))
+        .route("/api/store/proxy/:name", delete(handle_store_proxy_delete));
 
     let api_routes = apply_admin_auth(api_routes, &auth_user, &auth_password);
 
