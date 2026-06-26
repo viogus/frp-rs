@@ -1570,6 +1570,143 @@ test_r2g_stcp
 # Phase 5: Multi-proxy and edge cases
 test_multi_proxy
 test_g2r_compression
+test_r2g_compression
+test_r2g_multi_proxy
+
+# =============================================================================
+# Test: Compression (useCompression) — Rust client → Go server
+# =============================================================================
+test_r2g_compression() {
+    local name="rust-to-go-compression"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-r2g-comp"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_go_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    write_rust_frpc_config "$frps_port" "$token" "$echo_port" "$proxy_port" \
+        "tcp-comp" "$TEST_DIR/$name/frpc.toml" \
+        "use_compression = true"
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 10; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "hello-compression" "hello-compression" 5)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "expected OK: got $result"
+    fi
+}
+
+# =============================================================================
+# Test: Multi-Proxy — Rust client → Go server
+# =============================================================================
+test_r2g_multi_proxy() {
+    local name="rust-to-go-multi-proxy"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy1_port=$(random_port)
+    local proxy2_port=$(random_port)
+    local echo1_port=$(random_port)
+    local echo2_port=$(random_port)
+    local token="test-token-r2g-multi"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo1_port"
+    wait_for_port 127.0.0.1 "$echo1_port" 3 || {
+        fail_test "$name" "echo1 did not start"
+        return
+    }
+    start_echo_server "$echo2_port"
+    wait_for_port 127.0.0.1 "$echo2_port" 3 || {
+        fail_test "$name" "echo2 did not start"
+        return
+    }
+
+    write_go_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    # Rust frpc with 2 TCP proxies
+    cat > "$TEST_DIR/$name/frpc.toml" <<TOML
+server_addr = "127.0.0.1"
+server_port = $frps_port
+token = "$token"
+tcp_mux = false
+login_fail_exit = true
+pool_count = 1
+
+[[proxies]]
+name = "multi-1"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = $echo1_port
+remote_port = $proxy1_port
+
+[[proxies]]
+name = "multi-2"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = $echo2_port
+remote_port = $proxy2_port
+TOML
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy1_port" 15; then
+        fail_test "$name" "proxy1 port $proxy1_port not reachable"
+        return
+    fi
+    if ! wait_for_port_safe 127.0.0.1 "$proxy2_port" 15; then
+        fail_test "$name" "proxy2 port $proxy2_port not reachable"
+        return
+    fi
+
+    # Test both proxies
+    local r1 r2
+    r1=$(send_and_expect "$proxy1_port" "multi-one-r2g" "multi-one-r2g" 5)
+    r2=$(send_and_expect "$proxy2_port" "multi-two-r2g" "multi-two-r2g" 5)
+    if [[ "$r1" == OK:* && "$r2" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "proxy1=$r1 proxy2=$r2"
+    fi
+}
 
 # --- Summary ---
 echo ""
