@@ -279,10 +279,10 @@ impl Service {
             // Bind local UDP sockets for UDP proxies.
             // UDP data flows over work connections (Go frp v0.69.1 compat).
             // Sockets are shared with work conn tasks via Arc.
-            let udp_sockets: Arc<std::sync::Mutex<HashMap<String, Arc<UdpSocket>>>> =
-                Arc::new(std::sync::Mutex::new(HashMap::new()));
-            let udp_enc_cfg: Arc<std::sync::Mutex<HashMap<String, (bool, bool)>>> =
-                Arc::new(std::sync::Mutex::new(HashMap::new()));
+            let udp_sockets: Arc<tokio::sync::Mutex<HashMap<String, Arc<UdpSocket>>>> =
+                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let udp_enc_cfg: Arc<tokio::sync::Mutex<HashMap<String, (bool, bool)>>> =
+                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             for p in &proxies {
                 if p.proxy_type == "udp" {
                     let local_addr = format!("{}:{}", p.local_ip, p.local_port);
@@ -299,12 +299,12 @@ impl Service {
                         continue;
                     }
                     {
-                        let mut map = udp_sockets.lock().unwrap();
+                        let mut map = udp_sockets.lock().await;
                         map.insert(local_addr.clone(), socket.clone());
                         map.insert(p.name.clone(), socket);
                     }
                     {
-                        let mut cfg = udp_enc_cfg.lock().unwrap();
+                        let mut cfg = udp_enc_cfg.lock().await;
                         let enc = (p.use_encryption, p.use_compression);
                         cfg.insert(local_addr.clone(), enc);
                         cfg.insert(p.name.clone(), enc);
@@ -573,8 +573,8 @@ fn spawn_work_conn(
     tls_ca_file: Option<String>,
     yamux: Option<std::sync::Arc<YamuxSession>>,
     oidc_client: Option<Arc<OidcClient>>,
-    udp_sockets: Arc<std::sync::Mutex<HashMap<String, Arc<UdpSocket>>>>,
-    udp_enc_cfg: Arc<std::sync::Mutex<HashMap<String, (bool, bool)>>>,
+    udp_sockets: Arc<tokio::sync::Mutex<HashMap<String, Arc<UdpSocket>>>>,
+    udp_enc_cfg: Arc<tokio::sync::Mutex<HashMap<String, (bool, bool)>>>,
 ) {
     let server_addr = server_addr.to_string();
     let run_id = run_id.to_string();
@@ -682,7 +682,7 @@ fn spawn_work_conn(
                 if info.proxy_type == "udp" {
                     // UDP proxy: bridge work conn ↔ local UDP socket
                     let sock = {
-                        let map = udp_sockets.lock().unwrap();
+                        let map = udp_sockets.lock().await;
                         map.get(proxy_name).cloned()
                     };
                     let sock = match sock {
@@ -693,7 +693,7 @@ fn spawn_work_conn(
                         }
                     };
                     let enc_cfg = {
-                        let cfg = udp_enc_cfg.lock().unwrap();
+                        let cfg = udp_enc_cfg.lock().await;
                         cfg.get(proxy_name).copied().unwrap_or((false, false))
                     };
                     let (use_enc, use_comp) = enc_cfg;
@@ -706,8 +706,8 @@ fn spawn_work_conn(
                     // Shared last_remote_addr: the server tells us the remote user's address
                     // in each UDPPacket. We must echo it back so the server can route
                     // the response to the correct remote user (not the local echo service).
-                    let last_remote: Arc<std::sync::Mutex<Option<msg::UdpAddr>>> =
-                        Arc::new(std::sync::Mutex::new(None));
+                    let last_remote: Arc<tokio::sync::Mutex<Option<msg::UdpAddr>>> =
+                        Arc::new(tokio::sync::Mutex::new(None));
 
                     // Reader: work conn → local UDP socket
                     // Decrypt/decompress before forwarding to local service
@@ -722,7 +722,7 @@ fn spawn_work_conn(
                                 Ok(FrpMessage::UDPPacket(up)) => {
                                     // Save the original remote address for the response
                                     if let Some(ref ra) = up.remote_addr {
-                                        *last_remote_r.lock().unwrap() = Some(ra.clone());
+                                        *last_remote_r.lock().await = Some(ra.clone());
                                     }
                                     let n = up.content.len();
                                     let mut payload = up.content;
@@ -774,7 +774,7 @@ fn spawn_work_conn(
                                         if let Ok(e) = encryption::encrypt(&payload, &enc_key) { payload = e; }
                                     }
                                     // Use saved remote_addr from server (the true remote user)
-                                    let remote = last_remote_w.lock().unwrap().clone();
+                                    let remote = last_remote_w.lock().await.clone();
                                     let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
                                         content: payload,
                                         local_addr: msg::UdpAddr::from_string(&local_addr_str),
