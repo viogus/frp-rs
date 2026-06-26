@@ -363,5 +363,6 @@ pub(crate) async fn unregister_control(state: &Arc<AppState>, run_id: &str) {
     for p in &proxies {
         state.vhost_manager.unregister(&p.name).await;
         state.tcpmux_manager.unregister(&p.name).await;
+        state.proxy_metrics.remove(&p.name).await;
     }
 }
