@@ -87,10 +87,13 @@ pub struct AppState {
     pub oidc_verifier: Option<Arc<OidcVerifier>>,
     pub oidc_subjects: Arc<RwLock<HashMap<String, String>>>,
     pub nat_hole: Arc<NatHoleCoordinator>,
+    /// Shared UDP port for SUDP proxies. When > 0, all SUDP proxies
+    /// use this port instead of their individual remote_port.
+    pub sudp_port: u16,
 }
 
 impl AppState {
-    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>) -> Self {
+    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             auth_cfg: Arc::new(auth_cfg),
@@ -110,6 +113,7 @@ impl AppState {
             oidc_verifier,
             oidc_subjects: Arc::new(RwLock::new(HashMap::new())),
             nat_hole: Arc::new(NatHoleCoordinator::new()),
+            sudp_port,
         }
     }
 }
@@ -124,7 +128,7 @@ pub struct Service {
 }
 
 impl Service {
-    pub async fn new(cfg: ServerConfig) -> Self {
+    pub async fn new(cfg: ServerConfig) -> Result<Self, String> {
         let auth_cfg = AuthConfig {
             method: match cfg.auth.method.to_lowercase().as_str() {
                 "oidc" => AuthMethod::Oidc,
@@ -147,11 +151,13 @@ impl Service {
             ).await {
                 Ok(v) => {
                     info!("OIDC verifier initialized (issuer: {})", auth_cfg.oidc_issuer);
-                    Some(Arc::new(v))
+                    let v = Arc::new(v);
+                    v.start_background_refresh();
+                    Some(v)
                 }
                 Err(e) => {
                     error!("OIDC verifier initialization failed: {e}");
-                    panic!("Cannot start frps with OIDC auth: {e}");
+                    return Err(format!("Cannot start frps with OIDC auth: {e}"));
                 }
             }
         } else {
@@ -165,7 +171,7 @@ impl Service {
             vec![(cfg.allow_port_start, cfg.allow_port_end)]
         };
         let sub_host = cfg.sub_domain_host.clone();
-        Self {
+        Ok(Self {
             state: Arc::new(AppState::new(
             auth_cfg,
             if cfg.proxy_bind_addr.is_empty() {
@@ -180,9 +186,10 @@ impl Service {
             cfg.transport.tcp_mux_keepalive_interval,
             cfg.tls_only,
             oidc_verifier,
+            cfg.sudp_port,
         )),
             cfg,
-        }
+        })
     }
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {

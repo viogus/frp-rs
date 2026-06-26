@@ -75,6 +75,7 @@ impl Service {
                 Some(ac.oidc_token_endpoint.clone()).filter(|s| !s.is_empty()),
                 ac.oidc_scope.clone(),
                 Some(ac.oidc_issuer.clone()).filter(|s| !s.is_empty()),
+                &ac.additional_endpoint_params,
             ).await.map_err(|e| format!("OIDC client init failed: {e}"))?;
             info!("OIDC client initialized, token endpoint: {}", client.token_endpoint());
             Some(Arc::new(client))
@@ -284,7 +285,7 @@ impl Service {
             let udp_enc_cfg: Arc<tokio::sync::Mutex<HashMap<String, (bool, bool)>>> =
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             for p in &proxies {
-                if p.proxy_type == "udp" {
+                if p.proxy_type == "udp" || p.proxy_type == "sudp" {
                     let local_addr = format!("{}:{}", p.local_ip, p.local_port);
                     let bind_addr = format!("{}:0", p.local_ip);
                     let socket = match UdpSocket::bind(&bind_addr).await {

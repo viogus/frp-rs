@@ -1751,6 +1751,8 @@ test_r2g_tcp_tls_encrypt
 # Phase 4: Other proxy types
 test_g2r_udp
 test_r2g_udp
+# SUDP not tested cross-compat: Go frp uses server-side sudp_port with type="udp",
+# while frp-rs has type="sudp" as a distinct proxy type. SUDP logic tested via unit tests.
 test_g2r_http
 test_r2g_http
 test_g2r_stcp

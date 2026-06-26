@@ -76,7 +76,7 @@ pub async fn start_frps(port: u16, token: &str) -> JoinHandle<()> {
         },
         ..Default::default()
     };
-    let service = ServerService::new(cfg).await;
+    let service = ServerService::new(cfg).await.expect("create server service");
     tokio::spawn(async move {
         let _ = service.run().await;
     })

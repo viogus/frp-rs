@@ -23,7 +23,7 @@ pub fn allocate_port() -> u16 {
 pub async fn start_test_server(mut cfg: ServerConfig) -> (JoinHandle<()>, u16) {
     cfg.transport.tcp_mux = false; // test clients use raw V1 frames
     let port = cfg.bind_port;
-    let service = Service::new(cfg).await;
+    let service = Service::new(cfg).await.expect("create service");
     let handle = tokio::spawn(async move {
         let _ = service.run().await;
     });

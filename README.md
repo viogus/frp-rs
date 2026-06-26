@@ -26,11 +26,12 @@ suitable as a drop-in replacement for either the client or server side.
 |----------------------|--------|--------|
 | TCP proxy            | ✅     | ✅     |
 | UDP proxy            | ✅     | ✅     |
+| SUDP proxy (shared)  | ✅     | ✅     |
 | HTTP/HTTPS proxy     | ✅     | ✅     |
 | STCP / sk routing    | ✅     | ✅     |
 | XTCP (NAT hole punch)| ❌     | 🟡     |
 | Token authentication | ✅     | ✅     |
-| OIDC authentication  | ❌     | ❌     |
+| OIDC authentication  | ✅     | ✅     |
 | Heartbeat (ping/pong)| ✅     | ✅     |
 | Auto port allocation | —      | ✅     |
 | Encryption (AES-128-CFB) | ✅  | ✅     |

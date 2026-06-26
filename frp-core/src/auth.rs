@@ -162,6 +162,22 @@ impl OidcVerifier {
         Ok(verifier)
     }
 
+    /// Start a background task that periodically refreshes JWKS keys.
+    /// Prevents latency spikes on token verification when cache is stale.
+    pub fn start_background_refresh(self: &std::sync::Arc<Self>) {
+        let verifier = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                if let Err(e) = verifier.refresh_jwks().await {
+                    tracing::warn!("OIDC background JWKS refresh failed: {}", e);
+                } else {
+                    tracing::debug!("OIDC JWKS refreshed in background");
+                }
+            }
+        });
+    }
+
     async fn refresh_jwks(&self) -> Result<(), String> {
         let resp = self.http.get(&self.jwks_uri)
             .send()
@@ -337,6 +353,7 @@ pub struct OidcClient {
     client_secret: String,
     audience: String,
     scope: String,
+    additional_params: Vec<(String, String)>,
     cached: tokio::sync::Mutex<Option<CachedOidcToken>>,
     http: reqwest::Client,
 }
@@ -350,6 +367,7 @@ impl OidcClient {
         token_endpoint: Option<String>,
         scope: String,
         issuer: Option<String>,
+        additional_endpoint_params: &str,
     ) -> Result<Self, String> {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -384,25 +402,42 @@ impl OidcClient {
 
         let scope = if scope.is_empty() { "openid".to_string() } else { scope };
 
+        // Parse additional endpoint params: "key1=val1&key2=val2" → Vec of (key, val) pairs
+        let additional_params: Vec<(String, String)> = additional_endpoint_params
+            .split('&')
+            .filter(|s| !s.is_empty())
+            .filter_map(|pair| {
+                let mut parts = pair.splitn(2, '=');
+                let key = parts.next().unwrap_or("").trim().to_string();
+                let val = parts.next().unwrap_or("").trim().to_string();
+                if key.is_empty() { None } else { Some((key, val)) }
+            })
+            .collect();
+
         Ok(Self {
             token_endpoint: endpoint,
             client_id,
             client_secret,
             audience,
             scope,
+            additional_params,
             cached: tokio::sync::Mutex::new(None),
             http,
         })
     }
 
     async fn fetch_token(&self) -> Result<(String, u64), String> {
-        let params = [
+        let mut params: Vec<(&str, &str)> = vec![
             ("grant_type", "client_credentials"),
             ("client_id", self.client_id.as_str()),
             ("client_secret", self.client_secret.as_str()),
             ("scope", self.scope.as_str()),
             ("audience", self.audience.as_str()),
         ];
+        let extra: Vec<(&str, &str)> = self.additional_params.iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        params.extend_from_slice(&extra);
 
         let resp = self.http.post(&self.token_endpoint)
             .form(&params)

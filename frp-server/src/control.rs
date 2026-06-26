@@ -882,6 +882,16 @@ async fn handle_new_proxy(
     let remote_port = raw_port as u16;
 
     let is_sudp = np.proxy_type == "sudp";
+    // When sudp_port is configured, force all SUDP proxies to use that port
+    let remote_port = if is_sudp && state.sudp_port > 0 {
+        if remote_port > 0 && remote_port != state.sudp_port {
+            info!("SUDP proxy '{}': overriding remote_port {} → {} (sudp_port config)",
+                np.proxy_name, remote_port, state.sudp_port);
+        }
+        state.sudp_port
+    } else {
+        remote_port
+    };
     let allocated_port = if is_sudp && remote_port > 0 {
         // SUDP proxies can share ports. If the requested port is already
         // in use, reuse it without adding to used_ports.
