@@ -30,6 +30,8 @@ pub struct ControlConnection {
     dns_server: Option<String>,
     tcp_mux: bool,
     disable_custom_tls_first_byte: bool,
+    keepalive_secs: u64,
+    bind_addr: Option<String>,
     v2: bool,
     oidc_client: Option<Arc<OidcClient>>,
     /// Server's additional auth scopes from LoginResp. Combined with client
@@ -55,6 +57,8 @@ impl ControlConnection {
         dns_server: Option<String>,
         tcp_mux: bool,
         disable_custom_tls_first_byte: bool,
+        keepalive_secs: u64,
+        bind_addr: Option<String>,
         v2: bool,
         oidc_client: Option<Arc<OidcClient>>,
         metas: std::collections::HashMap<String, String>,
@@ -76,6 +80,8 @@ impl ControlConnection {
             dns_server,
             tcp_mux,
             disable_custom_tls_first_byte,
+            keepalive_secs,
+            bind_addr,
             v2,
             oidc_client,
             server_auth_scopes: Vec::new(),
@@ -103,6 +109,8 @@ impl ControlConnection {
             tls_key_file: self.tls_key_file.clone(),
             dns_server: self.dns_server.clone(),
             disable_custom_tls_first_byte: self.disable_custom_tls_first_byte,
+            keepalive_secs: self.keepalive_secs,
+            bind_addr: self.bind_addr.clone(),
             ..Default::default()
         };
 

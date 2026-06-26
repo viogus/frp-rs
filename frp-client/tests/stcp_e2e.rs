@@ -89,6 +89,7 @@ async fn test_stcp_e2e_relay() {
             bind_port: visitor_port,
             fallback_to: String::new(),
             fallback_timeout_ms: 5000,
+            disable_assisted_addrs: false,
             use_encryption: false,
             use_compression: false,
         }],

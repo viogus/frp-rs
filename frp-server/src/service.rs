@@ -99,6 +99,7 @@ pub struct AppState {
     pub sub_domain_host: String,
     pub tcp_mux: bool,
     pub tcp_mux_keepalive: i64,
+    pub udp_packet_size: usize,
     pub tls_only: bool,
     pub oidc_verifier: Option<Arc<OidcVerifier>>,
     pub oidc_subjects: Arc<RwLock<HashMap<String, String>>>,
@@ -122,7 +123,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16, vhost_http_timeout: u64, user_conn_timeout: u64, tcp_mux_passthrough: bool, custom_404_page: String, plugin_manager: Arc<crate::plugin::HttpPluginManager>) -> Self {
+    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, udp_packet_size: usize, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16, vhost_http_timeout: u64, user_conn_timeout: u64, tcp_mux_passthrough: bool, custom_404_page: String, plugin_manager: Arc<crate::plugin::HttpPluginManager>) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             reloadable: Arc::new(std::sync::RwLock::new(ReloadableState {
@@ -141,6 +142,7 @@ impl AppState {
             sub_domain_host,
             tcp_mux,
             tcp_mux_keepalive,
+            udp_packet_size,
             tls_only,
             oidc_verifier,
             oidc_subjects: Arc::new(RwLock::new(HashMap::new())),
@@ -229,6 +231,7 @@ impl Service {
             sub_host,
             cfg.transport.tcp_mux,
             cfg.transport.tcp_mux_keepalive_interval,
+            cfg.udp_packet_size,
             cfg.tls_only,
             oidc_verifier,
             cfg.sudp_port,

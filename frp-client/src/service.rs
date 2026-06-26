@@ -406,6 +406,8 @@ impl Service {
                 if self.cfg.dns_server.is_empty() { None } else { Some(self.cfg.dns_server.clone()) },
                 self.cfg.tcp_mux,
                 self.cfg.disable_custom_tls_first_byte,
+                self.cfg.dial_server_keepalive.max(0) as u64,
+                if self.cfg.connect_server_local_ip.is_empty() { None } else { Some(self.cfg.connect_server_local_ip.clone()) },
                 self.cfg.v2,
                 self.oidc_client.clone(),
                 self.cfg.metas.clone(),
@@ -521,6 +523,8 @@ impl Service {
                     client_scopes.clone(),
                     server_scopes.clone(),
                     self.cfg.disable_custom_tls_first_byte,
+                    self.cfg.dial_server_keepalive.max(0) as u64,
+                    if self.cfg.connect_server_local_ip.is_empty() { None } else { Some(self.cfg.connect_server_local_ip.clone()) },
                 );
             }
 
@@ -579,6 +583,8 @@ impl Service {
                                     client_scopes.clone(),
                                     server_scopes.clone(),
                                     self.cfg.disable_custom_tls_first_byte,
+                    self.cfg.dial_server_keepalive.max(0) as u64,
+                    if self.cfg.connect_server_local_ip.is_empty() { None } else { Some(self.cfg.connect_server_local_ip.clone()) },
                                 );
                             }
                             Ok(FrpMessage::Pong(_)) => {
@@ -904,6 +910,8 @@ fn spawn_work_conn(
     client_auth_scopes: Vec<String>,
     server_auth_scopes: Vec<String>,
     disable_custom_tls_first_byte: bool,
+    keepalive_secs: u64,
+    bind_addr: Option<String>,
 ) {
     let server_addr = server_addr.to_string();
     let run_id = run_id.to_string();
@@ -945,6 +953,8 @@ fn spawn_work_conn(
                 tls_server_name: tls_server_name.clone(),
                 tls_ca_file: tls_ca_file.clone(),
                 disable_custom_tls_first_byte,
+                keepalive_secs,
+                bind_addr: bind_addr.clone(),
                 ..Default::default()
             };
             match dial_server(&opts).await {
@@ -1217,6 +1227,8 @@ fn spawn_work_conn(
                 client_auth_scopes.clone(),
                 server_auth_scopes.clone(),
                 disable_custom_tls_first_byte,
+                keepalive_secs,
+                bind_addr.clone(),
             );
         }
     });

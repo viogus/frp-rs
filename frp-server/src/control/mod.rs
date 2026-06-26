@@ -246,7 +246,7 @@ pub async fn handle_control<S>(
                             let local_addr = state.proxy_manager.get(&proxy_name).await
                                 .and_then(|info| info.local_addr)
                                 .and_then(|s| msg::UdpAddr::from_string(&s));
-                            bridge::assign_udp_work_conn(stream, &proxy_name, &udp_sockets, local_addr, v2).await;
+                            bridge::assign_udp_work_conn(stream, &proxy_name, &udp_sockets, local_addr, v2, state.udp_packet_size).await;
                         } else {
                             // Drain expired TCP requests
                             while let Some(req) = pending_requests.front() {

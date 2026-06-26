@@ -76,17 +76,26 @@ pub struct ServerConfig {
     /// Go frp compat: TCPMuxPassthrough. Default: false.
     #[serde(default)]
     pub tcp_mux_passthrough: bool,
+    /// UDP packet buffer size in bytes. Controls the receive buffer for UDP
+    /// proxy datagrams. Default: 65535 (max UDP datagram size).
+    /// Go frp compat: udp_packet_size.
+    #[serde(default = "default_udp_packet_size")]
+    pub udp_packet_size: usize,
     /// Server-side HTTP plugin configurations. Each plugin is an external
     /// HTTP service called on lifecycle events (login, new_proxy, close_proxy).
     /// Go frp compat: http_plugins.
     #[serde(default)]
     pub http_plugins: Vec<HttpPluginConfig>,
+    /// Experimental feature gates. Go frp compat: [feature] section.
+    #[serde(default)]
+    pub feature: FeatureConfig,
 }
 
 fn default_allow_port_start() -> u16 { 10000 }
 fn default_allow_port_end() -> u16 { 50000 }
 fn default_vhost_http_timeout() -> u64 { 60 }
 fn default_user_conn_timeout() -> u64 { 10 }
+fn default_udp_packet_size() -> usize { 65535 }
 
 /// Parse a bandwidth limit string like "1MB", "500KB", "100K".
 /// Returns bytes per second, or None if unparseable.
@@ -184,7 +193,9 @@ impl Default for ServerConfig {
             vhost_http_timeout: default_vhost_http_timeout(),
             user_conn_timeout: default_user_conn_timeout(),
             tcp_mux_passthrough: false,
+            udp_packet_size: default_udp_packet_size(),
             http_plugins: Vec::new(),
+            feature: FeatureConfig::default(),
         }
     }
 }
@@ -376,6 +387,14 @@ pub struct PluginConfig {
     pub bind_port: i32,
 }
 
+/// Feature gate configuration ([feature] section in frps.toml / frpc.toml).
+/// Go frp v0.69.1 compat: map of feature name → enabled boolean.
+/// Experimental features are gated behind these flags.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FeatureConfig {
+    #[serde(flatten)]
+    pub gates: std::collections::HashMap<String, bool>,
+}
 
 
 // ---------------------------------------------------------------
@@ -486,6 +505,14 @@ pub struct ClientConfig {
     pub pool_count: i32,
     #[serde(default)]
     pub dns_server: String,
+    /// TCP keepalive interval in seconds for outbound connections to the
+    /// frp server. 0 disables. Go frp compat: dialServerKeepalive.
+    #[serde(default, alias = "dialServerKeepalive")]
+    pub dial_server_keepalive: i64,
+    /// Local IP address to bind when dialing the frp server.
+    /// Empty means use system default. Go frp compat: connectServerLocalIP.
+    #[serde(default, alias = "connectServerLocalIP")]
+    pub connect_server_local_ip: String,
     #[serde(default = "default_true")]
     pub tcp_mux: bool,
     /// Use V2 protocol framing (binary header + JSON payload).
@@ -498,6 +525,9 @@ pub struct ClientConfig {
     pub visitors: Vec<VisitorConfig>,
     #[serde(default)]
     pub web_server: WebServerConfig,
+    /// Experimental feature gates. Go frp compat: [feature] section.
+    #[serde(default)]
+    pub feature: FeatureConfig,
 }
 
 impl Default for ClientConfig {
@@ -521,11 +551,14 @@ impl Default for ClientConfig {
             login_fail_exit: true,
             pool_count: 0,
             dns_server: String::new(),
+            dial_server_keepalive: 0,
+            connect_server_local_ip: String::new(),
             tcp_mux: true,
             v2: false,
             proxies: vec![],
             visitors: vec![],
             web_server: WebServerConfig::default(),
+            feature: FeatureConfig::default(),
         }
     }
 }
@@ -645,6 +678,11 @@ pub struct VisitorConfig {
     /// Fallback visitor name if this one fails.
     #[serde(default, alias = "fallbackTo")]
     pub fallback_to: String,
+    /// Disable NAT traversal assisted address reporting (STUN-discovered
+    /// mapped addresses shared between peers during XTCP hole punching).
+    /// Go frp compat: natTraversal.disableAssistedAddrs.
+    #[serde(default, alias = "disableAssistedAddrs")]
+    pub disable_assisted_addrs: bool,
     /// Encrypt the tunnel traffic.
     #[serde(default)]
     pub use_encryption: bool,
