@@ -51,9 +51,7 @@ RUN zig cc -target $(cat /tmp/rust_target) -static -O2 \
     -DFRP_MODE=\"${FRP_COMPONENT}\" -o /entrypoint /tmp/entrypoint.c
 
 # ── Runtime stage ──────────────────────────────────────────
-FROM --platform=$TARGETPLATFORM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+FROM --platform=$TARGETPLATFORM gcr.io/distroless/static-debian12:latest
 COPY --from=downloader /usr/bin/frp /usr/bin/frp
 COPY --from=downloader /entrypoint /entrypoint
 ENV FRP_CONF=/app/frp.toml
