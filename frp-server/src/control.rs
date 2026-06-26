@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::net::SocketAddr;
 use std::collections::VecDeque;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::net::TcpListener;
 use tokio::net::UdpSocket;
 use tokio::time::{Duration, Instant};
@@ -864,6 +864,11 @@ async fn handle_new_proxy(
 
             let is_nat_hole = np.proxy_type == "stcp" || np.proxy_type == "xtcp";
 
+            // Collect oneshot senders for UDP work-conn tasks so we can signal
+            // them after NewProxyResp has been written (avoiding the race where
+            // client receives ReqWorkConn before proxy registration completes).
+            let mut udp_resp_signals: Vec<oneshot::Sender<()>> = Vec::new();
+
             if np.proxy_type == "udp" || np.proxy_type == "sudp" {
                 let is_sudp = np.proxy_type == "sudp";
                 let addr = format_socket_addr(&bind_addr, port);
@@ -922,11 +927,15 @@ async fn handle_new_proxy(
                 if should_spawn {
                     // Go frp v0.69.1 compat: UDP data flows over work connections,
                     // not the control connection. Request a work conn from the client.
+                    // Use oneshot channel to ensure NewProxyResp is written BEFORE
+                    // ReqWorkConn, avoiding race where client receives ReqWorkConn
+                    // before proxy registration completes.
                     let pn_clone = np.proxy_name.clone();
                     let itx_clone = itx.clone();
+                    let (tx, rx) = oneshot::channel();
+                    udp_resp_signals.push(tx);
                     tokio::spawn(async move {
-                        // Small delay to ensure NewProxyResp reaches client before ReqWorkConn
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        let _ = rx.await; // Wait until NewProxyResp is written
                         let _ = itx_clone.send(InternalMsg::UdpNeedsWorkConn { proxy_name: pn_clone });
                     });
                 }
@@ -948,6 +957,14 @@ async fn handle_new_proxy(
                 error: None,
             });
             let _ = write_msg_v1(writer, &resp).await;
+
+            // Signal UDP work-conn tasks that NewProxyResp has been written.
+            // This ensures ReqWorkConn is never sent to the client before the
+            // proxy registration response, preventing a race in the Go frp
+            // v0.69.1 compatibility path.
+            for tx in udp_resp_signals.drain(..) {
+                let _ = tx.send(());
+            }
         }
         None => {
             warn!("No available port for proxy '{}'", np.proxy_name);
