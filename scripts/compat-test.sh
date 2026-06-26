@@ -1795,7 +1795,25 @@ s.listen(5)
 while True:
     try:
         conn, _ = s.accept()
-        data = conn.recv(4096)
+        data = b''
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            # Wait until full body received (based on Content-Length)
+            if b'\r\n\r\n' in data:
+                hdr_end = data.index(b'\r\n\r\n') + 4
+                hdrs = data[:hdr_end].decode('utf-8', errors='ignore').lower()
+                cl = 0
+                for line in hdrs.split('\r\n'):
+                    if line.startswith('content-length:'):
+                        try:
+                            cl = int(line.split(':')[1].strip())
+                        except:
+                            pass
+                if len(data) - hdr_end >= cl:
+                    break
         if data:
             # Simple HTTP response echoing request
             body = b'http-ok:' + data.split(b'\r\n\r\n', 1)[-1] if b'\r\n\r\n' in data else b'http-ok'
@@ -1857,7 +1875,7 @@ TOML
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
-    sleep 2
+    sleep 3
 
     # Send HTTP request through VHost
     local result
@@ -1907,7 +1925,25 @@ s.listen(5)
 while True:
     try:
         conn, _ = s.accept()
-        data = conn.recv(4096)
+        data = b''
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            # Wait until full body received (based on Content-Length)
+            if b'\r\n\r\n' in data:
+                hdr_end = data.index(b'\r\n\r\n') + 4
+                hdrs = data[:hdr_end].decode('utf-8', errors='ignore').lower()
+                cl = 0
+                for line in hdrs.split('\r\n'):
+                    if line.startswith('content-length:'):
+                        try:
+                            cl = int(line.split(':')[1].strip())
+                        except:
+                            pass
+                if len(data) - hdr_end >= cl:
+                    break
         if data:
             body = b'http-ok:' + data.split(b'\r\n\r\n', 1)[-1] if b'\r\n\r\n' in data else b'http-ok'
             conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
@@ -1965,7 +2001,7 @@ TOML
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
-    sleep 2
+    sleep 3
 
     local result
     result=$(python3 -c "
