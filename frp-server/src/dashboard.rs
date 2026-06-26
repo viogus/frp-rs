@@ -349,12 +349,12 @@ pub async fn run_dashboard(
     let api_routes = Router::new()
         .route("/api/status", get(handle_status))
         .route("/api/proxies", get(handle_proxies))
-        .route("/api/proxy/:name", get(handle_proxy_detail))
-        .route("/api/proxy/:name/traffic", get(handle_proxy_traffic))
+        .route("/api/proxy/{name}", get(handle_proxy_detail))
+        .route("/api/proxy/{name}/traffic", get(handle_proxy_traffic))
         .route("/api/clients", get(handle_clients))
-        .route("/api/clients/:run_id", get(handle_client_detail))
+        .route("/api/clients/{run_id}", get(handle_client_detail))
         .route("/api/store/proxies", get(handle_store_proxies).post(handle_store_proxy_create))
-        .route("/api/store/proxy/:name", delete(handle_store_proxy_delete));
+        .route("/api/store/proxy/{name}", delete(handle_store_proxy_delete));
 
     let api_routes = apply_admin_auth(api_routes, &auth_user, &auth_password);
 
