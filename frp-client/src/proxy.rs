@@ -166,8 +166,8 @@ pub async fn bridge_streams(
         let mut work = work;
         match tokio::io::copy_bidirectional(&mut local, &mut work).await {
             Ok((to_work, to_local)) => {
-                proxy_metrics.bytes_in.fetch_add(to_local, Ordering::Relaxed);
-                proxy_metrics.bytes_out.fetch_add(to_work, Ordering::Relaxed);
+                proxy_metrics.bytes_in.fetch_add(to_work, Ordering::Relaxed);
+                proxy_metrics.bytes_out.fetch_add(to_local, Ordering::Relaxed);
                 debug!("Proxy {} closed: {}B to server, {}B to local", name, to_work, to_local);
             }
             Err(e) => {
