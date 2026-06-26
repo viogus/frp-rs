@@ -94,54 +94,89 @@ impl SnappyDecompressor {
     /// Returns an error only for truly corrupt input (bad magic, bad CRC);
     /// partial frames are silently buffered, not treated as errors.
     pub fn feed(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
-        use snap::read::FrameDecoder;
-        use std::io::Read;
-
         self.buf.extend_from_slice(data);
 
         let mut output = Vec::new();
-        let mut tmp = [0u8; 8192];
+        let mut pos = 0;
+        let stream_body = b"sNaPpY";
 
-        loop {
-            let mut cursor = std::io::Cursor::new(&self.buf[..]);
-            let mut decoder = FrameDecoder::new(&mut cursor);
-            let mut decoded_any = false;
+        while pos + 4 <= self.buf.len() {
+            let chunk_type = self.buf[pos];
+            let chunk_len = u32::from_le_bytes([
+                self.buf[pos + 1],
+                self.buf[pos + 2],
+                self.buf[pos + 3],
+                0,
+            ]) as usize;
 
-            loop {
-                match decoder.read(&mut tmp) {
-                    Ok(0) => {
-                        // All complete frames consumed.
-                        decoded_any = true;
-                        break;
+            match chunk_type {
+                0x00 => {
+                    // Compressed data: length field includes 4-byte CRC.
+                    if chunk_len < 4 {
+                        return Err("snappy: compressed chunk length too small".into());
                     }
-                    Ok(n) => {
-                        decoded_any = true;
-                        output.extend_from_slice(&tmp[..n]);
+                    let total = 4 + chunk_len;
+                    if pos + total > self.buf.len() {
+                        break; // incomplete chunk
                     }
-                    Err(_) => {
-                        // Partial frame or corrupt data — stop.
-                        break;
+                    // Skip 4-byte header (already read) + 4-byte CRC
+                    let data_start = pos + 8;
+                    let compressed = &self.buf[data_start..pos + total];
+                    let mut decoder = snap::raw::Decoder::new();
+                    let decompressed = decoder
+                        .decompress_vec(compressed)
+                        .map_err(|e| format!("snappy decompress: {e}"))?;
+                    output.extend_from_slice(&decompressed);
+                    pos += total;
+                }
+                0x01 => {
+                    // Uncompressed data: length field includes 4-byte CRC.
+                    if chunk_len < 4 {
+                        return Err("snappy: uncompressed chunk length too small".into());
                     }
+                    let total = 4 + chunk_len;
+                    if pos + total > self.buf.len() {
+                        break; // incomplete chunk
+                    }
+                    let data_start = pos + 8; // skip header + CRC
+                    let data = &self.buf[data_start..pos + total];
+                    output.extend_from_slice(data);
+                    pos += total;
+                }
+                0xFF => {
+                    // Stream identifier: 4-byte header + body, NO CRC.
+                    let total = 4 + chunk_len;
+                    if pos + total > self.buf.len() {
+                        break; // incomplete
+                    }
+                    let body = &self.buf[pos + 4..pos + total];
+                    if body != stream_body {
+                        return Err(format!(
+                            "snappy: bad stream identifier: {:?}",
+                            body
+                        ));
+                    }
+                    pos += total;
+                }
+                t if (0x02..=0x7F).contains(&t) => {
+                    // Reserved unskippable chunk — spec says return error.
+                    return Err(format!(
+                        "snappy: reserved unskippable chunk type 0x{t:02x}"
+                    ));
+                }
+                _ => {
+                    // Padding (0xFE) and reserved skippable (0x80-0xFD).
+                    // No CRC for these types.
+                    let total = 4 + chunk_len;
+                    if pos + total > self.buf.len() {
+                        break; // incomplete chunk
+                    }
+                    pos += total;
                 }
             }
-
-            let consumed = cursor.position() as usize;
-            if consumed == 0 {
-                // Nothing consumed — incomplete header or frame; wait for more data.
-                break;
-            }
-            self.buf.drain(..consumed);
-            if !decoded_any {
-                // Consumed bytes but no output (e.g. skipped a stream-identifier
-                // chunk mid-stream).  Loop again to try the next frame.
-                continue;
-            }
-            // We got output.  Don't loop — return what we have so the caller
-            // can send it to the user immediately.  Remaining frames will be
-            // processed on the next `feed()`.
-            break;
         }
 
+        self.buf.drain(..pos);
         Ok(output)
     }
 
@@ -187,6 +222,47 @@ mod tests {
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
         assert!(compressed.len() < data.len());
+    }
+
+    #[test]
+    fn test_snappy_decompressor_streaming() {
+        // Simulate data arriving in chunks: split mid-stream-identifier
+        // to exercise the partial-frame and multi-chunk paths.
+        let plaintext = b"test-data-for-streaming-decompression";
+        let compressed = compress(plaintext).unwrap();
+
+        // Snappy frame: stream identifier (10 bytes) + compressed data chunk.
+        // Split mid-stream-identifier to test partial delivery.
+        let split_at = 6;
+        let part1 = &compressed[..split_at];
+        let part2 = &compressed[split_at..];
+
+        let mut dec = SnappyDecompressor::new();
+        let out1 = dec.feed(part1).unwrap();
+        assert!(out1.is_empty(), "partial stream ID should produce no output");
+
+        let out2 = dec.feed(part2).unwrap();
+        assert_eq!(out2, plaintext, "second feed should produce full output");
+
+        // Third feed — new compressed chunk.
+        let out3 = dec.feed(&compress(b"second-chunk").unwrap()).unwrap();
+        assert_eq!(out3, b"second-chunk");
+    }
+
+    #[test]
+    fn test_snappy_decompressor_all_at_once() {
+        let plaintext = b"all-at-once-compression-test-data";
+        let compressed = compress(plaintext).unwrap();
+
+        let mut dec = SnappyDecompressor::new();
+        let output = dec.feed(&compressed).unwrap();
+        assert_eq!(output, plaintext);
+    }
+
+    #[test]
+    fn test_snappy_decompressor_empty() {
+        let mut dec = SnappyDecompressor::new();
+        assert!(dec.feed(b"").unwrap().is_empty());
     }
 
     #[test]
