@@ -286,7 +286,8 @@ impl Service {
             for p in &proxies {
                 if p.proxy_type == "udp" {
                     let local_addr = format!("{}:{}", p.local_ip, p.local_port);
-                    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+                    let bind_addr = format!("{}:0", p.local_ip);
+                    let socket = match UdpSocket::bind(&bind_addr).await {
                         Ok(s) => Arc::new(s),
                         Err(e) => {
                             warn!("UDP proxy '{}': bind failed: {}", p.name, e);
@@ -964,7 +965,12 @@ async fn tcp_simultaneous_open(peer_addr: &str) -> Result<tokio::net::TcpStream,
         .parse()
         .map_err(|e| format!("invalid peer address '{}': {}", peer_addr, e))?;
 
-    let local = TcpSocket::new_v4().map_err(|e| format!("TcpSocket::new_v4: {}", e))?;
+    // Use socket family matching peer address (IPv4 or IPv6)
+    let local = if peer.is_ipv4() {
+        TcpSocket::new_v4().map_err(|e| format!("TcpSocket::new_v4: {}", e))?
+    } else {
+        TcpSocket::new_v6().map_err(|e| format!("TcpSocket::new_v6: {}", e))?
+    };
 
     // SO_REUSEADDR is required for TCP simultaneous open:
     // both sides bind to the same port they use to connect.
@@ -975,8 +981,9 @@ async fn tcp_simultaneous_open(peer_addr: &str) -> Result<tokio::net::TcpStream,
     local.set_reuseport(true).ok();
 
     // Bind to any available port
+    let wildcard: &str = if peer.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
     local
-        .bind("0.0.0.0:0".parse().unwrap())
+        .bind(wildcard.parse().unwrap())
         .map_err(|e| format!("bind: {}", e))?;
 
     debug!("TCP simultaneous open: bound to local, dialing {}", peer);

@@ -8,7 +8,18 @@ set -euo pipefail
 # --- Paths ---
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-GO_FRP_DIR="/tmp/frp_0.69.1_darwin_arm64"
+# Auto-detect Go frp binary path. Override with GO_FRP_DIR env var.
+if [[ -n "${GO_FRP_DIR:-}" ]]; then
+    GO_FRP_DIR="$GO_FRP_DIR"
+else
+    _os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    _arch=$(uname -m)
+    case "$_arch" in
+        x86_64)  _arch="amd64" ;;
+        aarch64|arm64) _arch="arm64" ;;
+    esac
+    GO_FRP_DIR="/tmp/frp_0.69.1_${_os}_${_arch}"
+fi
 GO_FRPS="$GO_FRP_DIR/frps"
 GO_FRPC="$GO_FRP_DIR/frpc"
 RUST_FRPS="$PROJECT_DIR/target/release/frps"
@@ -105,7 +116,7 @@ wait_for_port_safe() {
     local host="$1" port="$2" timeout="${3:-15}"
     local deadline=$(($(date +%s) + timeout))
     while true; do
-        if lsof -nP -iTCP@"$host":"$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
+        if lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
             return 0
         fi
         if [[ $(date +%s) -gt $deadline ]]; then
