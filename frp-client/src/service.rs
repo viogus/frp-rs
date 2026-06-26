@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::{interval, Duration};
 use tracing::{info, warn, debug};
 
@@ -28,7 +28,7 @@ pub struct Service {
     auth_cfg: Arc<AuthConfig>,
     encryption_key: [u8; 16],
     /// Map proxy_name -> runtime info for looking up where to connect
-    proxy_info_map: HashMap<String, ProxyRuntimeInfo>,
+    proxy_info_map: Arc<RwLock<HashMap<String, ProxyRuntimeInfo>>>,
     /// Plugin handles kept alive for the lifetime of the service.
     _plugin_handles: Vec<PluginHandle>,
     /// OIDC client for fetching access tokens (None when auth method is Token).
@@ -125,9 +125,9 @@ impl Service {
             }
         }
 
-        let mut proxy_info_map: HashMap<String, ProxyRuntimeInfo> = HashMap::new();
+        let mut map: HashMap<String, ProxyRuntimeInfo> = HashMap::new();
         for p in &cfg.proxies {
-            if proxy_info_map.contains_key(&p.name) {
+            if map.contains_key(&p.name) {
                 warn!("Duplicate proxy name '{}' — only the first entry will be used", p.name);
                 continue;
             }
@@ -137,7 +137,7 @@ impl Service {
                 .get(&p.name)
                 .cloned()
                 .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
-            proxy_info_map.insert(p.name.clone(), ProxyRuntimeInfo {
+            map.insert(p.name.clone(), ProxyRuntimeInfo {
                 local_addr,
                 proxy_type: p.proxy_type.clone(),
                 use_encryption: p.use_encryption,
@@ -146,6 +146,7 @@ impl Service {
                 bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
             });
         }
+        let proxy_info_map = Arc::new(RwLock::new(map));
 
         Ok(Self {
             cfg,
@@ -193,7 +194,7 @@ impl Service {
                 warn!("Health check type '{}' not yet supported for '{}'", hc_type, p.name);
                 continue;
             }
-            let la = self.proxy_info_map
+            let la = self.proxy_info_map.read().await
                 .get(&p.name)
                 .map(|info| info.local_addr.clone())
                 .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
@@ -224,9 +225,7 @@ impl Service {
             );
             let admin_state = AdminState {
                 proxy_metrics: self.proxy_metrics.clone(),
-                proxies: Arc::new(tokio::sync::RwLock::new(
-                    self.proxy_info_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-                )),
+                proxies: self.proxy_info_map.clone(),
                 reload_tx: reload_tx.clone(),
                 stop_tx: stop_tx.clone(),
                 config_path: self.config_file.clone(),
@@ -287,7 +286,7 @@ impl Service {
 
             // Register proxies using IoStream directly (supports TCP and TLS)
             for p in &proxies {
-                let local_addr = self.proxy_info_map
+                let local_addr = self.proxy_info_map.read().await
                     .get(&p.name)
                     .map(|info| info.local_addr.clone())
                     .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
@@ -352,7 +351,7 @@ impl Service {
                     self.cfg.server_port,
                     &protocol,
                     &run_id,
-                    &self.proxy_info_map,
+                    self.proxy_info_map.clone(),
                     self.encryption_key,
                     i,
                     auth_token.clone(),
@@ -405,7 +404,7 @@ impl Service {
                                     self.cfg.server_port,
                                     &protocol,
                                     &run_id,
-                                    &self.proxy_info_map,
+                                    self.proxy_info_map.clone(),
                                     self.encryption_key,
                                     -1, // on-demand, not pool
                                     auth_token.clone(),
@@ -436,7 +435,7 @@ impl Service {
                                 let visitor_addr = nhc.visitor_addr.unwrap_or_default();
                                 let proxy_name = nhc.proxy_name.clone();
                                 let sid = nhc.transaction_id.clone();
-                                let local_addr = self.proxy_info_map
+                                let local_addr = self.proxy_info_map.read().await
                                     .get(&proxy_name)
                                     .map(|p| p.local_addr.clone());
 
@@ -570,7 +569,7 @@ impl Service {
 
                     Some(req) = reload_rx.recv() => {
                         let result = match &self.config_file {
-                            Some(path) => self.try_reload(path, req.strict).await,
+                            Some(path) => self.try_reload(path, req.strict, &writer).await,
                             None => Err("no config file path stored".into()),
                         };
                         let _ = req.reply.send(result);
@@ -596,40 +595,102 @@ impl Service {
     }
 
     /// Reload configuration from file. Used by admin API.
-    pub async fn try_reload(&self, config_path: &str, strict: bool) -> Result<String, String> {
-        let _new_cfg: ClientConfig = frp_core::config::load_client_config(config_path)
+    ///
+    /// Sends NewProxy for added proxies and CloseProxy for removed proxies
+    /// over the control connection. Responses are handled asynchronously by
+    /// the message loop. Plugin-based proxies log a warning (plugin restart
+    /// requires a full frpc restart).
+    pub async fn try_reload(
+        &self,
+        config_path: &str,
+        strict: bool,
+        writer: &Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>,
+    ) -> Result<String, String> {
+        use std::collections::HashSet;
+
+        let new_cfg: ClientConfig = frp_core::config::load_client_config(config_path)
             .map_err(|e| format!("failed to load config: {e}"))?;
 
-        // For initial implementation: reload config file, diff proxy list, log changes.
-        // Full re-registration deferred (requires refactoring control connection access).
+        // Diff old vs new proxy names
+        let old_names: HashSet<String> = {
+            self.proxy_info_map.read().await.keys().cloned().collect()
+        };
+        let new_names: HashSet<String> = new_cfg.proxies.iter().map(|p| p.name.clone()).collect();
+
+        let removed: Vec<String> = old_names.difference(&new_names).cloned().collect();
+        let added: Vec<String> = new_names.difference(&old_names).cloned().collect();
+
+        if strict && (!removed.is_empty() || !added.is_empty()) {
+            let mut parts: Vec<String> = Vec::new();
+            if !removed.is_empty() { parts.push(format!("removed: {:?}", removed)); }
+            if !added.is_empty() { parts.push(format!("added: {:?}", added)); }
+            return Err(format!("config changed — {}", parts.join("; ")));
+        }
+
+        if removed.is_empty() && added.is_empty() {
+            return Ok("reload success: no changes detected".into());
+        }
+
         let mut changes: Vec<String> = Vec::new();
+        let mut w = writer.lock().await;
 
-        let old_names: std::collections::HashSet<&str> =
-            self.proxy_info_map.keys().map(|s| s.as_str()).collect();
-        let new_names: std::collections::HashSet<&str> =
-            _new_cfg.proxies.iter().map(|p| p.name.as_str()).collect();
-
-        let removed: Vec<&str> = old_names.difference(&new_names).copied().collect();
+        // Send CloseProxy for removed proxies (fire-and-forget; CloseProxyResp
+        // is handled by the message loop)
         for name in &removed {
-            if strict { return Err(format!("proxy '{}' removed — restart required for full re-registration", name)); }
-            changes.push(format!("proxy '{}' removed (restart required)", name));
-            tracing::info!("Reload: proxy '{}' removed", name);
+            let close = FrpMessage::CloseProxy(msg::CloseProxy {
+                proxy_name: name.clone(),
+            });
+            write_msg_v1(&mut *w, &close).await
+                .map_err(|e| format!("send CloseProxy for '{name}': {e}"))?;
+            changes.push(format!("proxy '{name}' removed"));
+            tracing::info!("Reload: sent CloseProxy for '{name}'");
         }
 
-        let added: Vec<&str> = new_names.difference(&old_names).copied().collect();
+        // Send NewProxy for added proxies (fire-and-forget; NewProxyResp
+        // is handled by the message loop)
         for name in &added {
-            if strict { return Err(format!("proxy '{}' added — restart required for full re-registration", name)); }
-            changes.push(format!("proxy '{}' added (restart required)", name));
-            tracing::info!("Reload: proxy '{}' added", name);
+            if let Some(p) = new_cfg.proxies.iter().find(|p| &p.name == name) {
+                if p.plugin.is_some() {
+                    tracing::warn!(
+                        "Reload: proxy '{name}' has a plugin — plugin restart requires full frpc restart"
+                    );
+                }
+                let local_addr = format!("{}:{}", p.local_ip, p.local_port);
+                let np = crate::proxy::create_new_proxy_msg(p, &local_addr);
+                write_msg_v1(&mut *w, &np).await
+                    .map_err(|e| format!("send NewProxy for '{name}': {e}"))?;
+                changes.push(format!("proxy '{name}' added"));
+                tracing::info!("Reload: sent NewProxy for '{name}'");
+            }
+        }
+        drop(w);
+
+        // Update the shared proxy_info_map so admin API and work conn lookups
+        // reflect the new proxy set.
+        {
+            let mut map = self.proxy_info_map.write().await;
+            for name in &removed {
+                map.remove(name);
+            }
+            for name in &added {
+                if let Some(p) = new_cfg.proxies.iter().find(|p| &p.name == name) {
+                    let bw_limit = frp_core::config::parse_bandwidth_limit(&p.bandwidth_limit).unwrap_or(0);
+                    let local_addr = format!("{}:{}", p.local_ip, p.local_port);
+                    map.insert(name.clone(), ProxyRuntimeInfo {
+                        local_addr,
+                        proxy_type: p.proxy_type.clone(),
+                        use_encryption: p.use_encryption,
+                        use_compression: p.use_compression,
+                        bandwidth_limit: bw_limit,
+                        bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
+                    });
+                }
+            }
         }
 
-        if changes.is_empty() {
-            Ok("reload success: no changes detected".into())
-        } else {
-            let summary = changes.join("; ");
-            tracing::info!("Config reload summary: {}", summary);
-            Ok(format!("reload success: {}", summary))
-        }
+        let summary = changes.join("; ");
+        tracing::info!("Config reload summary: {}", summary);
+        Ok(format!("reload success: {summary}"))
     }
 }
 
@@ -653,7 +714,7 @@ fn spawn_work_conn(
     server_port: u16,
     protocol: &TransportProtocol,
     run_id: &str,
-    proxy_info_map: &HashMap<String, ProxyRuntimeInfo>,
+    proxy_info_map: Arc<RwLock<HashMap<String, ProxyRuntimeInfo>>>,
     enc_key: [u8; 16],
     pool_id: i32,
     auth_token: String,
@@ -762,7 +823,11 @@ fn spawn_work_conn(
                 info!("Work conn {} assigned to proxy '{}'", label, proxy_name);
 
                 // Look up the proxy runtime info
-                let info = match proxy_info_map.get(proxy_name) {
+                let info = {
+                    let map = proxy_info_map.read().await;
+                    map.get(proxy_name).cloned()
+                };
+                let info = match info {
                     Some(info) => info,
                     None => {
                         warn!("Work conn {}: unknown proxy '{}'", label, proxy_name);
@@ -915,7 +980,7 @@ fn spawn_work_conn(
                 server_port,
                 &protocol,
                 &run_id,
-                &proxy_info_map,
+                proxy_info_map.clone(),
                 enc_key,
                 pool_id,
                 auth_token,
