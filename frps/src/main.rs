@@ -75,7 +75,7 @@ async fn run(cli: CliArgs) {
             match load_server_config(&path_str) {
                 Ok(cfg) => {
                     handles.push(tokio::spawn(async move {
-                        let service = match Service::new(cfg).await {
+                        let service = match Service::new(cfg, Some(path_str.clone())).await {
                             Ok(s) => s,
                             Err(e) => {
                                 tracing::error!("frps service init failed for [{}]: {}", path_str, e);
@@ -118,12 +118,40 @@ async fn run(cli: CliArgs) {
     init_logging(&cli, Some(&cfg));
 
     tracing::info!("frps (Rust) v{} starting...", frp_core::VERSION);
-    let service = Service::new(cfg).await.unwrap_or_else(|e| {
-        tracing::error!("frps init error: {}", e);
-        process::exit(1);
-    });
+    let config_path = Some(cli.config.clone());
+    let service = std::sync::Arc::new(
+        Service::new(cfg, config_path).await.unwrap_or_else(|e| {
+            tracing::error!("frps init error: {}", e);
+            process::exit(1);
+        })
+    );
+
+    // SIGUSR1 reload handler (Unix only) — kill -USR1 <pid>
+    #[cfg(unix)]
+    let reload_handle = {
+        let svc = service.clone();
+        tokio::spawn(async move {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
+                Ok(mut sig) => {
+                    tracing::info!("SIGUSR1 reload ready (pid={})", std::process::id());
+                    loop {
+                        sig.recv().await;
+                        match svc.reload().await {
+                            Ok(summary) => tracing::info!("SIGUSR1: {}", summary),
+                            Err(e) => tracing::error!("SIGUSR1 reload: {}", e),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("SIGUSR1 unavailable: {}", e),
+            }
+        })
+    };
+
     if let Err(e) = service.run().await {
         tracing::error!("frps error: {}", e);
         process::exit(1);
     }
+
+    #[cfg(unix)]
+    reload_handle.abort();
 }
