@@ -1053,6 +1053,22 @@ async fn handle_visitor_conn_inner(
         }
     };
 
+    // --- allow_users check (Go frp compat: XTCP/STCP access control) ---
+    if let Some(proxy_info) = state.proxy_manager.get(&proxy_name).await {
+        if !proxy_info.allow_users.is_empty() {
+            let visitor_run_id = msg.run_id.as_deref().unwrap_or("");
+            if !proxy_info.allow_users.iter().any(|u| u == visitor_run_id) {
+                warn!("STCP visitor '{}' not in allow_users for proxy '{}'", visitor_run_id, proxy_name);
+                let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
+                    proxy_name: proxy_name.clone(),
+                    error: Some("visitor not allowed".into()),
+                });
+                let _ = write_msg_v1(&mut stream, &resp).await;
+                return;
+            }
+        }
+    }
+
     let ctl_tx = {
         let map = state.run_id_to_ctl_tx.read().await;
         map.get(&run_id).cloned()

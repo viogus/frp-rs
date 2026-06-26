@@ -37,6 +37,10 @@ pub struct Service {
     proxy_metrics: Arc<ProxyMetricsRegistry>,
     /// Path to config file for admin reload/config endpoints.
     config_file: Option<String>,
+    /// Channel to trigger config reload from external signal (SIGUSR1).
+    reload_tx: mpsc::UnboundedSender<ReloadRequest>,
+    /// Receiver side of reload channel — consumed by run().
+    reload_rx: Mutex<Option<mpsc::UnboundedReceiver<ReloadRequest>>>,
 }
 
 impl Service {
@@ -71,6 +75,8 @@ impl Service {
                 ac.oidc_scope.clone(),
                 Some(ac.oidc_issuer.clone()).filter(|s| !s.is_empty()),
                 &ac.additional_endpoint_params,
+                Some(ac.oidc_tls_trusted_ca_file.clone()).filter(|s| !s.is_empty()),
+                ac.oidc_tls_insecure_skip_verify,
             ).await.map_err(|e| format!("OIDC client init failed: {e}"))?;
             info!("OIDC client initialized, token endpoint: {}", client.token_endpoint());
             Some(Arc::new(client))
@@ -232,6 +238,8 @@ impl Service {
         }
         let proxy_info_map = Arc::new(RwLock::new(map));
 
+        let (reload_tx, reload_rx) = mpsc::unbounded_channel::<ReloadRequest>();
+
         Ok(Self {
             cfg,
             auth_cfg: Arc::new(auth_cfg),
@@ -241,7 +249,22 @@ impl Service {
             oidc_client,
             proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
             config_file,
+            reload_tx,
+            reload_rx: Mutex::new(Some(reload_rx)),
         })
+    }
+
+    /// Request a config reload. Safe to call from signal handler.
+    /// Returns immediately; actual reload happens asynchronously in run().
+    pub fn request_reload(&self) {
+        let _ = self.reload_tx.send(ReloadRequest {
+            strict: false,
+            reply: {
+                let (tx, _) = tokio::sync::oneshot::channel();
+                tx
+            },
+        });
+        tracing::info!("Config reload requested (SIGUSR1)");
     }
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -298,7 +321,9 @@ impl Service {
         }
 
         // Start admin HTTP server if configured
-        let (reload_tx, mut reload_rx) = mpsc::unbounded_channel::<ReloadRequest>();
+        let reload_tx = self.reload_tx.clone();
+        let mut reload_rx = self.reload_rx.lock().await.take()
+            .expect("reload_rx already taken — run() called twice?");
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel::<()>();
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 

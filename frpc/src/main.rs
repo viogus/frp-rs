@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::process;
+use std::sync::Arc;
 
+use tokio::signal;
 use tracing_subscriber::EnvFilter;
 
 use frp_core::args::{parse_args, CliArgs};
@@ -117,13 +119,36 @@ async fn run(cli: CliArgs) {
     init_logging(&cli, Some(&cfg));
 
     tracing::info!("frpc (Rust) v{} connecting...", frp_core::VERSION);
-    let service = match Service::new(cfg, Some(cli.config.clone())).await {
+    let service = Arc::new(match Service::new(cfg, Some(cli.config.clone())).await {
         Ok(svc) => svc,
         Err(e) => {
             tracing::error!("frpc init error: {}", e);
             process::exit(1);
         }
-    };
+    });
+
+    // SIGUSR1 → config hot reload
+    let reload_svc = service.clone();
+    tokio::spawn(async move {
+        // SIGUSR1: 30 on macOS, 10 on Linux
+        #[cfg(target_os = "macos")]
+        const SIGUSR1: std::os::raw::c_int = 30;
+        #[cfg(not(target_os = "macos"))]
+        const SIGUSR1: std::os::raw::c_int = 10;
+
+        let mut sig = match signal::unix::signal(signal::unix::SignalKind::from_raw(SIGUSR1)) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("SIGUSR1 handler init failed: {}", e);
+                return;
+            }
+        };
+        loop {
+            sig.recv().await;
+            reload_svc.request_reload();
+        }
+    });
+
     if let Err(e) = service.run().await {
         tracing::error!("frpc error: {}", e);
         process::exit(1);

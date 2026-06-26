@@ -97,6 +97,7 @@ pub(crate) async fn handle_new_proxy(
                 use_encryption: np.use_encryption.unwrap_or(false),
                 use_compression: np.use_compression.unwrap_or(false),
                 virtual_net: virtual_net.clone(),
+                allow_users: np.allow_users.clone().unwrap_or_default(),
             };
 
             if let Err(e) = state.proxy_manager.register(run_id.to_string(), info.clone()).await {
