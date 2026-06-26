@@ -160,6 +160,30 @@ impl VhostManager {
     }
 }
 
+/// Write an HTTP error response, optionally with a custom body.
+/// If custom_body is non-empty, it is used as the response body
+/// with Content-Type: text/html.
+pub(crate) async fn write_http_error(
+    stream: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+    status_line: &str,
+    custom_body: &str,
+) {
+    if custom_body.is_empty() {
+        let _ = stream.write_all(
+            format!("{status_line}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+        ).await;
+    } else {
+        let body = custom_body.as_bytes();
+        let _ = stream.write_all(
+            format!(
+                "{status_line}\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            ).as_bytes(),
+        ).await;
+        let _ = stream.write_all(body).await;
+    }
+}
+
 /// Run an HTTP VHost listener on the given address.
 /// Accepts connections, reads the Host header, and routes via InternalMsg.
 pub async fn run_vhost_http_listener(
@@ -229,11 +253,11 @@ pub async fn run_vhost_http_listener(
                     }).ok();
                 } else {
                     warn!("VHost route for '{}' path '{}' found but control handler gone", host, path);
-                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                    write_http_error(&mut stream, "HTTP/1.1 502 Bad Gateway", "").await;
                 }
             } else {
                 warn!("No VHost route for '{}' path '{}' from {}", host, path, peer);
-                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
+                write_http_error(&mut stream, "HTTP/1.1 404 Not Found", &state.custom_404_page).await;
             }
         });
     }
@@ -321,11 +345,11 @@ pub async fn run_vhost_https_listener(
                     }).ok();
                 } else {
                     warn!("HTTPS VHost route for '{}' path '{}' found but control handler gone", host, path);
-                    let _ = tokio::io::AsyncWriteExt::write_all(&mut tls_stream, b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                    write_http_error(&mut tls_stream, "HTTP/1.1 502 Bad Gateway", "").await;
                 }
             } else {
                 warn!("No VHost route for '{}' path '{}' from {}", host, path, peer);
-                let _ = tokio::io::AsyncWriteExt::write_all(&mut tls_stream, b"HTTP/1.1 404 Not Found\r\n\r\n").await;
+                write_http_error(&mut tls_stream, "HTTP/1.1 404 Not Found", &state.custom_404_page).await;
             }
         });
     }
@@ -597,5 +621,24 @@ mod tests {
     fn test_extract_sni_short_data() {
         assert_eq!(extract_sni_from_client_hello(&[0x16, 0x03]), None);
         assert_eq!(extract_sni_from_client_hello(&[]), None);
+    }
+
+    #[tokio::test]
+    async fn test_write_http_error_empty_body() {
+        let mut buf = Vec::new();
+        write_http_error(&mut buf, "HTTP/1.1 404 Not Found", "").await;
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.contains("HTTP/1.1 404 Not Found"));
+        assert!(resp.contains("Content-Length: 0"));
+    }
+
+    #[tokio::test]
+    async fn test_write_http_error_custom_body() {
+        let mut buf = Vec::new();
+        write_http_error(&mut buf, "HTTP/1.1 404 Not Found", "<h1>Not Found</h1>").await;
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.contains("HTTP/1.1 404 Not Found"));
+        assert!(resp.contains("Content-Type: text/html"));
+        assert!(resp.contains("<h1>Not Found</h1>"));
     }
 }

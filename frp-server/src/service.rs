@@ -108,6 +108,8 @@ pub struct AppState {
     pub vhost_http_timeout: u64,
     pub user_conn_timeout: u64,
     pub tcp_mux_passthrough: bool,
+    /// Custom 404 page body (HTML) from WebServerConfig.
+    pub custom_404_page: String,
     /// TCPMux HTTP CONNECT route table (domain → proxy mapping).
     pub tcpmux_manager: Arc<TcpMuxManager>,
     /// Per-proxy traffic metrics for dashboard API.
@@ -115,7 +117,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16, vhost_http_timeout: u64, user_conn_timeout: u64, tcp_mux_passthrough: bool) -> Self {
+    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16, vhost_http_timeout: u64, user_conn_timeout: u64, tcp_mux_passthrough: bool, custom_404_page: String) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             reloadable: Arc::new(std::sync::RwLock::new(ReloadableState {
@@ -143,6 +145,7 @@ impl AppState {
             vhost_http_timeout,
             user_conn_timeout,
             tcp_mux_passthrough,
+            custom_404_page,
         }
     }
 }
@@ -221,6 +224,7 @@ impl Service {
             cfg.vhost_http_timeout,
             cfg.user_conn_timeout,
             cfg.tcp_mux_passthrough,
+            cfg.web_server.custom_404_page.clone(),
         );
 
         // Initialize prometheus registry when enabled

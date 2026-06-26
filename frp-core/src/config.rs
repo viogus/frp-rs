@@ -262,6 +262,11 @@ pub struct WebServerConfig {
     /// TLS private key file path.
     #[serde(default)]
     pub tls_key_file: String,
+    /// Custom 404 page body (HTML). When non-empty, VHost and TCPMux
+    /// 404 responses include this content with Content-Type: text/html.
+    /// Go frp compat: custom_404_page.
+    #[serde(default)]
+    pub custom_404_page: String,
 }
 
 
