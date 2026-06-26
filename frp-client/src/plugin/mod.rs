@@ -67,7 +67,7 @@ pub(super) fn base64_decode(input: &str) -> Result<String, ()> {
             accum &= (1 << bits) - 1;
         }
     }
-    Ok(String::from_utf8(buf).map_err(|_| ())?)
+    String::from_utf8(buf).map_err(|_| ())
 }
 
 pub(super) fn split_host_port(s: &str) -> (&str, u16) {

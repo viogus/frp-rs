@@ -173,7 +173,7 @@ impl AsyncRead for WsByteStream {
                         Poll::Ready(Some(Ok(Message::Close(_)))) => return Poll::Ready(Ok(())),
                         Poll::Ready(Some(Ok(_))) => continue,
                         Poll::Ready(Some(Err(e))) => {
-                            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)));
+                            return Poll::Ready(Err(io::Error::other(e)));
                         }
                         Poll::Ready(None) => return Poll::Ready(Ok(())),
                         Poll::Pending => return Poll::Pending,
@@ -250,7 +250,7 @@ impl AsyncRead for WsByteStream {
 
                 match opcode {
                     // Text, Binary, Continuation — deliver as raw bytes
-                    0x01 | 0x02 | 0x00 => {
+                    0x00..=0x02 => {
                         let n = payload.len().min(buf.remaining());
                         buf.put_slice(&payload[..n]);
                         if n < payload.len() {
@@ -303,10 +303,10 @@ impl AsyncWrite for WsByteStream {
                         Poll::Ready(Ok(())) => {
                             match inner.as_mut().start_send(Message::Binary(buf.to_vec())) {
                                 Ok(()) => needs_flush = true,
-                                Err(e) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+                                Err(e) => return Poll::Ready(Err(io::Error::other(e))),
                             }
                         }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
                         Poll::Pending => {
                             self.needs_flush = needs_flush;
                             return Poll::Pending;
@@ -321,7 +321,7 @@ impl AsyncWrite for WsByteStream {
                         }
                         Poll::Ready(Err(e)) => {
                             self.needs_flush = false;
-                            Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)))
+                            Poll::Ready(Err(io::Error::other(e)))
                         }
                         Poll::Pending => {
                             self.needs_flush = true;
@@ -394,7 +394,7 @@ impl AsyncWrite for WsByteStream {
                             self.needs_flush = false;
                             Poll::Ready(Ok(()))
                         }
-                        Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+                        Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
                         Poll::Pending => {
                             self.needs_flush = true;
                             Poll::Pending
@@ -442,7 +442,7 @@ impl AsyncWrite for WsByteStream {
             WsInner::Tungstenite(inner) => inner
                 .as_mut()
                 .poll_close(cx)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e)),
+                .map_err(io::Error::other),
             WsInner::Raw(tcp) => {
                 let _ = Pin::new(&mut *tcp).poll_write(cx, &[0x88, 0x02, 0x03, 0xe8]);
                 Pin::new(&mut *tcp).poll_shutdown(cx)
@@ -917,7 +917,7 @@ pub async fn accept_websocket(stream: TcpStream) -> Result<IoStream, crate::Erro
         if line.len() > 1 {
             let lower = line[..1].to_lowercase() + &line[1..].to_lowercase();
             if lower.starts_with("sec-websocket-key:") {
-                key = line.splitn(2, ':').nth(1).unwrap_or("").trim().to_string();
+                key = line.split_once(':').map(|x| x.1).unwrap_or("").trim().to_string();
             }
         }
     }

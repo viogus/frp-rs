@@ -24,6 +24,12 @@ pub struct ProxyManager {
     groups: RwLock<HashMap<String, Vec<String>>>,
 }
 
+impl Default for ProxyManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProxyManager {
     pub fn new() -> Self {
         Self {

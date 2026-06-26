@@ -26,6 +26,12 @@ pub struct TcpMuxManager {
     by_proxy: RwLock<HashMap<String, Vec<String>>>,
 }
 
+impl Default for TcpMuxManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TcpMuxManager {
     pub fn new() -> Self {
         Self {

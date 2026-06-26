@@ -191,7 +191,11 @@ pub(crate) async fn assign_work_to_proxy(
             }
         } else {
             // Write VHost pre-read bytes to work connection first (plain).
-            if !pre_read.is_empty() {
+            // When pre_read was already written above, pass empty to bridge_plain
+            // so the bytes are not sent twice.
+            let bridge_pre_read = if pre_read.is_empty() {
+                Vec::new()
+            } else {
                 let write_result = match &mut work_conn {
                     IoStream::Tcp(ref mut s) => s.write_all(&pre_read).await,
                     IoStream::Tls(ref mut s) => s.write_all(&pre_read).await,
@@ -205,11 +209,12 @@ pub(crate) async fn assign_work_to_proxy(
                     warn!("Failed to write VHost pre-read bytes: {}", e);
                     return;
                 }
-            }
+                Vec::new() // already written, don't pass to bridge_plain
+            };
             // Plain bridge with optional compression.
             let (u_r, u_w) = req.user_conn.into_split();
             let (w_r, w_w) = work_conn.into_split();
-            frp_core::bridge::bridge_plain(u_r, u_w, w_r, w_w, comp_key, pre_read).await;
+            frp_core::bridge::bridge_plain(u_r, u_w, w_r, w_w, comp_key, bridge_pre_read).await;
         }
         info!("Proxy '{}' bridge completed", req.proxy_name);
     });

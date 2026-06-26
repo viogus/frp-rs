@@ -85,6 +85,11 @@ pub async fn bridge_encrypted(
     // Work → User: read from work (decrypted), decompress, write to user
     let work_to_user = async {
         let mut buf = vec![0u8; 65536];
+        let mut decompressor = if use_compression {
+            Some(encryption::SnappyDecompressor::new())
+        } else {
+            None
+        };
         loop {
             let n = match enc_work_r.read(&mut buf).await {
                 Ok(0) => break,
@@ -93,22 +98,40 @@ pub async fn bridge_encrypted(
             };
             let decrypted = &buf[..n];
 
-            let plaintext = if use_compression {
-                match encryption::decompress(decrypted) {
+            let plaintext = if let Some(ref mut dec) = decompressor {
+                match dec.feed(decrypted) {
                     Ok(p) => p,
-                    Err(_) => break,
+                    Err(e) => {
+                        tracing::warn!("snappy decompress error in encrypted bridge: {}", e);
+                        break;
+                    }
                 }
             } else {
                 decrypted.to_vec()
             };
 
-            // Apply read bandwidth limit before writing to user
-            if let Some(ref mut lim) = read_limiter {
-                lim.consume(plaintext.len()).await;
-            }
+            if !plaintext.is_empty() {
+                // Apply read bandwidth limit before writing to user
+                if let Some(ref mut lim) = read_limiter {
+                    lim.consume(plaintext.len()).await;
+                }
 
-            if user_w.write_all(&plaintext).await.is_err() { break; }
-            if user_w.flush().await.is_err() { break; }
+                if user_w.write_all(&plaintext).await.is_err() { break; }
+                if user_w.flush().await.is_err() { break; }
+            }
+        }
+        // Flush remaining buffered compressed data
+        if let Some(ref mut dec) = decompressor {
+            match dec.flush() {
+                Ok(plaintext) if !plaintext.is_empty() => {
+                    let _ = user_w.write_all(&plaintext).await;
+                    let _ = user_w.flush().await;
+                }
+                Err(e) => {
+                    tracing::warn!("snappy flush error in encrypted bridge: {}", e);
+                }
+                _ => {}
+            }
         }
     };
 
@@ -126,11 +149,10 @@ pub async fn bridge_plain(
     pre_read: Vec<u8>,
 ) {
     let user_to_work = async {
-        if !pre_read.is_empty() {
-            if work_w.write_all(&pre_read).await.is_err() {
+        if !pre_read.is_empty()
+            && work_w.write_all(&pre_read).await.is_err() {
                 return;
             }
-        }
         let mut buf = vec![0u8; 65536];
         loop {
             let n = match user_r.read(&mut buf).await {
@@ -154,22 +176,45 @@ pub async fn bridge_plain(
     };
     let work_to_user = async {
         let mut buf = vec![0u8; 65536];
+        let mut decompressor = if use_compression {
+            Some(encryption::SnappyDecompressor::new())
+        } else {
+            None
+        };
         loop {
             let n = match work_r.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(_) => break,
             };
-            let plaintext = if use_compression {
-                match encryption::decompress(&buf[..n]) {
+            let plaintext = if let Some(ref mut dec) = decompressor {
+                match dec.feed(&buf[..n]) {
                     Ok(p) => p,
-                    Err(_) => break,
+                    Err(e) => {
+                        tracing::warn!("snappy decompress error in bridge: {}", e);
+                        break;
+                    }
                 }
             } else {
                 buf[..n].to_vec()
             };
-            if user_w.write_all(&plaintext).await.is_err() { break; }
-            if user_w.flush().await.is_err() { break; }
+            if !plaintext.is_empty() {
+                if user_w.write_all(&plaintext).await.is_err() { break; }
+                if user_w.flush().await.is_err() { break; }
+            }
+        }
+        // Flush remaining buffered compressed data
+        if let Some(ref mut dec) = decompressor {
+            match dec.flush() {
+                Ok(plaintext) if !plaintext.is_empty() => {
+                    let _ = user_w.write_all(&plaintext).await;
+                    let _ = user_w.flush().await;
+                }
+                Err(e) => {
+                    tracing::warn!("snappy flush error in bridge: {}", e);
+                }
+                _ => {}
+            }
         }
         let _ = user_w.shutdown().await;
     };

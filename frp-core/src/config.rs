@@ -225,6 +225,7 @@ fn default_health_check_url() -> String { "/".into() }
 fn default_max_days() -> i32 { 3 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct WebServerConfig {
     #[serde(default)]
     pub addr: String,
@@ -236,16 +237,6 @@ pub struct WebServerConfig {
     pub password: String,
 }
 
-impl Default for WebServerConfig {
-    fn default() -> Self {
-        Self {
-            addr: String::new(),
-            port: 0,
-            user: String::new(),
-            password: String::new(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerTransportConfig {
@@ -268,6 +259,7 @@ impl Default for ServerTransportConfig {
 // ---------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct PluginConfig {
     #[serde(rename = "type")]
     pub plugin_type: String,
@@ -289,21 +281,6 @@ pub struct PluginConfig {
     pub password: String,
 }
 
-impl Default for PluginConfig {
-    fn default() -> Self {
-        Self {
-            plugin_type: String::new(),
-            http_user: String::new(),
-            http_password: String::new(),
-            local_addr: String::new(),
-            local_path: String::new(),
-            strip_prefix: String::new(),
-            host_header_rewrite: String::new(),
-            username: String::new(),
-            password: String::new(),
-        }
-    }
-}
 
 
 // ---------------------------------------------------------------
@@ -765,7 +742,7 @@ fn collect_config_files_inner(dir: &Path, files: &mut Vec<std::path::PathBuf>) -
         let path = entry.path();
         if path.is_dir() {
             collect_config_files_inner(&path, files)?;
-        } else if path.extension().map_or(false, |ext| ext == "toml" || ext == "ini") {
+        } else if path.extension().is_some_and(|ext| ext == "toml" || ext == "ini") {
             files.push(path);
         }
     }
