@@ -15,43 +15,9 @@ pub async fn bridge_encrypted_io(
     read_limiter: Option<&mut BandwidthLimiter>,
     write_limiter: Option<&mut BandwidthLimiter>,
 ) {
-    match (user, work) {
-        (IoStream::Tcp(u), IoStream::Tcp(w)) => {
-            let (u_r, u_w) = tokio::io::split(u);
-            let (w_r, w_w) = tokio::io::split(w);
-            bridge_encrypted(u_r, u_w, w_r, w_w, key, use_compression, pre_read, read_limiter, write_limiter).await;
-        }
-        (IoStream::Tls(u), IoStream::Tls(w)) => {
-            let (u_r, u_w) = tokio::io::split(u);
-            let (w_r, w_w) = tokio::io::split(w);
-            bridge_encrypted(u_r, u_w, w_r, w_w, key, use_compression, pre_read, read_limiter, write_limiter).await;
-        }
-        (IoStream::Kcp(u), IoStream::Kcp(w)) => {
-            let (u_r, u_w) = tokio::io::split(u);
-            let (w_r, w_w) = tokio::io::split(w);
-            bridge_encrypted(u_r, u_w, w_r, w_w, key, use_compression, pre_read, read_limiter, write_limiter).await;
-        }
-        (IoStream::WebSocket(u), IoStream::WebSocket(w)) => {
-            let (u_r, u_w) = tokio::io::split(u);
-            let (w_r, w_w) = tokio::io::split(w);
-            bridge_encrypted(u_r, u_w, w_r, w_w, key, use_compression, pre_read, read_limiter, write_limiter).await;
-        }
-        (IoStream::Quic(u), IoStream::Quic(w)) => {
-            let (u_r, u_w) = u.into_split();
-            let (w_r, w_w) = w.into_split();
-            bridge_encrypted(u_r, u_w, w_r, w_w, key, use_compression, pre_read, read_limiter, write_limiter).await;
-        }
-        (IoStream::Yamux(u), IoStream::Yamux(w)) => {
-            let (u_r, u_w) = tokio::io::split(u);
-            let (w_r, w_w) = tokio::io::split(w);
-            bridge_encrypted(u_r, u_w, w_r, w_w, key, use_compression, pre_read, read_limiter, write_limiter).await;
-        }
-        (user, work) => {
-            let (u_r, u_w) = user.into_split();
-            let (w_r, w_w) = work.into_split();
-            bridge_encrypted(u_r, u_w, w_r, w_w, key, use_compression, pre_read, read_limiter, write_limiter).await;
-        }
-    }
+    let (u_r, u_w) = user.into_split();
+    let (w_r, w_w) = work.into_split();
+    bridge_encrypted(u_r, u_w, w_r, w_w, key, use_compression, pre_read, read_limiter, write_limiter).await;
 }
 
 /// Bridge data between user and work connections over an encrypted+compressed channel.
