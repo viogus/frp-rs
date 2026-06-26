@@ -68,9 +68,6 @@ cleanup() {
     for pid in $PIDS; do
         kill "$pid" 2>/dev/null || true
     done
-    # Kill any remaining frp processes
-    pkill -f "frps" 2>/dev/null || true
-    pkill -f "frpc" 2>/dev/null || true
     if ! $KEEP_TMP; then
         rm -rf "$TEST_DIR"
     fi
