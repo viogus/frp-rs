@@ -67,28 +67,62 @@ impl std::str::FromStr for TransportProtocol {
 // ---------------------------------------------------------------
 
 /// A WebSocket-to-byte-stream adapter that implements AsyncRead/AsyncWrite.
-/// Converts between WebSocket binary messages and a byte stream suitable
+/// Converts between WebSocket messages and a byte stream suitable
 /// for use with the V1 protocol functions.
+///
+/// Two modes:
+/// - Tungstenite: client side (binary frames, RFC 6455 compliant)
+/// - Raw: server side (manual framing, tolerates text frames with non-UTF-8
+///   payload — Go frp v0.69.1 sends these via golang.org/x/net/websocket)
 pub struct WsByteStream {
-    inner: Pin<Box<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+    inner: WsInner,
     read_buf: Vec<u8>,
     read_pos: usize,
+    /// Write buffer for the Raw variant (frame bytes not yet flushed).
+    write_buf: Vec<u8>,
+    write_pos: usize,
     needs_flush: bool,
+}
+
+enum WsInner {
+    Tungstenite(Pin<Box<WebSocketStream<MaybeTlsStream<TcpStream>>>>),
+    /// Raw TCP stream post-upgrade. Manual WebSocket frame handling.
+    /// Server-side only — client frames are always masked (RFC 6455 §5.3).
+    Raw(TcpStream),
 }
 
 impl WsByteStream {
     pub fn new(ws: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
         Self {
-            inner: Box::pin(ws),
+            inner: WsInner::Tungstenite(Box::pin(ws)),
             read_buf: Vec::new(),
             read_pos: 0,
+            write_buf: Vec::new(),
+            write_pos: 0,
+            needs_flush: false,
+        }
+    }
+
+    /// Create from a raw TCP stream after manual WebSocket upgrade.
+    /// Used on the server accept path for Go frp compat.
+    pub fn from_raw_tcp(tcp: TcpStream) -> Self {
+        Self {
+            inner: WsInner::Raw(tcp),
+            read_buf: Vec::new(),
+            read_pos: 0,
+            write_buf: Vec::new(),
+            write_pos: 0,
             needs_flush: false,
         }
     }
 
     /// Consume the adapter and return the underlying WebSocket stream.
+    /// Panics if called on a Raw variant.
     pub fn into_inner(self) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
-        *Pin::into_inner(self.inner)
+        match self.inner {
+            WsInner::Tungstenite(ws) => *Pin::into_inner(ws),
+            WsInner::Raw(_) => panic!("into_inner called on Raw variant"),
+        }
     }
 }
 
@@ -98,56 +132,156 @@ impl AsyncRead for WsByteStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let this = &mut *self;
-
         // If we have buffered data, return it
-        if this.read_pos < this.read_buf.len() {
-            let available = &this.read_buf[this.read_pos..];
+        if self.read_pos < self.read_buf.len() {
+            let available = &self.read_buf[self.read_pos..];
             let len = available.len().min(buf.remaining());
             buf.put_slice(&available[..len]);
-            this.read_pos += len;
-            if this.read_pos >= this.read_buf.len() {
-                this.read_buf.clear();
-                this.read_pos = 0;
+            self.read_pos += len;
+            if self.read_pos >= self.read_buf.len() {
+                self.read_buf.clear();
+                self.read_pos = 0;
             }
             return Poll::Ready(Ok(()));
         }
 
-        // Read the next WS message
-        loop {
-            match this.inner.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(Message::Binary(data)))) => {
-                    let len = data.len().min(buf.remaining());
-                    buf.put_slice(&data[..len]);
-                    if len < data.len() {
-                        this.read_buf = data[len..].to_vec();
-                        this.read_pos = 0;
+        // Extract inner ref to avoid borrow conflict with self.{read_buf,read_pos}
+        match &mut self.inner {
+            WsInner::Tungstenite(inner) => {
+                loop {
+                    match inner.as_mut().poll_next(cx) {
+                        Poll::Ready(Some(Ok(Message::Binary(data)))) => {
+                            let len = data.len().min(buf.remaining());
+                            buf.put_slice(&data[..len]);
+                            if len < data.len() {
+                                self.read_buf = data[len..].to_vec();
+                                self.read_pos = 0;
+                            }
+                            return Poll::Ready(Ok(()));
+                        }
+                        Poll::Ready(Some(Ok(Message::Text(text)))) => {
+                            let data = text.into_bytes();
+                            let len = data.len().min(buf.remaining());
+                            buf.put_slice(&data[..len]);
+                            if len < data.len() {
+                                self.read_buf = data[len..].to_vec();
+                                self.read_pos = 0;
+                            }
+                            return Poll::Ready(Ok(()));
+                        }
+                        Poll::Ready(Some(Ok(Message::Ping(_)))) => continue,
+                        Poll::Ready(Some(Ok(Message::Close(_)))) => return Poll::Ready(Ok(())),
+                        Poll::Ready(Some(Ok(_))) => continue,
+                        Poll::Ready(Some(Err(e))) => {
+                            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)));
+                        }
+                        Poll::Ready(None) => return Poll::Ready(Ok(())),
+                        Poll::Pending => return Poll::Pending,
                     }
-                    return Poll::Ready(Ok(()));
                 }
-                Poll::Ready(Some(Ok(Message::Text(text)))) => {
-                    let data = text.into_bytes();
-                    let len = data.len().min(buf.remaining());
-                    buf.put_slice(&data[..len]);
-                    if len < data.len() {
-                        this.read_buf = data[len..].to_vec();
-                        this.read_pos = 0;
+            }
+            WsInner::Raw(tcp) => {
+                // --- Read WebSocket frame header ---
+                // Byte 0: FIN(1) RSV(3) OPCODE(4)
+                // Byte 1: MASK(1) PAYLOAD_LEN(7)
+                let mut head = [0u8; 2];
+                match Pin::new(&mut *tcp).poll_read(cx, &mut ReadBuf::new(&mut head)) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+
+                let opcode = head[0] & 0x0f;
+                let masked = (head[1] & 0x80) != 0;
+                let mut payload_len = (head[1] & 0x7f) as u64;
+
+                // Extended payload length
+                if payload_len == 126 {
+                    let mut ext = [0u8; 2];
+                    match Pin::new(&mut *tcp).poll_read(cx, &mut ReadBuf::new(&mut ext)) {
+                        Poll::Ready(Ok(())) => {}
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
                     }
-                    return Poll::Ready(Ok(()));
+                    payload_len = u16::from_be_bytes(ext) as u64;
+                } else if payload_len == 127 {
+                    let mut ext = [0u8; 8];
+                    match Pin::new(&mut *tcp).poll_read(cx, &mut ReadBuf::new(&mut ext)) {
+                        Poll::Ready(Ok(())) => {}
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                    payload_len = u64::from_be_bytes(ext);
                 }
-                Poll::Ready(Some(Ok(Message::Ping(_)))) => {
-                    // Ignore ping (tungstenite handles pong automatically)
-                    continue;
+
+                if payload_len > 16 * 1024 * 1024 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "WS frame too large",
+                    )));
                 }
-                Poll::Ready(Some(Ok(Message::Close(_)))) => {
-                    return Poll::Ready(Ok(()));
+
+                // Read mask key
+                let mut mask_key = [0u8; 4];
+                if masked {
+                    match Pin::new(&mut *tcp).poll_read(cx, &mut ReadBuf::new(&mut mask_key)) {
+                        Poll::Ready(Ok(())) => {}
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    }
                 }
-                Poll::Ready(Some(Ok(_))) => continue,
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)));
+
+                // Read payload
+                let mut payload = vec![0u8; payload_len as usize];
+                if payload_len > 0 {
+                    match Pin::new(&mut *tcp).poll_read(cx, &mut ReadBuf::new(&mut payload)) {
+                        Poll::Ready(Ok(())) => {}
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    }
                 }
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
-                Poll::Pending => return Poll::Pending,
+
+                // Unmask
+                if masked {
+                    for i in 0..payload.len() {
+                        payload[i] ^= mask_key[i % 4];
+                    }
+                }
+
+                match opcode {
+                    // Text, Binary, Continuation — deliver as raw bytes
+                    0x01 | 0x02 | 0x00 => {
+                        let n = payload.len().min(buf.remaining());
+                        buf.put_slice(&payload[..n]);
+                        if n < payload.len() {
+                            self.read_buf = payload[n..].to_vec();
+                            self.read_pos = 0;
+                        }
+                        Poll::Ready(Ok(()))
+                    }
+                    // Close
+                    0x08 => {
+                        let _ = Pin::new(&mut *tcp).poll_write(cx, &[0x88, 0x02, 0x03, 0xe8]);
+                        Poll::Ready(Ok(()))
+                    }
+                    // Ping → reply Pong, retry
+                    0x09 => {
+                        let mut pong = vec![0x8a, payload.len() as u8];
+                        pong.extend_from_slice(&payload);
+                        let _ = Pin::new(&mut *tcp).poll_write(cx, &pong);
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    // Pong → ignore, retry
+                    0x0a => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    _ => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unexpected WS opcode: {opcode:#x}"),
+                    ))),
+                }
             }
         }
     }
@@ -159,40 +293,91 @@ impl AsyncWrite for WsByteStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let this = &mut *self;
-        // If we have unflushed data, flush it first before accepting more.
-        // This prevents duplicate messages when write_all re-polls after Pending.
-        if !this.needs_flush && !buf.is_empty() {
-            match this.inner.as_mut().poll_ready(cx) {
-                Poll::Ready(Ok(())) => {
-                    match this.inner.as_mut().start_send(Message::Binary(buf.to_vec())) {
-                        Ok(()) => {
-                            this.needs_flush = true;
-                            // Fall through to flush below
+        // Use locals to avoid borrow conflicts between &mut self.inner and self.{needs_flush, write_buf}
+        let mut needs_flush = self.needs_flush;
+
+        match &mut self.inner {
+            WsInner::Tungstenite(inner) => {
+                if !needs_flush && !buf.is_empty() {
+                    match inner.as_mut().poll_ready(cx) {
+                        Poll::Ready(Ok(())) => {
+                            match inner.as_mut().start_send(Message::Binary(buf.to_vec())) {
+                                Ok(()) => needs_flush = true,
+                                Err(e) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+                            }
                         }
-                        Err(e) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+                        Poll::Pending => {
+                            self.needs_flush = needs_flush;
+                            return Poll::Pending;
+                        }
                     }
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        // Flush queued data so write_all (which may not call poll_flush) works.
-        // tokio's write_all only loops poll_write; it doesn't call poll_flush.
-        if this.needs_flush {
-            match this.inner.as_mut().poll_flush(cx) {
-                Poll::Ready(Ok(())) => {
-                    this.needs_flush = false;
-                    Poll::Ready(Ok(buf.len()))
+                if needs_flush {
+                    match inner.as_mut().poll_flush(cx) {
+                        Poll::Ready(Ok(())) => {
+                            self.needs_flush = false;
+                            Poll::Ready(Ok(buf.len()))
+                        }
+                        Poll::Ready(Err(e)) => {
+                            self.needs_flush = false;
+                            Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)))
+                        }
+                        Poll::Pending => {
+                            self.needs_flush = true;
+                            Poll::Pending
+                        }
+                    }
+                } else {
+                    self.needs_flush = false;
+                    Poll::Ready(Ok(0))
                 }
-                Poll::Ready(Err(e)) => {
-                    this.needs_flush = false;
-                    Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)))
-                }
-                Poll::Pending => Poll::Pending,
             }
-        } else {
-            Poll::Ready(Ok(0))
+            WsInner::Raw(tcp) => {
+                let tcp_ptr: *mut TcpStream = tcp;
+                if !needs_flush && !buf.is_empty() {
+                    let len = buf.len();
+                    self.write_buf.clear();
+                    self.write_buf.push(0x82);
+                    if len < 126 {
+                        self.write_buf.push(len as u8);
+                    } else if len <= 65535 {
+                        self.write_buf.push(126);
+                        self.write_buf.extend_from_slice(&(len as u16).to_be_bytes());
+                    } else {
+                        self.write_buf.push(127);
+                        self.write_buf.extend_from_slice(&(len as u64).to_be_bytes());
+                    }
+                    self.write_buf.extend_from_slice(buf);
+                    self.write_pos = 0;
+                    self.needs_flush = true;
+                }
+                if self.needs_flush {
+                    let remaining = &self.write_buf[self.write_pos..];
+                    // SAFETY: tcp_ptr derived from &mut self.inner, fields are disjoint
+                    let tcp = unsafe { &mut *tcp_ptr };
+                    match Pin::new(tcp).poll_write(cx, remaining) {
+                        Poll::Ready(Ok(n)) => {
+                            self.write_pos += n;
+                            if self.write_pos >= self.write_buf.len() {
+                                self.write_pos = 0;
+                                self.needs_flush = false;
+                                Poll::Ready(Ok(buf.len()))
+                            } else {
+                                cx.waker().wake_by_ref();
+                                Poll::Pending
+                            }
+                        }
+                        Poll::Ready(Err(e)) => {
+                            self.needs_flush = false;
+                            Poll::Ready(Err(e))
+                        }
+                        Poll::Pending => Poll::Pending,
+                    }
+                } else {
+                    Poll::Ready(Ok(0))
+                }
+            }
         }
     }
 
@@ -200,17 +385,52 @@ impl AsyncWrite for WsByteStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.needs_flush {
-            match self.inner.as_mut().poll_flush(cx) {
-                Poll::Ready(Ok(())) => {
-                    self.needs_flush = false;
+        let needs_flush = self.needs_flush;
+        match &mut self.inner {
+            WsInner::Tungstenite(inner) => {
+                if needs_flush {
+                    match inner.as_mut().poll_flush(cx) {
+                        Poll::Ready(Ok(())) => {
+                            self.needs_flush = false;
+                            Poll::Ready(Ok(()))
+                        }
+                        Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+                        Poll::Pending => {
+                            self.needs_flush = true;
+                            Poll::Pending
+                        }
+                    }
+                } else {
                     Poll::Ready(Ok(()))
                 }
-                Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
-                Poll::Pending => Poll::Pending,
             }
-        } else {
-            Poll::Ready(Ok(()))
+            WsInner::Raw(tcp) => {
+                let tcp_ptr: *mut TcpStream = tcp;
+                if needs_flush {
+                    let remaining = &self.write_buf[self.write_pos..];
+                    let tcp = unsafe { &mut *tcp_ptr };
+                    match Pin::new(tcp).poll_write(cx, remaining) {
+                        Poll::Ready(Ok(n)) => {
+                            self.write_pos += n;
+                            if self.write_pos >= self.write_buf.len() {
+                                self.write_pos = 0;
+                                self.needs_flush = false;
+                                Poll::Ready(Ok(()))
+                            } else {
+                                cx.waker().wake_by_ref();
+                                Poll::Pending
+                            }
+                        }
+                        Poll::Ready(Err(e)) => {
+                            self.needs_flush = false;
+                            Poll::Ready(Err(e))
+                        }
+                        Poll::Pending => Poll::Pending,
+                    }
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            }
         }
     }
 
@@ -218,8 +438,16 @@ impl AsyncWrite for WsByteStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        self.inner.as_mut().poll_close(cx)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        match &mut self.inner {
+            WsInner::Tungstenite(inner) => inner
+                .as_mut()
+                .poll_close(cx)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e)),
+            WsInner::Raw(tcp) => {
+                let _ = Pin::new(&mut *tcp).poll_write(cx, &[0x88, 0x02, 0x03, 0xe8]);
+                Pin::new(&mut *tcp).poll_shutdown(cx)
+            }
+        }
     }
 }
 
@@ -534,7 +762,22 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 opts.server_port,
                 FRP_WEBSOCKET_PATH
             );
-            let (ws_stream, _) = tokio_tungstenite::connect_async(url)
+            // Build request with Origin header — Go frp v0.69.1
+            // (golang.org/x/net/websocket) requires Origin.
+            use tokio_tungstenite::tungstenite::http::Request as HttpRequest;
+            let origin = format!("http://{}:{}", host, opts.server_port);
+            let req = HttpRequest::builder()
+                .method("GET")
+                .uri(&url)
+                .header("Host", format!("{}:{}", host, opts.server_port))
+                .header("Connection", "Upgrade")
+                .header("Upgrade", "websocket")
+                .header("Sec-WebSocket-Version", "13")
+                .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
+                .header("Origin", origin)
+                .body(())
+                .map_err(|e| crate::Error::Transport(format!("WS request build: {e}")))?;
+            let (ws_stream, _) = tokio_tungstenite::connect_async(req)
                 .await
                 .map_err(|e| crate::Error::Transport(format!("WebSocket connect: {e}")))?;
             Ok(IoStream::WebSocket(WsByteStream::new(ws_stream)))
@@ -648,12 +891,81 @@ pub async fn consume_tls_head_byte(stream: &mut TcpStream) -> Result<(), crate::
 /// Accept a WebSocket upgrade on the server side.
 /// Returns an IoStream with a WsByteStream adapter already applied,
 /// so callers can use read_msg_v1/write_msg_v1 directly.
+/// Accept a WebSocket connection on a raw TcpStream.
+///
+/// Does NOT use tungstenite — Go frp v0.69.1 (`golang.org/x/net/websocket`)
+/// sends frp V1 frames as TEXT frames. The V1 binary header contains bytes
+/// that aren't valid UTF-8 (e.g. the big-endian length field). Tungstenite
+/// rejects these text frames per RFC 6455 §5.6.
+///
+/// This implementation handles the HTTP upgrade manually and returns a
+/// WsByteStream in Raw mode — all data frames are treated as opaque bytes.
 pub async fn accept_websocket(stream: TcpStream) -> Result<IoStream, crate::Error> {
-    let tls_stream = MaybeTlsStream::Plain(stream);
-    let ws_stream = tokio_tungstenite::accept_async(tls_stream)
-        .await
-        .map_err(|e| crate::Error::Transport(format!("WebSocket accept: {e}")))?;
-    Ok(IoStream::WebSocket(WsByteStream::new(ws_stream)))
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let mut reader = BufReader::new(stream);
+    let mut key = String::new();
+
+    // Read HTTP upgrade request line by line.
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).await
+            .map_err(|e| crate::Error::Transport(format!("WS read request: {e}")))?;
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        if line.len() > 1 {
+            let lower = line[..1].to_lowercase() + &line[1..].to_lowercase();
+            if lower.starts_with("sec-websocket-key:") {
+                key = line.splitn(2, ':').nth(1).unwrap_or("").trim().to_string();
+            }
+        }
+    }
+
+    if key.is_empty() {
+        return Err(crate::Error::Transport("Missing Sec-WebSocket-Key".into()));
+    }
+
+    // Compute accept key: base64(sha1(key + magic GUID))
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let hash = hasher.finalize();
+    let accept = {
+        // Inline base64 encoding
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut s = String::with_capacity(28);
+        for chunk in hash.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+            let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+            let triple = (b0 << 16) | (b1 << 8) | b2;
+            s.push(CHARS[((triple >> 18) & 0x3f) as usize] as char);
+            s.push(CHARS[((triple >> 12) & 0x3f) as usize] as char);
+            if chunk.len() > 1 {
+                s.push(CHARS[((triple >> 6) & 0x3f) as usize] as char);
+            } else {
+                s.push('=');
+            }
+            if chunk.len() > 2 {
+                s.push(CHARS[(triple & 0x3f) as usize] as char);
+            } else {
+                s.push('=');
+            }
+        }
+        s
+    };
+
+    // Send HTTP 101 Switching Protocols
+    let mut tcp = reader.into_inner();
+    let resp = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+    );
+    tcp.write_all(resp.as_bytes()).await
+        .map_err(|e| crate::Error::Transport(format!("WS write response: {e}")))?;
+
+    Ok(IoStream::WebSocket(WsByteStream::from_raw_tcp(tcp)))
 }
 
 /// TLS configuration.

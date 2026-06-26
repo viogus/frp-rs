@@ -573,6 +573,9 @@ TOML
 
 write_go_frps_config_ws() {
     local port="$1" token="$2" out="$3"
+    # Go frps HandleMux on the main port detects WebSocket (GET /~!frp)
+    # and proxies internally to the VHost HTTP handler. They MUST share
+    # the same port for the internal proxy to work.
     cat > "$out" <<TOML
 bindAddr = "127.0.0.1"
 bindPort = $port
@@ -581,6 +584,9 @@ auth.method = "token"
 auth.token = "$token"
 
 transport.tcpMux = false
+
+# Same port as bindPort — enables HandleMux WS→VHost internal proxy
+vhostHTTPPort = $port
 
 log.to = "$TEST_DIR/go-frps.log"
 log.level = "debug"
@@ -2688,6 +2694,8 @@ test_r2g_ws_plain() {
         return
     }
 
+    # Rust frpc connects via WebSocket to Go frps main port (bindPort).
+    # Go frps HandleMux detects WS and proxies internally to VHost handler.
     write_rust_frpc_config_ws "$frps_port" "$token" "$echo_port" "$proxy_port" \
         "ws-plain" "$TEST_DIR/$name/frpc.toml"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
