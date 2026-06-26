@@ -19,3 +19,4 @@ docs/
 *~
 .DS_Store
 .worktrees/
+.claude/
