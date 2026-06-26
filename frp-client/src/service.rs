@@ -14,6 +14,8 @@ use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::mux::YamuxSession;
 use frp_core::transport::{TransportProtocol, DialOptions, dial_server, IoStream};
 
+use frp_core::metrics::ProxyMetricsRegistry;
+
 use crate::plugin::{self, PluginHandle};
 use crate::proxy;
 use crate::control::ControlConnection;
@@ -42,6 +44,8 @@ pub struct Service {
     _plugin_handles: Vec<PluginHandle>,
     /// OIDC client for fetching access tokens (None when auth method is Token).
     oidc_client: Option<Arc<OidcClient>>,
+    /// Per-proxy traffic metrics for admin API.
+    proxy_metrics: Arc<ProxyMetricsRegistry>,
 }
 
 impl Service {
@@ -159,6 +163,7 @@ impl Service {
             proxy_info_map,
             _plugin_handles: plugin_handles,
             oidc_client,
+            proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
         })
     }
 
@@ -335,6 +340,7 @@ impl Service {
                     self.oidc_client.clone(),
                     udp_sockets.clone(),
                     udp_enc_cfg.clone(),
+                    self.proxy_metrics.clone(),
                 );
             }
 
@@ -387,6 +393,7 @@ impl Service {
                                     self.oidc_client.clone(),
                                     udp_sockets.clone(),
                                     udp_enc_cfg.clone(),
+                                    self.proxy_metrics.clone(),
                                 );
                             }
                             Ok(FrpMessage::Pong(_)) => {
@@ -577,6 +584,7 @@ fn spawn_work_conn(
     oidc_client: Option<Arc<OidcClient>>,
     udp_sockets: Arc<tokio::sync::Mutex<HashMap<String, Arc<UdpSocket>>>>,
     udp_enc_cfg: Arc<tokio::sync::Mutex<HashMap<String, (bool, bool)>>>,
+    proxy_metrics: Arc<ProxyMetricsRegistry>,
 ) {
     let server_addr = server_addr.to_string();
     let run_id = run_id.to_string();
@@ -586,6 +594,7 @@ fn spawn_work_conn(
     // Clone for replenishment call (used after async block consumes originals)
     let repl_udp_sockets = udp_sockets.clone();
     let repl_udp_enc_cfg = udp_enc_cfg.clone();
+    let repl_proxy_metrics = proxy_metrics.clone();
 
     tokio::spawn(async move {
         let label = if pool_id >= 0 {
@@ -800,7 +809,7 @@ fn spawn_work_conn(
                     match proxy::connect_local(&info.local_addr).await {
                         Ok(local) => {
                             let enc = if info.use_encryption { Some(&enc_key) } else { None };
-                            proxy::bridge_streams(local, work, proxy_name, info.use_encryption, info.use_compression, enc, info.bandwidth_limit, &info.bandwidth_limit_mode).await;
+                            proxy::bridge_streams(local, work, proxy_name, info.use_encryption, info.use_compression, enc, info.bandwidth_limit, &info.bandwidth_limit_mode, proxy_metrics).await;
                         }
                         Err(e) => {
                             warn!("Work conn {}: failed to connect to local {}: {}", label, info.local_addr, e);
@@ -837,6 +846,7 @@ fn spawn_work_conn(
                 oidc_client,
                 repl_udp_sockets,
                 repl_udp_enc_cfg,
+                repl_proxy_metrics,
             );
         }
     });

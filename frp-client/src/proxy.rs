@@ -1,7 +1,11 @@
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
 use tokio::net::TcpStream;
 use tracing::{info, warn, debug};
 
 use frp_core::bandwidth::BandwidthLimiter;
+use frp_core::metrics::{ProxyMetricsRegistry, ConnGuard};
 use frp_core::msg::{self, FrpMessage};
 use frp_core::bridge;
 use frp_core::transport::IoStream;
@@ -105,9 +109,13 @@ pub async fn bridge_streams(
     enc_key: Option<&[u8; 16]>,
     bandwidth_limit: u64,
     bandwidth_limit_mode: &str,
+    metrics: Arc<ProxyMetricsRegistry>,
 ) {
     info!("Bridging streams for proxy: {} (encrypted: {}, compressed: {}, bw_limit: {} {})",
         name, use_encryption, use_compression, bandwidth_limit, bandwidth_limit_mode);
+
+    let proxy_metrics = metrics.get_or_create(name).await;
+    let _guard = ConnGuard::new(proxy_metrics.clone());
 
     // Build bandwidth limiters per direction.
     // "client" throttles upload (local→server, write to work).
@@ -129,7 +137,7 @@ pub async fn bridge_streams(
             let local_io = IoStream::Tcp(local);
             frp_core::bridge::bridge_encrypted_io(
                 local_io, work, &key, use_compression, Vec::new(),
-                read_lim.as_mut(), write_lim.as_mut(), None,
+                read_lim.as_mut(), write_lim.as_mut(), Some(proxy_metrics.clone()),
             ).await;
             debug!("Proxy {} encrypted bridge closed", name);
             return;
@@ -143,22 +151,24 @@ pub async fn bridge_streams(
     if use_compression {
         let (l_r, l_w) = tokio::io::split(local);
         let (w_r, w_w) = work.into_split();
-        bridge::bridge_plain(l_r, l_w, w_r, w_w, true, Vec::new(), None).await;
+        bridge::bridge_plain(l_r, l_w, w_r, w_w, true, Vec::new(), Some(proxy_metrics.clone())).await;
         debug!("Proxy {} compressed plain bridge closed", name);
     } else if read_lim.is_some() || write_lim.is_some() {
         let (l_r, l_w) = tokio::io::split(local);
         let (w_r, w_w) = work.into_split();
         bridge::bridge_plain_rate_limited(
             l_r, l_w, w_r, w_w,
-            read_lim.as_mut(), write_lim.as_mut(), None,
+            read_lim.as_mut(), write_lim.as_mut(), Some(proxy_metrics.clone()),
         ).await;
         debug!("Proxy {} rate-limited bridge closed", name);
     } else {
         let mut local = local;
         let mut work = work;
         match tokio::io::copy_bidirectional(&mut local, &mut work).await {
-            Ok((to_a, to_b)) => {
-                debug!("Proxy {} closed: {}B to server, {}B to local", name, to_a, to_b);
+            Ok((to_work, to_local)) => {
+                proxy_metrics.bytes_in.fetch_add(to_local, Ordering::Relaxed);
+                proxy_metrics.bytes_out.fetch_add(to_work, Ordering::Relaxed);
+                debug!("Proxy {} closed: {}B to server, {}B to local", name, to_work, to_local);
             }
             Err(e) => {
                 debug!("Proxy {} bridge error: {}", name, e);
