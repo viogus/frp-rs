@@ -367,6 +367,8 @@ pub struct ClientConfig {
     pub proxies: Vec<ProxyConfig>,
     #[serde(default)]
     pub visitors: Vec<VisitorConfig>,
+    #[serde(default)]
+    pub web_server: WebServerConfig,
 }
 
 impl Default for ClientConfig {
@@ -391,6 +393,7 @@ impl Default for ClientConfig {
             tcp_mux: true,
             proxies: vec![],
             visitors: vec![],
+            web_server: WebServerConfig::default(),
         }
     }
 }

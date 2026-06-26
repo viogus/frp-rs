@@ -91,7 +91,7 @@ async fn test_stcp_e2e_relay() {
         ..Default::default()
     };
 
-    let provider_service = ClientService::new(provider_cfg).await.expect("create client");
+    let provider_service = ClientService::new(provider_cfg, None).await.expect("create client");
     let _client_handle = tokio::spawn(async move {
         let _ = provider_service.run().await;
     });

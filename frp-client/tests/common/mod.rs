@@ -178,7 +178,7 @@ impl TestHarness {
             }],
             ..Default::default()
         };
-        let client_service = ClientService::new(client_cfg).await.expect("create client service");
+        let client_service = ClientService::new(client_cfg, None).await.expect("create client service");
         let client_handle = tokio::spawn(async move {
             let _ = client_service.run().await;
         });
