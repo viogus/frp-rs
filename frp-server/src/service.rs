@@ -38,11 +38,6 @@ pub enum InternalMsg {
         user_conn: IoStream,
         pre_read: Vec<u8>,
     },
-    UdpData {
-        proxy_name: String,
-        content: Vec<u8>,
-        remote_addr: msg::UdpAddr,
-    },
     /// UDP proxy needs a work connection for data forwarding
     /// (Go frp v0.69.1 uses work connections, not control connection).
     UdpNeedsWorkConn {

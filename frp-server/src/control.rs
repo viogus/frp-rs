@@ -275,43 +275,6 @@ pub async fn handle_control<S>(
                             pending_requests.push_back(PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() });
                         }
                     }
-                    Some(InternalMsg::UdpData { proxy_name: ref _pn, content, remote_addr }) => {
-                        debug!("UDP data for proxy '{}' from {:?}", _pn, remote_addr);
-                        // Include proxy's local_addr so the client can route to the correct local UDP socket.
-                        // Priority: 1) learned from incoming UDPPacket, 2) local_str from NewProxy,
-                        // 3) proxy name as fallback (clients key by proxy_name too).
-                        let local_addr = match udp_local_to_proxy.iter()
-                            .find(|(_, pn)| *pn == _pn)
-                            .map(|(ls, _)| ls.clone())
-                            .or_else(|| udp_sockets.keys().next().cloned())
-                        {
-                            Some(ls) => msg::UdpAddr::from_string(&ls),
-                            None => None,
-                        };
-                        // Encrypt/compress if the proxy requires it (Go frp v0.69.1 compat)
-                        let mut payload = content;
-                        if let Some(proxy_info) = state.proxy_manager.get(_pn).await {
-                            if proxy_info.use_compression {
-                                if let Ok(compressed) = encryption::compress(&payload) {
-                                    payload = compressed;
-                                }
-                            }
-                            if proxy_info.use_encryption {
-                                if let Ok(encrypted) = encryption::encrypt(&payload, &state.encryption_key) {
-                                    payload = encrypted;
-                                }
-                            }
-                        }
-                        let udp_packet = FrpMessage::UDPPacket(msg::UDPPacket {
-                            content: payload,
-                            local_addr,
-                            remote_addr: Some(remote_addr),
-                        });
-                        if let Err(e) = write_msg_v1(&mut writer, &udp_packet).await {
-                            warn!("Failed to send UDPPacket: {}", e);
-                            break;
-                        }
-                    }
                     Some(InternalMsg::UdpNeedsWorkConn { proxy_name }) => {
                         debug!("UDP proxy '{}' needs work connection", proxy_name);
                         if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
@@ -945,7 +908,6 @@ async fn handle_new_proxy(
                         return;
                     }
                 };
-                let _sock = socket.clone();
                 udp_sockets.insert(np.proxy_name.clone(), socket);
                 // Build reverse lookup: local_addr → proxy_name for routing UDPPacket responses
                 if let Some(ref local_str) = np.local_str {
@@ -1039,42 +1001,6 @@ async fn listen_and_proxy(
 }
 
 
-/// Run a UDP listener for a UDP proxy.
-/// Forwards received packets to the control handler via InternalMsg.
-/// Uses a shared Arc<UdpSocket> so the control handler can send responses
-/// through the same socket (bidirectional NAT, Go frp v0.69.1 compat).
-async fn run_udp_listener(
-    socket: std::sync::Arc<tokio::net::UdpSocket>,
-    proxy_name: String,
-    internal_tx: mpsc::UnboundedSender<InternalMsg>,
-) {
-    debug!("UDP listener started for '{}'", proxy_name);
-
-    let mut buf = vec![0u8; 65535];
-    loop {
-        match socket.recv_from(&mut buf).await {
-            Ok((n, src)) => {
-                let data = buf[..n].to_vec();
-                if internal_tx.send(InternalMsg::UdpData {
-                    proxy_name: proxy_name.clone(),
-                    content: data,
-                    remote_addr: msg::UdpAddr {
-                        ip: src.ip().to_string(),
-                        port: src.port(),
-                        zone: String::new(),
-                    },
-                }).is_err() {
-                    warn!("Control handler gone, stopping UDP listener for '{}'", proxy_name);
-                    break;
-                }
-            }
-            Err(e) => {
-                tracing::error!("UDP recv error for '{}': {}", proxy_name, e);
-                break;
-            }
-        }
-    }
-}
 
 async fn unregister_control(state: &Arc<AppState>, run_id: &str) {
     // Scope the run_id_to_ctl_tx lock to just the remove call
