@@ -143,6 +143,54 @@ impl Service {
                             warn!("Failed to start tls2raw plugin for '{}': {}", p.name, e);
                         }
                     }
+                } else if plugin_cfg.plugin_type == "http2http" {
+                    match plugin::start_http2http_plugin(plugin_cfg).await {
+                        Ok(handle) => {
+                            let addr = handle.local_addr.to_string();
+                            info!("http2http plugin for '{}' started on {}", p.name, addr);
+                            plugin_addrs.insert(p.name.clone(), addr);
+                            plugin_handles.push(handle);
+                        }
+                        Err(e) => {
+                            warn!("Failed to start http2http plugin for '{}': {}", p.name, e);
+                        }
+                    }
+                } else if plugin_cfg.plugin_type == "http2https" {
+                    match plugin::start_http2https_plugin(plugin_cfg).await {
+                        Ok(handle) => {
+                            let addr = handle.local_addr.to_string();
+                            info!("http2https plugin for '{}' started on {}", p.name, addr);
+                            plugin_addrs.insert(p.name.clone(), addr);
+                            plugin_handles.push(handle);
+                        }
+                        Err(e) => {
+                            warn!("Failed to start http2https plugin for '{}': {}", p.name, e);
+                        }
+                    }
+                } else if plugin_cfg.plugin_type == "https2http" {
+                    match plugin::start_https2http_plugin(plugin_cfg).await {
+                        Ok(handle) => {
+                            let addr = handle.local_addr.to_string();
+                            info!("https2http plugin for '{}' started on {}", p.name, addr);
+                            plugin_addrs.insert(p.name.clone(), addr);
+                            plugin_handles.push(handle);
+                        }
+                        Err(e) => {
+                            warn!("Failed to start https2http plugin for '{}': {}", p.name, e);
+                        }
+                    }
+                } else if plugin_cfg.plugin_type == "https2https" {
+                    match plugin::start_https2https_plugin(plugin_cfg).await {
+                        Ok(handle) => {
+                            let addr = handle.local_addr.to_string();
+                            info!("https2https plugin for '{}' started on {}", p.name, addr);
+                            plugin_addrs.insert(p.name.clone(), addr);
+                            plugin_handles.push(handle);
+                        }
+                        Err(e) => {
+                            warn!("Failed to start https2https plugin for '{}': {}", p.name, e);
+                        }
+                    }
                 } else {
                     warn!("Unknown plugin type '{}' for proxy '{}'", plugin_cfg.plugin_type, p.name);
                 }

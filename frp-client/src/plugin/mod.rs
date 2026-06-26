@@ -13,18 +13,27 @@ use std::net::SocketAddr;
 
 
 mod http;
+mod http2http;
+mod http2https;
+mod https2http;
+mod https2https;
 mod socks5;
 mod static_file;
 mod unix_socket;
 mod tls2raw;
 
 pub(crate) use http::start_http_proxy;
+pub(crate) use http2http::start_http2http_plugin;
+pub(crate) use http2https::start_http2https_plugin;
+pub(crate) use https2http::start_https2http_plugin;
+pub(crate) use https2https::start_https2https_plugin;
 pub(crate) use socks5::start_socks5_proxy;
 pub(crate) use static_file::start_static_file_proxy;
 pub(crate) use unix_socket::start_unix_socket_plugin;
 pub(crate) use tls2raw::start_tls2raw_plugin;
 
 /// A running plugin server. Drop to shut down.
+#[derive(Debug)]
 pub struct PluginHandle {
     pub local_addr: SocketAddr,
     /// Abort handle for the server task.
