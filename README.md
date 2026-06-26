@@ -56,6 +56,23 @@ suitable as a drop-in replacement for either the client or server side.
 
 Client plugins: `http_proxy`, `socks5`, `static_file`.
 
+### Go frp Compatibility Notes
+
+frp-rs targets protocol compatibility with Go frp v0.69.1. Most proxy types interoperate.
+Known differences:
+
+- **HTTPS proxy**: frp-rs terminates TLS on the server; Go frp uses SNI-only routing without
+  termination. frp-rs requires `tls_cert_file`/`tls_key_file` on the server for HTTPS proxies.
+- **QUIC/KCP**: Transport implementations exist but use different libraries and parameters.
+  Wire compatibility with Go frp over QUIC/KCP has not been verified — use TCP or WebSocket
+  for cross-implementation deployments.
+- **V2 protocol**: Not implemented (V1 only). Go frp v0.69.1 supports both V1 and V2.
+- **Plugin coverage**: 3 of 10 client plugin types implemented. See
+  [full audit](docs/go-frp-compat-audit.md) for details.
+
+For a complete feature-by-feature comparison, see
+[docs/go-frp-compat-audit.md](docs/go-frp-compat-audit.md).
+
 ---
 
 ## Architecture
