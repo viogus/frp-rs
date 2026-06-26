@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use axum::{Router, Json, extract::{State, Path}, response::Html, routing::{get, delete}};
+use axum::{Router, Json, extract::{State, Path, Query}, response::Html, routing::{get, delete}};
 use axum::http::StatusCode;
 use serde::{Serialize, Deserialize};
 use crate::service::AppState;
@@ -49,6 +49,18 @@ struct ErrorResponse {
     error: String,
 }
 
+#[derive(Deserialize, Default)]
+struct ProxiesQuery {
+    #[serde(rename = "type", default)]
+    proxy_type: String,
+}
+
+#[derive(Deserialize)]
+struct DeleteProxiesBody {
+    #[serde(default)]
+    proxies: Vec<String>,
+}
+
 #[derive(Serialize)]
 struct ClientEntry {
     run_id: String,
@@ -83,10 +95,31 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> Json<StatusRespons
     })
 }
 
-async fn handle_proxies(State(state): State<Arc<AppState>>) -> Json<Vec<ProxyEntry>> {
+/// GET /api/serverinfo — Go frp compat alias for /api/status.
+async fn handle_serverinfo(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
+    let uptime = state.dashboard_start.elapsed().as_secs();
+    let client_count = state.run_id_to_ctl_tx.read().await.len();
     let proxies = state.proxy_manager.list().await;
+    Json(StatusResponse {
+        version: frp_core::VERSION.to_string(),
+        uptime_secs: uptime,
+        client_count,
+        proxy_count: proxies.len(),
+    })
+}
+
+/// GET /api/proxies — list all proxies, optional ?type= filter.
+async fn handle_proxies(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ProxiesQuery>,
+) -> Json<Vec<ProxyEntry>> {
+    let proxies = state.proxy_manager.list().await;
+    let filter_type = query.proxy_type;
     let mut entries = Vec::new();
     for p in &proxies {
+        if !filter_type.is_empty() && p.proxy_type != filter_type {
+            continue;
+        }
         let online = state.run_id_to_ctl_tx.read().await.contains_key(&p.run_id);
         let traffic = state.proxy_metrics.get(&p.name).await
             .map(|m| m.snapshot())
@@ -158,6 +191,40 @@ async fn handle_proxy_traffic(
         });
 
     Ok(Json(traffic))
+}
+
+/// GET /api/proxies/{name} — Go frp compat alias for /api/proxy/{name}.
+async fn handle_proxy_by_name(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<ProxyDetail>, (axum::http::StatusCode, Json<ErrorResponse>)> {
+    let proxy = state.proxy_manager.get(&name).await
+        .ok_or_else(|| (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(ErrorResponse { error: "proxy not found".into() }),
+        ))?;
+
+    let online = state.run_id_to_ctl_tx.read().await.contains_key(&proxy.run_id);
+    let traffic = state.proxy_metrics.get(&name).await
+        .map(|m| m.snapshot())
+        .unwrap_or_else(|| MetricsSnapshot {
+            bytes_in: 0, bytes_out: 0, current_conns: 0, total_conns: 0,
+        });
+
+    Ok(Json(ProxyDetail {
+        name: proxy.name.clone(),
+        proxy_type: proxy.proxy_type.clone(),
+        status: if online { "online".into() } else { "offline".into() },
+        run_id: Some(proxy.run_id.clone()),
+        remote_port: proxy.remote_port,
+        local_addr: proxy.local_addr.clone(),
+        use_encryption: proxy.use_encryption,
+        use_compression: proxy.use_compression,
+        custom_domains: Vec::new(),
+        multiplexer: String::new(),
+        group: proxy.group.unwrap_or_default(),
+        traffic,
+    }))
 }
 
 async fn handle_clients(State(state): State<Arc<AppState>>) -> Json<Vec<ClientEntry>> {
@@ -335,6 +402,37 @@ async fn handle_store_proxy_delete(
     Ok(Json(serde_json::json!({"status": "deleted", "name": name})))
 }
 
+/// DELETE /api/proxies — bulk delete proxies. Go frp compat.
+/// Body: {"proxies": ["name1", "name2"]}
+async fn handle_proxies_delete(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DeleteProxiesBody>,
+) -> Json<serde_json::Value> {
+    let mut deleted = Vec::new();
+    for name in &body.proxies {
+        if let Some(proxy) = state.proxy_manager.get(name).await {
+            if let Some(port) = proxy.remote_port {
+                state.used_ports.write().await.remove(&port);
+            }
+            if let Some(ref sk) = proxy.sk {
+                if !sk.is_empty() {
+                    state.sk_index.write().await.remove(sk);
+                }
+            }
+            state.vhost_manager.unregister(name).await;
+            state.tcpmux_manager.unregister(name).await;
+            state.proxy_metrics.remove(name).await;
+            state.proxy_manager.remove(name).await;
+            state.proxy_config_store.write().await.remove(name);
+            deleted.push(name.clone());
+        }
+    }
+    Json(serde_json::json!({
+        "deleted": deleted.len(),
+        "proxies": deleted,
+    }))
+}
+
 // --- Dashboard runner ---
 
 pub async fn run_dashboard(
@@ -348,7 +446,9 @@ pub async fn run_dashboard(
     // API routes (auth-protected)
     let api_routes = Router::new()
         .route("/api/status", get(handle_status))
-        .route("/api/proxies", get(handle_proxies))
+        .route("/api/serverinfo", get(handle_serverinfo))
+        .route("/api/proxies", get(handle_proxies).delete(handle_proxies_delete))
+        .route("/api/proxies/{name}", get(handle_proxy_by_name))
         .route("/api/proxy/{name}", get(handle_proxy_detail))
         .route("/api/proxy/{name}/traffic", get(handle_proxy_traffic))
         .route("/api/clients", get(handle_clients))
