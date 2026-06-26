@@ -197,7 +197,7 @@ pub async fn handle_control<S>(
                                 }
                             }
                             if let Some(req) = pending_requests.pop_front() {
-                                bridge::assign_work_to_proxy(stream, req, state.reloadable.read().await.encryption_key).await;
+                                bridge::assign_work_to_proxy(stream, req, state.reloadable.read().await.encryption_key, state.clone()).await;
                             } else if work_pool.len() < pool_cap {
                                 work_pool.push_back(stream);
                                 debug!("Work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
@@ -215,7 +215,7 @@ pub async fn handle_control<S>(
                             (e, c)
                         };
                         if let Some(work_conn) = work_pool.pop_front() {
-                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now() }, state.reloadable.read().await.encryption_key).await;
+                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now() }, state.reloadable.read().await.encryption_key, state.clone()).await;
                         } else {
                             debug!("No pooled work conn for STCP, sending ReqWorkConn");
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
@@ -269,7 +269,7 @@ pub async fn handle_control<S>(
                             (e, c)
                         };
                         if let Some(work_conn) = work_pool.pop_front() {
-                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() }, state.reloadable.read().await.encryption_key).await;
+                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() }, state.reloadable.read().await.encryption_key, state.clone()).await;
                         } else {
                             debug!("No pooled work conn, sending ReqWorkConn for {}", target_proxy);
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
@@ -366,7 +366,7 @@ pub async fn handle_control<S>(
                         }
                     }
                     if let Some(req) = pending_requests.pop_front() {
-                        bridge::assign_work_to_proxy(io, req, state.reloadable.read().await.encryption_key).await;
+                        bridge::assign_work_to_proxy(io, req, state.reloadable.read().await.encryption_key, state.clone()).await;
                     } else if work_pool.len() < pool_cap {
                         work_pool.push_back(io);
                         debug!("Yamux work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);

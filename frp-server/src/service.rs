@@ -16,6 +16,7 @@ use frp_core::mux;
 use frp_core::transport::{IoStream, ConnectionType, peek_connection_type, consume_tls_head_byte};
 use frp_core::transport::{build_tls_acceptor, accept_websocket};
 use frp_core::format_socket_addr;
+use frp_core::metrics::ProxyMetricsRegistry;
 
 use crate::proxy::ProxyManager;
 use crate::control;
@@ -100,6 +101,8 @@ pub struct AppState {
     pub sudp_port: u16,
     /// TCPMux HTTP CONNECT route table (domain → proxy mapping).
     pub tcpmux_manager: Arc<TcpMuxManager>,
+    /// Per-proxy traffic metrics for dashboard API.
+    pub proxy_metrics: Arc<ProxyMetricsRegistry>,
 }
 
 impl AppState {
@@ -126,6 +129,7 @@ impl AppState {
             oidc_subjects: Arc::new(RwLock::new(HashMap::new())),
             nat_hole: Arc::new(NatHoleCoordinator::new()),
             tcpmux_manager: Arc::new(TcpMuxManager::new()),
+            proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
             sudp_port,
         }
     }
