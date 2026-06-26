@@ -463,9 +463,16 @@ pub async fn handle_control<S>(
                         }
                     }
                     Ok(FrpMessage::Ping(ref ping_msg)) => {
-                        // Validate ping auth (Go frp v0.69.1 compat)
-                        // OIDC path: verify JWT + subject binding
-                        let ping_auth_result = if let Some(ref verifier) = state.oidc_verifier {
+                        // Validate ping auth (Go frp v0.69.1 compat).
+                        // Go frp only sets privilege_key/timestamp when
+                        // AuthScopeHeartBeats is in additionalAuthScopes
+                        // (default: empty). Skip validation otherwise.
+                        let has_ping_auth = ping_msg.privilege_key.as_deref()
+                            .map_or(false, |k| !k.is_empty())
+                            || ping_msg.timestamp.unwrap_or(0) != 0;
+                        let ping_auth_result = if !has_ping_auth {
+                            Ok(())
+                        } else if let Some(ref verifier) = state.oidc_verifier {
                             let expected_sub = state.oidc_subjects.read().await
                                 .get(&run_id).cloned().unwrap_or_default();
                             verifier.verify_ping(

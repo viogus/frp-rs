@@ -700,6 +700,16 @@ fn normalize_client_config(value: &mut toml::Value) {
             }
         }
 
+        // Flatten [transport] section → top-level (ClientConfig has tcp_mux at top level,
+        // but Go frp config puts it under [transport])
+        if let Some(v) = table.remove("transport") {
+            if let Value::Table(tr_table) = v {
+                for (k, v) in tr_table {
+                    table.entry(k).or_insert(v);
+                }
+            }
+        }
+
         // Flatten log_* fields into log table (client side)
         let mut log_items: Vec<(String, Value)> = Vec::new();
         for key in ["log_file", "log_level", "log_max_days"] {
@@ -960,6 +970,35 @@ remote_port = 7001
         assert!(cfg.oidc_scope.is_empty());
         assert!(cfg.oidc_issuer.is_empty());
         assert!(cfg.additional_endpoint_params.is_empty());
+    }
+
+    #[test]
+    fn test_client_transport_flatten() {
+        // Go frp client config uses [transport] section.
+        // normalize_client_config should flatten it to top-level.
+        let toml_str = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+token = "test-token"
+
+[transport]
+tcp_mux = false
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+        // tcp_mux=false from [transport] should override default (true)
+        assert!(!cfg.tcp_mux);
+    }
+
+    #[test]
+    fn test_client_transport_flatten_default() {
+        // Without [transport] section, tcp_mux defaults to true
+        let toml_str = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+token = "test-token"
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+        assert!(cfg.tcp_mux);
     }
 
     #[test]

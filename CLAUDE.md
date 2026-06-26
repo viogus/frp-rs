@@ -33,6 +33,10 @@ Message type bytes and structs live in `frp-core/src/msg.rs`. The `FrpMessage` e
 
 Auth uses **MD5(token + timestamp)** → hex string (NOT HMAC-SHA256 as the README states). This matches Go frp v0.69.1 behavior — the switch from HMAC-SHA256 to MD5 happened in commit `78f9394`. See `frp-core/src/auth.rs`.
 
+### Encryption Key Derivation
+
+Uses **PBKDF2-SHA1(token, salt="frp", iterations=64, keylen=16)** for AES-128-CFB control encryption. Go frp v0.69.1 pre-built binary uses PBKDF2 salt `"frp"` (NOT `"crypto"` — the golib source says `"crypto"` but the Go frp binary was compiled with salt `"frp"`). See `frp-core/src/encryption.rs`.
+
 ### Server Architecture: The InternalMsg Channel
 
 The server's core is a pattern of cross-task message passing (`frp-server/src/service.rs`):

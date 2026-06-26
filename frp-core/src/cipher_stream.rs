@@ -371,8 +371,8 @@ mod tests {
         let token = "cc12122121212121212112565656CCtzT";
         let key = crate::encryption::derive_key(token);
         eprintln!("Key: {}", hex::encode(key));
-        // Expected from Go (salt="crypto"): 562ff6e7fbc064e40619b1c0e262c26f
-        assert_eq!(hex::encode(key), "562ff6e7fbc064e40619b1c0e262c26f");
+        // Expected from Go (salt="frp"): 004bc8379ee00e3d0c9eb0953c0b212c
+        assert_eq!(hex::encode(key), "004bc8379ee00e3d0c9eb0953c0b212c");
     }
 
     #[test]
@@ -386,8 +386,8 @@ mod tests {
         let mut ciphertext = plain.to_vec();
         cfb.encrypt(&mut ciphertext);
         eprintln!("Ciphertext: {}", hex::encode(&ciphertext));
-        // Expected from Go: 287efd63efada80f1a2a2285a904d144
-        assert_eq!(hex::encode(&ciphertext), "287efd63efada80f1a2a2285a904d144");
+        // Expected from Go (salt="frp"): d0710014c7af8e001ea6bfb27e97e1f7
+        assert_eq!(hex::encode(&ciphertext), "d0710014c7af8e001ea6bfb27e97e1f7");
     }
 
     #[tokio::test]
@@ -456,14 +456,14 @@ mod go_interop_tests {
         //   = a58f5b6761113b3aee79551cac8842c0
         let token = "enc-test-token-2024";
         let key = crate::encryption::derive_key(token);
-        assert_eq!(hex::encode(key), "a58f5b6761113b3aee79551cac8842c0");
+        assert_eq!(hex::encode(key), "c78f3c47ae07c8dade6c6a76009db8cf");
 
-        // Pre-computed: [IV=965be112...][CFB-ct of NewProxy V1 frame]
+        // Pre-computed: [IV=965be112...][CFB-ct of NewProxy V1 frame] (salt="frp")
         let wire = hex::decode(
             "965be1126c68f86001726011ba25e3b8\
-             a11f53ebd88f99919292fd2a28ee574ba59ab6970a39bcce8e77f5963eab76fa\
-             9cddc352971223e988a3252b85549b641b06ee9e2ddba90f7416d94472329f82\
-             89686089900f14042f"
+             084e5968c0dd229c6543b0dfc928a237d93a7f814343ba693cc61661f7f59121\
+             74e889a0b1d6c8afe88c7e60802fcec10dd7d41b8551addd938681e1dcb84941\
+             f7f8f46671d745200c"
         ).unwrap();
 
         // Expected plaintext: V1 NewProxy frame
