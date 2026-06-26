@@ -55,11 +55,11 @@ pub(crate) async fn handle_new_proxy(
         } else {
             drop(ports);
             let mut ports = state.used_ports.write().await;
-            allocate_port_multi(&mut ports, remote_port, &state.reloadable.read().await.allow_ports)
+            allocate_port_multi(&mut ports, remote_port, &state.reloadable.read().unwrap().allow_ports)
         }
     } else {
         let mut ports = state.used_ports.write().await;
-        allocate_port_multi(&mut ports, remote_port, &state.reloadable.read().await.allow_ports)
+        allocate_port_multi(&mut ports, remote_port, &state.reloadable.read().unwrap().allow_ports)
     };
 
     match allocated_port {

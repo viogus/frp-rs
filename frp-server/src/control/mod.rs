@@ -71,7 +71,8 @@ pub async fn handle_control<S>(
             }
         }
     } else {
-        if let Err(e) = state.reloadable.read().await.auth_cfg.validate_login(
+        let auth_cfg = state.reloadable.read().unwrap().auth_cfg.clone();
+        if let Err(e) = auth_cfg.validate_login(
             login.privilege_key.as_deref(),
             login.timestamp,
         ) {
@@ -126,7 +127,7 @@ pub async fn handle_control<S>(
     }
 
     // --- Wrap in AES-128-CFB encryption (matches client after login) ---
-    let enc_key = encryption::derive_key(&state.reloadable.read().await.auth_cfg.token);
+    let enc_key = encryption::derive_key(&state.reloadable.read().unwrap().auth_cfg.token);
     let cipher = frp_core::cipher_stream::CipherStream::new(Box::new(stream), enc_key);
 
     // --- Split encrypted stream for reading/writing ---
@@ -197,7 +198,8 @@ pub async fn handle_control<S>(
                                 }
                             }
                             if let Some(req) = pending_requests.pop_front() {
-                                bridge::assign_work_to_proxy(stream, req, state.reloadable.read().await.encryption_key, state.clone()).await;
+                                let enc_key = state.reloadable.read().unwrap().encryption_key;
+                                bridge::assign_work_to_proxy(stream, req, enc_key, state.clone()).await;
                             } else if work_pool.len() < pool_cap {
                                 work_pool.push_back(stream);
                                 debug!("Work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
@@ -215,7 +217,8 @@ pub async fn handle_control<S>(
                             (e, c)
                         };
                         if let Some(work_conn) = work_pool.pop_front() {
-                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now() }, state.reloadable.read().await.encryption_key, state.clone()).await;
+                            let enc_key = state.reloadable.read().unwrap().encryption_key;
+                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now() }, enc_key, state.clone()).await;
                         } else {
                             debug!("No pooled work conn for STCP, sending ReqWorkConn");
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
@@ -269,7 +272,8 @@ pub async fn handle_control<S>(
                             (e, c)
                         };
                         if let Some(work_conn) = work_pool.pop_front() {
-                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() }, state.reloadable.read().await.encryption_key, state.clone()).await;
+                            let enc_key = state.reloadable.read().unwrap().encryption_key;
+                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() }, enc_key, state.clone()).await;
                         } else {
                             debug!("No pooled work conn, sending ReqWorkConn for {}", target_proxy);
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
@@ -366,7 +370,8 @@ pub async fn handle_control<S>(
                         }
                     }
                     if let Some(req) = pending_requests.pop_front() {
-                        bridge::assign_work_to_proxy(io, req, state.reloadable.read().await.encryption_key, state.clone()).await;
+                        let enc_key = state.reloadable.read().unwrap().encryption_key;
+                        bridge::assign_work_to_proxy(io, req, enc_key, state.clone()).await;
                     } else if work_pool.len() < pool_cap {
                         work_pool.push_back(io);
                         debug!("Yamux work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
@@ -397,7 +402,7 @@ pub async fn handle_control<S>(
                         if let Some(ref pn) = proxy_name {
                             if let Some(proxy_info) = state.proxy_manager.get(pn.as_str()).await {
                                 if proxy_info.use_encryption {
-                                    if let Ok(decrypted) = encryption::decrypt(&payload, &state.reloadable.read().await.encryption_key) {
+                                    if let Ok(decrypted) = encryption::decrypt(&payload, &state.reloadable.read().unwrap().encryption_key) {
                                         payload = decrypted;
                                     }
                                 }
@@ -513,7 +518,7 @@ pub async fn handle_control<S>(
                                 &expected_sub,
                             ).await
                         } else {
-                            state.reloadable.read().await.auth_cfg.validate_login(
+                            state.reloadable.read().unwrap().auth_cfg.validate_login(
                                 ping_msg.privilege_key.as_deref(),
                                 ping_msg.timestamp,
                             ).map(|_| ())

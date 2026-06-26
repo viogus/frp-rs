@@ -81,7 +81,9 @@ pub struct ReloadableState {
 pub struct AppState {
     pub proxy_manager: Arc<ProxyManager>,
     /// Hot-reloadable config (auth, encryption, allow_ports).
-    pub reloadable: RwLock<ReloadableState>,
+    /// Uses std::sync::RwLock — blocking read has no async overhead.
+    /// Writes only happen on SIGUSR1 reload (vanishingly rare).
+    pub reloadable: Arc<std::sync::RwLock<ReloadableState>>,
     pub used_ports: Arc<RwLock<std::collections::HashSet<u16>>>,
     pub run_id_to_ctl_tx: Arc<RwLock<HashMap<String, ControlTx>>>,
     pub proxy_bind_addr: String,
@@ -109,11 +111,11 @@ impl AppState {
     pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
-            reloadable: RwLock::new(ReloadableState {
+            reloadable: Arc::new(std::sync::RwLock::new(ReloadableState {
                 auth_cfg: Arc::new(auth_cfg),
                 encryption_key,
                 allow_ports,
-            }),
+            })),
             used_ports: Arc::new(RwLock::new(std::collections::HashSet::new())),
             run_id_to_ctl_tx: Arc::new(RwLock::new(HashMap::new())),
             proxy_bind_addr,
@@ -749,7 +751,7 @@ impl Service {
 
         // Apply under write lock
         {
-            let mut r = self.state.reloadable.write().await;
+            let mut r = self.state.reloadable.write().unwrap();
             if r.allow_ports != new_allow_ports {
                 changes.push(format!(
                     "allow_ports: {:?} -> {:?}", r.allow_ports, new_allow_ports
@@ -1082,7 +1084,7 @@ async fn handle_work_conn_inner(
             &expected_sub,
         ).await
     } else {
-        state.reloadable.read().await.auth_cfg.validate_login(
+        state.reloadable.read().unwrap().auth_cfg.validate_login(
             msg.privilege_key.as_deref(),
             msg.timestamp,
         ).map(|_| ())
