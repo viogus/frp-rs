@@ -266,10 +266,10 @@ pub struct UdpAddr {
 
 impl UdpAddr {
     pub fn from_string(s: &str) -> Option<Self> {
-        let (ip, port_str) = s.rsplit_once(':')?;
+        let addr: std::net::SocketAddr = s.parse().ok()?;
         Some(UdpAddr {
-            ip: ip.to_string(),
-            port: port_str.parse().ok()?,
+            ip: addr.ip().to_string(),
+            port: addr.port(),
             zone: String::new(),
         })
     }
