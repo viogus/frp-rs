@@ -292,8 +292,8 @@ mod tests {
         // Writing a message > 64KB should fail
         let big = crate::msg::UDPPacket {
             content: vec![b'x'; 70000],
-            local_addr: "0.0.0.0:0".into(),
-            remote_addr: "0.0.0.0:0".into(),
+            local_addr: msg::UdpAddr::from_string("0.0.0.0:0"),
+            remote_addr: msg::UdpAddr::from_string("0.0.0.0:0"),
         };
         let msg = FrpMessage::UDPPacket(big);
         let (mut client, _server) = duplex(131072);

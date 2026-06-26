@@ -594,7 +594,7 @@ async fn assign_udp_work_conn(
         warn!("Failed to send StartWorkConn for UDP '{}': {}", proxy_name, e);
         return;
     }
-    info!("UDP work conn assigned to '{}', starting bridge tasks", proxy_name);
+    debug!("UDP work conn assigned to '{}', starting bridge tasks", proxy_name);
 
     let (mut w_r, mut w_w) = work_conn.into_split();
 
@@ -602,9 +602,9 @@ async fn assign_udp_work_conn(
     let sock_w = sock.clone();
     let pn_w = proxy_name.clone();
     tokio::spawn(async move {
-        info!("UDP work conn reader task started for '{}'", pn_w);
+        debug!("UDP work conn reader task started for '{}'", pn_w);
         loop {
-            info!("UDP reader '{}' waiting for read_msg_v1...", pn_w);
+            debug!("UDP reader '{}' waiting for read_msg_v1...", pn_w);
             match read_msg_v1(&mut w_r).await {
                 Ok(FrpMessage::UDPPacket(up)) => {
                     if let Some(ref remote) = up.remote_addr {
@@ -622,7 +622,7 @@ async fn assign_udp_work_conn(
                     debug!("UDP work conn for '{}': unexpected msg 0x{:02x}", pn_w, other.v1_type_byte());
                 }
                 Err(e) => {
-                    info!("UDP work conn for '{}' read closed: {}", pn_w, e);
+                    debug!("UDP work conn for '{}' read closed: {}", pn_w, e);
                     break;
                 }
             }
@@ -632,13 +632,13 @@ async fn assign_udp_work_conn(
     // Task: read from UDP socket → write UDPPacket to work conn
     let pn_w2 = proxy_name.clone();
     tokio::spawn(async move {
-        info!("UDP work conn writer task started for '{}'", pn_w2);
+        debug!("UDP work conn writer task started for '{}'", pn_w2);
         let mut buf = vec![0u8; 65535];
         loop {
-            info!("UDP writer '{}' waiting for recv_from...", pn_w2);
+            debug!("UDP writer '{}' waiting for recv_from...", pn_w2);
             match sock.recv_from(&mut buf).await {
                 Ok((n, src)) => {
-                    info!("UDP writer '{}' recv'd {} bytes from {}", pn_w2, n, src);
+                    debug!("UDP writer '{}' recv'd {} bytes from {}", pn_w2, n, src);
                     let remote = msg::UdpAddr {
                         ip: src.ip().to_string(),
                         port: src.port(),
@@ -649,21 +649,21 @@ async fn assign_udp_work_conn(
                         local_addr: Some(msg::UdpAddr { ip: "0.0.0.0".into(), port: 0, zone: String::new() }),
                         remote_addr: Some(remote),
                     });
-                    info!("UDP writer '{}' sending UDPPacket to work conn...", pn_w2);
+                    debug!("UDP writer '{}' sending UDPPacket to work conn...", pn_w2);
                     if let Err(e) = write_msg_v1(&mut w_w, &pkt).await {
-                        info!("UDP work conn write failed for '{}': {}", pn_w2, e);
+                        debug!("UDP work conn write failed for '{}': {}", pn_w2, e);
                         break;
                     }
-                    info!("UDP work conn wrote {} bytes for '{}'", n, pn_w2);
-                    info!("UDP writer '{}' looping back to recv_from...", pn_w2);
+                    debug!("UDP work conn wrote {} bytes for '{}'", n, pn_w2);
+                    debug!("UDP writer '{}' looping back to recv_from...", pn_w2);
                 }
                 Err(e) => {
-                    info!("UDP recv_from error for '{}': {}", pn_w2, e);
+                    debug!("UDP recv_from error for '{}': {}", pn_w2, e);
                     break;
                 }
             }
         }
-        info!("UDP writer '{}' task exiting", pn_w2);
+        debug!("UDP writer '{}' task exiting", pn_w2);
     });
 }
 
@@ -1048,7 +1048,7 @@ async fn run_udp_listener(
     proxy_name: String,
     internal_tx: mpsc::UnboundedSender<InternalMsg>,
 ) {
-    info!("UDP listener started for '{}'", proxy_name);
+    debug!("UDP listener started for '{}'", proxy_name);
 
     let mut buf = vec![0u8; 65535];
     loop {

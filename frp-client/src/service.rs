@@ -22,6 +22,7 @@ use crate::control::ControlConnection;
 #[derive(Clone)]
 struct ProxyRuntimeInfo {
     local_addr: String,
+    proxy_type: String,
     use_encryption: bool,
     use_compression: bool,
     /// Bandwidth limit in bytes/sec (0 = unlimited).
@@ -142,6 +143,7 @@ impl Service {
                 .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
             proxy_info_map.insert(p.name.clone(), ProxyRuntimeInfo {
                 local_addr,
+                proxy_type: p.proxy_type.clone(),
                 use_encryption: p.use_encryption,
                 use_compression: p.use_compression,
                 bandwidth_limit: bw_limit,
@@ -274,6 +276,44 @@ impl Service {
             let (mut reader, raw_writer) = control_stream.into_split();
             let writer = Arc::new(Mutex::new(raw_writer));
 
+            // Bind local UDP sockets for UDP proxies.
+            // UDP data flows over work connections (Go frp v0.69.1 compat).
+            // Sockets are shared with work conn tasks via Arc.
+            let udp_sockets: Arc<std::sync::Mutex<HashMap<String, Arc<UdpSocket>>>> =
+                Arc::new(std::sync::Mutex::new(HashMap::new()));
+            let udp_enc_cfg: Arc<std::sync::Mutex<HashMap<String, (bool, bool)>>> =
+                Arc::new(std::sync::Mutex::new(HashMap::new()));
+            for p in &proxies {
+                if p.proxy_type == "udp" {
+                    let local_addr = format!("{}:{}", p.local_ip, p.local_port);
+                    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+                        Ok(s) => Arc::new(s),
+                        Err(e) => {
+                            warn!("UDP proxy '{}': bind failed: {}", p.name, e);
+                            continue;
+                        }
+                    };
+                    // Connect to local UDP service for send/recv
+                    if let Err(e) = socket.connect(&local_addr).await {
+                        warn!("UDP proxy '{}': connect to local {} failed: {}", p.name, local_addr, e);
+                        continue;
+                    }
+                    {
+                        let mut map = udp_sockets.lock().unwrap();
+                        map.insert(local_addr.clone(), socket.clone());
+                        map.insert(p.name.clone(), socket);
+                    }
+                    {
+                        let mut cfg = udp_enc_cfg.lock().unwrap();
+                        let enc = (p.use_encryption, p.use_compression);
+                        cfg.insert(local_addr.clone(), enc);
+                        cfg.insert(p.name.clone(), enc);
+                    }
+                    let enc_label = if p.use_encryption { "encrypted" } else { "plain" };
+                    info!("UDP proxy '{}' ready, bridging to {} ({})", p.name, local_addr, enc_label);
+                }
+            }
+
             // Spawn initial pool work connections
             let auth_token = self.auth_cfg.token.clone();
             for i in 0..pool_count {
@@ -291,6 +331,8 @@ impl Service {
                     if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
                     yamux.clone(),
                     self.oidc_client.clone(),
+                    udp_sockets.clone(),
+                    udp_enc_cfg.clone(),
                 );
             }
 
@@ -318,87 +360,6 @@ impl Service {
                 });
             }
 
-            // Bind local UDP sockets for UDP proxies and spawn sender tasks
-            // (UDP traffic flows over the control connection, Go frp v0.69.1 compat)
-            let mut udp_sockets: HashMap<String, Arc<UdpSocket>> = HashMap::new();
-            // Per-proxy encryption config: keyed by local_addr and proxy name
-            let mut udp_enc_cfg: HashMap<String, (bool, bool)> = HashMap::new();
-            for p in &proxies {
-                if p.proxy_type == "udp" {
-                    let local_addr = format!("{}:{}", p.local_ip, p.local_port);
-                    let socket = match UdpSocket::bind("0.0.0.0:0").await {
-                        Ok(s) => Arc::new(s),
-                        Err(e) => {
-                            warn!("UDP proxy '{}': bind failed: {}", p.name, e);
-                            continue;
-                        }
-                    };
-                    // Connect to local UDP service for send/recv
-                    if let Err(e) = socket.connect(&local_addr).await {
-                        warn!("UDP proxy '{}': connect to local {} failed: {}", p.name, local_addr, e);
-                        continue;
-                    }
-                    // Map by local_str (matches UDPPacket.local_addr from server) and by name
-                    udp_sockets.insert(local_addr.clone(), socket.clone());
-                    udp_sockets.insert(p.name.clone(), socket.clone());
-                    // Store encryption config for both lookup keys
-                    let enc_cfg = (p.use_encryption, p.use_compression);
-                    udp_enc_cfg.insert(local_addr.clone(), enc_cfg);
-                    udp_enc_cfg.insert(p.name.clone(), enc_cfg);
-
-                    // Spawn task: read from local UDP → send UDPPacket to server
-                    let sock = socket;
-                    let w = writer.clone();
-                    let pn = p.name.clone();
-                    let la = local_addr.clone();
-                    let use_enc = p.use_encryption;
-                    let use_comp = p.use_compression;
-                    let enc_key = self.encryption_key;
-                    tokio::spawn(async move {
-                        let mut buf = vec![0u8; 65535];
-                        loop {
-                            match sock.recv_from(&mut buf).await {
-                                Ok((n, src)) => {
-                                    let mut payload = buf[..n].to_vec();
-                                    // Encrypt/compress on the client→server path
-                                    // (server decrypts before forwarding to remote)
-                                    if use_comp {
-                                        if let Ok(compressed) = encryption::compress(&payload) {
-                                            payload = compressed;
-                                        }
-                                    }
-                                    if use_enc {
-                                        if let Ok(encrypted) = encryption::encrypt(&payload, &enc_key) {
-                                            payload = encrypted;
-                                        }
-                                    }
-                                    let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
-                                        content: payload,
-                                        local_addr: msg::UdpAddr::from_string(&la),
-                                        remote_addr: Some(msg::UdpAddr {
-                                            ip: src.ip().to_string(),
-                                            port: src.port(),
-                                            zone: String::new(),
-                                        }),
-                                    });
-                                    let mut guard = w.lock().await;
-                                    if let Err(e) = write_msg_v1(&mut *guard, &pkt).await {
-                                        debug!("UDP '{}' send to server failed: {}", pn, e);
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    debug!("UDP '{}' recv from local failed: {}", pn, e);
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                    let enc_label = if use_enc { "encrypted" } else { "plain" };
-                    info!("UDP proxy '{}' bridging to {} ({})", p.name, local_addr, enc_label);
-                }
-            }
-
             // --- Message loop ---
             let mut ping_interval = interval(Duration::from_secs(30));
 
@@ -422,41 +383,12 @@ impl Service {
                                     if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
                                     yamux.clone(),
                                     self.oidc_client.clone(),
+                                    udp_sockets.clone(),
+                                    udp_enc_cfg.clone(),
                                 );
                             }
                             Ok(FrpMessage::Pong(_)) => {
                                 debug!("Pong received");
-                            }
-                            Ok(FrpMessage::UDPPacket(up)) => {
-                                // Forward to local UDP socket (Go frp v0.69.1 compat).
-                                // Use local_addr to find the matching proxy; fall back to first socket.
-                                let local_str = up.local_addr.as_ref().map(|a| a.to_string()).unwrap_or_default();
-                                let sock = udp_sockets.get(&local_str)
-                                    .or_else(|| udp_sockets.values().next())
-                                    .cloned();
-                                // Decrypt/decompress if the proxy requires it
-                                let content_len = up.content.len();
-                                let mut payload = up.content;
-                                if let Some(&(use_enc, use_comp)) = udp_enc_cfg.get(&local_str) {
-                                    if use_enc {
-                                        if let Ok(decrypted) = encryption::decrypt(&payload, &self.encryption_key) {
-                                            payload = decrypted;
-                                        }
-                                    }
-                                    if use_comp {
-                                        if let Ok(decompressed) = encryption::decompress(&payload) {
-                                            payload = decompressed;
-                                        }
-                                    }
-                                }
-                                if let Some(sock) = sock {
-                                    let content = payload;
-                                    tokio::spawn(async move {
-                                        let _ = sock.send(&content).await;
-                                    });
-                                } else {
-                                    warn!("No UDP socket for proxy, dropping {} bytes", content_len);
-                                }
                             }
                             Ok(FrpMessage::CloseProxy(cp)) => {
                                 info!("Server closed proxy: {}", cp.proxy_name);
@@ -641,12 +573,17 @@ fn spawn_work_conn(
     tls_ca_file: Option<String>,
     yamux: Option<std::sync::Arc<YamuxSession>>,
     oidc_client: Option<Arc<OidcClient>>,
+    udp_sockets: Arc<std::sync::Mutex<HashMap<String, Arc<UdpSocket>>>>,
+    udp_enc_cfg: Arc<std::sync::Mutex<HashMap<String, (bool, bool)>>>,
 ) {
     let server_addr = server_addr.to_string();
     let run_id = run_id.to_string();
     let protocol = protocol.clone();
     let proxy_info_map = proxy_info_map.clone();
     let tls_server_name = tls_server_name.clone();
+    // Clone for replenishment call (used after async block consumes originals)
+    let repl_udp_sockets = udp_sockets.clone();
+    let repl_udp_enc_cfg = udp_enc_cfg.clone();
 
     tokio::spawn(async move {
         let label = if pool_id >= 0 {
@@ -742,14 +679,130 @@ fn spawn_work_conn(
                     }
                 };
 
-                // Connect to local service
-                match proxy::connect_local(&info.local_addr).await {
-                    Ok(local) => {
-                        let enc = if info.use_encryption { Some(&enc_key) } else { None };
-                        proxy::bridge_streams(local, work, proxy_name, info.use_encryption, info.use_compression, enc, info.bandwidth_limit, &info.bandwidth_limit_mode).await;
-                    }
-                    Err(e) => {
-                        warn!("Work conn {}: failed to connect to local {}: {}", label, info.local_addr, e);
+                if info.proxy_type == "udp" {
+                    // UDP proxy: bridge work conn ↔ local UDP socket
+                    let sock = {
+                        let map = udp_sockets.lock().unwrap();
+                        map.get(proxy_name).cloned()
+                    };
+                    let sock = match sock {
+                        Some(s) => s,
+                        None => {
+                            warn!("Work conn {}: no UDP socket for proxy '{}'", label, proxy_name);
+                            return;
+                        }
+                    };
+                    let enc_cfg = {
+                        let cfg = udp_enc_cfg.lock().unwrap();
+                        cfg.get(proxy_name).copied().unwrap_or((false, false))
+                    };
+                    let (use_enc, use_comp) = enc_cfg;
+
+                    info!("Work conn {} bridging UDP for '{}' (enc={}, comp={})",
+                        label, proxy_name, use_enc, use_comp);
+
+                    let (mut w_r, mut w_w) = work.into_split();
+
+                    // Shared last_remote_addr: the server tells us the remote user's address
+                    // in each UDPPacket. We must echo it back so the server can route
+                    // the response to the correct remote user (not the local echo service).
+                    let last_remote: Arc<std::sync::Mutex<Option<msg::UdpAddr>>> =
+                        Arc::new(std::sync::Mutex::new(None));
+
+                    // Reader: work conn → local UDP socket
+                    // Decrypt/decompress before forwarding to local service
+                    let sock_r = sock.clone();
+                    let pn_r = proxy_name.clone();
+                    let enc_key_r = enc_key;
+                    let last_remote_r = last_remote.clone();
+                    tokio::spawn(async move {
+                        debug!("UDP reader '{}' started", pn_r);
+                        loop {
+                            match read_msg_v1(&mut w_r).await {
+                                Ok(FrpMessage::UDPPacket(up)) => {
+                                    // Save the original remote address for the response
+                                    if let Some(ref ra) = up.remote_addr {
+                                        *last_remote_r.lock().unwrap() = Some(ra.clone());
+                                    }
+                                    let n = up.content.len();
+                                    let mut payload = up.content;
+                                    if use_enc {
+                                        if let Ok(d) = encryption::decrypt(&payload, &enc_key_r) {
+                                            payload = d;
+                                        }
+                                    }
+                                    if use_comp {
+                                        if let Ok(d) = encryption::decompress(&payload) {
+                                            payload = d;
+                                        }
+                                    }
+                                    debug!("UDP reader '{}': forwarding {} bytes to local", pn_r, n);
+                                    if let Err(e) = sock_r.send(&payload).await {
+                                        debug!("UDP '{}' send to local failed: {}", pn_r, e);
+                                        break;
+                                    }
+                                }
+                                Ok(FrpMessage::Ping(_)) | Ok(FrpMessage::Pong(_)) => continue,
+                                Ok(other) => {
+                                    debug!("UDP work conn '{}': unexpected msg 0x{:02x}", pn_r, other.v1_type_byte());
+                                }
+                                Err(e) => {
+                                    debug!("UDP work conn '{}' read closed: {}", pn_r, e);
+                                    break;
+                                }
+                            }
+                        }
+                    });
+
+                    // Writer: local UDP socket → work conn
+                    // Encrypt/compress before sending to server
+                    let pn_w = proxy_name.clone();
+                    let local_addr_str = info.local_addr.clone();
+                    let last_remote_w = last_remote.clone();
+                    tokio::spawn(async move {
+                        debug!("UDP writer '{}' started", pn_w);
+                        let mut buf = vec![0u8; 65535];
+                        loop {
+                            match sock.recv_from(&mut buf).await {
+                                Ok((n, src)) => {
+                                    debug!("UDP writer '{}': recv'd {} bytes from local {}", pn_w, n, src);
+                                    let mut payload = buf[..n].to_vec();
+                                    if use_comp {
+                                        if let Ok(c) = encryption::compress(&payload) { payload = c; }
+                                    }
+                                    if use_enc {
+                                        if let Ok(e) = encryption::encrypt(&payload, &enc_key) { payload = e; }
+                                    }
+                                    // Use saved remote_addr from server (the true remote user)
+                                    let remote = last_remote_w.lock().unwrap().clone();
+                                    let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
+                                        content: payload,
+                                        local_addr: msg::UdpAddr::from_string(&local_addr_str),
+                                        remote_addr: remote,
+                                    });
+                                    if let Err(e) = write_msg_v1(&mut w_w, &pkt).await {
+                                        debug!("UDP '{}' send to work conn failed: {}", pn_w, e);
+                                        break;
+                                    }
+                                    debug!("UDP writer '{}': sent {} bytes to work conn", pn_w, n);
+                                }
+                                Err(e) => {
+                                    debug!("UDP '{}' recv from local failed: {}", pn_w, e);
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    // TCP/HTTP/STCP: connect to local TCP service and bridge
+                    match proxy::connect_local(&info.local_addr).await {
+                        Ok(local) => {
+                            let enc = if info.use_encryption { Some(&enc_key) } else { None };
+                            proxy::bridge_streams(local, work, proxy_name, info.use_encryption, info.use_compression, enc, info.bandwidth_limit, &info.bandwidth_limit_mode).await;
+                        }
+                        Err(e) => {
+                            warn!("Work conn {}: failed to connect to local {}: {}", label, info.local_addr, e);
+                        }
                     }
                 }
             }
@@ -780,6 +833,8 @@ fn spawn_work_conn(
                 tls_ca_file,
                 yamux,
                 oidc_client,
+                repl_udp_sockets,
+                repl_udp_enc_cfg,
             );
         }
     });
