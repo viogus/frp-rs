@@ -73,14 +73,11 @@ impl ControlConnection {
     /// Connect to the server and login.
     /// Returns the control stream, run_id, and optional yamux session.
     pub async fn login(&mut self) -> Result<(IoStream, String, Option<YamuxSession>), frp_core::Error> {
-        // Yamux only applies when transport is plain TCP and TLS is off.
-        // With TLS/WS/KCP/QUIC, yamux multiplexing is not used —
-        // those protocols have their own layering.
         // Go frp servers with tcpMux=true wrap every incoming TCP connection
         // in yamux immediately, so the client MUST wrap BEFORE sending Login.
+        // Works over both plain TCP and TLS (yamux sits on top of TLS).
         let propose_mux = self.tcp_mux
-            && matches!(self.transport_protocol, TransportProtocol::Tcp)
-            && !self.tls_enable;
+            && matches!(self.transport_protocol, TransportProtocol::Tcp);
 
         let opts = DialOptions {
             server_addr: self.server_addr.clone(),
@@ -101,15 +98,23 @@ impl ControlConnection {
         // The Go frp server wraps its side on accept, so the client must
         // wrap before sending its first frame.
         let (mut io_stream, yamux_session) = if propose_mux {
+            let mux_cfg = mux::TcpMuxConfig::default();
             match raw_stream {
                 IoStream::Tcp(tcp_stream) => {
-                    let mux_cfg = mux::TcpMuxConfig::default();
                     let (control_stream, session) = mux::client_mux(tcp_stream, &mux_cfg).await?;
                     info!("Yamux session established");
                     (IoStream::Yamux(control_stream), Some(session))
                 }
+                IoStream::Tls(tls_stream) => {
+                    let (control_stream, session) = mux::client_mux(tls_stream, &mux_cfg).await?;
+                    info!("Yamux session established over TLS");
+                    (IoStream::Yamux(control_stream), Some(session))
+                }
                 other => {
-                    warn!("Unexpected transport for mux proposal: {:?}", other);
+                    warn!(
+                        "Unexpected transport {:?} for mux proposal — yamux not applied",
+                        std::mem::discriminant(&other)
+                    );
                     (other, None)
                 }
             }
