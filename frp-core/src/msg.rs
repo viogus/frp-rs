@@ -784,4 +784,79 @@ mod tests {
         assert!(FrpMessage::from_v1_type_byte(0x00).is_none());
         assert!(FrpMessage::from_v1_type_byte(0xFF).is_none());
     }
+
+    // ---------------------------------------------------------------
+    // UdpAddr tests — serde JSON format matching Go frp v0.69.1
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_udp_addr_serialize_matches_go_format() {
+        let addr = UdpAddr {
+            ip: "127.0.0.1".into(),
+            port: 8080,
+            zone: String::new(),
+        };
+        let json = serde_json::to_string(&addr).expect("serialize");
+        // Zone is omitted when empty due to skip_serializing_if
+        // Go frp v0.69.1 includes "Zone":"" but both forms are
+        // semantically equivalent (empty zone = absent zone).
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["IP"].as_str(), Some("127.0.0.1"));
+        assert_eq!(v["Port"].as_u64(), Some(8080));
+
+        // Round-trip through deserialization verifies the wire format
+        // is compatible: both with and without Zone key.
+        let back: UdpAddr = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.ip, "127.0.0.1");
+        assert_eq!(back.port, 8080);
+        assert_eq!(back.zone, "");
+
+        // Also verify deserialization from Go-form JSON that includes Zone
+        let go_json = r#"{"IP":"127.0.0.1","Port":8080,"Zone":""}"#;
+        let from_go: UdpAddr = serde_json::from_str(go_json).expect("deserialize Go format");
+        assert_eq!(from_go.ip, "127.0.0.1");
+        assert_eq!(from_go.port, 8080);
+        assert_eq!(from_go.zone, "");
+    }
+
+    #[test]
+    fn test_udp_addr_deserialize_from_go_format() {
+        let json = r#"{"IP":"10.0.0.1","Port":53,"Zone":""}"#;
+        let addr: UdpAddr = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(addr.ip, "10.0.0.1");
+        assert_eq!(addr.port, 53);
+        assert_eq!(addr.zone, "");
+    }
+
+    #[test]
+    fn test_udp_addr_from_string_ipv4() {
+        let addr = UdpAddr::from_string("1.2.3.4:5678").expect("should parse IPv4:port");
+        assert_eq!(addr.ip, "1.2.3.4");
+        assert_eq!(addr.port, 5678);
+        assert_eq!(addr.zone, "");
+    }
+
+    #[test]
+    fn test_udp_addr_from_string_ipv6() {
+        let addr = UdpAddr::from_string("[::1]:9090").expect("should parse IPv6:port");
+        assert_eq!(addr.ip, "::1");
+        assert_eq!(addr.port, 9090);
+        assert_eq!(addr.zone, "");
+    }
+
+    #[test]
+    fn test_udp_addr_from_string_invalid() {
+        assert!(UdpAddr::from_string("not-an-address").is_none());
+        assert!(UdpAddr::from_string("").is_none());
+    }
+
+    #[test]
+    fn test_udp_addr_to_string() {
+        let addr = UdpAddr {
+            ip: "192.168.1.1".into(),
+            port: 3000,
+            zone: String::new(),
+        };
+        assert_eq!(addr.to_string(), "192.168.1.1:3000");
+    }
 }

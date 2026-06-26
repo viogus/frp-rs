@@ -6,6 +6,7 @@ edition = "2021"
 [dev-dependencies]
 frp-server = { path = "../frp-server" }
 tracing-subscriber.workspace = true
+md-5.workspace = true
 
 [dependencies]
 frp-core = { path = "../frp-core" }

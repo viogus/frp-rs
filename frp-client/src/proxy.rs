@@ -166,3 +166,63 @@ pub async fn bridge_streams(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use md5::Digest;
+
+    /// Compute the expected MD5 sign_key the same way `create_visitor_conn_msg`
+    /// does internally via `frp_core::auth::generate_token(sk, timestamp)`.
+    fn expected_sign_key(sk: &str, ts: i64) -> String {
+        let mut hasher = md5::Md5::new();
+        hasher.update(sk.as_bytes());
+        hasher.update(ts.to_string().as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    #[test]
+    fn test_create_visitor_conn_sign_key_with_sk() {
+        let sk = "test_secret";
+        let msg = create_visitor_conn_msg("stcp-proxy", sk, false, false);
+
+        match msg {
+            FrpMessage::NewVisitorConn(ref nvc) => {
+                let ts = nvc.timestamp.expect("timestamp should be set");
+                let got = nvc.sign_key.as_ref().expect("sign_key should be Some");
+                let expected = expected_sign_key(sk, ts);
+                assert_eq!(*got, expected, "sign_key mismatch");
+                // MD5 hex digest is always 32 characters
+                assert_eq!(got.len(), 32, "sign_key should be 32-char hex string");
+            }
+            _ => panic!("expected NewVisitorConn variant"),
+        }
+    }
+
+    #[test]
+    fn test_create_visitor_conn_sign_key_empty_sk() {
+        let msg = create_visitor_conn_msg("stcp-proxy", "", false, false);
+
+        match msg {
+            FrpMessage::NewVisitorConn(ref nvc) => {
+                assert!(nvc.sign_key.is_none(), "sign_key should be None for empty sk");
+            }
+            _ => panic!("expected NewVisitorConn variant"),
+        }
+    }
+
+    #[test]
+    fn test_create_visitor_conn_sign_key_format() {
+        // sign_key should be a 32-char hex string (MD5 digest)
+        let msg = create_visitor_conn_msg("stcp-proxy", "another_key", true, true);
+
+        match msg {
+            FrpMessage::NewVisitorConn(ref nvc) => {
+                let sig = nvc.sign_key.as_ref().expect("sign_key should be Some");
+                assert_eq!(sig.len(), 32, "sign_key length should be 32");
+                assert!(sig.chars().all(|c| c.is_ascii_hexdigit()), "all chars must be hex digits");
+            }
+            _ => panic!("expected NewVisitorConn variant"),
+        }
+    }
+}
