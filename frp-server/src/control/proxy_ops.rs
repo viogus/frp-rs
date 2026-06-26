@@ -241,7 +241,7 @@ pub(crate) async fn handle_new_proxy(
                 }
                 // For SUDP sharing existing socket, don't spawn duplicate listener
                 let should_spawn = !is_sudp || !udp_sockets.iter().any(|(n, _)| n != &np.proxy_name && {
-                    udp_sockets.get(n).and_then(|s| s.local_addr().ok()).map_or(false, |a| a.port() == port)
+                    udp_sockets.get(n).and_then(|s| s.local_addr().ok()).is_some_and(|a| a.port() == port)
                 });
                 if should_spawn {
                     // Go frp v0.69.1 compat: UDP data flows over work connections,

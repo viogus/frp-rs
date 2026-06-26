@@ -88,8 +88,8 @@ impl HttpProxyAuth {
         if let Some(credentials) = header.strip_prefix("Basic ") {
             if let Ok(decoded) = base64_decode(credentials) {
                 if let Some((user, pass)) = decoded.split_once(':') {
-                    let user_ok = self.user.as_deref().map_or(true, |u| u == user);
-                    let pass_ok = self.password.as_deref().map_or(true, |p| p == pass);
+                    let user_ok = self.user.as_deref().is_none_or(|u| u == user);
+                    let pass_ok = self.password.as_deref().is_none_or(|p| p == pass);
                     return user_ok && pass_ok;
                 }
             }

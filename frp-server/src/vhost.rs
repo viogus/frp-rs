@@ -33,6 +33,12 @@ pub struct VhostManager {
     by_proxy_locations: RwLock<HashMap<String, Vec<String>>>,
 }
 
+impl Default for VhostManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VhostManager {
     pub fn new() -> Self {
         Self {
@@ -351,15 +357,14 @@ fn rewrite_host_header(data: &[u8], new_host: &str) -> Vec<u8> {
     }
 
     // Preserve trailing double-CRLF (end of headers) that lines() strips
-    if text.ends_with("\r\n\r\n") {
-        if !result.ends_with("\r\n\r\n") {
+    if text.ends_with("\r\n\r\n")
+        && !result.ends_with("\r\n\r\n") {
             if result.ends_with("\r\n") {
                 result.push_str("\r\n");
             } else {
                 result.push_str("\r\n\r\n");
             }
         }
-    }
 
     result.into_bytes()
 }
@@ -388,7 +393,7 @@ fn extract_host_header(request: &str) -> Option<&str> {
         if value.starts_with('[') {
             return value.find(']').map(|end| &value[1..end]);
         }
-        return Some(value.rsplitn(2, ':').next().unwrap_or(value));
+        return Some(value.rsplit(':').next().unwrap_or(value));
     }
     None
 }

@@ -254,7 +254,7 @@ impl Service {
                     continue;
                 }
             };
-            let yamux = yamux_session.map(|s| std::sync::Arc::new(s));
+            let yamux = yamux_session.map(std::sync::Arc::new);
             info!("Logged in. run_id: {}", run_id);
 
             // Register proxies using IoStream directly (supports TCP and TLS)

@@ -500,7 +500,7 @@ pub async fn handle_control<S>(
                         // AuthScopeHeartBeats is in additionalAuthScopes
                         // (default: empty). Skip validation otherwise.
                         let has_ping_auth = ping_msg.privilege_key.as_deref()
-                            .map_or(false, |k| !k.is_empty())
+                            .is_some_and(|k| !k.is_empty())
                             || ping_msg.timestamp.unwrap_or(0) != 0;
                         let ping_auth_result = if !has_ping_auth {
                             Ok(())

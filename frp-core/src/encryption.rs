@@ -64,6 +64,98 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(result)
 }
 
+/// Streaming Snappy decompressor for use in bridges.
+///
+/// Unlike [`decompress`], this handles data arriving in arbitrary TCP chunks:
+/// partial snappy frames are buffered internally until a complete frame is
+/// available, then decompressed.  This avoids "unexpected EOF" errors when a
+/// `read()` boundary does not align with a snappy frame boundary.
+pub struct SnappyDecompressor {
+    buf: Vec<u8>,
+}
+
+impl Default for SnappyDecompressor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SnappyDecompressor {
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// Feed compressed bytes into the decompressor.
+    ///
+    /// Returns all decompressed plaintext that can be produced from complete
+    /// frames currently in the buffer.  Bytes that belong to an incomplete
+    /// frame are retained and will be processed on the next `feed()` call.
+    ///
+    /// Returns an error only for truly corrupt input (bad magic, bad CRC);
+    /// partial frames are silently buffered, not treated as errors.
+    pub fn feed(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        use snap::read::FrameDecoder;
+        use std::io::Read;
+
+        self.buf.extend_from_slice(data);
+
+        let mut output = Vec::new();
+        let mut tmp = [0u8; 8192];
+
+        loop {
+            let mut cursor = std::io::Cursor::new(&self.buf[..]);
+            let mut decoder = FrameDecoder::new(&mut cursor);
+            let mut decoded_any = false;
+
+            loop {
+                match decoder.read(&mut tmp) {
+                    Ok(0) => {
+                        // All complete frames consumed.
+                        decoded_any = true;
+                        break;
+                    }
+                    Ok(n) => {
+                        decoded_any = true;
+                        output.extend_from_slice(&tmp[..n]);
+                    }
+                    Err(_) => {
+                        // Partial frame or corrupt data — stop.
+                        break;
+                    }
+                }
+            }
+
+            let consumed = cursor.position() as usize;
+            if consumed == 0 {
+                // Nothing consumed — incomplete header or frame; wait for more data.
+                break;
+            }
+            self.buf.drain(..consumed);
+            if !decoded_any {
+                // Consumed bytes but no output (e.g. skipped a stream-identifier
+                // chunk mid-stream).  Loop again to try the next frame.
+                continue;
+            }
+            // We got output.  Don't loop — return what we have so the caller
+            // can send it to the user immediately.  Remaining frames will be
+            // processed on the next `feed()`.
+            break;
+        }
+
+        Ok(output)
+    }
+
+    /// Flush any remaining buffered data, returning decompressed output.
+    /// Call this when the compressed stream has ended (work_r EOF).
+    pub fn flush(&mut self) -> Result<Vec<u8>, String> {
+        if self.buf.is_empty() {
+            return Ok(Vec::new());
+        }
+        let remaining = std::mem::take(&mut self.buf);
+        decompress(&remaining)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

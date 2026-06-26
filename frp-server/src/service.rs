@@ -965,7 +965,7 @@ async fn handle_work_conn_inner(
     // AuthScopeNewWorkConns is in additionalAuthScopes
     // (default: empty). Skip validation otherwise.
     let has_nwc_auth = msg.privilege_key.as_deref()
-        .map_or(false, |k| !k.is_empty())
+        .is_some_and(|k| !k.is_empty())
         || msg.timestamp.unwrap_or(0) != 0;
     let nwc_auth_result = if !has_nwc_auth {
         Ok(())
