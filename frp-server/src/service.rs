@@ -101,6 +101,9 @@ pub struct AppState {
     /// Shared UDP port for SUDP proxies. When > 0, all SUDP proxies
     /// use this port instead of their individual remote_port.
     pub sudp_port: u16,
+    pub vhost_http_timeout: u64,
+    pub user_conn_timeout: u64,
+    pub tcp_mux_passthrough: bool,
     /// TCPMux HTTP CONNECT route table (domain → proxy mapping).
     pub tcpmux_manager: Arc<TcpMuxManager>,
     /// Per-proxy traffic metrics for dashboard API.
@@ -108,7 +111,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16) -> Self {
+    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16, vhost_http_timeout: u64, user_conn_timeout: u64, tcp_mux_passthrough: bool) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             reloadable: Arc::new(std::sync::RwLock::new(ReloadableState {
@@ -133,6 +136,9 @@ impl AppState {
             tcpmux_manager: Arc::new(TcpMuxManager::new()),
             proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
             sudp_port,
+            vhost_http_timeout,
+            user_conn_timeout,
+            tcp_mux_passthrough,
         }
     }
 }
@@ -208,6 +214,9 @@ impl Service {
             cfg.tls_only,
             oidc_verifier,
             cfg.sudp_port,
+            cfg.vhost_http_timeout,
+            cfg.user_conn_timeout,
+            cfg.tcp_mux_passthrough,
         );
 
         // Initialize prometheus registry when enabled
