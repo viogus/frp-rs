@@ -209,7 +209,6 @@ bind_port = $port
 tls_enable = true
 tls_cert_file = "$CERT_DIR/server.crt"
 tls_key_file = "$CERT_DIR/server.key"
-tls_ca_file = "$CERT_DIR/ca.crt"
 
 [auth]
 method = "token"
@@ -345,7 +344,7 @@ tcp_mux = false
 login_fail_exit = true
 pool_count = 1
 tls_enable = true
-tls_cert_file = "$CERT_DIR/ca.crt"
+tls_ca_file = "$CERT_DIR/ca.crt"
 tls_server_name = "localhost"
 
 [[proxies]]
