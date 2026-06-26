@@ -1,27 +1,20 @@
 mod bridge;
 mod proxy_ops;
 
-pub(crate) use proxy_ops::{handle_new_proxy, listen_and_proxy, unregister_control};
-pub(crate) use bridge::{assign_work_to_proxy, assign_udp_work_conn};
-
 use std::sync::Arc;
 use std::net::SocketAddr;
 use std::collections::VecDeque;
-use tokio::sync::{mpsc, oneshot};
-use tokio::net::TcpListener;
-use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 use tracing::{info, warn, debug};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::IncomingStreams;
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
-use frp_core::format_socket_addr;
 
-use crate::proxy::{ProxyInfo, allocate_port_multi};
 use crate::service::{AppState, InternalMsg, ControlTx};
 
 /// Max age of a pending request before it is dropped (Go frp: 10s default).

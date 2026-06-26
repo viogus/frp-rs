@@ -1,16 +1,12 @@
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
 
-use crate::service::{AppState, InternalMsg};
-
-use super::{PENDING_REQUEST_TIMEOUT, PendingRequest};
+use super::PendingRequest;
 
 /// Assign a work connection to a pending proxy request.
 /// Assign a work connection to a UDP proxy for bidirectional data forwarding.

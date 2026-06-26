@@ -1,9 +1,8 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::write_msg_v1;
@@ -11,9 +10,7 @@ use frp_core::transport::IoStream;
 use frp_core::format_socket_addr;
 
 use crate::proxy::{ProxyInfo, allocate_port_multi};
-use crate::service::{AppState, ControlTx, InternalMsg};
-
-use super::PENDING_REQUEST_TIMEOUT;
+use crate::service::{AppState, InternalMsg};
 
 /// Register a new proxy and start listening on its assigned port.
 pub(crate) async fn handle_new_proxy(
