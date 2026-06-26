@@ -131,6 +131,18 @@ impl Service {
                             warn!("Failed to start unix_domain_socket plugin for '{}': {}", p.name, e);
                         }
                     }
+                } else if plugin_cfg.plugin_type == "tls2raw" {
+                    match plugin::start_tls2raw_plugin(plugin_cfg).await {
+                        Ok(handle) => {
+                            let addr = handle.local_addr.to_string();
+                            info!("tls2raw plugin for '{}' started on {}", p.name, addr);
+                            plugin_addrs.insert(p.name.clone(), addr);
+                            plugin_handles.push(handle);
+                        }
+                        Err(e) => {
+                            warn!("Failed to start tls2raw plugin for '{}': {}", p.name, e);
+                        }
+                    }
                 } else {
                     warn!("Unknown plugin type '{}' for proxy '{}'", plugin_cfg.plugin_type, p.name);
                 }
