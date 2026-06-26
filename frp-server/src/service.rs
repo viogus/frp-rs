@@ -476,8 +476,21 @@ impl Service {
             let dash_state = self.state.clone();
             let dash_user = self.cfg.web_server.user.clone();
             let dash_pwd = self.cfg.web_server.password.clone();
+            let dash_tls_cert = if self.cfg.web_server.tls_cert_file.is_empty() {
+                None
+            } else {
+                Some(self.cfg.web_server.tls_cert_file.clone())
+            };
+            let dash_tls_key = if self.cfg.web_server.tls_key_file.is_empty() {
+                None
+            } else {
+                Some(self.cfg.web_server.tls_key_file.clone())
+            };
             tokio::spawn(async move {
-                if let Err(e) = crate::dashboard::run_dashboard(dash_addr, dash_state, dash_user, dash_pwd).await {
+                if let Err(e) = crate::dashboard::run_dashboard(
+                    dash_addr, dash_state, dash_user, dash_pwd,
+                    dash_tls_cert, dash_tls_key,
+                ).await {
                     tracing::error!("Dashboard server failed: {}", e);
                 }
             });

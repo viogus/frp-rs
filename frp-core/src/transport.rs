@@ -5,7 +5,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::stream::Stream;
 use futures_util::sink::Sink;
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use crate::kcp::KcpStream;
 use crate::quic::QuicStream;
@@ -1097,6 +1097,47 @@ pub fn build_tls_connector(
     };
 
     Ok(TlsConnector::from(Arc::new(config)))
+}
+
+/// TLS listener wrapper implementing axum's Listener trait.
+/// Used by dashboard and admin API servers to accept TLS connections.
+pub struct TlsListener {
+    inner: TcpListener,
+    acceptor: TlsAcceptor,
+}
+
+impl TlsListener {
+    pub fn new(inner: TcpListener, acceptor: TlsAcceptor) -> Self {
+        Self { inner, acceptor }
+    }
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, addr) = match self.inner.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::warn!("TLS listener accept error: {}", e);
+                    continue;
+                }
+            };
+            match self.acceptor.accept(stream).await {
+                Ok(tls_stream) => return (tls_stream, addr),
+                Err(e) => {
+                    tracing::warn!("TLS handshake error from {}: {}", addr, e);
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
 }
 
 #[cfg(test)]

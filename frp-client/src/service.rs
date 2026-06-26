@@ -256,9 +256,20 @@ impl Service {
             };
             let admin_auth_user = self.cfg.web_server.user.clone();
             let admin_auth_pwd = self.cfg.web_server.password.clone();
+            let admin_tls_cert = if self.cfg.web_server.tls_cert_file.is_empty() {
+                None
+            } else {
+                Some(self.cfg.web_server.tls_cert_file.clone())
+            };
+            let admin_tls_key = if self.cfg.web_server.tls_key_file.is_empty() {
+                None
+            } else {
+                Some(self.cfg.web_server.tls_key_file.clone())
+            };
             tokio::spawn(async move {
                 if let Err(e) = crate::admin::run_admin_server(
                     admin_addr, admin_state, admin_auth_user, admin_auth_pwd,
+                    admin_tls_cert, admin_tls_key,
                 ).await {
                     tracing::error!("frpc admin server failed: {}", e);
                 }

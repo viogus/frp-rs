@@ -255,6 +255,13 @@ pub struct WebServerConfig {
     pub password: String,
     #[serde(default)]
     pub enable_prometheus: bool,
+    /// TLS certificate file path. When both tls_cert_file and tls_key_file
+    /// are non-empty, dashboard/admin server starts with TLS.
+    #[serde(default)]
+    pub tls_cert_file: String,
+    /// TLS private key file path.
+    #[serde(default)]
+    pub tls_key_file: String,
 }
 
 
