@@ -151,13 +151,14 @@ pub(crate) async fn assign_work_to_proxy(
 
     let proxy_name = req.proxy_name.clone();
     let metrics = state.proxy_metrics.get_or_create(&proxy_name).await;
-    let _guard = ConnGuard::new(metrics.clone());
+    let guard = ConnGuard::new(metrics.clone());
 
     let pre_read = req.pre_read;
     let enc_key = req.use_encryption;
     let comp_key = req.use_compression;
 
     tokio::spawn(async move {
+        let _guard = guard;
         // For encrypted bridges, pre_read bytes are passed into bridge_encrypted
         // which writes them through the CipherWriter (matching Go frp streaming CFB).
         if enc_key {
