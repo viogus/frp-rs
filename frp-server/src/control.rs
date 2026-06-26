@@ -138,6 +138,8 @@ pub async fn handle_control<S>(
     let mut work_pool: VecDeque<IoStream> = VecDeque::new();
     let mut pending_requests: VecDeque<PendingRequest> = VecDeque::new();
     let mut pending_udp: VecDeque<(String, Instant)> = VecDeque::new();
+    // TCP/HTTP/STCP listener handles. UDP listeners are managed via the work-connection
+    // mechanism (UdpNeedsWorkConn → ReqWorkConn → assign_udp_work_conn).
     let mut listener_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> = std::collections::HashMap::new();
     let mut udp_sockets: std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>> = std::collections::HashMap::new();
     // Reverse mapping: local_addr → proxy_name for routing UDPPacket responses
@@ -571,7 +573,6 @@ async fn assign_udp_work_conn(
     tokio::spawn(async move {
         debug!("UDP work conn reader task started for '{}'", pn_w);
         loop {
-            debug!("UDP reader '{}' waiting for read_msg_v1...", pn_w);
             match read_msg_v1(&mut w_r).await {
                 Ok(FrpMessage::UDPPacket(up)) => {
                     if let Some(ref remote) = up.remote_addr {
@@ -602,7 +603,6 @@ async fn assign_udp_work_conn(
         debug!("UDP work conn writer task started for '{}'", pn_w2);
         let mut buf = vec![0u8; 65535];
         loop {
-            debug!("UDP writer '{}' waiting for recv_from...", pn_w2);
             match sock.recv_from(&mut buf).await {
                 Ok((n, src)) => {
                     debug!("UDP writer '{}' recv'd {} bytes from {}", pn_w2, n, src);
@@ -622,7 +622,6 @@ async fn assign_udp_work_conn(
                         break;
                     }
                     debug!("UDP work conn wrote {} bytes for '{}'", n, pn_w2);
-                    debug!("UDP writer '{}' looping back to recv_from...", pn_w2);
                 }
                 Err(e) => {
                     debug!("UDP recv_from error for '{}': {}", pn_w2, e);
