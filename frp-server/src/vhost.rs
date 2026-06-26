@@ -315,7 +315,7 @@ pub async fn run_vhost_https_listener(
                     let _ = ctl_tx.tx.send(crate::service::InternalMsg::ProxyUserConn {
                         proxy_name: route.proxy_name.clone(),
                         user_conn: frp_core::transport::IoStream::Tls(
-                            tokio_rustls::TlsStream::Server(tls_stream)
+                            Box::new(tokio_rustls::TlsStream::Server(tls_stream))
                         ),
                         pre_read,
                     }).ok();
@@ -396,4 +396,206 @@ fn extract_host_header(request: &str) -> Option<&str> {
         return Some(value.rsplit(':').next().unwrap_or(value));
     }
     None
+}
+
+/// Extract the SNI hostname from a TLS ClientHello message (RFC 6066 §3).
+///
+/// `data` must start with the TLS record header (content_type = 0x16).
+/// Returns the SNI hostname if found, or None.
+pub fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
+    // Minimum: TLS record header (5) + handshake header (4) + client version (2)
+    // + random (32) + session_id_len (1) = 44 bytes before any variable fields
+    if data.len() < 44 {
+        return None;
+    }
+
+    // TLS record: content_type (1) + version (2) + length (2)
+    if data[0] != 0x16 {
+        return None;
+    }
+    let record_len = u16::from_be_bytes([data[3], data[4]]) as usize;
+    if data.len() < 5 + record_len {
+        return None;
+    }
+
+    let handshake = &data[5..];
+    // Handshake: type (1) + length (3)
+    if handshake.is_empty() || handshake[0] != 0x01 {
+        return None;
+    }
+    if handshake.len() < 4 {
+        return None;
+    }
+    let hs_len = ((handshake[1] as usize) << 16)
+        | ((handshake[2] as usize) << 8)
+        | (handshake[3] as usize);
+    if handshake.len() < 4 + hs_len {
+        return None;
+    }
+
+    let ch = &handshake[4..4 + hs_len];
+    if ch.len() < 38 {
+        return None;
+    }
+
+    // Skip: version (2) + random (32) = 34 bytes to reach session_id_len
+    let mut pos = 34;
+    if pos >= ch.len() {
+        return None;
+    }
+    let sid_len = ch[pos] as usize;
+    pos += 1 + sid_len;
+    if pos + 2 > ch.len() {
+        return None;
+    }
+
+    // Cipher suites
+    let cs_len = u16::from_be_bytes([ch[pos], ch[pos + 1]]) as usize;
+    pos += 2 + cs_len;
+    if pos + 1 > ch.len() {
+        return None;
+    }
+
+    // Compression methods
+    let cm_len = ch[pos] as usize;
+    pos += 1 + cm_len;
+    if pos + 2 > ch.len() {
+        return None;
+    }
+
+    // Extensions
+    let ext_len = u16::from_be_bytes([ch[pos], ch[pos + 1]]) as usize;
+    pos += 2;
+    let ext_end = pos + ext_len;
+    if ext_end > ch.len() {
+        return None;
+    }
+
+    // Search extensions for SNI (type 0x0000)
+    while pos + 4 <= ext_end {
+        let ext_type = u16::from_be_bytes([ch[pos], ch[pos + 1]]);
+        let ext_data_len = u16::from_be_bytes([ch[pos + 2], ch[pos + 3]]) as usize;
+        pos += 4;
+
+        if ext_type == 0x0000 {
+            // SNI extension: ServerNameList
+            if pos + 2 > ch.len() {
+                return None;
+            }
+            let list_len = u16::from_be_bytes([ch[pos], ch[pos + 1]]) as usize;
+            pos += 2;
+            let list_end = pos + list_len;
+            if list_end > ch.len() {
+                return None;
+            }
+
+            while pos + 3 <= list_end {
+                let name_type = ch[pos];
+                let name_len = u16::from_be_bytes([ch[pos + 1], ch[pos + 2]]) as usize;
+                pos += 3;
+
+                if name_type == 0x00 && pos + name_len <= ch.len() {
+                    return String::from_utf8(ch[pos..pos + name_len].to_vec()).ok();
+                }
+                pos += name_len;
+            }
+            break;
+        }
+        pos += ext_data_len;
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_sni_real_client_hello() {
+        // Realistic TLS 1.2 ClientHello with SNI "example.com"
+        let name = b"example.com";
+        let name_bytes_len = name.len();
+
+        // Compute lengths
+        let sni_ext_data_len: u16 = 1 + 2 + name_bytes_len as u16; // name_type + name_len + name
+        let sni_ext_list_len: u16 = sni_ext_data_len; // just one ServerName
+        let sni_ext_len: u16 = 2 + sni_ext_list_len; // list_len + list
+        let extensions_len: u16 = 4 + sni_ext_len; // ext_type + ext_len + ext_data
+        // ClientHello body: version(2) + random(32) + sid_len(1) + sid(0)
+        //   + cs_len(2) + cs_data(2) + cm_len(1) + cm_data(1) + ext_len(2) + ext_data
+        let ch_body_len: u16 = 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + extensions_len;
+        let hs_len: u32 = ch_body_len as u32;
+        // record = hs_type(1) + hs_len(3) + ch_body
+        let record_len: u16 = 4 + ch_body_len;
+
+        let mut bytes = Vec::new();
+        // TLS record header
+        bytes.extend_from_slice(&[0x16, 0x03, 0x01]); // content_type + version
+        bytes.extend_from_slice(&record_len.to_be_bytes());
+
+        // Handshake header: type(1) + length(3 bytes, uint24)
+        bytes.push(0x01); // ClientHello
+        bytes.push((hs_len >> 16) as u8);
+        bytes.push((hs_len >> 8) as u8);
+        bytes.push(hs_len as u8);
+
+        // ClientHello body
+        bytes.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
+        // Random (32 bytes)
+        bytes.extend_from_slice(&[0x00u8; 32]);
+        // Session ID: empty
+        bytes.push(0x00);
+        // Cipher suites: 1 suite (TLS_AES_128_GCM_SHA256 = 0x1301)
+        bytes.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+        // Compression: null
+        bytes.extend_from_slice(&[0x01, 0x00]);
+        // Extensions
+        bytes.extend_from_slice(&extensions_len.to_be_bytes());
+
+        // SNI extension
+        bytes.extend_from_slice(&[0x00, 0x00]); // type = server_name
+        bytes.extend_from_slice(&sni_ext_len.to_be_bytes());
+        // ServerNameList
+        bytes.extend_from_slice(&sni_ext_list_len.to_be_bytes());
+        // ServerName: host_name
+        bytes.push(0x00); // name_type = host_name
+        bytes.extend_from_slice(&(name_bytes_len as u16).to_be_bytes());
+        bytes.extend_from_slice(name);
+
+        assert_eq!(
+            bytes.len(),
+            5 + 4 + ch_body_len as usize,
+            "record_len={} ch_body_len={} hs_len={}",
+            record_len, ch_body_len, hs_len
+        );
+
+        let result = extract_sni_from_client_hello(&bytes);
+        assert_eq!(result, Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn test_extract_sni_no_extension() {
+        // ClientHello without extensions
+        let data = vec![
+            0x16, 0x03, 0x01, 0x00, 0x29, // record header
+            0x01, 0x00, 0x00, 0x25, // handshake header
+            0x03, 0x03,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, // session_id_len = 0
+            0x00, 0x02, 0x13, 0x01, // cipher suites
+            0x01, 0x00, // compression
+            0x00, 0x00, // extensions length = 0
+        ];
+        assert_eq!(extract_sni_from_client_hello(&data), None);
+    }
+
+    #[test]
+    fn test_extract_sni_short_data() {
+        assert_eq!(extract_sni_from_client_hello(&[0x16, 0x03]), None);
+        assert_eq!(extract_sni_from_client_hello(&[]), None);
+    }
 }

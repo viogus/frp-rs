@@ -455,12 +455,19 @@ impl AsyncWrite for WsByteStream {
 // IoStream — unified stream type over TCP, TLS, KCP, WebSocket
 // ---------------------------------------------------------------
 
+/// Helper trait bundling AsyncRead + AsyncWrite + Unpin + Send for
+/// use as a dyn-compatible trait object in IoStream::Tls.
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+
 /// Unified stream type for TCP, TLS, KCP, and WebSocket.
 /// WebSocket variant wraps a WsByteStream adapter so all variants
 /// transparently support AsyncRead/AsyncWrite and V1 frame I/O.
 pub enum IoStream {
     Tcp(TcpStream),
-    Tls(tokio_rustls::TlsStream<TcpStream>),
+    /// Boxed TLS stream — type-erased to accept any TLS-wrapped transport
+    /// (e.g. TlsStream<TcpStream> or TlsStream<PreReadStream<TcpStream>>).
+    Tls(Box<dyn AsyncReadWrite>),
     Kcp(KcpStream),
     Quic(QuicStream),
     WebSocket(WsByteStream),
@@ -743,7 +750,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                     .map_err(|e| crate::Error::Transport(format!("invalid server name: {e}")))?;
                 let tls = connector.connect(server_name, stream).await
                     .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}")))?;
-                Ok(IoStream::Tls(tokio_rustls::TlsStream::Client(tls)))
+                Ok(IoStream::Tls(Box::new(tokio_rustls::TlsStream::Client(tls))))
             } else {
                 Ok(IoStream::Tcp(stream))
             }
@@ -1137,6 +1144,56 @@ impl axum::serve::Listener for TlsListener {
 
     fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
         self.inner.local_addr()
+    }
+}
+
+/// A stream wrapper that yields pre-read bytes before the inner stream.
+/// Used when bytes have been consumed for protocol detection (e.g., SNI peek)
+/// but need to be replayed for the actual protocol handler (e.g., TLS handshake).
+pub struct PreReadStream<S> {
+    pre_read: Vec<u8>,
+    pos: usize,
+    inner: S,
+}
+
+impl<S> PreReadStream<S> {
+    pub fn new(pre_read: Vec<u8>, inner: S) -> Self {
+        Self { pre_read, pos: 0, inner }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PreReadStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.pos < self.pre_read.len() {
+            let remaining = &self.pre_read[self.pos..];
+            let n = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..n]);
+            self.pos += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PreReadStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
