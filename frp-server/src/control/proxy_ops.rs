@@ -143,6 +143,47 @@ pub(crate) async fn handle_new_proxy(
                     np.proxy_name, domains, locations, hhr);
             }
 
+            // Register HTTPS proxies with VhostManager for SNI routing.
+            // Routes by domain only (no path/location) — SNI hostname
+            // from the TLS ClientHello determines the route.
+            if np.proxy_type == "https" {
+                let mut domains: Vec<String> = np.custom_domains.clone().unwrap_or_default();
+
+                // Subdomain routing
+                if let Some(ref subdomain) = np.subdomain {
+                    if !subdomain.is_empty() {
+                        let sub_host = &state.sub_domain_host;
+                        if !sub_host.is_empty() {
+                            let full_domain = format!("{}.{}", subdomain, sub_host);
+                            if !domains.contains(&full_domain) {
+                                domains.push(full_domain);
+                            }
+                        }
+                    }
+                }
+
+                if domains.is_empty() {
+                    warn!("HTTPS proxy '{}' has no custom_domains — SNI routing won't work", np.proxy_name);
+                }
+
+                let hhr = np.host_header_rewrite.as_deref().unwrap_or("");
+                let http_user = np.http_user.as_deref().unwrap_or("");
+                let http_pwd = np.http_pwd.as_deref().unwrap_or("");
+                state.vhost_manager.register(
+                    &np.proxy_name,
+                    &domains,
+                    &[],  // no locations for HTTPS SNI routing
+                    run_id,
+                    hhr,
+                    http_user,
+                    http_pwd,
+                ).await;
+                info!(
+                    "VHost SNI routes registered for HTTPS proxy '{}': domains={:?}",
+                    np.proxy_name, domains
+                );
+            }
+
             // Register TCPMux proxies with TcpMuxManager (domain-based CONNECT routing).
             // Follows the same pattern as VHost HTTP registration.
             if np.proxy_type == "tcpmux" {

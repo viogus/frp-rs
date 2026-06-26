@@ -1,8 +1,10 @@
 use std::sync::Arc;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::net::TcpListener;
+use tokio::io::AsyncReadExt;
 
 use tokio::sync::mpsc;
 
@@ -13,7 +15,7 @@ use frp_core::auth::{AuthConfig, AuthMethod, OidcVerifier};
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::mux;
-use frp_core::transport::{IoStream, ConnectionType, peek_connection_type, consume_tls_head_byte};
+use frp_core::transport::{IoStream, ConnectionType, peek_connection_type, consume_tls_head_byte, PreReadStream};
 use frp_core::transport::{build_tls_acceptor, accept_websocket};
 use frp_core::format_socket_addr;
 use frp_core::metrics::ProxyMetricsRegistry;
@@ -68,6 +70,8 @@ pub enum InternalMsg {
 #[derive(Debug, Clone)]
 pub struct ControlTx {
     pub tx: mpsc::UnboundedSender<InternalMsg>,
+    pub client_addr: Option<SocketAddr>,
+    pub login_time: Instant,
 }
 
 /// Hot-reloadable server configuration subset, updated atomically on SIGUSR1.
@@ -101,6 +105,9 @@ pub struct AppState {
     /// Shared UDP port for SUDP proxies. When > 0, all SUDP proxies
     /// use this port instead of their individual remote_port.
     pub sudp_port: u16,
+    pub vhost_http_timeout: u64,
+    pub user_conn_timeout: u64,
+    pub tcp_mux_passthrough: bool,
     /// TCPMux HTTP CONNECT route table (domain → proxy mapping).
     pub tcpmux_manager: Arc<TcpMuxManager>,
     /// Per-proxy traffic metrics for dashboard API.
@@ -108,7 +115,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16) -> Self {
+    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16, vhost_http_timeout: u64, user_conn_timeout: u64, tcp_mux_passthrough: bool) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             reloadable: Arc::new(std::sync::RwLock::new(ReloadableState {
@@ -133,6 +140,9 @@ impl AppState {
             tcpmux_manager: Arc::new(TcpMuxManager::new()),
             proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
             sudp_port,
+            vhost_http_timeout,
+            user_conn_timeout,
+            tcp_mux_passthrough,
         }
     }
 }
@@ -208,6 +218,9 @@ impl Service {
             cfg.tls_only,
             oidc_verifier,
             cfg.sudp_port,
+            cfg.vhost_http_timeout,
+            cfg.user_conn_timeout,
+            cfg.tcp_mux_passthrough,
         );
 
         // Initialize prometheus registry when enabled
@@ -464,8 +477,21 @@ impl Service {
             let dash_state = self.state.clone();
             let dash_user = self.cfg.web_server.user.clone();
             let dash_pwd = self.cfg.web_server.password.clone();
+            let dash_tls_cert = if self.cfg.web_server.tls_cert_file.is_empty() {
+                None
+            } else {
+                Some(self.cfg.web_server.tls_cert_file.clone())
+            };
+            let dash_tls_key = if self.cfg.web_server.tls_key_file.is_empty() {
+                None
+            } else {
+                Some(self.cfg.web_server.tls_key_file.clone())
+            };
             tokio::spawn(async move {
-                if let Err(e) = crate::dashboard::run_dashboard(dash_addr, dash_state, dash_user, dash_pwd).await {
+                if let Err(e) = crate::dashboard::run_dashboard(
+                    dash_addr, dash_state, dash_user, dash_pwd,
+                    dash_tls_cert, dash_tls_key,
+                ).await {
                     tracing::error!("Dashboard server failed: {}", e);
                 }
             });
@@ -513,6 +539,56 @@ impl Service {
                                         return;
                                     }
                                 }
+                                // --- SNI peek for HTTPS proxy routing ---
+                                // Read ClientHello bytes (up to 4KB) to extract SNI.
+                                // If SNI matches an HTTPS proxy, forward raw TLS bytes
+                                // directly through the work connection (no TLS termination).
+                                let mut sni_buf = vec![0u8; 4096];
+                                let sni_peek_n = match tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    stream.read(&mut sni_buf),
+                                ).await {
+                                    Ok(Ok(n)) if n >= 43 => n,
+                                    Ok(Ok(_)) => 0,
+                                    _ => {
+                                        warn!("TLS read timeout from {} during SNI check", addr);
+                                        return;
+                                    }
+                                };
+
+                                // The consumed bytes always start with 0x16 (the TLS record).
+                                // If first_byte was 0x17 it was already consumed and discarded above.
+                                // If first_byte was 0x16 it was MSG_PEEKed (not consumed) so it is
+                                // the first byte of sni_buf.
+                                let sni_data = sni_buf[..sni_peek_n].to_vec();
+
+                                // Try SNI-based routing for HTTPS proxies
+                                if sni_peek_n > 0 {
+                                    if let Some(sni_host) = crate::vhost::extract_sni_from_client_hello(&sni_data) {
+                                        debug!("SNI from {}: {}", addr, sni_host);
+                                        if let Some(route) = state.vhost_manager.lookup(&sni_host).await {
+                                            let ctl_tx = {
+                                                let map = state.run_id_to_ctl_tx.read().await;
+                                                map.get(&route.run_id).cloned()
+                                            };
+                                            if let Some(ctl) = ctl_tx {
+                                                info!("SNI route '{}' → HTTPS proxy '{}' from {}",
+                                                    sni_host, route.proxy_name, addr);
+                                                let _ = ctl.tx.send(InternalMsg::ProxyUserConn {
+                                                    proxy_name: route.proxy_name.clone(),
+                                                    user_conn: IoStream::Tcp(stream),
+                                                    pre_read: sni_data,
+                                                }).ok();
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // No SNI match — wrap stream to replay consumed ClientHello bytes
+                                // for the TLS handshake fallthrough path.
+                                let stream = PreReadStream::new(sni_data, stream);
+
                                 let acceptor = match acceptor {
                                     Some(a) => a,
                                     None => {
@@ -573,15 +649,15 @@ impl Service {
                                             control::handle_control(tls, login, state, Some(addr), None).await;
                                         }
                                         Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                            let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
+                                            let io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls)));
                                             handle_work_conn_inner(io, nwc, state).await;
                                         }
                                         Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                            let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
+                                            let io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls)));
                                             handle_visitor_conn_inner(io, nvc, state).await;
                                         }
                                         Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                            let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
+                                            let io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls)));
                                             let visitor_addr = Some(addr.to_string());
                                             handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
                                         }

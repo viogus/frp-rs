@@ -155,6 +155,13 @@ impl ProxyManager {
             .unwrap_or_default()
     }
 
+    /// List proxy names for a specific client (run_id).
+    pub async fn list_client_proxy_names(&self, run_id: &str) -> Vec<String> {
+        self.by_client.read().await.get(run_id)
+            .map(|proxies| proxies.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub async fn get_run_id(&self, name: &str) -> Option<String> {
         self.proxies.read().await.get(name).map(|p| p.run_id.clone())
     }

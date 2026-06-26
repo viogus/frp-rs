@@ -63,10 +63,25 @@ pub struct ServerConfig {
     /// Each range is inclusive on both ends.
     #[serde(default)]
     pub allow_ports: String,
+    /// Timeout in seconds for backend HTTP response in VHost handler.
+    /// Go frp compat: VhostHTTPTimeout. Default: 60.
+    #[serde(default = "default_vhost_http_timeout")]
+    pub vhost_http_timeout: u64,
+    /// Idle timeout in seconds on user-facing proxy connections.
+    /// Go frp compat: UserConnTimeout. Default: 10.
+    #[serde(default = "default_user_conn_timeout")]
+    pub user_conn_timeout: u64,
+    /// When tcp_mux is enabled and yamux init fails, forward raw bytes
+    /// to the VHost handler instead of closing the connection.
+    /// Go frp compat: TCPMuxPassthrough. Default: false.
+    #[serde(default)]
+    pub tcp_mux_passthrough: bool,
 }
 
 fn default_allow_port_start() -> u16 { 10000 }
 fn default_allow_port_end() -> u16 { 50000 }
+fn default_vhost_http_timeout() -> u64 { 60 }
+fn default_user_conn_timeout() -> u64 { 10 }
 
 /// Parse a bandwidth limit string like "1MB", "500KB", "100K".
 /// Returns bytes per second, or None if unparseable.
@@ -161,6 +176,9 @@ impl Default for ServerConfig {
             allow_port_start: default_allow_port_start(),
             allow_port_end: default_allow_port_end(),
             allow_ports: String::new(),
+            vhost_http_timeout: default_vhost_http_timeout(),
+            user_conn_timeout: default_user_conn_timeout(),
+            tcp_mux_passthrough: false,
         }
     }
 }
@@ -237,6 +255,13 @@ pub struct WebServerConfig {
     pub password: String,
     #[serde(default)]
     pub enable_prometheus: bool,
+    /// TLS certificate file path. When both tls_cert_file and tls_key_file
+    /// are non-empty, dashboard/admin server starts with TLS.
+    #[serde(default)]
+    pub tls_cert_file: String,
+    /// TLS private key file path.
+    #[serde(default)]
+    pub tls_key_file: String,
 }
 
 

@@ -148,6 +148,8 @@ pub async fn run_admin_server(
     state: AdminState,
     auth_user: String,
     auth_password: String,
+    tls_cert_file: Option<String>,
+    tls_key_file: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/api/status", get(handle_status))
@@ -163,8 +165,19 @@ pub async fn run_admin_server(
     let app = app.with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("frpc admin server listening on {}", addr);
-    axum::serve(listener, app).await?;
+
+    match (tls_cert_file, tls_key_file) {
+        (Some(cert), Some(key)) if !cert.is_empty() && !key.is_empty() => {
+            let acceptor = frp_core::transport::build_tls_acceptor(&cert, &key, None)?;
+            tracing::info!("frpc admin server listening on {} (TLS)", addr);
+            let tls_listener = frp_core::transport::TlsListener::new(listener, acceptor);
+            axum::serve(tls_listener, app).await?;
+        }
+        _ => {
+            tracing::info!("frpc admin server listening on {}", addr);
+            axum::serve(listener, app).await?;
+        }
+    }
     Ok(())
 }
 

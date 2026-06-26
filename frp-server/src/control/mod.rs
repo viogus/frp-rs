@@ -109,7 +109,11 @@ pub async fn handle_control<S>(
             warn!("Duplicate run_id {}: shutting down old control handler", run_id);
             let _ = old_ctl.tx.send(InternalMsg::Shutdown);
         }
-        map.insert(run_id.clone(), ControlTx { tx: internal_tx.clone() });
+        map.insert(run_id.clone(), ControlTx {
+            tx: internal_tx.clone(),
+            client_addr: peer,
+            login_time: std::time::Instant::now(),
+        });
     }
 
     // --- Send login response (plain, before encryption) ---

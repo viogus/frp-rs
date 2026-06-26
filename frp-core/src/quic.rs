@@ -59,7 +59,7 @@ impl QuicListener {
             .with_no_client_auth()
             .with_single_cert(cert_chain, key)
             .map_err(|e| io::Error::other(format!("TLS config: {e}")))?;
-        tls_config.alpn_protocols = vec![b"frp-rs".to_vec()];
+        tls_config.alpn_protocols = vec![b"frp".to_vec()];
 
         let quic_tls = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
             .map_err(|e| io::Error::other(format!("QUIC TLS config: {e}")))?;
@@ -106,9 +106,10 @@ pub async fn dial_quic(addr: &str, server_name: &str) -> io::Result<QuicStream> 
     let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
-    let tls_config = rustls::ClientConfig::builder()
+    let mut tls_config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"frp".to_vec()];
 
     let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
         .map_err(|e| io::Error::other(format!("QUIC TLS config: {e}")))?;

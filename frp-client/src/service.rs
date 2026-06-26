@@ -119,6 +119,30 @@ impl Service {
                             warn!("Failed to start static_file plugin for '{}': {}", p.name, e);
                         }
                     }
+                } else if plugin_cfg.plugin_type == "unix_domain_socket" {
+                    match plugin::start_unix_socket_plugin(plugin_cfg).await {
+                        Ok(handle) => {
+                            let addr = handle.local_addr.to_string();
+                            info!("unix_domain_socket plugin for '{}' started on {}", p.name, addr);
+                            plugin_addrs.insert(p.name.clone(), addr);
+                            plugin_handles.push(handle);
+                        }
+                        Err(e) => {
+                            warn!("Failed to start unix_domain_socket plugin for '{}': {}", p.name, e);
+                        }
+                    }
+                } else if plugin_cfg.plugin_type == "tls2raw" {
+                    match plugin::start_tls2raw_plugin(plugin_cfg).await {
+                        Ok(handle) => {
+                            let addr = handle.local_addr.to_string();
+                            info!("tls2raw plugin for '{}' started on {}", p.name, addr);
+                            plugin_addrs.insert(p.name.clone(), addr);
+                            plugin_handles.push(handle);
+                        }
+                        Err(e) => {
+                            warn!("Failed to start tls2raw plugin for '{}': {}", p.name, e);
+                        }
+                    }
                 } else {
                     warn!("Unknown plugin type '{}' for proxy '{}'", plugin_cfg.plugin_type, p.name);
                 }
@@ -232,9 +256,20 @@ impl Service {
             };
             let admin_auth_user = self.cfg.web_server.user.clone();
             let admin_auth_pwd = self.cfg.web_server.password.clone();
+            let admin_tls_cert = if self.cfg.web_server.tls_cert_file.is_empty() {
+                None
+            } else {
+                Some(self.cfg.web_server.tls_cert_file.clone())
+            };
+            let admin_tls_key = if self.cfg.web_server.tls_key_file.is_empty() {
+                None
+            } else {
+                Some(self.cfg.web_server.tls_key_file.clone())
+            };
             tokio::spawn(async move {
                 if let Err(e) = crate::admin::run_admin_server(
                     admin_addr, admin_state, admin_auth_user, admin_auth_pwd,
+                    admin_tls_cert, admin_tls_key,
                 ).await {
                     tracing::error!("frpc admin server failed: {}", e);
                 }
