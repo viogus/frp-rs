@@ -141,6 +141,10 @@ async fn handle_root() -> Html<String> {
     Html(include_str!("dashboard.html").replace("{version}", frp_core::VERSION))
 }
 
+async fn handle_healthz() -> &'static str {
+    "ok"
+}
+
 pub async fn run_dashboard(
     addr: String,
     state: Arc<AppState>,
@@ -170,6 +174,7 @@ pub async fn run_dashboard(
 
     let app = Router::new()
         .route("/", get(handle_root))
+        .route("/healthz", get(handle_healthz))
         .merge(api_routes)
         .merge(metrics_route)
         .with_state(state);
