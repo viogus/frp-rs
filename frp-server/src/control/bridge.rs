@@ -1,5 +1,7 @@
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tracing::{debug, info, warn};
 
 use frp_core::metrics::ConnGuard;
@@ -10,6 +12,90 @@ use frp_core::transport::IoStream;
 use crate::service::AppState;
 
 use super::PendingRequest;
+
+/// Wraps an AsyncRead, buffering HTTP response headers on first read
+/// and injecting configured headers before passing through.
+struct ResponseHeaderInjector<R> {
+    inner: R,
+    headers: std::collections::HashMap<String, String>,
+    buffer: Vec<u8>,
+    buffer_offset: usize,
+    complete: bool,
+}
+
+impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
+    fn new(inner: R, headers: std::collections::HashMap<String, String>) -> Self {
+        Self {
+            inner,
+            headers,
+            buffer: Vec::new(),
+            buffer_offset: 0,
+            complete: false,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.complete {
+            let this = unsafe { self.as_mut().get_unchecked_mut() };
+            return Pin::new(&mut this.inner).poll_read(cx, buf);
+        }
+
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+
+        // Read from inner into our buffer
+        let mut temp = vec![0u8; 4096];
+        let mut temp_buf = ReadBuf::new(&mut temp);
+        match Pin::new(&mut this.inner).poll_read(cx, &mut temp_buf) {
+            Poll::Ready(Ok(())) => {
+                let n = temp_buf.filled().len();
+                if n == 0 {
+                    this.complete = true;
+                    return Poll::Ready(Ok(()));
+                }
+                this.buffer.extend_from_slice(&temp[..n]);
+            }
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => {
+                if this.buffer.is_empty() {
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        // Check for end of HTTP headers
+        let header_end = this.buffer.windows(4).position(|w| w == b"\r\n\r\n");
+        if let Some(pos) = header_end {
+            let mut injected = Vec::with_capacity(this.buffer.len() + 512);
+            injected.extend_from_slice(&this.buffer[..pos]);
+            for (k, v) in &this.headers {
+                injected.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
+            }
+            injected.extend_from_slice(&this.buffer[pos..]);
+            this.buffer = injected;
+            this.complete = true;
+        }
+
+        // Serve from buffer
+        if this.buffer_offset < this.buffer.len() {
+            let remaining = this.buffer.len() - this.buffer_offset;
+            let to_copy = remaining.min(buf.remaining());
+            buf.put_slice(&this.buffer[this.buffer_offset..this.buffer_offset + to_copy]);
+            this.buffer_offset += to_copy;
+        }
+
+        if this.buffer_offset >= this.buffer.len() {
+            this.complete = true;
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
 
 /// Assign a work connection to a UDP proxy for bidirectional data forwarding.
 /// Matches Go frp v0.69.1 behavior: sends StartWorkConn, then bridges
@@ -136,12 +222,29 @@ pub(crate) async fn assign_work_to_proxy(
     state: Arc<AppState>,
     v2: bool,
 ) {
+    // Extract peer address from user connection for PROXY protocol support
+    let (src_addr, src_port) = match &req.user_conn {
+        IoStream::Tcp(s) => {
+            s.peer_addr().map(|a| (a.ip().to_string(), a.port() as i32)).ok()
+        }
+        _ => None,
+    }.map_or((String::new(), 0), |(ip, port)| (ip, port));
+
+    // Look up proxy info for dst address and proxy protocol version
+    let proxy_info = state.proxy_manager.get(&req.proxy_name).await;
+    let proxy_protocol_version = proxy_info.as_ref()
+        .map(|p| p.proxy_protocol_version.clone()).unwrap_or_default();
+    let dst_addr = proxy_info.as_ref()
+        .and_then(|p| p.local_addr.clone()).unwrap_or_default();
+    let dst_port = proxy_info.as_ref()
+        .and_then(|p| p.remote_port).map(|p| p as i32).unwrap_or(0);
+
     let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
         proxy_name: req.proxy_name.clone(),
-        src_addr: None,
-        src_port: None,
-        dst_addr: None,
-        dst_port: None,
+        src_addr: if !proxy_protocol_version.is_empty() && !src_addr.is_empty() { Some(src_addr) } else { None },
+        src_port: if !proxy_protocol_version.is_empty() && src_port != 0 { Some(src_port) } else { None },
+        dst_addr: if !proxy_protocol_version.is_empty() && !dst_addr.is_empty() { Some(dst_addr) } else { None },
+        dst_port: if !proxy_protocol_version.is_empty() && dst_port != 0 { Some(dst_port) } else { None },
         error: None,
     });
 
@@ -233,7 +336,12 @@ pub(crate) async fn assign_work_to_proxy(
             // Plain bridge with optional compression.
             let (u_r, u_w) = req.user_conn.into_split();
             let (w_r, w_w) = work_conn.into_split();
-            frp_core::bridge::bridge_plain(u_r, u_w, w_r, w_w, comp_key, bridge_pre_read, Some(metrics.clone())).await;
+            if !req.response_headers.is_empty() && req.proxy_type.starts_with("http") {
+                let injector = ResponseHeaderInjector::new(w_r, req.response_headers);
+                frp_core::bridge::bridge_plain(u_r, u_w, injector, w_w, comp_key, bridge_pre_read, Some(metrics.clone())).await;
+            } else {
+                frp_core::bridge::bridge_plain(u_r, u_w, w_r, w_w, comp_key, bridge_pre_read, Some(metrics.clone())).await;
+            }
         }
         info!("Proxy '{}' bridge completed", req.proxy_name);
     });

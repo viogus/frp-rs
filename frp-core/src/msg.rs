@@ -108,6 +108,11 @@ pub struct LoginResp {
     pub run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Server's additional auth scopes (union with client's to decide
+    /// which messages need authentication).
+    /// Go frp compat: serverAdditionalAuthScopes.
+    #[serde(rename = "serverAdditionalAuthScopes", skip_serializing_if = "Option::is_none")]
+    pub server_additional_auth_scopes: Option<Vec<String>>,
 }
 
 pub type LoginResponse = LoginResp;
@@ -162,6 +167,8 @@ pub struct NewProxy {
     pub multiplexer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub virtual_net: Option<String>,
+    #[serde(rename = "proxyProtocolVersion", skip_serializing_if = "Option::is_none")]
+    pub proxy_protocol_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -452,6 +459,7 @@ impl FrpMessage {
             })),
             TYPE_LOGIN_RESP    => Some(FrpMessage::LoginResp(LoginResp {
                 version: None, run_id: None, error: None,
+                server_additional_auth_scopes: None,
             })),
             TYPE_NEW_PROXY     => Some(FrpMessage::NewProxy(NewProxy {
                 proxy_name: String::new(), proxy_type: String::new(),
@@ -465,6 +473,7 @@ impl FrpMessage {
                 bandwidth_limit_mode: None, annotations: None,
                 metas: None, multiplexer: None,
                 virtual_net: None,
+                proxy_protocol_version: None,
             })),
             TYPE_NEW_PROXY_RESP => Some(FrpMessage::NewProxyResp(NewProxyResp {
                 proxy_name: String::new(), remote_addr: None, error: None,
@@ -577,6 +586,7 @@ mod tests {
             version: Some("0.69.1".into()),
             run_id: Some("rid1".into()),
             error: None,
+            server_additional_auth_scopes: None,
         };
         roundtrip(&resp, r#"{"version":"0.69.1","run_id":"rid1"}"#);
 
@@ -584,8 +594,17 @@ mod tests {
             version: None,
             run_id: None,
             error: Some("auth failed".into()),
+            server_additional_auth_scopes: None,
         };
         roundtrip(&err_resp, r#"{"error":"auth failed"}"#);
+
+        let scoped_resp = LoginResp {
+            version: Some("0.69.1".into()),
+            run_id: Some("rid2".into()),
+            error: None,
+            server_additional_auth_scopes: Some(vec!["HeartBeats".into(), "NewWorkConns".into()]),
+        };
+        roundtrip(&scoped_resp, r#"{"version":"0.69.1","run_id":"rid2","serverAdditionalAuthScopes":["HeartBeats","NewWorkConns"]}"#);
     }
 
     #[test]
@@ -616,6 +635,7 @@ mod tests {
             metas: None,
             multiplexer: None,
             virtual_net: None,
+            proxy_protocol_version: None,
         };
         let json = serde_json::to_string(&np).expect("serialize");
         let back: NewProxy = serde_json::from_str(&json).expect("deserialize");

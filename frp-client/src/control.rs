@@ -31,6 +31,10 @@ pub struct ControlConnection {
     tcp_mux: bool,
     v2: bool,
     oidc_client: Option<Arc<OidcClient>>,
+    /// Server's additional auth scopes from LoginResp. Combined with client
+    /// config to decide whether Ping/NewWorkConn need auth.
+    pub server_auth_scopes: Vec<String>,
+    metas: std::collections::HashMap<String, String>,
 }
 
 impl ControlConnection {
@@ -51,6 +55,7 @@ impl ControlConnection {
         tcp_mux: bool,
         v2: bool,
         oidc_client: Option<Arc<OidcClient>>,
+        metas: std::collections::HashMap<String, String>,
     ) -> Self {
         Self {
             server_addr,
@@ -70,6 +75,8 @@ impl ControlConnection {
             tcp_mux,
             v2,
             oidc_client,
+            server_auth_scopes: Vec::new(),
+            metas,
         }
     }
 
@@ -141,7 +148,7 @@ impl ControlConnection {
             pool_count: Some(self.pool_count),
             timestamp: Some(timestamp),
             privilege_key: None,
-            metas: None,
+            metas: if self.metas.is_empty() { None } else { Some(self.metas.clone()) },
             client_spec: None,
             multiplexer: if propose_mux { Some("yamux".into()) } else { None },
         };
@@ -174,6 +181,7 @@ impl ControlConnection {
                     return Err(frp_core::Error::Auth(format!("Login failed: {}", err)));
                 }
                 self.run_id = resp.run_id.clone().unwrap_or_default();
+                self.server_auth_scopes = resp.server_additional_auth_scopes.unwrap_or_default();
                 info!("Logged in. run_id: {}", self.run_id);
                 Ok((io_stream, self.run_id.clone(), yamux_session))
             }

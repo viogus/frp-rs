@@ -67,6 +67,7 @@ pub async fn start_frps(port: u16, token: &str) -> JoinHandle<()> {
             oidc_token_endpoint: String::new(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+                    additional_auth_scopes: Vec::new(),
         },
         allow_port_start: port.saturating_sub(50),
         allow_port_end: port.saturating_add(50).min(u16::MAX),
@@ -176,6 +177,8 @@ impl TestHarness {
                 health_check_timeout_seconds: 0,
                 health_check_max_failed: 0,
             virtual_net: String::new(),
+            health_check_http_headers: std::collections::HashMap::new(),
+            proxy_protocol_version: String::new(),
             }],
             ..Default::default()
         };

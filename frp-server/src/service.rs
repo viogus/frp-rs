@@ -80,6 +80,7 @@ pub struct ReloadableState {
     pub auth_cfg: Arc<AuthConfig>,
     pub encryption_key: [u8; 16],
     pub allow_ports: Vec<(u16, u16)>,
+    pub additional_auth_scopes: Vec<String>,
 }
 
 pub struct AppState {
@@ -125,9 +126,10 @@ impl AppState {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             reloadable: Arc::new(std::sync::RwLock::new(ReloadableState {
-                auth_cfg: Arc::new(auth_cfg),
+                auth_cfg: Arc::new(auth_cfg.clone()),
                 encryption_key,
                 allow_ports,
+                additional_auth_scopes: auth_cfg.additional_auth_scopes.clone(),
             })),
             used_ports: Arc::new(RwLock::new(std::collections::HashSet::new())),
             run_id_to_ctl_tx: Arc::new(RwLock::new(HashMap::new())),
@@ -181,6 +183,7 @@ impl Service {
             oidc_skip_expiry: cfg.auth.oidc_skip_expiry,
             oidc_skip_issuer: cfg.auth.oidc_skip_issuer,
             additional_data: None,
+            additional_auth_scopes: cfg.auth.additional_auth_scopes.clone(),
         };
 
         let oidc_verifier = if auth_cfg.method == AuthMethod::Oidc {
@@ -900,6 +903,7 @@ impl Service {
             oidc_skip_expiry: new_cfg.auth.oidc_skip_expiry,
             oidc_skip_issuer: new_cfg.auth.oidc_skip_issuer,
             additional_data: None,
+            additional_auth_scopes: new_cfg.auth.additional_auth_scopes.clone(),
         };
         let new_enc_key = frp_core::encryption::derive_key(&new_auth_cfg.token);
         let new_allow_ports = if !new_cfg.allow_ports.is_empty() {
@@ -921,6 +925,14 @@ impl Service {
                 changes.push("auth token updated".into());
                 r.auth_cfg = Arc::new(new_auth_cfg);
                 r.encryption_key = new_enc_key;
+            }
+            let new_scopes = &r.auth_cfg.additional_auth_scopes;
+            if r.additional_auth_scopes != *new_scopes {
+                changes.push(format!(
+                    "additional_auth_scopes: {:?} -> {:?}",
+                    r.additional_auth_scopes, new_scopes
+                ));
+                r.additional_auth_scopes = new_scopes.clone();
             }
         }
 
@@ -1253,14 +1265,11 @@ async fn handle_work_conn_inner(
         }
     };
 
-    // Verify work connection auth (Go frp v0.69.1 compat)
-    // Go frp only sets privilege_key/timestamp when
-    // AuthScopeNewWorkConns is in additionalAuthScopes
-    // (default: empty). Skip validation otherwise.
-    let has_nwc_auth = msg.privilege_key.as_deref()
-        .is_some_and(|k| !k.is_empty())
-        || msg.timestamp.unwrap_or(0) != 0;
-    let nwc_auth_result = if !has_nwc_auth {
+    // Verify work connection auth (Go frp v0.69.1 compat).
+    // Only validate when "NewWorkConns" is in additional_auth_scopes.
+    let requires_nwc_auth = state.reloadable.read().unwrap()
+        .additional_auth_scopes.iter().any(|s| s == "NewWorkConns");
+    let nwc_auth_result = if !requires_nwc_auth {
         Ok(())
     } else if let Some(ref verifier) = state.oidc_verifier {
         let expected_sub = state.oidc_subjects.read().await

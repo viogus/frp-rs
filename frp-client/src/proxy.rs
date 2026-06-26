@@ -77,6 +77,7 @@ pub fn create_new_proxy_msg(
         metas: if p.metas.is_empty() { None } else { Some(p.metas.clone()) },
         multiplexer: if p.multiplexer.is_empty() { None } else { Some(p.multiplexer.clone()) },
         virtual_net: if p.virtual_net.is_empty() { None } else { Some(p.virtual_net.clone()) },
+        proxy_protocol_version: if p.proxy_protocol_version.is_empty() { None } else { Some(p.proxy_protocol_version.clone()) },
     });
 
     // Strip local_str for Go frps compatibility — Go frps v0.69.1

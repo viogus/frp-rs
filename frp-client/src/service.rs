@@ -17,10 +17,15 @@ use frp_core::transport::{TransportProtocol, DialOptions, dial_server, IoStream}
 
 use frp_core::metrics::ProxyMetricsRegistry;
 
-use crate::plugin::{self, PluginHandle};
+use crate::plugin::{self, PluginHandle, PluginContext};
 use crate::proxy;
 use crate::control::ControlConnection;
 use crate::admin::{AdminState, ReloadRequest, ProxyRuntimeInfo};
+
+/// Check if an auth scope is enabled, considering both client and server config.
+fn scope_requires_auth(client_scopes: &[String], server_scopes: &[String], scope: &str) -> bool {
+    client_scopes.iter().any(|s| s == scope) || server_scopes.iter().any(|s| s == scope)
+}
 
 /// The main frpc service.
 pub struct Service {
@@ -33,6 +38,8 @@ pub struct Service {
     _plugin_handles: Vec<PluginHandle>,
     /// OIDC client for fetching access tokens (None when auth method is Token).
     oidc_client: Option<Arc<OidcClient>>,
+    /// Server-side auth scopes from LoginResp, used for Ping/NewWorkConn gating.
+    server_auth_scopes: tokio::sync::RwLock<Vec<String>>,
     /// Per-proxy traffic metrics for admin API.
     proxy_metrics: Arc<ProxyMetricsRegistry>,
     /// Path to config file for admin reload/config endpoints.
@@ -60,6 +67,7 @@ impl Service {
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             additional_data: None,
+            additional_auth_scopes: Vec::new(),
         };
 
         let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
@@ -198,7 +206,19 @@ impl Service {
                         }
                     }
                 } else if plugin_cfg.plugin_type == "visitor_plugin" {
-                    match plugin::start_visitor_plugin(plugin_cfg).await {
+                    let plugin_ctx = PluginContext {
+                        server_addr: cfg.server_addr.clone(),
+                        server_port: cfg.server_port,
+                        transport_protocol: cfg.transport_protocol.clone(),
+                        tls_enable: cfg.tls_enable,
+                        tls_server_name: cfg.tls_server_name.clone(),
+                        tls_ca_file: if cfg.tls_ca_file.is_empty() { None } else { Some(cfg.tls_ca_file.clone()) },
+                        use_encryption: p.use_encryption,
+                        use_compression: p.use_compression,
+                        token: auth_cfg.token.clone(),
+                        oidc_client: oidc_client.clone(),
+                    };
+                    match plugin::start_visitor_plugin(plugin_cfg, plugin_ctx).await {
                         Ok(handle) => {
                             let addr = handle.local_addr.to_string();
                             info!("visitor plugin for '{}' started on {}", p.name, addr);
@@ -234,6 +254,7 @@ impl Service {
                 use_compression: p.use_compression,
                 bandwidth_limit: bw_limit,
                 bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
+                proxy_protocol_version: p.proxy_protocol_version.clone(),
             });
         }
         let proxy_info_map = Arc::new(RwLock::new(map));
@@ -247,6 +268,7 @@ impl Service {
             proxy_info_map,
             _plugin_handles: plugin_handles,
             oidc_client,
+            server_auth_scopes: tokio::sync::RwLock::new(Vec::new()),
             proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
             config_file,
             reload_tx,
@@ -315,8 +337,9 @@ impl Service {
             let max_failed = p.health_check_max_failed.max(1);
             let tx = health_tx.clone();
             let hc_url = if hc_type == "http" { p.health_check_url.clone() } else { String::new() };
+            let hc_headers = p.health_check_http_headers.clone();
             tokio::spawn(async move {
-                run_health_check(pn, la, hc_type, hc_url, interval, timeout, max_failed, tx).await;
+                run_health_check(pn, la, hc_type, hc_url, hc_headers, interval, timeout, max_failed, tx).await;
             });
         }
 
@@ -382,11 +405,13 @@ impl Service {
                 self.cfg.tcp_mux,
                 self.cfg.v2,
                 self.oidc_client.clone(),
+                self.cfg.metas.clone(),
             );
 
             let (mut control_stream, run_id, yamux_session) = match ctl.login().await {
                 Ok(r) => {
                     did_login_once = true;
+                    *self.server_auth_scopes.write().await = ctl.server_auth_scopes.clone();
                     // After login, wrap control stream in AES-128-CFB encryption.
                     // Go frps v0.69.1 always encrypts the control connection for V1.
                     let (stream, run_id, yamux) = r;
@@ -467,6 +492,10 @@ impl Service {
 
             // Spawn initial pool work connections
             let auth_token = self.auth_cfg.token.clone();
+            let client_scopes: Vec<String> = self.cfg.auth.as_ref()
+                .map(|a| a.additional_auth_scopes.clone())
+                .unwrap_or_default();
+            let server_scopes = self.server_auth_scopes.read().await.clone();
             for i in 0..pool_count {
                 spawn_work_conn(
                     &self.cfg.server_addr,
@@ -486,6 +515,8 @@ impl Service {
                     udp_sockets.clone(),
                     udp_enc_cfg.clone(),
                     self.proxy_metrics.clone(),
+                    client_scopes.clone(),
+                    server_scopes.clone(),
                 );
             }
 
@@ -540,6 +571,8 @@ impl Service {
                                     udp_sockets.clone(),
                                     udp_enc_cfg.clone(),
                                     self.proxy_metrics.clone(),
+                                    client_scopes.clone(),
+                                    server_scopes.clone(),
                                 );
                             }
                             Ok(FrpMessage::Pong(_)) => {
@@ -651,27 +684,36 @@ impl Service {
                             privilege_key: None,
                             timestamp: None,
                         };
-                        if let Some(ref oidc) = self.oidc_client {
-                            if let Err(e) = oidc.set_ping(&mut ping_msg).await {
-                                warn!("OIDC ping token failed: {}. Reconnecting...", e);
-                                break;
+                        let client_scopes: Vec<String> = self.cfg.auth.as_ref()
+                            .map(|a| a.additional_auth_scopes.clone())
+                            .unwrap_or_default();
+                        let requires_auth = scope_requires_auth(
+                            &client_scopes, &self.server_auth_scopes.read().await, "HeartBeats"
+                        );
+                        if requires_auth {
+                            if let Some(ref oidc) = self.oidc_client {
+                                if let Err(e) = oidc.set_ping(&mut ping_msg).await {
+                                    warn!("OIDC ping token failed: {}. Reconnecting...", e);
+                                    break;
+                                }
+                            } else {
+                                let ts = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs() as i64;
+                                let ping_auth = AuthConfig {
+                                    method: AuthMethod::Token,
+                                    token: self.auth_cfg.token.clone(),
+                                    oidc_issuer: String::new(),
+                                    oidc_audience: String::new(),
+                                    oidc_skip_expiry: false,
+                                    oidc_skip_issuer: false,
+                                    additional_data: None,
+                                    additional_auth_scopes: Vec::new(),
+                                };
+                                ping_msg.privilege_key = ping_auth.generate_login_key(ts);
+                                ping_msg.timestamp = Some(ts);
                             }
-                        } else {
-                            let ts = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs() as i64;
-                            let ping_auth = AuthConfig {
-                                method: AuthMethod::Token,
-                                token: self.auth_cfg.token.clone(),
-                                oidc_issuer: String::new(),
-                                oidc_audience: String::new(),
-                                oidc_skip_expiry: false,
-                                oidc_skip_issuer: false,
-                                additional_data: None,
-                            };
-                            ping_msg.privilege_key = ping_auth.generate_login_key(ts);
-                            ping_msg.timestamp = Some(ts);
                         }
                         let ping = FrpMessage::Ping(ping_msg);
                         if let Err(e) = write_msg(&mut *writer.lock().await, &ping, v2).await {
@@ -807,6 +849,7 @@ impl Service {
                         use_compression: p.use_compression,
                         bandwidth_limit: bw_limit,
                         bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
+                        proxy_protocol_version: p.proxy_protocol_version.clone(),
                     });
                 }
             }
@@ -851,6 +894,8 @@ fn spawn_work_conn(
     udp_sockets: Arc<tokio::sync::Mutex<HashMap<String, Arc<UdpSocket>>>>,
     udp_enc_cfg: Arc<tokio::sync::Mutex<HashMap<String, (bool, bool)>>>,
     proxy_metrics: Arc<ProxyMetricsRegistry>,
+    client_auth_scopes: Vec<String>,
+    server_auth_scopes: Vec<String>,
 ) {
     let server_addr = server_addr.to_string();
     let run_id = run_id.to_string();
@@ -911,27 +956,31 @@ fn spawn_work_conn(
                 timestamp: None,
                 privilege_key: None,
             };
-            if let Some(ref oidc) = oidc_client {
-                if let Err(e) = oidc.set_new_work_conn(&mut nwc_msg).await {
-                    warn!("Work conn {} OIDC NewWorkConn auth failed: {}", label, e);
-                    return;
+            let requires_auth = scope_requires_auth(&client_auth_scopes, &server_auth_scopes, "NewWorkConns");
+            if requires_auth {
+                if let Some(ref oidc) = oidc_client {
+                    if let Err(e) = oidc.set_new_work_conn(&mut nwc_msg).await {
+                        warn!("Work conn {} OIDC NewWorkConn auth failed: {}", label, e);
+                        return;
+                    }
+                } else {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let auth_cfg = frp_core::auth::AuthConfig {
+                        method: frp_core::auth::AuthMethod::Token,
+                        token: nwc_token,
+                        oidc_issuer: String::new(),
+                        oidc_audience: String::new(),
+                        oidc_skip_expiry: false,
+                        oidc_skip_issuer: false,
+                        additional_data: None,
+                        additional_auth_scopes: Vec::new(),
+                    };
+                    nwc_msg.privilege_key = auth_cfg.generate_login_key(timestamp);
+                    nwc_msg.timestamp = Some(timestamp);
                 }
-            } else {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                let auth_cfg = frp_core::auth::AuthConfig {
-                    method: frp_core::auth::AuthMethod::Token,
-                    token: nwc_token,
-                    oidc_issuer: String::new(),
-                    oidc_audience: String::new(),
-                    oidc_skip_expiry: false,
-                    oidc_skip_issuer: false,
-                    additional_data: None,
-                };
-                nwc_msg.privilege_key = auth_cfg.generate_login_key(timestamp);
-                nwc_msg.timestamp = Some(timestamp);
             }
             let nwc = FrpMessage::NewWorkConn(nwc_msg);
             let write_result = if v2 {
@@ -1097,7 +1146,24 @@ fn spawn_work_conn(
                 } else {
                     // TCP/HTTP/STCP: connect to local TCP service and bridge
                     match proxy::connect_local(&info.local_addr).await {
-                        Ok(local) => {
+                        Ok(mut local) => {
+                            // Write PROXY protocol v1 header if configured
+                            if !info.proxy_protocol_version.is_empty() {
+                                if let Some(ref src) = swc.src_addr {
+                                    if info.proxy_protocol_version == "v1" {
+                                        let header = format!(
+                                            "PROXY TCP4 {} {} {} {}\r\n",
+                                            src,
+                                            swc.dst_addr.as_deref().unwrap_or("0.0.0.0"),
+                                            swc.src_port.unwrap_or(0),
+                                            swc.dst_port.unwrap_or(0),
+                                        );
+                                        if let Err(e) = local.write_all(header.as_bytes()).await {
+                                            warn!("Failed to write PROXY v1 header: {}", e);
+                                        }
+                                    }
+                                }
+                            }
                             let enc = if info.use_encryption { Some(&enc_key) } else { None };
                             proxy::bridge_streams(local, work, proxy_name, info.use_encryption, info.use_compression, enc, info.bandwidth_limit, &info.bandwidth_limit_mode, proxy_metrics).await;
                         }
@@ -1138,6 +1204,8 @@ fn spawn_work_conn(
                 repl_udp_sockets,
                 repl_udp_enc_cfg,
                 repl_proxy_metrics,
+                client_auth_scopes.clone(),
+                server_auth_scopes.clone(),
             );
         }
     });
@@ -1153,6 +1221,7 @@ async fn run_health_check(
     local_addr: String,
     check_type: String,
     check_url: String,
+    hc_headers: std::collections::HashMap<String, String>,
     interval: std::time::Duration,
     timeout: std::time::Duration,
     max_failed: u32,
@@ -1167,7 +1236,7 @@ async fn run_health_check(
         tokio::time::sleep(interval).await;
 
         let result = if check_type == "http" {
-            run_http_check(&local_addr, &check_url, timeout).await
+            run_http_check(&local_addr, &check_url, timeout, &hc_headers).await
         } else {
             run_tcp_check(&local_addr, timeout).await
         };
@@ -1203,7 +1272,7 @@ async fn run_tcp_check(addr: &str, timeout: std::time::Duration) -> Result<(), S
 
 /// HTTP health check: connect, send GET, verify 2xx status code.
 /// Uses raw TCP to avoid adding an HTTP client dependency.
-async fn run_http_check(addr: &str, url: &str, timeout: std::time::Duration) -> Result<(), String> {
+async fn run_http_check(addr: &str, url: &str, timeout: std::time::Duration, headers: &std::collections::HashMap<String, String>) -> Result<(), String> {
     let mut stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
         .await
         .map_err(|_| "connect timeout".to_string())?
@@ -1211,10 +1280,14 @@ async fn run_http_check(addr: &str, url: &str, timeout: std::time::Duration) -> 
 
     // Extract host from addr (strip port for Host header)
     let host = addr.split(':').next().unwrap_or(addr);
-    let req = format!(
-        "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
+    let mut req = format!(
+        "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close",
         url, host
     );
+    for (key, value) in headers {
+        req.push_str(&format!("\r\n{}: {}", key, value));
+    }
+    req.push_str("\r\n\r\n");
 
     tokio::time::timeout(timeout, stream.write_all(req.as_bytes()))
         .await

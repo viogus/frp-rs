@@ -24,6 +24,10 @@ pub struct AuthConfig {
     pub oidc_skip_expiry: bool,
     pub oidc_skip_issuer: bool,
     pub additional_data: Option<String>,
+    /// Additional auth scopes: "HeartBeats", "NewWorkConns".
+    /// When listed, corresponding message types require authentication.
+    /// Go frp compat: additionalAuthScopes.
+    pub additional_auth_scopes: Vec<String>,
 }
 
 impl Default for AuthConfig {
@@ -36,6 +40,7 @@ impl Default for AuthConfig {
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             additional_data: None,
+            additional_auth_scopes: Vec::new(),
         }
     }
 }
@@ -613,6 +618,7 @@ mod tests {
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             additional_data: None,
+            additional_auth_scopes: Vec::new(),
         };
         let ts = 100i64;
         let key = generate_token("secret", ts);
@@ -634,6 +640,7 @@ mod tests {
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             additional_data: None,
+            additional_auth_scopes: Vec::new(),
         };
         // AuthConfig::validate_login for OIDC returns error when no server-side verifier
         let result = cfg.validate_login(Some("some-jwt-token"), Some(100));
@@ -697,6 +704,7 @@ mod tests {
         assert!(cfg.token.is_empty());
         assert!(!cfg.oidc_skip_expiry);
         assert!(!cfg.oidc_skip_issuer);
+        assert!(cfg.additional_auth_scopes.is_empty());
     }
 
     #[test]
@@ -715,6 +723,7 @@ mod tests {
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             additional_data: None,
+            additional_auth_scopes: Vec::new(),
         };
         assert!(cfg.generate_login_key(100).is_none());
     }

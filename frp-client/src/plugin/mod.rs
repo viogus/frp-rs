@@ -23,6 +23,7 @@ mod static_file;
 mod unix_socket;
 mod tls2raw;
 mod visitor;
+mod context;
 
 pub(crate) use http::start_http_proxy;
 pub(crate) use http2http::start_http2http_plugin;
@@ -30,6 +31,7 @@ pub(crate) use http2https::start_http2https_plugin;
 pub(crate) use https2http::start_https2http_plugin;
 pub(crate) use https2https::start_https2https_plugin;
 pub(crate) use socks5::start_socks5_proxy;
+pub(crate) use context::PluginContext;
 pub(crate) use static_file::start_static_file_proxy;
 pub(crate) use unix_socket::start_unix_socket_plugin;
 pub(crate) use tls2raw::start_tls2raw_plugin;

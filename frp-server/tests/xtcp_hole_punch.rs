@@ -63,6 +63,7 @@ async fn test_xtcp_nat_hole_message_routing() {
         metas: None,
         multiplexer: None,
         virtual_net: None,
+                    proxy_protocol_version: None,
     });
     write_msg_v1(&mut provider, &np)
         .await
@@ -189,6 +190,7 @@ async fn test_xtcp_nat_hole_message_routing() {
         metas: None,
         multiplexer: None,
         virtual_net: None,
+                    proxy_protocol_version: None,
     });
     write_msg_v1(&mut provider, &np2)
         .await

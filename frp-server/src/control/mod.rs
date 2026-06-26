@@ -59,6 +59,8 @@ pub(super) struct PendingRequest {
     use_encryption: bool,
     use_compression: bool,
     created_at: Instant,
+    response_headers: std::collections::HashMap<String, String>,
+    proxy_type: String,
 }
 
 /// Handle a control connection from a frpc client.
@@ -91,6 +93,7 @@ pub async fn handle_control<S>(
                     version: Some(frp_core::VERSION.into()),
                     run_id: None,
                     error: Some(format!("OIDC authentication failed: {e}")),
+                    server_additional_auth_scopes: None,
                 });
                 let _ = write_ctl_msg(&mut writer, &resp, v2).await;
                 return;
@@ -108,6 +111,7 @@ pub async fn handle_control<S>(
                 version: Some(frp_core::VERSION.into()),
                 run_id: None,
                 error: Some(e),
+                server_additional_auth_scopes: None,
             });
             let _ = write_ctl_msg(&mut writer, &resp, v2).await;
             return;
@@ -132,6 +136,7 @@ pub async fn handle_control<S>(
         "user": login.user,
         "run_id": run_id,
         "remote_addr": peer.map(|a| a.to_string()),
+        "metas": login.metas,
     });
     if let Err(reason) = state.plugin_manager.notify("login", login_content).await {
         warn!("Login for run_id {} rejected by server plugin: {}", run_id, reason);
@@ -140,6 +145,7 @@ pub async fn handle_control<S>(
             version: Some(frp_core::VERSION.into()),
             run_id: None,
             error: Some(reason),
+            server_additional_auth_scopes: None,
         });
         let _ = write_ctl_msg(&mut writer, &resp, v2).await;
         return;
@@ -165,10 +171,12 @@ pub async fn handle_control<S>(
 
     // --- Send login response (plain, before encryption) ---
     {
+        let additional_auth_scopes = state.reloadable.read().unwrap().additional_auth_scopes.clone();
         let resp = FrpMessage::LoginResp(msg::LoginResp {
             version: Some(frp_core::VERSION.into()),
             run_id: Some(run_id.clone()),
             error: None,
+            server_additional_auth_scopes: if additional_auth_scopes.is_empty() { None } else { Some(additional_auth_scopes) },
         });
         if let Err(e) = write_ctl_msg(&mut stream, &resp, v2).await {
             warn!("Failed to send login response to {:?}: {}", peer, e);
@@ -261,22 +269,24 @@ pub async fn handle_control<S>(
                     }
                     Some(InternalMsg::VisitorConn { proxy_name, visitor_conn }) => {
                         debug!("STCP visitor conn for proxy {} on run_id {}", proxy_name, run_id);
-                        let (enc, comp) = {
+                        let (enc, comp, response_headers, proxy_type) = {
                             let p = state.proxy_manager.get(&proxy_name).await;
                             let e = p.as_ref().map(|p| p.use_encryption).unwrap_or(false);
                             let c = p.as_ref().map(|p| p.use_compression).unwrap_or(false);
-                            (e, c)
+                            let rh = p.as_ref().map(|p| p.response_headers.clone()).unwrap_or_default();
+                            let pt = p.as_ref().map(|p| p.proxy_type.clone()).unwrap_or_default();
+                            (e, c, rh, pt)
                         };
                         if let Some(work_conn) = work_pool.pop_front() {
                             let enc_key = state.reloadable.read().unwrap().encryption_key;
-                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now() }, enc_key, state.clone(), v2).await;
+                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type }, enc_key, state.clone(), v2).await;
                         } else {
                             debug!("No pooled work conn for STCP, sending ReqWorkConn");
                             if let Err(e) = write_ctl_msg(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
                                 warn!("Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
-                            pending_requests.push_back(PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now() });
+                            pending_requests.push_back(PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type });
                         }
                     }
                     Some(InternalMsg::ProxyUserConn { proxy_name, user_conn, pre_read }) => {
@@ -316,22 +326,24 @@ pub async fn handle_control<S>(
                             warn!("Group backend run_id {} not found for proxy {}", target_run_id, target_proxy);
                             continue;
                         }
-                        let (enc, comp) = {
+                        let (enc, comp, response_headers, proxy_type) = {
                             let p = state.proxy_manager.get(&target_proxy).await;
                             let e = p.as_ref().map(|p| p.use_encryption).unwrap_or(false);
                             let c = p.as_ref().map(|p| p.use_compression).unwrap_or(false);
-                            (e, c)
+                            let rh = p.as_ref().map(|p| p.response_headers.clone()).unwrap_or_default();
+                            let pt = p.as_ref().map(|p| p.proxy_type.clone()).unwrap_or_default();
+                            (e, c, rh, pt)
                         };
                         if let Some(work_conn) = work_pool.pop_front() {
                             let enc_key = state.reloadable.read().unwrap().encryption_key;
-                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() }, enc_key, state.clone(), v2).await;
+                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type }, enc_key, state.clone(), v2).await;
                         } else {
                             debug!("No pooled work conn, sending ReqWorkConn for {}", target_proxy);
                             if let Err(e) = write_ctl_msg(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
                                 warn!("Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
-                            pending_requests.push_back(PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() });
+                            pending_requests.push_back(PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type });
                         }
                     }
                     Some(InternalMsg::UdpNeedsWorkConn { proxy_name }) => {
@@ -563,13 +575,10 @@ pub async fn handle_control<S>(
                     }
                     Ok(FrpMessage::Ping(ref ping_msg)) => {
                         // Validate ping auth (Go frp v0.69.1 compat).
-                        // Go frp only sets privilege_key/timestamp when
-                        // AuthScopeHeartBeats is in additionalAuthScopes
-                        // (default: empty). Skip validation otherwise.
-                        let has_ping_auth = ping_msg.privilege_key.as_deref()
-                            .is_some_and(|k| !k.is_empty())
-                            || ping_msg.timestamp.unwrap_or(0) != 0;
-                        let ping_auth_result = if !has_ping_auth {
+                        // Only validate when "HeartBeats" is in additional_auth_scopes.
+                        let requires_ping_auth = state.reloadable.read().unwrap()
+                            .additional_auth_scopes.iter().any(|s| s == "HeartBeats");
+                        let ping_auth_result = if !requires_ping_auth {
                             Ok(())
                         } else if let Some(ref verifier) = state.oidc_verifier {
                             let expected_sub = state.oidc_subjects.read().await

@@ -19,6 +19,10 @@ pub struct ProxyInfo {
     /// Allowed visitor run_ids (STCP/XTCP access control).
     /// Empty = all visitors allowed. Go frp compat: allow_users.
     pub allow_users: Vec<String>,
+    /// PROXY protocol version (v1, v2, or empty).
+    pub proxy_protocol_version: String,
+    /// Response headers to inject into HTTP responses.
+    pub response_headers: std::collections::HashMap<String, String>,
 }
 
 /// Manages all proxy registrations on the server.

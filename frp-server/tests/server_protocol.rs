@@ -55,6 +55,7 @@ async fn test_login_wrong_token_fails() {
             oidc_token_endpoint: String::new(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+                    additional_auth_scopes: Vec::new(),
         },
         ..Default::default()
     };
@@ -92,6 +93,7 @@ async fn test_login_correct_token_succeeds() {
             oidc_token_endpoint: String::new(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+                    additional_auth_scopes: Vec::new(),
         },
         ..Default::default()
     };
@@ -191,6 +193,7 @@ async fn test_new_proxy_registration_auto_port() {
         metas: None,
         multiplexer: None,
         virtual_net: None,
+                    proxy_protocol_version: None,
     });
     write_msg_v1(&mut stream, &np).await.expect("send NewProxy");
 
@@ -253,6 +256,7 @@ async fn test_new_proxy_duplicate_name_fails() {
         metas: None,
         multiplexer: None,
         virtual_net: None,
+                    proxy_protocol_version: None,
     });
 
     // First registration — should succeed
@@ -341,6 +345,7 @@ async fn test_vhost_location_routing() {
         metas: None,
         multiplexer: None,
         virtual_net: None,
+                    proxy_protocol_version: None,
     });
     write_msg_v1(&mut provider, &np).await.expect("send NewProxy");
     match read_msg_v1(&mut provider).await.expect("read NewProxyResp") {
@@ -440,6 +445,7 @@ async fn test_vhost_location_path_mismatch_404() {
         metas: None,
         multiplexer: None,
         virtual_net: None,
+                    proxy_protocol_version: None,
     });
     write_msg_v1(&mut provider, &np).await.expect("send NewProxy");
     match read_msg_v1(&mut provider).await.expect("read NewProxyResp") {

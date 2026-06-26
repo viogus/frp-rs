@@ -208,6 +208,11 @@ pub struct AuthServerConfig {
     pub oidc_skip_expiry: bool,
     #[serde(default, alias = "oidcSkipIssuer")]
     pub oidc_skip_issuer: bool,
+    /// Additional auth scopes: "HeartBeats", "NewWorkConns".
+    /// When listed, corresponding message types require authentication.
+    /// Go frp compat: additionalAuthScopes.
+    #[serde(default, alias = "additionalAuthScopes")]
+    pub additional_auth_scopes: Vec<String>,
 }
 
 impl Default for AuthServerConfig {
@@ -220,6 +225,7 @@ impl Default for AuthServerConfig {
             oidc_token_endpoint: String::new(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+            additional_auth_scopes: Vec::new(),
         }
     }
 }
@@ -348,6 +354,12 @@ pub struct PluginConfig {
     /// TLS key file for plugin listener (https2http, https2https).
     #[serde(default, alias = "pluginKeyPath", alias = "plugin_key_path")]
     pub key_file: String,
+    /// Server name for STCP/XTCP visitor plugin (Go frp compat: serverName).
+    #[serde(default, alias = "serverName")]
+    pub server_name: String,
+    /// Secret key for STCP/XTCP visitor plugin auth (Go frp compat: sk).
+    #[serde(default, alias = "sk")]
+    pub secret_key: String,
 }
 
 
@@ -387,6 +399,11 @@ pub struct AuthClientConfig {
     /// Go frp compat: insecure_skip_verify.
     #[serde(default)]
     pub oidc_tls_insecure_skip_verify: bool,
+    /// Additional auth scopes: "HeartBeats", "NewWorkConns".
+    /// Client-side scopes, unioned with server's scopes.
+    /// Go frp compat: additionalAuthScopes.
+    #[serde(default, alias = "additionalAuthScopes")]
+    pub additional_auth_scopes: Vec<String>,
 }
 
 impl Default for AuthClientConfig {
@@ -403,6 +420,7 @@ impl Default for AuthClientConfig {
             additional_endpoint_params: String::new(),
             oidc_tls_trusted_ca_file: String::new(),
             oidc_tls_insecure_skip_verify: false,
+            additional_auth_scopes: Vec::new(),
         }
     }
 }
@@ -422,6 +440,10 @@ pub struct ClientConfig {
     pub user: String,
     #[serde(default)]
     pub client_id: String,
+    /// Client-level metadata sent in the Login message.
+    /// Go frp compat: metadatas.
+    #[serde(default, alias = "metadatas")]
+    pub metas: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub tls_enable: bool,
     #[serde(default)]
@@ -464,6 +486,7 @@ impl Default for ClientConfig {
             auth: None,
             user: String::new(),
             client_id: String::new(),
+            metas: std::collections::HashMap::new(),
             tls_enable: false,
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
@@ -545,6 +568,9 @@ pub struct ProxyConfig {
     pub health_check_type: String,
     #[serde(default = "default_health_check_url")]
     pub health_check_url: String,
+    /// Custom HTTP headers for health check requests (Go frp compat: healthCheckHttpHeaders).
+    #[serde(default, alias = "healthCheckHttpHeaders")]
+    pub health_check_http_headers: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub health_check_interval_seconds: u64,
     #[serde(default)]
@@ -556,6 +582,10 @@ pub struct ProxyConfig {
     /// Empty string (default) means the default (global) network.
     #[serde(default)]
     pub virtual_net: String,
+    /// PROXY protocol version: "v1", "v2", or "" (disabled).
+    /// Go frp compat: proxyProtocolVersion.
+    #[serde(default, alias = "proxyProtocolVersion")]
+    pub proxy_protocol_version: String,
 }
 
 /// STCP/XTCP visitor configuration — used by frpc to expose a local port

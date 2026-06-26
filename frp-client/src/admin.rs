@@ -21,6 +21,7 @@ pub struct ProxyRuntimeInfo {
     pub use_compression: bool,
     pub bandwidth_limit: u64,
     pub bandwidth_limit_mode: String,
+    pub proxy_protocol_version: String,
 }
 
 // --- Types ---

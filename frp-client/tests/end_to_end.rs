@@ -158,6 +158,8 @@ async fn test_e2e_tcp_proxy_over_websocket() {
             health_check_timeout_seconds: 0,
             health_check_max_failed: 0,
             virtual_net: String::new(),
+            health_check_http_headers: std::collections::HashMap::new(),
+            proxy_protocol_version: String::new(),
         }],
         ..Default::default()
     };
@@ -216,6 +218,7 @@ async fn test_e2e_tcp_proxy_over_tls() {
             oidc_token_endpoint: String::new(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+                    additional_auth_scopes: Vec::new(),
         },
         tls_enable: true,
         tls_cert_file: cert_dir.join("server.crt").to_string_lossy().into(),
@@ -279,6 +282,8 @@ async fn test_e2e_tcp_proxy_over_tls() {
             health_check_timeout_seconds: 0,
             health_check_max_failed: 0,
             virtual_net: String::new(),
+            health_check_http_headers: std::collections::HashMap::new(),
+            proxy_protocol_version: String::new(),
         }],
         ..Default::default()
     };
@@ -376,6 +381,8 @@ async fn test_e2e_tcp_proxy_over_yamux() {
             health_check_timeout_seconds: 0,
             health_check_max_failed: 0,
             virtual_net: String::new(),
+            health_check_http_headers: std::collections::HashMap::new(),
+            proxy_protocol_version: String::new(),
         }],
         ..Default::default()
     };
