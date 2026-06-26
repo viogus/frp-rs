@@ -337,6 +337,11 @@ pub struct ServerTransportConfig {
     pub tcp_mux: bool,
     #[serde(default)]
     pub tcp_mux_keepalive_interval: i64,
+    /// Heartbeat timeout in seconds. Server disconnects if no Ping
+    /// received within this interval. Default: 90.
+    /// Go frp compat: transport.heartbeatTimeout.
+    #[serde(default = "default_heartbeat_timeout", alias = "heartbeatTimeout")]
+    pub heartbeat_timeout: i64,
 }
 
 impl Default for ServerTransportConfig {
@@ -344,9 +349,12 @@ impl Default for ServerTransportConfig {
         Self {
             tcp_mux: true,
             tcp_mux_keepalive_interval: 30,
+            heartbeat_timeout: default_heartbeat_timeout(),
         }
     }
 }
+
+fn default_heartbeat_timeout() -> i64 { 90 }
 // ---------------------------------------------------------------
 // Plugin Configuration
 // ---------------------------------------------------------------
@@ -531,6 +539,10 @@ pub struct ClientConfig {
     pub login_fail_exit: bool,
     #[serde(default)]
     pub pool_count: i32,
+    /// Ping interval in seconds. Client sends a heartbeat Ping at this
+    /// interval. Default: 30. Go frp compat: transport.heartbeatInterval.
+    #[serde(default = "default_heartbeat_interval", alias = "heartbeatInterval")]
+    pub heartbeat_interval: i64,
     #[serde(default)]
     pub dns_server: String,
     /// TCP keepalive interval in seconds for outbound connections to the
@@ -582,6 +594,7 @@ impl Default for ClientConfig {
             log: LogConfig::default(),
             login_fail_exit: true,
             pool_count: 0,
+            heartbeat_interval: default_heartbeat_interval(),
             dns_server: String::new(),
             dial_server_keepalive: 0,
             connect_server_local_ip: String::new(),
@@ -598,6 +611,7 @@ impl Default for ClientConfig {
 fn default_server_port() -> u16 { 7000 }
 fn default_transport_protocol() -> String { "tcp".into() }
 fn default_true() -> bool { true }
+fn default_heartbeat_interval() -> i64 { 30 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProxyConfig {
@@ -676,6 +690,10 @@ pub struct ProxyConfig {
     /// Go frp compat: proxyProtocolVersion.
     #[serde(default, alias = "proxyProtocolVersion")]
     pub proxy_protocol_version: String,
+    /// Whether this proxy is enabled. Disabled proxies are not started.
+    /// Go frp compat: enabled. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 /// STCP/XTCP visitor configuration — used by frpc to expose a local port
@@ -721,8 +739,24 @@ pub struct VisitorConfig {
     /// Compress the tunnel traffic.
     #[serde(default)]
     pub use_compression: bool,
+    /// Keep XTCP tunnel open after connection ends. When true, the
+    /// visitor retries NAT hole punching instead of falling back to STCP.
+    /// Go frp compat: keepTunnelOpen.
+    #[serde(default, alias = "keepTunnelOpen")]
+    pub keep_tunnel_open: bool,
+    /// Maximum XTCP NAT hole punch retries per hour.
+    /// Go frp compat: maxRetriesAnHour. Default: 8.
+    #[serde(default = "default_max_retries_an_hour", alias = "maxRetriesAnHour")]
+    pub max_retries_an_hour: i32,
+    /// Minimum interval in seconds between XTCP retry attempts.
+    /// Go frp compat: minRetryInterval. Default: 30.
+    #[serde(default = "default_min_retry_interval", alias = "minRetryInterval")]
+    pub min_retry_interval: i64,
 }
 
+
+fn default_max_retries_an_hour() -> i32 { 8 }
+fn default_min_retry_interval() -> i64 { 30 }
 
 /// Normalize a parsed TOML value from Go frp format to frp-rs format.
 /// Handles:
