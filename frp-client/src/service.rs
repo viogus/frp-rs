@@ -307,6 +307,22 @@ impl Service {
         let pool_count = self.cfg.pool_count.max(0);
         let proxies = self.cfg.proxies.clone();
 
+        // Selective proxy start: if `start` is non-empty, only start proxies
+        // whose names are in the start list. Go frp compat.
+        let proxies: Vec<frp_core::config::ProxyConfig> = if self.cfg.start.is_empty() {
+            proxies
+        } else {
+            let start_set: std::collections::HashSet<&str> = self.cfg.start.iter().map(|s| s.as_str()).collect();
+            let filtered: Vec<_> = proxies.into_iter().filter(|p| start_set.contains(p.name.as_str())).collect();
+            info!(
+                "Selective proxy start: {} of {} proxies active (start={:?})",
+                filtered.len(),
+                self.cfg.proxies.len(),
+                self.cfg.start,
+            );
+            filtered
+        };
+
         if proxies.is_empty() {
             warn!("No proxies configured");
         }
@@ -411,6 +427,7 @@ impl Service {
                 self.cfg.v2,
                 self.oidc_client.clone(),
                 self.cfg.metas.clone(),
+                self.cfg.proxy_url.clone(),
             );
 
             let (mut control_stream, run_id, yamux_session) = match ctl.login().await {
@@ -525,6 +542,7 @@ impl Service {
                     self.cfg.disable_custom_tls_first_byte,
                     self.cfg.dial_server_keepalive.max(0) as u64,
                     if self.cfg.connect_server_local_ip.is_empty() { None } else { Some(self.cfg.connect_server_local_ip.clone()) },
+                    self.cfg.proxy_url.clone(),
                 );
             }
 
@@ -585,6 +603,7 @@ impl Service {
                                     self.cfg.disable_custom_tls_first_byte,
                     self.cfg.dial_server_keepalive.max(0) as u64,
                     if self.cfg.connect_server_local_ip.is_empty() { None } else { Some(self.cfg.connect_server_local_ip.clone()) },
+                    self.cfg.proxy_url.clone(),
                                 );
                             }
                             Ok(FrpMessage::Pong(_)) => {
@@ -912,6 +931,7 @@ fn spawn_work_conn(
     disable_custom_tls_first_byte: bool,
     keepalive_secs: u64,
     bind_addr: Option<String>,
+    proxy_url: String,
 ) {
     let server_addr = server_addr.to_string();
     let run_id = run_id.to_string();
@@ -922,6 +942,7 @@ fn spawn_work_conn(
     let repl_udp_sockets = udp_sockets.clone();
     let repl_udp_enc_cfg = udp_enc_cfg.clone();
     let repl_proxy_metrics = proxy_metrics.clone();
+    let repl_proxy_url = proxy_url.clone();
 
     tokio::spawn(async move {
         let label = if pool_id >= 0 {
@@ -955,6 +976,7 @@ fn spawn_work_conn(
                 disable_custom_tls_first_byte,
                 keepalive_secs,
                 bind_addr: bind_addr.clone(),
+                proxy_url: if proxy_url.is_empty() { None } else { Some(proxy_url.clone()) },
                 ..Default::default()
             };
             match dial_server(&opts).await {
@@ -1229,6 +1251,7 @@ fn spawn_work_conn(
                 disable_custom_tls_first_byte,
                 keepalive_secs,
                 bind_addr.clone(),
+                repl_proxy_url,
             );
         }
     });

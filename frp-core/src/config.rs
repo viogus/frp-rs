@@ -89,6 +89,12 @@ pub struct ServerConfig {
     /// Experimental feature gates. Go frp compat: [feature] section.
     #[serde(default)]
     pub feature: FeatureConfig,
+    /// Config file include patterns. Each entry is a glob pattern for
+    /// additional TOML/INI config files to merge. Relative to the main
+    /// config file directory.
+    /// Go frp compat: includes.
+    #[serde(default)]
+    pub includes: Vec<String>,
 }
 
 fn default_allow_port_start() -> u16 { 10000 }
@@ -196,6 +202,7 @@ impl Default for ServerConfig {
             udp_packet_size: default_udp_packet_size(),
             http_plugins: Vec::new(),
             feature: FeatureConfig::default(),
+            includes: Vec::new(),
         }
     }
 }
@@ -482,6 +489,27 @@ pub struct ClientConfig {
     /// Go frp compat: metadatas.
     #[serde(default, alias = "metadatas")]
     pub metas: std::collections::HashMap<String, String>,
+    /// Upstream proxy URL for the client→server control connection.
+    /// Supports http://, socks5:// schemes. Empty = direct connection.
+    /// Go frp compat: transport.proxyURL.
+    #[serde(default, alias = "proxyURL")]
+    pub proxy_url: String,
+    /// Custom STUN server address for NAT traversal.
+    /// Format: "stun:host:port". Empty = use default.
+    /// Go frp compat: natHoleStunServer.
+    #[serde(default, alias = "natHoleStunServer")]
+    pub nat_hole_stun_server: String,
+    /// Selective proxy start: if non-empty, only proxies with names in this
+    /// list are started. Empty = start all proxies.
+    /// Go frp compat: start.
+    #[serde(default)]
+    pub start: Vec<String>,
+    /// Config file include patterns. Each entry is a glob pattern for
+    /// additional TOML/INI config files to merge. Relative to the main
+    /// config file directory.
+    /// Go frp compat: includes.
+    #[serde(default)]
+    pub includes: Vec<String>,
     #[serde(default)]
     pub tls_enable: bool,
     #[serde(default)]
@@ -541,6 +569,10 @@ impl Default for ClientConfig {
             user: String::new(),
             client_id: String::new(),
             metas: std::collections::HashMap::new(),
+            proxy_url: String::new(),
+            nat_hole_stun_server: String::new(),
+            start: Vec::new(),
+            includes: Vec::new(),
             tls_enable: false,
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
@@ -900,16 +932,184 @@ fn normalize_client_config(value: &mut toml::Value) {
     }
 }
 
-/// Load a TOML server configuration from a file path.
+/// Load a TOML server configuration from a file path, processing includes.
 pub fn load_server_config(path: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)?;
-    load_server_config_from_str(&content)
+    let mut value: toml::Value = toml::from_str(&content)?;
+    let base_dir = Path::new(path).parent().unwrap_or(Path::new("."));
+    process_includes(&mut value, base_dir)?;
+    normalize_server_config(&mut value);
+    let json_value = toml_to_json(value);
+    let cfg: ServerConfig = serde_json::from_value(json_value)?;
+    Ok(cfg)
 }
 
-/// Load a TOML client configuration from a file path.
+/// Load a TOML client configuration from a file path, processing includes.
 pub fn load_client_config(path: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)?;
-    load_client_config_from_str(&content)
+    let mut value: toml::Value = toml::from_str(&content)?;
+    let base_dir = Path::new(path).parent().unwrap_or(Path::new("."));
+    process_includes(&mut value, base_dir)?;
+    normalize_client_config(&mut value);
+    let cfg: ClientConfig = serde_json::from_value(toml_to_json(value))?;
+    Ok(cfg)
+}
+
+/// Process `includes` directives in a TOML config: for each glob pattern,
+/// find matching files relative to `base_dir`, parse each, and deep-merge
+/// into the main config. Removes the `includes` key after processing.
+fn process_includes(
+    value: &mut toml::Value,
+    base_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use toml::Value;
+
+    let table = match value.as_table_mut() {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+
+    // Extract includes list (support both "includes" and "include" keys)
+    let patterns: Vec<String> = match table.remove("includes")
+        .or_else(|| table.remove("include"))
+    {
+        Some(Value::Array(arr)) => arr
+            .into_iter()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        Some(Value::String(s)) => vec![s],
+        _ => Vec::new(),
+    };
+
+    if patterns.is_empty() {
+        return Ok(());
+    }
+
+    for pattern in &patterns {
+        let full_pattern = if Path::new(pattern).is_absolute() {
+            pattern.clone()
+        } else {
+            base_dir.join(pattern).to_string_lossy().to_string()
+        };
+
+        let paths = match simple_glob(&full_pattern) {
+            Ok(paths) => paths,
+            Err(_) => continue,
+        };
+
+        for path in &paths {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("Include file {}: read error: {}", path.display(), e);
+                    continue;
+                }
+            };
+            let inc_value: Value = match toml::from_str(&content) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("Include file {}: parse error: {}", path.display(), e);
+                    continue;
+                }
+            };
+
+            // Deep-merge included config into main config
+            deep_merge_toml(value, &inc_value);
+            tracing::debug!("Merged include file: {}", path.display());
+        }
+    }
+
+    Ok(())
+}
+
+/// Simple glob matching that supports a single `*` wildcard per path component.
+/// Returns sorted list of matching file paths.
+fn simple_glob(pattern: &str) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
+    let pattern_path = Path::new(pattern);
+
+    // Split into: base directory (non-wildcard prefix) + wildcard component
+    let parent = pattern_path.parent().unwrap_or(Path::new("."));
+    let filename_part = pattern_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("*");
+
+    if !filename_part.contains('*') {
+        // No wildcard — check if exact file exists
+        let path = Path::new(pattern);
+        if path.is_file() {
+            return Ok(vec![path.to_path_buf()]);
+        }
+        return Ok(Vec::new());
+    }
+
+    if !parent.exists() || !parent.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    // Build prefix/suffix for matching
+    let (prefix, suffix) = if let Some(pos) = filename_part.find('*') {
+        (&filename_part[..pos], &filename_part[pos + 1..])
+    } else {
+        (filename_part, "")
+    };
+
+    let ext = pattern_path.extension().and_then(|s| s.to_str());
+
+    let mut results = Vec::new();
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        // Match extension
+        if let Some(ext) = ext {
+            if path.extension().and_then(|s| s.to_str()) != Some(ext) {
+                continue;
+            }
+        }
+        // Match prefix and suffix
+        if name.starts_with(prefix) && name.ends_with(suffix) {
+            results.push(path);
+        }
+    }
+
+    results.sort();
+    Ok(results)
+}
+
+/// Deep-merge two TOML values. `base` is mutated to include all keys from `overlay`.
+/// - Scalars: overlay replaces base
+/// - Tables: recursively merged
+/// - Arrays: concatenated (base + overlay)
+fn deep_merge_toml(base: &mut toml::Value, overlay: &toml::Value) {
+    use toml::Value;
+
+    match (base, overlay) {
+        (Value::Table(ref mut base_table), Value::Table(ref overlay_table)) => {
+            for (key, val) in overlay_table {
+                match base_table.get_mut(key) {
+                    Some(base_val) => {
+                        deep_merge_toml(base_val, val);
+                    }
+                    None => {
+                        base_table.insert(key.clone(), val.clone());
+                    }
+                }
+            }
+        }
+        (Value::Array(ref mut base_arr), Value::Array(ref overlay_arr)) => {
+            base_arr.extend(overlay_arr.clone());
+        }
+        (base_val, _) => {
+            *base_val = overlay.clone();
+        }
+    }
 }
 
 
