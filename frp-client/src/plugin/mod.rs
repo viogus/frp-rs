@@ -10,17 +10,13 @@
 //! - `static_file`: Serve static files from a local directory with optional basic auth.
 
 use std::net::SocketAddr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, warn};
 
-use frp_core::config::PluginConfig;
 
 mod http;
 mod socks5;
 mod static_file;
 
-pub(crate) use http::{start_http_proxy, HttpProxyAuth};
+pub(crate) use http::start_http_proxy;
 pub(crate) use socks5::start_socks5_proxy;
 pub(crate) use static_file::start_static_file_proxy;
 

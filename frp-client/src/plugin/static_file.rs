@@ -1,12 +1,10 @@
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, warn};
 
 use frp_core::config::PluginConfig;
 
-use super::{PluginHandle, base64_decode, urlencoding_decode};
+use super::{PluginHandle, urlencoding_decode};
 use super::http::HttpProxyAuth;
 
 // ---------------------------------------------------------------
