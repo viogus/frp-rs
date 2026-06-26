@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
@@ -14,22 +15,12 @@ use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::mux::YamuxSession;
 use frp_core::transport::{TransportProtocol, DialOptions, dial_server, IoStream};
 
+use frp_core::metrics::ProxyMetricsRegistry;
+
 use crate::plugin::{self, PluginHandle};
 use crate::proxy;
 use crate::control::ControlConnection;
-
-/// Proxy config needed at runtime for work connections.
-#[derive(Clone)]
-struct ProxyRuntimeInfo {
-    local_addr: String,
-    proxy_type: String,
-    use_encryption: bool,
-    use_compression: bool,
-    /// Bandwidth limit in bytes/sec (0 = unlimited).
-    bandwidth_limit: u64,
-    /// Bandwidth limit mode: "client", "server", or "both".
-    bandwidth_limit_mode: String,
-}
+use crate::admin::{AdminState, ReloadRequest, ProxyRuntimeInfo};
 
 /// The main frpc service.
 pub struct Service {
@@ -42,10 +33,14 @@ pub struct Service {
     _plugin_handles: Vec<PluginHandle>,
     /// OIDC client for fetching access tokens (None when auth method is Token).
     oidc_client: Option<Arc<OidcClient>>,
+    /// Per-proxy traffic metrics for admin API.
+    proxy_metrics: Arc<ProxyMetricsRegistry>,
+    /// Path to config file for admin reload/config endpoints.
+    config_file: Option<String>,
 }
 
 impl Service {
-    pub async fn new(cfg: ClientConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(cfg: ClientConfig, config_file: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
         // Determine auth method from [auth] section if present, otherwise token
         let auth_method = if let Some(ref ac) = cfg.auth {
             if ac.method == "oidc" { AuthMethod::Oidc } else { AuthMethod::Token }
@@ -159,6 +154,8 @@ impl Service {
             proxy_info_map,
             _plugin_handles: plugin_handles,
             oidc_client,
+            proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
+            config_file,
         })
     }
 
@@ -213,6 +210,37 @@ impl Service {
             tokio::spawn(async move {
                 run_health_check(pn, la, hc_type, hc_url, interval, timeout, max_failed, tx).await;
             });
+        }
+
+        // Start admin HTTP server if configured
+        let (reload_tx, mut reload_rx) = mpsc::unbounded_channel::<ReloadRequest>();
+        let (stop_tx, mut stop_rx) = mpsc::unbounded_channel::<()>();
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+
+        if self.cfg.web_server.port > 0 {
+            let admin_addr = frp_core::format_socket_addr(
+                &self.cfg.web_server.addr,
+                self.cfg.web_server.port,
+            );
+            let admin_state = AdminState {
+                proxy_metrics: self.proxy_metrics.clone(),
+                proxies: Arc::new(tokio::sync::RwLock::new(
+                    self.proxy_info_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                )),
+                reload_tx: reload_tx.clone(),
+                stop_tx: stop_tx.clone(),
+                config_path: self.config_file.clone(),
+            };
+            let admin_auth_user = self.cfg.web_server.user.clone();
+            let admin_auth_pwd = self.cfg.web_server.password.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::admin::run_admin_server(
+                    admin_addr, admin_state, admin_auth_user, admin_auth_pwd,
+                ).await {
+                    tracing::error!("frpc admin server failed: {}", e);
+                }
+            });
+            info!("frpc admin server starting on {}:{}", self.cfg.web_server.addr, self.cfg.web_server.port);
         }
 
         // Main session loop with reconnection
@@ -335,6 +363,7 @@ impl Service {
                     self.oidc_client.clone(),
                     udp_sockets.clone(),
                     udp_enc_cfg.clone(),
+                    self.proxy_metrics.clone(),
                 );
             }
 
@@ -387,6 +416,7 @@ impl Service {
                                     self.oidc_client.clone(),
                                     udp_sockets.clone(),
                                     udp_enc_cfg.clone(),
+                                    self.proxy_metrics.clone(),
                                 );
                             }
                             Ok(FrpMessage::Pong(_)) => {
@@ -537,11 +567,68 @@ impl Service {
                             warn!("Failed to send CloseProxy for {}: {}", proxy_name, e);
                         }
                     }
+
+                    Some(req) = reload_rx.recv() => {
+                        let result = match &self.config_file {
+                            Some(path) => self.try_reload(path, req.strict).await,
+                            None => Err("no config file path stored".into()),
+                        };
+                        let _ = req.reply.send(result);
+                    }
+
+                    Some(()) = stop_rx.recv() => {
+                        info!("Admin stop requested, shutting down");
+                        shutdown_flag.store(true, Ordering::SeqCst);
+                        break;
+                    }
                 }
+            }
+
+            // Check if admin stop was requested
+            if shutdown_flag.load(Ordering::SeqCst) {
+                info!("frpc shutting down");
+                return Ok(());
             }
 
             // Reconnect delay (login_fail_exit only applies to initial login, not session drops)
             tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    }
+
+    /// Reload configuration from file. Used by admin API.
+    pub async fn try_reload(&self, config_path: &str, strict: bool) -> Result<String, String> {
+        let _new_cfg: ClientConfig = frp_core::config::load_client_config(config_path)
+            .map_err(|e| format!("failed to load config: {e}"))?;
+
+        // For initial implementation: reload config file, diff proxy list, log changes.
+        // Full re-registration deferred (requires refactoring control connection access).
+        let mut changes: Vec<String> = Vec::new();
+
+        let old_names: std::collections::HashSet<&str> =
+            self.proxy_info_map.keys().map(|s| s.as_str()).collect();
+        let new_names: std::collections::HashSet<&str> =
+            _new_cfg.proxies.iter().map(|p| p.name.as_str()).collect();
+
+        let removed: Vec<&str> = old_names.difference(&new_names).copied().collect();
+        for name in &removed {
+            if strict { return Err(format!("proxy '{}' removed — restart required for full re-registration", name)); }
+            changes.push(format!("proxy '{}' removed (restart required)", name));
+            tracing::info!("Reload: proxy '{}' removed", name);
+        }
+
+        let added: Vec<&str> = new_names.difference(&old_names).copied().collect();
+        for name in &added {
+            if strict { return Err(format!("proxy '{}' added — restart required for full re-registration", name)); }
+            changes.push(format!("proxy '{}' added (restart required)", name));
+            tracing::info!("Reload: proxy '{}' added", name);
+        }
+
+        if changes.is_empty() {
+            Ok("reload success: no changes detected".into())
+        } else {
+            let summary = changes.join("; ");
+            tracing::info!("Config reload summary: {}", summary);
+            Ok(format!("reload success: {}", summary))
         }
     }
 }
@@ -577,6 +664,7 @@ fn spawn_work_conn(
     oidc_client: Option<Arc<OidcClient>>,
     udp_sockets: Arc<tokio::sync::Mutex<HashMap<String, Arc<UdpSocket>>>>,
     udp_enc_cfg: Arc<tokio::sync::Mutex<HashMap<String, (bool, bool)>>>,
+    proxy_metrics: Arc<ProxyMetricsRegistry>,
 ) {
     let server_addr = server_addr.to_string();
     let run_id = run_id.to_string();
@@ -586,6 +674,7 @@ fn spawn_work_conn(
     // Clone for replenishment call (used after async block consumes originals)
     let repl_udp_sockets = udp_sockets.clone();
     let repl_udp_enc_cfg = udp_enc_cfg.clone();
+    let repl_proxy_metrics = proxy_metrics.clone();
 
     tokio::spawn(async move {
         let label = if pool_id >= 0 {
@@ -800,7 +889,7 @@ fn spawn_work_conn(
                     match proxy::connect_local(&info.local_addr).await {
                         Ok(local) => {
                             let enc = if info.use_encryption { Some(&enc_key) } else { None };
-                            proxy::bridge_streams(local, work, proxy_name, info.use_encryption, info.use_compression, enc, info.bandwidth_limit, &info.bandwidth_limit_mode).await;
+                            proxy::bridge_streams(local, work, proxy_name, info.use_encryption, info.use_compression, enc, info.bandwidth_limit, &info.bandwidth_limit_mode, proxy_metrics).await;
                         }
                         Err(e) => {
                             warn!("Work conn {}: failed to connect to local {}: {}", label, info.local_addr, e);
@@ -837,6 +926,7 @@ fn spawn_work_conn(
                 oidc_client,
                 repl_udp_sockets,
                 repl_udp_enc_cfg,
+                repl_proxy_metrics,
             );
         }
     });

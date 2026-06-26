@@ -160,7 +160,7 @@ async fn test_e2e_tcp_proxy_over_websocket() {
         }],
         ..Default::default()
     };
-    let client_svc = ClientService::new(client_cfg).await.expect("create client");
+    let client_svc = ClientService::new(client_cfg, None).await.expect("create client");
     let _client = tokio::spawn(async move { let _ = client_svc.run().await; });
 
     // 4. Wait for proxy port
@@ -280,7 +280,7 @@ async fn test_e2e_tcp_proxy_over_tls() {
         }],
         ..Default::default()
     };
-    let client_svc = ClientService::new(client_cfg).await.expect("create client");
+    let client_svc = ClientService::new(client_cfg, None).await.expect("create client");
     let _client = tokio::spawn(async move { let _ = client_svc.run().await; });
 
     // 4. Wait for proxy port
@@ -376,7 +376,7 @@ async fn test_e2e_tcp_proxy_over_yamux() {
         }],
         ..Default::default()
     };
-    let client_svc = ClientService::new(client_cfg).await.expect("create client");
+    let client_svc = ClientService::new(client_cfg, None).await.expect("create client");
     let _client = tokio::spawn(async move { let _ = client_svc.run().await; });
 
     // 4. Wait for proxy port

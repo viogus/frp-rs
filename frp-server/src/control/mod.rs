@@ -15,7 +15,6 @@ use frp_core::mux::IncomingStreams;
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
 
-use crate::metrics::ServerMetrics;
 use crate::service::{AppState, InternalMsg, ControlTx};
 
 /// Max age of a pending request before it is dropped (Go frp: 10s default).
@@ -30,7 +29,6 @@ const WORK_POOL_EXTRA: usize = 10;
 /// A pending request from a proxy listener waiting for a work connection.
 pub(super) struct PendingRequest {
     proxy_name: String,
-    proxy_type: String,
     user_conn: IoStream,
     pre_read: Vec<u8>,
     use_encryption: bool,
@@ -93,11 +91,6 @@ pub async fn handle_control<S>(
     let run_id = login.run_id.clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     info!("Client {:?} logged in with run_id: {}", peer, run_id);
-
-    // Track new client in metrics
-    if let Some(ref m) = state.metrics {
-        m.new_client();
-    }
 
     // Store OIDC subject for ping/NWC verification
     if let Some(ref sub) = oidc_subject {
@@ -190,15 +183,10 @@ pub async fn handle_control<S>(
                         // Check if a UDP proxy needs this work connection
                         if let Some((proxy_name, _)) = pending_udp.pop_front() {
                             info!("Assigning work conn to UDP proxy '{}'", proxy_name);
-                            let proxy_info = state.proxy_manager.get(&proxy_name).await;
-                            let proxy_type = proxy_info.as_ref()
-                                .map(|p| p.proxy_type.clone())
-                                .unwrap_or_else(|| "udp".to_string());
-                            let local_addr = proxy_info
+                            let local_addr = state.proxy_manager.get(&proxy_name).await
                                 .and_then(|info| info.local_addr)
                                 .and_then(|s| msg::UdpAddr::from_string(&s));
-                            let metrics = state.metrics.clone();
-                            bridge::assign_udp_work_conn(stream, &proxy_name, &proxy_type, &udp_sockets, local_addr, metrics).await;
+                            bridge::assign_udp_work_conn(stream, &proxy_name, &udp_sockets, local_addr).await;
                         } else {
                             // Drain expired TCP requests
                             while let Some(req) = pending_requests.front() {
@@ -209,7 +197,7 @@ pub async fn handle_control<S>(
                                 }
                             }
                             if let Some(req) = pending_requests.pop_front() {
-                                bridge::assign_work_to_proxy(stream, req, state.reloadable.read().await.encryption_key, state.metrics.clone()).await;
+                                bridge::assign_work_to_proxy(stream, req, state.reloadable.read().await.encryption_key, state.clone()).await;
                             } else if work_pool.len() < pool_cap {
                                 work_pool.push_back(stream);
                                 debug!("Work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
@@ -220,22 +208,21 @@ pub async fn handle_control<S>(
                     }
                     Some(InternalMsg::VisitorConn { proxy_name, visitor_conn }) => {
                         debug!("STCP visitor conn for proxy {} on run_id {}", proxy_name, run_id);
-                        let (enc, comp, proxy_type) = {
+                        let (enc, comp) = {
                             let p = state.proxy_manager.get(&proxy_name).await;
                             let e = p.as_ref().map(|p| p.use_encryption).unwrap_or(false);
                             let c = p.as_ref().map(|p| p.use_compression).unwrap_or(false);
-                            let pt = p.as_ref().map(|p| p.proxy_type.clone()).unwrap_or_else(|| "stcp".into());
-                            (e, c, pt)
+                            (e, c)
                         };
                         if let Some(work_conn) = work_pool.pop_front() {
-                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name, proxy_type, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now() }, state.reloadable.read().await.encryption_key, state.metrics.clone()).await;
+                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now() }, state.reloadable.read().await.encryption_key, state.clone()).await;
                         } else {
                             debug!("No pooled work conn for STCP, sending ReqWorkConn");
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
                                 warn!("Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
-                            pending_requests.push_back(PendingRequest { proxy_name, proxy_type, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now() });
+                            pending_requests.push_back(PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now() });
                         }
                     }
                     Some(InternalMsg::ProxyUserConn { proxy_name, user_conn, pre_read }) => {
@@ -275,22 +262,21 @@ pub async fn handle_control<S>(
                             warn!("Group backend run_id {} not found for proxy {}", target_run_id, target_proxy);
                             continue;
                         }
-                        let (enc, comp, proxy_type) = {
+                        let (enc, comp) = {
                             let p = state.proxy_manager.get(&target_proxy).await;
                             let e = p.as_ref().map(|p| p.use_encryption).unwrap_or(false);
                             let c = p.as_ref().map(|p| p.use_compression).unwrap_or(false);
-                            let pt = p.as_ref().map(|p| p.proxy_type.clone()).unwrap_or_else(|| "tcp".into());
-                            (e, c, pt)
+                            (e, c)
                         };
                         if let Some(work_conn) = work_pool.pop_front() {
-                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name: target_proxy, proxy_type, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() }, state.reloadable.read().await.encryption_key, state.metrics.clone()).await;
+                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() }, state.reloadable.read().await.encryption_key, state.clone()).await;
                         } else {
                             debug!("No pooled work conn, sending ReqWorkConn for {}", target_proxy);
                             if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
                                 warn!("Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
-                            pending_requests.push_back(PendingRequest { proxy_name: target_proxy, proxy_type, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() });
+                            pending_requests.push_back(PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() });
                         }
                     }
                     Some(InternalMsg::UdpNeedsWorkConn { proxy_name }) => {
@@ -380,7 +366,7 @@ pub async fn handle_control<S>(
                         }
                     }
                     if let Some(req) = pending_requests.pop_front() {
-                        bridge::assign_work_to_proxy(io, req, state.reloadable.read().await.encryption_key, state.metrics.clone()).await;
+                        bridge::assign_work_to_proxy(io, req, state.reloadable.read().await.encryption_key, state.clone()).await;
                     } else if work_pool.len() < pool_cap {
                         work_pool.push_back(io);
                         debug!("Yamux work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
@@ -656,9 +642,6 @@ pub async fn handle_control<S>(
     }
 
     // Cleanup
-    if let Some(ref m) = state.metrics {
-        m.close_client();
-    }
     for (_, handle) in listener_handles.drain() {
         handle.abort();
     }

@@ -1,94 +1,144 @@
 use std::sync::Arc;
-use axum::{Router, Json, extract::State, response::Html, response::IntoResponse};
+use axum::{Router, Json, extract::{State, Path}, response::Html, routing::get};
 use serde::Serialize;
 use crate::service::AppState;
+use frp_core::admin_auth::apply_admin_auth;
+use frp_core::metrics::MetricsSnapshot;
 
 #[derive(Serialize)]
 struct StatusResponse {
     version: String,
     uptime_secs: u64,
-    client_count: i64,
-    proxy_count: i64,
-    connection_count: i64,
-    traffic_in: u64,
-    traffic_out: u64,
+    client_count: usize,
+    proxy_count: usize,
 }
 
 #[derive(Serialize)]
 struct ProxyEntry {
     name: String,
+    #[serde(rename = "type")]
     proxy_type: String,
+    status: String,
     remote_port: Option<u16>,
     local_addr: Option<String>,
     traffic_in: u64,
     traffic_out: u64,
-    connections: i64,
 }
+
+#[derive(Serialize)]
+struct ProxyDetail {
+    name: String,
+    #[serde(rename = "type")]
+    proxy_type: String,
+    status: String,
+    run_id: Option<String>,
+    remote_port: Option<u16>,
+    local_addr: Option<String>,
+    use_encryption: bool,
+    use_compression: bool,
+    custom_domains: Vec<String>,
+    multiplexer: String,
+    group: String,
+    traffic: MetricsSnapshot,
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+// --- Handlers ---
 
 async fn handle_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let uptime = state.dashboard_start.elapsed().as_secs();
-
-    let stats = state.metrics.as_ref().map(|m| m.mem_backend().server_stats());
-    let (client_count, proxy_count, connection_count, traffic_in, traffic_out) = match stats {
-        Some(s) => (s.client_count, s.proxy_count, s.connection_count, s.traffic_in, s.traffic_out),
-        None => {
-            let client_count = state.run_id_to_ctl_tx.read().await.len() as i64;
-            let proxy_count = state.proxy_manager.list().await.len() as i64;
-            (client_count, proxy_count, 0i64, 0u64, 0u64)
-        }
-    };
-
+    let client_count = state.run_id_to_ctl_tx.read().await.len();
+    let proxies = state.proxy_manager.list().await;
     Json(StatusResponse {
         version: frp_core::VERSION.to_string(),
         uptime_secs: uptime,
         client_count,
-        proxy_count,
-        connection_count,
-        traffic_in,
-        traffic_out,
+        proxy_count: proxies.len(),
     })
 }
 
 async fn handle_proxies(State(state): State<Arc<AppState>>) -> Json<Vec<ProxyEntry>> {
-    // Use mem backend stats when available (includes traffic data)
-    let mem_list = state.metrics.as_ref()
-        .map(|m| m.mem_backend().proxy_stats_list())
-        .unwrap_or_default();
-
-    if !mem_list.is_empty() {
-        let entries: Vec<ProxyEntry> = mem_list.into_iter().map(|p| ProxyEntry {
-            name: p.name,
-            proxy_type: p.proxy_type,
-            remote_port: None,
-            local_addr: None,
-            traffic_in: p.traffic_in,
-            traffic_out: p.traffic_out,
-            connections: p.connections,
-        }).collect();
-        return Json(entries);
-    }
-
-    // Fallback: read from proxy_manager when no metrics data
     let proxies = state.proxy_manager.list().await;
-    let entries: Vec<ProxyEntry> = proxies.into_iter().map(|p| ProxyEntry {
-        name: p.name,
-        proxy_type: p.proxy_type,
-        remote_port: p.remote_port,
-        local_addr: p.local_addr,
-        traffic_in: 0,
-        traffic_out: 0,
-        connections: 0,
-    }).collect();
+    let mut entries = Vec::new();
+    for p in &proxies {
+        let online = state.run_id_to_ctl_tx.read().await.contains_key(&p.run_id);
+        let traffic = state.proxy_metrics.get(&p.name).await
+            .map(|m| m.snapshot())
+            .unwrap_or_else(|| MetricsSnapshot {
+                bytes_in: 0, bytes_out: 0, current_conns: 0, total_conns: 0,
+            });
+        entries.push(ProxyEntry {
+            name: p.name.clone(),
+            proxy_type: p.proxy_type.clone(),
+            status: if online { "online".into() } else { "offline".into() },
+            remote_port: p.remote_port,
+            local_addr: p.local_addr.clone(),
+            traffic_in: traffic.bytes_in,
+            traffic_out: traffic.bytes_out,
+        });
+    }
     Json(entries)
 }
 
-async fn handle_metrics() -> impl IntoResponse {
-    let body = crate::metrics::prom::render_metrics_text();
-    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
+async fn handle_proxy_detail(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<ProxyDetail>, (axum::http::StatusCode, Json<ErrorResponse>)> {
+    let proxy = state.proxy_manager.get(&name).await
+        .ok_or_else(|| (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(ErrorResponse { error: "proxy not found".into() }),
+        ))?;
+
+    let online = state.run_id_to_ctl_tx.read().await.contains_key(&proxy.run_id);
+    let traffic = state.proxy_metrics.get(&name).await
+        .map(|m| m.snapshot())
+        .unwrap_or_else(|| MetricsSnapshot {
+            bytes_in: 0, bytes_out: 0, current_conns: 0, total_conns: 0,
+        });
+
+    Ok(Json(ProxyDetail {
+        name: proxy.name.clone(),
+        proxy_type: proxy.proxy_type.clone(),
+        status: if online { "online".into() } else { "offline".into() },
+        run_id: Some(proxy.run_id.clone()),
+        remote_port: proxy.remote_port,
+        local_addr: proxy.local_addr.clone(),
+        use_encryption: proxy.use_encryption,
+        use_compression: proxy.use_compression,
+        custom_domains: Vec::new(),
+        multiplexer: String::new(),
+        group: proxy.group.unwrap_or_default(),
+        traffic,
+    }))
+}
+
+async fn handle_proxy_traffic(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<MetricsSnapshot>, (axum::http::StatusCode, Json<ErrorResponse>)> {
+    // Verify proxy exists
+    let _proxy = state.proxy_manager.get(&name).await
+        .ok_or_else(|| (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(ErrorResponse { error: "proxy not found".into() }),
+        ))?;
+
+    let traffic = state.proxy_metrics.get(&name).await
+        .map(|m| m.snapshot())
+        .unwrap_or_else(|| MetricsSnapshot {
+            bytes_in: 0, bytes_out: 0, current_conns: 0, total_conns: 0,
+        });
+
+    Ok(Json(traffic))
 }
 
 async fn handle_root() -> Html<String> {
-    Html(format!(r#"<!DOCTYPE html>
+    Html(format!(r##"<!DOCTYPE html>
 <html><head><title>frp-rs Dashboard</title>
 <style>
 body{{font-family:sans-serif;margin:2em;background:#111;color:#eee}}
@@ -101,40 +151,48 @@ pre{{background:#222;padding:1em;border-radius:4px}}
 </style></head><body>
 <h1>frp-rs v{}</h1>
 <div class=card><pre id=status>Loading...</pre></div>
-<div class=card><table id=proxies><tr><th>Name</th><th>Type</th><th>Remote Port</th><th>Local</th></tr></table></div>
+<div class=card><table id=proxies><tr><th>Name</th><th>Type</th><th>Status</th><th>Port</th><th>Traffic In</th><th>Traffic Out</th></tr></table></div>
 <script>
 async function load(){{try{{
 let s=await fetch('/api/status');let d=await s.json();
 document.getElementById('status').textContent=
-  'Uptime: '+d.uptime_secs+'s | Clients: '+d.client_count+' | Proxies: '+d.proxy_count
-  +' | Conns: '+d.connection_count+' | In: '+d.traffic_in+' | Out: '+d.traffic_out;
+  'Uptime: '+d.uptime_secs+'s | Clients: '+d.client_count+' | Proxies: '+d.proxy_count;
 let p=await fetch('/api/proxies');let px=await p.json();
-document.getElementById('proxies').innerHTML='<tr><th>Name</th><th>Type</th><th>Remote Port</th><th>Local</th><th>Traffic In</th><th>Traffic Out</th><th>Conns</th></tr>'+
-  px.map(x=>'<tr><td>'+x.name+'</td><td>'+x.proxy_type+'</td><td>'+(x.remote_port||'-')+'</td><td>'+(x.local_addr||'-')+'</td><td>'+x.traffic_in+'</td><td>'+x.traffic_out+'</td><td>'+x.connections+'</td></tr>').join('');
+let rows=px.map(x=>'<tr><td><a href="#" onclick="loadDetail(\''+x.name+'\')">'+x.name+'</a></td><td>'+x.type+'</td><td>'+x.status+'</td><td>'+(x.remote_port||'-')+'</td><td>'+formatBytes(x.traffic_in)+'</td><td>'+formatBytes(x.traffic_out)+'</td></tr>').join('');
+document.getElementById('proxies').innerHTML='<tr><th>Name</th><th>Type</th><th>Status</th><th>Port</th><th>Traffic In</th><th>Traffic Out</th></tr>'+rows;
 }}catch(e){{setTimeout(load,1000)}}}}
+async function loadDetail(name){{try{{
+let r=await fetch('/api/proxy/'+name);let d=await r.json();
+alert(JSON.stringify(d,null,2));
+}}catch(e){{}}}}
+function formatBytes(b){{if(b<1024)return b+'B';if(b<1048576)return (b/1024).toFixed(1)+'KB';return (b/1048576).toFixed(1)+'MB'}}
 load();setInterval(load,5000);
-</script></body></html>"#, frp_core::VERSION))
+</script></body></html>"##, frp_core::VERSION))
 }
 
-pub async fn run_dashboard(addr: String, state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
-    let addr2 = addr.clone();
-    let enable_prometheus = state.metrics.as_ref()
-        .map(|m| m.backend_count() > 1)
-        .unwrap_or(false);
+pub async fn run_dashboard(
+    addr: String,
+    state: Arc<AppState>,
+    auth_user: String,
+    auth_password: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // API routes
+    let api_routes = Router::new()
+        .route("/api/status", get(handle_status))
+        .route("/api/proxies", get(handle_proxies))
+        .route("/api/proxy/:name", get(handle_proxy_detail))
+        .route("/api/proxy/:name/traffic", get(handle_proxy_traffic));
 
-    let mut app = Router::new()
-        .route("/", axum::routing::get(handle_root))
-        .route("/api/status", axum::routing::get(handle_status))
-        .route("/api/proxies", axum::routing::get(handle_proxies));
+    // Apply auth to API routes only (not HTML page)
+    let api_routes = apply_admin_auth(api_routes, &auth_user, &auth_password);
 
-    if enable_prometheus {
-        app = app.route("/metrics", axum::routing::get(handle_metrics));
-    }
-
-    let app = app.with_state(state);
+    let app = Router::new()
+        .route("/", get(handle_root))
+        .merge(api_routes)
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("Dashboard listening on {}", addr2);
+    tracing::info!("Dashboard listening on {}", addr);
     axum::serve(listener, app).await?;
     Ok(())
 }

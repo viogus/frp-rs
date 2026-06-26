@@ -16,6 +16,7 @@ use frp_core::mux;
 use frp_core::transport::{IoStream, ConnectionType, peek_connection_type, consume_tls_head_byte};
 use frp_core::transport::{build_tls_acceptor, accept_websocket};
 use frp_core::format_socket_addr;
+use frp_core::metrics::ProxyMetricsRegistry;
 
 use crate::proxy::ProxyManager;
 use crate::control;
@@ -101,6 +102,8 @@ pub struct AppState {
     pub sudp_port: u16,
     /// TCPMux HTTP CONNECT route table (domain → proxy mapping).
     pub tcpmux_manager: Arc<TcpMuxManager>,
+    /// Per-proxy traffic metrics for dashboard API.
+    pub proxy_metrics: Arc<ProxyMetricsRegistry>,
 }
 
 impl AppState {
@@ -127,6 +130,7 @@ impl AppState {
             oidc_subjects: Arc::new(RwLock::new(HashMap::new())),
             nat_hole: Arc::new(NatHoleCoordinator::new()),
             tcpmux_manager: Arc::new(TcpMuxManager::new()),
+            proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
             sudp_port,
             metrics: None,
         }
@@ -463,8 +467,10 @@ impl Service {
             let dash_addr = format_socket_addr(&self.cfg.web_server.addr, self.cfg.web_server.port);
             let dash_addr2 = dash_addr.clone();
             let dash_state = self.state.clone();
+            let dash_user = self.cfg.web_server.user.clone();
+            let dash_pwd = self.cfg.web_server.password.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::dashboard::run_dashboard(dash_addr, dash_state).await {
+                if let Err(e) = crate::dashboard::run_dashboard(dash_addr, dash_state, dash_user, dash_pwd).await {
                     tracing::error!("Dashboard server failed: {}", e);
                 }
             });

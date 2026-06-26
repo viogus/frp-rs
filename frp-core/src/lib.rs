@@ -8,6 +8,8 @@ pub mod cipher_stream;
 pub mod mux;
 pub mod bridge;
 pub mod bandwidth;
+pub mod metrics;
+pub mod admin_auth;
 pub mod args;
 pub mod kcp;
 pub mod quic;
