@@ -569,6 +569,85 @@ $extra
 TOML
 }
 
+# ── tcpmux HTTP CONNECT config helpers ──────────────────────
+
+write_rust_frps_config_tcpmux() {
+    local port="$1" token="$2" tcpmux_port="$3" out="$4"
+    local extra="${5:-}"
+    cat > "$out" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $port
+tcpmux_httpconnect_port = $tcpmux_port
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+
+$extra
+TOML
+}
+
+write_go_frps_config_tcpmux() {
+    local port="$1" token="$2" tcpmux_port="$3" out="$4"
+    cat > "$out" <<TOML
+bindAddr = "127.0.0.1"
+bindPort = $port
+tcpmuxHTTPConnectPort = $tcpmux_port
+auth.method = "token"
+auth.token = "$token"
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frps.log"
+log.level = "debug"
+TOML
+}
+
+write_go_frpc_config_tcpmux() {
+    local server_port="$1" token="$2" echo_port="$3" name="$4" domain="$5" out="$6"
+    cat > "$out" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $server_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-$name.log"
+log.level = "debug"
+
+[[proxies]]
+name = "$name"
+type = "tcpmux"
+multiplexer = "httpconnect"
+localIP = "127.0.0.1"
+localPort = $echo_port
+customDomains = ["$domain"]
+TOML
+}
+
+write_rust_frpc_config_tcpmux() {
+    local server_port="$1" token="$2" echo_port="$3" name="$4" domain="$5" out="$6"
+    local extra="${7:-}"
+    cat > "$out" <<TOML
+server_addr = "127.0.0.1"
+server_port = $server_port
+token = "$token"
+tcp_mux = false
+login_fail_exit = true
+pool_count = 1
+
+[[proxies]]
+name = "$name"
+type = "tcpmux"
+multiplexer = "httpconnect"
+local_ip = "127.0.0.1"
+local_port = $echo_port
+custom_domains = ["$domain"]
+
+$extra
+TOML
+}
+
 # ── WebSocket transport config helpers ─────────────────────
 
 write_go_frps_config_ws() {
@@ -2403,6 +2482,192 @@ test_g2r_compression() {
 }
 
 # =============================================================================
+# Test: Go frpc -> Rust frps, tcpmux HTTP CONNECT
+# =============================================================================
+test_g2r_tcpmux() {
+    local name="go-to-rust-tcpmux"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local tcpmux_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-tcpmux"
+    local domain="tcpmux-g2r.local"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    # Start Rust frps with tcpmux HTTP CONNECT port
+    write_rust_frps_config_tcpmux "$frps_port" "$token" "$tcpmux_port" \
+        "$TEST_DIR/$name/frps.toml"
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+    wait_for_port_safe 127.0.0.1 "$tcpmux_port" 5 || {
+        fail_test "$name" "tcpmux port $tcpmux_port not reachable"
+        return
+    }
+
+    # Start Go frpc with tcpmux proxy
+    write_go_frpc_config_tcpmux "$frps_port" "$token" "$echo_port" \
+        "tcpmux-g2r" "$domain" "$TEST_DIR/$name/frpc.toml"
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    sleep 2  # wait for proxy registration
+
+    # HTTP CONNECT through tcpmux port, then echo test
+    local result
+    result=$(python3 -c "
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(10)
+deadline = time.time() + 10
+while True:
+    try:
+        s.connect(('127.0.0.1', $tcpmux_port))
+        break
+    except (ConnectionRefusedError, OSError):
+        if time.time() > deadline:
+            print('FAIL:CONNECT_TIMEOUT')
+            exit(0)
+        time.sleep(0.5)
+# Send CONNECT
+req = b'CONNECT $domain:22 HTTP/1.1\r\nHost: $domain:22\r\n\r\n'
+s.sendall(req)
+# Read HTTP response
+resp = b''
+while b'\r\n\r\n' not in resp:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    resp += chunk
+if not resp.startswith(b'HTTP/1.1 200'):
+    print('FAIL:CONNECT_RESPONSE ' + repr(resp[:200]))
+    s.close()
+    exit(0)
+# Send test data and expect echo
+test_data = b'tcpmux-g2r-echo'
+s.sendall(test_data)
+reply = s.recv(4096)
+s.close()
+if reply == test_data:
+    print('OK:tcpmux-g2r')
+else:
+    print('FAIL:MISMATCH expected=' + repr(test_data) + ' got=' + repr(reply[:200]))
+" 2>&1)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Rust frpc -> Go frps, tcpmux HTTP CONNECT
+# =============================================================================
+test_r2g_tcpmux() {
+    local name="rust-to-go-tcpmux"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local tcpmux_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-r2g-tcpmux"
+    local domain="tcpmux-r2g.local"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    # Start Go frps with tcpmux HTTP CONNECT port
+    write_go_frps_config_tcpmux "$frps_port" "$token" "$tcpmux_port" \
+        "$TEST_DIR/$name/frps.toml"
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+    wait_for_port_safe 127.0.0.1 "$tcpmux_port" 5 || {
+        fail_test "$name" "tcpmux port $tcpmux_port not reachable"
+        return
+    }
+
+    # Start Rust frpc with tcpmux proxy
+    write_rust_frpc_config_tcpmux "$frps_port" "$token" "$echo_port" \
+        "tcpmux-r2g" "$domain" "$TEST_DIR/$name/frpc.toml"
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    sleep 2  # wait for proxy registration
+
+    # HTTP CONNECT through tcpmux port, then echo test
+    local result
+    result=$(python3 -c "
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(10)
+deadline = time.time() + 10
+while True:
+    try:
+        s.connect(('127.0.0.1', $tcpmux_port))
+        break
+    except (ConnectionRefusedError, OSError):
+        if time.time() > deadline:
+            print('FAIL:CONNECT_TIMEOUT')
+            exit(0)
+        time.sleep(0.5)
+# Send CONNECT
+req = b'CONNECT $domain:22 HTTP/1.1\r\nHost: $domain:22\r\n\r\n'
+s.sendall(req)
+# Read HTTP response
+resp = b''
+while b'\r\n\r\n' not in resp:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    resp += chunk
+if not resp.startswith(b'HTTP/1.1 200'):
+    print('FAIL:CONNECT_RESPONSE ' + repr(resp[:200]))
+    s.close()
+    exit(0)
+# Send test data and expect echo
+test_data = b'tcpmux-r2g-echo'
+s.sendall(test_data)
+reply = s.recv(4096)
+s.close()
+if reply == test_data:
+    print('OK:tcpmux-r2g')
+else:
+    print('FAIL:MISMATCH expected=' + repr(test_data) + ' got=' + repr(reply[:200]))
+" 2>&1)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -2471,6 +2736,9 @@ test_r2g_udp
 # while frp-rs has type="sudp" as a distinct proxy type. SUDP logic tested via unit tests.
 test_g2r_http
 test_r2g_http
+# Phase 4b: tcpmux HTTP CONNECT
+test_g2r_tcpmux
+test_r2g_tcpmux
 test_g2r_stcp
 test_r2g_stcp
 # XTCP disabled: Go frp v0.69.1 uses QUIC-based NAT detection + candidate
