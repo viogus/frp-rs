@@ -1,0 +1,53 @@
+name: Cross-Compat
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      go_frp_version:
+        description: 'Go frp version (e.g. 0.69.1)'
+        required: false
+        default: '0.69.1'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+
+    env:
+      GO_FRP_VERSION: ${{ github.event.inputs.go_frp_version || '0.69.1' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/release/
+          key: ${{ runner.os }}-cargo-compat-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-compat-
+
+      - name: Build frp-rs (release)
+        run: cargo build --release --bin frps --bin frpc
+
+      - name: Download Go frp
+        run: bash scripts/download-go-frp.sh "$GO_FRP_VERSION"
+
+      - name: Run compat tests
+        run: bash scripts/compat-test.sh --ci --go-version "$GO_FRP_VERSION"

@@ -17,6 +17,21 @@ RUST_LOG=debug cargo run --bin frps -- -c frps.toml  # Enable debug logging
 - No `cargo check` variation needed — use `cargo build` for the full workspace.
 - Tests live inline (`#[cfg(test)] mod tests`), no separate test crates.
 
+## Development Workflow (mandatory)
+
+Every feature, fix, and test change follows three rules:
+
+1. **Worktree** — create a git worktree (`EnterWorktree`) before any file modification. Never edit directly on the main branch.
+2. **Subagents** — dispatch work to subagents (`Agent` or `Workflow` tool). One subagent per logical task, review between tasks.
+3. **Compat tests** — after any protocol, transport, encryption, or proxy change, run the cross-compatibility test suite:
+   ```bash
+   bash scripts/compat-test.sh --verbose
+   ```
+   CI gate: `.github/workflows/compat.yml` must stay green. Download Go frp first if needed:
+   ```bash
+   bash scripts/download-go-frp.sh
+   ```
+
 ## Architecture: Beyond the README
 
 The README gives a solid overview. The sections below cover details that reading a single file won't reveal.
