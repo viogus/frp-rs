@@ -57,6 +57,8 @@ where
                     .map(|v| v == s.expected_header)
                     .unwrap_or(false);
                 if !ok {
+                    // Match Go frp's authFailDelay (200ms) to slow brute-force attacks
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     return (
                         StatusCode::UNAUTHORIZED,
                         [("www-authenticate", "Basic realm=\"frp\"")],
