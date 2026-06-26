@@ -25,6 +25,10 @@ pub struct ServerConfig {
     /// share this port instead of allocating individual ports.
     #[serde(default)]
     pub sudp_port: u16,
+    /// Port for tcpmux HTTP CONNECT multiplexing. When > 0, TCPMux
+    /// proxies share this port via HTTP CONNECT Host header routing.
+    #[serde(default)]
+    pub tcpmux_httpconnect_port: u16,
     #[serde(default)]
     pub sub_domain_host: String,
     #[serde(default)]
@@ -142,6 +146,7 @@ impl Default for ServerConfig {
             kcp_bind_port: 0,
             quic_bind_port: 0,
             sudp_port: 0,
+            tcpmux_httpconnect_port: 0,
             sub_domain_host: String::new(),
             websocket_port: 0,
             tls_enable: false,

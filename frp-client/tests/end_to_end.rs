@@ -240,6 +240,7 @@ async fn test_e2e_tcp_proxy_over_tls() {
         token: token.to_string(),
         login_fail_exit: false,
         pool_count: 1,
+        tcp_mux: false,
         tls_enable: true,
         tls_server_name: "localhost".into(),
         tls_ca_file: cert_dir.join("ca.crt").to_string_lossy().into(), // trust CA
