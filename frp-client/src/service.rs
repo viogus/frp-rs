@@ -11,7 +11,7 @@ use frp_core::auth::{AuthConfig, AuthMethod, OidcClient};
 use frp_core::config::ClientConfig;
 use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::{read_msg_v1, write_msg_v1};
+use frp_core::protocol::{read_msg, write_msg, read_msg_v1, write_msg_v1, read_msg_v2, write_msg_v2};
 use frp_core::mux::YamuxSession;
 use frp_core::transport::{TransportProtocol, DialOptions, dial_server, IoStream};
 
@@ -355,6 +355,7 @@ impl Service {
                 if self.cfg.tls_key_file.is_empty() { None } else { Some(self.cfg.tls_key_file.clone()) },
                 if self.cfg.dns_server.is_empty() { None } else { Some(self.cfg.dns_server.clone()) },
                 self.cfg.tcp_mux,
+                self.cfg.v2,
                 self.oidc_client.clone(),
             );
 
@@ -377,6 +378,7 @@ impl Service {
                 }
             };
             let yamux = yamux_session.map(std::sync::Arc::new);
+            let v2 = self.cfg.v2;
             info!("Logged in. run_id: {}", run_id);
 
             // Register proxies using IoStream directly (supports TCP and TLS)
@@ -454,6 +456,7 @@ impl Service {
                     self.cfg.tls_server_name.clone(),
                     if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
                     yamux.clone(),
+                    v2,
                     self.oidc_client.clone(),
                     udp_sockets.clone(),
                     udp_enc_cfg.clone(),
@@ -490,7 +493,7 @@ impl Service {
 
             loop {
                 tokio::select! {
-                    msg = read_msg_v1(&mut reader) => {
+                    msg = read_msg(&mut reader, v2) => {
                         match msg {
                             Ok(FrpMessage::ReqWorkConn(_)) => {
                                 debug!("Received ReqWorkConn, creating work connection");
@@ -507,6 +510,7 @@ impl Service {
                                     self.cfg.tls_server_name.clone(),
                                     if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
                                     yamux.clone(),
+                                    v2,
                                     self.oidc_client.clone(),
                                     udp_sockets.clone(),
                                     udp_enc_cfg.clone(),
@@ -539,7 +543,7 @@ impl Service {
                                     let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
                                         sid: Some(sid.clone()),
                                     });
-                                    let _ = write_msg_v1(&mut *writer.lock().await, &report).await;
+                                    let _ = write_msg(&mut *writer.lock().await, &report, v2).await;
                                     continue;
                                 }
 
@@ -548,7 +552,7 @@ impl Service {
                                     sid: Some(sid.clone()),
                                     provider_addr: None, // server fills from control connection peer addr
                                 });
-                                if let Err(e) = write_msg_v1(&mut *writer.lock().await, &sid_msg).await {
+                                if let Err(e) = write_msg(&mut *writer.lock().await, &sid_msg, v2).await {
                                     warn!("Failed to send NatHoleSid: {}", e);
                                     continue;
                                 }
@@ -581,7 +585,7 @@ impl Service {
                                                     let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
                                                         sid: Some(sid),
                                                     });
-                                                    let _ = write_msg_v1(&mut *writer.lock().await, &report).await;
+                                                    let _ = write_msg(&mut *writer.lock().await, &report, v2).await;
                                                 }
                                             }
                                         } else {
@@ -589,7 +593,7 @@ impl Service {
                                             let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
                                                 sid: Some(sid),
                                             });
-                                            let _ = write_msg_v1(&mut *writer.lock().await, &report).await;
+                                            let _ = write_msg(&mut *writer.lock().await, &report, v2).await;
                                         }
                                     }
                                     Err(e) => {
@@ -598,7 +602,7 @@ impl Service {
                                         let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
                                             sid: Some(sid),
                                         });
-                                        let _ = write_msg_v1(&mut *writer.lock().await, &report).await;
+                                        let _ = write_msg(&mut *writer.lock().await, &report, v2).await;
                                     }
                                 }
                             }
@@ -645,7 +649,7 @@ impl Service {
                             ping_msg.timestamp = Some(ts);
                         }
                         let ping = FrpMessage::Ping(ping_msg);
-                        if let Err(e) = write_msg_v1(&mut *writer.lock().await, &ping).await {
+                        if let Err(e) = write_msg(&mut *writer.lock().await, &ping, v2).await {
                             warn!("Ping failed: {}. Reconnecting...", e);
                             break;
                         }
@@ -657,7 +661,7 @@ impl Service {
                         let close = FrpMessage::CloseProxy(msg::CloseProxy {
                             proxy_name: proxy_name.clone(),
                         });
-                        if let Err(e) = write_msg_v1(&mut *writer.lock().await, &close).await {
+                        if let Err(e) = write_msg(&mut *writer.lock().await, &close, v2).await {
                             warn!("Failed to send CloseProxy for {}: {}", proxy_name, e);
                         }
                     }
@@ -735,7 +739,7 @@ impl Service {
             let close = FrpMessage::CloseProxy(msg::CloseProxy {
                 proxy_name: name.clone(),
             });
-            write_msg_v1(&mut *w, &close).await
+            write_msg(&mut *w, &close, self.cfg.v2).await
                 .map_err(|e| format!("send CloseProxy for '{name}': {e}"))?;
             changes.push(format!("proxy '{name}' removed"));
             tracing::info!("Reload: sent CloseProxy for '{name}'");
@@ -752,7 +756,7 @@ impl Service {
                 }
                 let local_addr = format!("{}:{}", p.local_ip, p.local_port);
                 let np = crate::proxy::create_new_proxy_msg(p, &local_addr);
-                write_msg_v1(&mut *w, &np).await
+                write_msg(&mut *w, &np, self.cfg.v2).await
                     .map_err(|e| format!("send NewProxy for '{name}': {e}"))?;
                 changes.push(format!("proxy '{name}' added"));
                 tracing::info!("Reload: sent NewProxy for '{name}'");
@@ -817,6 +821,7 @@ fn spawn_work_conn(
     tls_server_name: String,
     tls_ca_file: Option<String>,
     yamux: Option<std::sync::Arc<YamuxSession>>,
+    v2: bool,
     oidc_client: Option<Arc<OidcClient>>,
     udp_sockets: Arc<tokio::sync::Mutex<HashMap<String, Arc<UdpSocket>>>>,
     udp_enc_cfg: Arc<tokio::sync::Mutex<HashMap<String, (bool, bool)>>>,
@@ -904,7 +909,12 @@ fn spawn_work_conn(
                 nwc_msg.timestamp = Some(timestamp);
             }
             let nwc = FrpMessage::NewWorkConn(nwc_msg);
-            if let Err(e) = work.write_v1_frame(&nwc).await {
+            let write_result = if v2 {
+                work.write_v2_frame(&nwc).await
+            } else {
+                work.write_v1_frame(&nwc).await
+            };
+            if let Err(e) = write_result {
                 warn!("Work conn {} failed to send NewWorkConn: {}", label, e);
                 return;
             }
@@ -912,7 +922,12 @@ fn spawn_work_conn(
         }
 
         // Read StartWorkConn
-        match work.read_v1_frame().await {
+        let swc_result = if v2 {
+            work.read_v2_frame().await
+        } else {
+            work.read_v1_frame().await
+        };
+        match swc_result {
             Ok(FrpMessage::StartWorkConn(swc)) => {
                 let proxy_name = &swc.proxy_name;
                 info!("Work conn {} assigned to proxy '{}'", label, proxy_name);
@@ -969,7 +984,12 @@ fn spawn_work_conn(
                     tokio::spawn(async move {
                         debug!("UDP reader '{}' started", pn_r);
                         loop {
-                            match read_msg_v1(&mut w_r).await {
+                            let result = if v2 {
+                                read_msg_v2(&mut w_r).await
+                            } else {
+                                read_msg_v1(&mut w_r).await
+                            };
+                            match result {
                                 Ok(FrpMessage::UDPPacket(up)) => {
                                     // Save the original remote address for the response
                                     if let Some(ref ra) = up.remote_addr {
@@ -1031,7 +1051,12 @@ fn spawn_work_conn(
                                         local_addr: msg::UdpAddr::from_string(&local_addr_str),
                                         remote_addr: remote,
                                     });
-                                    if let Err(e) = write_msg_v1(&mut w_w, &pkt).await {
+                                    let write_result = if v2 {
+                                        write_msg_v2(&mut w_w, &pkt).await
+                                    } else {
+                                        write_msg_v1(&mut w_w, &pkt).await
+                                    };
+                                    if let Err(e) = write_result {
                                         debug!("UDP '{}' send to work conn failed: {}", pn_w, e);
                                         break;
                                     }
@@ -1083,6 +1108,7 @@ fn spawn_work_conn(
                 tls_server_name,
                 tls_ca_file,
                 yamux,
+                v2,
                 oidc_client,
                 repl_udp_sockets,
                 repl_udp_enc_cfg,

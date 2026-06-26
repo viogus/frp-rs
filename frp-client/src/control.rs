@@ -29,6 +29,7 @@ pub struct ControlConnection {
     tls_key_file: Option<String>,
     dns_server: Option<String>,
     tcp_mux: bool,
+    v2: bool,
     oidc_client: Option<Arc<OidcClient>>,
 }
 
@@ -48,6 +49,7 @@ impl ControlConnection {
         tls_key_file: Option<String>,
         dns_server: Option<String>,
         tcp_mux: bool,
+        v2: bool,
         oidc_client: Option<Arc<OidcClient>>,
     ) -> Self {
         Self {
@@ -66,6 +68,7 @@ impl ControlConnection {
             tls_key_file,
             dns_server,
             tcp_mux,
+            v2,
             oidc_client,
         }
     }
@@ -153,10 +156,18 @@ impl ControlConnection {
 
         let login = FrpMessage::Login(login);
 
-        io_stream.write_v1_frame(&login).await?;
+        if self.v2 {
+            io_stream.write_v2_frame(&login).await?;
+        } else {
+            io_stream.write_v1_frame(&login).await?;
+        }
         info!("Login sent, waiting for response...");
 
-        let resp_msg = io_stream.read_v1_frame().await?;
+        let resp_msg = if self.v2 {
+            io_stream.read_v2_frame().await?
+        } else {
+            io_stream.read_v1_frame().await?
+        };
         match resp_msg {
             FrpMessage::LoginResp(resp) => {
                 if let Some(err) = resp.error {
@@ -181,10 +192,18 @@ impl ControlConnection {
         debug!("NewProxy JSON: {}", serde_json::to_string(&np).unwrap_or_default());
         info!("Registering proxy '{}' type={} remote_port={} local={}",
             p.name, p.proxy_type, p.remote_port, local_addr);
-        stream.write_v1_frame(&np).await?;
+        if self.v2 {
+            stream.write_v2_frame(&np).await?;
+        } else {
+            stream.write_v1_frame(&np).await?;
+        }
         info!("NewProxy sent for '{}', waiting for response...", p.name);
         loop {
-            let resp_msg = stream.read_v1_frame().await?;
+            let resp_msg = if self.v2 {
+                stream.read_v2_frame().await?
+            } else {
+                stream.read_v1_frame().await?
+            };
             match resp_msg {
                 FrpMessage::NewProxyResp(resp) => {
                     if let Some(err) = resp.error {
