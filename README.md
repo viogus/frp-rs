@@ -27,6 +27,7 @@ suitable as a drop-in replacement for either the client or server side.
 | TCP proxy            | ✅     | ✅     |
 | UDP proxy            | ✅     | ✅     |
 | SUDP proxy (shared)  | ✅     | ✅     |
+| TCPMux HTTP CONNECT  | ✅     | ✅     |
 | HTTP/HTTPS proxy     | ✅     | ✅     |
 | STCP / sk routing    | ✅     | ✅     |
 | XTCP (NAT hole punch)| ❌     | 🟡     |
@@ -46,6 +47,9 @@ suitable as a drop-in replacement for either the client or server side.
 | HTTP VHost routing   | —      | ✅     |
 | HTTPS VHost routing  | —      | ✅     |
 | Dashboard (web UI)   | —      | ✅     |
+| Management REST API  | ✅     | ✅     |
+| Prometheus metrics   | —      | ✅     |
+| Server config reload | —      | ✅     |
 | Config directory mode| ✅     | ✅     |
 | Client plugins       | ✅     | —      |
 | Visitor (STCP/XTCP)  | ✅     | —      |
@@ -168,11 +172,14 @@ tcp_mux_keepalive_interval = 30
 | `proxy_bind_addr` | `""` | Separate bind address for proxy ports (empty = same as bind_addr) |
 | `vhost_http_port` | `0` | HTTP VHost port (0 = disabled) |
 | `vhost_https_port` | `0` | HTTPS VHost port (0 = disabled) |
+| `tcpmux_httpconnect_port` | `0` | TCPMux HTTP CONNECT port (0 = disabled) |
 | `kcp_bind_port` | `0` | KCP port (0 = disabled) |
 | `quic_bind_port` | `0` | QUIC port (0 = disabled) |
 | `websocket_port` | `0` | WebSocket listener port (0 = disabled) |
 | `sub_domain_host` | `""` | Host for sub-domain proxy support |
+| `sudp_port` | `0` | Shared port for all SUDP proxies (0 = per-proxy ports) |
 | `tls_enable` | `false` | Enable TLS on the listener |
+| `tls_only` | `false` | Reject non-TLS connections |
 | `tls_cert_file` | `""` | Path to TLS certificate |
 | `tls_key_file` | `""` | Path to TLS private key |
 | `tls_ca_file` | `""` | CA certificate for mutual TLS |
@@ -182,10 +189,43 @@ tcp_mux_keepalive_interval = 30
 | `log.file` | `""` | Log file path (empty = stderr) |
 | `log.max_days` | `3` | Max days to retain log files |
 | `web_server.port` | `0` | Dashboard port (0 = disabled) |
+| `web_server.user` | `""` | Dashboard Basic Auth username |
+| `web_server.password` | `""` | Dashboard Basic Auth password |
+| `web_server.enable_prometheus` | `false` | Expose /metrics for Prometheus scraping |
 | `transport.tcp_mux` | `true` | Enable TCP multiplexing |
 | `transport.tcp_mux_keepalive_interval` | `30` | Keepalive interval (seconds) for mux |
 | `allow_port_start` | `10000` | Start of auto-assigned port range |
 | `allow_port_end` | `50000` | End of auto-assigned port range |
+
+### Server Reload (SIGUSR1)
+
+Send `SIGUSR1` to the frps process to hot-reload these settings from the config file:
+- `auth.token` — updates encryption key and accepts new token for future logins
+- `allow_ports` / `allow_port_start` / `allow_port_end` — adjusts port allocation range
+
+Settings that require a restart: `bind_port`, `bind_addr`, TLS settings, OIDC settings.
+
+### Management REST API
+
+Both frps (dashboard) and frpc expose a management API over HTTP with Basic Auth.
+
+**frps endpoints** (on dashboard port):
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/status` | Server status (version, uptime, client/proxy counts) |
+| GET | `/api/proxies` | List all proxies with traffic stats |
+| GET | `/api/proxy/:name` | Proxy detail |
+| GET | `/api/proxy/:name/traffic` | Proxy traffic counters |
+| GET | `/metrics` | Prometheus text format (if `enable_prometheus = true`) |
+
+**frpc endpoints** (on admin port):
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/status` | Proxy status grouped by type |
+| GET | `/api/config` | Current config (sensitive values redacted) |
+| PUT | `/api/config` | Update config file + trigger reload |
+| GET | `/api/reload?strictConfig=true` | Reload proxies from config |
+| POST | `/api/stop` | Gracefully stop the client |
 
 ### Client (`frpc.toml`)
 
@@ -197,6 +237,12 @@ transport_protocol = "tcp"
 tcp_mux = true
 pool_count = 1
 login_fail_exit = false
+
+[web_server]
+addr = "127.0.0.1"
+port = 7400
+user = "admin"
+password = "admin"
 
 [[proxies]]
 name = "ssh"
@@ -225,13 +271,17 @@ use_compression = false
 | `login_fail_exit` | `true` | Exit on login failure; false to keep retrying |
 | `pool_count` | `0` | Number of pre-established work connections (pooled on the server) |
 | `tcp_mux` | `true` | Enable TCP multiplexing |
+| `web_server.addr` | `"127.0.0.1"` | Admin API bind address |
+| `web_server.port` | `0` | Admin API port (0 = disabled) |
+| `web_server.user` | `""` | Admin API Basic Auth username |
+| `web_server.password` | `""` | Admin API Basic Auth password |
 
 #### Proxy entries (`[[proxies]]`)
 
 | Field | Default | Description |
 |-------|---------|-------------|
 | `name` | — | Unique proxy name |
-| `type` | — | Proxy type: tcp, udp, http, https, stcp, xtcp |
+| `type` | — | Proxy type: tcp, udp, http, https, stcp, xtcp, tcpmux |
 | `local_ip` | `""` | Local service IP |
 | `local_port` | `0` | Local service port |
 | `remote_port` | `0` | Remote port to expose (0 = auto-assign) |
@@ -424,24 +474,38 @@ frp-rs/
     src/
       lib.rs              Error types, Result, VERSION
       args.rs             CLI argument parsing (shared by frps + frpc)
-      auth.rs             MD5 token authentication
+      admin_auth.rs       HTTP Basic Auth middleware (admin API / dashboard)
+      auth.rs             MD5 token authentication + OIDC verification
       bridge.rs           Encrypted data bridge (AES-128-CFB framed)
-      config.rs           TOML config structs + Go frp compat normalization
-      encryption.rs       AES-128-CFB encrypt/decrypt + Snappy compress/decompress
+      cipher_stream.rs    AES-128-CFB streaming encrypt/decrypt
+      config.rs           TOML config structs + Go→Rust compat normalization
+      encryption.rs       Key derivation (PBKDF2-SHA1) + Snappy compression
+      kcp.rs              KCP transport wrapper
+      metrics.rs          ProxyMetricsRegistry + ConnGuard (per-proxy counters)
       msg.rs              Wire protocol message structs
       mux.rs              TCP multiplexing (yamux)
       protocol.rs         V1/V2 frame read/write
+      quic.rs             QUIC transport wrapper
       transport.rs        TCP/TLS/WebSocket dial + accept + IoStream abstraction
+      v1_compat.rs        Go frp v0.69.1 compatibility helpers
   frp-server/             Server library
     Cargo.toml
     src/
       lib.rs
-      service.rs          AppState, InternalMsg, accept loop with frame dispatch
-      control.rs          Per-client control handler, work pool, listener registry
+      service.rs          AppState, InternalMsg, accept loop, reload
+      control/
+        mod.rs            Per-client control handler, work pool, select loop
+        bridge.rs         Encrypted/plain bridge (+ proxy auth)
+        proxy_ops.rs      NewProxy/CloseProxy handler, listen_and_proxy
       proxy.rs            ProxyManager, ProxyInfo, port allocation
       vhost.rs            HTTP/HTTPS VHost routing + Host header parsing
-      dashboard.rs        Dashboard web UI
-      nat_hole.rs         XTCP NAT hole punch coordinator (dual-path: accept + control channel)
+      tcpmux.rs           TCPMux HTTP CONNECT domain routing
+      dashboard.rs        Dashboard web UI + REST API
+      dashboard.html      Dashboard HTML template (embedded via include_str!)
+      metrics/
+        mod.rs            Metrics module root
+        prom.rs           Prometheus gauge registry + /metrics rendering
+      nat_hole.rs         XTCP NAT hole punch coordinator
   frps/                   Server binary
     Cargo.toml
     src/main.rs
@@ -449,9 +513,15 @@ frp-rs/
     Cargo.toml
     src/
       lib.rs
+      admin.rs            Admin REST API server (status, config, reload, stop)
       service.rs          Login, proxy registration, message/select loop,
                           work connection spawning, health checks, UDP work conns
       control.rs          ControlConnection, login handshake, hostname resolution
+      plugin/
+        mod.rs            Plugin dispatch
+        http.rs           HTTP proxy plugin
+        socks5.rs         SOCKS5 proxy plugin
+        static_file.rs    Static file serving plugin
       proxy.rs            NewProxy message builder, local TCP connect, bridge
   frpc/                   Client binary
     Cargo.toml
