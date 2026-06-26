@@ -143,13 +143,45 @@ pub(crate) async fn handle_new_proxy(
                     np.proxy_name, domains, locations, hhr);
             }
 
+            // Register TCPMux proxies with TcpMuxManager (domain-based CONNECT routing).
+            // Follows the same pattern as VHost HTTP registration.
+            if np.proxy_type == "tcpmux" {
+                let domains: Vec<String> = np.custom_domains.clone().unwrap_or_default();
+                if domains.is_empty() {
+                    // TCPMux requires at least one domain for routing
+                    let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
+                        proxy_name: np.proxy_name.clone(),
+                        remote_addr: None,
+                        error: Some("tcpmux proxy requires custom_domains".into()),
+                    });
+                    let _ = write_msg_v1(writer, &resp).await;
+                    state.proxy_manager.remove(&np.proxy_name).await;
+                    return;
+                }
+                let http_user = np.http_user.as_deref().unwrap_or("");
+                let http_pwd = np.http_pwd.as_deref().unwrap_or("");
+                state.tcpmux_manager.register(
+                    &np.proxy_name,
+                    &domains,
+                    run_id,
+                    http_user,
+                    http_pwd,
+                ).await;
+                info!(
+                    "TCPMux routes registered for '{}': domains={:?}",
+                    np.proxy_name, domains
+                );
+            }
+
             // Start the appropriate listener for this proxy type.
-            // STCP/XTCP use NAT hole punching — no listener port needed.
+            // STCP/XTCP/TCPMux use NAT hole punching or shared ports — no listener port needed.
             let pn = np.proxy_name.clone();
             let itx = internal_tx.clone();
             let bind_addr = state.proxy_bind_addr.clone();
 
-            let is_nat_hole = np.proxy_type == "stcp" || np.proxy_type == "xtcp";
+            let is_nat_hole = np.proxy_type == "stcp"
+                || np.proxy_type == "xtcp"
+                || np.proxy_type == "tcpmux";
 
             // Collect oneshot senders for UDP work-conn tasks so we can signal
             // them after NewProxyResp has been written (avoiding the race where
@@ -330,5 +362,6 @@ pub(crate) async fn unregister_control(state: &Arc<AppState>, run_id: &str) {
     // VHost unregister outside port lock to avoid holding it across awaits
     for p in &proxies {
         state.vhost_manager.unregister(&p.name).await;
+        state.tcpmux_manager.unregister(&p.name).await;
     }
 }

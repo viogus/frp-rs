@@ -21,6 +21,7 @@ use crate::proxy::ProxyManager;
 use crate::control;
 use crate::nat_hole::NatHoleCoordinator;
 use crate::vhost::VhostManager;
+use crate::tcpmux::TcpMuxManager;
 
 // ---------------------------------------------------------------
 // Shared state for cross-task communication
@@ -90,6 +91,8 @@ pub struct AppState {
     /// Shared UDP port for SUDP proxies. When > 0, all SUDP proxies
     /// use this port instead of their individual remote_port.
     pub sudp_port: u16,
+    /// TCPMux HTTP CONNECT route table (domain → proxy mapping).
+    pub tcpmux_manager: Arc<TcpMuxManager>,
 }
 
 impl AppState {
@@ -113,6 +116,7 @@ impl AppState {
             oidc_verifier,
             oidc_subjects: Arc::new(RwLock::new(HashMap::new())),
             nat_hole: Arc::new(NatHoleCoordinator::new()),
+            tcpmux_manager: Arc::new(TcpMuxManager::new()),
             sudp_port,
         }
     }
@@ -290,6 +294,26 @@ impl Service {
                 }
             });
             info!("HTTPS VHost listener starting on {}", https_addr2);
+        }
+
+        // Start TCPMux HTTP CONNECT listener if configured
+        if self.cfg.tcpmux_httpconnect_port > 0 {
+            let tcpmux_addr = format_socket_addr(
+                &self.cfg.bind_addr,
+                self.cfg.tcpmux_httpconnect_port,
+            );
+            let tcpmux_state = self.state.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::tcpmux::run_tcpmux_listener(tcpmux_addr, tcpmux_state).await
+                {
+                    error!("TCPMux HTTP CONNECT listener failed: {}", e);
+                }
+            });
+            info!(
+                "TCPMux HTTP CONNECT listener starting on port {}",
+                self.cfg.tcpmux_httpconnect_port
+            );
         }
 
         // Start KCP listener if configured
