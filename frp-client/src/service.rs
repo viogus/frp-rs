@@ -191,6 +191,18 @@ impl Service {
                             warn!("Failed to start https2https plugin for '{}': {}", p.name, e);
                         }
                     }
+                } else if plugin_cfg.plugin_type == "visitor_plugin" {
+                    match plugin::start_visitor_plugin(plugin_cfg).await {
+                        Ok(handle) => {
+                            let addr = handle.local_addr.to_string();
+                            info!("visitor plugin for '{}' started on {}", p.name, addr);
+                            plugin_addrs.insert(p.name.clone(), addr);
+                            plugin_handles.push(handle);
+                        }
+                        Err(e) => {
+                            warn!("Failed to start visitor plugin for '{}': {}", p.name, e);
+                        }
+                    }
                 } else {
                     warn!("Unknown plugin type '{}' for proxy '{}'", plugin_cfg.plugin_type, p.name);
                 }
