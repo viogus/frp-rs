@@ -288,18 +288,35 @@ pub async fn handle_control<S>(
                         }
                         pending_udp.push_back((proxy_name, Instant::now()));
                     }
-                    Some(InternalMsg::NatHoleClient { proxy_name, sign_key, run_id: _run_id, sid, visitor_addr }) => {
-                        debug!("Sending NatHoleClient for session {} to provider", sid);
+                    Some(InternalMsg::NatHoleClient { proxy_name, transaction_id, visitor_addr }) => {
+                        debug!("Sending NatHoleClient for session {} to provider", transaction_id);
                         let nhc = FrpMessage::NatHoleClient(msg::NatHoleClient {
                             proxy_name,
-                            sign_key,
-                            run_id: _run_id,
-                            sid: Some(sid),
+                            transaction_id,
                             visitor_addr,
                         });
                         if let Err(e) = write_msg_v1(&mut writer, &nhc).await {
                             warn!("Failed to send NatHoleClient: {}", e);
                             break;
+                        }
+                    }
+                    Some(InternalMsg::WriteNatHoleSid { sid, provider_addr }) => {
+                        debug!("Writing NatHoleSid to visitor via control channel for {}", sid);
+                        let forward = FrpMessage::NatHoleSid(msg::NatHoleSid {
+                            sid: Some(sid),
+                            provider_addr,
+                        });
+                        if let Err(e) = write_msg_v1(&mut writer, &forward).await {
+                            warn!("Failed to write NatHoleSid to visitor: {}", e);
+                        }
+                    }
+                    Some(InternalMsg::WriteNatHoleReport { sid }) => {
+                        debug!("Writing NatHoleReport to visitor via control channel for {}", sid);
+                        let forward = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                            sid: Some(sid),
+                        });
+                        if let Err(e) = write_msg_v1(&mut writer, &forward).await {
+                            warn!("Failed to write NatHoleReport to visitor: {}", e);
                         }
                     }
                     Some(InternalMsg::Shutdown) => {
@@ -441,12 +458,15 @@ pub async fn handle_control<S>(
                     Ok(FrpMessage::NatHoleSid(ref sid_msg)) => {
                         debug!("Received NatHoleSid from provider: {:?}", sid_msg.sid);
                         if let Some(ref sid) = sid_msg.sid {
-                            // Forward NatHoleSid to the visitor via the session's writer.
-                            // The server adds provider_addr to the forwarded message.
-                            if let Some(mut writer) = state.nat_hole.take_writer(sid).await {
+                            let provider_addr = peer.as_ref().map(|a| a.to_string());
+                            // Try control-channel path first (Go frp compat).
+                            if state.nat_hole.forward_sid_via_ctl(sid, provider_addr.clone()).await {
+                                debug!("Forwarded NatHoleSid via control channel for {}", sid);
+                            } else if let Some(mut writer) = state.nat_hole.take_writer(sid).await {
+                                // Fallback: accept-loop writer path
                                 let forward = FrpMessage::NatHoleSid(msg::NatHoleSid {
                                     sid: Some(sid.clone()),
-                                    provider_addr: peer.as_ref().map(|a| a.to_string()),
+                                    provider_addr,
                                 });
                                 if write_msg_v1(&mut writer, &forward).await.is_ok() {
                                     debug!("Forwarded NatHoleSid to visitor for session {}", sid);
@@ -462,12 +482,15 @@ pub async fn handle_control<S>(
                     Ok(FrpMessage::NatHoleReport(ref report_msg)) => {
                         debug!("Received NatHoleReport from provider: {:?}", report_msg.sid);
                         if let Some(ref sid) = report_msg.sid {
-                            // Forward NatHoleReport to the visitor and complete the session
-                            if let Some(mut writer) = state.nat_hole.take_writer(sid).await {
-                                let forward = FrpMessage::NatHoleReport(msg::NatHoleReport {
-                                    sid: Some(sid.clone()),
-                                });
-                                let _ = write_msg_v1(&mut writer, &forward).await;
+                            // Try control-channel path first (Go frp compat).
+                            if !state.nat_hole.forward_report_via_ctl(sid).await {
+                                // Fallback: accept-loop writer path
+                                if let Some(mut writer) = state.nat_hole.take_writer(sid).await {
+                                    let forward = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                                        sid: Some(sid.clone()),
+                                    });
+                                    let _ = write_msg_v1(&mut writer, &forward).await;
+                                }
                             }
                             state.nat_hole.complete(sid).await;
                         }
@@ -508,6 +531,103 @@ pub async fn handle_control<S>(
                             break;
                         }
                         debug!("Ping from {:?}", peer);
+                    }
+                    Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                        debug!("NatHoleVisitor on control channel: proxy='{}', txn='{}'",
+                            nhv.proxy_name, nhv.transaction_id);
+                        let transaction_id = nhv.transaction_id.clone();
+                        let proxy_name = nhv.proxy_name.clone();
+
+                        // Validate proxy exists
+                        if state.proxy_manager.get(&proxy_name).await.is_none() {
+                            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                transaction_id: transaction_id.clone(),
+                                error: Some("proxy not found".into()),
+                                ..Default::default()
+                            });
+                            let _ = write_msg_v1(&mut writer, &resp).await;
+                            continue;
+                        }
+
+                        // Look up provider run_id and control channel
+                        let provider_run_id = match state.proxy_manager.get_run_id(&proxy_name).await {
+                            Some(id) => id,
+                            None => {
+                                let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                    transaction_id: transaction_id.clone(),
+                                    error: Some("provider offline".into()),
+                                    ..Default::default()
+                                });
+                                let _ = write_msg_v1(&mut writer, &resp).await;
+                                continue;
+                            }
+                        };
+
+                        let provider_ctl = {
+                            let map = state.run_id_to_ctl_tx.read().await;
+                            map.get(&provider_run_id).cloned()
+                        };
+                        let provider_ctl = match provider_ctl {
+                            Some(ctl) => ctl,
+                            None => {
+                                let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                    transaction_id: transaction_id.clone(),
+                                    error: Some("provider disconnected".into()),
+                                    ..Default::default()
+                                });
+                                let _ = write_msg_v1(&mut writer, &resp).await;
+                                continue;
+                            }
+                        };
+
+                        // Create session via control-channel path
+                        let report_rx = state.nat_hole
+                            .create_session_with_ctl(
+                                transaction_id.clone(),
+                                proxy_name.clone(),
+                                internal_tx.clone(),
+                            ).await;
+
+                        // Send NatHoleClient to provider
+                        let visitor_addr = peer.as_ref().map(|a| a.to_string());
+                        if provider_ctl.tx.send(InternalMsg::NatHoleClient {
+                            proxy_name: proxy_name.clone(),
+                            transaction_id: transaction_id.clone(),
+                            visitor_addr,
+                        }).is_err() {
+                            warn!("Provider for run_id {} has gone away", provider_run_id);
+                            state.nat_hole.remove(&transaction_id).await;
+                            continue;
+                        }
+
+                        // Write NatHoleResp OK to visitor
+                        let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                            transaction_id: transaction_id.clone(),
+                            error: None,
+                            ..Default::default()
+                        });
+                        let _ = write_msg_v1(&mut writer, &resp).await;
+
+                        // Spawn task to wait for report oneshot (30s timeout)
+                        let nat_hole = state.nat_hole.clone();
+                        let tid = transaction_id.clone();
+                        tokio::spawn(async move {
+                            match tokio::time::timeout(
+                                Duration::from_secs(30), report_rx
+                            ).await {
+                                Ok(Ok(_)) => {
+                                    debug!("NatHole session {} (ctl path): provider completed", tid);
+                                }
+                                Ok(Err(_)) => {
+                                    debug!("NatHole session {} (ctl path): provider dropped without report", tid);
+                                    nat_hole.remove(&tid).await;
+                                }
+                                Err(_) => {
+                                    warn!("NatHole session {} (ctl path): timed out", tid);
+                                    nat_hole.remove(&tid).await;
+                                }
+                            }
+                        });
                     }
                     Ok(_) => {
                         debug!("Unhandled message from {:?}", peer);

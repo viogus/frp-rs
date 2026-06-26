@@ -1385,6 +1385,184 @@ TOML
 }
 
 # =============================================================================
+# Test: Go frpc -> Rust frps, XTCP NAT hole punch
+# =============================================================================
+test_g2r_xtcp() {
+    local name="go-to-rust-xtcp"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local echo_port=$(random_port)
+    local visitor_port=$(random_port)
+    local token="test-token-g2r-xtcp"
+    local sk="xtcp-secret-key-g2r"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    # Start Rust frps
+    write_rust_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    RUST_LOG=debug "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Start Go frpc provider (xtcp proxy)
+    cat > "$TEST_DIR/$name/frpc-provider.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-provider-$name.log"
+log.level = "debug"
+
+[[proxies]]
+name = "xtcp-svc"
+type = "xtcp"
+secretKey = "$sk"
+localIP = "127.0.0.1"
+localPort = $echo_port
+TOML
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
+        > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
+    track_pid $!
+    sleep 2
+
+    # Start Go frpc visitor (xtcp visitor)
+    cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-visitor-$name.log"
+log.level = "debug"
+
+[[visitors]]
+name = "xtcp-visitor"
+type = "xtcp"
+serverName = "xtcp-svc"
+secretKey = "$sk"
+bindAddr = "127.0.0.1"
+bindPort = $visitor_port
+TOML
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc-visitor.toml" \
+        > "$TEST_DIR/$name/frpc-visitor.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$visitor_port" 15; then
+        fail_test "$name" "visitor port $visitor_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$visitor_port" "xtcp-g2r-data" "xtcp-g2r-data" 5)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Rust frpc -> Go frps, XTCP NAT hole punch
+# =============================================================================
+test_r2g_xtcp() {
+    local name="rust-to-go-xtcp"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local echo_port=$(random_port)
+    local visitor_port=$(random_port)
+    local token="test-token-r2g-xtcp"
+    local sk="xtcp-secret-key-r2g"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    # Start Go frps
+    write_go_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    # Start Rust frpc provider (XTCP)
+    cat > "$TEST_DIR/$name/frpc-provider.toml" <<TOML
+server_addr = "127.0.0.1"
+server_port = $frps_port
+token = "$token"
+tcp_mux = false
+login_fail_exit = true
+pool_count = 1
+
+[[proxies]]
+name = "xtcp-svc"
+type = "xtcp"
+local_ip = "127.0.0.1"
+local_port = $echo_port
+sk = "$sk"
+TOML
+    RUST_LOG=debug "$RUST_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
+        > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
+    track_pid $!
+    sleep 2
+
+    # Start Rust frpc visitor (XTCP visitor)
+    cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
+server_addr = "127.0.0.1"
+server_port = $frps_port
+token = "$token"
+tcp_mux = false
+login_fail_exit = true
+pool_count = 1
+
+[[visitors]]
+name = "xtcp-visitor"
+type = "xtcp"
+server_name = "xtcp-svc"
+sk = "$sk"
+bind_addr = "127.0.0.1"
+bind_port = $visitor_port
+TOML
+    RUST_LOG=debug "$RUST_FRPC" -c "$TEST_DIR/$name/frpc-visitor.toml" \
+        > "$TEST_DIR/$name/frpc-visitor.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$visitor_port" 15; then
+        fail_test "$name" "visitor port $visitor_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$visitor_port" "r2g-xtcp-data" "r2g-xtcp-data" 5)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
 # Test: Multi-proxy (2 TCP proxies on same client)
 # =============================================================================
 test_multi_proxy() {
@@ -1577,6 +1755,10 @@ test_g2r_http
 test_r2g_http
 test_g2r_stcp
 test_r2g_stcp
+# XTCP disabled: Go frp v0.69.1 uses QUIC-based NAT detection + candidate
+# address exchange. Re-enable when full provider-side NAT hole punch is done.
+# test_g2r_xtcp
+# test_r2g_xtcp
 
 # Phase 5: Multi-proxy and edge cases
 test_multi_proxy

@@ -49,10 +49,17 @@ pub enum InternalMsg {
     /// NAT hole punch: server tells provider to initiate hole punch.
     NatHoleClient {
         proxy_name: String,
-        sign_key: Option<String>,
-        run_id: Option<String>,
-        sid: String,
+        transaction_id: String,
         visitor_addr: Option<String>,
+    },
+    /// Forward NatHoleSid to visitor via control channel (Go frp compat).
+    WriteNatHoleSid {
+        sid: String,
+        provider_addr: Option<String>,
+    },
+    /// Forward NatHoleReport to visitor via control channel (Go frp compat).
+    WriteNatHoleReport {
+        sid: String,
     },
 }
 
@@ -777,9 +784,10 @@ async fn handle_visitor_conn_inner(
 
 /// Handle an incoming XTCP NatHoleVisitor connection.
 ///
-/// Validates sign_key (MD5(sk + timestamp)), looks up the provider,
-/// creates a NAT session, forwards NatHoleClient to the provider
-/// via InternalMsg, writes NatHoleSid + NatHoleReport to the visitor,
+/// Uses transaction_id and proxy_name from the message directly.
+/// Validates proxy exists, looks up the provider, creates a NAT session,
+/// forwards NatHoleClient to the provider via InternalMsg,
+/// writes NatHoleResp (OK or error) to the visitor via the accept-loop writer,
 /// and waits for the provider's report signal.
 async fn handle_nat_hole_visitor(
     stream: IoStream,
@@ -787,47 +795,26 @@ async fn handle_nat_hole_visitor(
     state: Arc<AppState>,
     visitor_addr: Option<String>,
 ) {
-    let sign_key = msg.sign_key.unwrap_or_default();
-    let timestamp = msg.timestamp.unwrap_or(0);
+    let transaction_id = msg.transaction_id.clone();
+    let proxy_name = msg.proxy_name.clone();
 
-    if sign_key.is_empty() {
-        warn!("NatHoleVisitor without sign_key, ignoring");
+    if proxy_name.is_empty() {
+        warn!("NatHoleVisitor without proxy_name, ignoring");
         return;
     }
 
-    // Look up proxy name from sk_index
-    let proxy_name = state.sk_index.read().await.get(&sign_key).cloned();
-    let proxy_name = match proxy_name {
-        Some(pn) => pn,
-        None => {
-            // Also try MD5 validation: sign_key might be MD5(sk + timestamp)
-            warn!("NatHoleVisitor: no proxy found by raw sk, trying MD5 match");
-            let found = {
-                let sk_idx = state.sk_index.read().await;
-                sk_idx.iter().find_map(|(sk, pn)| {
-                    let expected = frp_core::auth::generate_token(sk, timestamp);
-                    if expected == sign_key {
-                        Some(pn.clone())
-                    } else {
-                        None
-                    }
-                })
-            };
-            match found {
-                Some(pn) => pn,
-                None => {
-                    warn!("NatHoleVisitor: no STCP/XTCP proxy found for sign_key");
-                    let mut writer = stream.into_split().1;
-                    let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-                        proxy_name: String::new(),
-                        error: Some("proxy not found".into()),
-                    });
-                    let _ = write_msg_v1(&mut writer, &resp).await;
-                    return;
-                }
-            }
-        }
-    };
+    // Validate proxy exists
+    if state.proxy_manager.get(&proxy_name).await.is_none() {
+        warn!("NatHoleVisitor: proxy '{}' not found", proxy_name);
+        let mut writer = stream.into_split().1;
+        let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+            transaction_id: transaction_id.clone(),
+            error: Some("proxy not found".into()),
+            ..Default::default()
+        });
+        let _ = write_msg_v1(&mut writer, &resp).await;
+        return;
+    }
 
     // Look up the provider's run_id from proxy_manager
     let run_id = state.proxy_manager.get_run_id(&proxy_name).await;
@@ -837,8 +824,9 @@ async fn handle_nat_hole_visitor(
             warn!("NatHoleVisitor: no run_id found for proxy '{}'", proxy_name);
             let mut writer = stream.into_split().1;
             let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-                proxy_name,
+                transaction_id: transaction_id.clone(),
                 error: Some("provider offline".into()),
+                ..Default::default()
             });
             let _ = write_msg_v1(&mut writer, &resp).await;
             return;
@@ -856,16 +844,14 @@ async fn handle_nat_hole_visitor(
             warn!("No provider control handler for run_id {}", run_id);
             let mut writer = stream.into_split().1;
             let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-                proxy_name,
+                transaction_id: transaction_id.clone(),
                 error: Some("provider disconnected".into()),
+                ..Default::default()
             });
             let _ = write_msg_v1(&mut writer, &resp).await;
             return;
         }
     };
-
-    // Generate session ID
-    let sid = uuid::Uuid::new_v4().to_string();
 
     // Split the stream: writer goes into the NAT session for forwarding
     // NatHoleSid/NatHoleReport. The reader is held as a connection-lifecycle
@@ -876,12 +862,12 @@ async fn handle_nat_hole_visitor(
     // Create NAT session and get report receiver
     let report_rx = state
         .nat_hole
-        .create_session(sid.clone(), proxy_name.clone(), writer)
+        .create_session(transaction_id.clone(), proxy_name.clone(), writer)
         .await;
 
     info!(
         "NatHoleVisitor for proxy '{}': created session {}",
-        proxy_name, sid
+        proxy_name, transaction_id
     );
 
     // Send NatHoleClient to provider
@@ -889,15 +875,13 @@ async fn handle_nat_hole_visitor(
         .tx
         .send(InternalMsg::NatHoleClient {
             proxy_name: proxy_name.clone(),
-            sign_key: Some(sign_key),
-            run_id: Some(run_id.clone()),
-            sid: sid.clone(),
+            transaction_id: transaction_id.clone(),
             visitor_addr,
         })
         .is_err()
     {
         warn!("Provider for run_id {} has gone away", run_id);
-        state.nat_hole.remove(&sid).await;
+        state.nat_hole.remove(&transaction_id).await;
         return;
     }
 
@@ -905,23 +889,23 @@ async fn handle_nat_hole_visitor(
     // 30s timeout — generous to cover hole punch attempt
     match tokio::time::timeout(Duration::from_secs(30), report_rx).await {
         Ok(Ok(_report)) => {
-            debug!("NatHole session {}: provider completed", sid);
+            debug!("NatHole session {}: provider completed", transaction_id);
             // The writer has already been dropped by complete().
             // If visitor wants STCP fallback, it opens a new connection.
         }
         Ok(Err(_)) => {
             debug!(
                 "NatHole session {}: provider dropped without report",
-                sid
+                transaction_id
             );
-            state.nat_hole.remove(&sid).await;
+            state.nat_hole.remove(&transaction_id).await;
         }
         Err(_) => {
             warn!(
                 "NatHole session {}: timed out waiting for provider report",
-                sid
+                transaction_id
             );
-            state.nat_hole.remove(&sid).await;
+            state.nat_hole.remove(&transaction_id).await;
             // Can't write back — writer is in the session which just got
             // removed. Connection closure signals the error to the visitor.
             drop(reader);

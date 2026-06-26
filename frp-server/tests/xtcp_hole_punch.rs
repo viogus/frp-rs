@@ -83,18 +83,11 @@ async fn test_xtcp_nat_hole_message_routing() {
             .await
             .expect("visitor connect"),
     );
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    let sign_key = frp_core::auth::generate_token(xtcp_sk, timestamp);
     let nhv = FrpMessage::NatHoleVisitor(msg::NatHoleVisitor {
+        transaction_id: format!("test-txn-{}", port),
         proxy_name: "xtcp-test".into(),
-        sign_key: Some(sign_key.clone()),
-        timestamp: Some(timestamp),
-        run_id: None,
-        use_encryption: None,
-        use_compression: None,
+        pre_check: true,
+        ..Default::default()
     });
     write_msg_v1(&mut visitor_conn, &nhv)
         .await
@@ -113,7 +106,7 @@ async fn test_xtcp_nat_hole_message_routing() {
                 nhc.proxy_name,
                 nhc.visitor_addr.as_deref().unwrap_or("none")
             );
-            nhc.sid.expect("should have sid")
+            nhc.transaction_id.clone()
         }
         other => panic!("expected NatHoleClient, got: {:?}", other.v1_type_byte()),
     };

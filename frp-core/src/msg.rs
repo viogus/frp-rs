@@ -292,39 +292,43 @@ pub struct UDPPacket {
 // NAT hole punch messages (Go frp v0.69.1 STCP/XTCP)
 // ---------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NatHoleVisitor {
+    pub transaction_id: String,
     pub proxy_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub pre_check: bool,
+    // Phase 2 fields (pre_check=false, NAT info exchange):
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sign_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub use_encryption: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub use_compression: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapped_addrs: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assisted_addrs: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NatHoleClient {
+    pub transaction_id: String,
     pub proxy_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sign_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visitor_addr: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NatHoleResp {
-    pub proxy_name: String,
+    pub transaction_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    // Provider-side addresses for NAT hole punch (Go frp v0.69.1 compat)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_addrs: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assisted_addrs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -485,17 +489,9 @@ impl FrpMessage {
             TYPE_UDP_PACKET    => Some(FrpMessage::UDPPacket(UDPPacket {
                 content: vec![], local_addr: None, remote_addr: None,
             })),
-            TYPE_NAT_HOLE_VISITOR => Some(FrpMessage::NatHoleVisitor(NatHoleVisitor {
-                proxy_name: String::new(), sign_key: None, timestamp: None,
-                run_id: None, use_encryption: None, use_compression: None,
-            })),
-            TYPE_NAT_HOLE_CLIENT => Some(FrpMessage::NatHoleClient(NatHoleClient {
-                proxy_name: String::new(), sign_key: None, run_id: None,
-                sid: None, visitor_addr: None,
-            })),
-            TYPE_NAT_HOLE_RESP => Some(FrpMessage::NatHoleResp(NatHoleResp {
-                proxy_name: String::new(), error: None,
-            })),
+            TYPE_NAT_HOLE_VISITOR => Some(FrpMessage::NatHoleVisitor(NatHoleVisitor::default())),
+            TYPE_NAT_HOLE_CLIENT => Some(FrpMessage::NatHoleClient(NatHoleClient::default())),
+            TYPE_NAT_HOLE_RESP => Some(FrpMessage::NatHoleResp(NatHoleResp::default())),
             TYPE_NAT_HOLE_SID => Some(FrpMessage::NatHoleSid(NatHoleSid {
                 sid: None,
                 provider_addr: None,

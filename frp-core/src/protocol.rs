@@ -158,8 +158,11 @@ fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate::Er
             FrpMessage::UDPPacket(v)
         }
         msg::TYPE_NAT_HOLE_VISITOR => {
+            tracing::debug!("NatHoleVisitor raw payload: {}", String::from_utf8_lossy(payload));
             let v: msg::NatHoleVisitor = serde_json::from_slice(payload)
                 .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleVisitor: {e}")))?;
+            tracing::debug!("NatHoleVisitor deserialized: transaction_id={:?}, proxy_name={}, pre_check={}",
+                v.transaction_id, v.proxy_name, v.pre_check);
             FrpMessage::NatHoleVisitor(v)
         }
         msg::TYPE_NAT_HOLE_CLIENT => {

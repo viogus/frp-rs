@@ -404,7 +404,7 @@ impl Service {
                                 debug!("Received NatHoleClient for proxy '{}'", nhc.proxy_name);
                                 let visitor_addr = nhc.visitor_addr.unwrap_or_default();
                                 let proxy_name = nhc.proxy_name.clone();
-                                let sid = nhc.sid.unwrap_or_default();
+                                let sid = nhc.transaction_id.clone();
                                 let local_addr = self.proxy_info_map
                                     .get(&proxy_name)
                                     .map(|p| p.local_addr.clone());
@@ -1066,23 +1066,12 @@ async fn run_visitor_listener(
                             }
                         };
 
-                        // Build NatHoleVisitor with MD5 sign_key
-                        let timestamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs() as i64;
-                        let sign_key = if sk.is_empty() {
-                            sk.clone()
-                        } else {
-                            frp_core::auth::generate_token(&sk, timestamp)
-                        };
+                        // Build NatHoleVisitor
                         let nhv = FrpMessage::NatHoleVisitor(msg::NatHoleVisitor {
+                            transaction_id: uuid::Uuid::new_v4().to_string(),
                             proxy_name: sn.clone(),
-                            sign_key: Some(sign_key),
-                            timestamp: Some(timestamp),
-                            run_id: None,
-                            use_encryption: Some(use_encryption),
-                            use_compression: Some(use_compression),
+                            pre_check: true,
+                            ..Default::default()
                         });
                         if let Err(e) = server_conn.write_v1_frame(&nhv).await {
                             warn!("Visitor '{}': send NatHoleVisitor failed: {}", visitor_name, e);
