@@ -33,6 +33,8 @@ pub enum ConnectionType {
     WebSocket,
     /// V1 type byte → plain frp protocol (the byte is the V1 message type)
     V1(u8),
+    /// 0x46 ('F') → V2 protocol (magic bytes: FRP\0\x02\r\n)
+    V2,
 }
 
 /// The WebSocket path used by frp (matching the Go version).
@@ -845,6 +847,7 @@ pub async fn peek_connection_type(stream: &TcpStream) -> Result<ConnectionType, 
     match buf[0] {
         FRP_TLS_HEAD_BYTE | FRP_TLS_DIRECT_BYTE => Ok(ConnectionType::Tls(buf[0])),
         b'G' => Ok(ConnectionType::WebSocket),
+        b'F' => Ok(ConnectionType::V2),
         b => Ok(ConnectionType::V1(b)),
     }
 }

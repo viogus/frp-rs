@@ -13,7 +13,7 @@ use tracing::{info, error, warn, debug};
 use frp_core::config::ServerConfig;
 use frp_core::auth::{AuthConfig, AuthMethod, OidcVerifier};
 use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::{read_msg_v1, write_msg_v1};
+use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1};
 use frp_core::mux;
 use frp_core::transport::{IoStream, ConnectionType, peek_connection_type, consume_tls_head_byte, PreReadStream};
 use frp_core::transport::{build_tls_acceptor, accept_websocket};
@@ -716,6 +716,39 @@ impl Service {
                                     }
                                     Err(e) => {
                                         warn!("WebSocket upgrade failed for {}: {}", addr, e);
+                                    }
+                                }
+                            }
+
+                            ConnectionType::V2 => {
+                                // V2 protocol (msgpack binary framing)
+                                if state.tls_only {
+                                    warn!("TLS-only mode: rejected V2 from {}", addr);
+                                    return;
+                                }
+                                // V2 doesn't support yamux wrapping yet; read directly
+                                match read_msg_v2(&mut stream).await {
+                                    Ok(FrpMessage::Login(login)) => {
+                                        control::handle_control(stream, login, state, Some(addr), None).await;
+                                    }
+                                    Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                        let io = IoStream::Tcp(stream);
+                                        handle_work_conn_inner(io, nwc, state).await;
+                                    }
+                                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                        let io = IoStream::Tcp(stream);
+                                        handle_visitor_conn_inner(io, nvc, state).await;
+                                    }
+                                    Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                        let io = IoStream::Tcp(stream);
+                                        let visitor_addr = Some(addr.to_string());
+                                        handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
+                                    }
+                                    Ok(other) => {
+                                        warn!("Unexpected V2 first message from {}: {:?}", addr, other.v2_type_id());
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to read V2 first message from {}: {}", addr, e);
                                     }
                                 }
                             }

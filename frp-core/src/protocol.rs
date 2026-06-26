@@ -215,6 +215,85 @@ pub async fn write_v2_magic<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+/// V2 frame header size: magic(7) + frame_type(2 BE) + payload_length(4 BE) = 13 bytes.
+pub const V2_HEADER_LEN: usize = 13;
+
+/// Write a V2 frame: magic bytes + frame type (u16 BE) + payload length (u32 BE) + payload.
+pub async fn write_v2_frame<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    frame_type: u16,
+    payload: &[u8],
+) -> Result<(), crate::Error> {
+    if payload.len() > V2_MAX_FRAME_PAYLOAD as usize {
+        return Err(crate::Error::Protocol(format!(
+            "V2 payload too large: {} > {}", payload.len(), V2_MAX_FRAME_PAYLOAD
+        )));
+    }
+    let mut buf = Vec::with_capacity(V2_HEADER_LEN + payload.len());
+    buf.extend_from_slice(&V2_MAGIC_BYTES);
+    buf.extend_from_slice(&frame_type.to_be_bytes());
+    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    buf.extend_from_slice(payload);
+    writer.write_all(&buf).await
+        .map_err(|e| crate::Error::Protocol(format!("write V2 frame: {e}")))?;
+    Ok(())
+}
+
+/// Read a V2 frame header + payload. Returns (frame_type, payload_bytes).
+pub async fn read_v2_frame<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> Result<(u16, Vec<u8>), crate::Error> {
+    let mut header = [0u8; V2_HEADER_LEN];
+    reader.read_exact(&mut header).await
+        .map_err(|e| crate::Error::Protocol(format!("read V2 header: {e}")))?;
+
+    if header[..7] != V2_MAGIC_BYTES {
+        return Err(crate::Error::Protocol("invalid V2 magic".into()));
+    }
+
+    let frame_type = u16::from_be_bytes([header[7], header[8]]);
+    let payload_len = u32::from_be_bytes([header[9], header[10], header[11], header[12]]) as usize;
+
+    if payload_len > V2_MAX_FRAME_PAYLOAD as usize {
+        return Err(crate::Error::Protocol(format!(
+            "V2 payload too large: {payload_len}"
+        )));
+    }
+
+    let mut payload = vec![0u8; payload_len];
+    reader.read_exact(&mut payload).await
+        .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}")))?;
+
+    Ok((frame_type, payload))
+}
+
+/// Write a FrpMessage using V2 framing with JSON serialization.
+/// V2 uses the same JSON payload as V1 but with proper binary framing
+/// (magic bytes, 2-byte type, 4-byte length) instead of V1's 1-byte type + 8-byte length.
+/// The frame_type is the V1 type byte (cast to u16) for correct deserialization dispatch.
+pub async fn write_msg_v2<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    msg: &FrpMessage,
+) -> Result<(), crate::Error> {
+    let payload = serde_json::to_vec(msg)
+        .map_err(|e| crate::Error::Protocol(format!("V2 JSON serialize: {e}")))?;
+    write_v2_frame(writer, msg.v1_type_byte() as u16, &payload).await
+}
+
+/// Read a FrpMessage using V2 framing with JSON deserialization.
+/// Uses the frame_type (V1 type byte) for correct variant dispatch.
+pub async fn read_msg_v2<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> Result<FrpMessage, crate::Error> {
+    let (frame_type, payload) = read_v2_frame(reader).await?;
+    if frame_type > u8::MAX as u16 {
+        return Err(crate::Error::Protocol(format!(
+            "unknown V2 frame type: {frame_type}"
+        )));
+    }
+    deserialize_v1(frame_type as u8, &payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +403,85 @@ mod tests {
         client.write_all(&header).await.expect("write");
         let result = read_msg_v1(&mut server).await;
         assert!(result.is_err(), "unknown type byte should error");
+    }
+
+    // --- V2 protocol tests ---
+
+    #[tokio::test]
+    async fn test_v2_frame_read_write() {
+        let (mut client, mut server) = duplex(65536);
+        let payload = b"hello v2 world";
+        write_v2_frame(&mut client, 16, payload).await.expect("write V2 frame");
+        let (ft, data) = read_v2_frame(&mut server).await.expect("read V2 frame");
+        assert_eq!(ft, 16);
+        assert_eq!(data, payload);
+    }
+
+    #[tokio::test]
+    async fn test_v2_msg_roundtrip() {
+        let (mut client, mut server) = duplex(65536);
+        let msg = FrpMessage::Login(msg::Login {
+            version: Some("0.69.1".into()),
+            hostname: Some("testhost".into()),
+            os: Some("linux".into()),
+            arch: None,
+            user: None,
+            run_id: None,
+            client_id: None,
+            pool_count: Some(3),
+            timestamp: Some(1234567890),
+            privilege_key: Some("abc123".into()),
+            metas: None,
+            client_spec: None,
+            multiplexer: Some("yamux".into()),
+        });
+        write_msg_v2(&mut client, &msg).await.expect("write V2 msg");
+        let result = read_msg_v2(&mut server).await.expect("read V2 msg");
+        match result {
+            FrpMessage::Login(login) => {
+                assert_eq!(login.version.as_deref(), Some("0.69.1"));
+                assert_eq!(login.hostname.as_deref(), Some("testhost"));
+                assert_eq!(login.pool_count, Some(3));
+                assert_eq!(login.multiplexer.as_deref(), Some("yamux"));
+            }
+            other => panic!("expected Login, got: {:?}", other.v2_type_id()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v2_msg_all_types_roundtrip() {
+        let (mut client, mut server) = duplex(65536);
+
+        let messages = vec![
+            FrpMessage::Ping(msg::Ping { privilege_key: None, timestamp: Some(42) }),
+            FrpMessage::Pong(msg::Pong { error: None }),
+            FrpMessage::CloseProxy(msg::CloseProxy { proxy_name: "test".into() }),
+            FrpMessage::CloseProxyResp(msg::CloseProxyResp { proxy_name: "test".into() }),
+            FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
+            FrpMessage::Error(msg::Error { error: "err".into() }),
+        ];
+
+        for msg in &messages {
+            write_msg_v2(&mut client, msg).await.expect("write V2");
+            let back = read_msg_v2(&mut server).await.expect("read V2");
+            assert_eq!(back.v2_type_id(), msg.v2_type_id(),
+                "roundtrip type mismatch for {:?}", msg.v2_type_id());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v2_frame_rejects_bad_magic() {
+        let (mut client, mut server) = duplex(256);
+        client.write_all(b"BADMAGIC!!!!!").await.expect("write bad magic");
+        let result = read_v2_frame(&mut server).await;
+        assert!(result.is_err(), "should reject bad magic");
+    }
+
+    #[tokio::test]
+    async fn test_v2_frame_rejects_oversized() {
+        let oversized = vec![0u8; (V2_MAX_FRAME_PAYLOAD + 1) as usize];
+        let mut buf = Vec::new();
+        let result = write_v2_frame(&mut buf, 16, &oversized).await;
+        assert!(result.is_err(), "should reject oversized payload");
     }
 }
