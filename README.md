@@ -30,7 +30,7 @@ suitable as a drop-in replacement for either the client or server side.
 | TCPMux HTTP CONNECT  | ✅     | ✅     |
 | HTTP/HTTPS proxy     | ✅     | ✅     |
 | STCP / sk routing    | ✅     | ✅     |
-| XTCP (NAT hole punch)| ❌     | 🟡     |
+| XTCP (NAT hole punch)| ✅     | ✅     |
 | Token authentication | ✅     | ✅     |
 | OIDC authentication  | ✅     | ✅     |
 | Heartbeat (ping/pong)| ✅     | ✅     |
@@ -55,8 +55,6 @@ suitable as a drop-in replacement for either the client or server side.
 | Visitor (STCP/XTCP)  | ✅     | —      |
 
 Client plugins: `http_proxy`, `socks5`, `static_file`.
-
-🟡 XTCP: server-side NAT hole punch (phase 1) done. Provider-side NAT detection (QUIC-based, phase 2) pending — needed for full Go frp v0.69.1 XTCP compatibility.
 
 ---
 

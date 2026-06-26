@@ -128,14 +128,14 @@ Two paths for visitor connections:
 
 Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleClient via InternalMsg) → Provider→Server(NatHoleSid) → Server→Visitor(NatHoleSid forwarded) → ... → Provider→Server(NatHoleReport) → session complete.
 
-**Status:** Server-side (phase 1) complete. Provider-side NAT detection (QUIC-based, phase 2) not yet implemented — needed for full Go frp v0.69.1 XTCP compat.
+**Status:** Fully implemented. Both sides use TCP simultaneous open for hole punching. Provider-side (`frp-client/src/service.rs`) handles `NatHoleClient` → TCP simultaneous open → bridge to local. Visitor-side (`frp-client/src/service.rs`) handles `NatHoleVisitor` → TCP simultaneous open → bridge to user. e2e test in `frp-server/tests/xtcp_hole_punch.rs`.
 
 ### Transport Status
 
 - **TCP**: fully implemented (control + work connections, TLS, WebSocket upgrade)
-- **WebSocket**: control and visitor connections work on main port; work connection dial not yet implemented
-- **KCP**: accept loop + message dispatch working; work connection dial not yet implemented
-- **QUIC**: accept loop + message dispatch working (requires TLS cert); work connection dial not yet implemented
+- **WebSocket**: fully implemented — dial, accept, message dispatch (control + work connections)
+- **KCP**: fully implemented — dial, accept, message dispatch (control + work connections)
+- **QUIC**: fully implemented — dial, accept, message dispatch (requires TLS cert on server)
 - **TcpMux** (`frp-core/src/mux.rs`, 258 lines): full yamux implementation — server and client mode, keepalive, stream accept/spawn
 - **Dashboard** (`frp-server/src/dashboard.rs`, 86 lines): basic status API with axum (version, uptime, client/proxy counts)
 - **VHost** (`frp-server/src/vhost.rs`, 394 lines): HTTP/HTTPS VHost routing with Host header parsing, SNI, pre-read byte forwarding
