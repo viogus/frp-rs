@@ -29,9 +29,9 @@ The README gives a solid overview. The sections below cover details that reading
 
 Message type bytes and structs live in `frp-core/src/msg.rs`. The `FrpMessage` enum is `#[serde(untagged)]` — serde matches the first variant whose fields intersect the JSON, which means ordering of the enum variants matters.
 
-### Authentication (Note: README is outdated)
+### Authentication
 
-Auth uses **MD5(token + timestamp)** → hex string (NOT HMAC-SHA256 as the README states). This matches Go frp v0.69.1 behavior — the switch from HMAC-SHA256 to MD5 happened in commit `78f9394`. See `frp-core/src/auth.rs`.
+Auth uses **MD5(token + timestamp)** → hex string. Matches Go frp v0.69.1 behavior — Go frp switched from HMAC-SHA256 to MD5 in commit `78f9394`. See `frp-core/src/auth.rs`.
 
 ### Encryption Key Derivation
 
@@ -46,12 +46,20 @@ AppState
   ├── run_id_to_ctl_tx: HashMap<run_id, ControlTx>   // routes work conns to correct handler
   ├── proxy_manager: ProxyManager                     // global proxy registry
   ├── used_ports: HashSet<u16>                        // port allocation tracking
-  ├── sk_index: HashMap<sk, proxy_name>              // STCP secret-key → proxy lookup
-  └── vhost_manager: VhostManager                     // HTTP VHost routing
+  ├── sk_index: HashMap<sk, proxy_name>              // STCP/XTCP secret-key → proxy lookup
+  ├── vhost_manager: VhostManager                     // HTTP VHost routing
+  ├── nat_hole: Arc<NatHoleCoordinator>              // XTCP NAT hole punch session mgmt
+  ├── oidc_verifier: Option<Arc<OidcVerifier>>       // OIDC token verification
+  └── oidc_subjects: HashMap<sub, proxy_name>        // OIDC subject → proxy routing
 ```
 
 **Connection dispatch** (`service.rs`, accept loop):
-- Every new TCP connection reads one frame. If it's `Login` → `handle_control()`. If it's `NewWorkConn` → `handle_work_conn_inner()` (looks up `run_id_to_ctl_tx`, forwards the stream via `InternalMsg::NewWorkConn`).
+- Every new TCP connection reads one frame. Dispatch by message type:
+  - `Login` → `handle_control()` (new control connection)
+  - `NewWorkConn` → `handle_work_conn_inner()` (routes to control handler via `run_id`)
+  - `NewVisitorConn` → `handle_visitor_conn_inner()` (STCP visitor, looks up `sk_index`)
+  - `NatHoleVisitor` → `handle_nat_hole_visitor()` (XTCP hole punch, fresh-connection path)
+- WebSocket connections on main port also dispatch the same message types after upgrade.
 
 **Control handler** (`control.rs`): the most complex file. Runs a `tokio::select!` loop with:
 1. **Biased** `internal_rx.recv()` — prioritized to reduce proxy connection latency
@@ -60,14 +68,22 @@ AppState
 Internal message variants drive the work connection lifecycle:
 - `ProxyUserConn` / `VisitorConn` → check `work_pool` → if empty, send `ReqWorkConn` and push to `pending_requests`
 - `NewWorkConn` → if `pending_requests` is non-empty, pop and bridge immediately; otherwise push to `work_pool`
+- `UdpNeedsWorkConn` → triggers work connection creation for UDP proxy
+- `NatHoleClient` → forwarded to provider control handler to initiate NAT hole punch
+- `WriteNatHoleSid` / `WriteNatHoleReport` → forwarded to visitor via control channel (Go frp compat path)
+- `Shutdown` → old control handler stops when superseded by new connection with same run_id
 
-**Bridging** (`assign_work_to_proxy` in `control.rs`): sends `StartWorkConn` over the work connection, writes any pre-read bytes (from HTTP VHost parsing), then either uses `tokio::io::copy_bidirectional` (plain) or `bridge::bridge_encrypted` (AES-256-GCM framed).
+**Bridging** (`assign_work_to_proxy` in `control.rs`): sends `StartWorkConn` over the work connection, writes any pre-read bytes (from HTTP VHost parsing), then either uses `tokio::io::copy_bidirectional` (plain) or `bridge::bridge_encrypted` (AES-128-CFB + Snappy, 4-byte BE length prefix framing).
 
 ### Encryption
 
-`frp-core/src/encryption.rs`: AES-256-GCM with a key derived via SHA-256 from the auth token (`encryption_key` in `AppState`). Encrypted bridge uses a 4-byte big-endian length prefix framing (`bridge.rs`).
+**Control connection:** AES-128-CFB. Key derived via PBKDF2-SHA1(token, salt="frp", iterations=64, keylen=16). See `frp-core/src/encryption.rs`.
+
+**Encrypted bridge (data plane):** AES-128-CFB streaming with Snappy compression (applied first: compress → encrypt). Framing: 4-byte big-endian length prefix + 16-byte IV + CFB-encrypted payload. See `frp-core/src/bridge.rs`.
 
 `derive_key` is called in `Service::new()` with `auth_cfg.token` — the encryption key derives from the auth token, not a separate secret.
+
+Note: Go frp v0.69.1 golib source says salt `"crypto"` but the pre-built binary uses salt `"frp"`. This codebase uses `"frp"` for binary compatibility.
 
 ### Transport Abstraction
 
@@ -87,12 +103,32 @@ Internal message variants drive the work connection lifecycle:
 - Client-side: `protocol` → `transport_protocol`, `serverAddr` → `server_addr`, `auth.token` → top-level `token`
 - TOML values are converted via `toml_to_json()` to `serde_json::Value`, then deserialized into config structs
 
-### Placeholder / Stub Code
+### XTCP NAT Hole Punching
 
-- `TcpMux` (`frp-core/src/mux.rs`): empty struct, commented-out yamux dependency
-- `dashboard.rs` and `vhost.rs` mods declared in `frp-server/src/lib.rs` but contain minimal scaffolding
-- KCP, QUIC, WebSocket work connections: handled as match arms that log a warning and return
-- `login_fail_exit` defaults to `true` in `ClientConfig::default()` but README says `false` for frpc.toml — be aware the code default is `true`
+`frp-server/src/nat_hole.rs`: `NatHoleCoordinator` manages hole-punch sessions.
+
+Two paths for visitor connections:
+1. **Fresh TCP connection** (accept loop): visitor sends `NatHoleVisitor` on a new connection. Writer stored in session for `NatHoleSid`/`NatHoleReport` forwarding.
+2. **Control connection** (Go frp compat): Go frpc v0.69.1 sends `NatHoleVisitor` on its existing control channel. Uses `InternalMsg::WriteNatHoleSid`/`WriteNatHoleReport` for forwarding.
+
+Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleClient via InternalMsg) → Provider→Server(NatHoleSid) → Server→Visitor(NatHoleSid forwarded) → ... → Provider→Server(NatHoleReport) → session complete.
+
+**Status:** Server-side (phase 1) complete. Provider-side NAT detection (QUIC-based, phase 2) not yet implemented — needed for full Go frp v0.69.1 XTCP compat.
+
+### Transport Status
+
+- **TCP**: fully implemented (control + work connections, TLS, WebSocket upgrade)
+- **WebSocket**: control and visitor connections work on main port; work connection dial not yet implemented
+- **KCP**: accept loop + message dispatch working; work connection dial not yet implemented
+- **QUIC**: accept loop + message dispatch working (requires TLS cert); work connection dial not yet implemented
+- **TcpMux** (`frp-core/src/mux.rs`, 258 lines): full yamux implementation — server and client mode, keepalive, stream accept/spawn
+- **Dashboard** (`frp-server/src/dashboard.rs`, 86 lines): basic status API with axum (version, uptime, client/proxy counts)
+- **VHost** (`frp-server/src/vhost.rs`, 394 lines): HTTP/HTTPS VHost routing with Host header parsing, SNI, pre-read byte forwarding
+
+### Gotchas
+
+- `login_fail_exit` defaults to `true` in `ClientConfig::default()` but README example shows `false` — be aware the code default is `true`
+- `#[serde(untagged)]` on `FrpMessage` enum — ordering matters for serde matching, but V1 protocol dispatches by type byte first via `deserialize_v1()`, so untagged matching is not involved in wire deserialization
 
 ### Workspace Dependencies
 

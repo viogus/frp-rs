@@ -28,7 +28,7 @@ suitable as a drop-in replacement for either the client or server side.
 | UDP proxy            | ✅     | ✅     |
 | HTTP/HTTPS proxy     | ✅     | ✅     |
 | STCP / sk routing    | ✅     | ✅     |
-| XTCP (NAT hole punch)| ❌     | ❌     |
+| XTCP (NAT hole punch)| ❌     | 🟡     |
 | Token authentication | ✅     | ✅     |
 | OIDC authentication  | ❌     | ❌     |
 | Heartbeat (ping/pong)| ✅     | ✅     |
@@ -50,6 +50,8 @@ suitable as a drop-in replacement for either the client or server side.
 | Visitor (STCP/XTCP)  | ✅     | —      |
 
 Client plugins: `http_proxy`, `socks5`, `static_file`.
+
+🟡 XTCP: server-side NAT hole punch (phase 1) done. Provider-side NAT detection (QUIC-based, phase 2) pending — needed for full Go frp v0.69.1 XTCP compatibility.
 
 ---
 
@@ -388,7 +390,7 @@ with **AES-128-CFB**, matching Go frp v0.69.1. The encryption key (16 bytes) is
 derived from the auth token via PBKDF2-SHA1:
 
 ```
-encryption_key = PBKDF2(token, "crypto", iterations=64, key_len=16, hash=SHA1)
+encryption_key = PBKDF2(token, "frp", iterations=64, key_len=16, hash=SHA1)
 ```
 
 ### Compression
@@ -407,8 +409,8 @@ Each encrypted frame contains a random 16-byte IV followed by the CFB-encrypted
 [4-byte BE len][16-byte IV][AES-128-CFB encrypted (Snappy-compressed? plaintext)]
 ```
 
-- Supported for TCP proxies (both client and server bridge paths).
-- UDP proxy encryption not yet implemented.
+- Supported for TCP proxies (both client and server bridge paths) and control connections.
+- Note: Go frp v0.69.1 golib source says salt `"crypto"` but the pre-built binary uses `"frp"`. This codebase uses `"frp"` for binary compatibility.
 
 ## Project Structure
 
@@ -438,6 +440,7 @@ frp-rs/
       proxy.rs            ProxyManager, ProxyInfo, port allocation
       vhost.rs            HTTP/HTTPS VHost routing + Host header parsing
       dashboard.rs        Dashboard web UI
+      nat_hole.rs         XTCP NAT hole punch coordinator (dual-path: accept + control channel)
   frps/                   Server binary
     Cargo.toml
     src/main.rs
@@ -457,6 +460,9 @@ frp-rs/
     Dockerfile.source      Multi-stage image (builds from Rust source)
     build.sh               Release binary download + verification script
     entrypoint.c           Minimal static entrypoint (FRP_MODE, conf path)
+    README.md              Docker build documentation
+  scripts/
+    compat-test.sh         Go↔Rust cross-compatibility test suite (18+ tests)
   frps.toml               Example server config
   frpc.toml               Example client config
   CLAUDE.md               Claude Code project instructions
@@ -522,6 +528,10 @@ cargo run --bin frps -- --config-dir /etc/frp/conf.d
 
 # Build Docker image locally
 docker build -f docker/Dockerfile.source --build-arg FRP_COMPONENT=frps -t frps-rs:local .
+
+# Run Go↔Rust cross-compatibility tests
+bash scripts/compat-test.sh            # all tests
+bash scripts/compat-test.sh tcp g2r    # specific filter: TCP, Go→Rust direction
 ```
 
 ---
