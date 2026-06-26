@@ -176,19 +176,23 @@ pub async fn run_dashboard(
     auth_user: String,
     auth_password: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // API routes
+    // API routes (auth-protected)
     let api_routes = Router::new()
         .route("/api/status", get(handle_status))
         .route("/api/proxies", get(handle_proxies))
         .route("/api/proxy/:name", get(handle_proxy_detail))
         .route("/api/proxy/:name/traffic", get(handle_proxy_traffic));
 
-    // Apply auth to API routes only (not HTML page)
     let api_routes = apply_admin_auth(api_routes, &auth_user, &auth_password);
+
+    // /metrics is public (Prometheus scrapers don't use Basic Auth)
+    let metrics_route = Router::new()
+        .route("/metrics", get(|| async { crate::metrics::prom::render_metrics_text() }));
 
     let app = Router::new()
         .route("/", get(handle_root))
         .merge(api_routes)
+        .merge(metrics_route)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

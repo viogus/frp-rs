@@ -114,6 +114,11 @@ async fn handle_put_config(
 ) -> Result<&'static str, (StatusCode, String)> {
     let path = state.config_path.as_ref()
         .ok_or_else(|| (StatusCode::NOT_FOUND, "no config file path stored".into()))?;
+
+    // Validate TOML before writing — don't overwrite with invalid config
+    let _ = frp_core::config::load_client_config_from_str(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid config: {e}")))?;
+
     std::fs::write(path, &body)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write config: {e}")))?;
     // Trigger reload after config update
