@@ -157,6 +157,7 @@ async fn test_e2e_tcp_proxy_over_websocket() {
             health_check_interval_seconds: 0,
             health_check_timeout_seconds: 0,
             health_check_max_failed: 0,
+            virtual_net: String::new(),
         }],
         ..Default::default()
     };
@@ -277,6 +278,7 @@ async fn test_e2e_tcp_proxy_over_tls() {
             health_check_interval_seconds: 0,
             health_check_timeout_seconds: 0,
             health_check_max_failed: 0,
+            virtual_net: String::new(),
         }],
         ..Default::default()
     };
@@ -373,6 +375,7 @@ async fn test_e2e_tcp_proxy_over_yamux() {
             health_check_interval_seconds: 0,
             health_check_timeout_seconds: 0,
             health_check_max_failed: 0,
+            virtual_net: String::new(),
         }],
         ..Default::default()
     };

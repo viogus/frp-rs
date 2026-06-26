@@ -8,6 +8,7 @@
 //! - `http_proxy`: HTTP/HTTPS forward proxy with optional basic auth.
 //! - `socks5`: SOCKS5 proxy (CONNECT only) with optional username/password auth.
 //! - `static_file`: Serve static files from a local directory with optional basic auth.
+//! - `visitor_plugin`: Placeholder for STCP/XTCP visitor connection hooks.
 
 use std::net::SocketAddr;
 
@@ -21,6 +22,7 @@ mod socks5;
 mod static_file;
 mod unix_socket;
 mod tls2raw;
+mod visitor;
 
 pub(crate) use http::start_http_proxy;
 pub(crate) use http2http::start_http2http_plugin;
@@ -31,6 +33,7 @@ pub(crate) use socks5::start_socks5_proxy;
 pub(crate) use static_file::start_static_file_proxy;
 pub(crate) use unix_socket::start_unix_socket_plugin;
 pub(crate) use tls2raw::start_tls2raw_plugin;
+pub(crate) use visitor::start_visitor_plugin;
 
 /// A running plugin server. Drop to shut down.
 #[derive(Debug)]

@@ -1,3 +1,35 @@
+# Dashboard HTML Upgrade — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Replace minimal dashboard HTML with a full admin panel (monitoring + proxy management) in a single `dashboard.html` file.
+
+**Architecture:** Single `dashboard.html` embedded via `include_str!()` in `dashboard.rs`. No Rust changes, no new dependencies, no build step. Modern Clean visual style (system font, purple/cyan/amber accents, #0f0f1a background). Canvas charts hand-rolled (~100 lines vanilla JS). 5s polling with countdown indicator.
+
+**Tech Stack:** HTML5, CSS3, vanilla JavaScript (ES6), `<canvas>` API. Served by existing axum `handle_root()` handler via `include_str!()`.
+
+---
+
+## File Structure
+
+| File | Action |
+|------|--------|
+| `frp-server/src/dashboard.html` | Complete rewrite (~500 lines) |
+
+No other files changed.
+
+---
+
+### Task 1: Write the complete dashboard.html
+
+**Files:**
+- Modify: `frp-server/src/dashboard.html` — full rewrite
+
+- [ ] **Step 1: Replace dashboard.html with new implementation**
+
+Write the following content to `frp-server/src/dashboard.html`:
+
+```html
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -63,7 +95,7 @@ tr:hover td { background: rgba(255,255,255,0.02); }
 /* Detail panel */
 .detail-row td { padding: 0; border-bottom: 1px solid #2d2d4a; }
 .detail-panel {
-  display: flex; flex-direction: column; gap: 0; padding: 14px 16px;
+  display: flex; gap: 20px; padding: 14px 16px;
   background: rgba(167,139,250,0.04); border-left: 2px solid #a78bfa;
 }
 .detail-panel .config { flex: 1; }
@@ -236,13 +268,10 @@ tr:hover td { background: rgba(255,255,255,0.02); }
 <script>
 // --- State ---
 const HISTORY_LEN = 10;
-const state = {
+let state = {
   proxies: [],
   clients: [],
-  trafficHistory: [],
-  lastCumIn: undefined,
-  lastCumOut: undefined,
-  proxyHistory: {},   // { name: [{bytesIn, bytesOut}, ...] }
+  trafficHistory: [],  // [{bytesIn, bytesOut}, ...]
   expandedProxy: null,
   countdown: 5,
   storeConfigs: [],
@@ -300,9 +329,11 @@ function drawBarChart(canvas, data, width, height) {
 
   for (let i = 0; i < data.length; i++) {
     let x = 4 + i * (barW + 2);
+    // In bar (blue)
     let hIn = Math.max(1, (data[i].bytesIn || 0) * scale);
     ctx.fillStyle = '#60a5fa';
     ctx.fillRect(x, height - hIn - 2, barW / 2 - 1, hIn);
+    // Out bar (amber)
     let hOut = Math.max(1, (data[i].bytesOut || 0) * scale);
     ctx.fillStyle = '#f59e0b';
     ctx.fillRect(x + barW / 2, height - hOut - 2, barW / 2 - 1, hOut);
@@ -376,38 +407,15 @@ async function load() {
     state.proxies = await pResp.json();
     renderProxies();
 
-    // Update traffic history — compute deltas from cumulative counters
+    // Update traffic history
     let totalIn = 0, totalOut = 0;
-    for (let i = 0; i < state.proxies.length; i++) {
-      totalIn += state.proxies[i].traffic_in || 0;
-      totalOut += state.proxies[i].traffic_out || 0;
+    for (let p of state.proxies) {
+      totalIn += p.traffic_in || 0;
+      totalOut += p.traffic_out || 0;
     }
-    // Compute deltas from last cumulative values
-    if (state.lastCumIn !== undefined) {
-      state.trafficHistory.push({
-        bytesIn: Math.max(0, totalIn - state.lastCumIn),
-        bytesOut: Math.max(0, totalOut - state.lastCumOut)
-      });
-    } else {
-      // First poll — no baseline, push zero
-      state.trafficHistory.push({ bytesIn: 0, bytesOut: 0 });
-    }
-    state.lastCumIn = totalIn;
-    state.lastCumOut = totalOut;
+    state.trafficHistory.push({ bytesIn: totalIn, bytesOut: totalOut });
     if (state.trafficHistory.length > HISTORY_LEN) state.trafficHistory.shift();
     renderTraffic();
-
-    // Update per-proxy traffic history for sparklines
-    for (let i = 0; i < state.proxies.length; i++) {
-      let p = state.proxies[i];
-      let name = p.name;
-      if (!state.proxyHistory[name]) state.proxyHistory[name] = [];
-      state.proxyHistory[name].push({
-        bytesIn: p.traffic_in || 0,
-        bytesOut: p.traffic_out || 0
-      });
-      if (state.proxyHistory[name].length > HISTORY_LEN) state.proxyHistory[name].shift();
-    }
 
     // If detail open, refresh it
     if (state.expandedProxy) {
@@ -446,6 +454,7 @@ function renderStats(d) {
   document.getElementById('uptime').textContent = formatDuration(d.uptime_secs);
   document.getElementById('stat-clients').textContent = d.client_count;
   document.getElementById('stat-proxies').textContent = d.proxy_count;
+  // Traffic totals computed in load()
 }
 
 function renderTraffic() {
@@ -497,7 +506,7 @@ function escHtml(s) {
 
 function escAttr(s) {
   if (!s) return '';
-  return String(s).replace(/\\/g, '\\\\').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 async function toggleProxy(name) {
@@ -510,7 +519,7 @@ async function toggleProxy(name) {
 
 async function expandProxy(name) {
   state.expandedProxy = name;
-  renderProxies();
+  renderProxies(); // show expanded row placeholder
   await refreshDetail(name);
 }
 
@@ -530,9 +539,7 @@ async function refreshDetail(name) {
     let traffic = tResp.ok ? await tResp.json() : null;
 
     panel.innerHTML =
-      '<div style="display:flex;justify-content:flex-end;margin-bottom:8px"><button onclick="collapseProxy()" style="background:none;border:none;color:#8b8baa;font-size:18px;cursor:pointer;line-height:1;padding:0 4px" title="Close">&times;</button></div>' +
-      '<div style="display:flex;gap:20px">' +
-        '<div class="config">' +
+      '<div class="config">' +
         '<dl>' +
           '<dt>Type</dt><dd>' + escHtml(detail.type) + '</dd>' +
           '<dt>Remote Port</dt><dd>' + (detail.remote_port || '--') + '</dd>' +
@@ -546,14 +553,14 @@ async function refreshDetail(name) {
       '<div class="traffic-panel">' +
         '<canvas id="spark-' + escAttr(name) + '" width="220" height="80" style="width:220px;height:80px"></canvas>' +
         '<div class="conn-info">Connections: ' + (traffic ? traffic.current_conns : '--') + ' active &middot; ' + (traffic ? traffic.total_conns : '--') + ' total</div>' +
-      '</div>' +
       '</div>';
 
-    // Draw sparkline from per-proxy history
+    // If we had per-proxy history we'd draw sparkline here.
+    // For now, draw a simple bar from current traffic snapshot.
     let sparkCanvas = document.getElementById('spark-' + escAttr(name));
-    if (sparkCanvas) {
-      let hist = state.proxyHistory[name] || [];
-      drawSparkline(sparkCanvas, hist, 220, 80);
+    if (sparkCanvas && traffic) {
+      let snapData = [{bytesIn: traffic.bytes_in || 0, bytesOut: traffic.bytes_out || 0}];
+      drawBarChart(sparkCanvas, snapData, 220, 80);
     }
   } catch(e) {
     panel.innerHTML = '<span style="color:#f87171">Error: ' + escHtml(String(e)) + '</span>';
@@ -567,10 +574,9 @@ function renderClients() {
     return;
   }
   let rows = [];
-  for (let i = 0; i < state.clients.length; i++) {
-    let c = state.clients[i];
+  for (let c of state.clients) {
     rows.push('<tr>');
-    rows.push('<td class="mono" style="font-size:11px;color:#8b8baa">' + escHtml(truncate(c.run_id, 16)) + '</td>');
+    rows.push('<td class="mono" style="font-size:11px;color:#8b8baa">' + truncate(c.run_id, 16) + '</td>');
     rows.push('<td>' + escHtml(c.client_addr || '--') + '</td>');
     rows.push('<td>' + formatDuration(c.login_time_secs) + '</td>');
     rows.push('<td>' + (c.proxies && c.proxies.length > 0 ? escHtml(c.proxies.join(', ')) : '<span class="muted">none</span>') + '</td>');
@@ -623,6 +629,7 @@ async function deleteProxy(name) {
     if (resp.ok) {
       toast('Deleted: ' + name, 'success');
       await loadStore();
+      // Reload proxy list since proxy was removed
       await load();
     } else {
       toast(data.error || 'Delete failed', 'error');
@@ -639,8 +646,7 @@ function renderStore() {
     return;
   }
   let items = [];
-  for (let i = 0; i < state.storeConfigs.length; i++) {
-    let c = state.storeConfigs[i];
+  for (let c of state.storeConfigs) {
     items.push(
       '<div class="store-item">' +
         '<span>' + escHtml(c.name) + ' <span class="muted">' + escHtml(c.type) + '</span>' +
@@ -672,14 +678,121 @@ async function tick() {
 load();
 loadClients();
 loadStore();
-function scheduleTick() {
-  setTimeout(function() {
-    tick().then(function() {
-      scheduleTick();
-    });
-  }, 1000);
-}
-scheduleTick();
+setInterval(tick, 1000);
 </script>
 </body>
 </html>
+```
+
+- [ ] **Step 2: Verify file was written correctly**
+
+```bash
+wc -l frp-server/src/dashboard.html
+```
+
+Expected: ~450-500 lines.
+
+---
+
+### Task 2: Build and verify
+
+**Files:** No changes — verification only.
+
+- [ ] **Step 1: Build the workspace**
+
+```bash
+cargo build --workspace
+```
+
+Expected: Clean build, no errors.
+
+- [ ] **Step 2: Run existing tests**
+
+```bash
+cargo test --workspace
+```
+
+Expected: All tests pass (no Rust changes, so existing test count unchanged).
+
+- [ ] **Step 3: Run clippy**
+
+```bash
+cargo clippy --workspace
+```
+
+Expected: No new warnings.
+
+- [ ] **Step 4: Create a minimal frps config for dashboard smoke test**
+
+Write to `/tmp/frps-dash-test.toml`:
+
+```toml
+bind_addr = "0.0.0.0"
+bind_port = 7999
+auth.token = "test123"
+dashboard.enable = true
+dashboard.port = 7500
+dashboard.user = "admin"
+dashboard.pwd = "admin"
+```
+
+- [ ] **Step 5: Start frps with dashboard**
+
+```bash
+cargo run --bin frps -- -c /tmp/frps-dash-test.toml &
+FRPS_PID=$!
+sleep 2
+```
+
+- [ ] **Step 6: Verify dashboard serves HTML**
+
+```bash
+curl -s -u admin:admin http://localhost:7500/ | head -5
+```
+
+Expected: `<!DOCTYPE html>` and dashboard content.
+
+- [ ] **Step 7: Verify /api/status returns JSON**
+
+```bash
+curl -s -u admin:admin http://localhost:7500/api/status | python3 -m json.tool
+```
+
+Expected: JSON with `version`, `uptime_secs`, `client_count`, `proxy_count` fields.
+
+- [ ] **Step 8: Verify /api/proxies returns JSON array**
+
+```bash
+curl -s -u admin:admin http://localhost:7500/api/proxies | python3 -m json.tool
+```
+
+Expected: `[]` (empty array, no proxies registered yet).
+
+- [ ] **Step 9: Stop frps**
+
+```bash
+kill $FRPS_PID
+```
+
+---
+
+### Task 3: Commit
+
+**Files:** Modified `frp-server/src/dashboard.html`
+
+- [ ] **Step 1: Stage and commit**
+
+```bash
+git add frp-server/src/dashboard.html
+git commit -m "feat: upgrade dashboard HTML with full admin panel
+
+- Modern Clean visual style (system font, purple/cyan/amber accents)
+- Stat cards (clients, proxies, traffic in/out)
+- Canvas bar chart for traffic history (rolling 50s window)
+- Proxy table with inline expandable detail panel
+- Client table with run ID, address, uptime, proxy list
+- Store section with create form and delete buttons
+- 5s polling with countdown indicator
+- Zero new dependencies, no Rust changes
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"

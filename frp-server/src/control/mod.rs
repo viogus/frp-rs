@@ -7,12 +7,37 @@ use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 use tracing::{info, warn, debug};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 
 use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::IncomingStreams;
-use frp_core::protocol::{read_msg_v1, write_msg_v1};
+use frp_core::protocol::{read_msg_v1, write_msg_v1, read_msg_v2, write_msg_v2};
+
+/// Protocol-aware read: dispatches to V1 or V2 framing based on the `v2` flag.
+async fn read_ctl_msg<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    v2: bool,
+) -> Result<FrpMessage, frp_core::Error> {
+    if v2 {
+        read_msg_v2(reader).await
+    } else {
+        read_msg_v1(reader).await
+    }
+}
+
+/// Protocol-aware write: dispatches to V1 or V2 framing based on the `v2` flag.
+async fn write_ctl_msg<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    msg: &FrpMessage,
+    v2: bool,
+) -> Result<(), frp_core::Error> {
+    if v2 {
+        write_msg_v2(writer, msg).await
+    } else {
+        write_msg_v1(writer, msg).await
+    }
+}
 use frp_core::transport::IoStream;
 
 use crate::service::{AppState, InternalMsg, ControlTx};
@@ -45,6 +70,7 @@ pub async fn handle_control<S>(
     state: Arc<AppState>,
     peer: Option<SocketAddr>,
     mut incoming: Option<IncomingStreams>,
+    v2: bool,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -66,7 +92,7 @@ pub async fn handle_control<S>(
                     run_id: None,
                     error: Some(format!("OIDC authentication failed: {e}")),
                 });
-                let _ = write_msg_v1(&mut writer, &resp).await;
+                let _ = write_ctl_msg(&mut writer, &resp, v2).await;
                 return;
             }
         }
@@ -83,7 +109,7 @@ pub async fn handle_control<S>(
                 run_id: None,
                 error: Some(e),
             });
-            let _ = write_msg_v1(&mut writer, &resp).await;
+            let _ = write_ctl_msg(&mut writer, &resp, v2).await;
             return;
         }
         None
@@ -96,6 +122,27 @@ pub async fn handle_control<S>(
     // Store OIDC subject for ping/NWC verification
     if let Some(ref sub) = oidc_subject {
         state.oidc_subjects.write().await.insert(run_id.clone(), sub.clone());
+    }
+
+    // --- Server plugin: login hook ---
+    let login_content = serde_json::json!({
+        "version": login.version,
+        "hostname": login.hostname,
+        "os": login.os,
+        "user": login.user,
+        "run_id": run_id,
+        "remote_addr": peer.map(|a| a.to_string()),
+    });
+    if let Err(reason) = state.plugin_manager.notify("login", login_content).await {
+        warn!("Login for run_id {} rejected by server plugin: {}", run_id, reason);
+        let (_, mut writer) = tokio::io::split(stream);
+        let resp = FrpMessage::LoginResp(msg::LoginResp {
+            version: Some(frp_core::VERSION.into()),
+            run_id: None,
+            error: Some(reason),
+        });
+        let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+        return;
     }
 
     // --- Set up internal channel ---
@@ -123,7 +170,7 @@ pub async fn handle_control<S>(
             run_id: Some(run_id.clone()),
             error: None,
         });
-        if let Err(e) = write_msg_v1(&mut stream, &resp).await {
+        if let Err(e) = write_ctl_msg(&mut stream, &resp, v2).await {
             warn!("Failed to send login response to {:?}: {}", peer, e);
             proxy_ops::unregister_control(&state, &run_id).await;
             return;
@@ -191,7 +238,7 @@ pub async fn handle_control<S>(
                             let local_addr = state.proxy_manager.get(&proxy_name).await
                                 .and_then(|info| info.local_addr)
                                 .and_then(|s| msg::UdpAddr::from_string(&s));
-                            bridge::assign_udp_work_conn(stream, &proxy_name, &udp_sockets, local_addr).await;
+                            bridge::assign_udp_work_conn(stream, &proxy_name, &udp_sockets, local_addr, v2).await;
                         } else {
                             // Drain expired TCP requests
                             while let Some(req) = pending_requests.front() {
@@ -203,7 +250,7 @@ pub async fn handle_control<S>(
                             }
                             if let Some(req) = pending_requests.pop_front() {
                                 let enc_key = state.reloadable.read().unwrap().encryption_key;
-                                bridge::assign_work_to_proxy(stream, req, enc_key, state.clone()).await;
+                                bridge::assign_work_to_proxy(stream, req, enc_key, state.clone(), v2).await;
                             } else if work_pool.len() < pool_cap {
                                 work_pool.push_back(stream);
                                 debug!("Work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
@@ -222,10 +269,10 @@ pub async fn handle_control<S>(
                         };
                         if let Some(work_conn) = work_pool.pop_front() {
                             let enc_key = state.reloadable.read().unwrap().encryption_key;
-                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now() }, enc_key, state.clone()).await;
+                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now() }, enc_key, state.clone(), v2).await;
                         } else {
                             debug!("No pooled work conn for STCP, sending ReqWorkConn");
-                            if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
+                            if let Err(e) = write_ctl_msg(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
                                 warn!("Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
@@ -277,10 +324,10 @@ pub async fn handle_control<S>(
                         };
                         if let Some(work_conn) = work_pool.pop_front() {
                             let enc_key = state.reloadable.read().unwrap().encryption_key;
-                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() }, enc_key, state.clone()).await;
+                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now() }, enc_key, state.clone(), v2).await;
                         } else {
                             debug!("No pooled work conn, sending ReqWorkConn for {}", target_proxy);
-                            if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
+                            if let Err(e) = write_ctl_msg(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
                                 warn!("Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
@@ -289,7 +336,7 @@ pub async fn handle_control<S>(
                     }
                     Some(InternalMsg::UdpNeedsWorkConn { proxy_name }) => {
                         debug!("UDP proxy '{}' needs work connection", proxy_name);
-                        if let Err(e) = write_msg_v1(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {})).await {
+                        if let Err(e) = write_ctl_msg(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
                             warn!("Failed to send ReqWorkConn for UDP: {}", e);
                             break;
                         }
@@ -302,7 +349,7 @@ pub async fn handle_control<S>(
                             transaction_id,
                             visitor_addr,
                         });
-                        if let Err(e) = write_msg_v1(&mut writer, &nhc).await {
+                        if let Err(e) = write_ctl_msg(&mut writer, &nhc, v2).await {
                             warn!("Failed to send NatHoleClient: {}", e);
                             break;
                         }
@@ -313,7 +360,7 @@ pub async fn handle_control<S>(
                             sid: Some(sid),
                             provider_addr,
                         });
-                        if let Err(e) = write_msg_v1(&mut writer, &forward).await {
+                        if let Err(e) = write_ctl_msg(&mut writer, &forward, v2).await {
                             warn!("Failed to write NatHoleSid to visitor: {}", e);
                         }
                     }
@@ -322,7 +369,7 @@ pub async fn handle_control<S>(
                         let forward = FrpMessage::NatHoleReport(msg::NatHoleReport {
                             sid: Some(sid),
                         });
-                        if let Err(e) = write_msg_v1(&mut writer, &forward).await {
+                        if let Err(e) = write_ctl_msg(&mut writer, &forward, v2).await {
                             warn!("Failed to write NatHoleReport to visitor: {}", e);
                         }
                     }
@@ -348,7 +395,7 @@ pub async fn handle_control<S>(
             } => {
                 if let Some(stream) = incoming_msg {
                     let mut io = IoStream::Yamux(stream);
-                    match read_msg_v1(&mut io).await {
+                    match read_ctl_msg(&mut io, v2).await {
                         Ok(FrpMessage::NewWorkConn(nwc)) => {
                             let stream_run_id = nwc.run_id.as_deref().unwrap_or("");
                             if stream_run_id != run_id {
@@ -375,7 +422,7 @@ pub async fn handle_control<S>(
                     }
                     if let Some(req) = pending_requests.pop_front() {
                         let enc_key = state.reloadable.read().unwrap().encryption_key;
-                        bridge::assign_work_to_proxy(io, req, enc_key, state.clone()).await;
+                        bridge::assign_work_to_proxy(io, req, enc_key, state.clone(), v2).await;
                     } else if work_pool.len() < pool_cap {
                         work_pool.push_back(io);
                         debug!("Yamux work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
@@ -385,7 +432,7 @@ pub async fn handle_control<S>(
                 }
             }
 
-            msg = read_msg_v1(&mut reader) => {
+            msg = read_ctl_msg(&mut reader, v2) => {
                 match msg {
                     Ok(FrpMessage::UDPPacket(up)) => {
                         debug!("UDPPacket from client: {} bytes to {:?}", up.content.len(), up.remote_addr);
@@ -458,11 +505,21 @@ pub async fn handle_control<S>(
                         }
                         state.proxy_manager.remove(&cp.proxy_name).await;
                         info!("Proxy closed: {}", cp.proxy_name);
+                        // Server plugin: close_proxy hook (fire-and-forget)
+                        let plugin_state = state.clone();
+                        let pn = cp.proxy_name.clone();
+                        let rid = run_id.clone();
+                        tokio::spawn(async move {
+                            let _ = plugin_state.plugin_manager.notify(
+                                "close_proxy",
+                                serde_json::json!({ "proxy_name": pn, "run_id": rid }),
+                            ).await;
+                        });
                         // Send CloseProxyResp back to client (Go frp compat)
                         let cpr = FrpMessage::CloseProxyResp(msg::CloseProxyResp {
                             proxy_name: cp.proxy_name.clone(),
                         });
-                        let _ = write_msg_v1(&mut writer, &cpr).await;
+                        let _ = write_ctl_msg(&mut writer, &cpr, v2).await;
                     }
                     Ok(FrpMessage::NatHoleSid(ref sid_msg)) => {
                         debug!("Received NatHoleSid from provider: {:?}", sid_msg.sid);
@@ -477,7 +534,7 @@ pub async fn handle_control<S>(
                                     sid: Some(sid.clone()),
                                     provider_addr,
                                 });
-                                if write_msg_v1(&mut writer, &forward).await.is_ok() {
+                                if write_ctl_msg(&mut writer, &forward, v2).await.is_ok() {
                                     debug!("Forwarded NatHoleSid to visitor for session {}", sid);
                                 } else {
                                     warn!("Failed to write NatHoleSid to visitor for session {}", sid);
@@ -498,7 +555,7 @@ pub async fn handle_control<S>(
                                     let forward = FrpMessage::NatHoleReport(msg::NatHoleReport {
                                         sid: Some(sid.clone()),
                                     });
-                                    let _ = write_msg_v1(&mut writer, &forward).await;
+                                    let _ = write_ctl_msg(&mut writer, &forward, v2).await;
                                 }
                             }
                             state.nat_hole.complete(sid).await;
@@ -530,12 +587,12 @@ pub async fn handle_control<S>(
                         if let Err(e) = ping_auth_result {
                             warn!("Ping auth failed from {:?}: {}", peer, e);
                             let pong = FrpMessage::Pong(msg::Pong { error: Some(e) });
-                            let _ = write_msg_v1(&mut writer, &pong).await;
+                            let _ = write_ctl_msg(&mut writer, &pong, v2).await;
                             break;
                         }
                         last_ping = Instant::now();
                         let pong = FrpMessage::Pong(msg::Pong { error: None });
-                        if let Err(e) = write_msg_v1(&mut writer, &pong).await {
+                        if let Err(e) = write_ctl_msg(&mut writer, &pong, v2).await {
                             warn!("Failed to send pong: {}", e);
                             break;
                         }
@@ -554,7 +611,7 @@ pub async fn handle_control<S>(
                                 error: Some("proxy not found".into()),
                                 ..Default::default()
                             });
-                            let _ = write_msg_v1(&mut writer, &resp).await;
+                            let _ = write_ctl_msg(&mut writer, &resp, v2).await;
                             continue;
                         }
 
@@ -567,7 +624,7 @@ pub async fn handle_control<S>(
                                     error: Some("provider offline".into()),
                                     ..Default::default()
                                 });
-                                let _ = write_msg_v1(&mut writer, &resp).await;
+                                let _ = write_ctl_msg(&mut writer, &resp, v2).await;
                                 continue;
                             }
                         };
@@ -584,7 +641,7 @@ pub async fn handle_control<S>(
                                     error: Some("provider disconnected".into()),
                                     ..Default::default()
                                 });
-                                let _ = write_msg_v1(&mut writer, &resp).await;
+                                let _ = write_ctl_msg(&mut writer, &resp, v2).await;
                                 continue;
                             }
                         };
@@ -615,7 +672,7 @@ pub async fn handle_control<S>(
                             error: None,
                             ..Default::default()
                         });
-                        let _ = write_msg_v1(&mut writer, &resp).await;
+                        let _ = write_ctl_msg(&mut writer, &resp, v2).await;
 
                         // Spawn task to wait for report oneshot (30s timeout)
                         let nat_hole = state.nat_hole.clone();

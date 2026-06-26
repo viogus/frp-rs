@@ -4,14 +4,13 @@ use tracing::{debug, info, warn};
 
 use frp_core::metrics::ConnGuard;
 use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::{read_msg_v1, write_msg_v1};
+use frp_core::protocol::{read_msg_v1, write_msg_v1, read_msg_v2, write_msg_v2};
 use frp_core::transport::IoStream;
 
 use crate::service::AppState;
 
 use super::PendingRequest;
 
-/// Assign a work connection to a pending proxy request.
 /// Assign a work connection to a UDP proxy for bidirectional data forwarding.
 /// Matches Go frp v0.69.1 behavior: sends StartWorkConn, then bridges
 /// UDP socket ↔ work connection via UDPPacket messages.
@@ -20,6 +19,7 @@ pub(crate) async fn assign_udp_work_conn(
     proxy_name: &str,
     udp_sockets: &std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
     local_addr: Option<msg::UdpAddr>,
+    v2: bool,
 ) {
     let mut work_conn = work_conn;
     let sock = match udp_sockets.get(proxy_name) {
@@ -40,7 +40,12 @@ pub(crate) async fn assign_udp_work_conn(
         dst_port: None,
         error: None,
     });
-    if let Err(e) = write_msg_v1(&mut work_conn, &swc).await {
+    if v2 {
+        if let Err(e) = work_conn.write_v2_frame(&swc).await {
+            warn!("Failed to send StartWorkConn (V2) for UDP '{}': {}", proxy_name, e);
+            return;
+        }
+    } else if let Err(e) = work_conn.write_v1_frame(&swc).await {
         warn!("Failed to send StartWorkConn for UDP '{}': {}", proxy_name, e);
         return;
     }
@@ -54,7 +59,12 @@ pub(crate) async fn assign_udp_work_conn(
     tokio::spawn(async move {
         debug!("UDP work conn reader task started for '{}'", pn_w);
         loop {
-            match read_msg_v1(&mut w_r).await {
+            let result = if v2 {
+                read_msg_v2(&mut w_r).await
+            } else {
+                read_msg_v1(&mut w_r).await
+            };
+            match result {
                 Ok(FrpMessage::UDPPacket(up)) => {
                     if let Some(ref remote) = up.remote_addr {
                         let remote_str = remote.to_string();
@@ -98,7 +108,12 @@ pub(crate) async fn assign_udp_work_conn(
                         remote_addr: Some(remote),
                     });
                     debug!("UDP writer '{}' sending UDPPacket to work conn...", pn_w2);
-                    if let Err(e) = write_msg_v1(&mut w_w, &pkt).await {
+                    let write_result = if v2 {
+                        write_msg_v2(&mut w_w, &pkt).await
+                    } else {
+                        write_msg_v1(&mut w_w, &pkt).await
+                    };
+                    if let Err(e) = write_result {
                         debug!("UDP work conn write failed for '{}': {}", pn_w2, e);
                         break;
                     }
@@ -119,6 +134,7 @@ pub(crate) async fn assign_work_to_proxy(
     req: PendingRequest,
     encryption_key: [u8; 16],
     state: Arc<AppState>,
+    v2: bool,
 ) {
     let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
         proxy_name: req.proxy_name.clone(),
@@ -129,17 +145,10 @@ pub(crate) async fn assign_work_to_proxy(
         error: None,
     });
 
-    let write_result = match &mut work_conn {
-        IoStream::Tcp(ref mut s) => write_msg_v1(s, &swc).await,
-        IoStream::Tls(ref mut s) => write_msg_v1(s, &swc).await,
-        IoStream::WebSocket(ref mut s) => write_msg_v1(s, &swc).await,
-        IoStream::Yamux(ref mut s) => write_msg_v1(s, &swc).await,
-        IoStream::Kcp(ref mut s) => write_msg_v1(s, &swc).await,
-        IoStream::Quic(ref mut s) => write_msg_v1(s, &swc).await,
-        IoStream::Cipher(_) => {
-            warn!("Cipher stream unexpected in server StartWorkConn write");
-            return;
-        }
+    let write_result = if v2 {
+        work_conn.write_v2_frame(&swc).await
+    } else {
+        work_conn.write_v1_frame(&swc).await
     };
 
     if let Err(e) = write_result {

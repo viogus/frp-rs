@@ -175,6 +175,7 @@ impl TestHarness {
                 health_check_interval_seconds: 0,
                 health_check_timeout_seconds: 0,
                 health_check_max_failed: 0,
+            virtual_net: String::new(),
             }],
             ..Default::default()
         };

@@ -35,6 +35,25 @@ pub(crate) async fn handle_new_proxy(
     }
     let remote_port = raw_port as u16;
 
+    // Server plugin: new_proxy hook (before port allocation).
+    // Control-enabled plugins can reject the proxy registration.
+    let np_content = serde_json::json!({
+        "proxy_name": np.proxy_name,
+        "proxy_type": np.proxy_type,
+        "remote_port": remote_port,
+        "custom_domains": np.custom_domains,
+        "run_id": run_id,
+    });
+    if let Err(reason) = state.plugin_manager.notify("new_proxy", np_content).await {
+        let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
+            proxy_name: np.proxy_name.clone(),
+            remote_addr: None,
+            error: Some(reason),
+        });
+        let _ = write_msg_v1(writer, &resp).await;
+        return;
+    }
+
     let is_sudp = np.proxy_type == "sudp";
     // When sudp_port is configured, force all SUDP proxies to use that port
     let remote_port = if is_sudp && state.sudp_port > 0 {
@@ -64,6 +83,8 @@ pub(crate) async fn handle_new_proxy(
 
     match allocated_port {
         Some(port) => {
+            let virtual_net = np.virtual_net.clone()
+                .filter(|v| !v.is_empty());
             let info = ProxyInfo {
                 name: np.proxy_name.clone(),
                 proxy_type: np.proxy_type.clone(),
@@ -73,8 +94,9 @@ pub(crate) async fn handle_new_proxy(
                 group: np.group.clone(),
                 group_key: np.group_key.clone(),
                 local_addr: np.local_str.clone(),
-            use_encryption: np.use_encryption.unwrap_or(false),
-            use_compression: np.use_compression.unwrap_or(false),
+                use_encryption: np.use_encryption.unwrap_or(false),
+                use_compression: np.use_compression.unwrap_or(false),
+                virtual_net: virtual_net.clone(),
             };
 
             if let Err(e) = state.proxy_manager.register(run_id.to_string(), info.clone()).await {
@@ -88,12 +110,20 @@ pub(crate) async fn handle_new_proxy(
                 return;
             }
 
-            // Register STCP proxies in sk_index
+            // Register STCP/XTCP proxies in sk_index (scoped by virtual_net)
             if np.proxy_type == "stcp" || np.proxy_type == "xtcp" {
                 if let Some(ref sk) = np.sk {
                     if !sk.is_empty() {
-                        state.sk_index.write().await.insert(sk.clone(), np.proxy_name.clone());
-                        info!("STCP/XTCP proxy '{}' registered with sk", np.proxy_name);
+                        let vn = np.virtual_net.as_deref().unwrap_or("");
+                        let sk_key = if vn.is_empty() {
+                            sk.clone()
+                        } else {
+                            format!("{}:{}", vn, sk)
+                        };
+                        state.sk_index.write().await.insert(sk_key, np.proxy_name.clone());
+                        info!("STCP/XTCP proxy '{}' registered with sk{}",
+                            np.proxy_name,
+                            if vn.is_empty() { String::new() } else { format!(" (virtual_net: {vn})") });
                     }
                 }
             }
@@ -393,10 +423,15 @@ pub(crate) async fn unregister_control(state: &Arc<AppState>, run_id: &str) {
         if let Some(port) = p.remote_port {
             ports.remove(&port);
         }
-        // Clean up STCP sk_index
+        // Clean up STCP sk_index (with virtual_net scoping)
         if let Some(ref sk) = p.sk {
             if !sk.is_empty() {
-                state.sk_index.write().await.remove(sk);
+                let sk_key = if let Some(ref vn) = p.virtual_net {
+                    format!("{}:{}", vn, sk)
+                } else {
+                    sk.clone()
+                };
+                state.sk_index.write().await.remove(&sk_key);
             }
         }
     }

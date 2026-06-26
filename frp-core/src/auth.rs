@@ -517,6 +517,57 @@ impl OidcClient {
     }
 }
 
+/// Resolve a token that may use a URL scheme for dynamic sourcing.
+///
+/// Supported schemes:
+/// - `file:///absolute/path` — reads the first line of the file
+/// - `exec://command arg1 arg2` — runs the command, reads first line of stdout
+/// - plain string — returned as-is
+///
+/// Go frp compat: file:// and exec:// token sources.
+pub fn resolve_dynamic_token(token: &str) -> String {
+    if let Some(path) = token.strip_prefix("file://") {
+        match std::fs::read_to_string(path) {
+            Ok(content) => content.lines().next().unwrap_or("").trim().to_string(),
+            Err(e) => {
+                tracing::warn!("Failed to read dynamic token file {}: {}", path, e);
+                String::new()
+            }
+        }
+    } else if let Some(cmd) = token.strip_prefix("exec://") {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        if parts.is_empty() {
+            tracing::warn!("Dynamic token exec:// with empty command");
+            return String::new();
+        }
+        match std::process::Command::new(parts[0])
+            .args(&parts[1..])
+            .output()
+        {
+            Ok(o) => {
+                if !o.status.success() {
+                    tracing::warn!(
+                        "Dynamic token exec command '{}' exited with {}",
+                        cmd, o.status
+                    );
+                }
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            }
+            Err(e) => {
+                tracing::warn!("Failed to exec dynamic token command '{}': {}", cmd, e);
+                String::new()
+            }
+        }
+    } else {
+        token.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,5 +695,44 @@ mod tests {
             additional_data: None,
         };
         assert!(cfg.generate_login_key(100).is_none());
+    }
+
+    #[test]
+    fn test_resolve_dynamic_token_plain() {
+        assert_eq!(resolve_dynamic_token("my-token"), "my-token");
+        assert_eq!(resolve_dynamic_token(""), "");
+    }
+
+    #[test]
+    fn test_resolve_dynamic_token_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("frp-test-token.txt");
+        std::fs::write(&path, "file-token-value\n").unwrap();
+        let url = format!("file://{}", path.display());
+        assert_eq!(resolve_dynamic_token(&url), "file-token-value");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_resolve_dynamic_token_file_multiline() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("frp-test-token-multi.txt");
+        std::fs::write(&path, "first-line\nsecond-line\n").unwrap();
+        let url = format!("file://{}", path.display());
+        assert_eq!(resolve_dynamic_token(&url), "first-line");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_resolve_dynamic_token_file_missing() {
+        let result = resolve_dynamic_token("file:///nonexistent/path/token.txt");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_dynamic_token_exec() {
+        // Use /bin/echo on Unix — portable across macOS and Linux
+        let result = resolve_dynamic_token("exec:///bin/echo dynamic-token-value");
+        assert_eq!(result, "dynamic-token-value");
     }
 }

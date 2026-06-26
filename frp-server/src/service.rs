@@ -13,7 +13,7 @@ use tracing::{info, error, warn, debug};
 use frp_core::config::ServerConfig;
 use frp_core::auth::{AuthConfig, AuthMethod, OidcVerifier};
 use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::{read_msg_v1, write_msg_v1};
+use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1};
 use frp_core::mux;
 use frp_core::transport::{IoStream, ConnectionType, peek_connection_type, consume_tls_head_byte, PreReadStream};
 use frp_core::transport::{build_tls_acceptor, accept_websocket};
@@ -108,6 +108,12 @@ pub struct AppState {
     pub vhost_http_timeout: u64,
     pub user_conn_timeout: u64,
     pub tcp_mux_passthrough: bool,
+    /// Custom 404 page body (HTML) from WebServerConfig.
+    pub custom_404_page: String,
+    /// Server-side HTTP plugin manager for lifecycle hooks.
+    pub plugin_manager: Arc<crate::plugin::HttpPluginManager>,
+    /// In-memory store for proxy configs submitted via dashboard Store API.
+    pub proxy_config_store: Arc<RwLock<HashMap<String, frp_core::config::ProxyConfig>>>,
     /// TCPMux HTTP CONNECT route table (domain → proxy mapping).
     pub tcpmux_manager: Arc<TcpMuxManager>,
     /// Per-proxy traffic metrics for dashboard API.
@@ -115,7 +121,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16, vhost_http_timeout: u64, user_conn_timeout: u64, tcp_mux_passthrough: bool) -> Self {
+    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16, vhost_http_timeout: u64, user_conn_timeout: u64, tcp_mux_passthrough: bool, custom_404_page: String, plugin_manager: Arc<crate::plugin::HttpPluginManager>) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             reloadable: Arc::new(std::sync::RwLock::new(ReloadableState {
@@ -143,6 +149,9 @@ impl AppState {
             vhost_http_timeout,
             user_conn_timeout,
             tcp_mux_passthrough,
+            custom_404_page,
+            plugin_manager,
+            proxy_config_store: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -166,7 +175,7 @@ impl Service {
                 "oidc" => AuthMethod::Oidc,
                 _ => AuthMethod::Token,
             },
-            token: cfg.auth.token.clone(),
+            token: frp_core::auth::resolve_dynamic_token(&cfg.auth.token),
             oidc_issuer: cfg.auth.oidc_issuer.clone(),
             oidc_audience: cfg.auth.oidc_audience.clone(),
             oidc_skip_expiry: cfg.auth.oidc_skip_expiry,
@@ -221,6 +230,8 @@ impl Service {
             cfg.vhost_http_timeout,
             cfg.user_conn_timeout,
             cfg.tcp_mux_passthrough,
+            cfg.web_server.custom_404_page.clone(),
+            Arc::new(crate::plugin::HttpPluginManager::new(cfg.http_plugins.clone())),
         );
 
         // Initialize prometheus registry when enabled
@@ -276,7 +287,7 @@ impl Service {
                                         info!("WebSocket upgrade completed for {}", addr);
                                         match read_msg_v1(&mut ws).await {
                                             Ok(FrpMessage::Login(login)) => {
-                                                control::handle_control(ws, login, state.clone(), Some(addr), None).await;
+                                                control::handle_control(ws, login, state.clone(), Some(addr), None, false).await;
                                             }
                                             Ok(FrpMessage::NewWorkConn(nwc)) => {
                                                 handle_work_conn_inner(ws, nwc, state.clone()).await;
@@ -377,7 +388,7 @@ impl Service {
                                 let mut ctl = frp_core::transport::IoStream::Kcp(stream);
                                 match frp_core::protocol::read_msg_v1(&mut ctl).await {
                                     Ok(frp_core::msg::FrpMessage::Login(login)) => {
-                                        control::handle_control(ctl, login, state, None, None).await;
+                                        control::handle_control(ctl, login, state, None, None, false).await;
                                     }
                                     Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                         handle_work_conn_inner(ctl, nwc, state).await;
@@ -446,7 +457,7 @@ impl Service {
                                 let mut ctl = frp_core::transport::IoStream::Quic(stream);
                                 match frp_core::protocol::read_msg_v1(&mut ctl).await {
                                     Ok(frp_core::msg::FrpMessage::Login(login)) => {
-                                        control::handle_control(ctl, login, state, None, None).await;
+                                        control::handle_control(ctl, login, state, None, None, false).await;
                                     }
                                     Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                         handle_work_conn_inner(ctl, nwc, state).await;
@@ -619,7 +630,7 @@ impl Service {
                                             info!("Yamux over TLS session established for {:?}", addr);
                                             match read_msg_v1(&mut io).await {
                                                 Ok(FrpMessage::Login(login)) => {
-                                                    control::handle_control(io, login, state, Some(addr), Some(incoming)).await;
+                                                    control::handle_control(io, login, state, Some(addr), Some(incoming), false).await;
                                                 }
                                                 Ok(FrpMessage::NewWorkConn(nwc)) => {
                                                     handle_work_conn_inner(io, nwc, state).await;
@@ -646,7 +657,7 @@ impl Service {
                                     let mut tls = tls_stream;
                                     match read_msg_v1(&mut tls).await {
                                         Ok(FrpMessage::Login(login)) => {
-                                            control::handle_control(tls, login, state, Some(addr), None).await;
+                                            control::handle_control(tls, login, state, Some(addr), None, false).await;
                                         }
                                         Ok(FrpMessage::NewWorkConn(nwc)) => {
                                             let io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls)));
@@ -684,7 +695,7 @@ impl Service {
                                         info!("WebSocket upgrade on main port for {}", addr);
                                         match read_msg_v1(&mut ws).await {
                                             Ok(FrpMessage::Login(login)) => {
-                                                control::handle_control(ws, login, state.clone(), Some(addr), None).await;
+                                                control::handle_control(ws, login, state.clone(), Some(addr), None, false).await;
                                             }
                                             Ok(FrpMessage::NewWorkConn(nwc)) => {
                                                 handle_work_conn_inner(ws, nwc, state.clone()).await;
@@ -705,6 +716,78 @@ impl Service {
                                     }
                                     Err(e) => {
                                         warn!("WebSocket upgrade failed for {}: {}", addr, e);
+                                    }
+                                }
+                            }
+
+                            ConnectionType::V2 => {
+                                // V2 protocol (binary framing + JSON payload)
+                                if state.tls_only {
+                                    warn!("TLS-only mode: rejected V2 from {}", addr);
+                                    return;
+                                }
+                                // When tcp_mux is enabled, wrap in yamux BEFORE reading
+                                // the first message (same pattern as V1 + tcp_mux).
+                                if state.tcp_mux {
+                                    let mux_cfg = mux::TcpMuxConfig {
+                                        keepalive_interval: std::time::Duration::from_secs(
+                                            state.tcp_mux_keepalive.max(1) as u64
+                                        ),
+                                    };
+                                    match mux::server_mux(stream, &mux_cfg).await {
+                                        Ok((control_stream, incoming)) => {
+                                            let mut io = IoStream::Yamux(control_stream);
+                                            info!("Yamux over V2 session established for {:?}", addr);
+                                            match io.read_v2_frame().await {
+                                                Ok(FrpMessage::Login(login)) => {
+                                                    control::handle_control(io, login, state, Some(addr), Some(incoming), true).await;
+                                                }
+                                                Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                    handle_work_conn_inner(io, nwc, state).await;
+                                                }
+                                                Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                    handle_visitor_conn_inner(io, nvc, state).await;
+                                                }
+                                                Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                    handle_nat_hole_visitor(io, nhv, state, None).await;
+                                                }
+                                                Ok(other) => {
+                                                    warn!("Unexpected V2+yamux first message from {:?}: {:?}", addr, other.v2_type_id());
+                                                }
+                                                Err(e) => {
+                                                    warn!("V2+yamux read error from {}: {}", addr, e);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to start yamux over V2 for {:?}: {}", addr, e);
+                                        }
+                                    }
+                                } else {
+                                    // No tcp_mux: read V2 directly on raw TCP
+                                    match read_msg_v2(&mut stream).await {
+                                        Ok(FrpMessage::Login(login)) => {
+                                            control::handle_control(stream, login, state, Some(addr), None, true).await;
+                                        }
+                                        Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                            let io = IoStream::Tcp(stream);
+                                            handle_work_conn_inner(io, nwc, state).await;
+                                        }
+                                        Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                            let io = IoStream::Tcp(stream);
+                                            handle_visitor_conn_inner(io, nvc, state).await;
+                                        }
+                                        Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                            let io = IoStream::Tcp(stream);
+                                            let visitor_addr = Some(addr.to_string());
+                                            handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
+                                        }
+                                        Ok(other) => {
+                                            warn!("Unexpected V2 first message from {}: {:?}", addr, other.v2_type_id());
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to read V2 first message from {}: {}", addr, e);
+                                        }
                                     }
                                 }
                             }
@@ -730,7 +813,7 @@ impl Service {
                                             info!("Yamux session established for {:?}", addr);
                                             match read_msg_v1(&mut io).await {
                                                 Ok(FrpMessage::Login(login)) => {
-                                                    control::handle_control(io, login, state, Some(addr), Some(incoming)).await;
+                                                    control::handle_control(io, login, state, Some(addr), Some(incoming), false).await;
                                                 }
                                                 Ok(FrpMessage::NewWorkConn(nwc)) => {
                                                     handle_work_conn_inner(io, nwc, state).await;
@@ -757,7 +840,7 @@ impl Service {
                                     // Byte is still in buffer, read_msg_v1 will consume it
                                     match read_msg_v1(&mut stream).await {
                                         Ok(FrpMessage::Login(login)) => {
-                                            control::handle_control(stream, login, state, Some(addr), None).await;
+                                            control::handle_control(stream, login, state, Some(addr), None, false).await;
                                         }
                                         Ok(FrpMessage::NewWorkConn(nwc)) => {
                                             let io = IoStream::Tcp(stream);
@@ -811,7 +894,7 @@ impl Service {
                 "oidc" => AuthMethod::Oidc,
                 _ => AuthMethod::Token,
             },
-            token: new_cfg.auth.token.clone(),
+            token: frp_core::auth::resolve_dynamic_token(&new_cfg.auth.token),
             oidc_issuer: new_cfg.auth.oidc_issuer.clone(),
             oidc_audience: new_cfg.auth.oidc_audience.clone(),
             oidc_skip_expiry: new_cfg.auth.oidc_skip_expiry,

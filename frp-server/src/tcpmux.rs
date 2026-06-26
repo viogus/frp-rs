@@ -172,9 +172,11 @@ pub async fn run_tcpmux_listener(
                         "TCPMux: no route for host '{}' from {}",
                         host, peer
                     );
-                    let _ = stream
-                        .write_all(b"HTTP/1.1 404 Not Found\r\n\r\n")
-                        .await;
+                    crate::vhost::write_http_error(
+                        &mut stream,
+                        "HTTP/1.1 404 Not Found",
+                        &state.custom_404_page,
+                    ).await;
                     return;
                 }
             };

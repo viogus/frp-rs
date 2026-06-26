@@ -18,3 +18,4 @@ tokio-rustls.workspace = true
 axum.workspace = true
 prometheus.workspace = true
 lazy_static.workspace = true
+reqwest.workspace = true

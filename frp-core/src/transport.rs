@@ -33,6 +33,8 @@ pub enum ConnectionType {
     WebSocket,
     /// V1 type byte → plain frp protocol (the byte is the V1 message type)
     V1(u8),
+    /// 0x46 ('F') → V2 protocol (magic bytes: FRP\0\x02\r\n)
+    V2,
 }
 
 /// The WebSocket path used by frp (matching the Go version).
@@ -579,6 +581,32 @@ impl IoStream {
         }
     }
 
+    /// Write a V2 protocol frame (binary framing + JSON payload) to this stream.
+    pub async fn write_v2_frame(&mut self, msg: &crate::msg::FrpMessage) -> Result<(), crate::Error> {
+        match self {
+            IoStream::Tcp(s) => crate::protocol::write_msg_v2(s, msg).await,
+            IoStream::Tls(s) => crate::protocol::write_msg_v2(s, msg).await,
+            IoStream::Kcp(s) => crate::protocol::write_msg_v2(s, msg).await,
+            IoStream::Quic(s) => crate::protocol::write_msg_v2(s, msg).await,
+            IoStream::WebSocket(s) => crate::protocol::write_msg_v2(s, msg).await,
+            IoStream::Yamux(s) => crate::protocol::write_msg_v2(s, msg).await,
+            IoStream::Cipher(s) => crate::protocol::write_msg_v2(s, msg).await,
+        }
+    }
+
+    /// Read a V2 protocol frame (binary framing + JSON payload) from this stream.
+    pub async fn read_v2_frame(&mut self) -> Result<crate::msg::FrpMessage, crate::Error> {
+        match self {
+            IoStream::Tcp(s) => crate::protocol::read_msg_v2(s).await,
+            IoStream::Tls(s) => crate::protocol::read_msg_v2(s).await,
+            IoStream::Kcp(s) => crate::protocol::read_msg_v2(s).await,
+            IoStream::Quic(s) => crate::protocol::read_msg_v2(s).await,
+            IoStream::WebSocket(s) => crate::protocol::read_msg_v2(s).await,
+            IoStream::Yamux(s) => crate::protocol::read_msg_v2(s).await,
+            IoStream::Cipher(s) => crate::protocol::read_msg_v2(s).await,
+        }
+    }
+
     /// Get the peer address of this stream, if available.
     pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         match self {
@@ -845,6 +873,7 @@ pub async fn peek_connection_type(stream: &TcpStream) -> Result<ConnectionType, 
     match buf[0] {
         FRP_TLS_HEAD_BYTE | FRP_TLS_DIRECT_BYTE => Ok(ConnectionType::Tls(buf[0])),
         b'G' => Ok(ConnectionType::WebSocket),
+        b'F' => Ok(ConnectionType::V2),
         b => Ok(ConnectionType::V1(b)),
     }
 }

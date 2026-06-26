@@ -55,6 +55,7 @@ async fn test_stcp_visitor_routed_to_provider() {
         annotations: None,
         metas: None,
         multiplexer: None,
+        virtual_net: None,
     });
     write_msg_v1(&mut provider, &np).await.expect("send NewProxy");
     match read_msg_v1(&mut provider).await.expect("read NewProxyResp") {

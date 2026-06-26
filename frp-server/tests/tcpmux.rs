@@ -35,6 +35,7 @@ fn tcpmux_proxy(name: &str, domains: Vec<String>, local: &str) -> NewProxy {
         annotations: None,
         metas: None,
         multiplexer: Some("httpconnect".into()),
+        virtual_net: None,
     }
 }
 

@@ -60,6 +60,7 @@ pub async fn raw_login(
         metas: None,
         client_spec: None,
         multiplexer: None,
+        
     });
 
     let mut io = IoStream::Tcp(stream);
