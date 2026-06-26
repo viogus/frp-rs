@@ -679,6 +679,11 @@ pub struct DialOptions {
     pub keepalive_secs: u64,
     /// Local IP address to bind before dialing. None = system default.
     pub bind_addr: Option<String>,
+    /// Upstream proxy URL. Supports http:// and socks5:// schemes.
+    /// When set, the TCP connection goes through the proxy instead of
+    /// connecting directly. Empty = direct connection.
+    /// Go frp compat: transport.proxyURL.
+    pub proxy_url: Option<String>,
 }
 
 impl Default for DialOptions {
@@ -697,6 +702,7 @@ impl Default for DialOptions {
             disable_custom_tls_first_byte: false,
             keepalive_secs: 0,
             bind_addr: None,
+            proxy_url: None,
         }
     }
 }
@@ -741,11 +747,242 @@ async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<String, c
         .ok_or_else(|| crate::Error::Transport(format!("DNS resolve {host}: no records found")))
 }
 
+/// Direct TCP connection with optional bind and keepalive.
+async fn connect_direct(
+    addr: &str,
+    peer: std::net::SocketAddr,
+    opts: &DialOptions,
+) -> Result<tokio::net::TcpStream, crate::Error> {
+    use tokio::net::TcpSocket;
+    use tokio::time::{timeout, Duration};
+
+    // Create socket for optional local bind
+    let socket = if peer.is_ipv4() {
+        TcpSocket::new_v4()
+    } else {
+        TcpSocket::new_v6()
+    }.map_err(|e| crate::Error::Transport(format!("create socket: {e}")))?;
+
+    // Bind to specific local IP if configured
+    if let Some(ref bind_ip) = opts.bind_addr {
+        let bind_addr: std::net::SocketAddr = format!("{bind_ip}:0").parse().map_err(|e| {
+            crate::Error::Transport(format!("invalid bind_addr '{bind_ip}': {e}"))
+        })?;
+        socket.bind(bind_addr).map_err(|e| {
+            crate::Error::Transport(format!("bind to {bind_ip}: {e}"))
+        })?;
+    }
+
+    let stream = timeout(
+        Duration::from_secs(opts.dial_timeout_secs),
+        socket.connect(peer),
+    )
+    .await
+    .map_err(|_| crate::Error::Transport(format!("dial timeout to {addr}")))?
+    .map_err(|e| crate::Error::Transport(format!("dial to {addr}: {e}")))?;
+
+    // Configure TCP keepalive after connection
+    if opts.keepalive_secs > 0 {
+        let keepalive = socket2::SockRef::from(&stream);
+        let ka = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(opts.keepalive_secs));
+        keepalive.set_tcp_keepalive(&ka).map_err(|e| {
+            crate::Error::Transport(format!("set keepalive: {e}"))
+        })?;
+    }
+
+    Ok(stream)
+}
+
+/// Connect to a target through an HTTP CONNECT or SOCKS5 proxy.
+/// Returns a raw TcpStream that tunnels to `target_host:target_port`.
+async fn connect_via_proxy(
+    proxy_url: &str,
+    target_host: &str,
+    target_port: u16,
+    dial_timeout_secs: u64,
+) -> Result<tokio::net::TcpStream, crate::Error> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::time::{timeout, Duration};
+
+    let (scheme, proxy_host, proxy_port) = parse_proxy_url(proxy_url)?;
+    let proxy_addr = format!("{proxy_host}:{proxy_port}");
+    let proxy_peer: std::net::SocketAddr = proxy_addr.parse().map_err(|e| {
+        crate::Error::Transport(format!("invalid proxy address '{proxy_addr}': {e}"))
+    })?;
+
+    let mut stream = timeout(
+        Duration::from_secs(dial_timeout_secs),
+        tokio::net::TcpStream::connect(proxy_peer),
+    )
+    .await
+    .map_err(|_| crate::Error::Transport(format!("proxy dial timeout to {proxy_addr}")))?
+    .map_err(|e| crate::Error::Transport(format!("proxy dial to {proxy_addr}: {e}")))?;
+
+    match scheme {
+        "http" | "https" => {
+            // HTTP CONNECT tunnel
+            let connect_req = format!(
+                "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n\r\n"
+            );
+            timeout(Duration::from_secs(dial_timeout_secs), stream.write_all(connect_req.as_bytes()))
+                .await
+                .map_err(|_| crate::Error::Transport("proxy CONNECT write timeout".into()))?
+                .map_err(|e| crate::Error::Transport(format!("proxy CONNECT write: {e}")))?;
+
+            let mut reader = BufReader::new(&mut stream);
+            let mut status_line = String::new();
+            timeout(Duration::from_secs(dial_timeout_secs), reader.read_line(&mut status_line))
+                .await
+                .map_err(|_| crate::Error::Transport("proxy CONNECT read timeout".into()))?
+                .map_err(|e| crate::Error::Transport(format!("proxy CONNECT read: {e}")))?;
+
+            if !status_line.contains("200") {
+                return Err(crate::Error::Transport(format!(
+                    "proxy CONNECT rejected: {}",
+                    status_line.trim()
+                )));
+            }
+
+            // Read remaining headers until \r\n\r\n
+            let mut buf = Vec::new();
+            loop {
+                let mut line = String::new();
+                timeout(Duration::from_secs(dial_timeout_secs), reader.read_line(&mut line))
+                    .await
+                    .map_err(|_| crate::Error::Transport("proxy CONNECT headers timeout".into()))?
+                    .map_err(|e| crate::Error::Transport(format!("proxy CONNECT headers: {e}")))?;
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                buf.push(line);
+            }
+        }
+        "socks5" => {
+            // SOCKS5 handshake
+            // 1. Auth negotiation: send [0x05, 0x01, 0x00] (SOCKS5, 1 method, no auth)
+            timeout(
+                Duration::from_secs(dial_timeout_secs),
+                stream.write_all(&[0x05, 0x01, 0x00]),
+            )
+            .await
+            .map_err(|_| crate::Error::Transport("SOCKS5 auth write timeout".into()))?
+            .map_err(|e| crate::Error::Transport(format!("SOCKS5 auth write: {e}")))?;
+
+            // 2. Read server response: [0x05, method]
+            let mut auth_resp = [0u8; 2];
+            timeout(
+                Duration::from_secs(dial_timeout_secs),
+                stream.read_exact(&mut auth_resp),
+            )
+            .await
+            .map_err(|_| crate::Error::Transport("SOCKS5 auth read timeout".into()))?
+            .map_err(|e| crate::Error::Transport(format!("SOCKS5 auth read: {e}")))?;
+
+            if auth_resp[0] != 0x05 || auth_resp[1] != 0x00 {
+                return Err(crate::Error::Transport(format!(
+                    "SOCKS5 auth rejected: {:02x?}", auth_resp
+                )));
+            }
+
+            // 3. Resolve target address and build connect request
+            let target_ip: std::net::IpAddr = target_host.parse().map_err(|_| {
+                crate::Error::Transport(format!("SOCKS5: cannot resolve hostname '{target_host}' — use IP"))
+            })?;
+
+            let mut connect_req = Vec::with_capacity(10);
+            connect_req.extend_from_slice(&[0x05, 0x01, 0x00]); // SOCKS5, CONNECT, reserved
+            match target_ip {
+                std::net::IpAddr::V4(ip) => {
+                    connect_req.push(0x01); // IPv4
+                    connect_req.extend_from_slice(&ip.octets());
+                }
+                std::net::IpAddr::V6(ip) => {
+                    connect_req.push(0x04); // IPv6
+                    connect_req.extend_from_slice(&ip.octets());
+                }
+            }
+            connect_req.extend_from_slice(&target_port.to_be_bytes());
+
+            timeout(
+                Duration::from_secs(dial_timeout_secs),
+                stream.write_all(&connect_req),
+            )
+            .await
+            .map_err(|_| crate::Error::Transport("SOCKS5 connect write timeout".into()))?
+            .map_err(|e| crate::Error::Transport(format!("SOCKS5 connect write: {e}")))?;
+
+            // 4. Read connect response: [0x05, rep, 0x00, atyp, bind_addr..., bind_port...]
+            let mut resp = [0u8; 10];
+            timeout(
+                Duration::from_secs(dial_timeout_secs),
+                stream.read_exact(&mut resp),
+            )
+            .await
+            .map_err(|_| crate::Error::Transport("SOCKS5 connect read timeout".into()))?
+            .map_err(|e| crate::Error::Transport(format!("SOCKS5 connect read: {e}")))?;
+
+            if resp[0] != 0x05 || resp[1] != 0x00 {
+                return Err(crate::Error::Transport(format!(
+                    "SOCKS5 connect rejected: rep=0x{:02x}",
+                    resp[1]
+                )));
+            }
+
+            // Read remaining bind address bytes
+            let extra = match resp[3] {
+                0x01 => 4 - 2, // IPv4: we already read 6 bytes of address (4 IP + 2 port), correct
+                0x04 => 16 - 2, // IPv6: need 14 more bytes
+                _ => 0,
+            };
+            if extra > 0 {
+                let mut extra_buf = vec![0u8; extra as usize];
+                timeout(
+                    Duration::from_secs(dial_timeout_secs),
+                    stream.read_exact(&mut extra_buf),
+                )
+                .await
+                .map_err(|_| crate::Error::Transport("SOCKS5 bind addr read timeout".into()))?
+                .map_err(|e| crate::Error::Transport(format!("SOCKS5 bind addr read: {e}")))?;
+            }
+        }
+        other => {
+            return Err(crate::Error::Transport(format!(
+                "unsupported proxy scheme: '{other}'. Supported: http, socks5"
+            )));
+        }
+    }
+
+    Ok(stream)
+}
+
+/// Parse a proxy URL into (scheme, host, port).
+fn parse_proxy_url(url: &str) -> Result<(&str, &str, u16), crate::Error> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| crate::Error::Transport(format!("invalid proxy URL '{url}': missing scheme")))?;
+
+    let (host, port_str) = if let Some((h, p)) = rest.rsplit_once(':') {
+        (h, p)
+    } else {
+        return Err(crate::Error::Transport(format!(
+            "invalid proxy URL '{url}': missing port"
+        )));
+    };
+
+    let port: u16 = port_str.parse().map_err(|_| {
+        crate::Error::Transport(format!("invalid proxy port '{port_str}' in '{url}'"))
+    })?;
+
+    // Strip brackets from IPv6 addresses
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+
+    Ok((scheme, host, port))
+}
+
 /// Connect to the server with the given options.
 pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
     use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpSocket;
-    use tokio::time::{timeout, Duration};
 
     // Resolve server_addr via custom DNS server if configured.
     // Otherwise let TcpStream::connect use system DNS.
@@ -763,40 +1000,17 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
         crate::Error::Transport(format!("invalid server address '{addr}': {e}"))
     })?;
 
-    // Create socket for optional local bind + keepalive configuration
-    let socket = if peer.is_ipv4() {
-        TcpSocket::new_v4()
+    // Connect via upstream proxy if configured, otherwise direct TCP.
+    let mut stream = if let Some(ref proxy_url) = opts.proxy_url {
+        if proxy_url.is_empty() {
+            // Empty string = direct connection
+            connect_direct(&addr, peer, opts).await?
+        } else {
+            connect_via_proxy(proxy_url, &target_ip, opts.server_port, opts.dial_timeout_secs).await?
+        }
     } else {
-        TcpSocket::new_v6()
-    }.map_err(|e| crate::Error::Transport(format!("create socket: {e}")))?;
-
-    // Bind to specific local IP if configured
-    if let Some(ref bind_ip) = opts.bind_addr {
-        let bind_addr: std::net::SocketAddr = format!("{bind_ip}:0").parse().map_err(|e| {
-            crate::Error::Transport(format!("invalid bind_addr '{bind_ip}': {e}"))
-        })?;
-        socket.bind(bind_addr).map_err(|e| {
-            crate::Error::Transport(format!("bind to {bind_ip}: {e}"))
-        })?;
-    }
-
-    let mut stream = timeout(
-        Duration::from_secs(opts.dial_timeout_secs),
-        socket.connect(peer),
-    )
-    .await
-    .map_err(|_| crate::Error::Transport(format!("dial timeout to {addr}")))?
-    .map_err(|e| crate::Error::Transport(format!("dial to {addr}: {e}")))?;
-
-    // Configure TCP keepalive after connection
-    if opts.keepalive_secs > 0 {
-        let keepalive = socket2::SockRef::from(&stream);
-        let ka = socket2::TcpKeepalive::new()
-            .with_time(Duration::from_secs(opts.keepalive_secs));
-        keepalive.set_tcp_keepalive(&ka).map_err(|e| {
-            crate::Error::Transport(format!("set keepalive: {e}"))
-        })?;
-    }
+        connect_direct(&addr, peer, opts).await?
+    };
 
     match opts.protocol {
         TransportProtocol::Tcp => {

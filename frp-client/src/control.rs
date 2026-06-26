@@ -38,6 +38,7 @@ pub struct ControlConnection {
     /// config to decide whether Ping/NewWorkConn need auth.
     pub server_auth_scopes: Vec<String>,
     metas: std::collections::HashMap<String, String>,
+    proxy_url: String,
 }
 
 impl ControlConnection {
@@ -62,6 +63,7 @@ impl ControlConnection {
         v2: bool,
         oidc_client: Option<Arc<OidcClient>>,
         metas: std::collections::HashMap<String, String>,
+        proxy_url: String,
     ) -> Self {
         Self {
             server_addr,
@@ -86,6 +88,7 @@ impl ControlConnection {
             oidc_client,
             server_auth_scopes: Vec::new(),
             metas,
+            proxy_url,
         }
     }
 
@@ -111,6 +114,7 @@ impl ControlConnection {
             disable_custom_tls_first_byte: self.disable_custom_tls_first_byte,
             keepalive_secs: self.keepalive_secs,
             bind_addr: self.bind_addr.clone(),
+            proxy_url: if self.proxy_url.is_empty() { None } else { Some(self.proxy_url.clone()) },
             ..Default::default()
         };
 
