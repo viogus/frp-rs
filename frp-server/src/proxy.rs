@@ -14,6 +14,8 @@ pub struct ProxyInfo {
     pub local_addr: Option<String>,
     pub use_encryption: bool,
     pub use_compression: bool,
+    /// Virtual network for STCP/XTCP isolation.
+    pub virtual_net: Option<String>,
 }
 
 /// Manages all proxy registrations on the server.

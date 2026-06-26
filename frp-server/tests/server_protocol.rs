@@ -190,6 +190,7 @@ async fn test_new_proxy_registration_auto_port() {
         annotations: None,
         metas: None,
         multiplexer: None,
+        virtual_net: None,
     });
     write_msg_v1(&mut stream, &np).await.expect("send NewProxy");
 
@@ -251,6 +252,7 @@ async fn test_new_proxy_duplicate_name_fails() {
         annotations: None,
         metas: None,
         multiplexer: None,
+        virtual_net: None,
     });
 
     // First registration — should succeed
@@ -338,6 +340,7 @@ async fn test_vhost_location_routing() {
         annotations: None,
         metas: None,
         multiplexer: None,
+        virtual_net: None,
     });
     write_msg_v1(&mut provider, &np).await.expect("send NewProxy");
     match read_msg_v1(&mut provider).await.expect("read NewProxyResp") {
@@ -436,6 +439,7 @@ async fn test_vhost_location_path_mismatch_404() {
         annotations: None,
         metas: None,
         multiplexer: None,
+        virtual_net: None,
     });
     write_msg_v1(&mut provider, &np).await.expect("send NewProxy");
     match read_msg_v1(&mut provider).await.expect("read NewProxyResp") {
@@ -508,6 +512,7 @@ async fn test_login_via_websocket() {
         metas: None,
         client_spec: None,
         multiplexer: None,
+        
     });
     io.write_v1_frame(&login).await.expect("send login over WS");
 
@@ -572,6 +577,7 @@ async fn test_login_via_tls() {
         metas: None,
         client_spec: None,
         multiplexer: None,
+        
     });
     io.write_v1_frame(&login).await.expect("send login over TLS");
 

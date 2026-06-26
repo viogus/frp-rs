@@ -74,6 +74,7 @@ async fn test_stcp_e2e_relay() {
             health_check_interval_seconds: 0,
             health_check_timeout_seconds: 0,
             health_check_max_failed: 0,
+            virtual_net: String::new(),
             plugin: None,
         }],
         visitors: vec![VisitorConfig {

@@ -160,6 +160,8 @@ pub struct NewProxy {
     pub metas: Option<std::collections::HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multiplexer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub virtual_net: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -462,6 +464,7 @@ impl FrpMessage {
                 allow_users: None, bandwidth_limit: None,
                 bandwidth_limit_mode: None, annotations: None,
                 metas: None, multiplexer: None,
+                virtual_net: None,
             })),
             TYPE_NEW_PROXY_RESP => Some(FrpMessage::NewProxyResp(NewProxyResp {
                 proxy_name: String::new(), remote_addr: None, error: None,
@@ -612,6 +615,7 @@ mod tests {
             annotations: None,
             metas: None,
             multiplexer: None,
+            virtual_net: None,
         };
         let json = serde_json::to_string(&np).expect("serialize");
         let back: NewProxy = serde_json::from_str(&json).expect("deserialize");

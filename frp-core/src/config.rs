@@ -536,6 +536,11 @@ pub struct ProxyConfig {
     pub health_check_timeout_seconds: u64,
     #[serde(default)]
     pub health_check_max_failed: u32,
+    /// Virtual network name for STCP/XTCP proxy isolation.
+    /// Proxies in different virtual nets cannot reach each other.
+    /// Empty string (default) means the default (global) network.
+    #[serde(default)]
+    pub virtual_net: String,
 }
 
 /// STCP/XTCP visitor configuration — used by frpc to expose a local port
