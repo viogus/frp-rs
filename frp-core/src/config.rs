@@ -432,6 +432,10 @@ pub struct ClientConfig {
     pub dns_server: String,
     #[serde(default = "default_true")]
     pub tcp_mux: bool,
+    /// Use V2 protocol framing (binary header + JSON payload).
+    /// Requires tcp_mux for yamux multiplexing. Default: false.
+    #[serde(default)]
+    pub v2: bool,
     #[serde(default)]
     pub proxies: Vec<ProxyConfig>,
     #[serde(default)]
@@ -460,6 +464,7 @@ impl Default for ClientConfig {
             pool_count: 0,
             dns_server: String::new(),
             tcp_mux: true,
+            v2: false,
             proxies: vec![],
             visitors: vec![],
             web_server: WebServerConfig::default(),

@@ -581,6 +581,32 @@ impl IoStream {
         }
     }
 
+    /// Write a V2 protocol frame (binary framing + JSON payload) to this stream.
+    pub async fn write_v2_frame(&mut self, msg: &crate::msg::FrpMessage) -> Result<(), crate::Error> {
+        match self {
+            IoStream::Tcp(s) => crate::protocol::write_msg_v2(s, msg).await,
+            IoStream::Tls(s) => crate::protocol::write_msg_v2(s, msg).await,
+            IoStream::Kcp(s) => crate::protocol::write_msg_v2(s, msg).await,
+            IoStream::Quic(s) => crate::protocol::write_msg_v2(s, msg).await,
+            IoStream::WebSocket(s) => crate::protocol::write_msg_v2(s, msg).await,
+            IoStream::Yamux(s) => crate::protocol::write_msg_v2(s, msg).await,
+            IoStream::Cipher(s) => crate::protocol::write_msg_v2(s, msg).await,
+        }
+    }
+
+    /// Read a V2 protocol frame (binary framing + JSON payload) from this stream.
+    pub async fn read_v2_frame(&mut self) -> Result<crate::msg::FrpMessage, crate::Error> {
+        match self {
+            IoStream::Tcp(s) => crate::protocol::read_msg_v2(s).await,
+            IoStream::Tls(s) => crate::protocol::read_msg_v2(s).await,
+            IoStream::Kcp(s) => crate::protocol::read_msg_v2(s).await,
+            IoStream::Quic(s) => crate::protocol::read_msg_v2(s).await,
+            IoStream::WebSocket(s) => crate::protocol::read_msg_v2(s).await,
+            IoStream::Yamux(s) => crate::protocol::read_msg_v2(s).await,
+            IoStream::Cipher(s) => crate::protocol::read_msg_v2(s).await,
+        }
+    }
+
     /// Get the peer address of this stream, if available.
     pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         match self {

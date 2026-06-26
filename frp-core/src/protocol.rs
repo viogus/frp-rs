@@ -294,6 +294,31 @@ pub async fn read_msg_v2<R: AsyncReadExt + Unpin>(
     deserialize_v1(frame_type as u8, &payload)
 }
 
+/// Protocol-aware message read: dispatches to V1 or V2 framing based on the `v2` flag.
+pub async fn read_msg<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    v2: bool,
+) -> Result<FrpMessage, crate::Error> {
+    if v2 {
+        read_msg_v2(reader).await
+    } else {
+        read_msg_v1(reader).await
+    }
+}
+
+/// Protocol-aware message write: dispatches to V1 or V2 framing based on the `v2` flag.
+pub async fn write_msg<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    msg: &FrpMessage,
+    v2: bool,
+) -> Result<(), crate::Error> {
+    if v2 {
+        write_msg_v2(writer, msg).await
+    } else {
+        write_msg_v1(writer, msg).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
