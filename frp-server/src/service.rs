@@ -68,18 +68,25 @@ pub struct ControlTx {
     pub tx: mpsc::UnboundedSender<InternalMsg>,
 }
 
+/// Hot-reloadable server configuration subset, updated atomically on SIGUSR1.
+#[derive(Debug, Clone)]
+pub struct ReloadableState {
+    pub auth_cfg: Arc<AuthConfig>,
+    pub encryption_key: [u8; 16],
+    pub allow_ports: Vec<(u16, u16)>,
+}
+
 pub struct AppState {
     pub proxy_manager: Arc<ProxyManager>,
-    pub auth_cfg: Arc<AuthConfig>,
+    /// Hot-reloadable config (auth, encryption, allow_ports).
+    pub reloadable: RwLock<ReloadableState>,
     pub used_ports: Arc<RwLock<std::collections::HashSet<u16>>>,
     pub run_id_to_ctl_tx: Arc<RwLock<HashMap<String, ControlTx>>>,
     pub proxy_bind_addr: String,
     pub vhost_manager: Arc<VhostManager>,
     pub vhost_http_port: u16,
-    pub encryption_key: [u8; 16],
     pub sk_index: Arc<RwLock<HashMap<String, String>>>,
     pub dashboard_start: std::time::Instant,
-    pub allow_ports: Vec<(u16, u16)>,
     pub sub_domain_host: String,
     pub tcp_mux: bool,
     pub tcp_mux_keepalive: i64,
@@ -96,16 +103,18 @@ impl AppState {
     pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
-            auth_cfg: Arc::new(auth_cfg),
+            reloadable: RwLock::new(ReloadableState {
+                auth_cfg: Arc::new(auth_cfg),
+                encryption_key,
+                allow_ports,
+            }),
             used_ports: Arc::new(RwLock::new(std::collections::HashSet::new())),
             run_id_to_ctl_tx: Arc::new(RwLock::new(HashMap::new())),
             proxy_bind_addr,
             vhost_manager: Arc::new(VhostManager::new()),
             vhost_http_port: 0, // set by Service::run() before starting listeners
-            encryption_key,
             dashboard_start: std::time::Instant::now(),
             sk_index: Arc::new(RwLock::new(HashMap::new())),
-            allow_ports,
             sub_domain_host,
             tcp_mux,
             tcp_mux_keepalive,
@@ -125,10 +134,13 @@ impl AppState {
 pub struct Service {
     cfg: ServerConfig,
     state: Arc<AppState>,
+    /// Path to config file for SIGUSR1 reload.
+    #[allow(dead_code)]
+    config_file: Option<String>,
 }
 
 impl Service {
-    pub async fn new(cfg: ServerConfig) -> Result<Self, String> {
+    pub async fn new(cfg: ServerConfig, config_file: Option<String>) -> Result<Self, String> {
         let auth_cfg = AuthConfig {
             method: match cfg.auth.method.to_lowercase().as_str() {
                 "oidc" => AuthMethod::Oidc,
@@ -189,6 +201,7 @@ impl Service {
             cfg.sudp_port,
         )),
             cfg,
+            config_file,
         })
     }
 
@@ -662,6 +675,85 @@ impl Service {
             }
         }
     }
+
+    /// Reload configuration from the config file (SIGUSR1 handler).
+    /// Re-reads the TOML config and applies safe-to-reload settings
+    /// (allow_ports, auth token, encryption key). Returns a summary
+    /// of changes, or an error if the config cannot be read.
+    pub async fn reload(&self) -> Result<String, String> {
+        let config_path = match &self.config_file {
+            Some(p) => p.clone(),
+            None => return Err("No config file path stored".into()),
+        };
+        let new_cfg: ServerConfig = frp_core::config::load_server_config(&config_path)
+            .map_err(|e| format!("Failed to reload config: {e}"))?;
+
+        let mut changes: Vec<String> = Vec::new();
+
+        // Build new reloadable state
+        let new_auth_cfg = AuthConfig {
+            method: match new_cfg.auth.method.to_lowercase().as_str() {
+                "oidc" => AuthMethod::Oidc,
+                _ => AuthMethod::Token,
+            },
+            token: new_cfg.auth.token.clone(),
+            oidc_issuer: new_cfg.auth.oidc_issuer.clone(),
+            oidc_audience: new_cfg.auth.oidc_audience.clone(),
+            oidc_skip_expiry: new_cfg.auth.oidc_skip_expiry,
+            oidc_skip_issuer: new_cfg.auth.oidc_skip_issuer,
+            additional_data: None,
+        };
+        let new_enc_key = frp_core::encryption::derive_key(&new_auth_cfg.token);
+        let new_allow_ports = if !new_cfg.allow_ports.is_empty() {
+            frp_core::config::parse_allow_ports(&new_cfg.allow_ports)
+        } else {
+            vec![(new_cfg.allow_port_start, new_cfg.allow_port_end)]
+        };
+
+        // Apply under write lock
+        {
+            let mut r = self.state.reloadable.write().await;
+            if r.allow_ports != new_allow_ports {
+                changes.push(format!(
+                    "allow_ports: {:?} -> {:?}", r.allow_ports, new_allow_ports
+                ));
+                r.allow_ports = new_allow_ports;
+            }
+            if r.auth_cfg.token != new_auth_cfg.token {
+                changes.push("auth token updated".into());
+                r.auth_cfg = Arc::new(new_auth_cfg);
+                r.encryption_key = new_enc_key;
+            }
+        }
+
+        // Log settings that require restart
+        if self.cfg.bind_port != new_cfg.bind_port {
+            changes.push(format!(
+                "bind_port: {} -> {} (restart required)",
+                self.cfg.bind_port, new_cfg.bind_port
+            ));
+        }
+        if self.cfg.bind_addr != new_cfg.bind_addr {
+            changes.push(format!(
+                "bind_addr: {} -> {} (restart required)",
+                self.cfg.bind_addr, new_cfg.bind_addr
+            ));
+        }
+        if self.cfg.tls_enable != new_cfg.tls_enable {
+            changes.push(format!(
+                "tls_enable: {} -> {} (restart required)",
+                self.cfg.tls_enable, new_cfg.tls_enable
+            ));
+        }
+
+        if changes.is_empty() {
+            Ok("config reloaded: no changes detected".into())
+        } else {
+            info!("Config reloaded: {}", changes.join("; "));
+            Ok(changes.join("; "))
+        }
+    }
+
 }
 
 /// Handle an incoming STCP visitor connection. Looks up the proxy and
@@ -953,7 +1045,7 @@ async fn handle_work_conn_inner(
             &expected_sub,
         ).await
     } else {
-        state.auth_cfg.validate_login(
+        state.reloadable.read().await.auth_cfg.validate_login(
             msg.privilege_key.as_deref(),
             msg.timestamp,
         ).map(|_| ())
