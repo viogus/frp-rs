@@ -3,16 +3,19 @@ name: Docker
 on:
   push:
     branches: [main]
-    paths:
-      - 'docker/**'
-      - '.github/workflows/docker.yml'
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - '**/*.rs'
-      - '**/*.c'
+    tags:
+      - 'v*'
+  # release:published kept as fallback — but GITHUB_TOKEN-created
+  # releases don't chain-trigger other workflows, so we also listen
+  # on tag pushes above.
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v0.1.6). Leave empty for test.'
+        required: false
+        default: ''
 
 # Use write-all for GITHUB_TOKEN — workaround for GHCR push from
 # user-owned repos where packages:write alone may not permit first-time
@@ -45,8 +48,19 @@ jobs:
           SHA="$(git rev-parse --short=7 HEAD)"
 
           if [ "${{ github.event_name }}" = "release" ]; then
-            # Release: tag with version (e.g. v0.1.4), SHA, and update latest
+            # Release published: tag with version (e.g. v0.1.4), SHA, and update latest
             VER="${{ github.event.release.tag_name }}"
+            echo "version=${VER}" >> $GITHUB_OUTPUT
+            echo "tags=${IMAGE}:${VER},${IMAGE}:${VER}-${SHA},${IMAGE}:latest" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            # Tag push (e.g. v0.1.6): same as release — GITHUB_TOKEN-created
+            # releases don't chain-trigger workflows, so we also listen on tags.
+            VER="${{ github.ref_name }}"
+            echo "version=${VER}" >> $GITHUB_OUTPUT
+            echo "tags=${IMAGE}:${VER},${IMAGE}:${VER}-${SHA},${IMAGE}:latest" >> $GITHUB_OUTPUT
+          elif [ -n "${{ inputs.version }}" ]; then
+            # Manual dispatch with explicit version (e.g. backfill missing release)
+            VER="${{ inputs.version }}"
             echo "version=${VER}" >> $GITHUB_OUTPUT
             echo "tags=${IMAGE}:${VER},${IMAGE}:${VER}-${SHA},${IMAGE}:latest" >> $GITHUB_OUTPUT
           else
