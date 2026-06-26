@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use futures_util::future::poll_fn;
 use tokio::sync::{mpsc, oneshot};
-use tokio::net::TcpStream;
+// (TcpStream no longer directly used; client_mux is generic over S)
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tracing::{debug, warn};
 
@@ -159,17 +159,20 @@ where
     Ok((control_compat, IncomingStreams { rx }))
 }
 
-/// Create a client-side yamux session from an already-established TcpStream.
+/// Create a client-side yamux session from an already-established stream.
 ///
 /// Returns:
 /// - `control_stream`: the first opened stream (control channel)
 /// - `session`: handle for opening additional streams (work connections)
 ///
 /// Spawns a background task to manage the yamux Connection.
-pub async fn client_mux(
-    stream: TcpStream,
+pub async fn client_mux<S>(
+    stream: S,
     mux_cfg: &TcpMuxConfig,
-) -> Result<(YamuxStream, YamuxSession), crate::Error> {
+) -> Result<(YamuxStream, YamuxSession), crate::Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let compat = stream.compat();
     let yamux_cfg = yamux_config(mux_cfg);
     let mut conn = Connection::new(compat, yamux_cfg, Mode::Client);

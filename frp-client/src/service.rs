@@ -236,11 +236,9 @@ impl Service {
             let (mut control_stream, run_id, yamux_session) = match ctl.login().await {
                 Ok(r) => {
                     did_login_once = true;
-                    // After login, wrap control stream in AES-128-CFB encryption.
-                    // Go frps v0.69.1 always encrypts the control connection for V1.
-                    let (stream, run_id, yamux) = r;
-                    let enc_key = encryption::derive_key(&self.auth_cfg.token);
-                    (stream.into_encrypted(enc_key), run_id, yamux)
+                    // login() now handles encryption + yamux internally
+                    // (Go frp v0.69.1: encryption wraps raw conn, yamux runs on top).
+                    r
                 }
                 Err(e) => {
                     warn!("Login failed: {}", e);

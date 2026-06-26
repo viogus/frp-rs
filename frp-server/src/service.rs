@@ -463,41 +463,37 @@ impl Service {
                                 };
                                 info!("TLS connection from {}", addr);
 
-                                // When tcp_mux is enabled, wrap TLS stream in yamux
-                                // before reading the first message (matches Go frp).
+                                // When tcp_mux is enabled, create yamux AFTER login+encryption
+                                // inside handle_control (matching Go frp v0.69.1: encryption
+                                // wraps the raw connection, yamux runs on top).
                                 if state.tcp_mux {
                                     let mux_cfg = mux::TcpMuxConfig {
                                         keepalive_interval: std::time::Duration::from_secs(
                                             state.tcp_mux_keepalive.max(1) as u64
                                         ),
                                     };
-                                    match mux::server_mux(tls_stream, &mux_cfg).await {
-                                        Ok((control_stream, incoming)) => {
-                                            let mut io = IoStream::Yamux(control_stream);
-                                            info!("Yamux over TLS session established for {:?}", addr);
-                                            match read_msg_v1(&mut io).await {
-                                                Ok(FrpMessage::Login(login)) => {
-                                                    control::handle_control(io, login, state, Some(addr), Some(incoming)).await;
-                                                }
-                                                Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                    handle_work_conn_inner(io, nwc, state).await;
-                                                }
-                                                Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                    handle_visitor_conn_inner(io, nvc, state).await;
-                                                }
-                                                Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                    handle_nat_hole_visitor(io, nhv, state, None).await;
-                                                }
-                                                Ok(other) => {
-                                                    warn!("Unexpected TLS+yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
-                                                }
-                                                Err(e) => {
-                                                    warn!("TLS+yamux read error from {}: {}", addr, e);
-                                                }
-                                            }
+                                    let mut tls = tls_stream;
+                                    match read_msg_v1(&mut tls).await {
+                                        Ok(FrpMessage::Login(login)) => {
+                                            control::handle_control(tls, login, state, Some(addr), Some(mux_cfg)).await;
+                                        }
+                                        Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                            let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
+                                            handle_work_conn_inner(io, nwc, state).await;
+                                        }
+                                        Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                            let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
+                                            handle_visitor_conn_inner(io, nvc, state).await;
+                                        }
+                                        Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                            let io = IoStream::Tls(tokio_rustls::TlsStream::Server(tls));
+                                            handle_nat_hole_visitor(io, nhv, state, None).await;
+                                        }
+                                        Ok(other) => {
+                                            warn!("Unexpected TLS first message from {:?}: {:?}", addr, other.v1_type_byte());
                                         }
                                         Err(e) => {
-                                            warn!("Failed to start yamux over TLS for {:?}: {}", addr, e);
+                                            warn!("TLS read error from {}: {}", addr, e);
                                         }
                                     }
                                 } else {
@@ -572,43 +568,37 @@ impl Service {
                                     warn!("TLS-only mode: rejected plain TCP from {}", addr);
                                     return;
                                 }
-                                // When tcp_mux is enabled, wrap in yamux BEFORE reading
-                                // the first message. This matches Go frp v0.69.1 behaviour:
-                                // both sides wrap immediately, then Login flows through
-                                // a yamux stream — not on raw TCP.
+                                // When tcp_mux is enabled, create yamux AFTER login+encryption
+                                // inside handle_control (matching Go frp v0.69.1: encryption
+                                // wraps the raw connection, yamux runs on top).
                                 if state.tcp_mux {
                                     let mux_cfg = mux::TcpMuxConfig {
                                         keepalive_interval: std::time::Duration::from_secs(
                                             state.tcp_mux_keepalive.max(1) as u64
                                         ),
                                     };
-                                    match mux::server_mux(stream, &mux_cfg).await {
-                                        Ok((control_stream, incoming)) => {
-                                            let mut io = IoStream::Yamux(control_stream);
-                                            info!("Yamux session established for {:?}", addr);
-                                            match read_msg_v1(&mut io).await {
-                                                Ok(FrpMessage::Login(login)) => {
-                                                    control::handle_control(io, login, state, Some(addr), Some(incoming)).await;
-                                                }
-                                                Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                    handle_work_conn_inner(io, nwc, state).await;
-                                                }
-                                                Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                    handle_visitor_conn_inner(io, nvc, state).await;
-                                                }
-                                                Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                    handle_nat_hole_visitor(io, nhv, state, None).await;
-                                                }
-                                                Ok(other) => {
-                                                    warn!("Unexpected yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
-                                                }
-                                                Err(e) => {
-                                                    warn!("Failed to read yamux first message from {}: {}", addr, e);
-                                                }
-                                            }
+                                    // Byte was peeked (MSG_PEEK), stream is intact.
+                                    match read_msg_v1(&mut stream).await {
+                                        Ok(FrpMessage::Login(login)) => {
+                                            control::handle_control(stream, login, state, Some(addr), Some(mux_cfg)).await;
+                                        }
+                                        Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                            let io = IoStream::Tcp(stream);
+                                            handle_work_conn_inner(io, nwc, state).await;
+                                        }
+                                        Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                            let io = IoStream::Tcp(stream);
+                                            handle_visitor_conn_inner(io, nvc, state).await;
+                                        }
+                                        Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                            let io = IoStream::Tcp(stream);
+                                            handle_nat_hole_visitor(io, nhv, state, None).await;
+                                        }
+                                        Ok(other) => {
+                                            warn!("Unexpected TCP first message from {:?}: {:?}", addr, other.v1_type_byte());
                                         }
                                         Err(e) => {
-                                            warn!("Failed to start yamux server for {:?}: {}", addr, e);
+                                            warn!("TCP read error from {}: {}", addr, e);
                                         }
                                     }
                                 } else {

@@ -10,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
-use frp_core::mux::IncomingStreams;
+use frp_core::mux::{self, IncomingStreams};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
 use frp_core::format_socket_addr;
@@ -45,7 +45,7 @@ pub async fn handle_control<S>(
     login: msg::Login,
     state: Arc<AppState>,
     peer: Option<SocketAddr>,
-    mut incoming: Option<IncomingStreams>,
+    mux_cfg: Option<mux::TcpMuxConfig>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -130,8 +130,31 @@ pub async fn handle_control<S>(
     let enc_key = encryption::derive_key(&state.auth_cfg.token);
     let cipher = frp_core::cipher_stream::CipherStream::new(Box::new(stream), enc_key);
 
-    // --- Split encrypted stream for reading/writing ---
-    let (mut reader, mut writer) = tokio::io::split(cipher);
+    // --- Set up reader/writer (and yamux) ---
+    // Go frp v0.69.1: encryption wraps the raw connection, then yamux runs on
+    // top of the encrypted stream. Login/LoginResp happen in plaintext on the
+    // raw connection BEFORE this point.
+    let (mut reader, mut writer, mut incoming): (
+        Box<dyn AsyncRead + Unpin + Send>,
+        Box<dyn AsyncWrite + Unpin + Send>,
+        Option<IncomingStreams>,
+    ) = if let Some(ref mux_cfg) = mux_cfg {
+        match mux::server_mux(cipher, mux_cfg).await {
+            Ok((control_stream, inc)) => {
+                info!("Yamux session established over encrypted stream for {:?}", peer);
+                let (r, w) = tokio::io::split(IoStream::Yamux(control_stream));
+                (Box::new(r), Box::new(w), Some(inc))
+            }
+            Err(e) => {
+                warn!("Failed to start yamux over encrypted stream for {:?}: {}", peer, e);
+                unregister_control(&state, &run_id).await;
+                return;
+            }
+        }
+    } else {
+        let (r, w) = tokio::io::split(cipher);
+        (Box::new(r), Box::new(w), None)
+    };
 
     // --- Per-client state ---
     let pool_cap = login.pool_count.unwrap_or(1).max(0) as usize + WORK_POOL_EXTRA;
