@@ -306,6 +306,12 @@ pub struct PluginConfig {
     pub username: String,
     #[serde(default)]
     pub password: String,
+    /// TLS certificate file for plugin listener (https2http, https2https).
+    #[serde(default, alias = "pluginCrtPath", alias = "plugin_crt_path")]
+    pub crt_file: String,
+    /// TLS key file for plugin listener (https2http, https2https).
+    #[serde(default, alias = "pluginKeyPath", alias = "plugin_key_path")]
+    pub key_file: String,
 }
 
 
