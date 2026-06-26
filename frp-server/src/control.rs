@@ -182,7 +182,10 @@ pub async fn handle_control<S>(
                         // Check if a UDP proxy needs this work connection
                         if let Some((proxy_name, _)) = pending_udp.pop_front() {
                             info!("Assigning work conn to UDP proxy '{}'", proxy_name);
-                            assign_udp_work_conn(stream, &proxy_name, &udp_sockets).await;
+                            let local_addr = state.proxy_manager.get(&proxy_name).await
+                                .and_then(|info| info.local_addr)
+                                .and_then(|s| msg::UdpAddr::from_string(&s));
+                            assign_udp_work_conn(stream, &proxy_name, &udp_sockets, local_addr).await;
                         } else {
                             // Drain expired TCP requests
                             while let Some(req) = pending_requests.front() {
@@ -533,6 +536,7 @@ async fn assign_udp_work_conn(
     work_conn: IoStream,
     proxy_name: &str,
     udp_sockets: &std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
+    local_addr: Option<msg::UdpAddr>,
 ) {
     let mut work_conn = work_conn;
     let sock = match udp_sockets.get(proxy_name) {
@@ -609,7 +613,7 @@ async fn assign_udp_work_conn(
                     };
                     let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
                         content: buf[..n].to_vec(),
-                        local_addr: Some(msg::UdpAddr { ip: "0.0.0.0".into(), port: 0, zone: String::new() }),
+                        local_addr: local_addr.clone(),
                         remote_addr: Some(remote),
                     });
                     debug!("UDP writer '{}' sending UDPPacket to work conn...", pn_w2);
