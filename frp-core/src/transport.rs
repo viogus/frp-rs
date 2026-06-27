@@ -1354,7 +1354,7 @@ pub async fn consume_tls_head_byte(stream: &mut TcpStream) -> Result<(), crate::
 ///
 /// This implementation handles the HTTP upgrade manually and returns a
 /// WsByteStream in Raw mode — all data frames are treated as opaque bytes.
-pub async fn accept_websocket(stream: TcpStream) -> Result<IoStream, crate::Error> {
+pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let mut reader = BufReader::new(stream);
@@ -1415,7 +1415,20 @@ pub async fn accept_websocket(stream: TcpStream) -> Result<IoStream, crate::Erro
     // Capture any bytes BufReader may have read-ahead past headers
     // (defensive: client should wait for 101 before sending frames).
     let leftover = reader.buffer().to_vec();
-    let mut tcp = reader.into_inner();
+    let stream = reader.into_inner();
+
+    // Extract TcpStream from IoStream. PreRead variant may have
+    // unconsumed pre-read bytes (if BufReader didn't need them all).
+    let (extra_pre_read, mut tcp) = match stream {
+        IoStream::PreRead(pre, t) => (pre, t),
+        IoStream::Tcp(t) => (vec![], t),
+        _ => {
+            return Err(crate::Error::Transport(
+                "WebSocket accept requires TcpStream-based IoStream".into(),
+            ));
+        }
+    };
+
     let resp = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
     );
@@ -1423,8 +1436,10 @@ pub async fn accept_websocket(stream: TcpStream) -> Result<IoStream, crate::Erro
         .map_err(|e| crate::Error::Transport(format!("WS write response: {e}")))?;
 
     let mut ws = WsByteStream::from_raw(Box::new(tcp), false);
-    if !leftover.is_empty() {
-        ws.read_buf = leftover;
+    let mut all_leftover = extra_pre_read;
+    all_leftover.extend_from_slice(&leftover);
+    if !all_leftover.is_empty() {
+        ws.read_buf = all_leftover;
         ws.read_pos = 0;
     }
     Ok(IoStream::WebSocket(ws))
