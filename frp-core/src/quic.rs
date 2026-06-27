@@ -1,8 +1,8 @@
 //! QUIC transport — async stream via the `quinn` crate.
 //!
-//! Maps a single QUIC bidirectional stream to `AsyncRead + AsyncWrite`.
-//! The QUIC connection is established first, then a single stream is opened.
-//! This matches how Go frp uses quic-go: one stream per logical connection.
+//! `QuicStream` maps a single QUIC bidirectional stream to `AsyncRead + AsyncWrite`.
+//! `QuicConnection` wraps a Quinn connection and supports opening/accepting
+//! multiple streams over a single QUIC connection (Go frp compat).
 
 use std::io;
 use std::net::SocketAddr;
