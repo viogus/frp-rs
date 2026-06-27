@@ -3441,6 +3441,116 @@ test_r2g_quic() {
     fi
 }
 
+# =============================================================================
+# Test: Go frpc (V2 wire protocol) -> Rust frps
+# =============================================================================
+test_g2r_v2_tcp() {
+    local name="go-to-rust-v2-tcp"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-v2"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    # Start Rust frps (standard config — detect_and_strip_magic auto-detects V2)
+    write_rust_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Start Go frpc with V2 wire protocol + tcp_mux
+    write_go_frpc_config "$frps_port" "$token" "$echo_port" "$proxy_port" \
+        "v2-tcp" "$TEST_DIR/$name/frpc.toml" \
+        $'transport.wireProtocol = "v2"\ntransport.tcpMux = true'
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "v2-g2r-test" "v2-g2r-test" 5)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Rust frpc (V2 wire protocol) -> Go frps
+# =============================================================================
+test_r2g_v2_tcp() {
+    local name="rust-to-go-v2-tcp"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-r2g-v2"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    # Start Go frps with V2 wire protocol + tcp_mux
+    write_go_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    cat >> "$TEST_DIR/$name/frps.toml" <<'TOML'
+transport.tcpMux = true
+transport.wireProtocol = "v2"
+TOML
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    # Start Rust frpc with V2 + tcp_mux
+    write_rust_frpc_config "$frps_port" "$token" "$echo_port" "$proxy_port" \
+        "v2-tcp" "$TEST_DIR/$name/frpc.toml" \
+        $'v2 = true\ntcp_mux = true'
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "v2-r2g-test" "v2-r2g-test" 5)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
 # Phase 5: Multi-proxy and edge cases (continued)
 run_test test_r2g_compression
 run_test test_r2g_multi_proxy
@@ -3472,6 +3582,10 @@ run_test test_quic_rust_to_rust
 # Go frp uses quic-go (multi-stream), Rust now accepts additional streams.
 run_test test_g2r_quic
 run_test test_r2g_quic
+
+# Phase 9: V2 wire protocol
+test_g2r_v2_tcp
+test_r2g_v2_tcp
 
 # --- Summary ---
 echo ""
