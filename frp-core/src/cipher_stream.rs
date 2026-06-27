@@ -432,7 +432,7 @@ mod tests {
         our_cfb.encrypt(&mut our_enc);
 
         // Standard crate implementation
-        let mut std_enc = cfb_mode::Encryptor::<Aes128>::new((&key).into(), (&iv).into());
+        let std_enc = cfb_mode::Encryptor::<Aes128>::new((&key).into(), (&iv).into());
         let mut std_encrypted = plaintext.to_vec();
         std_enc.encrypt(&mut std_encrypted);
 
