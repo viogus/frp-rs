@@ -1027,7 +1027,29 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
         }
     };
 
-    // Connect via upstream proxy if configured, otherwise direct TCP.
+    match opts.protocol {
+        TransportProtocol::Kcp => {
+            let addr = format!("{}:{}", opts.server_addr, opts.server_port);
+            let stream = crate::kcp::dial_kcp(&addr, Default::default()).await
+                .map_err(|e| crate::Error::Transport(format!("KCP dial: {e}")))?;
+            return Ok(IoStream::Kcp(stream));
+        }
+        TransportProtocol::Quic => {
+            let addr = format!("{}:{}", opts.server_addr, opts.server_port);
+            let server_name = if !opts.tls_server_name.is_empty() {
+                &opts.tls_server_name
+            } else {
+                &opts.server_addr
+            };
+            let ca_file = opts.tls_ca_file.as_deref();
+            let stream = crate::quic::dial_quic(&addr, server_name, ca_file).await
+                .map_err(|e| crate::Error::Transport(format!("QUIC dial: {e}")))?;
+            return Ok(IoStream::Quic(stream));
+        }
+        _ => {}
+    }
+
+    // TCP, WebSocket, WSS: connect via upstream proxy if configured, otherwise direct TCP.
     let mut stream = if let Some(ref proxy_url) = opts.proxy_url {
         if proxy_url.is_empty() {
             // Empty string = direct connection
@@ -1100,22 +1122,8 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 .map_err(|e| crate::Error::Transport(format!("WebSocket connect: {e}")))?;
             Ok(IoStream::WebSocket(WsByteStream::new(ws_stream)))
         }
-        TransportProtocol::Kcp => {
-            let addr = format!("{}:{}", opts.server_addr, opts.server_port);
-            let stream = crate::kcp::dial_kcp(&addr, Default::default()).await
-                .map_err(|e| crate::Error::Transport(format!("KCP dial: {e}")))?;
-            Ok(IoStream::Kcp(stream))
-        }
-        TransportProtocol::Quic => {
-            let addr = format!("{}:{}", opts.server_addr, opts.server_port);
-            let server_name = if !opts.tls_server_name.is_empty() {
-                &opts.tls_server_name
-            } else {
-                &opts.server_addr
-            };
-            let stream = crate::quic::dial_quic(&addr, server_name).await
-                .map_err(|e| crate::Error::Transport(format!("QUIC dial: {e}")))?;
-            Ok(IoStream::Quic(stream))
+        TransportProtocol::Kcp | TransportProtocol::Quic => {
+            unreachable!("KCP/QUIC handled before TCP connect")
         }
     }
 }
@@ -1356,14 +1364,10 @@ pub fn build_tls_acceptor(
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-/// Create a TLS connector for client-side TLS.
-/// If ca_file is provided, use it as a custom root CA; otherwise use webpki roots.
-/// If cert_file/key_file are provided, present client certificate to server (mTLS).
-pub fn build_tls_connector(
-    ca_file: Option<&str>,
-    cert_file: Option<&str>,
-    key_file: Option<&str>,
-) -> Result<TlsConnector, crate::Error> {
+/// Build a `RootCertStore` from an optional CA file path.
+/// If `ca_file` is Some and non-empty, loads CA certs from that file.
+/// If None or empty, uses the system's webpki roots.
+pub fn build_root_store(ca_file: Option<&str>) -> Result<rustls::RootCertStore, crate::Error> {
     let mut root_store = rustls::RootCertStore::empty();
 
     if let Some(ca_path) = ca_file {
@@ -1381,6 +1385,19 @@ pub fn build_tls_connector(
     } else {
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
+
+    Ok(root_store)
+}
+
+/// Create a TLS connector for client-side TLS.
+/// If ca_file is provided, use it as a custom root CA; otherwise use webpki roots.
+/// If cert_file/key_file are provided, present client certificate to server (mTLS).
+pub fn build_tls_connector(
+    ca_file: Option<&str>,
+    cert_file: Option<&str>,
+    key_file: Option<&str>,
+) -> Result<TlsConnector, crate::Error> {
+    let root_store = build_root_store(ca_file)?;
 
     let config = if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
         if !cert_path.is_empty() && !key_path.is_empty() {

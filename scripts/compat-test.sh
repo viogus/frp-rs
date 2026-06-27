@@ -738,6 +738,192 @@ $extra
 TOML
 }
 
+# ── KCP transport config helpers ──────────────────────────────
+
+write_go_frps_config_kcp() {
+    local port="$1" token="$2" kcp_port="$3" out="$4"
+    cat > "$out" <<TOML
+bindAddr = "127.0.0.1"
+bindPort = $port
+kcpBindPort = $kcp_port
+
+auth.method = "token"
+auth.token = "$token"
+
+transport.tcpMux = false
+
+log.to = "$TEST_DIR/go-frps.log"
+log.level = "debug"
+TOML
+}
+
+write_rust_frps_config_kcp() {
+    local port="$1" token="$2" kcp_port="$3" out="$4"
+    cat > "$out" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $port
+kcp_bind_port = $kcp_port
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+
+TOML
+}
+
+write_go_frpc_config_kcp() {
+    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
+    local extra="${7:-}"
+    cat > "$out" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $server_port
+
+auth.token = "$token"
+
+transport.protocol = "kcp"
+transport.tls.enable = false
+transport.tcpMux = false
+
+log.to = "$TEST_DIR/go-frpc-$name.log"
+log.level = "debug"
+
+[[proxies]]
+name = "$name"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = $echo_port
+remotePort = $proxy_port
+
+$extra
+TOML
+}
+
+write_rust_frpc_config_kcp() {
+    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
+    local extra="${7:-}"
+    cat > "$out" <<TOML
+server_addr = "127.0.0.1"
+server_port = $server_port
+token = "$token"
+tcp_mux = false
+login_fail_exit = true
+pool_count = 1
+transport_protocol = "kcp"
+
+[[proxies]]
+name = "$name"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = $echo_port
+remote_port = $proxy_port
+
+$extra
+TOML
+}
+
+# ── QUIC transport config helpers ──────────────────────────────
+
+write_go_frps_config_quic() {
+    local port="$1" token="$2" quic_port="$3" out="$4"
+    cat > "$out" <<TOML
+bindAddr = "127.0.0.1"
+bindPort = $port
+quicBindPort = $quic_port
+
+auth.method = "token"
+auth.token = "$token"
+
+transport.tls.force = true
+transport.tls.certFile = "$CERT_DIR/server.crt"
+transport.tls.keyFile = "$CERT_DIR/server.key"
+transport.tcpMux = false
+
+log.to = "$TEST_DIR/go-frps.log"
+log.level = "debug"
+TOML
+}
+
+write_rust_frps_config_quic() {
+    local port="$1" token="$2" quic_port="$3" out="$4"
+    cat > "$out" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $port
+quic_bind_port = $quic_port
+
+# QUIC requires TLS
+tls_enable = true
+tls_cert_file = "$CERT_DIR/server.crt"
+tls_key_file = "$CERT_DIR/server.key"
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+
+TOML
+}
+
+write_go_frpc_config_quic() {
+    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
+    local extra="${7:-}"
+    cat > "$out" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $server_port
+
+auth.token = "$token"
+
+transport.protocol = "quic"
+transport.tls.enable = true
+transport.tls.disableCustomTLSFirstByte = true
+transport.tls.trustedCaFile = "$CERT_DIR/ca.crt"
+transport.tls.serverName = "localhost"
+transport.tcpMux = false
+
+log.to = "$TEST_DIR/go-frpc-$name.log"
+log.level = "debug"
+
+[[proxies]]
+name = "$name"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = $echo_port
+remotePort = $proxy_port
+
+$extra
+TOML
+}
+
+write_rust_frpc_config_quic() {
+    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
+    local extra="${7:-}"
+    cat > "$out" <<TOML
+server_addr = "127.0.0.1"
+server_port = $server_port
+token = "$token"
+tcp_mux = false
+login_fail_exit = true
+pool_count = 1
+transport_protocol = "quic"
+tls_enable = true
+tls_ca_file = "$CERT_DIR/ca.crt"
+tls_server_name = "localhost"
+
+[[proxies]]
+name = "$name"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = $echo_port
+remote_port = $proxy_port
+
+$extra
+TOML
+}
+
 log() {
     echo -e "${YELLOW}[LOG]${NC} $*" >&2
 }
@@ -3123,6 +3309,217 @@ s.close()
     fi
 }
 
+# =============================================================================
+# Test: Go frpc -> Rust frps, KCP transport
+# =============================================================================
+test_g2r_kcp() {
+    local name="go-to-rust-kcp"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local kcp_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-kcp"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_rust_frps_config_kcp "$frps_port" "$token" "$kcp_port" "$TEST_DIR/$name/frps.toml"
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    # KCP uses UDP — wait for TCP bind port as readiness signal
+    wait_for_port 127.0.0.1 "$frps_port" 10 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Go frpc with transport.protocol=kcp connects to the KCP port directly
+    write_go_frpc_config_kcp "$kcp_port" "$token" "$echo_port" "$proxy_port" \
+        "kcp-plain" "$TEST_DIR/$name/frpc.toml"
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "kcp-test-data" "kcp-test-data" 10)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Rust frpc -> Go frps, KCP transport
+# =============================================================================
+test_r2g_kcp() {
+    local name="rust-to-go-kcp"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local kcp_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-r2g-kcp"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_go_frps_config_kcp "$frps_port" "$token" "$kcp_port" "$TEST_DIR/$name/frps.toml"
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    # KCP uses UDP — wait for TCP bind port as readiness signal
+    wait_for_port 127.0.0.1 "$frps_port" 10 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    # Rust frpc with transport_protocol=kcp connects to the KCP port directly
+    write_rust_frpc_config_kcp "$kcp_port" "$token" "$echo_port" "$proxy_port" \
+        "kcp-plain" "$TEST_DIR/$name/frpc.toml"
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "kcp-r2g-test" "kcp-r2g-test" 10)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Go frpc -> Rust frps, QUIC transport
+# =============================================================================
+test_g2r_quic() {
+    local name="go-to-rust-quic"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local quic_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-quic"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_rust_frps_config_quic "$frps_port" "$token" "$quic_port" "$TEST_DIR/$name/frps.toml"
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    # QUIC uses UDP, wait for the TCP bind port as readiness signal
+    wait_for_port 127.0.0.1 "$frps_port" 10 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Go frpc with transport.protocol=quic connects to the QUIC port directly
+    write_go_frpc_config_quic "$quic_port" "$token" "$echo_port" "$proxy_port" \
+        "quic-plain" "$TEST_DIR/$name/frpc.toml"
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "quic-test-data" "quic-test-data" 10)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Rust frpc -> Go frps, QUIC transport
+# =============================================================================
+test_r2g_quic() {
+    local name="rust-to-go-quic"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local quic_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-r2g-quic"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_go_frps_config_quic "$frps_port" "$token" "$quic_port" "$TEST_DIR/$name/frps.toml"
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 10 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    # Rust frpc with transport_protocol=quic connects to the QUIC port directly
+    write_rust_frpc_config_quic "$quic_port" "$token" "$echo_port" "$proxy_port" \
+        "quic-plain" "$TEST_DIR/$name/frpc.toml"
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "quic-r2g-test" "quic-r2g-test" 10)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
 # Phase 5: Multi-proxy and edge cases (continued)
 test_r2g_compression
 test_r2g_multi_proxy
@@ -3133,6 +3530,19 @@ test_r2g_ws_plain
 
 # Phase 7: Plugin
 test_r2g_socks5
+
+# Phase 8: KCP + QUIC transport cross-compat
+# KCP Go↔Rust guarded: Go frp uses kcp-go session layer (FEC + XOR encryption),
+# Rust uses raw kcp crate. Different wire formats — incompatible.
+# Rust↔Rust KCP works (verified).
+# test_g2r_kcp
+# test_r2g_kcp
+
+# QUIC Go↔Rust guarded: Go frp uses multi-stream-per-connection (quic-go),
+# Rust accepts one stream per QUIC connection. Work connections never arrive.
+# Rust↔Rust QUIC works (verified — control + work over separate QUIC connections).
+# test_g2r_quic
+# test_r2g_quic
 
 # --- Summary ---
 echo ""

@@ -62,6 +62,54 @@ pub struct AdminState {
 
 // --- Handlers ---
 
+/// Escape special characters in a Prometheus label value.
+/// Per the exposition format spec, backslash, double-quote, and newline
+/// must be escaped with a backslash.
+fn prometheus_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+     .replace('"', "\\\"")
+     .replace('\n', "\\n")
+}
+
+async fn handle_metrics(State(state): State<AdminState>) -> String {
+    let proxies = state.proxies.read().await;
+    let mut traffic_in = String::new();
+    let mut traffic_out = String::new();
+    let mut conn_counts = String::new();
+    let mut current_conns = String::new();
+
+    for (name, info) in proxies.iter() {
+        if let Some(m) = state.proxy_metrics.get(name).await {
+            let s = m.snapshot();
+            let labels = format!(
+                "{{name=\"{}\",type=\"{}\"}}",
+                prometheus_escape(name),
+                prometheus_escape(&info.proxy_type),
+            );
+            traffic_in.push_str(&format!("frp_client_traffic_in{} {}\n", labels, s.bytes_in));
+            traffic_out.push_str(&format!("frp_client_traffic_out{} {}\n", labels, s.bytes_out));
+            conn_counts.push_str(&format!("frp_client_connection_counts{} {}\n", labels, s.total_conns));
+            current_conns.push_str(&format!("frp_client_current_conns{} {}\n", labels, s.current_conns));
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("# HELP frp_client_traffic_in Total inbound traffic bytes per proxy\n");
+    out.push_str("# TYPE frp_client_traffic_in gauge\n");
+    out.push_str(&traffic_in);
+    out.push_str("# HELP frp_client_traffic_out Total outbound traffic bytes per proxy\n");
+    out.push_str("# TYPE frp_client_traffic_out gauge\n");
+    out.push_str(&traffic_out);
+    out.push_str("# HELP frp_client_connection_counts Total connections per proxy\n");
+    out.push_str("# TYPE frp_client_connection_counts gauge\n");
+    out.push_str(&conn_counts);
+    out.push_str("# HELP frp_client_current_conns Current active connections per proxy\n");
+    out.push_str("# TYPE frp_client_current_conns gauge\n");
+    out.push_str(&current_conns);
+    out.push_str("# EOF\n");
+    out
+}
+
 async fn handle_status(State(state): State<AdminState>) -> Json<serde_json::Value> {
     let proxies = state.proxies.read().await;
     let mut by_type: HashMap<String, Vec<ProxyStatusEntry>> = HashMap::new();
@@ -163,6 +211,7 @@ pub async fn run_admin_server(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/api/status", get(handle_status))
+        .route("/api/metrics", get(handle_metrics))
         .route("/api/reload", get(handle_reload))
         .route("/api/stop", axum::routing::post(handle_stop))
         .route("/api/config",
