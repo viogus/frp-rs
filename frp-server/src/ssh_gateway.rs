@@ -5,7 +5,14 @@
 //!
 //! The remote command string is parsed into a ProxyConfig.
 
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use frp_core::config::ProxyConfig;
+use frp_core::msg::TYPE_REQ_WORK_CONN;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::mpsc;
 
 /// Parsed result from an SSH remote command string.
 #[derive(Debug, PartialEq)]
@@ -132,6 +139,163 @@ fn shell_split(cmd: &str) -> Vec<String> {
         tokens.push(current);
     }
     tokens
+}
+
+/// Virtual control channel — an mpsc-based AsyncRead + AsyncWrite pair
+/// that implements the FRP V1 protocol over channels instead of TCP.
+///
+/// The read side receives V1-encoded messages pushed from the SSH session
+/// (e.g., NewProxy). The write side intercepts ReqWorkConn messages and
+/// forwards them as WorkConnRequest to the SSH session.
+pub struct VirtualControl {
+    /// Inbound V1 frames from SSH session → read by handle_control().
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    /// Outbound work connection requests to SSH session.
+    work_req_tx: mpsc::UnboundedSender<WorkConnRequest>,
+    /// Write buffer for partial V1 frame assembly.
+    write_buf: Vec<u8>,
+    write_pos: usize,
+}
+
+/// A request from the control handler to the SSH session to open a
+/// reverse-forward channel for a work connection.
+#[derive(Debug)]
+pub struct WorkConnRequest {
+    pub proxy_name: String,
+}
+
+impl VirtualControl {
+    pub fn new(
+        rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        work_req_tx: mpsc::UnboundedSender<WorkConnRequest>,
+    ) -> Self {
+        Self {
+            rx,
+            work_req_tx,
+            write_buf: Vec::new(),
+            write_pos: 0,
+        }
+    }
+
+    /// Create a paired (VirtualControl, tx, work_rx) where tx is the sender
+    /// that the SSH session writes V1 frames into.
+    pub fn channel() -> (Self, mpsc::UnboundedSender<Vec<u8>>, mpsc::UnboundedReceiver<WorkConnRequest>) {
+        let (frame_tx, frame_rx) = mpsc::unbounded_channel();
+        let (work_tx, work_rx) = mpsc::unbounded_channel();
+        (Self::new(frame_rx, work_tx), frame_tx, work_rx)
+    }
+}
+
+impl AsyncRead for VirtualControl {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // If we have buffered data from a previous frame, drain it first
+        if self.write_pos < self.write_buf.len() {
+            let available = &self.write_buf[self.write_pos..];
+            let len = available.len().min(buf.remaining());
+            buf.put_slice(&available[..len]);
+            self.write_pos += len;
+            if self.write_pos >= self.write_buf.len() {
+                self.write_buf.clear();
+                self.write_pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        // Poll the mpsc receiver for the next V1 frame
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(frame)) => {
+                let len = frame.len().min(buf.remaining());
+                buf.put_slice(&frame[..len]);
+                if len < frame.len() {
+                    self.write_buf = frame;
+                    self.write_pos = len;
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(None) => {
+                // Channel closed — EOF
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for VirtualControl {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        // Accumulate bytes. When we have a complete V1 frame, check if it's
+        // a ReqWorkConn. If so, intercept and send WorkConnRequest.
+        // Otherwise, consume and ignore (heartbeats, ping responses, etc.).
+        //
+        // V1 frame: 1-byte type + 8-byte BE length + payload
+
+        const HEADER_LEN: usize = 9;
+
+        self.write_buf.extend_from_slice(buf);
+
+        // Try to parse complete frames from the buffer
+        while self.write_buf.len() >= HEADER_LEN {
+            let payload_len = i64::from_be_bytes([
+                self.write_buf[1], self.write_buf[2], self.write_buf[3],
+                self.write_buf[4], self.write_buf[5], self.write_buf[6],
+                self.write_buf[7], self.write_buf[8],
+            ]) as usize;
+
+            // Guard against excessive payload length (max V1 frame is 64KB)
+            if payload_len > 65536 {
+                // Corrupt frame — clear buffer to recover
+                self.write_buf.clear();
+                break;
+            }
+
+            if self.write_buf.len() < HEADER_LEN + payload_len {
+                // Incomplete frame — wait for more bytes
+                break;
+            }
+
+            // We have a complete frame
+            let msg_type = self.write_buf[0];
+
+            if msg_type == TYPE_REQ_WORK_CONN {
+                // Intercept: send WorkConnRequest instead of writing to wire
+                // ReqWorkConn has no fields — the control handler just needs
+                // any ReqWorkConn to trigger work connection creation.
+                let _ = self.work_req_tx.send(WorkConnRequest {
+                    proxy_name: String::new(),
+                });
+            }
+            // For all other message types (Pong, NewProxyResp, etc.), consume and ignore.
+
+            // Remove the consumed frame from the buffer
+            let consumed = HEADER_LEN + payload_len;
+            self.write_buf.drain(..consumed);
+        }
+
+        // Report all bytes as written (they were consumed)
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 #[cfg(test)]
@@ -324,5 +488,117 @@ mod key_tests {
         let loaded_fp = loaded.public_key().fingerprint(HashAlg::Sha256);
         let auto_fp = auto.public_key().fingerprint(HashAlg::Sha256);
         assert_ne!(loaded_fp.to_string(), auto_fp.to_string());
+    }
+}
+
+#[cfg(test)]
+mod virtual_ctrl_tests {
+    use super::*;
+
+    /// Helper: manually encode a V1 frame (type byte + 8-byte BE i64 length + payload).
+    fn encode_v1_frame(msg: &frp_core::msg::FrpMessage) -> Vec<u8> {
+        let type_byte = msg.v1_type_byte();
+        let payload = serde_json::to_vec(msg).unwrap();
+        let mut frame = Vec::with_capacity(9 + payload.len());
+        frame.push(type_byte);
+        frame.extend_from_slice(&(payload.len() as i64).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    #[tokio::test]
+    async fn test_virtual_control_newproxy_roundtrip() {
+        use frp_core::msg::{NewProxy, FrpMessage};
+
+        let (mut vc, tx, _work_rx) = VirtualControl::channel();
+
+        // Build a NewProxy message as V1 bytes
+        let msg = FrpMessage::NewProxy(NewProxy {
+            proxy_name: "test-proxy".into(),
+            proxy_type: "tcp".into(),
+            use_encryption: None,
+            use_compression: None,
+            group: None,
+            group_key: None,
+            local_str: None,
+            remote_port: Some(9090),
+            sk: None,
+            custom_domains: None,
+            subdomain: None,
+            locations: None,
+            http_user: None,
+            http_pwd: None,
+            host_header_rewrite: None,
+            headers: None,
+            response_headers: None,
+            route_by_http_user: None,
+            allow_users: None,
+            bandwidth_limit: None,
+            bandwidth_limit_mode: None,
+            annotations: None,
+            metas: None,
+            multiplexer: None,
+            virtual_net: None,
+            proxy_protocol_version: None,
+        });
+
+        let v1_buf = encode_v1_frame(&msg);
+
+        // Push frame into the channel
+        tx.send(v1_buf.clone()).unwrap();
+        drop(tx); // close the sender so poll_read returns Ready(None) after the frame
+
+        // Read it back through VirtualControl
+        let mut read_buf = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            use tokio::io::AsyncReadExt;
+            match vc.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => read_buf.extend_from_slice(&buf[..n]),
+                Err(e) => panic!("read error: {}", e),
+            }
+        }
+
+        // Verify we got the V1 frame bytes back exactly
+        assert_eq!(read_buf, v1_buf, "VirtualControl should return exact V1 frame bytes");
+
+        // Verify the frame is a valid V1 NewProxy message
+        assert_eq!(read_buf[0], frp_core::msg::TYPE_NEW_PROXY, "first byte should be TYPE_NEW_PROXY");
+        // Payload length (next 8 bytes BE) should match JSON body
+        let payload_len = i64::from_be_bytes(read_buf[1..9].try_into().unwrap()) as usize;
+        assert!(payload_len > 0);
+        // Payload should contain proxy_name
+        let json = std::str::from_utf8(&read_buf[9..9 + payload_len]).unwrap();
+        assert!(json.contains("test-proxy"), "JSON should contain proxy_name");
+        assert!(json.contains("9090"), "JSON should contain remote_port");
+    }
+
+    #[tokio::test]
+    async fn test_virtual_control_intercepts_req_work_conn() {
+        use frp_core::msg::{ReqWorkConn, FrpMessage};
+
+        // Create a VirtualControl that only tests the write side
+        let (_frame_tx, frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (work_tx, mut work_rx) = mpsc::unbounded_channel();
+        let mut vc = VirtualControl::new(frame_rx, work_tx);
+
+        // Build a ReqWorkConn V1 frame
+        let msg = FrpMessage::ReqWorkConn(ReqWorkConn {});
+        let v1_buf = encode_v1_frame(&msg);
+
+        // Verify the frame header is correct
+        assert_eq!(v1_buf[0], frp_core::msg::TYPE_REQ_WORK_CONN, "type byte should be TYPE_REQ_WORK_CONN");
+
+        // Write the ReqWorkConn frame
+        use tokio::io::AsyncWriteExt;
+        vc.write_all(&v1_buf).await.unwrap();
+
+        // The write buffer should be empty (frame consumed)
+        assert!(vc.write_buf.is_empty());
+
+        // A WorkConnRequest should have been sent
+        let req = work_rx.try_recv().expect("should have received WorkConnRequest");
+        assert!(req.proxy_name.is_empty(), "ReqWorkConn has no proxy_name field");
     }
 }
