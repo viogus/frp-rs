@@ -311,12 +311,12 @@ impl AsyncWrite for VirtualControl {
 /// Per-connection SSH session handler.
 ///
 /// Lifecycle:
-/// 1. `auth_succeeded` → store handle, mark authenticated
+/// 1. `auth_succeeded` → store handle, spawn work-connection background task
 /// 2. `exec_request` → parse proxy args from SSH remote command
-/// 3. `tcpip_forward` → register an FRP proxy via VirtualControl
+/// 3. `tcpip_forward` → register an FRP proxy via VirtualControl, store listen port
 /// 4. When a work connection is needed, the control handler sends
-///    ReqWorkConn → VirtualControl intercepts → WorkConnRequest,
-///    which the SshListener calls to open a channel.
+///    ReqWorkConn → VirtualControl intercepts → WorkConnRequest →
+///    background task opens TCP to SSH listen port → sends NewWorkConn.
 pub struct SshSession {
     /// Unique run_id for this SSH client (used as FRP run_id).
     pub run_id: String,
@@ -328,14 +328,18 @@ pub struct SshSession {
     /// V1 frame sender into the VirtualControl channel (→ control handler).
     frame_tx: mpsc::UnboundedSender<Vec<u8>>,
     /// Receives WorkConnRequest from VirtualControl's AsyncWrite intercept.
-    #[allow(dead_code)]
-    work_conn_rx: mpsc::UnboundedReceiver<WorkConnRequest>,
+    /// Taken by the background task spawned in `auth_succeeded`.
+    work_conn_rx: Option<mpsc::UnboundedReceiver<WorkConnRequest>>,
+    /// SSH listen ports allocated by `tcpip_forward`, consumed by the
+    /// work-connection background task to open TCP connections that
+    /// traverse the SSH reverse tunnel.
+    listen_ports: std::sync::Arc<tokio::sync::Mutex<std::collections::VecDeque<u16>>>,
     /// Server auth token for password authentication.
     server_token: String,
     /// Allowed public keys (loaded from authorized_keys file).
     authorized_keys: Vec<russh::keys::PublicKey>,
     /// Shared server state (proxy manager, used_ports, etc.).
-    state: Arc<AppState>,
+    state: std::sync::Arc<AppState>,
     /// Set to true by auth_succeeded.
     authenticated: bool,
     /// The raw exec command string from the SSH client.
@@ -351,14 +355,15 @@ impl SshSession {
         work_conn_rx: mpsc::UnboundedReceiver<WorkConnRequest>,
         server_token: String,
         authorized_keys: Vec<russh::keys::PublicKey>,
-        state: Arc<AppState>,
+        state: std::sync::Arc<AppState>,
     ) -> Self {
         Self {
             run_id,
             registered_proxies: Vec::new(),
             ssh_handle: None,
             frame_tx,
-            work_conn_rx,
+            work_conn_rx: Some(work_conn_rx),
+            listen_ports: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
             server_token,
             authorized_keys,
             state,
@@ -452,6 +457,13 @@ impl Handler for SshSession {
         _user: &str,
         password: &str,
     ) -> Result<Auth, Self::Error> {
+        // No token configured → disable password auth per spec
+        if self.server_token.is_empty() {
+            return Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            });
+        }
         if password == self.server_token {
             Ok(Auth::Accept)
         } else {
@@ -486,6 +498,25 @@ impl Handler for SshSession {
         self.ssh_handle = Some(session.handle());
         self.authenticated = true;
         tracing::info!("SSH session {} authenticated", self.run_id);
+
+        // Spawn a background task that handles work connection requests.
+        // When the control handler needs a work connection, it writes
+        // ReqWorkConn → VirtualControl intercepts → WorkConnRequest.
+        // This task receives WorkConnRequest, opens a TCP connection to
+        // the SSH listen port (which traverses the SSH reverse tunnel
+        // back to the client's local service), and sends the resulting
+        // stream as InternalMsg::NewWorkConn to the control handler.
+        let work_rx = self.work_conn_rx.take().ok_or_else(|| {
+            anyhow!("work_conn_rx already taken")
+        })?;
+        let listen_ports = self.listen_ports.clone();
+        let state = self.state.clone();
+        let run_id = self.run_id.clone();
+
+        tokio::spawn(async move {
+            handle_work_conn_requests(work_rx, listen_ports, state, run_id).await;
+        });
+
         Ok(())
     }
 
@@ -566,7 +597,14 @@ impl Handler for SshSession {
         let proxy_name = args.proxy_name.clone();
         self.registered_proxies.push(proxy_name.clone());
 
-        // 6. Report allocated port back to SSH client
+        // 6. Store the allocated SSH listen port so the work-connection
+        //    background task can open a TCP connection through the tunnel.
+        {
+            let mut ports = self.listen_ports.lock().await;
+            ports.push_back(allocated);
+        }
+
+        // 7. Report allocated port back to SSH client
         *port = allocated as u32;
 
         tracing::info!(
@@ -619,6 +657,78 @@ impl Handler for SshSession {
         // bridge. No handler-side processing needed.
         Ok(())
     }
+}
+
+/// Background task: receives WorkConnRequest signals from VirtualControl
+/// (which intercepted ReqWorkConn from the control handler), opens a TCP
+/// connection to the SSH listen port so it traverses the reverse tunnel
+/// back to the client's local service, and sends the stream as
+/// InternalMsg::NewWorkConn to the control handler for bridging.
+async fn handle_work_conn_requests(
+    mut work_rx: mpsc::UnboundedReceiver<WorkConnRequest>,
+    listen_ports: std::sync::Arc<tokio::sync::Mutex<std::collections::VecDeque<u16>>>,
+    state: std::sync::Arc<AppState>,
+    run_id: String,
+) {
+    while let Some(_req) = work_rx.recv().await {
+        // Pop the next listen port allocated by tcpip_forward
+        let port = {
+            let mut ports = listen_ports.lock().await;
+            ports.pop_front()
+        };
+
+        let port = match port {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    "SSH session {}: WorkConnRequest but no listen ports available",
+                    run_id
+                );
+                continue;
+            }
+        };
+
+        // Open a TCP connection to the SSH listen port. This connection
+        // traverses the SSH reverse tunnel: frps TCP → SSH forwarded-tcpip
+        // channel → SSH client → local service.
+        let stream = match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(
+                    "SSH session {}: failed to connect to SSH listen port {}: {}",
+                    run_id, port, e
+                );
+                continue;
+            }
+        };
+
+        // Look up the control handler's internal_tx from the global map
+        let ctl_tx = {
+            let map = state.run_id_to_ctl_tx.read().await;
+            map.get(&run_id).cloned()
+        };
+
+        match ctl_tx {
+            Some(tx) => {
+                use crate::service::InternalMsg;
+                let io_stream = frp_core::transport::IoStream::Tcp(stream);
+                if tx.tx.send(InternalMsg::NewWorkConn(io_stream)).is_err() {
+                    tracing::error!(
+                        "SSH session {}: control handler channel closed",
+                        run_id
+                    );
+                }
+            }
+            None => {
+                tracing::error!(
+                    "SSH session {}: no control handler found for work connection",
+                    run_id
+                );
+            }
+        }
+    }
+
+    tracing::debug!("SSH session {} work-connection handler exiting", run_id);
 }
 
 /// Clean up a disconnected SSH session: remove all registered proxies.
