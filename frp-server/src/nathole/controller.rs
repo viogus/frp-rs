@@ -9,14 +9,14 @@ use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWrite;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
-use tracing::{debug, trace, warn};
+use tracing::{trace, warn};
 
 use frp_core::msg::{self, FrpMessage, NatHoleDetectBehavior, PortsRange};
 use frp_core::protocol::write_msg_v1;
 
 use crate::service::InternalMsg;
 use super::analysis::{Analyzer, RecommandBehavior};
-use super::classify::{classify_nat_feature, NatFeature};
+use super::classify::NatFeature;
 
 /// Generates unique transaction/session IDs.
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -250,6 +250,85 @@ impl Controller {
         let now = Instant::now();
         let mut sessions = self.sessions.write().await;
         sessions.retain(|_sid, s| now.duration_since(s.created_at) < timeout);
+    }
+
+    // --- Backward-compat methods matching old NatHoleCoordinator API ---
+
+    /// Take the visitor writer for a session (accept-loop path).
+    pub async fn take_writer(&self, sid: &str) -> Option<Box<dyn AsyncWrite + Send + Unpin>> {
+        let sessions = self.sessions.read().await;
+        let session = sessions.get(sid)?;
+        let mut guard = session.visitor_writer.lock().await;
+        guard.take()
+    }
+
+    /// Return the writer back to the session after use.
+    pub async fn return_writer(&self, sid: &str, writer: Box<dyn AsyncWrite + Send + Unpin>) {
+        let sessions = self.sessions.read().await;
+        if let Some(session) = sessions.get(sid) {
+            *session.visitor_writer.lock().await = Some(writer);
+        }
+    }
+
+    /// Forward NatHoleSid to the visitor via control channel.
+    /// Returns true if forwarded via ctl path.
+    pub async fn forward_sid_via_ctl(
+        &self,
+        sid: &str,
+        provider_addr: Option<String>,
+    ) -> bool {
+        let sessions = self.sessions.read().await;
+        if let Some(session) = sessions.get(sid) {
+            if let Some(ref tx) = session.visitor_ctl_tx {
+                let _ = tx.send(InternalMsg::WriteNatHoleSid {
+                    sid: sid.to_string(),
+                    provider_addr,
+                });
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Forward NatHoleResp to the visitor via control channel.
+    pub async fn forward_nat_hole_resp_via_ctl(
+        &self,
+        sid: &str,
+        error: Option<String>,
+        resp_sid: Option<String>,
+        protocol: Option<String>,
+        candidate_addrs: Option<Vec<String>>,
+        assisted_addrs: Option<Vec<String>>,
+    ) -> bool {
+        let sessions = self.sessions.read().await;
+        if let Some(session) = sessions.get(sid) {
+            if let Some(ref tx) = session.visitor_ctl_tx {
+                let _ = tx.send(InternalMsg::WriteNatHoleResp {
+                    transaction_id: sid.to_string(),
+                    error,
+                    sid: resp_sid,
+                    protocol,
+                    candidate_addrs,
+                    assisted_addrs,
+                });
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Forward NatHoleReport to the visitor via control channel.
+    pub async fn forward_report_via_ctl(&self, sid: &str) -> bool {
+        let sessions = self.sessions.read().await;
+        if let Some(session) = sessions.get(sid) {
+            if let Some(ref tx) = session.visitor_ctl_tx {
+                let _ = tx.send(InternalMsg::WriteNatHoleReport {
+                    sid: sid.to_string(),
+                });
+                return true;
+            }
+        }
+        false
     }
 
     /// Send NatHoleResp to visitor. Tries writer path first, then ctl path.

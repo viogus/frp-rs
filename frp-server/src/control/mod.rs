@@ -9,6 +9,8 @@ use tokio::time::{Duration, Instant};
 use tracing::{info, warn, debug};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 
+use crate::nathole::discovery;
+
 use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::IncomingStreams;
@@ -353,17 +355,36 @@ pub async fn handle_control<S>(
                         pending_udp.push_back((proxy_name, Instant::now()));
                     }
                     Some(InternalMsg::NatHoleClient { proxy_name, transaction_id, visitor_addr }) => {
-                        debug!("Sending NatHoleClient for session {} to provider", transaction_id);
-                        let nhc = FrpMessage::NatHoleClient(msg::NatHoleClient {
-                            proxy_name,
-                            transaction_id,
+                        debug!("Received NatHoleClient notification for session {}", transaction_id);
+
+                        // --- Do STUN discovery to find our external addresses ---
+                        let stun_server = "stun.l.google.com:19302";
+                        let mapped_addrs = match discovery::discover(stun_server) {
+                            Ok(addrs) => {
+                                debug!("STUN discovery for {}: {:?}", proxy_name, addrs);
+                                addrs
+                            }
+                            Err(e) => {
+                                warn!("STUN discovery failed for {}: {}", proxy_name, e);
+                                vec![]
+                            }
+                        };
+
+                        // Send NatHoleClient back with STUN addresses
+                        let reply = FrpMessage::NatHoleClient(msg::NatHoleClient {
+                            transaction_id: transaction_id.clone(),
+                            proxy_name: proxy_name.clone(),
+                            sid: Some(transaction_id.clone()),
+                            protocol: Some("tcp".to_string()),
+                            mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
+                            assisted_addrs: None,
                             visitor_addr,
-                            ..Default::default()
                         });
-                        if let Err(e) = write_ctl_msg(&mut writer, &nhc, v2).await {
-                            warn!("Failed to send NatHoleClient: {}", e);
+                        if let Err(e) = write_ctl_msg(&mut writer, &reply, v2).await {
+                            warn!("Failed to send NatHoleClient reply: {}", e);
                             break;
                         }
+                        debug!("Sent NatHoleClient reply with STUN addresses for {}", transaction_id);
                     }
                     Some(InternalMsg::WriteNatHoleSid { sid, provider_addr }) => {
                         debug!("Writing NatHoleSid to visitor via control channel for {}", sid);
@@ -547,6 +568,13 @@ pub async fn handle_control<S>(
                         });
                         let _ = write_ctl_msg(&mut writer, &cpr, v2).await;
                     }
+                    Ok(FrpMessage::NatHoleClient(ref client_msg)) => {
+                        debug!(
+                            "Received NatHoleClient from provider: txn={}, addrs={:?}",
+                            client_msg.transaction_id, client_msg.mapped_addrs
+                        );
+                        state.nat_hole.handle_client(client_msg.clone()).await;
+                    }
                     Ok(FrpMessage::NatHoleSid(ref sid_msg)) => {
                         debug!("Received NatHoleSid from provider: {:?}", sid_msg.sid);
                         if let Some(ref sid) = sid_msg.sid {
@@ -703,10 +731,11 @@ pub async fn handle_control<S>(
                         };
 
                         // Create session via control-channel path
-                        let report_rx = state.nat_hole
+                        let (_session, report_rx) = state.nat_hole
                             .create_session_with_ctl(
                                 transaction_id.clone(),
                                 proxy_name.clone(),
+                                nhv.clone(),
                                 internal_tx.clone(),
                             ).await;
 
