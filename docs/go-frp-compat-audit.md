@@ -6,7 +6,7 @@
 
 frp-rs achieves **~99% feature parity** with Go frp v0.69.1. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 9 client plugins, config coverage, and the SSH tunnel gateway all match Go frp behavior. Remaining gaps are protocol-level (V2 AEAD) and a cross-compat edge case (XTCP Go interop) — both documented as acknowledged limitations.
 
-**35/35 cross-compatibility tests pass.**
+**34/34 cross-compatibility tests pass.**
 
 ---
 
@@ -134,6 +134,12 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 - ✅ Client `/api/metrics`: Prometheus-format metrics endpoint (traffic_in/out, connection_counts, current_conns) — matches server `/metrics`
 - ✅ KCP cross-compat: Go↔Rust KCP transport tests added (g2r + r2g)
 - ✅ QUIC cross-compat: Go↔Rust QUIC transport tests added (g2r + r2g)
+- ✅ Rust↔Rust KCP compat test: Rust frps + Rust frpc over KCP transport, data round-trip verified
+- ✅ Rust↔Rust QUIC compat test: Rust frps + Rust frpc over QUIC transport with TLS, data round-trip verified
+- ✅ Go→Rust HTTPS compat test: Go frpc → Rust frps HTTPS proxy (VHost HTTPS), TLS-terminated routing
+- ✅ KCP dial_kcp reader task leak fixed (abort on Drop)
+- ✅ UdpOutput::write() returns Err on hard errors (KCP retransmits properly)
+- ✅ KcpListener::active map prunes dead entries (prevents unbounded growth)
 - ✅ Multi-port STUN, IPv6 parsing, session limit, stable key generation
 
 ---

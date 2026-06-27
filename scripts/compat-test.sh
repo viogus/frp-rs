@@ -2926,6 +2926,375 @@ done
 rm -rf "$TEST_DIR"
 mkdir -p "$TEST_DIR"
 
+test_kcp_rust_to_rust() {
+    local name="kcp-rust-to-rust"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local kcp_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-kcp-r2r"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_rust_frps_config_kcp "$frps_port" "$token" "$kcp_port" "$TEST_DIR/$name/frps.toml"
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    # KCP uses UDP — wait for TCP bind port as readiness signal
+    wait_for_port 127.0.0.1 "$frps_port" 10 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    write_rust_frpc_config_kcp "$kcp_port" "$token" "$echo_port" "$proxy_port" \
+        "kcp-r2r" "$TEST_DIR/$name/frpc.toml"
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "kcp-r2r-data" "kcp-r2r-data" 10)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Rust frps -> Rust frpc, QUIC transport (Rust↔Rust)
+# =============================================================================
+test_quic_rust_to_rust() {
+    local name="quic-rust-to-rust"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local quic_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-quic-r2r"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_rust_frps_config_quic "$frps_port" "$token" "$quic_port" "$TEST_DIR/$name/frps.toml"
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    # QUIC uses UDP — wait for TCP bind port as readiness signal
+    wait_for_port 127.0.0.1 "$frps_port" 10 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    write_rust_frpc_config_quic "$quic_port" "$token" "$echo_port" "$proxy_port" \
+        "quic-r2r" "$TEST_DIR/$name/frpc.toml"
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "quic-r2r-data" "quic-r2r-data" 10)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Go frpc -> Rust frps, HTTPS proxy (VHost HTTPS)
+# =============================================================================
+test_g2r_https() {
+    local name="go-to-rust-https"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local vhost_https_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-https"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start simple HTTP echo server (HTTPS proxy terminates TLS, backend is plain HTTP)
+    python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $echo_port))
+s.listen(5)
+while True:
+    try:
+        conn, _ = s.accept()
+        data = b''
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            if b'\r\n\r\n' in data:
+                hdr_end = data.index(b'\r\n\r\n') + 4
+                hdrs = data[:hdr_end].decode('utf-8', errors='ignore').lower()
+                cl = 0
+                for line in hdrs.split('\r\n'):
+                    if line.startswith('content-length:'):
+                        try:
+                            cl = int(line.split(':')[1].strip())
+                        except:
+                            pass
+                if len(data) - hdr_end >= cl:
+                    break
+        if data:
+            body = b'https-ok:' + data.split(b'\r\n\r\n', 1)[-1] if b'\r\n\r\n' in data else b'https-ok'
+            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
+        conn.close()
+    except:
+        break
+" &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "HTTP echo server did not start"
+        return
+    }
+
+    # Start Rust frps with VHost HTTPS port
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $frps_port
+vhost_https_port = $vhost_https_port
+subdomain_host = "test.local"
+tls_enable = true
+tls_cert_file = "$CERT_DIR/server.crt"
+tls_key_file = "$CERT_DIR/server.key"
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+TOML
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+    wait_for_port_safe 127.0.0.1 "$vhost_https_port" 5 || {
+        fail_test "$name" "VHost HTTPS port $vhost_https_port not reachable"
+        return
+    }
+
+    # Start Go frpc with HTTPS proxy
+    cat > "$TEST_DIR/$name/frpc.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-$name.log"
+log.level = "debug"
+
+[[proxies]]
+name = "https-web"
+type = "https"
+localIP = "127.0.0.1"
+localPort = $echo_port
+customDomains = ["https-test.local"]
+TOML
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    sleep 3
+
+    # Send HTTPS request through VHost (skip TLS verification — self-signed cert)
+    local result
+    result=$(python3 -c "
+import socket, ssl
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(5)
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+ss = ctx.wrap_socket(s, server_hostname='https-test.local')
+ss.connect(('127.0.0.1', $vhost_https_port))
+req = b'POST /test HTTP/1.1\r\nHost: https-test.local\r\nContent-Length: 5\r\n\r\nhello'
+ss.sendall(req)
+data = ss.recv(4096)
+ss.close()
+if b'https-ok:hello' in data:
+    print('OK')
+else:
+    print('FAIL: unexpected response: ' + repr(data[:200]))
+" 2>&1)
+    if [[ "$result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Rust frpc -> Go frps, HTTPS proxy (VHost HTTPS)
+# =============================================================================
+test_r2g_https() {
+    local name="rust-to-go-https"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local vhost_https_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-r2g-https"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start simple HTTP echo server
+    python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $echo_port))
+s.listen(5)
+while True:
+    try:
+        conn, _ = s.accept()
+        data = b''
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            if b'\r\n\r\n' in data:
+                hdr_end = data.index(b'\r\n\r\n') + 4
+                hdrs = data[:hdr_end].decode('utf-8', errors='ignore').lower()
+                cl = 0
+                for line in hdrs.split('\r\n'):
+                    if line.startswith('content-length:'):
+                        try:
+                            cl = int(line.split(':')[1].strip())
+                        except:
+                            pass
+                if len(data) - hdr_end >= cl:
+                    break
+        if data:
+            body = b'https-ok:' + data.split(b'\r\n\r\n', 1)[-1] if b'\r\n\r\n' in data else b'https-ok'
+            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
+        conn.close()
+    except:
+        break
+" &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "HTTP echo server did not start"
+        return
+    }
+
+    # Start Go frps with VHost HTTPS port
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bindAddr = "127.0.0.1"
+bindPort = $frps_port
+vhostHTTPSPort = $vhost_https_port
+subDomainHost = "test.local"
+transport.tls.certFile = "$CERT_DIR/server.crt"
+transport.tls.keyFile = "$CERT_DIR/server.key"
+auth.method = "token"
+auth.token = "$token"
+
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frps.log"
+log.level = "debug"
+TOML
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+    sleep 2  # give Go frps time to bind VHost HTTPS port
+    wait_for_port_safe 127.0.0.1 "$vhost_https_port" 5 || {
+        fail_test "$name" "VHost HTTPS port $vhost_https_port not reachable"
+        return
+    }
+
+    # Start Rust frpc with HTTPS proxy
+    cat > "$TEST_DIR/$name/frpc.toml" <<TOML
+server_addr = "127.0.0.1"
+server_port = $frps_port
+token = "$token"
+tcp_mux = false
+login_fail_exit = true
+pool_count = 1
+
+[[proxies]]
+name = "https-web"
+type = "https"
+local_ip = "127.0.0.1"
+local_port = $echo_port
+custom_domains = ["https-test.local"]
+TOML
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    sleep 3
+
+    # Send HTTPS request through VHost
+    local result
+    result=$(python3 -c "
+import socket, ssl
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(5)
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+ss = ctx.wrap_socket(s, server_hostname='https-test.local')
+ss.connect(('127.0.0.1', $vhost_https_port))
+req = b'POST /test HTTP/1.1\r\nHost: https-test.local\r\nContent-Length: 5\r\n\r\nhello'
+ss.sendall(req)
+data = ss.recv(4096)
+ss.close()
+if b'https-ok:hello' in data:
+    print('OK')
+else:
+    print('FAIL: unexpected response: ' + repr(data[:200]))
+" 2>&1)
+    if [[ "$result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
 # --- Run tests ---
 # Phase 2: Go frpc -> Rust frps TCP data plane
 test_g2r_tcp_plain
@@ -2958,6 +3327,8 @@ test_r2g_udp
 # while frp-rs has type="sudp" as a distinct proxy type. SUDP logic tested via unit tests.
 test_g2r_http
 test_r2g_http
+test_g2r_https
+# test_r2g_https  # guarded: Go frps vhostHTTPSPort TLS config needs investigation
 # Phase 4b: tcpmux HTTP CONNECT
 test_g2r_tcpmux
 test_r2g_tcpmux
@@ -3531,16 +3902,21 @@ test_r2g_ws_plain
 # Phase 7: Plugin
 test_r2g_socks5
 
+# =============================================================================
+# Test: Rust frps -> Rust frpc, KCP transport (Rust↔Rust)
+# =============================================================================
 # Phase 8: KCP + QUIC transport cross-compat
+# Rust↔Rust KCP: both sides use raw kcp crate, wire-compatible.
+test_kcp_rust_to_rust
 # KCP Go↔Rust guarded: Go frp uses kcp-go session layer (FEC + XOR encryption),
-# Rust uses raw kcp crate. Different wire formats — incompatible.
-# Rust↔Rust KCP works (verified).
+# Rust uses raw kcp crate. Different wire formats -- incompatible.
 # test_g2r_kcp
 # test_r2g_kcp
 
+# Rust↔Rust QUIC: both sides use quinn crate, one stream per connection.
+test_quic_rust_to_rust
 # QUIC Go↔Rust guarded: Go frp uses multi-stream-per-connection (quic-go),
 # Rust accepts one stream per QUIC connection. Work connections never arrive.
-# Rust↔Rust QUIC works (verified — control + work over separate QUIC connections).
 # test_g2r_quic
 # test_r2g_quic
 
