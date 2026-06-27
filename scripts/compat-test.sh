@@ -3479,7 +3479,8 @@ V2CHECK
     }
 
     # Start Rust frps (mux required -- Go frpc V2 uses yamux)
-    write_rust_frps_config_mux "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "mux"
+    echo 'v2 = true' >> "$TEST_DIR/$name/frps.toml"
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3488,17 +3489,14 @@ V2CHECK
         return
     }
 
-    # Start Go frpc with V2 wire protocol + tcp_mux
-    # transport.wireProtocol must be above [[proxies]] (Go frp positional parsing)
-    write_go_frpc_config_mux "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "v2-tcp" "$TEST_DIR/$name/frpc.toml"
-    # Insert wireProtocol after tcpMux (portable, avoids BSD/GNU sed -i divergence)
-    local tmpconf="$TEST_DIR/$name/frpc.toml.tmp"
-    while IFS= read -r line; do
-        echo "$line"
-        [[ "$line" == "transport.tcpMux = true" ]] && echo 'transport.wireProtocol = "v2"'
-    done < "$TEST_DIR/$name/frpc.toml" > "$tmpconf"
-    mv "$tmpconf" "$TEST_DIR/$name/frpc.toml"
+    # Start Go frpc with V2 wire protocol + tcp_mux.
+    # Go frp >= v0.50 defaults TLS=true; disable for plain TCP test.
+    write_frpc_config go "$frps_port" "$token" "$echo_port" "$proxy_port" \
+        "v2-tcp" "$TEST_DIR/$name/frpc.toml" "mux"
+    cat >> "$TEST_DIR/$name/frpc.toml" <<'GOV2'
+transport.wireProtocol = "v2"
+transport.tls.enable = false
+GOV2
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -3554,9 +3552,12 @@ V2CHECK
         return
     }
 
-    # Start Go frps with V2 wire protocol + tcp_mux
-    write_go_frps_config_mux "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
-    echo 'transport.wireProtocol = "v2"' >> "$TEST_DIR/$name/frps.toml"
+    # Start Go frps with V2 wire protocol + tcp_mux.
+    # Go frp >= v0.50 defaults TLS=true; disable for plain TCP test.
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "mux"
+    cat >> "$TEST_DIR/$name/frps.toml" <<'GOV2SRV'
+transport.wireProtocol = "v2"
+GOV2SRV
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3566,9 +3567,9 @@ V2CHECK
     }
 
     # Start Rust frpc with V2 + tcp_mux
-    write_rust_frpc_config_mux "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "v2-tcp" "$TEST_DIR/$name/frpc.toml" \
-        'v2 = true'
+    write_frpc_config rust "$frps_port" "$token" "$echo_port" "$proxy_port" \
+        "v2-tcp" "$TEST_DIR/$name/frpc.toml" "mux"
+    echo 'v2 = true' >> "$TEST_DIR/$name/frpc.toml"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
