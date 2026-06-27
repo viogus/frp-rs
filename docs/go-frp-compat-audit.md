@@ -135,6 +135,7 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 - ✅ KCP cross-compat: Go↔Rust KCP transport tests added (g2r + r2g)
 - ✅ QUIC cross-compat: Go↔Rust QUIC transport tests added (g2r + r2g)
 - ✅ Multi-port STUN, IPv6 parsing, session limit, stable key generation
+- ✅ Rust→Go HTTPS compat test: fixed TLS termination architecture (Go frps vhostHTTPSPort forwards raw TLS; local echo server upgraded to HTTPS with proper SSL error resilience)
 
 ---
 
