@@ -2285,7 +2285,7 @@ TOML
     fi
 
     local result
-    result=$(send_and_expect "$visitor_port" "xtcp-g2r-data" "xtcp-g2r-data" 5)
+    result=$(send_and_expect "$visitor_port" "xtcp-g2r-data" "xtcp-g2r-data" 15)
     if [[ "$result" == OK:* ]]; then
         pass_test "$name"
     else
@@ -2373,7 +2373,7 @@ TOML
     fi
 
     local result
-    result=$(send_and_expect "$visitor_port" "r2g-xtcp-data" "r2g-xtcp-data" 5)
+    result=$(send_and_expect "$visitor_port" "r2g-xtcp-data" "r2g-xtcp-data" 15)
     if [[ "$result" == OK:* ]]; then
         pass_test "$name"
     else

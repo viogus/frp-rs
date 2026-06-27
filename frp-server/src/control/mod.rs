@@ -371,20 +371,25 @@ pub async fn handle_control<S>(
                         };
 
                         // Send NatHoleClient back with STUN addresses
-                        let reply = FrpMessage::NatHoleClient(msg::NatHoleClient {
+                        let reply = msg::NatHoleClient {
                             transaction_id: transaction_id.clone(),
                             proxy_name: proxy_name.clone(),
                             sid: Some(transaction_id.clone()),
                             protocol: Some("tcp".to_string()),
-                            mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
+                            mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs.clone()) },
                             assisted_addrs: None,
-                            visitor_addr,
-                        });
-                        if let Err(e) = write_ctl_msg(&mut writer, &reply, v2).await {
+                            visitor_addr: visitor_addr.clone(),
+                        };
+                        let wire_msg = FrpMessage::NatHoleClient(reply.clone());
+                        if let Err(e) = write_ctl_msg(&mut writer, &wire_msg, v2).await {
                             warn!("Failed to send NatHoleClient reply: {}", e);
                             break;
                         }
                         debug!("Sent NatHoleClient reply with STUN addresses for {}", transaction_id);
+
+                        // Signal the session's notify channel so handle_nat_hole_visitor
+                        // wakes up and sends NatHoleResp to both sides.
+                        state.nat_hole.handle_client(reply).await;
                     }
                     Some(InternalMsg::WriteNatHoleSid { sid, provider_addr }) => {
                         debug!("Writing NatHoleSid to visitor via control channel for {}", sid);
