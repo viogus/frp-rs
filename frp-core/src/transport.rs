@@ -90,9 +90,9 @@ pub struct WsByteStream {
 
 enum WsInner {
     Tungstenite(Pin<Box<WebSocketStream<MaybeTlsStream<TcpStream>>>>),
-    /// Raw TCP stream post-upgrade. Manual WebSocket frame handling.
-    /// Server-side only — client frames are always masked (RFC 6455 §5.3).
-    Raw(TcpStream),
+    /// Raw stream post-upgrade. Manual WebSocket frame handling.
+    /// Type-erased to support both plain TCP and TLS-wrapped streams.
+    Raw(Box<dyn AsyncReadWrite>),
 }
 
 impl WsByteStream {
@@ -108,12 +108,12 @@ impl WsByteStream {
         }
     }
 
-    /// Create from a raw TCP stream after manual WebSocket upgrade.
+    /// Create from a raw stream after manual WebSocket upgrade.
     /// Used on the server accept path for Go frp compat.
     /// When `client_mode` is true, outgoing frames are masked per RFC 6455 §5.3.
-    pub fn from_raw_tcp(tcp: TcpStream, client_mode: bool) -> Self {
+    pub fn from_raw(stream: Box<dyn AsyncReadWrite>, client_mode: bool) -> Self {
         Self {
-            inner: WsInner::Raw(tcp),
+            inner: WsInner::Raw(stream),
             read_buf: Vec::new(),
             read_pos: 0,
             write_buf: Vec::new(),
@@ -128,7 +128,7 @@ impl WsByteStream {
     pub fn into_inner(self) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
         match self.inner {
             WsInner::Tungstenite(ws) => *Pin::into_inner(ws),
-            WsInner::Raw(_) => panic!("into_inner called on Raw variant"),
+            WsInner::Raw(_) => panic!("into_inner called on Raw variant — Raw stores Box<dyn AsyncReadWrite>, not WebSocketStream"),
         }
     }
 }
@@ -187,12 +187,12 @@ impl AsyncRead for WsByteStream {
                     }
                 }
             }
-            WsInner::Raw(tcp) => {
+            WsInner::Raw(raw) => {
                 // --- Read WebSocket frame header ---
                 // Byte 0: FIN(1) RSV(3) OPCODE(4)
                 // Byte 1: MASK(1) PAYLOAD_LEN(7)
                 let mut head = [0u8; 2];
-                match Pin::new(&mut *tcp).poll_read(cx, &mut ReadBuf::new(&mut head)) {
+                match Pin::new(raw.as_mut()).poll_read(cx, &mut ReadBuf::new(&mut head)) {
                     Poll::Ready(Ok(())) => {}
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => return Poll::Pending,
@@ -205,7 +205,7 @@ impl AsyncRead for WsByteStream {
                 // Extended payload length
                 if payload_len == 126 {
                     let mut ext = [0u8; 2];
-                    match Pin::new(&mut *tcp).poll_read(cx, &mut ReadBuf::new(&mut ext)) {
+                    match Pin::new(raw.as_mut()).poll_read(cx, &mut ReadBuf::new(&mut ext)) {
                         Poll::Ready(Ok(())) => {}
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => return Poll::Pending,
@@ -213,7 +213,7 @@ impl AsyncRead for WsByteStream {
                     payload_len = u16::from_be_bytes(ext) as u64;
                 } else if payload_len == 127 {
                     let mut ext = [0u8; 8];
-                    match Pin::new(&mut *tcp).poll_read(cx, &mut ReadBuf::new(&mut ext)) {
+                    match Pin::new(raw.as_mut()).poll_read(cx, &mut ReadBuf::new(&mut ext)) {
                         Poll::Ready(Ok(())) => {}
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => return Poll::Pending,
@@ -231,7 +231,7 @@ impl AsyncRead for WsByteStream {
                 // Read mask key
                 let mut mask_key = [0u8; 4];
                 if masked {
-                    match Pin::new(&mut *tcp).poll_read(cx, &mut ReadBuf::new(&mut mask_key)) {
+                    match Pin::new(raw.as_mut()).poll_read(cx, &mut ReadBuf::new(&mut mask_key)) {
                         Poll::Ready(Ok(())) => {}
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => return Poll::Pending,
@@ -241,7 +241,7 @@ impl AsyncRead for WsByteStream {
                 // Read payload
                 let mut payload = vec![0u8; payload_len as usize];
                 if payload_len > 0 {
-                    match Pin::new(&mut *tcp).poll_read(cx, &mut ReadBuf::new(&mut payload)) {
+                    match Pin::new(raw.as_mut()).poll_read(cx, &mut ReadBuf::new(&mut payload)) {
                         Poll::Ready(Ok(())) => {}
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => return Poll::Pending,
@@ -268,14 +268,14 @@ impl AsyncRead for WsByteStream {
                     }
                     // Close
                     0x08 => {
-                        let _ = Pin::new(&mut *tcp).poll_write(cx, &[0x88, 0x02, 0x03, 0xe8]);
+                        let _ = Pin::new(raw.as_mut()).poll_write(cx, &[0x88, 0x02, 0x03, 0xe8]);
                         Poll::Ready(Ok(()))
                     }
                     // Ping → reply Pong, retry
                     0x09 => {
                         let mut pong = vec![0x8a, payload.len() as u8];
                         pong.extend_from_slice(&payload);
-                        let _ = Pin::new(&mut *tcp).poll_write(cx, &pong);
+                        let _ = Pin::new(raw.as_mut()).poll_write(cx, &pong);
                         cx.waker().wake_by_ref();
                         Poll::Pending
                     }
@@ -340,8 +340,8 @@ impl AsyncWrite for WsByteStream {
                     Poll::Ready(Ok(0))
                 }
             }
-            WsInner::Raw(tcp) => {
-                let tcp_ptr: *mut TcpStream = tcp;
+            WsInner::Raw(raw) => {
+                let raw_ptr: *mut Box<dyn AsyncReadWrite> = raw;
                 let client_mode = self.client_mode;
                 if !needs_flush && !buf.is_empty() {
                     let len = buf.len();
@@ -380,9 +380,9 @@ impl AsyncWrite for WsByteStream {
                 }
                 if self.needs_flush {
                     let remaining = &self.write_buf[self.write_pos..];
-                    // SAFETY: tcp_ptr derived from &mut self.inner, fields are disjoint
-                    let tcp = unsafe { &mut *tcp_ptr };
-                    match Pin::new(tcp).poll_write(cx, remaining) {
+                    // SAFETY: raw_ptr derived from &mut self.inner, fields are disjoint
+                    let stream = unsafe { (*raw_ptr).as_mut() };
+                    match Pin::new(stream).poll_write(cx, remaining) {
                         Poll::Ready(Ok(n)) => {
                             self.write_pos += n;
                             if self.write_pos >= self.write_buf.len() {
@@ -430,12 +430,12 @@ impl AsyncWrite for WsByteStream {
                     Poll::Ready(Ok(()))
                 }
             }
-            WsInner::Raw(tcp) => {
-                let tcp_ptr: *mut TcpStream = tcp;
+            WsInner::Raw(raw) => {
+                let raw_ptr: *mut Box<dyn AsyncReadWrite> = raw;
                 if needs_flush {
                     let remaining = &self.write_buf[self.write_pos..];
-                    let tcp = unsafe { &mut *tcp_ptr };
-                    match Pin::new(tcp).poll_write(cx, remaining) {
+                    let stream = unsafe { (*raw_ptr).as_mut() };
+                    match Pin::new(stream).poll_write(cx, remaining) {
                         Poll::Ready(Ok(n)) => {
                             self.write_pos += n;
                             if self.write_pos >= self.write_buf.len() {
@@ -469,9 +469,9 @@ impl AsyncWrite for WsByteStream {
                 .as_mut()
                 .poll_close(cx)
                 .map_err(io::Error::other),
-            WsInner::Raw(tcp) => {
-                let _ = Pin::new(&mut *tcp).poll_write(cx, &[0x88, 0x02, 0x03, 0xe8]);
-                Pin::new(&mut *tcp).poll_shutdown(cx)
+            WsInner::Raw(raw) => {
+                let _ = Pin::new(raw.as_mut()).poll_write(cx, &[0x88, 0x02, 0x03, 0xe8]);
+                Pin::new(raw.as_mut()).poll_shutdown(cx)
             }
         }
     }
@@ -1121,39 +1121,31 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             };
 
             if is_wss {
-                // WSS: use tungstenite (handles TLS internally).
-                // TODO: raw mode for WSS would avoid UTF-8 validation on TEXT
-                // frames from Go frps; need TLS wrapping before raw upgrade.
-                let url = format!(
-                    "wss://{}:{}{}",
-                    host, opts.server_port, FRP_WEBSOCKET_PATH
-                );
-                use tokio_tungstenite::tungstenite::http::Request as HttpRequest;
-                let origin = format!("https://{}:{}", host, opts.server_port);
-                let req = HttpRequest::builder()
-                    .method("GET")
-                    .uri(&url)
-                    .header("Host", format!("{}:{}", host, opts.server_port))
-                    .header("Connection", "Upgrade")
-                    .header("Upgrade", "websocket")
-                    .header("Sec-WebSocket-Version", "13")
-                    .header(
-                        "Sec-WebSocket-Key",
-                        tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-                    )
-                    .header("Origin", origin)
-                    .body(())
-                    .map_err(|e| {
-                        crate::Error::Transport(format!("WS request build: {e}"))
-                    })?;
-                let (ws_stream, _) = tokio_tungstenite::connect_async(req)
-                    .await
-                    .map_err(|e| crate::Error::Transport(format!("WebSocket connect: {e}")))?;
-                Ok(IoStream::WebSocket(WsByteStream::new(ws_stream)))
+                // WSS raw mode: TLS handshake + manual HTTP upgrade.
+                // Avoids tungstenite UTF-8 validation on TEXT frames from Go frps.
+                if !opts.disable_custom_tls_first_byte {
+                    stream.write_all(&[FRP_TLS_HEAD_BYTE]).await
+                        .map_err(|e| crate::Error::Transport(format!("write TLS head byte: {e}")))?;
+                }
+                let connector = build_tls_connector(
+                    opts.tls_ca_file.as_deref(),
+                    opts.tls_cert_file.as_deref(),
+                    opts.tls_key_file.as_deref(),
+                )?;
+                let server_name = if !opts.tls_server_name.is_empty() {
+                    opts.tls_server_name.clone()
+                } else {
+                    opts.server_addr.clone()
+                };
+                let server_name = rustls::pki_types::ServerName::try_from(server_name)
+                    .map_err(|e| crate::Error::Transport(format!("invalid server name: {e}")))?;
+                let tls_stream = connector.connect(server_name, stream).await
+                    .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}")))?;
+                connect_ws_raw(tls_stream, &host, opts.server_port, FRP_WEBSOCKET_PATH, "https").await
             } else {
                 // Plain WS: use raw mode to tolerate TEXT frames with
                 // non-UTF-8 payload from Go frps (golang.org/x/net/websocket).
-                connect_ws_raw(stream, &host, opts.server_port, FRP_WEBSOCKET_PATH).await
+                connect_ws_raw(stream, &host, opts.server_port, FRP_WEBSOCKET_PATH, "http").await
             }
         }
         TransportProtocol::Kcp | TransportProtocol::Quic => {
@@ -1329,7 +1321,7 @@ pub async fn accept_websocket(stream: TcpStream) -> Result<IoStream, crate::Erro
     tcp.write_all(resp.as_bytes()).await
         .map_err(|e| crate::Error::Transport(format!("WS write response: {e}")))?;
 
-    let mut ws = WsByteStream::from_raw_tcp(tcp, false);
+    let mut ws = WsByteStream::from_raw(Box::new(tcp), false);
     if !leftover.is_empty() {
         ws.read_buf = leftover;
         ws.read_pos = 0;
@@ -1347,15 +1339,19 @@ pub async fn accept_websocket(stream: TcpStream) -> Result<IoStream, crate::Erro
 /// Raw mode treats all data frames as opaque bytes.
 ///
 /// The returned WsByteStream masks outgoing frames per RFC 6455 §5.3.
-pub async fn connect_ws_raw(
-    tcp: TcpStream,
+pub async fn connect_ws_raw<S>(
+    stream: S,
     host: &str,
     port: u16,
     path: &str,
-) -> Result<IoStream, crate::Error> {
+    origin_scheme: &str,
+) -> Result<IoStream, crate::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let mut tcp = tcp;
+    let mut stream = stream;
 
     // Generate WebSocket key: 16 random bytes, base64 encoded
     let key_bytes: [u8; 16] = rand::random();
@@ -1390,20 +1386,20 @@ pub async fn connect_ws_raw(
          Upgrade: websocket\r\n\
          Sec-WebSocket-Version: 13\r\n\
          Sec-WebSocket-Key: {key}\r\n\
-         Origin: http://{host}:{port}\r\n\
+         Origin: {origin_scheme}://{host}:{port}\r\n\
          \r\n"
     );
 
-    tcp.write_all(req.as_bytes()).await
+    stream.write_all(req.as_bytes()).await
         .map_err(|e| crate::Error::Transport(format!("WS raw connect write: {e}")))?;
 
     // Read HTTP 101 response with timeout.
     // BufReader may buffer WebSocket frame bytes past \r\n\r\n — capture
     // them before into_inner() to avoid permanent stream desync.
-    let (tcp, leftover) = tokio::time::timeout(
+    let (stream, leftover) = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         async {
-            let mut reader = BufReader::new(tcp);
+            let mut reader = BufReader::new(stream);
             let mut status_line = String::new();
             reader.read_line(&mut status_line).await
                 .map_err(|e| crate::Error::Transport(format!("WS raw connect read status: {e}")))?;
@@ -1426,13 +1422,13 @@ pub async fn connect_ws_raw(
             }
 
             let leftover = reader.buffer().to_vec();
-            let tcp = reader.into_inner();
-            Ok::<_, crate::Error>((tcp, leftover))
+            let stream = reader.into_inner();
+            Ok::<_, crate::Error>((stream, leftover))
         }
     ).await
         .map_err(|_| crate::Error::Transport("WS raw connect: timeout waiting for 101 response".into()))??;
 
-    let mut ws = WsByteStream::from_raw_tcp(tcp, true);
+    let mut ws = WsByteStream::from_raw(Box::new(stream), true);
     if !leftover.is_empty() {
         ws.read_buf = leftover;
         ws.read_pos = 0;
