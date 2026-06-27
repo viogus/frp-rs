@@ -2,6 +2,7 @@ use std::path::Path;
 use std::process;
 use std::sync::Arc;
 
+#[cfg(unix)]
 use tokio::signal;
 use tracing_subscriber::EnvFilter;
 
