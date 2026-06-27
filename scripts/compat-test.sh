@@ -38,6 +38,7 @@ VERBOSE=false
 SELECTED_TEST=""
 KEEP_TMP=false
 CI=false
+DEBUG=false
 PIDS=""
 
 # --- Colors (empty in CI mode) ---
@@ -58,12 +59,19 @@ while [[ $# -gt 0 ]]; do
         --keep-tmp) KEEP_TMP=true; shift ;;
         --ci) CI=true; shift ;;
         --go-version) GO_FRP_VERSION="$2"; shift 2 ;;
+        --debug|-x) DEBUG=true; shift ;;
+        --list)
+            awk '/^run_test test_[a-z]/ {print $2}' "$0" | sort
+            exit 0
+            ;;
         --help|-h)
             echo "Usage: $0 [options]"
             echo "  --test <name>    Run only the named test"
             echo "  --verbose         Show full logs on failure"
             echo "  --keep-tmp        Don't clean up test directory"
             echo "  --ci              CI mode: no color, GitHub annotations"
+            echo "  --debug, -x       Enable bash trace (set -x) during test execution"
+            echo "  --list            List all test names and exit"
             echo "  --go-version VER  Go frp version (default: 0.69.1)"
             exit 0
             ;;
@@ -1210,6 +1218,16 @@ should_run_test() {
         return 0
     fi
     [[ "$SELECTED_TEST" == "$1" ]]
+}
+
+# Wrapper that enables set -x tracing in --debug mode.
+# Uses a subshell so set -x doesn't leak across tests.
+run_test() {
+    if $DEBUG; then
+        (set -x; "$@")
+    else
+        "$@"
+    fi
 }
 
 # =============================================================================
@@ -3262,50 +3280,50 @@ TOML
 
 # --- Run tests ---
 # Phase 2: Go frpc -> Rust frps TCP data plane
-test_g2r_tcp_plain
-test_g2r_tcp_encrypted
-test_g2r_tcp_tls
-test_g2r_tcp_tls_encrypt
+run_test test_g2r_tcp_plain
+run_test test_g2r_tcp_encrypted
+run_test test_g2r_tcp_tls
+run_test test_g2r_tcp_tls_encrypt
 
 # Phase 2b: Go frpc -> Rust frps, tcp_mux
-test_g2r_mux_plain
-test_g2r_mux_encrypted
-test_g2r_mux_tls
-test_g2r_mux_tls_encrypt
+run_test test_g2r_mux_plain
+run_test test_g2r_mux_encrypted
+run_test test_g2r_mux_tls
+run_test test_g2r_mux_tls_encrypt
 
 # Phase 3: Rust frpc -> Go frps TCP data plane
-test_r2g_tcp_plain
-test_r2g_tcp_encrypted
-test_r2g_tcp_tls
-test_r2g_tcp_tls_encrypt
+run_test test_r2g_tcp_plain
+run_test test_r2g_tcp_encrypted
+run_test test_r2g_tcp_tls
+run_test test_r2g_tcp_tls_encrypt
 
 # Phase 3b: Rust frpc -> Go frps, tcp_mux
-test_r2g_mux_plain
-test_r2g_mux_encrypted
-test_r2g_mux_tls
-test_r2g_mux_tls_encrypt
+run_test test_r2g_mux_plain
+run_test test_r2g_mux_encrypted
+run_test test_r2g_mux_tls
+run_test test_r2g_mux_tls_encrypt
 
 # Phase 4: Other proxy types
-test_g2r_udp
-test_r2g_udp
+run_test test_g2r_udp
+run_test test_r2g_udp
 # SUDP not tested cross-compat: Go frp uses server-side sudp_port with type="udp",
 # while frp-rs has type="sudp" as a distinct proxy type. SUDP logic tested via unit tests.
-test_g2r_http
-test_r2g_http
-test_g2r_https
-test_r2g_https
+run_test test_g2r_http
+run_test test_r2g_http
+run_test test_g2r_https
+run_test test_r2g_https
 # Phase 4b: tcpmux HTTP CONNECT
-test_g2r_tcpmux
-test_r2g_tcpmux
-test_g2r_stcp
-test_r2g_stcp
+run_test test_g2r_tcpmux
+run_test test_r2g_tcpmux
+run_test test_g2r_stcp
+run_test test_r2g_stcp
 # XTCP Go-Rust: server coordinates NAT analysis and address exchange.
 # test_g2r_xtcp  # guarded: Go frp XTCP protocol doesn't interoperate (TCP simultaneous open vs QUIC NAT probes)
 # test_r2g_xtcp
 
 # Phase 5: Multi-proxy and edge cases
-test_multi_proxy
-test_g2r_compression
+run_test test_multi_proxy
+run_test test_g2r_compression
 # =============================================================================
 # Test: Compression (useCompression) — Rust client → Go server
 # =============================================================================
@@ -3992,36 +4010,36 @@ test_r2g_quic() {
 }
 
 # Phase 5: Multi-proxy and edge cases (continued)
-test_r2g_compression
-test_r2g_multi_proxy
+run_test test_r2g_compression
+run_test test_r2g_multi_proxy
 
 # Phase 6: WebSocket transport
-test_g2r_ws_plain
-test_r2g_ws_plain
-test_g2r_ws_encrypted
-test_r2g_ws_encrypted
+run_test test_g2r_ws_plain
+run_test test_r2g_ws_plain
+run_test test_g2r_ws_encrypted
+run_test test_r2g_ws_encrypted
 
 # Phase 7: Plugin
-test_g2r_socks5
-test_r2g_socks5
+run_test test_g2r_socks5
+run_test test_r2g_socks5
 
 # =============================================================================
 # Test: Rust frps -> Rust frpc, KCP transport (Rust↔Rust)
 # =============================================================================
 # Phase 8: KCP + QUIC transport cross-compat
 # Rust↔Rust KCP: both sides use raw kcp crate, wire-compatible.
-test_kcp_rust_to_rust
+run_test test_kcp_rust_to_rust
 # KCP Go↔Rust guarded: Go frp uses kcp-go session layer (FEC + XOR encryption),
 # Rust uses raw kcp crate. Different wire formats -- incompatible.
 # test_g2r_kcp
 # test_r2g_kcp
 
 # QUIC Rust↔Rust: both sides use quinn crate, wire-compatible.
-test_quic_rust_to_rust
+run_test test_quic_rust_to_rust
 # QUIC Go↔Rust: multi-stream-per-connection enabled.
 # Go frp uses quic-go (multi-stream), Rust now accepts additional streams.
-test_g2r_quic
-test_r2g_quic
+run_test test_g2r_quic
+run_test test_r2g_quic
 
 # --- Summary ---
 echo ""
