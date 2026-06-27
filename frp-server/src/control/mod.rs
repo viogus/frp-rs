@@ -379,6 +379,7 @@ pub async fn handle_control<S>(
                             mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
                             assisted_addrs: None,
                             visitor_addr,
+                            ..Default::default()
                         });
                         if let Err(e) = write_ctl_msg(&mut writer, &reply, v2).await {
                             warn!("Failed to send NatHoleClient reply: {}", e);
