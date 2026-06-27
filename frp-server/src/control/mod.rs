@@ -73,6 +73,7 @@ pub async fn handle_control<S>(
     peer: Option<SocketAddr>,
     mut incoming: Option<IncomingStreams>,
     v2: bool,
+    crypto_ctx: Option<frp_core::v2_handshake::CryptoContext>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -185,12 +186,24 @@ pub async fn handle_control<S>(
         }
     }
 
-    // --- Wrap in AES-128-CFB encryption (matches client after login) ---
-    let enc_key = encryption::derive_key(&state.reloadable.read().unwrap().auth_cfg.token);
-    let cipher = frp_core::cipher_stream::CipherStream::new(Box::new(stream), enc_key);
-
-    // --- Split encrypted stream for reading/writing ---
-    let (mut reader, mut writer) = tokio::io::split(cipher);
+    // --- Wrap in encryption (matches client after login) ---
+    // V2 with AEAD crypto: stream was already wrapped at call site before Login
+    // was read, so we just split without additional encryption.
+    // V1 or V2 without AEAD: wrap in AES-128-CFB (CipherStream) for backward compat.
+    let (mut reader, mut writer): (
+        Box<dyn AsyncRead + Unpin + Send>,
+        Box<dyn AsyncWrite + Unpin + Send>,
+    ) = if v2 && crypto_ctx.is_some() {
+        // Already AEAD-wrapped at call site
+        let (r, w) = tokio::io::split(stream);
+        (Box::new(r), Box::new(w))
+    } else {
+        // V1 or plain V2: wrap in AES-128-CFB
+        let enc_key = encryption::derive_key(&state.reloadable.read().unwrap().auth_cfg.token);
+        let cipher = frp_core::cipher_stream::CipherStream::new(Box::new(stream), enc_key);
+        let (r, w) = tokio::io::split(cipher);
+        (Box::new(r), Box::new(w))
+    };
 
     // --- Per-client state ---
     let pool_cap = login.pool_count.unwrap_or(1).max(0) as usize + WORK_POOL_EXTRA;

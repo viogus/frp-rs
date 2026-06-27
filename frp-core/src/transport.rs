@@ -567,6 +567,9 @@ pub enum IoStream {
     /// AES-128-CFB encrypted control stream.
     /// Created after login by wrapping the inner IoStream.
     Cipher(Box<crate::cipher_stream::CipherStream>),
+    /// AEAD encrypted V2 control stream (AES-256-GCM or XChaCha20-Poly1305).
+    /// Created after V2 handshake with crypto negotiation.
+    Aead(Box<crate::crypto::AeadStream>),
     /// SSH reverse-forward channel (type-erased).
     SshChannel(Box<dyn AsyncReadWrite>),
     /// Pre-read bytes followed by a TCP stream.
@@ -590,6 +593,7 @@ impl std::fmt::Debug for IoStream {
             IoStream::WebSocket(_) => f.debug_struct("IoStream::WebSocket").finish_non_exhaustive(),
             IoStream::Yamux(_) => f.debug_struct("IoStream::Yamux").finish_non_exhaustive(),
             IoStream::Cipher(_) => f.debug_struct("IoStream::Cipher").finish_non_exhaustive(),
+            IoStream::Aead(_) => f.debug_struct("IoStream::Aead").finish_non_exhaustive(),
             IoStream::SshChannel(_) => f.debug_struct("IoStream::SshChannel").finish_non_exhaustive(),
             IoStream::PreRead(..) => f.debug_struct("IoStream::PreRead").finish_non_exhaustive(),
             IoStream::BufferedRead(..) => f.debug_struct("IoStream::BufferedRead").finish_non_exhaustive(),
@@ -634,6 +638,7 @@ impl tokio::io::AsyncRead for IoStream {
             IoStream::WebSocket(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Yamux(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Cipher(s) => Pin::new(s).poll_read(cx, buf),
+            IoStream::Aead(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
             IoStream::PreRead(_, _) | IoStream::BufferedRead(..) => unreachable!(),
         }
@@ -654,6 +659,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::WebSocket(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::Yamux(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::Cipher(s) => Pin::new(s).poll_write(cx, buf),
+            IoStream::Aead(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
             IoStream::PreRead(_, s) => Pin::new(s).poll_write(cx, buf),
             IoStream::BufferedRead(_, _, inner) => Pin::new(inner.as_mut()).poll_write(cx, buf),
@@ -669,6 +675,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::WebSocket(s) => Pin::new(s).poll_flush(cx),
             IoStream::Yamux(s) => Pin::new(s).poll_flush(cx),
             IoStream::Cipher(s) => Pin::new(s).poll_flush(cx),
+            IoStream::Aead(s) => Pin::new(s).poll_flush(cx),
             IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_flush(cx),
             IoStream::PreRead(_, s) => Pin::new(s).poll_flush(cx),
             IoStream::BufferedRead(_, _, inner) => Pin::new(inner.as_mut()).poll_flush(cx),
@@ -684,6 +691,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::WebSocket(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::Yamux(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::Cipher(s) => Pin::new(s).poll_shutdown(cx),
+            IoStream::Aead(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
             IoStream::PreRead(_, s) => Pin::new(s).poll_shutdown(cx),
             IoStream::BufferedRead(_, _, inner) => Pin::new(inner.as_mut()).poll_shutdown(cx),
@@ -702,6 +710,7 @@ impl IoStream {
             IoStream::WebSocket(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::Yamux(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::Cipher(s) => crate::protocol::write_msg_v1(s, msg).await,
+            IoStream::Aead(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::SshChannel(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::PreRead(_, s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::BufferedRead(_, _, inner) => crate::protocol::write_msg_v1(inner.as_mut(), msg).await,
@@ -718,6 +727,7 @@ impl IoStream {
             IoStream::WebSocket(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Yamux(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Cipher(s) => crate::protocol::read_msg_v1(s).await,
+            IoStream::Aead(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::SshChannel(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::PreRead(..) => crate::protocol::read_msg_v1(self).await,
             IoStream::BufferedRead(..) => crate::protocol::read_msg_v1(self).await,
@@ -734,6 +744,7 @@ impl IoStream {
             IoStream::WebSocket(s) => crate::protocol::write_msg_v2(s, msg).await,
             IoStream::Yamux(s) => crate::protocol::write_msg_v2(s, msg).await,
             IoStream::Cipher(s) => crate::protocol::write_msg_v2(s, msg).await,
+            IoStream::Aead(s) => crate::protocol::write_msg_v2(s, msg).await,
             IoStream::SshChannel(s) => crate::protocol::write_msg_v2(s, msg).await,
             IoStream::PreRead(_, s) => crate::protocol::write_msg_v2(s, msg).await,
             IoStream::BufferedRead(_, _, inner) => crate::protocol::write_msg_v2(inner.as_mut(), msg).await,
@@ -750,6 +761,7 @@ impl IoStream {
             IoStream::WebSocket(s) => crate::protocol::read_msg_v2(s).await,
             IoStream::Yamux(s) => crate::protocol::read_msg_v2(s).await,
             IoStream::Cipher(s) => crate::protocol::read_msg_v2(s).await,
+            IoStream::Aead(s) => crate::protocol::read_msg_v2(s).await,
             IoStream::SshChannel(s) => crate::protocol::read_msg_v2(s).await,
             IoStream::PreRead(..) => crate::protocol::read_msg_v2(self).await,
             IoStream::BufferedRead(..) => crate::protocol::read_msg_v2(self).await,
@@ -767,6 +779,7 @@ impl IoStream {
             IoStream::WebSocket(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
             IoStream::Yamux(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
             IoStream::Cipher(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            IoStream::Aead(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
             IoStream::SshChannel(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
             IoStream::PreRead(_, s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
             IoStream::BufferedRead(_, _, inner) => crate::protocol::write_v2_frame_raw(inner.as_mut(), frame_type, flags, payload).await,
@@ -783,6 +796,7 @@ impl IoStream {
             IoStream::WebSocket(s) => crate::protocol::read_v2_frame_raw(s).await,
             IoStream::Yamux(s) => crate::protocol::read_v2_frame_raw(s).await,
             IoStream::Cipher(s) => crate::protocol::read_v2_frame_raw(s).await,
+            IoStream::Aead(s) => crate::protocol::read_v2_frame_raw(s).await,
             IoStream::SshChannel(s) => crate::protocol::read_v2_frame_raw(s).await,
             IoStream::PreRead(..) => crate::protocol::read_v2_frame_raw(self).await,
             IoStream::BufferedRead(..) => crate::protocol::read_v2_frame_raw(self).await,
@@ -795,7 +809,7 @@ impl IoStream {
             IoStream::Tcp(s) => s.peer_addr().ok(),
             IoStream::PreRead(_, s) => s.peer_addr().ok(),
             IoStream::BufferedRead(_, _, inner) => inner.peer_addr(),
-            IoStream::Tls(_) | IoStream::Kcp(_) | IoStream::Quic(_) | IoStream::WebSocket(_) | IoStream::Yamux(_) | IoStream::Cipher(_) | IoStream::SshChannel(_) => None,
+            IoStream::Tls(_) | IoStream::Kcp(_) | IoStream::Quic(_) | IoStream::WebSocket(_) | IoStream::Yamux(_) | IoStream::Cipher(_) | IoStream::Aead(_) | IoStream::SshChannel(_) => None,
         }
     }
 
@@ -834,6 +848,10 @@ impl IoStream {
                 let (r, w) = tokio::io::split(stream);
                 (Box::new(r), Box::new(w))
             }
+            IoStream::Aead(stream) => {
+                let (r, w) = tokio::io::split(stream);
+                (Box::new(r), Box::new(w))
+            }
             IoStream::SshChannel(s) => {
                 let (r, w) = tokio::io::split(s);
                 (Box::new(r), Box::new(w))
@@ -859,6 +877,10 @@ impl IoStream {
                 // they will be replayed before encrypted reads begin.
                 debug_assert!(pos >= buf.len(), "into_encrypted called before buffered bytes consumed");
                 IoStream::BufferedRead(buf, pos, Box::new(inner.into_encrypted(key)))
+            }
+            IoStream::Aead(inner) => {
+                // Already AEAD-encrypted (V2 with crypto). Don't double-wrap.
+                IoStream::Aead(inner)
             }
             other => {
                 let c = crate::cipher_stream::CipherStream::new(Box::new(other), key);

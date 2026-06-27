@@ -311,6 +311,10 @@ pub(crate) async fn assign_work_to_proxy(
                     warn!("Cipher stream unexpected in server bridge");
                     return;
                 }
+                IoStream::Aead(_) => {
+                    warn!("Aead stream unexpected in server bridge");
+                    return;
+                }
                 IoStream::SshChannel(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);

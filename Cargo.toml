@@ -50,6 +50,10 @@ kcp = "0.6"
 quinn = "0.11"
 hickory-resolver = "0.24"
 socket2 = "0.5"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+base64 = "0.22"
 
 # Release profile: slim, LTO, single codegen unit, stripped symbols, abort on panic.
 # After cargo build --release, compress further with:

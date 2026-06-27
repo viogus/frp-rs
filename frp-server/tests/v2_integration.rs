@@ -86,7 +86,7 @@ async fn test_v2_tcp_proxy() {
     let mut control = IoStream::Yamux(control_yamux);
 
     // V2 ClientHello / ServerHello handshake on the yamux control stream
-    v2_handshake::v2_handshake_client(&mut control, "tcp", false, true)
+    v2_handshake::v2_handshake_client(&mut control, "tcp", false, true, false /* with_crypto */)
         .await
         .expect("V2 handshake");
 
@@ -308,7 +308,7 @@ async fn test_v2_ping_pong_raw_tcp() {
         .expect("dial server");
 
     // V2 handshake on raw TCP (no yamux)
-    v2_handshake::v2_handshake_client(&mut stream, "tcp", false, false)
+    v2_handshake::v2_handshake_client(&mut stream, "tcp", false, false, false /* with_crypto */)
         .await
         .expect("V2 handshake");
 
@@ -414,7 +414,7 @@ async fn test_v2_ping_pong_yamux() {
     let mut control = IoStream::Yamux(control_yamux);
 
     // V2 handshake on yamux stream
-    v2_handshake::v2_handshake_client(&mut control, "tcp", false, true)
+    v2_handshake::v2_handshake_client(&mut control, "tcp", false, true, false /* with_crypto */)
         .await
         .expect("V2 handshake");
 

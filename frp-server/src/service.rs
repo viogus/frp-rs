@@ -325,7 +325,7 @@ impl Service {
                                         info!("WebSocket upgrade completed for {}", addr);
                                         match read_msg_v1(&mut ws).await {
                                             Ok(FrpMessage::Login(login)) => {
-                                                control::handle_control(ws, login, state.clone(), Some(addr), None, false).await;
+                                                control::handle_control(ws, login, state.clone(), Some(addr), None, false, None).await;
                                             }
                                             Ok(FrpMessage::NewWorkConn(nwc)) => {
                                                 handle_work_conn_inner(ws, nwc, state.clone()).await;
@@ -452,7 +452,7 @@ impl Service {
                                 let mut ctl = frp_core::transport::IoStream::Kcp(stream);
                                 match frp_core::protocol::read_msg_v1(&mut ctl).await {
                                     Ok(frp_core::msg::FrpMessage::Login(login)) => {
-                                        control::handle_control(ctl, login, state, None, None, false).await;
+                                        control::handle_control(ctl, login, state, None, None, false, None).await;
                                     }
                                     Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                         handle_work_conn_inner(ctl, nwc, state).await;
@@ -568,7 +568,7 @@ impl Service {
                                             }
                                         });
                                         // Run control handler on first stream (blocking)
-                                        control::handle_control(ctl, login, state, None, None, false).await;
+                                        control::handle_control(ctl, login, state, None, None, false, None).await;
                                         cancel.cancel();
                                     }
                                     Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
@@ -763,33 +763,48 @@ impl Service {
                                             };
                                             if is_v2 {
                                                 // V2 detected on TLS+yamux stream
-                                                let msg_payload = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                                    Ok(Some(p)) => p,
-                                                    Ok(None) => {
-                                                        match io.read_raw_v2_frame().await {
-                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => p,
-                                                            Ok((ft, _, _)) => {
-                                                                warn!("Unexpected frame type {} after V2 TLS+yamux handshake from {}", ft, addr);
-                                                                return;
-                                                            }
-                                                            Err(e) => {
-                                                                warn!("Failed to read V2 message after TLS+yamux handshake from {}: {}", addr, e);
-                                                                return;
-                                                            }
+                                                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                    Ok((Some(p), crypto)) => (p, crypto),
+                                                    Ok((None, crypto)) => {
+                                                        // Wrap in AEAD before reading Login (encrypted from here on)
+                                                    if let Some(ref ctx) = crypto {
+                                                        let token = state.reloadable.read().unwrap().auth_cfg.token.clone();
+                                                        match frp_core::crypto::derive_aead_control_keys(
+                                                            token.as_bytes(), ctx.algorithm, &ctx.transcript_hash,
+                                                        ) {
+                                                            Ok((rk, wk)) => match frp_core::crypto::AeadStream::new(
+                                                                Box::new(io), ctx.algorithm, &rk, &wk,
+                                                            ) {
+                                                                Ok(aead) => { io = IoStream::Aead(Box::new(aead)); }
+                                                                Err(e) => { warn!("AEAD stream error: {}", e); return; }
+                                                            },
+                                                            Err(e) => { warn!("AEAD key error: {}", e); return; }
                                                         }
+                                                    }
+                                                    match io.read_raw_v2_frame().await {
+                                                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                        Ok((ft, _, _)) => {
+                                                            warn!("Unexpected frame type {} after V2 TLS+yamux handshake from {}", ft, addr);
+                                                            return;
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("Failed to read V2 message after TLS+yamux handshake from {}: {}", addr, e);
+                                                            return;
+                                                        }
+                                                    }
                                                     }
                                                     Err(e) => {
                                                         warn!("V2 TLS+yamux handshake error from {}: {}", addr, e);
                                                         return;
                                                     }
                                                 };
-                                                dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None).await;
+                                                dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None, crypto_ctx).await;
                                             } else {
                                                 // Not V2. Replay consumed bytes for V1 processing.
                                                 let mut io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
                                                 match read_msg_v1(&mut io).await {
                                                     Ok(FrpMessage::Login(login)) => {
-                                                        control::handle_control(io, login, state, Some(addr), Some(incoming), false).await;
+                                                        control::handle_control(io, login, state, Some(addr), Some(incoming), false, None).await;
                                                     }
                                                     Ok(FrpMessage::NewWorkConn(nwc)) => {
                                                         handle_work_conn_inner(io, nwc, state).await;
@@ -817,7 +832,7 @@ impl Service {
                                     let mut tls = tls_stream;
                                     match read_msg_v1(&mut tls).await {
                                         Ok(FrpMessage::Login(login)) => {
-                                            control::handle_control(tls, login, state, Some(addr), None, false).await;
+                                            control::handle_control(tls, login, state, Some(addr), None, false, None).await;
                                         }
                                         Ok(FrpMessage::NewWorkConn(nwc)) => {
                                             let io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls)));
@@ -854,7 +869,7 @@ impl Service {
                                         info!("WebSocket upgrade on main port for {}", addr);
                                         match read_msg_v1(&mut ws).await {
                                             Ok(FrpMessage::Login(login)) => {
-                                                control::handle_control(ws, login, state.clone(), Some(addr), None, false).await;
+                                                control::handle_control(ws, login, state.clone(), Some(addr), None, false, None).await;
                                             }
                                             Ok(FrpMessage::NewWorkConn(nwc)) => {
                                                 handle_work_conn_inner(ws, nwc, state.clone()).await;
@@ -907,11 +922,26 @@ impl Service {
                                             info!("Yamux over V2 session established for {:?}", addr);
 
                                             // V2 handshake: may receive ClientHello or first message
-                                            let msg_payload = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                                Ok(Some(p)) => p,
-                                                Ok(None) => {
+                                            let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                Ok((Some(p), crypto)) => (p, crypto),
+                                                Ok((None, crypto)) => {
+                                                    // Wrap in AEAD before reading Login (encrypted from here on)
+                                                    if let Some(ref ctx) = crypto {
+                                                        let token = state.reloadable.read().unwrap().auth_cfg.token.clone();
+                                                        match frp_core::crypto::derive_aead_control_keys(
+                                                            token.as_bytes(), ctx.algorithm, &ctx.transcript_hash,
+                                                        ) {
+                                                            Ok((rk, wk)) => match frp_core::crypto::AeadStream::new(
+                                                                Box::new(io), ctx.algorithm, &rk, &wk,
+                                                            ) {
+                                                                Ok(aead) => { io = IoStream::Aead(Box::new(aead)); }
+                                                                Err(e) => { warn!("AEAD stream error: {}", e); return; }
+                                                            },
+                                                            Err(e) => { warn!("AEAD key error: {}", e); return; }
+                                                        }
+                                                    }
                                                     match io.read_raw_v2_frame().await {
-                                                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => p,
+                                                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                         Ok((ft, _, _)) => {
                                                             warn!("Unexpected frame type {} after V2 handshake from {}", ft, addr);
                                                             return;
@@ -928,7 +958,7 @@ impl Service {
                                                 }
                                             };
 
-                                            dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None).await;
+                                            dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None, crypto_ctx).await;
                                         }
                                         Err(e) => {
                                             warn!("Failed to start yamux over V2 for {:?}: {}", addr, e);
@@ -939,11 +969,12 @@ impl Service {
                                     let mut io = IoStream::Tcp(inner_stream);
 
                                     // V2 handshake: may receive ClientHello or first message
-                                    let msg_payload = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                        Ok(Some(p)) => p,
-                                        Ok(None) => {
+                                    let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                        Ok((Some(p), crypto)) => (p, crypto),
+                                        Ok((None, crypto)) => {
+                                            // TODO AEAD: wrap io in AeadStream before reading Login
                                             match io.read_raw_v2_frame().await {
-                                                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => p,
+                                                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                 Ok((ft, _, _)) => {
                                                     warn!("Unexpected frame type {} after V2 handshake from {}", ft, addr);
                                                     return;
@@ -960,7 +991,7 @@ impl Service {
                                         }
                                     };
 
-                                    dispatch_v2_message(io, msg_payload, state, addr, None, Some(addr.to_string())).await;
+                                    dispatch_v2_message(io, msg_payload, state, addr, None, Some(addr.to_string()), crypto_ctx).await;
                                 }
                             }
 
@@ -998,11 +1029,12 @@ impl Service {
                                             };
                                             if is_v2 {
                                                 // V2 detected on yamux stream! Do V2 handshake + dispatch
-                                                let msg_payload = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                                    Ok(Some(p)) => p,
-                                                    Ok(None) => {
+                                                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                    Ok((Some(p), crypto)) => (p, crypto),
+                                                    Ok((None, crypto)) => {
+                                                        // TODO AEAD: wrap io in AeadStream before reading Login
                                                         match io.read_raw_v2_frame().await {
-                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => p,
+                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                             Ok((ft, _, _)) => {
                                                                 warn!("Unexpected frame type {} after V2 handshake from {}", ft, addr);
                                                                 return;
@@ -1018,13 +1050,13 @@ impl Service {
                                                         return;
                                                     }
                                                 };
-                                                dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None).await;
+                                                dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None, crypto_ctx).await;
                                             } else {
                                                 // Not V2. Replay consumed bytes and process as V1.
                                                 let mut io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
                                                 match read_msg_v1(&mut io).await {
                                                     Ok(FrpMessage::Login(login)) => {
-                                                        control::handle_control(io, login, state, Some(addr), Some(incoming), false).await;
+                                                        control::handle_control(io, login, state, Some(addr), Some(incoming), false, None).await;
                                                     }
                                                     Ok(FrpMessage::NewWorkConn(nwc)) => {
                                                         handle_work_conn_inner(io, nwc, state).await;
@@ -1054,7 +1086,7 @@ impl Service {
                                     // the rest from the TcpStream.
                                     match read_msg_v1(&mut stream_io).await {
                                         Ok(FrpMessage::Login(login)) => {
-                                            control::handle_control(stream_io, login, state, Some(addr), None, false).await;
+                                            control::handle_control(stream_io, login, state, Some(addr), None, false, None).await;
                                         }
                                         Ok(FrpMessage::NewWorkConn(nwc)) => {
                                             handle_work_conn_inner(stream_io, nwc, state).await;
@@ -1622,6 +1654,7 @@ async fn dispatch_v2_message(
     addr: std::net::SocketAddr,
     incoming: Option<frp_core::mux::IncomingStreams>,
     visitor_addr: Option<String>,
+    crypto_ctx: Option<frp_core::v2_handshake::CryptoContext>,
 ) {
     if payload.len() < 2 {
         warn!("V2 message payload too short from {}", addr);
@@ -1637,7 +1670,7 @@ async fn dispatch_v2_message(
     };
     match msg {
         FrpMessage::Login(login) => {
-            control::handle_control(io, login, state, Some(addr), incoming, true).await;
+            control::handle_control(io, login, state, Some(addr), incoming, true, crypto_ctx).await;
         }
         FrpMessage::NewWorkConn(nwc) => {
             handle_work_conn_inner(io, nwc, state).await;
