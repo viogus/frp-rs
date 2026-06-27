@@ -3596,6 +3596,108 @@ test_r2g_ws_plain() {
 }
 
 # =============================================================================
+# Test: Go frpc -> Rust frps, WebSocket transport + encryption
+# =============================================================================
+test_g2r_ws_encrypted() {
+    local name="go-to-rust-ws-encrypted"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-ws-enc"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_rust_frps_config_ws "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    write_go_frpc_config_ws "$frps_port" "$token" "$echo_port" "$proxy_port" \
+        "ws-enc" "$TEST_DIR/$name/frpc.toml" \
+        "transport.useEncryption = true"
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "ws-enc-test" "ws-enc-test" 5)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Rust frpc -> Go frps, WebSocket transport + encryption
+# =============================================================================
+test_r2g_ws_encrypted() {
+    local name="rust-to-go-ws-encrypted"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-r2g-ws-enc"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_go_frps_config_ws "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    write_rust_frpc_config_ws "$frps_port" "$token" "$echo_port" "$proxy_port" \
+        "ws-enc" "$TEST_DIR/$name/frpc.toml" \
+        "use_encryption = true"
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "r2g-ws-enc-test" "r2g-ws-enc-test" 5)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
 # Test: Rust frpc SOCKS5 plugin -> Go frps
 # =============================================================================
 test_r2g_socks5() {
@@ -3687,6 +3789,109 @@ if data == b'socks5-test':
     print('OK:socks5-test')
 else:
     print('FAIL:MISMATCH expected=socks5-test got=' + repr(data))
+s.close()
+" 2>&1) || echo "FAIL:PYTHON_ERROR"
+
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Go frpc SOCKS5 plugin -> Rust frps
+# =============================================================================
+test_g2r_socks5() {
+    local name="go-to-rust-socks5"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-socks5"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_rust_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Go frpc with SOCKS5 plugin
+    cat > "$TEST_DIR/$name/frpc.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-$name.log"
+log.level = "debug"
+
+[[proxies]]
+name = "socks5-proxy"
+type = "tcp"
+remotePort = $proxy_port
+
+[proxies.plugin]
+type = "socks5"
+TOML
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "SOCKS5 proxy port $proxy_port not reachable"
+        return
+    fi
+
+    # SOCKS5 handshake + CONNECT to echo server, then echo test
+    local result
+    result=$(python3 -c "
+import socket, struct, sys
+
+# Connect to SOCKS5 proxy
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect(('127.0.0.1', $proxy_port))
+
+# SOCKS5 handshake: no auth
+s.sendall(b'\x05\x01\x00')
+reply = s.recv(2)
+if reply != b'\x05\x00':
+    print('FAIL:SOCKS5_HANDSHAKE ' + str(reply))
+    sys.exit(0)
+
+# CONNECT to echo server
+host = b'\x7f\x00\x00\x01'  # 127.0.0.1
+port = struct.pack('>H', $echo_port)
+s.sendall(b'\x05\x01\x00\x01' + host + port)
+reply = s.recv(10)
+if len(reply) < 10 or reply[0] != 0x05:
+    print('FAIL:SOCKS5_CONNECT ' + str(reply[:10]))
+    sys.exit(0)
+if reply[1] != 0x00:
+    print('FAIL:SOCKS5_CONNECT_REFUSED code=' + str(reply[1]))
+    sys.exit(0)
+
+# Echo test through proxy
+s.sendall(b'socks5-g2r-test')
+data = s.recv(1024)
+if data == b'socks5-g2r-test':
+    print('OK:socks5-g2r-test')
+else:
+    print('FAIL:MISMATCH expected=socks5-g2r-test got=' + repr(data))
 s.close()
 " 2>&1) || echo "FAIL:PYTHON_ERROR"
 
@@ -3915,8 +4120,11 @@ test_r2g_multi_proxy
 # Phase 6: WebSocket transport
 test_g2r_ws_plain
 test_r2g_ws_plain
+test_g2r_ws_encrypted
+test_r2g_ws_encrypted
 
 # Phase 7: Plugin
+test_g2r_socks5
 test_r2g_socks5
 
 # =============================================================================
