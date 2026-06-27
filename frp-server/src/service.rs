@@ -257,6 +257,11 @@ impl Service {
         })
     }
 
+    /// Get a clone of the shared AppState (for tests and introspection).
+    pub fn state(&self) -> std::sync::Arc<AppState> {
+        self.state.clone()
+    }
+
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let bind_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.bind_port);
         info!("frps starting on {}", bind_addr);
@@ -375,6 +380,32 @@ impl Service {
                 "TCPMux HTTP CONNECT listener starting on port {}",
                 self.cfg.tcpmux_httpconnect_port
             );
+        }
+
+        // Start SSH tunnel gateway if configured
+        if self.cfg.ssh_tunnel_gateway.bind_port > 0 {
+            let ssh_state = self.state.clone();
+            let ssh_cfg = self.cfg.clone();
+            let token = {
+                let r = self.state.reloadable.read().unwrap();
+                r.auth_cfg.token.clone()
+            };
+            tokio::spawn(async move {
+                match crate::ssh_gateway::SshListener::new(&ssh_cfg, ssh_state, token).await {
+                    Ok(Some(listener)) => {
+                        if let Err(e) = listener.run().await {
+                            tracing::error!("SSH tunnel gateway failed: {}", e);
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::debug!("SSH tunnel gateway disabled (bind_port=0)");
+                    }
+                    Err(e) => {
+                        tracing::error!("SSH tunnel gateway init failed: {}", e);
+                    }
+                }
+            });
+            tracing::info!("SSH tunnel gateway starting on port {}", self.cfg.ssh_tunnel_gateway.bind_port);
         }
 
         // Start KCP listener if configured
