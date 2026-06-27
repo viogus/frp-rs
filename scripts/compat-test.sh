@@ -3177,19 +3177,24 @@ test_r2g_https() {
 
     mkdir -p "$TEST_DIR/$name"
 
-    # Start simple HTTP echo server
+    # Start HTTPS echo server (Go frps forwards raw TLS bytes; frpc needs local
+    # service to terminate TLS — unlike g2r where Rust frps terminates TLS).
+    # Use existing test certs; Python ssl module handles the TLS handshake.
     python3 -c "
-import socket
+import socket, ssl
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('127.0.0.1', $echo_port))
 s.listen(5)
+ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+ctx.load_cert_chain('$CERT_DIR/server.crt', '$CERT_DIR/server.key')
 while True:
     try:
         conn, _ = s.accept()
+        ss = ctx.wrap_socket(conn, server_side=True)
         data = b''
         while True:
-            chunk = conn.recv(4096)
+            chunk = ss.recv(4096)
             if not chunk:
                 break
             data += chunk
@@ -3207,25 +3212,37 @@ while True:
                     break
         if data:
             body = b'https-ok:' + data.split(b'\r\n\r\n', 1)[-1] if b'\r\n\r\n' in data else b'https-ok'
-            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
-        conn.close()
-    except:
-        break
+            resp = b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body
+            ss.sendall(resp)
+        ss.close()
+    except Exception:
+        # SSL errors per-connection are expected (e.g., wait_for_port
+        # uses nc -z which doesn't do TLS handshake). Continue serving.
+        try:
+            conn.close()
+        except Exception:
+            pass
 " &
     track_pid $!
+    # NOTE: wait_for_port uses nc -z which triggers a TLS handshake
+    # failure on the HTTPS echo server. The server handles this gracefully
+    # by catching the per-connection error and continuing. But we still
+    # need to verify the port is listening.
     wait_for_port 127.0.0.1 "$echo_port" 3 || {
-        fail_test "$name" "HTTP echo server did not start"
+        fail_test "$name" "HTTPS echo server did not start"
         return
     }
 
-    # Start Go frps with VHost HTTPS port
+    # Start Go frps with VHost HTTPS port.
+    # Note: Go frps vhostHTTPSPort does NOT terminate TLS — it reads SNI from
+    # the ClientHello, routes to the correct frpc, and forwards raw TLS bytes.
+    # TLS termination happens at frpc (or the local service behind frpc).
+    # No TLS certs needed on Go frps for this path.
     cat > "$TEST_DIR/$name/frps.toml" <<TOML
 bindAddr = "127.0.0.1"
 bindPort = $frps_port
 vhostHTTPSPort = $vhost_https_port
 subDomainHost = "test.local"
-transport.tls.certFile = "$CERT_DIR/server.crt"
-transport.tls.keyFile = "$CERT_DIR/server.key"
 auth.method = "token"
 auth.token = "$token"
 
@@ -3328,7 +3345,7 @@ test_r2g_udp
 test_g2r_http
 test_r2g_http
 test_g2r_https
-# test_r2g_https  # guarded: Go frps vhostHTTPSPort TLS config needs investigation
+test_r2g_https
 # Phase 4b: tcpmux HTTP CONNECT
 test_g2r_tcpmux
 test_r2g_tcpmux
