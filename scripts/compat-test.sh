@@ -186,32 +186,38 @@ while True:
 
 send_and_expect() {
     local port="$1" data="$2" expected="$3" timeout="${4:-5}"
-    python3 -c "
-import socket, sys, time
+    _SE_PORT="$port" _SE_DATA="$data" _SE_EXPECTED="$expected" _SE_TIMEOUT="$timeout" \
+    python3 -c '
+import os, socket, time
+port = int(os.environ["_SE_PORT"])
+data = os.environ["_SE_DATA"]
+expected = os.environ["_SE_EXPECTED"]
+timeout = float(os.environ["_SE_TIMEOUT"])
+
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout($timeout)
-deadline = time.time() + $timeout
+s.settimeout(timeout)
+deadline = time.time() + timeout
 while True:
     try:
-        s.connect(('127.0.0.1', $port))
+        s.connect(("127.0.0.1", port))
         break
     except (ConnectionRefusedError, OSError):
         if time.time() > deadline:
-            print('FAIL:CONNECT_TIMEOUT')
-            sys.exit(0)
+            print("FAIL:CONNECT_TIMEOUT")
+            raise SystemExit(0)
         time.sleep(0.1)
 try:
-    s.sendall('$data'.encode())
+    s.sendall(data.encode())
     reply = s.recv(4096).decode()
-    if reply == '$expected':
-        print('OK:' + repr(reply))
+    if reply == expected:
+        print("OK:" + repr(reply))
     else:
-        print('FAIL:MISMATCH expected=' + repr('$expected') + ' got=' + repr(reply))
+        print("FAIL:MISMATCH expected=" + repr(expected) + " got=" + repr(reply))
 except Exception as e:
-    print('FAIL:ERROR ' + str(e))
+    print("FAIL:ERROR " + str(e))
 finally:
     s.close()
-" || echo "FAIL:PYTHON_ERROR"
+' || echo "FAIL:PYTHON_ERROR"
 }
 
 # Write config files in the test directory
