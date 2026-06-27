@@ -7,12 +7,18 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use frp_core::config::ProxyConfig;
-use frp_core::msg::TYPE_REQ_WORK_CONN;
+use anyhow::anyhow;
+use frp_core::msg::{FrpMessage, NewProxy, TYPE_REQ_WORK_CONN};
+use russh::server::{Auth, Handler, Msg, Session};
+use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
+
+use crate::proxy::allocate_port_multi;
+use crate::service::AppState;
 
 /// Parsed result from an SSH remote command string.
 #[derive(Debug, PartialEq)]
@@ -296,6 +302,329 @@ impl AsyncWrite for VirtualControl {
     ) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
+}
+
+// ==============================================================
+// SshSession — russh server::Handler impl
+// ==============================================================
+
+/// Per-connection SSH session handler.
+///
+/// Lifecycle:
+/// 1. `auth_succeeded` → store handle, mark authenticated
+/// 2. `exec_request` → parse proxy args from SSH remote command
+/// 3. `tcpip_forward` → register an FRP proxy via VirtualControl
+/// 4. When a work connection is needed, the control handler sends
+///    ReqWorkConn → VirtualControl intercepts → WorkConnRequest,
+///    which the SshListener calls to open a channel.
+pub struct SshSession {
+    /// Unique run_id for this SSH client (used as FRP run_id).
+    pub run_id: String,
+    /// Proxy names registered by this session (for cleanup).
+    pub registered_proxies: Vec<String>,
+    /// Stored after auth_succeeded; used to open reverse-forward
+    /// channels and request work connections from the SSH client.
+    pub ssh_handle: Option<russh::server::Handle>,
+    /// V1 frame sender into the VirtualControl channel (→ control handler).
+    frame_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Receives WorkConnRequest from VirtualControl's AsyncWrite intercept.
+    #[allow(dead_code)]
+    work_conn_rx: mpsc::UnboundedReceiver<WorkConnRequest>,
+    /// Server auth token for password authentication.
+    server_token: String,
+    /// Allowed public keys (loaded from authorized_keys file).
+    authorized_keys: Vec<russh::keys::PublicKey>,
+    /// Shared server state (proxy manager, used_ports, etc.).
+    state: Arc<AppState>,
+    /// Set to true by auth_succeeded.
+    authenticated: bool,
+    /// The raw exec command string from the SSH client.
+    pending_command: Option<String>,
+    /// Parsed proxy args from the exec command.
+    pending_proxy: Option<ParsedProxyArgs>,
+}
+
+impl SshSession {
+    pub fn new(
+        run_id: String,
+        frame_tx: mpsc::UnboundedSender<Vec<u8>>,
+        work_conn_rx: mpsc::UnboundedReceiver<WorkConnRequest>,
+        server_token: String,
+        authorized_keys: Vec<russh::keys::PublicKey>,
+        state: Arc<AppState>,
+    ) -> Self {
+        Self {
+            run_id,
+            registered_proxies: Vec::new(),
+            ssh_handle: None,
+            frame_tx,
+            work_conn_rx,
+            server_token,
+            authorized_keys,
+            state,
+            authenticated: false,
+            pending_command: None,
+            pending_proxy: None,
+        }
+    }
+}
+
+/// Build a V1 frame from a parsed SSH command and allocated port.
+fn build_v1_frame_from_args(args: &ParsedProxyArgs, allocated_port: u16) -> Result<Vec<u8>, anyhow::Error> {
+    let remote_port = if allocated_port > 0 {
+        Some(allocated_port as i32)
+    } else {
+        None
+    };
+
+    let msg = FrpMessage::NewProxy(NewProxy {
+        proxy_name: args.proxy_name.clone(),
+        proxy_type: args.proxy_type.clone(),
+        use_encryption: Some(args.use_encryption),
+        use_compression: Some(args.use_compression),
+        group: none_if_empty(&args.group),
+        group_key: none_if_empty(&args.group_key),
+        local_str: {
+            if !args.local_ip.is_empty() || args.local_port > 0 {
+                Some(format!("{}:{}", args.local_ip, args.local_port))
+            } else {
+                None
+            }
+        },
+        remote_port,
+        sk: none_if_empty(&args.sk),
+        custom_domains: non_empty_vec(args.custom_domains.clone()),
+        subdomain: none_if_empty(&args.subdomain),
+        locations: non_empty_vec(args.locations.clone()),
+        http_user: none_if_empty(&args.http_user),
+        http_pwd: none_if_empty(&args.http_pwd),
+        host_header_rewrite: none_if_empty(&args.host_header_rewrite),
+        headers: None,
+        response_headers: None,
+        route_by_http_user: None,
+        allow_users: None,
+        bandwidth_limit: none_if_empty(&args.bandwidth_limit),
+        bandwidth_limit_mode: none_if_empty(&args.bandwidth_limit_mode),
+        annotations: None,
+        metas: None,
+        multiplexer: none_if_empty(&args.multiplexer),
+        virtual_net: None,
+        proxy_protocol_version: None,
+    });
+
+    let type_byte = msg.v1_type_byte();
+    let payload = serde_json::to_vec(&msg)
+        .map_err(|e| anyhow!("serialize NewProxy: {}", e))?;
+
+    let mut buf = Vec::with_capacity(9 + payload.len());
+    buf.push(type_byte);
+    buf.extend_from_slice(&(payload.len() as i64).to_be_bytes());
+    buf.extend_from_slice(&payload);
+
+    Ok(buf)
+}
+
+/// Return None if the string is empty, Some(s) otherwise.
+fn none_if_empty(s: &str) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// Return None if the vec is empty, Some(v) otherwise.
+fn non_empty_vec(v: Vec<String>) -> Option<Vec<String>> {
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+impl Handler for SshSession {
+    type Error = anyhow::Error;
+
+    // ── Authentication ──────────────────────────────────────
+
+    async fn auth_password(
+        &mut self,
+        _user: &str,
+        password: &str,
+    ) -> Result<Auth, Self::Error> {
+        if password == self.server_token {
+            Ok(Auth::Accept)
+        } else {
+            Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            })
+        }
+    }
+
+    async fn auth_publickey(
+        &mut self,
+        _user: &str,
+        public_key: &russh::keys::PublicKey,
+    ) -> Result<Auth, Self::Error> {
+        if self.authorized_keys.iter().any(|k| k == public_key) {
+            tracing::debug!("SSH public key auth accepted");
+            Ok(Auth::Accept)
+        } else {
+            tracing::debug!("SSH public key auth rejected, fall through to password");
+            Ok(Auth::Reject {
+                proceed_with_methods: Some(MethodSet::from(&[MethodKind::Password][..])),
+                partial_success: false,
+            })
+        }
+    }
+
+    async fn auth_succeeded(
+        &mut self,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.ssh_handle = Some(session.handle());
+        self.authenticated = true;
+        tracing::info!("SSH session {} authenticated", self.run_id);
+        Ok(())
+    }
+
+    // ── Command execution ───────────────────────────────────
+
+    async fn exec_request(
+        &mut self,
+        _channel: ChannelId,
+        data: &[u8],
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let cmd = std::str::from_utf8(data)
+            .map_err(|e| anyhow!("exec command is not valid UTF-8: {}", e))?
+            .trim()
+            .to_string();
+
+        if cmd.is_empty() {
+            return Err(anyhow!(
+                "empty command; usage: ssh ... <proxy_type> --proxy_name <name> [--remote_port <port>] ..."
+            ));
+        }
+
+        self.pending_command = Some(cmd.clone());
+
+        match parse_ssh_args(&cmd) {
+            Ok(args) => {
+                tracing::info!(
+                    "SSH session {}: parsed proxy '{}' type={} port={}",
+                    self.run_id,
+                    args.proxy_name,
+                    args.proxy_type,
+                    args.remote_port
+                );
+                self.pending_proxy = Some(args);
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("SSH session {}: parse error: {}", self.run_id, e);
+                Err(anyhow!("{}", e))
+            }
+        }
+    }
+
+    // ── Reverse forward (proxy registration) ────────────────
+
+    async fn tcpip_forward(
+        &mut self,
+        _address: &str,
+        port: &mut u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        // 1. Extract data before any async borrow of self.state
+        let args = self
+            .pending_proxy
+            .take()
+            .ok_or_else(|| anyhow!(
+                "no pending proxy config; run 'ssh ... <proxy_type> --proxy_name <name> ...' before '-R'"
+            ))?;
+        let state = self.state.clone();
+
+        // 2. Allocate port (async)
+        let allocated = {
+            let mut used = state.used_ports.write().await;
+            let ranges = state.reloadable.read().unwrap().allow_ports.clone();
+            allocate_port_multi(&mut used, args.remote_port, &ranges)
+                .ok_or_else(|| anyhow!("no port available in configured ranges"))?
+        };
+
+        // 3. Build V1 frame
+        let v1_frame = build_v1_frame_from_args(&args, allocated)?;
+
+        // 4. Send frame to virtual control (non-async)
+        self.frame_tx
+            .send(v1_frame)
+            .map_err(|_| anyhow!("virtual control channel closed"))?;
+
+        // 5. Track proxy for cleanup
+        let proxy_name = args.proxy_name.clone();
+        self.registered_proxies.push(proxy_name.clone());
+
+        // 6. Report allocated port back to SSH client
+        *port = allocated as u32;
+
+        tracing::info!(
+            "SSH gateway: registered proxy '{}' on port {} (run_id={})",
+            proxy_name,
+            allocated,
+            self.run_id
+        );
+
+        Ok(true)
+    }
+
+    // ── Channels ─────────────────────────────────────────────
+
+    async fn channel_open_forwarded_tcpip(
+        &mut self,
+        _channel: Channel<Msg>,
+        _host: &str,
+        _port: u32,
+        _origin: &str,
+        _origin_port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        // Accept: work connections bridge through forwarded channels
+        Ok(true)
+    }
+
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        _channel: Channel<Msg>,
+        _host: &str,
+        _port: u32,
+        _origin: &str,
+        _origin_port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        // Reject: no -L (local forward) support
+        Ok(false)
+    }
+
+    // ── Data (bridged by control handler) ───────────────────
+
+    async fn data(
+        &mut self,
+        _channel: ChannelId,
+        _data: &[u8],
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // Channels are bridged transparently by the work-connection
+        // bridge. No handler-side processing needed.
+        Ok(())
+    }
+}
+
+/// Clean up a disconnected SSH session: remove all registered proxies.
+pub async fn cleanup_session(run_id: &str, state: &Arc<AppState>) {
+    state.proxy_manager.remove_client(run_id).await;
+    tracing::info!("SSH session {} cleaned up", run_id);
 }
 
 #[cfg(test)]
