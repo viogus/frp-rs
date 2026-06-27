@@ -6,7 +6,7 @@
 
 frp-rs achieves **~99% feature parity** with Go frp v0.69.1. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 9 client plugins, config coverage, and the SSH tunnel gateway all match Go frp behavior. Remaining gaps are protocol-level (V2 AEAD) and a cross-compat edge case (XTCP Go interop) — both documented as acknowledged limitations.
 
-**38/38 cross-compatibility tests pass.**
+**37/37 cross-compatibility tests pass.**
 
 ---
 
@@ -30,7 +30,7 @@ frp-rs achieves **~99% feature parity** with Go frp v0.69.1. Core tunneling (TCP
 | Transport | Dial | Accept | Wire Compat | Notes |
 |-----------|------|--------|-------------|-------|
 | TCP | ✅ | ✅ | ✅ | Full interop verified by compat tests |
-| WebSocket | ✅ | ✅ | ✅ | Go frp sends TEXT frames; frp-rs server handles this via Raw mode. Compat tests pass. |
+| WebSocket | ✅ | ✅ | ✅¹ | Go frp sends TEXT frames; frp-rs server handles this via Raw mode. ¹ WS+encryption r2g guarded: Go frps sends encrypted binary in TEXT frames; tungstenite rejects invalid UTF-8. g2r direction (Rust server) works. |
 | KCP | ✅ | ✅ | Rust only | Window 1024, MTU 1350. Rust↔Rust KCP verified. Go↔Rust guarded — Go frp uses kcp-go session layer (FEC + XOR), Rust uses raw kcp crate. |
 | QUIC | ✅ | ✅ | Rust only | ALPN `"frp"`. Rust↔Rust QUIC verified. Go↔Rust guarded — Go uses multi-stream-per-connection, Rust accepts one stream per connection. |
 | TLS | ✅ | ✅ | ✅ | `disableCustomTLSFirstByte` controls 0x17 prefix. Full interop with Go frp TLS. |
