@@ -2777,9 +2777,8 @@ test_g2r_tcpmux
 test_r2g_tcpmux
 test_g2r_stcp
 test_r2g_stcp
-# XTCP disabled: Go frp v0.69.1 uses QUIC-based NAT detection + candidate
-# address exchange. Re-enable when full provider-side NAT hole punch is done.
-# test_g2r_xtcp
+# XTCP Go-Rust: server coordinates NAT analysis and address exchange.
+test_g2r_xtcp
 # test_r2g_xtcp
 
 # Phase 5: Multi-proxy and edge cases

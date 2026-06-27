@@ -19,8 +19,10 @@ use super::analysis::{Analyzer, RecommandBehavior};
 use super::classify::NatFeature;
 
 /// Generates unique transaction/session IDs.
+#[allow(dead_code)]
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[allow(dead_code)]
 fn gen_sid() -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
