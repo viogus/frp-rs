@@ -153,6 +153,12 @@ pub async fn v2_handshake_client(
             if let Some(err) = server_hello.error {
                 return Err(crate::Error::Protocol(format!("ServerHello error: {err}")));
             }
+            if server_hello.selected.message.codec != "json" {
+                return Err(crate::Error::Protocol(format!(
+                    "server selected unsupported codec: {}",
+                    server_hello.selected.message.codec
+                )));
+            }
             Ok(())
         }
         V2_FRAME_TYPE_MESSAGE => {
@@ -187,7 +193,7 @@ pub async fn v2_handshake_server(
             let client_hello: ClientHello = serde_json::from_slice(&payload)
                 .map_err(|e| crate::Error::Protocol(format!("deserialize ClientHello: {e}")))?;
 
-            let server_hello = if client_hello.capabilities.message.codecs.contains(&"json".to_string()) {
+            let server_hello = if client_hello.capabilities.message.codecs.iter().any(|c| c == "json") {
                 ServerHello::default_ok()
             } else {
                 ServerHello::with_error("unsupported message codec")
