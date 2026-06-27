@@ -1,5 +1,3 @@
-use tracing::debug;
-
 use frp_core::config::PluginConfig;
 
 use super::PluginHandle;
@@ -13,6 +11,7 @@ use super::PluginHandle;
 #[cfg(unix)]
 pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle, frp_core::Error> {
     use tokio::net::UnixStream;
+    use tracing::debug;
     let path = if !cfg.local_addr.is_empty() {
         cfg.local_addr.clone()
     } else {
