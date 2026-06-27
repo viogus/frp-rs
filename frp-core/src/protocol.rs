@@ -80,6 +80,108 @@ pub async fn write_msg_v1<W: AsyncWriteExt + Unpin>(
     write_v1_frame(writer, msg).await
 }
 
+/// Deserialize a V2 message from its type ID and JSON payload bytes.
+/// V2 uses numeric type IDs (u16) instead of V1's ASCII type bytes.
+pub fn deserialize_v2(type_id: u16, json_bytes: &[u8]) -> Result<FrpMessage, crate::Error> {
+    use crate::msg;
+    let msg = match type_id {
+        msg::V2_TYPE_LOGIN => {
+            let v: msg::Login = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize Login (v2): {e}")))?;
+            FrpMessage::Login(v)
+        }
+        msg::V2_TYPE_LOGIN_RESP => {
+            let v: msg::LoginResp = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize LoginResp (v2): {e}")))?;
+            FrpMessage::LoginResp(v)
+        }
+        msg::V2_TYPE_NEW_PROXY => {
+            let v: msg::NewProxy = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewProxy (v2): {e}")))?;
+            FrpMessage::NewProxy(v)
+        }
+        msg::V2_TYPE_NEW_PROXY_RESP => {
+            let v: msg::NewProxyResp = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewProxyResp (v2): {e}")))?;
+            FrpMessage::NewProxyResp(v)
+        }
+        msg::V2_TYPE_CLOSE_PROXY => {
+            let v: msg::CloseProxy = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize CloseProxy (v2): {e}")))?;
+            FrpMessage::CloseProxy(v)
+        }
+        msg::V2_TYPE_NEW_WORK_CONN => {
+            let v: msg::NewWorkConn = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewWorkConn (v2): {e}")))?;
+            FrpMessage::NewWorkConn(v)
+        }
+        msg::V2_TYPE_REQ_WORK_CONN => {
+            let v: msg::ReqWorkConn = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize ReqWorkConn (v2): {e}")))?;
+            FrpMessage::ReqWorkConn(v)
+        }
+        msg::V2_TYPE_START_WORK_CONN => {
+            let v: msg::StartWorkConn = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize StartWorkConn (v2): {e}")))?;
+            FrpMessage::StartWorkConn(v)
+        }
+        msg::V2_TYPE_NEW_VISITOR_CONN => {
+            let v: msg::NewVisitorConn = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConn (v2): {e}")))?;
+            FrpMessage::NewVisitorConn(v)
+        }
+        msg::V2_TYPE_NEW_VISITOR_CONN_RESP => {
+            let v: msg::NewVisitorConnResp = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConnResp (v2): {e}")))?;
+            FrpMessage::NewVisitorConnResp(v)
+        }
+        msg::V2_TYPE_PING => {
+            let v: msg::Ping = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize Ping (v2): {e}")))?;
+            FrpMessage::Ping(v)
+        }
+        msg::V2_TYPE_PONG => {
+            let v: msg::Pong = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize Pong (v2): {e}")))?;
+            FrpMessage::Pong(v)
+        }
+        msg::V2_TYPE_UDP_PACKET => {
+            let v: msg::UDPPacket = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize UDPPacket (v2): {e}")))?;
+            FrpMessage::UDPPacket(v)
+        }
+        msg::V2_TYPE_NAT_HOLE_VISITOR => {
+            let v: msg::NatHoleVisitor = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleVisitor (v2): {e}")))?;
+            FrpMessage::NatHoleVisitor(v)
+        }
+        msg::V2_TYPE_NAT_HOLE_CLIENT => {
+            let v: msg::NatHoleClient = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleClient (v2): {e}")))?;
+            FrpMessage::NatHoleClient(v)
+        }
+        msg::V2_TYPE_NAT_HOLE_RESP => {
+            let v: msg::NatHoleResp = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleResp (v2): {e}")))?;
+            FrpMessage::NatHoleResp(v)
+        }
+        msg::V2_TYPE_NAT_HOLE_SID => {
+            let v: msg::NatHoleSid = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleSid (v2): {e}")))?;
+            FrpMessage::NatHoleSid(v)
+        }
+        msg::V2_TYPE_NAT_HOLE_REPORT => {
+            let v: msg::NatHoleReport = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleReport (v2): {e}")))?;
+            FrpMessage::NatHoleReport(v)
+        }
+        _ => return Err(crate::Error::Protocol(format!(
+            "unknown V2 message type ID: {type_id}"
+        ))),
+    };
+    Ok(msg)
+}
+
 fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate::Error> {
     let msg = match type_byte {
         msg::TYPE_LOGIN => {
@@ -195,6 +297,15 @@ pub const V2_MAGIC_BYTES: [u8; 7] = [0x46, 0x52, 0x50, 0x00, 0x02, 0x0D, 0x0A];
 pub const V2_FRAME_TYPE_MESSAGE: u16 = 16;
 pub const V2_MAX_FRAME_PAYLOAD: u32 = 64 * 1024;
 
+/// V2 frame header size (Go wire.Conn format): type(2) + flags(2) + length(4) = 8 bytes.
+/// Does NOT include magic bytes — magic is only at connection start.
+pub const V2_FRAME_HEADER_LEN: usize = 8;
+
+/// V2 frame type constants (matching Go frp pkg/proto/wire/wire.go).
+pub const V2_FRAME_TYPE_CLIENT_HELLO: u16 = 1;
+pub const V2_FRAME_TYPE_SERVER_HELLO: u16 = 2;
+// V2_FRAME_TYPE_MESSAGE = 16 already exists above.
+
 pub async fn detect_v2_magic<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> Result<bool, crate::Error> {
@@ -213,6 +324,64 @@ pub async fn write_v2_magic<W: AsyncWriteExt + Unpin>(
         .await
         .map_err(|e| crate::Error::Protocol(format!("write V2 magic: {e}")))?;
     Ok(())
+}
+
+/// Write a raw V2 frame: type(2 BE) + flags(2 BE) + length(4 BE) + payload.
+/// This is the Go wire.Conn.WriteFrame format — magic is NOT repeated per frame.
+pub async fn write_v2_frame_raw<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    frame_type: u16,
+    flags: u16,
+    payload: &[u8],
+) -> Result<(), crate::Error> {
+    if payload.len() > V2_MAX_FRAME_PAYLOAD as usize {
+        return Err(crate::Error::Protocol(format!(
+            "V2 payload too large: {} > {}",
+            payload.len(),
+            V2_MAX_FRAME_PAYLOAD
+        )));
+    }
+    let mut header = [0u8; V2_FRAME_HEADER_LEN];
+    header[0..2].copy_from_slice(&frame_type.to_be_bytes());
+    header[2..4].copy_from_slice(&flags.to_be_bytes());
+    header[4..8].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+
+    writer.write_all(&header).await
+        .map_err(|e| crate::Error::Protocol(format!("write V2 frame: {e}")))?;
+    writer.write_all(payload).await
+        .map_err(|e| crate::Error::Protocol(format!("write V2 payload: {e}")))?;
+    Ok(())
+}
+
+/// Read a raw V2 frame. Returns (frame_type, flags, payload).
+/// This is the Go wire.Conn.ReadFrame format.
+pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> Result<(u16, u16, Vec<u8>), crate::Error> {
+    let mut header = [0u8; V2_FRAME_HEADER_LEN];
+    reader.read_exact(&mut header).await
+        .map_err(|e| crate::Error::Protocol(format!("read V2 frame: {e}")))?;
+
+    let frame_type = u16::from_be_bytes([header[0], header[1]]);
+    let flags = u16::from_be_bytes([header[2], header[3]]);
+    let payload_len = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+
+    if flags != 0 {
+        return Err(crate::Error::Protocol(format!(
+            "unsupported V2 frame flags: {flags}"
+        )));
+    }
+    if payload_len > V2_MAX_FRAME_PAYLOAD as usize {
+        return Err(crate::Error::Protocol(format!(
+            "V2 frame payload too large: {payload_len}"
+        )));
+    }
+
+    let mut payload = vec![0u8; payload_len];
+    reader.read_exact(&mut payload).await
+        .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}")))?;
+
+    Ok((frame_type, flags, payload))
 }
 
 /// V2 frame header size: magic(7) + frame_type(2 BE) + payload_length(4 BE) = 13 bytes.
@@ -292,6 +461,42 @@ pub async fn read_msg_v2<R: AsyncReadExt + Unpin>(
         )));
     }
     deserialize_v1(frame_type as u8, &payload)
+}
+
+/// Write a FrpMessage using Go-compatible V2 framing.
+/// Frame: type=16(Message) flags=0, payload = type_id(2 BE) + JSON.
+pub async fn write_msg_v2_go<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    msg: &FrpMessage,
+) -> Result<(), crate::Error> {
+    let type_id = msg.v2_type_id();
+    let json_bytes = serde_json::to_vec(msg)
+        .map_err(|e| crate::Error::Protocol(format!("V2 JSON serialize: {e}")))?;
+
+    let mut payload = Vec::with_capacity(2 + json_bytes.len());
+    payload.extend_from_slice(&type_id.to_be_bytes());
+    payload.extend_from_slice(&json_bytes);
+
+    write_v2_frame_raw(writer, V2_FRAME_TYPE_MESSAGE, 0, &payload).await
+}
+
+/// Read a FrpMessage using Go-compatible V2 framing.
+/// Expects frame type=16, extracts 2-byte type ID from payload prefix.
+pub async fn read_msg_v2_go<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> Result<FrpMessage, crate::Error> {
+    let (frame_type, _flags, payload) = read_v2_frame_raw(reader).await?;
+    if frame_type != V2_FRAME_TYPE_MESSAGE {
+        return Err(crate::Error::Protocol(format!(
+            "unexpected V2 frame type: {frame_type}, expected {} (Message)",
+            V2_FRAME_TYPE_MESSAGE
+        )));
+    }
+    if payload.len() < 2 {
+        return Err(crate::Error::Protocol("V2 message payload too short".into()));
+    }
+    let type_id = u16::from_be_bytes([payload[0], payload[1]]);
+    deserialize_v2(type_id, &payload[2..])
 }
 
 /// Protocol-aware message read: dispatches to V1 or V2 framing based on the `v2` flag.
