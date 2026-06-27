@@ -118,6 +118,7 @@ impl ControlConnection {
             keepalive_secs: self.keepalive_secs,
             bind_addr: self.bind_addr.clone(),
             proxy_url: if self.proxy_url.is_empty() { None } else { Some(self.proxy_url.clone()) },
+            v2: self.v2,
             ..Default::default()
         };
 
@@ -134,9 +135,27 @@ impl ControlConnection {
             let ca_file = self.tls_ca_file.as_deref();
             let (stream, qc) = frp_core::quic::dial_quic(&addr, server_name, ca_file).await
                 .map_err(|e| frp_core::Error::Transport(format!("QUIC dial: {e}")))?;
+            // TODO: V2 handshake over QUIC when V2+QUIC interop needed.
             (IoStream::Quic(stream), None, Some(qc))
         } else {
-            let raw_stream = dial_server(&opts).await?;
+            let mut raw_stream = dial_server(&opts).await?;
+
+            // V2: ClientHello/ServerHello handshake on raw stream BEFORE yamux.
+            if self.v2 {
+                let transport_name = match self.transport_protocol {
+                    TransportProtocol::Tcp => "tcp",
+                    TransportProtocol::Kcp => "kcp",
+                    TransportProtocol::WebSocket => "websocket",
+                    TransportProtocol::Wss => "wss",
+                    _ => "tcp",
+                };
+                frp_core::v2_handshake::v2_handshake_client(
+                    &mut raw_stream,
+                    transport_name,
+                    self.tls_enable,
+                    self.tcp_mux,
+                ).await?;
+            }
 
             // Wrap in yamux BEFORE any protocol communication if proposing mux.
             // The Go frp server wraps its side on accept, so the client must
