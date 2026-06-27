@@ -325,6 +325,24 @@ pub async fn write_v2_magic<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+/// Read and verify V2 magic bytes from a stream.
+/// Returns an error if the magic doesn't match.
+/// Used on yamux streams where Go frp writes magic after yamux wrap.
+pub async fn read_v2_magic<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> Result<(), crate::Error> {
+    let mut buf = [0u8; V2_MAGIC_LEN];
+    reader.read_exact(&mut buf).await
+        .map_err(|e| crate::Error::Protocol(format!("read V2 magic: {e}")))?;
+    if buf != V2_MAGIC_BYTES {
+        return Err(crate::Error::Protocol(format!(
+            "unexpected V2 magic: expected {:02x?}, got {:02x?}",
+            V2_MAGIC_BYTES.as_slice(), buf.as_slice()
+        )));
+    }
+    Ok(())
+}
+
 /// Write a raw V2 frame: type(2 BE) + flags(2 BE) + length(4 BE) + payload.
 /// This is the Go wire.Conn.WriteFrame format — magic is NOT repeated per frame.
 pub async fn write_v2_frame_raw<W: AsyncWriteExt + Unpin>(
@@ -400,7 +418,9 @@ pub async fn write_msg_v2<W: AsyncWriteExt + Unpin>(
     payload.extend_from_slice(&type_id.to_be_bytes());
     payload.extend_from_slice(&json_bytes);
 
-    write_v2_frame_raw(writer, V2_FRAME_TYPE_MESSAGE, 0, &payload).await
+    write_v2_frame_raw(writer, V2_FRAME_TYPE_MESSAGE, 0, &payload).await?;
+    writer.flush().await.map_err(|e| crate::Error::Protocol(format!("flush after write_msg_v2: {e}")))?;
+    Ok(())
 }
 
 /// Read a FrpMessage using Go-compatible V2 framing.

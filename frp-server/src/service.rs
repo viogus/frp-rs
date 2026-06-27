@@ -766,28 +766,15 @@ impl Service {
                                                 let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
                                                     Ok((Some(p), crypto)) => (p, crypto),
                                                     Ok((None, crypto)) => {
-                                                        // Wrap in AEAD before reading Login (encrypted from here on)
-                                                    if let Some(ref ctx) = crypto {
-                                                        let token = state.reloadable.read().unwrap().auth_cfg.token.clone();
-                                                        match frp_core::crypto::derive_aead_control_keys(
-                                                            token.as_bytes(), ctx.algorithm, &ctx.transcript_hash,
-                                                        ) {
-                                                            Ok((rk, wk)) => match frp_core::crypto::AeadStream::new(
-                                                                Box::new(io), ctx.algorithm, &rk, &wk,
-                                                            ) {
-                                                                Ok(aead) => { io = IoStream::Aead(Box::new(aead)); }
-                                                                Err(e) => { warn!("AEAD stream error: {}", e); return; }
-                                                            },
-                                                            Err(e) => { warn!("AEAD key error: {}", e); return; }
-                                                        }
-                                                    }
-                                                    match io.read_raw_v2_frame().await {
-                                                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                        Ok((ft, _, _)) => {
-                                                            warn!("Unexpected frame type {} after V2 TLS+yamux handshake from {}", ft, addr);
-                                                            return;
-                                                        }
-                                                        Err(e) => {
+                                                        // Read Login in plaintext. AEAD wrapping happens in
+                                                        // handle_control after LoginResp (matching Go frp flow).
+                                                        match io.read_raw_v2_frame().await {
+                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                            Ok((ft, _, _)) => {
+                                                                warn!("Unexpected frame type {} after V2 TLS+yamux handshake from {}", ft, addr);
+                                                                return;
+                                                            }
+                                                            Err(e) => {
                                                             warn!("Failed to read V2 message after TLS+yamux handshake from {}: {}", addr, e);
                                                             return;
                                                         }
@@ -921,25 +908,33 @@ impl Service {
                                             let mut io = IoStream::Yamux(control_stream);
                                             info!("Yamux over V2 session established for {:?}", addr);
 
+                                            // Consume V2 magic on yamux stream if present.
+                                            // Go frp writes magic on the yamux stream (after yamux wrap).
+                                            // If magic is absent (backward compat), replay the bytes
+                                            // before the handshake.
+                                            {
+                                                let mut magic_buf = [0u8; 7];
+                                                match tokio::io::AsyncReadExt::read_exact(&mut io, &mut magic_buf).await {
+                                                    Ok(_) => {
+                                                        if magic_buf != frp_core::protocol::V2_MAGIC_BYTES {
+                                                            // Replay non-magic bytes before handshake
+                                                            io = IoStream::BufferedRead(magic_buf.to_vec(), 0, Box::new(io));
+                                                        }
+                                                        // Magic consumed — continue
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("Failed to read V2 magic from yamux stream: {}", e);
+                                                        return;
+                                                    }
+                                                }
+                                            }
+
                                             // V2 handshake: may receive ClientHello or first message
                                             let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
                                                 Ok((Some(p), crypto)) => (p, crypto),
                                                 Ok((None, crypto)) => {
-                                                    // Wrap in AEAD before reading Login (encrypted from here on)
-                                                    if let Some(ref ctx) = crypto {
-                                                        let token = state.reloadable.read().unwrap().auth_cfg.token.clone();
-                                                        match frp_core::crypto::derive_aead_control_keys(
-                                                            token.as_bytes(), ctx.algorithm, &ctx.transcript_hash,
-                                                        ) {
-                                                            Ok((rk, wk)) => match frp_core::crypto::AeadStream::new(
-                                                                Box::new(io), ctx.algorithm, &rk, &wk,
-                                                            ) {
-                                                                Ok(aead) => { io = IoStream::Aead(Box::new(aead)); }
-                                                                Err(e) => { warn!("AEAD stream error: {}", e); return; }
-                                                            },
-                                                            Err(e) => { warn!("AEAD key error: {}", e); return; }
-                                                        }
-                                                    }
+                                                    // Read Login in plaintext. AEAD wrapping happens in
+                                                    // handle_control after LoginResp (matching Go frp flow).
                                                     match io.read_raw_v2_frame().await {
                                                         Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                         Ok((ft, _, _)) => {
@@ -972,7 +967,8 @@ impl Service {
                                     let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
                                         Ok((Some(p), crypto)) => (p, crypto),
                                         Ok((None, crypto)) => {
-                                            // TODO AEAD: wrap io in AeadStream before reading Login
+                                            // Read Login in plaintext. AEAD wrapping happens in
+                                            // handle_control after LoginResp (matching Go frp flow).
                                             match io.read_raw_v2_frame().await {
                                                 Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                 Ok((ft, _, _)) => {
@@ -1032,7 +1028,8 @@ impl Service {
                                                 let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
                                                     Ok((Some(p), crypto)) => (p, crypto),
                                                     Ok((None, crypto)) => {
-                                                        // TODO AEAD: wrap io in AeadStream before reading Login
+                                                        // Read Login in plaintext. AEAD wrapping happens in
+                                                        // handle_control after LoginResp (matching Go frp flow).
                                                         match io.read_raw_v2_frame().await {
                                                             Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                             Ok((ft, _, _)) => {

@@ -471,3 +471,132 @@ async fn test_v2_ping_pong_yamux() {
         other => panic!("expected Pong, got {:?}", other.v2_type_id()),
     }
 }
+
+/// V2 Ping/Pong over yamux with AEAD crypto negotiation.
+/// Verifies that V2 ClientHello/ServerHello + AEAD key derivation + encrypted
+/// multi-frame communication works end-to-end (Rust↔Rust).
+#[tokio::test]
+async fn test_v2_aead_ping_pong_yamux() {
+    let bind_port = allocate_port();
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        ..Default::default()
+    };
+    let service = Service::new(cfg, None).await.expect("create service");
+    let _server_handle = tokio::spawn(async move {
+        let _ = service.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let opts = DialOptions {
+        server_addr: "127.0.0.1".into(),
+        server_port: bind_port,
+        v2: true,
+        ..Default::default()
+    };
+    let raw_stream = frp_core::transport::dial_server(&opts)
+        .await
+        .expect("dial server");
+
+    // Wrap in yamux FIRST (matching server)
+    let tcp_stream = match raw_stream {
+        IoStream::Tcp(s) => s,
+        other => panic!("expected IoStream::Tcp, got {:?}", std::mem::discriminant(&other)),
+    };
+    let (control_yamux, _yamux_session) =
+        mux::client_mux(tcp_stream, &mux::TcpMuxConfig::default())
+            .await
+            .expect("yamux client init");
+    let mut control = IoStream::Yamux(control_yamux);
+
+    // Write V2 magic on yamux stream (matching real client + Go frp)
+    frp_core::protocol::write_v2_magic(&mut control).await.expect("write V2 magic");
+
+    // V2 handshake WITH crypto
+    let crypto_ctx = v2_handshake::v2_handshake_client(
+        &mut control, "tcp", false, true, true /* with_crypto */
+    )
+        .await
+        .expect("V2 handshake")
+        .expect("crypto must be negotiated");
+
+    // Login via plaintext V2 (matching Go frp flow: Login before AEAD wrapping)
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let login = FrpMessage::Login(msg::Login {
+        version: Some(frp_core::VERSION.into()),
+        hostname: Some("v2-aead".into()),
+        os: Some(std::env::consts::OS.into()),
+        arch: Some(std::env::consts::ARCH.into()),
+        user: None,
+        run_id: None,
+        client_id: None,
+        pool_count: Some(1),
+        timestamp: Some(ts),
+        privilege_key: None,
+        metas: None,
+        client_spec: None,
+        multiplexer: Some("yamux".into()),
+    });
+    control.write_v2_frame(&login).await.expect("send Login");
+
+    let resp = control.read_v2_frame().await.expect("read LoginResp");
+    match &resp {
+        FrpMessage::LoginResp(r) => {
+            assert!(r.error.is_none(), "Login error: {:?}", r.error);
+        }
+        other => panic!("expected LoginResp, got {:?}", other.v2_type_id()),
+    }
+    println!("V2 AEAD login OK (yamux)");
+
+    // Wrap in AEAD after LoginResp (matching Go frp flow)
+    let (write_key, read_key) = frp_core::crypto::derive_aead_control_keys(
+        b"", // empty token = no auth
+        crypto_ctx.algorithm,
+        &crypto_ctx.transcript_hash,
+    )
+    .expect("derive AEAD keys");
+    let aead = frp_core::crypto::AeadStream::new(
+        Box::new(control),
+        crypto_ctx.algorithm,
+        &read_key,
+        &write_key,
+    )
+    .expect("create AeadStream");
+    let mut control = IoStream::Aead(Box::new(aead));
+
+    // Ping (second encrypted frame in each direction)
+    let ping = FrpMessage::Ping(msg::Ping {
+        privilege_key: None,
+        timestamp: None,
+    });
+    control.write_v2_frame(&ping).await.expect("send Ping");
+    println!("Ping sent (AEAD)");
+
+    // Pong
+    let pong = control.read_v2_frame().await.expect("read Pong");
+    match &pong {
+        FrpMessage::Pong(p) => {
+            assert!(p.error.is_none(), "Pong error: {:?}", p.error);
+            println!("Pong received OK (AEAD)");
+        }
+        other => panic!("expected Pong, got {:?}", other.v2_type_id()),
+    }
+
+    // Third frame to verify nonce incrementing
+    control.write_v2_frame(&ping).await.expect("send Ping #2");
+    println!("Ping #2 sent (AEAD)");
+
+    let pong2 = control.read_v2_frame().await.expect("read Pong #2");
+    match &pong2 {
+        FrpMessage::Pong(p) => {
+            assert!(p.error.is_none(), "Pong #2 error: {:?}", p.error);
+            println!("Pong #2 received OK (AEAD)");
+        }
+        other => panic!("expected Pong #2, got {:?}", other.v2_type_id()),
+    }
+}

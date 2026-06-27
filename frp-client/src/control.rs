@@ -172,6 +172,7 @@ impl ControlConnection {
         };
 
         // V2: ClientHello/ServerHello handshake on yamux-wrapped stream.
+        let mut crypto_ctx = None;
         if self.v2 {
             // When tcpMux is enabled, write V2 magic on the yamux stream
             // (not on raw TCP). Go frp does: yamux wrap -> write magic -> handshake.
@@ -185,7 +186,7 @@ impl ControlConnection {
                 TransportProtocol::WebSocket => "websocket",
                 TransportProtocol::Wss => "wss",
             };
-            let crypto_ctx = frp_core::v2_handshake::v2_handshake_client(
+            crypto_ctx = frp_core::v2_handshake::v2_handshake_client(
                 &mut io_stream,
                 transport_name,
                 self.tls_enable,
@@ -193,17 +194,6 @@ impl ControlConnection {
                 true, // with_crypto
             ).await?;
 
-            // If AEAD crypto negotiated, wrap stream before sending Login
-            if let Some(ref ctx) = crypto_ctx {
-                let token = self.auth_cfg.token.clone();
-                let (read_key, write_key) = frp_core::crypto::derive_aead_control_keys(
-                    token.as_bytes(), ctx.algorithm, &ctx.transcript_hash,
-                ).map_err(|e| frp_core::Error::Protocol(e))?;
-                let aead = frp_core::crypto::AeadStream::new(
-                    Box::new(io_stream), ctx.algorithm, &read_key, &write_key,
-                ).map_err(|e| frp_core::Error::Protocol(e))?;
-                io_stream = IoStream::Aead(Box::new(aead));
-            }
         }
 
         let timestamp = std::time::SystemTime::now()
@@ -249,6 +239,24 @@ impl ControlConnection {
         } else {
             io_stream.read_v1_frame().await?
         };
+
+        // If AEAD crypto negotiated, wrap stream after LoginResp (matching Go frp flow).
+        // Login/LoginResp are exchanged in plaintext; all subsequent messages use AEAD.
+        if self.v2 {
+            if let Some(ref ctx) = crypto_ctx {
+                let token = self.auth_cfg.token.clone();
+                // derive_aead_control_keys returns (client_to_server, server_to_client)
+                let (write_key, read_key) = frp_core::crypto::derive_aead_control_keys(
+                    token.as_bytes(), ctx.algorithm, &ctx.transcript_hash,
+                ).map_err(|e| frp_core::Error::Protocol(e))?;
+                // Client reads from server → server_to_client
+                // Client writes to server → client_to_server
+                let aead = frp_core::crypto::AeadStream::new(
+                    Box::new(io_stream), ctx.algorithm, &read_key, &write_key,
+                ).map_err(|e| frp_core::Error::Protocol(e))?;
+                io_stream = IoStream::Aead(Box::new(aead));
+            }
+        }
         match resp_msg {
             FrpMessage::LoginResp(resp) => {
                 if let Some(err) = resp.error {

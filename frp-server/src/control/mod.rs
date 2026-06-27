@@ -187,16 +187,43 @@ pub async fn handle_control<S>(
     }
 
     // --- Wrap in encryption (matches client after login) ---
-    // V2 with AEAD crypto: stream was already wrapped at call site before Login
-    // was read, so we just split without additional encryption.
+    // V2 with AEAD crypto: wrap stream in AEAD here, AFTER LoginResp sent
+    // (matching Go frp flow: ClientHello/ServerHello + Login/LoginResp in
+    // plaintext, then AEAD for all subsequent messages).
     // V1 or V2 without AEAD: wrap in AES-128-CFB (CipherStream) for backward compat.
     let (mut reader, mut writer): (
         Box<dyn AsyncRead + Unpin + Send>,
         Box<dyn AsyncWrite + Unpin + Send>,
     ) = if v2 && crypto_ctx.is_some() {
-        // Already AEAD-wrapped at call site
-        let (r, w) = tokio::io::split(stream);
-        (Box::new(r), Box::new(w))
+        let ctx = crypto_ctx.as_ref().unwrap();
+        let token = state.reloadable.read().unwrap().auth_cfg.token.clone();
+        match frp_core::crypto::derive_aead_control_keys(
+            token.as_bytes(), ctx.algorithm, &ctx.transcript_hash,
+        ) {
+            Ok((read_key, write_key)) => {
+                // derive_aead_control_keys returns (client_to_server, server_to_client).
+                // Server reads from client → client_to_server (= read_key).
+                // Server writes to client → server_to_client (= write_key).
+                match frp_core::crypto::AeadStream::new(
+                    Box::new(stream), ctx.algorithm, &read_key, &write_key,
+                ) {
+                    Ok(aead) => {
+                        let (r, w) = tokio::io::split(aead);
+                        (Box::new(r), Box::new(w))
+                    }
+                    Err(e) => {
+                        warn!("Failed to create AEAD stream for {:?}: {}", peer, e);
+                        proxy_ops::unregister_control(&state, &run_id).await;
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to derive AEAD keys for {:?}: {}", peer, e);
+                proxy_ops::unregister_control(&state, &run_id).await;
+                return;
+            }
+        }
     } else {
         // V1 or plain V2: wrap in AES-128-CFB
         let enc_key = encryption::derive_key(&state.reloadable.read().unwrap().auth_cfg.token);

@@ -736,19 +736,21 @@ impl IoStream {
 
     /// Write a V2 protocol frame (binary framing + JSON payload) to this stream.
     pub async fn write_v2_frame(&mut self, msg: &crate::msg::FrpMessage) -> Result<(), crate::Error> {
+        use tokio::io::AsyncWriteExt;
         match self {
-            IoStream::Tcp(s) => crate::protocol::write_msg_v2(s, msg).await,
-            IoStream::Tls(s) => crate::protocol::write_msg_v2(s, msg).await,
-            IoStream::Kcp(s) => crate::protocol::write_msg_v2(s, msg).await,
-            IoStream::Quic(s) => crate::protocol::write_msg_v2(s, msg).await,
-            IoStream::WebSocket(s) => crate::protocol::write_msg_v2(s, msg).await,
-            IoStream::Yamux(s) => crate::protocol::write_msg_v2(s, msg).await,
-            IoStream::Cipher(s) => crate::protocol::write_msg_v2(s, msg).await,
-            IoStream::Aead(s) => crate::protocol::write_msg_v2(s, msg).await,
-            IoStream::SshChannel(s) => crate::protocol::write_msg_v2(s, msg).await,
-            IoStream::PreRead(_, s) => crate::protocol::write_msg_v2(s, msg).await,
-            IoStream::BufferedRead(_, _, inner) => crate::protocol::write_msg_v2(inner.as_mut(), msg).await,
+            IoStream::Tcp(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            IoStream::Tls(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            IoStream::Kcp(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            IoStream::Quic(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            IoStream::WebSocket(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            IoStream::Yamux(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            IoStream::Cipher(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            IoStream::Aead(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            IoStream::SshChannel(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            IoStream::PreRead(_, s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            IoStream::BufferedRead(_, _, inner) => { crate::protocol::write_msg_v2(inner.as_mut(), msg).await?; inner.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
         }
+        Ok(())
     }
 
     /// Read a V2 protocol frame (binary framing + JSON payload) from this stream.
