@@ -996,9 +996,21 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
         opts.server_addr.clone()
     };
     let addr = format!("{target_ip}:{}", opts.server_port);
-    let peer: std::net::SocketAddr = addr.parse().map_err(|e| {
-        crate::Error::Transport(format!("invalid server address '{addr}': {e}"))
-    })?;
+    let peer: std::net::SocketAddr = match addr.parse() {
+        Ok(peer) => peer,
+        Err(_) => {
+            // target_ip is a hostname, not an IP — resolve via system DNS.
+            // Mirrors what TcpStream::connect(addr) did before b4a9359.
+            tokio::net::lookup_host(&addr).await
+                .map_err(|e| crate::Error::Transport(format!(
+                    "invalid server address '{addr}': {e}"
+                )))?
+                .next()
+                .ok_or_else(|| crate::Error::Transport(format!(
+                    "DNS resolve '{addr}': no records found"
+                )))?
+        }
+    };
 
     // Connect via upstream proxy if configured, otherwise direct TCP.
     let mut stream = if let Some(ref proxy_url) = opts.proxy_url {
