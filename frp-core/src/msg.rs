@@ -337,7 +337,13 @@ pub struct NatHoleResp {
     pub transaction_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    // Provider-side addresses for NAT hole punch (Go frp v0.69.1 compat)
+    /// NAT hole session ID (Go frp v0.69.1 compat: sid).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+    /// NAT traversal protocol: "quic" or "tcp" (Go frp v0.69.1 compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// Provider-side addresses for NAT hole punch (Go frp v0.69.1 compat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_addrs: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

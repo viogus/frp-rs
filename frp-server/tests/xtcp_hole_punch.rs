@@ -123,7 +123,20 @@ async fn test_xtcp_nat_hole_message_routing() {
         .expect("send NatHoleSid");
     println!("Provider sent NatHoleSid for session {}", sid);
 
-    // --- Step 5: Visitor reads NatHoleSid (should have provider_addr filled by server) ---
+    // --- Step 5: Visitor reads NatHoleResp (server echoes addresses from NatHoleVisitor) ---
+    match read_msg_v1(&mut visitor_conn)
+        .await
+        .expect("read NatHoleResp from visitor")
+    {
+        FrpMessage::NatHoleResp(resp) => {
+            assert!(resp.error.is_none(), "NatHoleResp error: {:?}", resp.error);
+            assert_eq!(resp.sid, Some(sid.clone()));
+            println!("Visitor received NatHoleResp with sid={}", sid);
+        }
+        other => panic!("expected NatHoleResp, got: {:?}", other.v1_type_byte()),
+    }
+
+    // --- Step 6: Visitor reads NatHoleSid (should have provider_addr filled by server) ---
     let _provider_addr = match read_msg_v1(&mut visitor_conn)
         .await
         .expect("read NatHoleSid from visitor")
@@ -141,7 +154,7 @@ async fn test_xtcp_nat_hole_message_routing() {
         other => panic!("expected NatHoleSid, got: {:?}", other.v1_type_byte()),
     };
 
-    // --- Step 6: Provider sends NatHoleReport (hole punch complete) ---
+    // --- Step 7: Provider sends NatHoleReport (hole punch complete) ---
     let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
         sid: Some(sid.clone()),
     });

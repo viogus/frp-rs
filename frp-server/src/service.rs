@@ -70,6 +70,8 @@ pub enum InternalMsg {
     WriteNatHoleResp {
         transaction_id: String,
         error: Option<String>,
+        sid: Option<String>,
+        protocol: Option<String>,
         candidate_addrs: Option<Vec<String>>,
         assisted_addrs: Option<Vec<String>>,
     },
@@ -1242,7 +1244,20 @@ async fn handle_nat_hole_visitor(
     // NatHoleSid/NatHoleReport. The reader is held as a connection-lifecycle
     // handle — it is never read (the visitor opens a fresh connection for
     // STCP fallback). Dropping it signals connection close.
-    let (reader, writer) = stream.into_split();
+    let (reader, mut writer) = stream.into_split();
+
+    // Send NatHoleResp to visitor with available address info.
+    // Echo visitor's own mapped/assisted addrs — provider's addrs are
+    // relayed later via NatHoleResp forwarding. Go frp v0.69.1 compat.
+    let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+        transaction_id: transaction_id.clone(),
+        error: None,
+        sid: Some(transaction_id.clone()),
+        protocol: msg.protocol.clone(),
+        candidate_addrs: msg.mapped_addrs.clone(),
+        assisted_addrs: msg.assisted_addrs.clone(),
+    });
+    let _ = write_msg_v1(&mut writer, &resp).await;
 
     // Create NAT session and get report receiver
     let report_rx = state

@@ -374,11 +374,13 @@ pub async fn handle_control<S>(
                             warn!("Failed to write NatHoleSid to visitor: {}", e);
                         }
                     }
-                    Some(InternalMsg::WriteNatHoleResp { transaction_id, error, candidate_addrs, assisted_addrs }) => {
+                    Some(InternalMsg::WriteNatHoleResp { transaction_id, error, sid, protocol, candidate_addrs, assisted_addrs }) => {
                         debug!("Writing NatHoleResp to visitor via control channel for {}", transaction_id);
                         let forward = FrpMessage::NatHoleResp(msg::NatHoleResp {
                             transaction_id,
                             error,
+                            sid,
+                            protocol,
                             candidate_addrs,
                             assisted_addrs,
                         });
@@ -578,6 +580,8 @@ pub async fn handle_control<S>(
                         if state.nat_hole.forward_nat_hole_resp_via_ctl(
                             tid,
                             resp_msg.error.clone(),
+                            resp_msg.sid.clone(),
+                            resp_msg.protocol.clone(),
                             resp_msg.candidate_addrs.clone(),
                             resp_msg.assisted_addrs.clone(),
                         ).await {
@@ -586,6 +590,8 @@ pub async fn handle_control<S>(
                             let forward = FrpMessage::NatHoleResp(msg::NatHoleResp {
                                 transaction_id: tid.clone(),
                                 error: resp_msg.error.clone(),
+                                sid: resp_msg.sid.clone(),
+                                protocol: resp_msg.protocol.clone(),
                                 candidate_addrs: resp_msg.candidate_addrs.clone(),
                                 assisted_addrs: resp_msg.assisted_addrs.clone(),
                             });
@@ -713,11 +719,19 @@ pub async fn handle_control<S>(
                             continue;
                         }
 
-                        // Don't send a synthetic NatHoleResp — the provider will send
-                        // a real NatHoleResp (with candidate_addrs from NAT detection),
-                        // which is relayed to the visitor via the message loop.
-                        // Go frp v0.69.1 compat: visitor expects ONE NatHoleResp from
-                        // the provider (relayed by server), not an immediate ACK.
+                        // Send NatHoleResp to visitor with available address info.
+                        // Echo the visitor's own mapped/assisted addrs as candidates —
+                        // the provider's addrs are relayed later via NatHoleResp forwarding
+                        // (see NatHoleResp handler above). Go frp v0.69.1 compat.
+                        let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                            transaction_id: transaction_id.clone(),
+                            error: None,
+                            sid: Some(transaction_id.clone()),
+                            protocol: nhv.protocol.clone(),
+                            candidate_addrs: nhv.mapped_addrs.clone(),
+                            assisted_addrs: nhv.assisted_addrs.clone(),
+                        });
+                        let _ = write_ctl_msg(&mut writer, &resp, v2).await;
 
                         // Spawn task to wait for report oneshot (30s timeout)
                         let nat_hole = state.nat_hole.clone();

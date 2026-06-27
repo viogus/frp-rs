@@ -127,6 +127,8 @@ impl NatHoleCoordinator {
         &self,
         sid: &str,
         error: Option<String>,
+        resp_sid: Option<String>,
+        protocol: Option<String>,
         candidate_addrs: Option<Vec<String>>,
         assisted_addrs: Option<Vec<String>>,
     ) -> bool {
@@ -136,6 +138,8 @@ impl NatHoleCoordinator {
                 let _ = tx.send(InternalMsg::WriteNatHoleResp {
                     transaction_id: sid.to_string(),
                     error,
+                    sid: resp_sid,
+                    protocol,
                     candidate_addrs,
                     assisted_addrs,
                 });
