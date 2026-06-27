@@ -1259,7 +1259,7 @@ async fn handle_nat_hole_visitor(
     let sid = transaction_id.clone();
 
     // --- Step 1: Create session and notify provider ---
-    let (session, report_rx) = state
+    let (session, report_rx) = match state
         .nat_hole
         .create_session_with_writer(
             sid.clone(),
@@ -1267,7 +1267,14 @@ async fn handle_nat_hole_visitor(
             msg.clone(),
             writer,
         )
-        .await;
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("NatHole session creation failed: {}", e);
+            return;
+        }
+    };
 
     // --- Step 2: Set up notify channel BEFORE sending to provider ---
     // Must happen before the provider notification to avoid a race:

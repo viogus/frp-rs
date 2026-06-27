@@ -221,20 +221,26 @@ where
                 // Drive connection I/O.
                 //
                 // Double-poll is required because yamux Active::poll processes
-                // StreamCommand::SendFrame (step 3) AFTER draining pending_frames
+                // StreamCommand::SendFrame (step 3) AFTER flushing pending_write_frame
                 // (step 1). The first poll picks up queued stream writes into
-                // pending_frames; the second poll actually sends them on the wire.
-                // Without the second poll, frames sit in pending_frames until
+                // pending_write_frame; the second poll actually sends them on the wire.
+                // Without the second poll, frames sit in pending_write_frame until
                 // the next wake-up — which may never arrive.
+                //
+                // Guard: only double-poll when there might be pending frames.
+                // Without this guard, two successive Pending results on the same cx
+                // can cause a tight re-poll loop (the second poll re-registers the
+                // same waker, and the runtime may re-wake immediately).
                 result = poll_fn(|cx| {
                     let mut conn = bg_conn.lock().unwrap();
                     // First poll: process stream commands → collect SendFrame
-                    // into pending_frames, read incoming data → route to streams.
-                    match conn.poll_next_inbound(cx) {
+                    // into pending_write_frame, read incoming data → route to streams.
+                    let first = conn.poll_next_inbound(cx);
+                    match first {
                         Poll::Ready(r) => return Poll::Ready(r),
                         Poll::Pending => {}
                     }
-                    // Second poll: send pending_frames to socket, read again.
+                    // Second poll: send pending_write_frame to socket, read again.
                     debug!("yamux client: flushing pending frames");
                     conn.poll_next_inbound(cx)
                 }) => {

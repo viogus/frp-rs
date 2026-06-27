@@ -106,16 +106,18 @@ impl Controller {
     }
 
     /// Create a session with a visitor writer (fresh connection path).
+    /// Returns `Err` when the global session cap is reached.
     pub async fn create_session_with_writer(
         &self,
         sid: String,
         proxy_name: String,
         visitor_msg: msg::NatHoleVisitor,
         writer: Box<dyn AsyncWrite + Send + Unpin>,
-    ) -> (Arc<Session>, oneshot::Receiver<msg::NatHoleReport>) {
+    ) -> Result<(Arc<Session>, oneshot::Receiver<msg::NatHoleReport>), String> {
         // Session cap: prevent unbounded memory growth under load.
         if self.sessions.read().await.len() >= MAX_SESSIONS {
             warn!("NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session");
+            return Err(format!("NAT hole session limit reached ({MAX_SESSIONS})"));
         }
         let (report_tx, report_rx) = oneshot::channel();
         let session = Arc::new(Session {
@@ -137,17 +139,23 @@ impl Controller {
             .write()
             .await
             .insert(sid.clone(), session.clone());
-        (session, report_rx)
+        Ok((session, report_rx))
     }
 
     /// Create a session for the control-connection path (Go frp compat).
+    /// Returns `Err` when the global session cap is reached.
     pub async fn create_session_with_ctl(
         &self,
         sid: String,
         proxy_name: String,
         visitor_msg: msg::NatHoleVisitor,
         visitor_ctl_tx: mpsc::UnboundedSender<InternalMsg>,
-    ) -> (Arc<Session>, oneshot::Receiver<msg::NatHoleReport>) {
+    ) -> Result<(Arc<Session>, oneshot::Receiver<msg::NatHoleReport>), String> {
+        // Session cap: prevent unbounded memory growth under load.
+        if self.sessions.read().await.len() >= MAX_SESSIONS {
+            warn!("NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session");
+            return Err(format!("NAT hole session limit reached ({MAX_SESSIONS})"));
+        }
         let (report_tx, report_rx) = oneshot::channel();
         let (notify_tx, _notify_rx) = oneshot::channel();
         let session = Arc::new(Session {
@@ -169,7 +177,7 @@ impl Controller {
             .write()
             .await
             .insert(sid.clone(), session.clone());
-        (session, report_rx)
+        Ok((session, report_rx))
     }
 
     /// Handle the provider's NatHoleClient response (with STUN addresses).
@@ -339,6 +347,7 @@ pub fn gen_analysis_key(c: &NatFeature, v: &NatFeature) -> String {
 
 /// Build a NatHoleResp with detect_behavior filled in.
 /// Go frp v0.69.1 compat: newNatHoleResponse in controller.go
+#[allow(clippy::too_many_arguments)]
 pub fn build_nat_hole_response(
     transaction_id: &str,
     sid: &str,
