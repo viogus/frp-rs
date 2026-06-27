@@ -13,61 +13,75 @@ use crate::protocol::{V2_FRAME_TYPE_CLIENT_HELLO, V2_FRAME_TYPE_SERVER_HELLO, V2
 // Handshake JSON structures (matching Go frp wire.go)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BootstrapInfo {
+    #[serde(default)]
     pub transport: String,
+    #[serde(default)]
     pub tls: bool,
-    #[serde(rename = "tcpMux")]
+    #[serde(default, rename = "tcpMux")]
     pub tcp_mux: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MessageCapabilities {
+    #[serde(default)]
     pub codecs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CryptoCapabilities {
+    #[serde(default)]
     pub algorithms: Vec<String>,
-    #[serde(rename = "clientRandom", skip_serializing_if = "Option::is_none")]
-    pub client_random: Option<Vec<u8>>,
+    // Go json encodes []byte as base64 string; accept String for now (crypto deferred).
+    #[serde(default, rename = "clientRandom")]
+    pub client_random: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClientCapabilities {
+    #[serde(default)]
     pub message: MessageCapabilities,
+    #[serde(default)]
     pub crypto: CryptoCapabilities,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClientHello {
+    #[serde(default)]
     pub bootstrap: BootstrapInfo,
+    #[serde(default)]
     pub capabilities: ClientCapabilities,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MessageSelection {
+    #[serde(default)]
     pub codec: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CryptoSelection {
+    #[serde(default)]
     pub algorithm: String,
-    #[serde(rename = "serverRandom")]
-    pub server_random: Vec<u8>,
+    // Go json encodes []byte as base64 string; accept String for now (crypto deferred).
+    #[serde(default, rename = "serverRandom")]
+    pub server_random: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerSelection {
+    #[serde(default)]
     pub message: MessageSelection,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crypto: Option<CryptoSelection>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerHello {
+    #[serde(default)]
     pub selected: ServerSelection,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
