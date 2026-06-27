@@ -250,6 +250,9 @@ impl Service {
                 .get(&p.name)
                 .cloned()
                 .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
+            let plugin_type = p.plugin.as_ref()
+                .map(|pl| pl.plugin_type.clone())
+                .unwrap_or_default();
             map.insert(p.name.clone(), ProxyRuntimeInfo {
                 local_addr,
                 proxy_type: p.proxy_type.clone(),
@@ -258,6 +261,9 @@ impl Service {
                 bandwidth_limit: bw_limit,
                 bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
                 proxy_protocol_version: p.proxy_protocol_version.clone(),
+                plugin: plugin_type,
+                remote_addr: String::new(),
+                err: String::new(),
             });
         }
         let proxy_info_map = Arc::new(RwLock::new(map));
@@ -495,10 +501,22 @@ impl Service {
                     .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
                 match ctl.register_proxy(p, &local_addr, &mut control_stream).await {
                     Ok(resp) => {
-                        info!("Proxy '{}' registered on remote port {:?}", p.name, resp.remote_addr);
+                        let remote = resp.remote_addr
+                            .unwrap_or_else(|| format!("0.0.0.0:{}", p.remote_port));
+                        info!("Proxy '{}' registered on remote port {}", p.name, remote);
+                        // Update runtime info for admin API
+                        let mut map = self.proxy_info_map.write().await;
+                        if let Some(info) = map.get_mut(&p.name) {
+                            info.remote_addr = remote;
+                            info.err.clear();
+                        }
                     }
                     Err(e) => {
                         warn!("Failed to register proxy '{}': {}", p.name, e);
+                        let mut map = self.proxy_info_map.write().await;
+                        if let Some(info) = map.get_mut(&p.name) {
+                            info.err = e.to_string();
+                        }
                     }
                 }
             }
@@ -918,6 +936,9 @@ impl Service {
                 if let Some(p) = new_cfg.proxies.iter().find(|p| &p.name == name) {
                     let bw_limit = frp_core::config::parse_bandwidth_limit(&p.bandwidth_limit).unwrap_or(0);
                     let local_addr = format!("{}:{}", p.local_ip, p.local_port);
+                    let plugin_type = p.plugin.as_ref()
+                        .map(|pl| pl.plugin_type.clone())
+                        .unwrap_or_default();
                     map.insert(name.clone(), ProxyRuntimeInfo {
                         local_addr,
                         proxy_type: p.proxy_type.clone(),
@@ -926,6 +947,9 @@ impl Service {
                         bandwidth_limit: bw_limit,
                         bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
                         proxy_protocol_version: p.proxy_protocol_version.clone(),
+                        plugin: plugin_type,
+                        remote_addr: String::new(),
+                        err: String::new(),
                     });
                 }
             }

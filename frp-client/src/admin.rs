@@ -22,6 +22,12 @@ pub struct ProxyRuntimeInfo {
     pub bandwidth_limit: u64,
     pub bandwidth_limit_mode: String,
     pub proxy_protocol_version: String,
+    /// Plugin type (e.g. "http_proxy", "socks5"). Empty if no plugin.
+    pub plugin: String,
+    /// Remote address assigned by frps (from NewProxyResp).
+    pub remote_addr: String,
+    /// Last registration error, if any. Cleared on success.
+    pub err: String,
 }
 
 // --- Types ---
@@ -59,14 +65,15 @@ async fn handle_status(State(state): State<AdminState>) -> Json<serde_json::Valu
     let mut by_type: HashMap<String, Vec<ProxyStatusEntry>> = HashMap::new();
 
     for (name, info) in proxies.iter() {
+        let status = if !info.err.is_empty() { "error" } else { "online" };
         let entry = ProxyStatusEntry {
             name: name.clone(),
             proxy_type: info.proxy_type.clone(),
-            status: "online".into(),
+            status: status.into(),
             local_addr: info.local_addr.clone(),
-            remote_addr: String::new(),
-            plugin: String::new(),
-            err: String::new(),
+            remote_addr: info.remote_addr.clone(),
+            plugin: info.plugin.clone(),
+            err: info.err.clone(),
         };
         by_type.entry(info.proxy_type.clone()).or_default().push(entry);
     }
