@@ -642,4 +642,172 @@ mod tests {
         let result = write_v2_frame_raw(&mut buf, 16, 0, &oversized).await;
         assert!(result.is_err(), "should reject oversized payload");
     }
+
+    #[tokio::test]
+    async fn test_v2_frame_raw_rejects_nonzero_flags() {
+        let (mut client, mut server) = duplex(65536);
+        // Write frame with flags=1 (unsupported) manually
+        let mut header = [0u8; 8];
+        header[0..2].copy_from_slice(&V2_FRAME_TYPE_MESSAGE.to_be_bytes());
+        header[2..4].copy_from_slice(&1u16.to_be_bytes()); // flags=1
+        header[4..8].copy_from_slice(&4u32.to_be_bytes()); // len=4
+        client.write_all(&header).await.unwrap();
+        client.write_all(b"data").await.unwrap();
+        drop(client);
+
+        let result = read_v2_frame_raw(&mut server).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("flags"));
+    }
+
+    #[tokio::test]
+    async fn test_v2_frame_raw_oversized_payload() {
+        let mut buf = Vec::new();
+        let oversized = vec![0u8; (V2_MAX_FRAME_PAYLOAD + 1) as usize];
+        let result = write_v2_frame_raw(&mut buf, V2_FRAME_TYPE_MESSAGE, 0, &oversized).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn test_v2_msg_18_types_roundtrip() {
+        // Test all 18 V2 message types survive encode -> decode roundtrip.
+        // Skip CloseProxyResp and Error (V1-only, v2_type_id returns 0).
+        // Construct each message with minimal valid fields (no Default on most).
+        fn test_addr() -> msg::UdpAddr {
+            msg::UdpAddr { ip: "0.0.0.0".into(), port: 0, zone: String::new() }
+        }
+
+        let messages: Vec<FrpMessage> = vec![
+            FrpMessage::Login(msg::Login {
+                version: Some("1.0".into()), hostname: Some("h".into()),
+                os: None, arch: None, user: None, run_id: None, client_id: None,
+                pool_count: None, timestamp: None, privilege_key: None,
+                metas: None, client_spec: None, multiplexer: None,
+            }),
+            FrpMessage::LoginResp(msg::LoginResp {
+                version: None, run_id: None, error: None,
+                server_additional_auth_scopes: None,
+            }),
+            FrpMessage::NewProxy(msg::NewProxy {
+                proxy_name: "p".into(), proxy_type: "tcp".into(),
+                use_encryption: None, use_compression: None, group: None,
+                group_key: None, local_str: None, remote_port: None, sk: None,
+                custom_domains: None, subdomain: None, locations: None,
+                http_user: None, http_pwd: None, host_header_rewrite: None,
+                headers: None, response_headers: None, route_by_http_user: None,
+                allow_users: None, bandwidth_limit: None, bandwidth_limit_mode: None,
+                annotations: None, metas: None, multiplexer: None, virtual_net: None,
+                proxy_protocol_version: None,
+            }),
+            FrpMessage::NewProxyResp(msg::NewProxyResp {
+                proxy_name: "p".into(), remote_addr: None, error: None,
+            }),
+            FrpMessage::CloseProxy(msg::CloseProxy { proxy_name: "p".into() }),
+            FrpMessage::NewWorkConn(msg::NewWorkConn {
+                run_id: None, timestamp: None, privilege_key: None,
+            }),
+            FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
+            FrpMessage::StartWorkConn(msg::StartWorkConn {
+                proxy_name: "p".into(), src_addr: None, src_port: None,
+                dst_addr: None, dst_port: None, error: None,
+            }),
+            FrpMessage::NewVisitorConn(msg::NewVisitorConn {
+                proxy_name: "p".into(), sign_key: None, timestamp: None,
+                run_id: None, use_encryption: None, use_compression: None,
+            }),
+            FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
+                proxy_name: "p".into(), error: None,
+            }),
+            FrpMessage::Ping(msg::Ping { privilege_key: None, timestamp: Some(42) }),
+            FrpMessage::Pong(msg::Pong { error: None }),
+            FrpMessage::UDPPacket(msg::UDPPacket {
+                content: b"hello".to_vec(),
+                local_addr: Some(test_addr()),
+                remote_addr: Some(test_addr()),
+            }),
+            FrpMessage::NatHoleVisitor(msg::NatHoleVisitor::default()),
+            FrpMessage::NatHoleClient(msg::NatHoleClient::default()),
+            FrpMessage::NatHoleResp(msg::NatHoleResp::default()),
+            FrpMessage::NatHoleSid(msg::NatHoleSid { sid: None, provider_addr: None }),
+            FrpMessage::NatHoleReport(msg::NatHoleReport { sid: None }),
+        ];
+
+        for msg in &messages {
+            let (mut client, mut server) = duplex(65536);
+            write_msg_v2(&mut client, msg).await.expect("write v2");
+            let back = read_msg_v2(&mut server).await.expect("read v2");
+            assert_eq!(back.v2_type_id(), msg.v2_type_id(),
+                "roundtrip type mismatch for {:?}", msg.v2_type_id());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v2_msg_unknown_type_id() {
+        let (mut client, mut server) = duplex(65536);
+        // Write frame type=Message with type_id=99 and empty JSON payload
+        let mut payload = vec![0u8; 2];
+        payload[0..2].copy_from_slice(&99u16.to_be_bytes());
+        write_v2_frame_raw(&mut client, V2_FRAME_TYPE_MESSAGE, 0, &payload).await.unwrap();
+        drop(client);
+
+        let result = read_msg_v2(&mut server).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown V2 message type ID: 99"));
+    }
+
+    #[tokio::test]
+    async fn test_v2_msg_payload_too_short() {
+        let (mut client, mut server) = duplex(65536);
+        // Write frame type=Message with only 1 byte payload (need 2 for type_id)
+        write_v2_frame_raw(&mut client, V2_FRAME_TYPE_MESSAGE, 0, b"x").await.unwrap();
+        drop(client);
+
+        let result = read_msg_v2(&mut server).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too short"));
+    }
+
+    #[tokio::test]
+    async fn test_v2_msg_wrong_frame_type() {
+        let (mut client, mut server) = duplex(65536);
+        // Write frame with type=ClientHello(1) — read_msg_v2 should reject
+        write_v2_frame_raw(&mut client, V2_FRAME_TYPE_CLIENT_HELLO, 0, b"{}").await.unwrap();
+        drop(client);
+
+        let result = read_msg_v2(&mut server).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unexpected V2 frame type: 1"));
+    }
+
+    #[tokio::test]
+    async fn test_v2_msg_login_content() {
+        let (mut client, mut server) = duplex(65536);
+        let msg = FrpMessage::Login(msg::Login {
+            version: Some("0.69.1".into()),
+            hostname: Some("testhost".into()),
+            os: Some("linux".into()),
+            arch: None,
+            user: None,
+            run_id: None,
+            client_id: None,
+            pool_count: Some(3),
+            timestamp: Some(1234567890),
+            privilege_key: Some("abc123".into()),
+            metas: None,
+            client_spec: None,
+            multiplexer: Some("yamux".into()),
+        });
+        write_msg_v2(&mut client, &msg).await.expect("write");
+        let result = read_msg_v2(&mut server).await.expect("read");
+        match result {
+            FrpMessage::Login(login) => {
+                assert_eq!(login.version.as_deref(), Some("0.69.1"));
+                assert_eq!(login.hostname.as_deref(), Some("testhost"));
+                assert_eq!(login.pool_count, Some(3));
+                assert_eq!(login.multiplexer.as_deref(), Some("yamux"));
+            }
+            other => panic!("expected Login, got {:?}", other.v2_type_id()),
+        }
+    }
 }
