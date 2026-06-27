@@ -138,28 +138,11 @@ impl ControlConnection {
             // TODO: V2 handshake over QUIC when V2+QUIC interop needed.
             (IoStream::Quic(stream), None, Some(qc))
         } else {
-            let mut raw_stream = dial_server(&opts).await?;
+            let raw_stream = dial_server(&opts).await?;
 
-            // V2: ClientHello/ServerHello handshake on raw stream BEFORE yamux.
-            if self.v2 {
-                let transport_name = match self.transport_protocol {
-                    TransportProtocol::Tcp => "tcp",
-                    TransportProtocol::Kcp => "kcp",
-                    TransportProtocol::WebSocket => "websocket",
-                    TransportProtocol::Wss => "wss",
-                    _ => "tcp",
-                };
-                frp_core::v2_handshake::v2_handshake_client(
-                    &mut raw_stream,
-                    transport_name,
-                    self.tls_enable,
-                    self.tcp_mux,
-                ).await?;
-            }
-
-            // Wrap in yamux BEFORE any protocol communication if proposing mux.
-            // The Go frp server wraps its side on accept, so the client must
-            // wrap before sending its first frame.
+            // Wrap in yamux BEFORE V2 handshake (matches Go frp flow).
+            // The server wraps its side on accept, so the client must wrap
+            // before sending ClientHello.
             if propose_mux {
                 let mux_cfg = mux::TcpMuxConfig::default();
                 match raw_stream {
@@ -182,9 +165,27 @@ impl ControlConnection {
                     }
                 }
             } else {
+                // No yamux: raw stream directly (V2 handshake happens below).
                 (raw_stream, None, None)
             }
         };
+
+        // V2: ClientHello/ServerHello handshake on yamux-wrapped stream.
+        if self.v2 {
+            let transport_name = match self.transport_protocol {
+                TransportProtocol::Tcp => "tcp",
+                TransportProtocol::Kcp => "kcp",
+                TransportProtocol::Quic => "quic",
+                TransportProtocol::WebSocket => "websocket",
+                TransportProtocol::Wss => "wss",
+            };
+            frp_core::v2_handshake::v2_handshake_client(
+                &mut io_stream,
+                transport_name,
+                self.tls_enable,
+                self.tcp_mux,
+            ).await?;
+        }
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
