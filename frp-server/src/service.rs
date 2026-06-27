@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 use tokio::net::TcpListener;
 use tokio::io::AsyncReadExt;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use tracing::{info, error, warn, debug};
 
@@ -22,7 +22,8 @@ use frp_core::metrics::ProxyMetricsRegistry;
 
 use crate::proxy::ProxyManager;
 use crate::control;
-use crate::nat_hole::NatHoleCoordinator;
+use crate::nathole::controller::{self as nathole_ctrl, Controller};
+use crate::nathole::{classify, NAT_HOLE_TIMEOUT};
 use crate::vhost::VhostManager;
 use crate::tcpmux::TcpMuxManager;
 
@@ -114,7 +115,7 @@ pub struct AppState {
     pub tls_only: bool,
     pub oidc_verifier: Option<Arc<OidcVerifier>>,
     pub oidc_subjects: Arc<RwLock<HashMap<String, String>>>,
-    pub nat_hole: Arc<NatHoleCoordinator>,
+    pub nat_hole: Arc<Controller>,
     /// Shared UDP port for SUDP proxies. When > 0, all SUDP proxies
     /// use this port instead of their individual remote_port.
     pub sudp_port: u16,
@@ -159,7 +160,7 @@ impl AppState {
             tls_only,
             oidc_verifier,
             oidc_subjects: Arc::new(RwLock::new(HashMap::new())),
-            nat_hole: Arc::new(NatHoleCoordinator::new()),
+            nat_hole: Arc::new(Controller::new(Duration::from_secs(3600))),
             tcpmux_manager: Arc::new(TcpMuxManager::new()),
             proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
             sudp_port,
@@ -572,6 +573,11 @@ impl Service {
             loop {
                 interval.tick().await;
                 nat_hole.expire_sessions(Duration::from_secs(120)).await;
+                // Clean expired analyzer entries to prevent unbounded memory growth.
+                let (removed, total) = nat_hole.analyzer.clean();
+                if removed > 0 {
+                    tracing::debug!("Analyzer cleanup: removed {}/{} expired entries", removed, total);
+                }
             }
         });
 
@@ -1240,37 +1246,32 @@ async fn handle_nat_hole_visitor(
         }
     };
 
-    // Split the stream: writer goes into the NAT session for forwarding
-    // NatHoleSid/NatHoleReport. The reader is held as a connection-lifecycle
-    // handle — it is never read (the visitor opens a fresh connection for
-    // STCP fallback). Dropping it signals connection close.
-    let (reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
+    let sid = transaction_id.clone();
 
-    // Send NatHoleResp to visitor with available address info.
-    // Echo visitor's own mapped/assisted addrs — provider's addrs are
-    // relayed later via NatHoleResp forwarding. Go frp v0.69.1 compat.
-    let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-        transaction_id: transaction_id.clone(),
-        error: None,
-        sid: Some(transaction_id.clone()),
-        protocol: msg.protocol.clone(),
-        candidate_addrs: msg.mapped_addrs.clone(),
-        assisted_addrs: msg.assisted_addrs.clone(),
-    });
-    let _ = write_msg_v1(&mut writer, &resp).await;
-
-    // Create NAT session and get report receiver
-    let report_rx = state
+    // --- Step 1: Create session and notify provider ---
+    let (session, report_rx) = state
         .nat_hole
-        .create_session(transaction_id.clone(), proxy_name.clone(), writer)
+        .create_session_with_writer(
+            sid.clone(),
+            proxy_name.clone(),
+            msg.clone(),
+            writer,
+        )
         .await;
 
-    info!(
-        "NatHoleVisitor for proxy '{}': created session {}",
-        proxy_name, transaction_id
-    );
+    // --- Step 2: Set up notify channel BEFORE sending to provider ---
+    // Must happen before the provider notification to avoid a race:
+    // if the provider responds with NatHoleClient before we set up
+    // notify_rx, the signal is lost and we timeout spuriously.
+    let notify_rx = {
+        let mut guard = session.notify_ch.lock().await;
+        let (tx, rx) = oneshot::channel();
+        *guard = Some(tx);
+        rx
+    };
 
-    // Send NatHoleClient to provider
+    // Send NatHoleClient to provider (notification + address info)
     if ctl_tx
         .tx
         .send(InternalMsg::NatHoleClient {
@@ -1285,33 +1286,172 @@ async fn handle_nat_hole_visitor(
         return;
     }
 
-    // Wait for the provider to complete the hole punch (via report oneshot)
-    // 30s timeout — generous to cover hole punch attempt
+    info!(
+        "NatHoleVisitor for proxy '{}': created session {}, waiting for provider",
+        proxy_name, sid
+    );
+
+    // Wait for provider's NatHoleClient with STUN addresses.
+    // The provider's control handler will do STUN discovery and send
+    // NatHoleClient back with mapped_addrs/assisted_addrs.
+    // handle_client() signals notify_ch when the message arrives.
+
+    let client_msg_received = tokio::time::timeout(
+        Duration::from_secs(NAT_HOLE_TIMEOUT),
+        notify_rx,
+    )
+    .await;
+
+    if client_msg_received.is_err() {
+        warn!(
+            "NatHole session {}: timeout waiting for provider NatHoleClient",
+            sid
+        );
+        let mut writer_guard = session.visitor_writer.lock().await;
+        if let Some(ref mut w) = *writer_guard {
+            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                transaction_id: transaction_id.clone(),
+                error: Some("provider NAT detection timeout".into()),
+                ..Default::default()
+            });
+            let _ = write_msg_v1(w, &resp).await;
+        }
+        state.nat_hole.remove(&sid).await;
+        drop(reader);
+        return;
+    }
+
+    // --- Step 3: Get provider's addresses from session ---
+    let client_msg_opt = session.client_msg.lock().await.take();
+    let client_msg = match client_msg_opt {
+        Some(m) => m,
+        None => {
+            warn!("NatHole session {}: no client message after notify", sid);
+            state.nat_hole.remove(&sid).await;
+            drop(reader);
+            return;
+        }
+    };
+
+    let client_mapped = client_msg.mapped_addrs.unwrap_or_default();
+    let client_assisted = client_msg.assisted_addrs.unwrap_or_default();
+    let visitor_mapped = msg.mapped_addrs.unwrap_or_default();
+    let visitor_assisted = msg.assisted_addrs.unwrap_or_default();
+
+    // --- Step 4: Classify both NAT features ---
+    let v_feature = classify::classify_nat_feature(&visitor_mapped, &[]).ok();
+    let c_feature = classify::classify_nat_feature(&client_mapped, &[]).ok();
+
+    // Store features on session
+    if let Some(ref vf) = v_feature {
+        *session.v_nat_feature.lock().await = Some(vf.clone());
+    }
+    if let Some(ref cf) = c_feature {
+        *session.c_nat_feature.lock().await = Some(cf.clone());
+    }
+
+    // --- Step 5: Run analysis and build responses ---
+    let (v_resp, c_resp) = if let (Some(ref vf), Some(ref cf)) = (&v_feature, &c_feature) {
+        let key = nathole_ctrl::gen_analysis_key(cf, vf);
+        let (mode, _index, c_behavior, v_behavior) =
+            state.nat_hole.analyzer.get_recommand_behaviors(&key, cf, vf);
+
+        let timeout_ms = c_behavior.send_delay_ms.max(v_behavior.send_delay_ms) + 5000;
+        let v_read_timeout = timeout_ms - v_behavior.send_delay_ms;
+        let c_read_timeout = timeout_ms - c_behavior.send_delay_ms;
+        let c_ports_diff = cf.ports_difference;
+        let v_ports_diff = vf.ports_difference;
+
+        let v_resp = nathole_ctrl::build_nat_hole_response(
+            &transaction_id,
+            &sid,
+            msg.protocol.clone(),
+            mode,
+            client_mapped.clone(),  // visitor gets PROVIDER's addresses
+            client_assisted.clone(),
+            v_behavior,
+            v_read_timeout,
+            c_ports_diff,
+        );
+
+        let c_resp = nathole_ctrl::build_nat_hole_response(
+            &client_msg.transaction_id,
+            &sid,
+            client_msg.protocol.clone(),
+            mode,
+            visitor_mapped.clone(),  // provider gets VISITOR's addresses
+            visitor_assisted.clone(),
+            c_behavior,
+            c_read_timeout,
+            v_ports_diff,
+        );
+
+        (v_resp, Some(c_resp))
+    } else {
+        // Fallback: simple exchange without analysis
+        let v_resp = msg::NatHoleResp {
+            transaction_id: transaction_id.clone(),
+            error: None,
+            sid: Some(sid.clone()),
+            protocol: msg.protocol.clone(),
+            candidate_addrs: if client_mapped.is_empty() { None } else { Some(client_mapped) },
+            assisted_addrs: if client_assisted.is_empty() { None } else { Some(client_assisted) },
+            ..Default::default()
+        };
+        let c_resp = msg::NatHoleResp {
+            transaction_id: client_msg.transaction_id.clone(),
+            error: None,
+            sid: Some(sid.clone()),
+            protocol: client_msg.protocol.clone(),
+            candidate_addrs: if visitor_mapped.is_empty() { None } else { Some(visitor_mapped) },
+            assisted_addrs: if visitor_assisted.is_empty() { None } else { Some(visitor_assisted) },
+            ..Default::default()
+        };
+        (v_resp, Some(c_resp))
+    };
+
+    // Store v_resp for reporting
+    *session.v_resp.lock().await = Some(v_resp.clone());
+
+    // --- Step 6: Send NatHoleResp to both sides ---
+    // Send to visitor via writer
+    {
+        let mut writer_guard = session.visitor_writer.lock().await;
+        if let Some(ref mut w) = *writer_guard {
+            let _ = write_msg_v1(w, &FrpMessage::NatHoleResp(v_resp)).await;
+        }
+    }
+
+    // Send to provider via control channel
+    if let Some(ref cr) = c_resp {
+        let _ = ctl_tx.tx.send(InternalMsg::WriteNatHoleResp {
+            transaction_id: cr.transaction_id.clone(),
+            error: cr.error.clone(),
+            sid: cr.sid.clone(),
+            protocol: cr.protocol.clone(),
+            candidate_addrs: cr.candidate_addrs.clone(),
+            assisted_addrs: cr.assisted_addrs.clone(),
+        });
+    }
+
+    info!("NatHole session {}: NatHoleResp sent to both sides", sid);
+
+    // --- Step 7: Wait for report ---
     match tokio::time::timeout(Duration::from_secs(30), report_rx).await {
         Ok(Ok(_report)) => {
-            debug!("NatHole session {}: provider completed", transaction_id);
-            // The writer has already been dropped by complete().
-            // If visitor wants STCP fallback, it opens a new connection.
+            debug!("NatHole session {}: provider completed", sid);
         }
         Ok(Err(_)) => {
-            debug!(
-                "NatHole session {}: provider dropped without report",
-                transaction_id
-            );
-            state.nat_hole.remove(&transaction_id).await;
+            debug!("NatHole session {}: provider dropped without report", sid);
+            state.nat_hole.remove(&sid).await;
         }
         Err(_) => {
-            warn!(
-                "NatHole session {}: timed out waiting for provider report",
-                transaction_id
-            );
-            state.nat_hole.remove(&transaction_id).await;
-            // Can't write back — writer is in the session which just got
-            // removed. Connection closure signals the error to the visitor.
+            warn!("NatHole session {}: timed out waiting for provider report", sid);
+            state.nat_hole.remove(&sid).await;
             drop(reader);
         }
     }
-    // reader is dropped here — connection closes
+    // reader dropped → connection closes
 }
 
 /// Handle an incoming work connection. Verifies auth, then routes the

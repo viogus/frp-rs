@@ -2285,7 +2285,7 @@ TOML
     fi
 
     local result
-    result=$(send_and_expect "$visitor_port" "xtcp-g2r-data" "xtcp-g2r-data" 5)
+    result=$(send_and_expect "$visitor_port" "xtcp-g2r-data" "xtcp-g2r-data" 15)
     if [[ "$result" == OK:* ]]; then
         pass_test "$name"
     else
@@ -2373,7 +2373,7 @@ TOML
     fi
 
     local result
-    result=$(send_and_expect "$visitor_port" "r2g-xtcp-data" "r2g-xtcp-data" 5)
+    result=$(send_and_expect "$visitor_port" "r2g-xtcp-data" "r2g-xtcp-data" 15)
     if [[ "$result" == OK:* ]]; then
         pass_test "$name"
     else
@@ -2777,9 +2777,8 @@ test_g2r_tcpmux
 test_r2g_tcpmux
 test_g2r_stcp
 test_r2g_stcp
-# XTCP disabled: Go frp v0.69.1 uses QUIC-based NAT detection + candidate
-# address exchange. Re-enable when full provider-side NAT hole punch is done.
-# test_g2r_xtcp
+# XTCP Go-Rust: server coordinates NAT analysis and address exchange.
+# test_g2r_xtcp  # guarded: Go frp XTCP protocol doesn't interoperate (TCP simultaneous open vs QUIC NAT probes)
 # test_r2g_xtcp
 
 # Phase 5: Multi-proxy and edge cases
