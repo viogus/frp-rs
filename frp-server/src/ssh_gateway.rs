@@ -179,21 +179,68 @@ impl VirtualControl {
 
         // Spawn background task that bridges the duplex to the mpsc channels,
         // with encryption matching handle_control's CipherStream.
+        //
+        // handle_control writes LoginResp as PLAINTEXT before wrapping its side
+        // in CipherStream. To keep both sides' CFB state in sync, we consume
+        // the plaintext LoginResp from the raw stream BEFORE wrapping our side
+        // in CipherStream.
         tokio::spawn(async move {
-            // Wrap the ENTIRE duplex side in CipherStream first, then split.
-            // This avoids the ReadHalf/WriteHalf trait bound issue.
+            use tokio::io::AsyncReadExt;
+            use tokio::io::AsyncWriteExt;
+
+            const V1_HDR: usize = 9;
+            let mut buf = vec![0u8; 65536];
+            let mut accumulated = Vec::new();
+            let mut from_ssh = from_ssh;
+
+            // ---- Phase 1: consume plaintext LoginResp from raw stream ----
+            loop {
+                match from_ssh.read(&mut buf).await {
+                    Ok(0) => return,
+                    Ok(n) => {
+                        accumulated.extend_from_slice(&buf[..n]);
+                        if accumulated.len() >= V1_HDR {
+                            let plen = u64::from_be_bytes(
+                                accumulated[1..V1_HDR].try_into().unwrap(),
+                            ) as usize;
+                            if plen > 65536 {
+                                return;
+                            }
+                            if accumulated.len() >= V1_HDR + plen {
+                                // Drop LoginResp; keep extra bytes (unlikely, see below)
+                                let extra =
+                                    accumulated[V1_HDR + plen..].to_vec();
+                                accumulated = extra;
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+
+            // Extra bytes after LoginResp are encrypted data that was read
+            // ahead of the CipherStream. In practice unreachable:
+            // handle_control writes LoginResp synchronously then wraps in
+            // CipherStream — no other data is interleaved. Warn + discard.
+            if !accumulated.is_empty() {
+                tracing::warn!(
+                    "bridge: {} extra bytes after LoginResp, discarding",
+                    accumulated.len()
+                );
+                accumulated.clear();
+            }
+
+            // ---- Phase 2: wrap in CipherStream, split for concurrent r/w ----
             let encrypted = frp_core::cipher_stream::CipherStream::new(
                 Box::new(from_ssh),
                 enc_key,
             );
             let (mut enc_reader, mut enc_writer) = tokio::io::split(encrypted);
-
-            use tokio::io::AsyncReadExt;
-            use tokio::io::AsyncWriteExt;
-
             let read_work_tx = work_tx;
+            drop(accumulated); // free the LoginResp-phase buffer
 
-            // Read loop: decrypt data from handle_control, intercept ReqWorkConn
+            // Read task: decrypt V1 frames, intercept ReqWorkConn
             let read_task: tokio::task::JoinHandle<()> = tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
                 let mut accumulated = Vec::new();
@@ -202,18 +249,28 @@ impl VirtualControl {
                         Ok(0) => break,
                         Ok(n) => {
                             accumulated.extend_from_slice(&buf[..n]);
-                            const V1_HDR: usize = 9;
                             while accumulated.len() >= V1_HDR {
                                 let plen = u64::from_be_bytes([
-                                    accumulated[1], accumulated[2], accumulated[3],
-                                    accumulated[4], accumulated[5], accumulated[6],
-                                    accumulated[7], accumulated[8],
+                                    accumulated[1],
+                                    accumulated[2],
+                                    accumulated[3],
+                                    accumulated[4],
+                                    accumulated[5],
+                                    accumulated[6],
+                                    accumulated[7],
+                                    accumulated[8],
                                 ]) as usize;
-                                if plen > 65536 || accumulated.len() < V1_HDR + plen {
+                                if plen > 65536
+                                    || accumulated.len() < V1_HDR + plen
+                                {
                                     break;
                                 }
-                                if accumulated[0] == frp_core::msg::TYPE_REQ_WORK_CONN {
-                                    tracing::debug!("bridge: intercepted ReqWorkConn -> WorkConnRequest");
+                                if accumulated[0]
+                                    == frp_core::msg::TYPE_REQ_WORK_CONN
+                                {
+                                    tracing::debug!(
+                                        "bridge: intercepted ReqWorkConn -> WorkConnRequest"
+                                    );
                                     let _ = read_work_tx.send(WorkConnRequest {
                                         proxy_name: String::new(),
                                     });
@@ -226,7 +283,7 @@ impl VirtualControl {
                 }
             });
 
-            // Write loop: read plain V1 frames from mpsc, encrypt, write to duplex
+            // Write loop: encrypt outgoing V1 frames through CipherStream
             while let Some(frame) = frame_rx.recv().await {
                 if enc_writer.write_all(&frame).await.is_err() {
                     break;
@@ -1108,29 +1165,59 @@ mod key_tests {
 mod virtual_ctrl_tests {
     use super::*;
 
+    /// Helper: build a plaintext LoginResp V1 frame matching what
+    /// handle_control writes before wrapping in CipherStream.
+    fn make_login_resp_frame() -> Vec<u8> {
+        let payload = br#"{"version":"0.69.1","run_id":"test"}"#;
+        let mut frame = Vec::with_capacity(9 + payload.len());
+        frame.push(frp_core::msg::TYPE_LOGIN_RESP);
+        frame.extend_from_slice(&(payload.len() as i64).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// Helper: write a LoginResp to `vc` so the VirtualControl bg task
+    /// can consume it (Phase 1) and transition to encrypted mode (Phase 2).
+    async fn feed_login_resp(
+        vc: &mut (impl tokio::io::AsyncWrite + Unpin),
+    ) {
+        use tokio::io::AsyncWriteExt;
+        vc.write_all(&make_login_resp_frame()).await.unwrap();
+        // Small yield so the bg task processes the LoginResp before
+        // subsequent writes arrive through the CipherStream.
+        tokio::task::yield_now().await;
+    }
+
     #[tokio::test]
     async fn test_virtual_control_channel_creation() {
         // Verify VirtualControl::channel creates a working duplex + mpsc channels
         let enc_key = frp_core::encryption::derive_key("test-token");
-        let (_vc, tx, _work_rx) = VirtualControl::channel(enc_key);
+        let (mut vc, tx, _work_rx) = VirtualControl::channel(enc_key);
+        // Feed LoginResp so the bg task transitions to encrypted mode
+        feed_login_resp(&mut vc).await;
         // Channel should be alive — sending a frame should work
         assert!(tx.send(vec![0x04, 0, 0, 0, 0, 0, 0, 0, 0]).is_ok());
     }
 
     #[tokio::test]
     async fn test_virtual_control_channel_encrypted_roundtrip() {
-        // Send a plain V1 frame through the channel and verify it arrives
-        // on the other side (after encryption + decryption by CipherStream)
+        // Write a plain V1 frame through the encrypted channel and verify
+        // it arrives on the other side (after encryption + decryption).
         use tokio::io::AsyncReadExt;
         let enc_key = frp_core::encryption::derive_key("test-key");
         let (mut vc, tx, _work_rx) = VirtualControl::channel(enc_key);
 
-        // Plain frame: TYPE_NEW_PROXY (0x04) + 9-byte header with len=0
-        let frame = vec![0x04u8, 0, 0, 0, 0, 0, 0, 0, 0];
+        // Phase 1: feed plaintext LoginResp so the bg task starts encryption
+        feed_login_resp(&mut vc).await;
+
+        // Phase 2: send a plain frame through frame_tx. The bg task encrypts
+        // it and writes to the duplex. We read the encrypted data from vc
+        // (the to_handler end).
+        let frame = vec![0x04u8, 0, 0, 0, 0, 0, 0, 0, 0]; // TYPE_NEW_PROXY + 8-byte len
         tx.send(frame.clone()).unwrap();
         drop(tx);
 
-        // Read back from the other side — should get encrypted data
+        // Read back from vc — should get encrypted data
         let mut buf = [0u8; 4096];
         let n = vc.read(&mut buf).await.unwrap();
         assert!(n > 0, "should read data from encrypted channel");

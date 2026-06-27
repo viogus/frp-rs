@@ -6,3 +6,4 @@
 *.toml.bak
 Cargo.lock
 .worktrees/
+.autogen_ssh_key
