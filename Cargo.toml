@@ -44,6 +44,8 @@ prometheus = "0.13"
 lazy_static = "1.5"
 libc = "0.2"
 yamux = "0.14"
+russh = "0.61"
+russh-keys = "0.50.0-beta.7"
 tokio-util = { version = "0.7", features = ["compat"] }
 kcp = "0.6"
 quinn = "0.11"

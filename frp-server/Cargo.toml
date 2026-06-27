@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 frp-core = { path = "../frp-core" }
+russh = { workspace = true }
+russh-keys = { workspace = true }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
