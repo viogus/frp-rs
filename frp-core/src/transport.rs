@@ -708,6 +708,35 @@ impl IoStream {
         }
     }
 
+    /// Write a raw V2 frame (for handshake frames like ClientHello/ServerHello).
+    /// Lower-level than write_v2_frame — caller controls frame_type and raw payload bytes.
+    pub async fn write_raw_v2_frame(&mut self, frame_type: u16, flags: u16, payload: &[u8]) -> Result<(), crate::Error> {
+        match self {
+            IoStream::Tcp(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            IoStream::Tls(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            IoStream::Kcp(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            IoStream::Quic(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            IoStream::WebSocket(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            IoStream::Yamux(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            IoStream::Cipher(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            IoStream::SshChannel(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+        }
+    }
+
+    /// Read a raw V2 frame (for handshake). Returns (frame_type, flags, payload_bytes).
+    pub async fn read_raw_v2_frame(&mut self) -> Result<(u16, u16, Vec<u8>), crate::Error> {
+        match self {
+            IoStream::Tcp(s) => crate::protocol::read_v2_frame_raw(s).await,
+            IoStream::Tls(s) => crate::protocol::read_v2_frame_raw(s).await,
+            IoStream::Kcp(s) => crate::protocol::read_v2_frame_raw(s).await,
+            IoStream::Quic(s) => crate::protocol::read_v2_frame_raw(s).await,
+            IoStream::WebSocket(s) => crate::protocol::read_v2_frame_raw(s).await,
+            IoStream::Yamux(s) => crate::protocol::read_v2_frame_raw(s).await,
+            IoStream::Cipher(s) => crate::protocol::read_v2_frame_raw(s).await,
+            IoStream::SshChannel(s) => crate::protocol::read_v2_frame_raw(s).await,
+        }
+    }
+
     /// Get the peer address of this stream, if available.
     pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         match self {

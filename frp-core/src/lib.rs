@@ -13,6 +13,7 @@ pub mod admin_auth;
 pub mod args;
 pub mod kcp;
 pub mod quic;
+pub mod v2_handshake;
 
 use thiserror::Error;
 
