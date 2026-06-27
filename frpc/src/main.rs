@@ -128,26 +128,29 @@ async fn run(cli: CliArgs) {
     });
 
     // SIGUSR1 → config hot reload
-    let reload_svc = service.clone();
-    tokio::spawn(async move {
-        // SIGUSR1: 30 on macOS, 10 on Linux
-        #[cfg(target_os = "macos")]
-        const SIGUSR1: std::os::raw::c_int = 30;
-        #[cfg(not(target_os = "macos"))]
-        const SIGUSR1: std::os::raw::c_int = 10;
+    #[cfg(unix)]
+    {
+        let reload_svc = service.clone();
+        tokio::spawn(async move {
+            // SIGUSR1: 30 on macOS, 10 on Linux
+            #[cfg(target_os = "macos")]
+            const SIGUSR1: std::os::raw::c_int = 30;
+            #[cfg(not(target_os = "macos"))]
+            const SIGUSR1: std::os::raw::c_int = 10;
 
-        let mut sig = match signal::unix::signal(signal::unix::SignalKind::from_raw(SIGUSR1)) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("SIGUSR1 handler init failed: {}", e);
-                return;
+            let mut sig = match signal::unix::signal(signal::unix::SignalKind::from_raw(SIGUSR1)) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("SIGUSR1 handler init failed: {}", e);
+                    return;
+                }
+            };
+            loop {
+                sig.recv().await;
+                reload_svc.request_reload();
             }
-        };
-        loop {
-            sig.recv().await;
-            reload_svc.request_reload();
-        }
-    });
+        });
+    }
 
     if let Err(e) = service.run().await {
         tracing::error!("frpc error: {}", e);
