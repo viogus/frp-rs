@@ -4,33 +4,21 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWrite;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tracing::{trace, warn};
 
-use frp_core::msg::{self, FrpMessage, NatHoleDetectBehavior, PortsRange};
-use frp_core::protocol::write_msg_v1;
+use frp_core::msg::{self, NatHoleDetectBehavior, PortsRange};
 
 use crate::service::InternalMsg;
 use super::analysis::{Analyzer, RecommendBehavior};
 use super::classify::NatFeature;
 
-/// Generates unique transaction/session IDs.
-#[allow(dead_code)]
-static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-#[allow(dead_code)]
-fn gen_sid() -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let id = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}{}", ts, id)
-}
+/// Maximum concurrent NAT hole punch sessions.
+/// Prevents unbounded memory growth under load or attack.
+const MAX_SESSIONS: usize = 256;
 
 /// Provider registration for XTCP.
 pub struct ClientCfg {
@@ -125,6 +113,10 @@ impl Controller {
         visitor_msg: msg::NatHoleVisitor,
         writer: Box<dyn AsyncWrite + Send + Unpin>,
     ) -> (Arc<Session>, oneshot::Receiver<msg::NatHoleReport>) {
+        // Session cap: prevent unbounded memory growth under load.
+        if self.sessions.read().await.len() >= MAX_SESSIONS {
+            warn!("NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session");
+        }
         let (report_tx, report_rx) = oneshot::channel();
         let session = Arc::new(Session {
             sid: sid.clone(),
@@ -332,39 +324,17 @@ impl Controller {
         false
     }
 
-    /// Send NatHoleResp to visitor. Tries writer path first, then ctl path.
-    pub async fn send_to_visitor(&self, session: &Session, resp: &msg::NatHoleResp) {
-        // Try writer path
-        let mut writer_guard = session.visitor_writer.lock().await;
-        if let Some(ref mut writer) = *writer_guard {
-            if let Err(e) = write_msg_v1(writer, &FrpMessage::NatHoleResp(resp.clone())).await {
-                warn!("Failed to write NatHoleResp to visitor via writer: {}", e);
-            }
-        } else if let Some(ref tx) = session.visitor_ctl_tx {
-            let _ = tx.send(InternalMsg::WriteNatHoleResp {
-                transaction_id: resp.transaction_id.clone(),
-                error: resp.error.clone(),
-                sid: resp.sid.clone(),
-                protocol: resp.protocol.clone(),
-                candidate_addrs: resp.candidate_addrs.clone(),
-                assisted_addrs: resp.assisted_addrs.clone(),
-            });
-        }
-    }
 }
 
-/// Generate an analysis key from two NAT features for analyzer lookup.
+/// Generate a stable analysis key from two NAT features for analyzer lookup.
+/// Uses a canonical string representation — stable across Rust versions and
+/// platforms, and human-readable for debugging.
 pub fn gen_analysis_key(c: &NatFeature, v: &NatFeature) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    c.nat_type.hash(&mut hasher);
-    c.behavior.hash(&mut hasher);
-    c.regular_ports_change.hash(&mut hasher);
-    v.nat_type.hash(&mut hasher);
-    v.behavior.hash(&mut hasher);
-    v.regular_ports_change.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
+    format!(
+        "{}:{}:{}|{}:{}:{}",
+        c.nat_type, c.behavior, c.regular_ports_change as u8,
+        v.nat_type, v.behavior, v.regular_ports_change as u8,
+    )
 }
 
 /// Build a NatHoleResp with detect_behavior filled in.

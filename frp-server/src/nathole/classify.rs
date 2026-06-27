@@ -21,9 +21,42 @@ pub struct NatFeature {
     pub public_network: bool,
 }
 
+/// Split "ip:port" into (ip_str, port) handling IPv4 and bracketed IPv6.
+/// Returns error for unbracketed IPv6 (ambiguous with colon separators).
+fn split_host_port(addr: &str) -> Result<(&str, i32), String> {
+    if addr.starts_with('[') {
+        // Bracketed IPv6: [::1]:8080 or [2001:db8::1]:1234
+        let close = addr
+            .find(']')
+            .ok_or_else(|| format!("unclosed bracket in: {}", addr))?;
+        let ip = &addr[1..close];
+        let port_str = addr
+            .get(close + 2..) // skip "]:" — two chars
+            .ok_or_else(|| format!("missing port after bracket in: {}", addr))?;
+        let port: i32 = port_str
+            .parse()
+            .map_err(|_| format!("invalid port in: {}", addr))?;
+        Ok((ip, port))
+    } else {
+        // IPv4 or hostname: "1.2.3.4:1234" or "host:port"
+        // rsplitn works here because IPv4 has no colons, hostnames conventionally don't
+        let colon = addr
+            .rfind(':')
+            .ok_or_else(|| format!("missing port separator in: {}", addr))?;
+        let ip = &addr[..colon];
+        let port_str = &addr[colon + 1..];
+        let port: i32 = port_str
+            .parse()
+            .map_err(|_| format!("invalid port in: {}", addr))?;
+        Ok((ip, port))
+    }
+}
+
 /// Classify a peer's NAT type and behavior from its discovered addresses.
 ///
 /// `addresses` — STUN-discovered external addresses (ip:port strings).
+/// Handles IPv4 and bracketed IPv6 ([::1]:8080). Unbracketed IPv6
+/// addresses are rejected (they are ambiguous with colons as port separators).
 /// `local_ips` — known local IPs; if found in addresses, marks public_network.
 ///
 /// Returns error if `addresses.len() <= 1` (need at least 2 for classification).
@@ -39,14 +72,7 @@ pub fn classify_nat_feature(addresses: &[String], local_ips: &[String]) -> Resul
     let mut public_network = false;
 
     // Parse first address as baseline
-    let first_parts: Vec<&str> = addresses[0].rsplitn(2, ':').collect();
-    if first_parts.len() != 2 {
-        return Err(format!("invalid address format: {}", addresses[0]));
-    }
-    let first_ip = first_parts[1];
-    let first_port: i32 = first_parts[0]
-        .parse()
-        .map_err(|_| format!("invalid port in: {}", addresses[0]))?;
+    let (first_ip, first_port) = split_host_port(&addresses[0])?;
     if !(0..=65535).contains(&first_port) {
         return Err(format!("port out of range (0-65535): {}", addresses[0]));
     }
@@ -61,14 +87,7 @@ pub fn classify_nat_feature(addresses: &[String], local_ips: &[String]) -> Resul
     }
 
     for addr in &addresses[1..] {
-        let parts: Vec<&str> = addr.rsplitn(2, ':').collect();
-        if parts.len() != 2 {
-            return Err(format!("invalid address format: {}", addr));
-        }
-        let ip = parts[1];
-        let port: i32 = parts[0]
-            .parse()
-            .map_err(|_| format!("invalid port in: {}", addr))?;
+        let (ip, port) = split_host_port(addr)?;
         if !(0..=65535).contains(&port) {
             return Err(format!("port out of range (0-65535): {}", addr));
         }
