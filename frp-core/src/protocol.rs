@@ -83,7 +83,6 @@ pub async fn write_msg_v1<W: AsyncWriteExt + Unpin>(
 /// Deserialize a V2 message from its type ID and JSON payload bytes.
 /// V2 uses numeric type IDs (u16) instead of V1's ASCII type bytes.
 pub fn deserialize_v2(type_id: u16, json_bytes: &[u8]) -> Result<FrpMessage, crate::Error> {
-    use crate::msg;
     let msg = match type_id {
         msg::V2_TYPE_LOGIN => {
             let v: msg::Login = serde_json::from_slice(json_bytes)
@@ -346,10 +345,13 @@ pub async fn write_v2_frame_raw<W: AsyncWriteExt + Unpin>(
     header[2..4].copy_from_slice(&flags.to_be_bytes());
     header[4..8].copy_from_slice(&(payload.len() as u32).to_be_bytes());
 
-    writer.write_all(&header).await
+    tracing::trace!("write V2 frame: type={}, flags={}, len={}", frame_type, flags, payload.len());
+
+    let mut out = Vec::with_capacity(V2_FRAME_HEADER_LEN + payload.len());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(payload);
+    writer.write_all(&out).await
         .map_err(|e| crate::Error::Protocol(format!("write V2 frame: {e}")))?;
-    writer.write_all(payload).await
-        .map_err(|e| crate::Error::Protocol(format!("write V2 payload: {e}")))?;
     Ok(())
 }
 
@@ -365,6 +367,8 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
     let frame_type = u16::from_be_bytes([header[0], header[1]]);
     let flags = u16::from_be_bytes([header[2], header[3]]);
     let payload_len = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+
+    tracing::debug!("read V2 frame: type={}, flags={}, len={}", frame_type, flags, payload_len);
 
     if flags != 0 {
         return Err(crate::Error::Protocol(format!(
