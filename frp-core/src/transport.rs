@@ -95,6 +95,107 @@ enum WsInner {
     Raw(Box<dyn AsyncReadWrite>),
 }
 
+impl WsInner {
+    /// Poll-write logic for the Raw variant.
+    /// Takes buffer state as separate params to avoid borrow conflicts
+    /// with the outer WsByteStream struct — the match on WsInner variants
+    /// borrows self (the WsInner), not the buffer fields.
+    fn poll_write_raw(
+        raw: &mut Box<dyn AsyncReadWrite>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        write_buf: &mut Vec<u8>,
+        write_pos: &mut usize,
+        needs_flush: &mut bool,
+        new_frame: Option<Vec<u8>>,
+    ) -> Poll<io::Result<usize>> {
+        // Build new frame if provided (pre-built before the match)
+        if let Some(frame) = new_frame {
+            match Pin::new(raw.as_mut()).poll_write(cx, &frame) {
+                Poll::Ready(Ok(n)) if n >= frame.len() => {
+                    // Full write — success
+                    return Poll::Ready(Ok(buf.len()));
+                }
+                Poll::Ready(Ok(n)) => {
+                    *write_buf = frame;
+                    *write_pos = n;
+                    *needs_flush = true;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    *write_buf = frame;
+                    *write_pos = 0;
+                    *needs_flush = true;
+                    return Poll::Pending;
+                }
+            }
+        }
+        // Flush pending write buffer
+        if *needs_flush {
+            let remaining = &write_buf[*write_pos..];
+            match Pin::new(raw.as_mut()).poll_write(cx, remaining) {
+                Poll::Ready(Ok(n)) => {
+                    *write_pos += n;
+                    if *write_pos >= write_buf.len() {
+                        *write_pos = 0;
+                        *needs_flush = false;
+                        Poll::Ready(Ok(buf.len()))
+                    } else {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                }
+                Poll::Ready(Err(e)) => {
+                    *needs_flush = false;
+                    Poll::Ready(Err(e))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            Poll::Ready(Ok(0))
+        }
+    }
+
+    /// Build a WebSocket data frame (FIN + BINARY opcode) for the Raw path.
+    fn build_frame(buf: &[u8], client_mode: bool) -> Vec<u8> {
+        let len = buf.len();
+        let mut frame = Vec::with_capacity(len + 14); // header + mask + payload
+        frame.push(0x82); // FIN + BINARY opcode
+        if client_mode {
+            // Client MUST mask frames per RFC 6455 §5.3
+            if len < 126 {
+                frame.push(0x80 | len as u8);
+            } else if len <= 65535 {
+                frame.push(0x80 | 126);
+                frame.extend_from_slice(&(len as u16).to_be_bytes());
+            } else {
+                frame.push(0x80 | 127);
+                frame.extend_from_slice(&(len as u64).to_be_bytes());
+            }
+            let mask: [u8; 4] = rand::random();
+            frame.extend_from_slice(&mask);
+            for i in 0..len {
+                frame.push(buf[i] ^ mask[i % 4]);
+            }
+        } else {
+            // Server MUST NOT mask frames per RFC 6455 §5.1
+            if len < 126 {
+                frame.push(len as u8);
+            } else if len <= 65535 {
+                frame.push(126);
+                frame.extend_from_slice(&(len as u16).to_be_bytes());
+            } else {
+                frame.push(127);
+                frame.extend_from_slice(&(len as u64).to_be_bytes());
+            }
+            frame.extend_from_slice(buf);
+        }
+        frame
+    }
+}
+
 impl WsByteStream {
     pub fn new(ws: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
         Self {
@@ -300,109 +401,73 @@ impl AsyncWrite for WsByteStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // Use locals to avoid borrow conflicts between &mut self.inner and self.{needs_flush, write_buf}
-        let mut needs_flush = self.needs_flush;
+        // Destructure self to get separate borrows on each field.
+        // This is safe because WsByteStream is Unpin.
+        let this = &mut *self;
+        let WsByteStream {
+            inner,
+            write_buf,
+            write_pos,
+            needs_flush,
+            client_mode,
+            ..
+        } = this;
+        let mut needs_flush_local = *needs_flush;
 
-        match &mut self.inner {
-            WsInner::Tungstenite(inner) => {
-                if !needs_flush && !buf.is_empty() {
-                    match inner.as_mut().poll_ready(cx) {
+        // Pre-build WebSocket frame for Raw variant before the match
+        let new_frame = if !needs_flush_local && !buf.is_empty() {
+            if matches!(inner, WsInner::Raw(_)) {
+                Some(WsInner::build_frame(buf, *client_mode))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        match inner {
+            WsInner::Tungstenite(tungstenite) => {
+                if !needs_flush_local && !buf.is_empty() {
+                    match tungstenite.as_mut().poll_ready(cx) {
                         Poll::Ready(Ok(())) => {
-                            match inner.as_mut().start_send(Message::Binary(buf.to_vec())) {
-                                Ok(()) => needs_flush = true,
+                            match tungstenite.as_mut().start_send(Message::Binary(buf.to_vec())) {
+                                Ok(()) => needs_flush_local = true,
                                 Err(e) => return Poll::Ready(Err(io::Error::other(e))),
                             }
                         }
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
                         Poll::Pending => {
-                            self.needs_flush = needs_flush;
+                            *needs_flush = needs_flush_local;
                             return Poll::Pending;
                         }
                     }
                 }
-                if needs_flush {
-                    match inner.as_mut().poll_flush(cx) {
+                if needs_flush_local {
+                    match tungstenite.as_mut().poll_flush(cx) {
                         Poll::Ready(Ok(())) => {
-                            self.needs_flush = false;
+                            *needs_flush = false;
                             Poll::Ready(Ok(buf.len()))
                         }
                         Poll::Ready(Err(e)) => {
-                            self.needs_flush = false;
+                            *needs_flush = false;
                             Poll::Ready(Err(io::Error::other(e)))
                         }
                         Poll::Pending => {
-                            self.needs_flush = true;
+                            *needs_flush = true;
                             Poll::Pending
                         }
                     }
                 } else {
-                    self.needs_flush = false;
+                    *needs_flush = false;
                     Poll::Ready(Ok(0))
                 }
             }
             WsInner::Raw(raw) => {
-                let raw_ptr: *mut Box<dyn AsyncReadWrite> = raw;
-                let client_mode = self.client_mode;
-                if !needs_flush && !buf.is_empty() {
-                    let len = buf.len();
-                    self.write_buf.clear();
-                    self.write_buf.push(0x82); // FIN + BINARY opcode
-                    if client_mode {
-                        // Client MUST mask frames per RFC 6455 §5.3
-                        if len < 126 {
-                            self.write_buf.push(0x80 | len as u8);
-                        } else if len <= 65535 {
-                            self.write_buf.push(0x80 | 126);
-                            self.write_buf.extend_from_slice(&(len as u16).to_be_bytes());
-                        } else {
-                            self.write_buf.push(0x80 | 127);
-                            self.write_buf.extend_from_slice(&(len as u64).to_be_bytes());
-                        }
-                        let mask: [u8; 4] = rand::random();
-                        self.write_buf.extend_from_slice(&mask);
-                        for i in 0..len {
-                            self.write_buf.push(buf[i] ^ mask[i % 4]);
-                        }
-                    } else {
-                        if len < 126 {
-                            self.write_buf.push(len as u8);
-                        } else if len <= 65535 {
-                            self.write_buf.push(126);
-                            self.write_buf.extend_from_slice(&(len as u16).to_be_bytes());
-                        } else {
-                            self.write_buf.push(127);
-                            self.write_buf.extend_from_slice(&(len as u64).to_be_bytes());
-                        }
-                        self.write_buf.extend_from_slice(buf);
-                    }
-                    self.write_pos = 0;
-                    self.needs_flush = true;
-                }
-                if self.needs_flush {
-                    let remaining = &self.write_buf[self.write_pos..];
-                    // SAFETY: raw_ptr derived from &mut self.inner, fields are disjoint
-                    let stream = unsafe { (*raw_ptr).as_mut() };
-                    match Pin::new(stream).poll_write(cx, remaining) {
-                        Poll::Ready(Ok(n)) => {
-                            self.write_pos += n;
-                            if self.write_pos >= self.write_buf.len() {
-                                self.write_pos = 0;
-                                self.needs_flush = false;
-                                Poll::Ready(Ok(buf.len()))
-                            } else {
-                                cx.waker().wake_by_ref();
-                                Poll::Pending
-                            }
-                        }
-                        Poll::Ready(Err(e)) => {
-                            self.needs_flush = false;
-                            Poll::Ready(Err(e))
-                        }
-                        Poll::Pending => Poll::Pending,
-                    }
-                } else {
-                    Poll::Ready(Ok(0))
-                }
+                WsInner::poll_write_raw(
+                    raw, cx, buf,
+                    write_buf, write_pos, needs_flush,
+                    new_frame,
+                )
             }
         }
     }
@@ -411,18 +476,21 @@ impl AsyncWrite for WsByteStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        let needs_flush = self.needs_flush;
-        match &mut self.inner {
-            WsInner::Tungstenite(inner) => {
-                if needs_flush {
-                    match inner.as_mut().poll_flush(cx) {
+        // Destructure to get separate borrows — same pattern as poll_write.
+        let this = &mut *self;
+        let WsByteStream { inner, write_buf, write_pos, needs_flush, .. } = this;
+        let needs_flush_local = *needs_flush;
+        match inner {
+            WsInner::Tungstenite(tungstenite) => {
+                if needs_flush_local {
+                    match tungstenite.as_mut().poll_flush(cx) {
                         Poll::Ready(Ok(())) => {
-                            self.needs_flush = false;
+                            *needs_flush = false;
                             Poll::Ready(Ok(()))
                         }
                         Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
                         Poll::Pending => {
-                            self.needs_flush = true;
+                            *needs_flush = true;
                             Poll::Pending
                         }
                     }
@@ -431,16 +499,14 @@ impl AsyncWrite for WsByteStream {
                 }
             }
             WsInner::Raw(raw) => {
-                let raw_ptr: *mut Box<dyn AsyncReadWrite> = raw;
-                if needs_flush {
-                    let remaining = &self.write_buf[self.write_pos..];
-                    let stream = unsafe { (*raw_ptr).as_mut() };
-                    match Pin::new(stream).poll_write(cx, remaining) {
+                if needs_flush_local {
+                    let remaining = &write_buf[*write_pos..];
+                    match Pin::new(raw.as_mut()).poll_write(cx, remaining) {
                         Poll::Ready(Ok(n)) => {
-                            self.write_pos += n;
-                            if self.write_pos >= self.write_buf.len() {
-                                self.write_pos = 0;
-                                self.needs_flush = false;
+                            *write_pos += n;
+                            if *write_pos >= write_buf.len() {
+                                *write_pos = 0;
+                                *needs_flush = false;
                                 Poll::Ready(Ok(()))
                             } else {
                                 cx.waker().wake_by_ref();
@@ -448,7 +514,7 @@ impl AsyncWrite for WsByteStream {
                             }
                         }
                         Poll::Ready(Err(e)) => {
-                            self.needs_flush = false;
+                            *needs_flush = false;
                             Poll::Ready(Err(e))
                         }
                         Poll::Pending => Poll::Pending,

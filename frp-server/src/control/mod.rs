@@ -360,7 +360,7 @@ pub async fn handle_control<S>(
 
                         // --- Do STUN discovery to find our external addresses ---
                         let stun_server = "stun.l.google.com:19302";
-                        let mapped_addrs = match discovery::discover(stun_server) {
+                        let mapped_addrs = match discovery::discover(stun_server).await {
                             Ok(addrs) => {
                                 debug!("STUN discovery for {}: {:?}", proxy_name, addrs);
                                 addrs
@@ -380,7 +380,6 @@ pub async fn handle_control<S>(
                             mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
                             assisted_addrs: None,
                             visitor_addr,
-                            ..Default::default()
                         });
                         if let Err(e) = write_ctl_msg(&mut writer, &reply, v2).await {
                             warn!("Failed to send NatHoleClient reply: {}", e);
@@ -747,13 +746,20 @@ pub async fn handle_control<S>(
                         };
 
                         // Create session via control-channel path
-                        let (_session, report_rx) = state.nat_hole
+                        let (_session, report_rx) = match state.nat_hole
                             .create_session_with_ctl(
                                 transaction_id.clone(),
                                 proxy_name.clone(),
                                 nhv.clone(),
                                 internal_tx.clone(),
-                            ).await;
+                            ).await
+                        {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!("NatHole session creation failed: {}", e);
+                                continue;
+                            }
+                        };
 
                         // Send NatHoleClient to provider
                         let visitor_addr = peer.as_ref().map(|a| a.to_string());

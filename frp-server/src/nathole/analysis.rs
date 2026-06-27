@@ -312,28 +312,25 @@ impl Analyzer {
 
         // Role swap rules per mode (Go frp v0.69.1 compat).
         match mode {
-            1 => {
-                // Mode 1: HardNAT is always sender. If client is EasyNAT, swap.
-                if c_feature.nat_type == super::classify::EASY_NAT {
-                    std::mem::swap(&mut c_behavior, &mut v_behavior);
-                }
+            1 if c_feature.nat_type == super::classify::EASY_NAT => {
+                // Mode 1: HardNAT is always sender. Client is EasyNAT, swap.
+                std::mem::swap(&mut c_behavior, &mut v_behavior);
             }
-            2 => {
-                // Mode 2: HardNAT is always receiver. If client is HardNAT, swap.
-                if c_feature.nat_type == super::classify::HARD_NAT {
-                    std::mem::swap(&mut c_behavior, &mut v_behavior);
-                }
+            1 => {}
+            2 if c_feature.nat_type == super::classify::HARD_NAT => {
+                // Mode 2: HardNAT is always receiver. Client is HardNAT, swap.
+                std::mem::swap(&mut c_behavior, &mut v_behavior);
             }
+            2 => {}
             3 => {
                 // Mode 3: No swap in default (first 3 entries have A=sender).
                 // Entries 3-5 have A=receiver, B=sender — already swapped in table.
             }
-            4 => {
+            4 if !c_feature.regular_ports_change => {
                 // Mode 4: Regular ports change peer is always sender.
-                if !c_feature.regular_ports_change {
-                    std::mem::swap(&mut c_behavior, &mut v_behavior);
-                }
+                std::mem::swap(&mut c_behavior, &mut v_behavior);
             }
+            4 => {}
             _ => {} // Mode 0: behaviors already alternate in table
         }
 

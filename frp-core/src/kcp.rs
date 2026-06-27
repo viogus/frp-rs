@@ -136,6 +136,7 @@ impl Drop for KcpStream {
 /// Reads from UDP → feeds into KCP → emits to `read_tx`.
 /// Reads from `write_rx` → feeds into KCP → KCP output flushes to UDP.
 /// Calls `kcp.update()` periodically (every `interval` ms).
+#[allow(clippy::too_many_arguments)]
 async fn run_kcp_driver(
     conv: u32,
     socket: Arc<UdpSocket>,
