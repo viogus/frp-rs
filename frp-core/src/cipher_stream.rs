@@ -71,7 +71,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for CipherReader<R> {
                             *filled += n;
                             if *filled == 16 {
                                 let cfb = CfbState::new(&this.key, iv_buf);
-                                this.state = ReadState::Decrypting { cfb };
+                                this.state = ReadState::Decrypting { cfb: Box::new(cfb) };
                             }
                             continue;
                         }
@@ -232,7 +232,7 @@ impl CfbState {
 
 enum ReadState {
     ReadingIv { buf: [u8; 16], filled: usize },
-    Decrypting { cfb: CfbState },
+    Decrypting { cfb: Box<CfbState> },
 }
 
 enum WriteState {
@@ -297,7 +297,7 @@ impl AsyncRead for CipherStream {
                             *filled += n;
                             if *filled == 16 {
                                 let cfb = CfbState::new(&this.key, iv_buf);
-                                this.read_state = ReadState::Decrypting { cfb };
+                                this.read_state = ReadState::Decrypting { cfb: Box::new(cfb) };
                             }
                             continue;
                         }

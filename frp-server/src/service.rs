@@ -124,6 +124,7 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, heartbeat_timeout: i64, udp_packet_size: usize, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16, vhost_http_timeout: u64, user_conn_timeout: u64, tcp_mux_passthrough: bool, custom_404_page: String, plugin_manager: Arc<crate::plugin::HttpPluginManager>) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
@@ -1002,9 +1003,9 @@ impl Service {
             || self.cfg.auth.oidc_skip_expiry != new_cfg.auth.oidc_skip_expiry
             || self.cfg.auth.oidc_skip_issuer != new_cfg.auth.oidc_skip_issuer
         {
-            changes.push(format!(
-                "OIDC settings changed (restart required)"
-            ));
+            changes.push(
+                "OIDC settings changed (restart required)".to_string()
+            );
         }
 
         if changes.is_empty() {

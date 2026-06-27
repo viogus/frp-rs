@@ -1,3 +1,4 @@
+use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 // ---------------------------------------------------------------
@@ -46,7 +47,7 @@ pub const V2_TYPE_NEW_VISITOR_CONN_RESP: u16 = 15;
 // Base64 helpers for UDPPacket (Go frp encodes []byte as base64)
 // ---------------------------------------------------------------
 
-fn b64_ser<S: Serializer>(data: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+fn b64_ser<S: Serializer>(data: &[u8], s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&data_encoding::BASE64.encode(data))
 }
 
@@ -283,8 +284,11 @@ impl UdpAddr {
         })
     }
 
-    pub fn to_string(&self) -> String {
-        format!("{}:{}", self.ip, self.port)
+}
+
+impl fmt::Display for UdpAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.ip, self.port)
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,6 +369,7 @@ pub struct NatHoleReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum FrpMessage {
     CloseProxyResp(CloseProxyResp),
     CloseProxy(CloseProxy),

@@ -923,7 +923,9 @@ impl Service {
 ///    Without TcpMux: dials the server via TCP/TLS/WS
 /// 2. Without TcpMux: sends NewWorkConn (with run_id + auth)
 /// 3. Reads StartWorkConn from the server
+///
 /// Write HAProxy PROXY protocol v2 binary header to the stream.
+///
 /// Format: 12-byte signature + 4-byte header + address block (binary).
 async fn write_proxy_protocol_v2(
     stream: &mut (impl tokio::io::AsyncWriteExt + Unpin),
@@ -980,6 +982,7 @@ async fn write_proxy_protocol_v2(
 /// 5. Bridges data bidirectionally
 ///
 /// `pool_id` is for logging only (< 0 means on-demand).
+#[allow(clippy::too_many_arguments)]
 fn spawn_work_conn(
     server_addr: &str,
     server_port: u16,
@@ -1276,14 +1279,13 @@ fn spawn_work_conn(
                                             warn!("Failed to write PROXY v1 header: {}", e);
                                         }
                                     } else if info.proxy_protocol_version == "v2" {
-                                        match write_proxy_protocol_v2(
+                                        if let Err(e) = write_proxy_protocol_v2(
                                             &mut local, src,
                                             swc.dst_addr.as_deref().unwrap_or("0.0.0.0"),
                                             swc.src_port.unwrap_or(0) as u16,
                                             swc.dst_port.unwrap_or(0) as u16,
                                         ).await {
-                                            Err(e) => warn!("Failed to write PROXY v2 header: {}", e),
-                                            _ => {}
+                                            warn!("Failed to write PROXY v2 header: {}", e);
                                         }
                                     }
                                 }
@@ -1344,6 +1346,7 @@ fn spawn_work_conn(
 /// When the local service exceeds max_failed consecutive failures, sends
 /// the proxy name on `health_tx` so the control loop can send CloseProxy
 /// to the server.
+#[allow(clippy::too_many_arguments)]
 async fn run_health_check(
     proxy_name: String,
     local_addr: String,
@@ -1508,6 +1511,7 @@ async fn tcp_simultaneous_open(peer_addr: &str, timeout_ms: u64) -> Result<tokio
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_visitor_listener(
     server_addr: String,
     server_port: u16,

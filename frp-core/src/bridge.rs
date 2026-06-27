@@ -8,6 +8,7 @@ use crate::encryption;
 use crate::transport::IoStream;
 
 /// Bridge encrypted data between two IoStreams, splitting them internally.
+#[allow(clippy::too_many_arguments)]
 pub async fn bridge_encrypted_io(
     user: IoStream,
     work: IoStream,
@@ -36,6 +37,7 @@ pub async fn bridge_encrypted_io(
 /// CFB state.
 ///
 /// `read_limiter` limits work→user (download). `write_limiter` limits user→work (upload).
+#[allow(clippy::too_many_arguments)]
 pub async fn bridge_encrypted(
     mut user_r: impl AsyncReadExt + Unpin,
     mut user_w: impl AsyncWriteExt + Unpin,

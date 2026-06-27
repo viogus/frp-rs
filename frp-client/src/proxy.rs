@@ -102,6 +102,7 @@ pub async fn connect_local(addr: &str) -> Result<TcpStream, frp_core::Error> {
 ///
 /// `bandwidth_limit` is in bytes/sec (0 = unlimited).
 /// `bandwidth_limit_mode` is "client" (upload), "server" (download), or "both".
+#[allow(clippy::too_many_arguments)]
 pub async fn bridge_streams(
     local: tokio::net::TcpStream,
     work: IoStream,

@@ -127,6 +127,7 @@ pub async fn start_visitor_plugin(
 }
 
 /// Handle one visitor connection: dial frps, login, send NewVisitorConn, bridge.
+#[allow(clippy::too_many_arguments)]
 async fn handle_visitor_conn(
     user_conn: tokio::net::TcpStream,
     server_name: &str,

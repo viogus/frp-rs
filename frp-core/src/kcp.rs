@@ -201,6 +201,7 @@ fn kcp_now_ms() -> u32 {
 /// any new conv ID from a new peer address.
 pub struct KcpListener {
     socket: Arc<UdpSocket>,
+    #[allow(clippy::type_complexity)]
     active: Mutex<HashMap<(SocketAddr, u32), mpsc::UnboundedSender<Vec<u8>>>>,
     config: KcpConfig,
 }

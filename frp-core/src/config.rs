@@ -812,7 +812,6 @@ fn default_min_retry_interval() -> i64 { 30 }
 /// - `[common]` section → flatten to top level
 /// - Flat auth_*, log_*, web_server_*, transport_* → nested structs
 /// - Field name differences (protocol → transport_protocol, etc.)
-
 pub fn load_server_config_from_str(content: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let mut value: toml::Value = toml::from_str(content)?;
     normalize_server_config(&mut value);
@@ -857,6 +856,7 @@ fn toml_to_json(v: toml::Value) -> serde_json::Value {
     }
 }
 
+#[allow(clippy::collapsible_match)]
 fn normalize_server_config(value: &mut toml::Value) {
     use toml::Value;
     if let Some(table) = value.as_table_mut() {
@@ -956,11 +956,9 @@ fn normalize_client_config(value: &mut toml::Value) {
     use toml::Value;
     if let Some(table) = value.as_table_mut() {
         // Handle [common] section
-        if let Some(common) = table.remove("common") {
-            if let Value::Table(common_table) = common {
-                for (k, v) in common_table {
-                    table.entry(k).or_insert(v);
-                }
+        if let Some(Value::Table(common_table)) = table.remove("common") {
+            for (k, v) in common_table {
+                table.entry(k).or_insert(v);
             }
         }
 
@@ -983,21 +981,17 @@ fn normalize_client_config(value: &mut toml::Value) {
         }
 
         // Extract token from [auth] table (Go frp uses auth.token, auth.method)
-        if let Some(v) = table.remove("auth") {
-            if let Value::Table(auth_table) = v {
-                if let Some(token_val) = auth_table.get("token") {
-                    table.entry("token").or_insert(token_val.clone());
-                }
+        if let Some(Value::Table(auth_table)) = table.remove("auth") {
+            if let Some(token_val) = auth_table.get("token") {
+                table.entry("token").or_insert(token_val.clone());
             }
         }
 
         // Flatten [transport] section → top-level (ClientConfig has tcp_mux at top level,
         // but Go frp config puts it under [transport])
-        if let Some(v) = table.remove("transport") {
-            if let Value::Table(tr_table) = v {
-                for (k, v) in tr_table {
-                    table.entry(k).or_insert(v);
-                }
+        if let Some(Value::Table(tr_table)) = table.remove("transport") {
+            for (k, v) in tr_table {
+                table.entry(k).or_insert(v);
             }
         }
 
