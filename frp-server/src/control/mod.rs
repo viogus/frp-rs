@@ -1,6 +1,7 @@
 mod bridge;
 mod proxy_ops;
 
+use proxy_ops::err_msg;
 use std::sync::Arc;
 use std::net::SocketAddr;
 use std::collections::VecDeque;
@@ -91,7 +92,7 @@ pub async fn handle_control<S>(
                 let resp = FrpMessage::LoginResp(msg::LoginResp {
                     version: Some(frp_core::VERSION.into()),
                     run_id: None,
-                    error: Some(format!("OIDC authentication failed: {e}")),
+                    error: Some(err_msg(state.detailed_errors_to_client, format!("OIDC authentication failed: {e}"), "OIDC authentication failed")),
                     server_additional_auth_scopes: None,
                 });
                 let _ = write_ctl_msg(&mut writer, &resp, v2).await;
@@ -109,7 +110,7 @@ pub async fn handle_control<S>(
             let resp = FrpMessage::LoginResp(msg::LoginResp {
                 version: Some(frp_core::VERSION.into()),
                 run_id: None,
-                error: Some(e),
+                error: Some(err_msg(state.detailed_errors_to_client, e, "token authentication failed")),
                 server_additional_auth_scopes: None,
             });
             let _ = write_ctl_msg(&mut writer, &resp, v2).await;
@@ -685,7 +686,7 @@ pub async fn handle_control<S>(
                         };
                         if let Err(e) = ping_auth_result {
                             warn!("Ping auth failed from {:?}: {}", peer, e);
-                            let pong = FrpMessage::Pong(msg::Pong { error: Some(e) });
+                            let pong = FrpMessage::Pong(msg::Pong { error: Some(err_msg(state.detailed_errors_to_client, e, "ping authentication failed")) });
                             let _ = write_ctl_msg(&mut writer, &pong, v2).await;
                             break;
                         }

@@ -63,6 +63,10 @@ pub struct ServerConfig {
     /// Each range is inclusive on both ends.
     #[serde(default)]
     pub allow_ports: String,
+    /// Maximum number of proxies a single client can register.
+    /// 0 = unlimited (default). Go frp compat: maxPortsPerClient.
+    #[serde(default)]
+    pub max_ports_per_client: u64,
     /// Timeout in seconds for backend HTTP response in VHost handler.
     /// Go frp compat: VhostHTTPTimeout. Default: 60.
     #[serde(default = "default_vhost_http_timeout")]
@@ -71,6 +75,11 @@ pub struct ServerConfig {
     /// Go frp compat: UserConnTimeout. Default: 10.
     #[serde(default = "default_user_conn_timeout")]
     pub user_conn_timeout: u64,
+    /// When false (default), internal error details are replaced with generic
+    /// messages in client-facing error responses. When true, full Rust error
+    /// details are included. Go frp compat: detailedErrorsToClient. Default: false.
+    #[serde(default)]
+    pub detailed_errors_to_client: bool,
     /// When tcp_mux is enabled and yamux init fails, forward raw bytes
     /// to the VHost handler instead of closing the connection.
     /// Go frp compat: TCPMuxPassthrough. Default: false.
@@ -99,6 +108,11 @@ pub struct ServerConfig {
     /// When bind_port > 0, an SSH server listens for `ssh -R` reverse tunnels.
     #[serde(default)]
     pub ssh_tunnel_gateway: SshTunnelGatewayConfig,
+    /// NAT hole analysis data retention in hours.
+    /// Controls how long historical NAT behavior records are kept.
+    /// Go frp compat: natholeAnalysisDataReserveHours. Default: 1 (hour).
+    #[serde(default = "default_nathole_analysis_data_reserve_hours")]
+    pub nat_hole_analysis_data_reserve_hours: u64,
 }
 
 fn default_allow_port_start() -> u16 { 10000 }
@@ -106,6 +120,7 @@ fn default_allow_port_end() -> u16 { 50000 }
 fn default_vhost_http_timeout() -> u64 { 60 }
 fn default_user_conn_timeout() -> u64 { 10 }
 fn default_udp_packet_size() -> usize { 65535 }
+fn default_nathole_analysis_data_reserve_hours() -> u64 { 1 }
 
 /// Parse a bandwidth limit string like "1MB", "500KB", "100K".
 /// Returns bytes per second, or None if unparseable.
@@ -200,14 +215,17 @@ impl Default for ServerConfig {
             allow_port_start: default_allow_port_start(),
             allow_port_end: default_allow_port_end(),
             allow_ports: String::new(),
+            max_ports_per_client: 0,
             vhost_http_timeout: default_vhost_http_timeout(),
             user_conn_timeout: default_user_conn_timeout(),
             tcp_mux_passthrough: false,
+            detailed_errors_to_client: false,
             udp_packet_size: default_udp_packet_size(),
             http_plugins: Vec::new(),
             feature: FeatureConfig::default(),
             includes: Vec::new(),
             ssh_tunnel_gateway: SshTunnelGatewayConfig::default(),
+            nat_hole_analysis_data_reserve_hours: default_nathole_analysis_data_reserve_hours(),
         }
     }
 }
