@@ -20,6 +20,7 @@ pub fn allocate_port() -> u16 {
 /// Start the frp server on the given config, returning the join handle.
 /// The server is ready to accept connections after a short sleep.
 /// Note: tcp_mux is disabled by default for tests (raw V1 frames, no yamux).
+#[allow(dead_code)]
 pub async fn start_test_server(mut cfg: ServerConfig) -> (JoinHandle<()>, u16) {
     cfg.transport.tcp_mux = false; // test clients use raw V1 frames
     let port = cfg.bind_port;
