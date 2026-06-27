@@ -3448,6 +3448,12 @@ test_g2r_v2_tcp() {
     local name="go-to-rust-v2-tcp"
     should_run_test "$name" || return 0
 
+    # Check if Go frp binary supports V2 protocol
+    if ! "$GO_FRPC" --help 2>&1 | grep -q "wireProtocol" && ! "$GO_FRPS" --help 2>&1 | grep -q "wireProtocol"; then
+        log "SKIP $name: Go binary lacks V2 support, compile from source for this test"
+        return 0
+    fi
+
     log "=== $name ==="
     local frps_port=$(random_port)
     local proxy_port=$(random_port)
@@ -3507,6 +3513,12 @@ test_g2r_v2_tcp() {
 test_r2g_v2_tcp() {
     local name="rust-to-go-v2-tcp"
     should_run_test "$name" || return 0
+
+    # Check if Go frp binary supports V2 protocol
+    if ! "$GO_FRPC" --help 2>&1 | grep -q "wireProtocol" && ! "$GO_FRPS" --help 2>&1 | grep -q "wireProtocol"; then
+        log "SKIP $name: Go binary lacks V2 support, compile from source for this test"
+        return 0
+    fi
 
     log "=== $name ==="
     local frps_port=$(random_port)
