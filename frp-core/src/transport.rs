@@ -569,6 +569,10 @@ pub enum IoStream {
     Cipher(Box<crate::cipher_stream::CipherStream>),
     /// SSH reverse-forward channel (type-erased).
     SshChannel(Box<dyn AsyncReadWrite>),
+    /// Pre-read bytes followed by a TCP stream.
+    /// Used after connection type detection when bytes have been consumed
+    /// but need to be replayed (e.g., V1 type byte in non-V2 connections).
+    PreRead(Vec<u8>, TcpStream),
 }
 
 impl std::fmt::Debug for IoStream {
@@ -582,6 +586,7 @@ impl std::fmt::Debug for IoStream {
             IoStream::Yamux(_) => f.debug_struct("IoStream::Yamux").finish_non_exhaustive(),
             IoStream::Cipher(_) => f.debug_struct("IoStream::Cipher").finish_non_exhaustive(),
             IoStream::SshChannel(_) => f.debug_struct("IoStream::SshChannel").finish_non_exhaustive(),
+            IoStream::PreRead(..) => f.debug_struct("IoStream::PreRead").finish_non_exhaustive(),
         }
     }
 }
@@ -593,7 +598,18 @@ impl tokio::io::AsyncRead for IoStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
+        let this = self.get_mut();
+        // PreRead: replay buffered bytes first, then delegate to inner TcpStream.
+        if let IoStream::PreRead(pre_read, tcp) = this {
+            if !pre_read.is_empty() {
+                let n = pre_read.len().min(buf.remaining());
+                buf.put_slice(&pre_read[..n]);
+                pre_read.drain(..n);
+                return Poll::Ready(Ok(()));
+            }
+            return Pin::new(tcp).poll_read(cx, buf);
+        }
+        match this {
             IoStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Kcp(s) => Pin::new(s).poll_read(cx, buf),
@@ -602,6 +618,7 @@ impl tokio::io::AsyncRead for IoStream {
             IoStream::Yamux(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Cipher(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+            IoStream::PreRead(_, _) => unreachable!(),
         }
     }
 }
@@ -621,6 +638,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Yamux(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::Cipher(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+            IoStream::PreRead(_, s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -634,6 +652,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Yamux(s) => Pin::new(s).poll_flush(cx),
             IoStream::Cipher(s) => Pin::new(s).poll_flush(cx),
             IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_flush(cx),
+            IoStream::PreRead(_, s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -647,6 +666,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Yamux(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::Cipher(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+            IoStream::PreRead(_, s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -663,6 +683,7 @@ impl IoStream {
             IoStream::Yamux(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::Cipher(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::SshChannel(s) => crate::protocol::write_msg_v1(s, msg).await,
+            IoStream::PreRead(_, s) => crate::protocol::write_msg_v1(s, msg).await,
         }
     }
 
@@ -677,6 +698,7 @@ impl IoStream {
             IoStream::Yamux(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Cipher(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::SshChannel(s) => crate::protocol::read_msg_v1(s).await,
+            IoStream::PreRead(_, s) => crate::protocol::read_msg_v1(s).await,
         }
     }
 
@@ -691,6 +713,7 @@ impl IoStream {
             IoStream::Yamux(s) => crate::protocol::write_msg_v2(s, msg).await,
             IoStream::Cipher(s) => crate::protocol::write_msg_v2(s, msg).await,
             IoStream::SshChannel(s) => crate::protocol::write_msg_v2(s, msg).await,
+            IoStream::PreRead(_, s) => crate::protocol::write_msg_v2(s, msg).await,
         }
     }
 
@@ -705,6 +728,7 @@ impl IoStream {
             IoStream::Yamux(s) => crate::protocol::read_msg_v2(s).await,
             IoStream::Cipher(s) => crate::protocol::read_msg_v2(s).await,
             IoStream::SshChannel(s) => crate::protocol::read_msg_v2(s).await,
+            IoStream::PreRead(_, s) => crate::protocol::read_msg_v2(s).await,
         }
     }
 
@@ -720,6 +744,7 @@ impl IoStream {
             IoStream::Yamux(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
             IoStream::Cipher(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
             IoStream::SshChannel(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            IoStream::PreRead(_, s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
         }
     }
 
@@ -734,6 +759,7 @@ impl IoStream {
             IoStream::Yamux(s) => crate::protocol::read_v2_frame_raw(s).await,
             IoStream::Cipher(s) => crate::protocol::read_v2_frame_raw(s).await,
             IoStream::SshChannel(s) => crate::protocol::read_v2_frame_raw(s).await,
+            IoStream::PreRead(_, s) => crate::protocol::read_v2_frame_raw(s).await,
         }
     }
 
@@ -741,6 +767,7 @@ impl IoStream {
     pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         match self {
             IoStream::Tcp(s) => s.peer_addr().ok(),
+            IoStream::PreRead(_, s) => s.peer_addr().ok(),
             IoStream::Tls(_) | IoStream::Kcp(_) | IoStream::Quic(_) | IoStream::WebSocket(_) | IoStream::Yamux(_) | IoStream::Cipher(_) | IoStream::SshChannel(_) => None,
         }
     }
@@ -784,6 +811,10 @@ impl IoStream {
                 let (r, w) = tokio::io::split(s);
                 (Box::new(r), Box::new(w))
             }
+            IoStream::PreRead(_, s) => {
+                let (r, w) = tokio::io::split(s);
+                (Box::new(r), Box::new(w))
+            }
         }
     }
 
@@ -818,6 +849,9 @@ pub struct DialOptions {
     /// connecting directly. Empty = direct connection.
     /// Go frp compat: transport.proxyURL.
     pub proxy_url: Option<String>,
+    /// Use V2 protocol framing. Client writes V2 magic bytes and performs
+    /// ClientHello/ServerHello handshake. Default: false (V1).
+    pub v2: bool,
 }
 
 impl Default for DialOptions {
@@ -837,6 +871,7 @@ impl Default for DialOptions {
             keepalive_secs: 0,
             bind_addr: None,
             proxy_url: None,
+            v2: false,
         }
     }
 }
@@ -1180,6 +1215,11 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
         connect_direct(&addr, peer, opts).await?
     };
 
+    // Write V2 magic BEFORE any TLS/WS/yamux upgrade (Go frp WriteMagicIfV2).
+    if opts.v2 {
+        crate::protocol::write_v2_magic(&mut stream).await?;
+    }
+
     match opts.protocol {
         TransportProtocol::Tcp => {
             if opts.tls_enable {
@@ -1249,84 +1289,49 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
     }
 }
 
-/// Peek the first byte of a TCP stream to determine connection type.
-/// Uses MSG_PEEK so the byte remains in the socket buffer — the caller
-/// uses the existing stream directly without needing to prepend bytes.
+/// Detect connection type by reading first 7 bytes from the stream (consuming).
 ///
-/// Returns:
-/// - `Tls` if first byte is 0x17 (TLS head byte, must be consumed before TLS handshake)
-/// - `WebSocket` if first byte is 'G' (HTTP GET for WS upgrade)
-/// - `V1(byte)` otherwise (frp protocol, byte is V1 message type byte)
+/// If the 7 bytes match V2 magic, returns `(V2, IoStream::Tcp(stream))` —
+/// magic consumed, stream ready for V2 framing.
 ///
-/// Tokio TcpStreams are non-blocking. If no data has arrived yet, recv
-/// returns EAGAIN. We retry with short sleeps until data arrives or timeout.
-pub async fn peek_connection_type(stream: &TcpStream) -> Result<ConnectionType, crate::Error> {
-    let mut buf = [0u8; 1];
+/// If no match, wraps consumed bytes in `IoStream::PreRead` and classifies
+/// by the first byte. Downstream handlers receive the exact same byte stream.
+pub async fn detect_and_strip_magic(
+    mut stream: tokio::net::TcpStream,
+) -> Result<(ConnectionType, IoStream), crate::Error> {
+    use tokio::io::AsyncReadExt;
 
-    // Retry loop: tokio TcpStream is non-blocking, recv may return EAGAIN
-    // if the client hasn't written yet.
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    loop {
-        match peek_byte(stream, &mut buf) {
-            Ok(1) => break,
-            Ok(0) => return Err(crate::Error::Transport("peek connection type: stream closed".into())),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(crate::Error::Transport("peek connection type: timeout waiting for data".into()));
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                continue;
-            }
-            Err(e) => return Err(crate::Error::Transport(format!("peek connection type: {}", e))),
-            _ => {}
+    let mut magic_buf = [0u8; 7];
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_exact(&mut magic_buf),
+    ).await {
+        Ok(Ok(_n)) => {}
+        Ok(Err(e)) => {
+            return Err(crate::Error::Transport(format!("read connection magic: {e}")));
+        }
+        Err(_) => {
+            return Err(crate::Error::Transport("timeout reading connection magic".into()));
         }
     }
 
-    match buf[0] {
-        FRP_TLS_HEAD_BYTE | FRP_TLS_DIRECT_BYTE => Ok(ConnectionType::Tls(buf[0])),
-        b'G' => Ok(ConnectionType::WebSocket),
-        b'F' => Ok(ConnectionType::V2),
-        b => Ok(ConnectionType::V1(b)),
+    if magic_buf == crate::protocol::V2_MAGIC_BYTES {
+        return Ok((ConnectionType::V2, IoStream::Tcp(stream)));
     }
-}
 
-/// Platform-specific peek of one byte from a TCP stream without consuming it.
-#[cfg(unix)]
-fn peek_byte(stream: &TcpStream, buf: &mut [u8; 1]) -> io::Result<usize> {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let n = unsafe {
-        libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK)
+    let first_byte = magic_buf[0];
+    let ct = match first_byte {
+        FRP_TLS_HEAD_BYTE | FRP_TLS_DIRECT_BYTE => ConnectionType::Tls(first_byte),
+        b'G' => ConnectionType::WebSocket,
+        b => ConnectionType::V1(b),
     };
-    if n >= 0 {
-        Ok(n as usize)
-    } else {
-        Err(io::Error::last_os_error())
-    }
+
+    Ok((ct, IoStream::PreRead(magic_buf.to_vec(), stream)))
 }
 
-#[cfg(windows)]
-fn peek_byte(stream: &TcpStream, buf: &mut [u8; 1]) -> io::Result<usize> {
-    use std::os::windows::io::AsRawSocket;
-    // libc crate does not expose recv/MSG_PEEK on Windows targets.
-    // Declare WinSock2 recv directly — ws2_32.dll is linked by std.
-    extern "system" {
-        fn recv(socket: usize, buf: *mut std::ffi::c_void, len: i32, flags: i32) -> i32;
-    }
-    const MSG_PEEK: i32 = 0x2;
-    let socket = stream.as_raw_socket();
-    let n = unsafe {
-        recv(socket as usize, buf.as_mut_ptr() as *mut std::ffi::c_void, 1, MSG_PEEK)
-    };
-    if n >= 0 {
-        Ok(n as usize)
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-/// After peeking ConnectionType::Tls, consume the 0x17 head byte from the stream.
-/// Must be called before TLS handshake.
+/// After detection classified the connection as TLS, consume the 0x17 head byte.
+/// DEPRECATED: use detect_and_strip_magic instead, which consumes magic upfront.
+/// Kept for frp-server/src/service.rs migration in Task 6.
 pub async fn consume_tls_head_byte(stream: &mut TcpStream) -> Result<(), crate::Error> {
     let mut buf = [0u8; 1];
     tokio::io::AsyncReadExt::read_exact(stream, &mut buf)

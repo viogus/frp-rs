@@ -388,88 +388,9 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
     Ok((frame_type, flags, payload))
 }
 
-/// V2 frame header size: magic(7) + frame_type(2 BE) + payload_length(4 BE) = 13 bytes.
-pub const V2_HEADER_LEN: usize = 13;
-
-/// Write a V2 frame: magic bytes + frame type (u16 BE) + payload length (u32 BE) + payload.
-pub async fn write_v2_frame<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
-    frame_type: u16,
-    payload: &[u8],
-) -> Result<(), crate::Error> {
-    if payload.len() > V2_MAX_FRAME_PAYLOAD as usize {
-        return Err(crate::Error::Protocol(format!(
-            "V2 payload too large: {} > {}", payload.len(), V2_MAX_FRAME_PAYLOAD
-        )));
-    }
-    let mut buf = Vec::with_capacity(V2_HEADER_LEN + payload.len());
-    buf.extend_from_slice(&V2_MAGIC_BYTES);
-    buf.extend_from_slice(&frame_type.to_be_bytes());
-    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    buf.extend_from_slice(payload);
-    writer.write_all(&buf).await
-        .map_err(|e| crate::Error::Protocol(format!("write V2 frame: {e}")))?;
-    Ok(())
-}
-
-/// Read a V2 frame header + payload. Returns (frame_type, payload_bytes).
-pub async fn read_v2_frame<R: AsyncReadExt + Unpin>(
-    reader: &mut R,
-) -> Result<(u16, Vec<u8>), crate::Error> {
-    let mut header = [0u8; V2_HEADER_LEN];
-    reader.read_exact(&mut header).await
-        .map_err(|e| crate::Error::Protocol(format!("read V2 header: {e}")))?;
-
-    if header[..7] != V2_MAGIC_BYTES {
-        return Err(crate::Error::Protocol("invalid V2 magic".into()));
-    }
-
-    let frame_type = u16::from_be_bytes([header[7], header[8]]);
-    let payload_len = u32::from_be_bytes([header[9], header[10], header[11], header[12]]) as usize;
-
-    if payload_len > V2_MAX_FRAME_PAYLOAD as usize {
-        return Err(crate::Error::Protocol(format!(
-            "V2 payload too large: {payload_len}"
-        )));
-    }
-
-    let mut payload = vec![0u8; payload_len];
-    reader.read_exact(&mut payload).await
-        .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}")))?;
-
-    Ok((frame_type, payload))
-}
-
-/// Write a FrpMessage using V2 framing with JSON serialization.
-/// V2 uses the same JSON payload as V1 but with proper binary framing
-/// (magic bytes, 2-byte type, 4-byte length) instead of V1's 1-byte type + 8-byte length.
-/// The frame_type is the V1 type byte (cast to u16) for correct deserialization dispatch.
-pub async fn write_msg_v2<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
-    msg: &FrpMessage,
-) -> Result<(), crate::Error> {
-    let payload = serde_json::to_vec(msg)
-        .map_err(|e| crate::Error::Protocol(format!("V2 JSON serialize: {e}")))?;
-    write_v2_frame(writer, msg.v1_type_byte() as u16, &payload).await
-}
-
-/// Read a FrpMessage using V2 framing with JSON deserialization.
-/// Uses the frame_type (V1 type byte) for correct variant dispatch.
-pub async fn read_msg_v2<R: AsyncReadExt + Unpin>(
-    reader: &mut R,
-) -> Result<FrpMessage, crate::Error> {
-    let (frame_type, payload) = read_v2_frame(reader).await?;
-    if frame_type > u8::MAX as u16 {
-        return Err(crate::Error::Protocol(format!(
-            "unknown V2 frame type: {frame_type}"
-        )));
-    }
-    deserialize_v1(frame_type as u8, &payload)
-}
-
 /// Write a FrpMessage using Go-compatible V2 framing.
 /// Frame: type=16(Message) flags=0, payload = type_id(2 BE) + JSON.
-pub async fn write_msg_v2_go<W: AsyncWriteExt + Unpin>(
+pub async fn write_msg_v2<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg: &FrpMessage,
 ) -> Result<(), crate::Error> {
@@ -486,7 +407,7 @@ pub async fn write_msg_v2_go<W: AsyncWriteExt + Unpin>(
 
 /// Read a FrpMessage using Go-compatible V2 framing.
 /// Expects frame type=16, extracts 2-byte type ID from payload prefix.
-pub async fn read_msg_v2_go<R: AsyncReadExt + Unpin>(
+pub async fn read_msg_v2<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> Result<FrpMessage, crate::Error> {
     let (frame_type, _flags, payload) = read_v2_frame_raw(reader).await?;
@@ -645,9 +566,10 @@ mod tests {
     async fn test_v2_frame_read_write() {
         let (mut client, mut server) = duplex(65536);
         let payload = b"hello v2 world";
-        write_v2_frame(&mut client, 16, payload).await.expect("write V2 frame");
-        let (ft, data) = read_v2_frame(&mut server).await.expect("read V2 frame");
+        write_v2_frame_raw(&mut client, 16, 0, payload).await.expect("write V2 frame");
+        let (ft, flags, data) = read_v2_frame_raw(&mut server).await.expect("read V2 frame");
         assert_eq!(ft, 16);
+        assert_eq!(flags, 0);
         assert_eq!(data, payload);
     }
 
@@ -690,9 +612,9 @@ mod tests {
             FrpMessage::Ping(msg::Ping { privilege_key: None, timestamp: Some(42) }),
             FrpMessage::Pong(msg::Pong { error: None }),
             FrpMessage::CloseProxy(msg::CloseProxy { proxy_name: "test".into() }),
-            FrpMessage::CloseProxyResp(msg::CloseProxyResp { proxy_name: "test".into() }),
             FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
-            FrpMessage::Error(msg::Error { error: "err".into() }),
+            // Note: CloseProxyResp and Error are V1-only (v2_type_id() == 0),
+            // so they are excluded from this V2 roundtrip test.
         ];
 
         for msg in &messages {
@@ -704,18 +626,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_v2_frame_rejects_bad_magic() {
+    async fn test_v2_msg_rejects_non_message_frame_type() {
+        // Go-compatible V2: read_msg_v2 expects frame_type == 16 (Message).
+        // Write a frame with frame_type=1 (ClientHello) — should be rejected.
         let (mut client, mut server) = duplex(256);
-        client.write_all(b"BADMAGIC!!!!!").await.expect("write bad magic");
-        let result = read_v2_frame(&mut server).await;
-        assert!(result.is_err(), "should reject bad magic");
+        write_v2_frame_raw(&mut client, 1, 0, b"hello").await.expect("write frame");
+        let result = read_msg_v2(&mut server).await;
+        assert!(result.is_err(), "should reject non-Message frame type");
     }
 
     #[tokio::test]
     async fn test_v2_frame_rejects_oversized() {
         let oversized = vec![0u8; (V2_MAX_FRAME_PAYLOAD + 1) as usize];
         let mut buf = Vec::new();
-        let result = write_v2_frame(&mut buf, 16, &oversized).await;
+        let result = write_v2_frame_raw(&mut buf, 16, 0, &oversized).await;
         assert!(result.is_err(), "should reject oversized payload");
     }
 }
