@@ -1318,7 +1318,10 @@ pub async fn accept_websocket(stream: TcpStream) -> Result<IoStream, crate::Erro
         s
     };
 
-    // Send HTTP 101 Switching Protocols
+    // Send HTTP 101 Switching Protocols.
+    // Capture any bytes BufReader may have read-ahead past headers
+    // (defensive: client should wait for 101 before sending frames).
+    let leftover = reader.buffer().to_vec();
     let mut tcp = reader.into_inner();
     let resp = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
@@ -1326,7 +1329,12 @@ pub async fn accept_websocket(stream: TcpStream) -> Result<IoStream, crate::Erro
     tcp.write_all(resp.as_bytes()).await
         .map_err(|e| crate::Error::Transport(format!("WS write response: {e}")))?;
 
-    Ok(IoStream::WebSocket(WsByteStream::from_raw_tcp(tcp, false)))
+    let mut ws = WsByteStream::from_raw_tcp(tcp, false);
+    if !leftover.is_empty() {
+        ws.read_buf = leftover;
+        ws.read_pos = 0;
+    }
+    Ok(IoStream::WebSocket(ws))
 }
 
 /// Connect via WebSocket using manual HTTP upgrade (Raw mode, client side).
@@ -1389,34 +1397,47 @@ pub async fn connect_ws_raw(
     tcp.write_all(req.as_bytes()).await
         .map_err(|e| crate::Error::Transport(format!("WS raw connect write: {e}")))?;
 
-    // Read HTTP 101 response
-    let mut reader = BufReader::new(tcp);
-    let mut status_line = String::new();
-    reader.read_line(&mut status_line).await
-        .map_err(|e| crate::Error::Transport(format!("WS raw connect read status: {e}")))?;
+    // Read HTTP 101 response with timeout.
+    // BufReader may buffer WebSocket frame bytes past \r\n\r\n — capture
+    // them before into_inner() to avoid permanent stream desync.
+    let (tcp, leftover) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async {
+            let mut reader = BufReader::new(tcp);
+            let mut status_line = String::new();
+            reader.read_line(&mut status_line).await
+                .map_err(|e| crate::Error::Transport(format!("WS raw connect read status: {e}")))?;
 
-    if !status_line.contains("101") {
-        return Err(crate::Error::Transport(format!(
-            "WS upgrade rejected: {}",
-            status_line.trim()
-        )));
-    }
+            if !status_line.starts_with("HTTP/1.1 101") {
+                return Err(crate::Error::Transport(format!(
+                    "WS upgrade rejected: {}",
+                    status_line.trim()
+                )));
+            }
 
-    // Consume response headers until \r\n\r\n
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).await
-            .map_err(|e| crate::Error::Transport(format!("WS raw connect read headers: {e}")))?;
-        if line == "\r\n" || line.is_empty() {
-            break;
+            // Consume response headers until \r\n\r\n
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await
+                    .map_err(|e| crate::Error::Transport(format!("WS raw connect read headers: {e}")))?;
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+
+            let leftover = reader.buffer().to_vec();
+            let tcp = reader.into_inner();
+            Ok::<_, crate::Error>((tcp, leftover))
         }
-    }
+    ).await
+        .map_err(|_| crate::Error::Transport("WS raw connect: timeout waiting for 101 response".into()))??;
 
-    let tcp = reader.into_inner();
-    Ok(IoStream::WebSocket(WsByteStream::from_raw_tcp(
-        tcp,
-        true, // client mode — mask outgoing frames
-    )))
+    let mut ws = WsByteStream::from_raw_tcp(tcp, true);
+    if !leftover.is_empty() {
+        ws.read_buf = leftover;
+        ws.read_pos = 0;
+    }
+    Ok(IoStream::WebSocket(ws))
 }
 
 /// TLS configuration.
