@@ -234,6 +234,7 @@ pub async fn handle_control<S>(
     let mut work_pool: VecDeque<IoStream> = VecDeque::new();
     let mut pending_requests: VecDeque<PendingRequest> = VecDeque::new();
     let mut pending_udp: VecDeque<(String, Instant)> = VecDeque::new();
+    let mut pending_nat_hole_sids: VecDeque<String> = VecDeque::new();
     // TCP/HTTP/STCP listener handles. UDP listeners are managed via the work-connection
     // mechanism (UdpNeedsWorkConn → ReqWorkConn → assign_udp_work_conn).
     let mut listener_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> = std::collections::HashMap::new();
@@ -267,41 +268,55 @@ pub async fn handle_control<S>(
             // Prefer internal messages to reduce latency for proxy connections
             internal = internal_rx.recv() => {
                 match internal {
-                    Some(InternalMsg::NewWorkConn(stream)) => {
+                    Some(InternalMsg::NewWorkConn(mut stream)) => {
                         debug!("Got work conn for run_id {}", run_id);
-                        // Expire stale pending UDP requests first
-                        while let Some((_, ts)) = pending_udp.front() {
-                            if ts.elapsed() > PENDING_REQUEST_TIMEOUT {
-                                let (pn, _) = pending_udp.pop_front().unwrap();
-                                debug!("Pending UDP work conn for '{}' timed out", pn);
-                            } else {
-                                break;
+                        // Check NatHoleSid delivery first (Go frp XTCP compat).
+                        // Pending sids take priority — they unblock waiting visitors.
+                        if let Some(sid) = pending_nat_hole_sids.pop_front() {
+                            debug!("Delivering pending NatHoleSid {} to provider", sid);
+                            let forward = FrpMessage::NatHoleSid(msg::NatHoleSid {
+                                sid: Some(sid.clone()),
+                                provider_addr: None,
+                            });
+                            if let Err(e) = write_ctl_msg(&mut stream, &forward, v2).await {
+                                warn!("Failed to send pending NatHoleSid: {}", e);
                             }
-                        }
-                        // Check if a UDP proxy needs this work connection
-                        if let Some((proxy_name, _)) = pending_udp.pop_front() {
-                            info!("Assigning work conn to UDP proxy '{}'", proxy_name);
-                            let local_addr = state.proxy_manager.get(&proxy_name).await
-                                .and_then(|info| info.local_addr)
-                                .and_then(|s| msg::UdpAddr::from_string(&s));
-                            bridge::assign_udp_work_conn(stream, &proxy_name, &udp_sockets, local_addr, v2, state.udp_packet_size).await;
+                            // Work conn consumed for XTCP notification — drop it.
                         } else {
-                            // Drain expired TCP requests
-                            while let Some(req) = pending_requests.front() {
-                                if req.created_at.elapsed() > PENDING_REQUEST_TIMEOUT {
-                                    pending_requests.pop_front();
+                            // Expire stale pending UDP requests first
+                            while let Some((_, ts)) = pending_udp.front() {
+                                if ts.elapsed() > PENDING_REQUEST_TIMEOUT {
+                                    let (pn, _) = pending_udp.pop_front().unwrap();
+                                    debug!("Pending UDP work conn for '{}' timed out", pn);
                                 } else {
                                     break;
                                 }
                             }
-                            if let Some(req) = pending_requests.pop_front() {
-                                let enc_key = state.reloadable.read().unwrap().encryption_key;
-                                bridge::assign_work_to_proxy(stream, req, enc_key, state.clone(), v2).await;
-                            } else if work_pool.len() < pool_cap {
-                                work_pool.push_back(stream);
-                                debug!("Work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
+                            // Check if a UDP proxy needs this work connection
+                            if let Some((proxy_name, _)) = pending_udp.pop_front() {
+                                info!("Assigning work conn to UDP proxy '{}'", proxy_name);
+                                let local_addr = state.proxy_manager.get(&proxy_name).await
+                                    .and_then(|info| info.local_addr)
+                                    .and_then(|s| msg::UdpAddr::from_string(&s));
+                                bridge::assign_udp_work_conn(stream, &proxy_name, &udp_sockets, local_addr, v2, state.udp_packet_size).await;
                             } else {
-                                debug!("Work pool full for {} ({}/{}), dropping work conn", run_id, work_pool.len(), pool_cap);
+                                // Drain expired TCP requests
+                                while let Some(req) = pending_requests.front() {
+                                    if req.created_at.elapsed() > PENDING_REQUEST_TIMEOUT {
+                                        pending_requests.pop_front();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if let Some(req) = pending_requests.pop_front() {
+                                    let enc_key = state.reloadable.read().unwrap().encryption_key;
+                                    bridge::assign_work_to_proxy(stream, req, enc_key, state.clone(), v2).await;
+                                } else if work_pool.len() < pool_cap {
+                                    work_pool.push_back(stream);
+                                    debug!("Work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
+                                } else {
+                                    debug!("Work pool full for {} ({}/{}), dropping work conn", run_id, work_pool.len(), pool_cap);
+                                }
                             }
                         }
                     }
@@ -392,26 +407,27 @@ pub async fn handle_control<S>(
                         }
                         pending_udp.push_back((proxy_name, Instant::now()));
                     }
-                    Some(InternalMsg::NatHoleClient { proxy_name, transaction_id, visitor_addr, visitor_mapped_addrs, visitor_assisted_addrs, visitor_protocol }) => {
+                    Some(InternalMsg::NatHoleClient { proxy_name, transaction_id, visitor_addr }) => {
                         debug!("Received NatHoleClient notification for session {}", transaction_id);
 
-                        // Go frp v0.69.1 compat: server is a pure relay.
-                        // Forward visitor's STUN-discovered addresses and protocol
-                        // to the provider so it knows where to send hole-punch packets.
+                        // Server-side STUN for Rust frpc XTCP compat path.
+                        // The Rust frpc provider uses NatHoleClient.visitor_addr for
+                        // TCP simultaneous open to the visitor.
+                        // For Go frp compat, the NatHoleSidOnWorkConn path is used instead.
                         let reply = FrpMessage::NatHoleClient(msg::NatHoleClient {
                             transaction_id: transaction_id.clone(),
                             proxy_name: proxy_name.clone(),
                             sid: Some(transaction_id.clone()),
-                            protocol: visitor_protocol.clone(),
-                            mapped_addrs: visitor_mapped_addrs.clone(),
-                            assisted_addrs: visitor_assisted_addrs.clone(),
+                            protocol: None,
+                            mapped_addrs: None,
+                            assisted_addrs: None,
                             visitor_addr,
                         });
                         if let Err(e) = write_ctl_msg(&mut writer, &reply, v2).await {
                             warn!("Failed to send NatHoleClient reply: {}", e);
                             break;
                         }
-                        debug!("Sent NatHoleClient reply with STUN addresses for {}", transaction_id);
+                        debug!("Sent NatHoleClient reply for {}", transaction_id);
                     }
                     Some(InternalMsg::WriteNatHoleSid { sid, provider_addr }) => {
                         debug!("Writing NatHoleSid to visitor via control channel for {}", sid);
@@ -445,6 +461,30 @@ pub async fn handle_control<S>(
                         });
                         if let Err(e) = write_ctl_msg(&mut writer, &forward, v2).await {
                             warn!("Failed to write NatHoleReport to visitor: {}", e);
+                        }
+                    }
+                    Some(InternalMsg::NatHoleSidOnWorkConn { sid }) => {
+                        debug!("Sending NatHoleSid {} to provider on work conn", sid);
+                        if let Some(mut work_conn) = work_pool.pop_front() {
+                            let forward = FrpMessage::NatHoleSid(msg::NatHoleSid {
+                                sid: Some(sid.clone()),
+                                provider_addr: None,
+                            });
+                            if let Err(e) = write_ctl_msg(&mut work_conn, &forward, v2).await {
+                                warn!("Failed to send NatHoleSid on work conn: {}", e);
+                            } else {
+                                debug!("Sent NatHoleSid {} to provider on work conn", sid);
+                            }
+                            // Connection consumed — Go frp doesn't reuse after NatHoleSid.
+                            drop(work_conn);
+                        } else {
+                            // No pooled work conn — request one, queue sid.
+                            debug!("No pooled work conn for NatHoleSid {}, requesting via ReqWorkConn", sid);
+                            if let Err(e) = write_ctl_msg(&mut writer,
+                                &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
+                                warn!("Failed to send ReqWorkConn for NatHoleSid: {}", e);
+                            }
+                            pending_nat_hole_sids.push_back(sid);
                         }
                     }
                     Some(InternalMsg::Shutdown) => {
@@ -754,6 +794,19 @@ pub async fn handle_control<S>(
                             }
                         };
 
+                        // Go frp v0.69.1 pre_check compat: validate and return OK,
+                        // no session created, no provider notified.
+                        if nhv.pre_check && nhv.mapped_addrs.is_none() {
+                            debug!("NatHoleVisitor pre_check on ctl channel: proxy='{}' OK", proxy_name);
+                            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                transaction_id: transaction_id.clone(),
+                                error: None,
+                                ..Default::default()
+                            });
+                            let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                            continue;
+                        }
+
                         let provider_ctl = {
                             let map = state.run_id_to_ctl_tx.read().await;
                             map.get(&provider_run_id).cloned()
@@ -787,16 +840,11 @@ pub async fn handle_control<S>(
                             }
                         };
 
-                        // Send NatHoleClient to provider with visitor's STUN data.
-                        // Go frp v0.69.1 compat: server is a pure relay.
-                        let visitor_addr = peer.as_ref().map(|a| a.to_string());
-                        if provider_ctl.tx.send(InternalMsg::NatHoleClient {
-                            proxy_name: proxy_name.clone(),
-                            transaction_id: transaction_id.clone(),
-                            visitor_addr,
-                            visitor_mapped_addrs: nhv.mapped_addrs.clone(),
-                            visitor_assisted_addrs: nhv.assisted_addrs.clone(),
-                            visitor_protocol: nhv.protocol.clone(),
+                        // Send NatHoleSid to provider ON A WORK CONNECTION (Go frp compat).
+                        // The provider's control handler pops a work conn, writes NatHoleSid,
+                        // and the provider does STUN + sends NatHoleClient on control.
+                        if provider_ctl.tx.send(InternalMsg::NatHoleSidOnWorkConn {
+                            sid: transaction_id.clone(),
                         }).is_err() {
                             warn!("Provider for run_id {} has gone away", provider_run_id);
                             state.nat_hole.remove(&transaction_id).await;

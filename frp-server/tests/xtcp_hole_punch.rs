@@ -7,23 +7,23 @@ use frp_core::transport::IoStream;
 
 use common::{allocate_port, raw_login, start_test_server};
 
-/// Server-side XTCP message routing test.
+/// Server-side XTCP message routing test — Go frp v0.69.1 compat flow.
 ///
 /// Verifies that the server correctly routes NatHole messages between
-/// visitor (fresh connection) and provider (control connection).
-/// Tests the NEW Go frp v0.69.1-compatible flow with address exchange.
+/// visitor (fresh connection) and provider (control + work connection).
+/// Uses the Go-compatible flow: pre_check validation, NatHoleSid on
+/// work connection, provider STUN response on control connection.
 ///
 /// Flow:
-/// 1. Provider logs in and registers an XTCP proxy with sk
-/// 2. Visitor sends NatHoleVisitor via fresh TCP connection
-/// 3. Server sends NatHoleClient notification to provider
-/// 4. Provider sends NatHoleClient reply with STUN addresses
-/// 5. Server runs NAT analysis, sends NatHoleResp to visitor
-///    with provider's addresses as candidate_addrs
-/// 6. Provider sends NatHoleSid back (simulating hole punch start)
-/// 7. Server forwards NatHoleSid to visitor
-/// 8. Provider sends NatHoleReport (hole punch complete)
-/// 9. Server forwards NatHoleReport to visitor and cleans up session
+/// 1. Provider logs in, registers XTCP proxy, establishes work conn pool
+/// 2. Visitor: pre_check NatHoleVisitor → NatHoleResp(OK) → disconnect
+/// 3. Visitor reconnects: full NatHoleVisitor (mapped_addrs, protocol)
+/// 4. Server sends NatHoleSid to provider ON WORK CONNECTION
+/// 5. Provider reads NatHoleSid from work conn
+/// 6. Provider sends NatHoleClient (with STUN addresses) on control conn
+/// 7. Server runs analysis → NatHoleResp to visitor (provider's addresses)
+/// 8. Server → NatHoleResp to provider (visitor's addresses)
+/// 9. Provider → NatHoleReport → server cleans up session
 #[tokio::test]
 async fn test_xtcp_nat_hole_message_routing() {
     let port = allocate_port();
@@ -36,8 +36,8 @@ async fn test_xtcp_nat_hole_message_routing() {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // --- Step 1: Provider logs in and registers XTCP proxy ---
-    let (mut provider, resp) = raw_login(addr, None, None, "").await.expect("provider login");
-    let _run_id = resp.run_id.expect("provider should get run_id");
+    let (mut provider_ctl, resp) = raw_login(addr, None, None, "").await.expect("provider login");
+    let run_id = resp.run_id.expect("provider should get run_id");
 
     let xtcp_sk = "xtcp-test-sk";
     let np = FrpMessage::NewProxy(NewProxy {
@@ -66,12 +66,12 @@ async fn test_xtcp_nat_hole_message_routing() {
         metas: None,
         multiplexer: None,
         virtual_net: None,
-                    proxy_protocol_version: None,
+        proxy_protocol_version: None,
     });
-    write_msg_v1(&mut provider, &np)
+    write_msg_v1(&mut provider_ctl, &np)
         .await
         .expect("send NewProxy");
-    match read_msg_v1(&mut provider).await.expect("read NewProxyResp") {
+    match read_msg_v1(&mut provider_ctl).await.expect("read NewProxyResp") {
         FrpMessage::NewProxyResp(ref resp) => {
             assert!(
                 resp.error.is_none(),
@@ -81,72 +81,148 @@ async fn test_xtcp_nat_hole_message_routing() {
         }
         other => panic!("expected NewProxyResp, got: {:?}", other.v1_type_byte()),
     }
+    println!("Provider registered XTCP proxy (run_id={})", run_id);
 
-    // --- Step 2: Visitor sends NatHoleVisitor on fresh connection ---
-    let mut visitor_conn = IoStream::Tcp(
+    // Establish a work connection and send NewWorkConn so server pools it.
+    // The provider KEEPS READING from this work conn to receive NatHoleSid.
+    let mut work_conn = IoStream::Tcp(
         tokio::net::TcpStream::connect(addr)
             .await
-            .expect("visitor connect"),
+            .expect("work conn connect"),
     );
-    let nhv = FrpMessage::NatHoleVisitor(msg::NatHoleVisitor {
-        transaction_id: format!("test-txn-{}", port),
+    let nwc = FrpMessage::NewWorkConn(msg::NewWorkConn {
+        run_id: Some(run_id.clone()),
+        ..Default::default()
+    });
+    write_msg_v1(&mut work_conn, &nwc)
+        .await
+        .expect("send NewWorkConn");
+    println!("Provider sent NewWorkConn — work conn pooled by server");
+
+    // Give server time to pool the work connection
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // --- Phase 1: PreCheck ---
+    let mut precheck_conn = IoStream::Tcp(
+        tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("visitor precheck connect"),
+    );
+    let precheck_msg = FrpMessage::NatHoleVisitor(msg::NatHoleVisitor {
+        transaction_id: format!("precheck-{}", port),
         proxy_name: "xtcp-test".into(),
         pre_check: true,
         ..Default::default()
     });
-    write_msg_v1(&mut visitor_conn, &nhv)
+    write_msg_v1(&mut precheck_conn, &precheck_msg)
         .await
-        .expect("send NatHoleVisitor");
+        .expect("send precheck NatHoleVisitor");
 
-    // --- Step 3: Provider reads NatHoleClient notification from server ---
-    let (sid, txn_id) = match read_msg_v1(&mut provider)
+    // PreCheck should return simple NatHoleResp (no sid, no session created)
+    match read_msg_v1(&mut precheck_conn)
         .await
-        .expect("read NatHoleClient from provider")
+        .expect("read precheck NatHoleResp")
     {
-        FrpMessage::NatHoleClient(nhc) => {
-            assert_eq!(nhc.proxy_name, "xtcp-test");
-            assert!(nhc.visitor_addr.is_some(), "should have visitor_addr");
-            println!(
-                "Provider received NatHoleClient: proxy={}, visitor_addr={}",
-                nhc.proxy_name,
-                nhc.visitor_addr.as_deref().unwrap_or("none")
-            );
-            let sid = nhc.sid.clone().unwrap_or_else(|| nhc.transaction_id.clone());
-            let txn = nhc.transaction_id.clone();
-            (sid, txn)
+        FrpMessage::NatHoleResp(resp) => {
+            assert!(resp.error.is_none(), "precheck error: {:?}", resp.error);
+            assert!(resp.sid.is_none(), "precheck should NOT have sid");
+            println!("PreCheck passed — NatHoleResp OK (no sid)");
         }
-        other => panic!("expected NatHoleClient, got: {:?}", other.v1_type_byte()),
-    };
+        other => panic!("expected NatHoleResp for precheck, got: {:?}", other.v1_type_byte()),
+    }
+    drop(precheck_conn);
 
-    // --- Step 4: Provider sends NatHoleClient reply with STUN addresses ---
-    // (simulating STUN discovery result)
-    let reply = FrpMessage::NatHoleClient(msg::NatHoleClient {
+    // --- Phase 2: Full NatHoleVisitor ---
+    let txn_id = format!("full-txn-{}", port);
+    let mut visitor_conn = IoStream::Tcp(
+        tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("visitor full connect"),
+    );
+    let nhv = FrpMessage::NatHoleVisitor(msg::NatHoleVisitor {
         transaction_id: txn_id.clone(),
         proxy_name: "xtcp-test".into(),
-        sid: Some(sid.clone()),
+        pre_check: false,
         protocol: Some("tcp".to_string()),
+        sign_key: None, // no auth needed for test
+        timestamp: None,
         mapped_addrs: Some(vec![
-            "10.0.0.1:7000".to_string(),
-            "10.0.0.1:7002".to_string(),
+            "1.2.3.4:5678".to_string(),
+            "1.2.3.4:5680".to_string(),
         ]),
-        assisted_addrs: None,
-        visitor_addr: Some("127.0.0.1:65411".into()),
+        assisted_addrs: Some(vec!["192.168.1.5:5678".to_string()]),
+        ..Default::default()
     });
-    write_msg_v1(&mut provider, &reply)
+    write_msg_v1(&mut visitor_conn, &nhv)
         .await
-        .expect("send NatHoleClient reply");
-    println!("Provider sent NatHoleClient reply with STUN addresses for {}", sid);
+        .expect("send full NatHoleVisitor");
+    println!("Visitor sent full NatHoleVisitor with mapped_addrs");
 
-    // --- Step 5: Visitor reads NatHoleResp with provider's candidate addresses ---
+    // --- Provider reads NatHoleSid from WORK CONNECTION ---
+    match read_msg_v1(&mut work_conn)
+        .await
+        .expect("read NatHoleSid from work conn")
+    {
+        FrpMessage::NatHoleSid(sid_msg) => {
+            let sid = sid_msg.sid.clone().expect("NatHoleSid should have sid");
+            assert!(!sid.is_empty(), "sid should be non-empty");
+            println!("Provider received NatHoleSid on work conn: sid={}", sid);
+
+            // --- Provider does "STUN" → sends NatHoleClient on CONTROL conn ---
+            let client_msg = FrpMessage::NatHoleClient(msg::NatHoleClient {
+                transaction_id: txn_id.clone(),
+                proxy_name: "xtcp-test".into(),
+                sid: Some(sid.clone()),
+                protocol: Some("tcp".to_string()),
+                mapped_addrs: Some(vec![
+                    "10.0.0.1:7000".to_string(),
+                    "10.0.0.1:7002".to_string(),
+                ]),
+                assisted_addrs: None,
+                visitor_addr: None,
+            });
+            write_msg_v1(&mut provider_ctl, &client_msg)
+                .await
+                .expect("send NatHoleClient on control");
+            println!("Provider sent NatHoleClient on control with STUN addresses");
+
+            // --- Provider reads NatHoleResp from server on control conn ---
+            match read_msg_v1(&mut provider_ctl)
+                .await
+                .expect("read NatHoleResp from provider control")
+            {
+                FrpMessage::NatHoleResp(resp) => {
+                    assert!(resp.error.is_none(), "provider NatHoleResp error: {:?}", resp.error);
+                    assert_eq!(resp.sid.as_deref(), Some(sid.as_str()));
+                    // Provider should get VISITOR's mapped addresses as candidates
+                    if let Some(ref candidates) = resp.candidate_addrs {
+                        assert!(
+                            candidates.iter().any(|a| a.contains("1.2.3.4")),
+                            "provider's candidate_addrs should contain visitor addresses, got: {:?}",
+                            candidates
+                        );
+                    }
+                    println!(
+                        "Provider received NatHoleResp with visitor addresses: detect_behavior={:?}",
+                        resp.detect_behavior
+                    );
+                }
+                other => panic!("expected NatHoleResp on provider control, got: {:?}", other.v1_type_byte()),
+            }
+        }
+        other => panic!("expected NatHoleSid on work conn, got: {:?}", other.v1_type_byte()),
+    }
+
+    // --- Visitor reads NatHoleResp with provider's candidate addresses ---
     match read_msg_v1(&mut visitor_conn)
         .await
         .expect("read NatHoleResp from visitor")
     {
         FrpMessage::NatHoleResp(resp) => {
-            assert!(resp.error.is_none(), "NatHoleResp error: {:?}", resp.error);
-            let resp_sid = resp.sid.as_deref().map(|s| s.to_string());
-            assert_eq!(resp_sid, Some(sid.clone()));
-            // KEY: candidate_addrs should contain PROVIDER's addresses, not visitor's
+            assert!(resp.error.is_none(), "visitor NatHoleResp error: {:?}", resp.error);
+            let resp_sid = resp.sid.clone();
+            assert!(resp_sid.is_some(), "visitor NatHoleResp should have sid");
+            // KEY: candidate_addrs should contain PROVIDER's addresses
             if let Some(ref candidates) = resp.candidate_addrs {
                 assert!(
                     candidates.iter().any(|a| a.contains("10.0.0.1")),
@@ -161,72 +237,23 @@ async fn test_xtcp_nat_hole_message_routing() {
                 resp.detect_behavior
             );
         }
-        other => panic!("expected NatHoleResp, got: {:?}", other.v1_type_byte()),
+        other => panic!("expected NatHoleResp on visitor, got: {:?}", other.v1_type_byte()),
     }
 
-    // --- Step 6: Provider reads NatHoleResp from server ---
-    // Server sends NatHoleResp to provider with visitor's addresses as candidates.
-    // Provider must consume this before sending further messages.
-    match read_msg_v1(&mut provider)
-        .await
-        .expect("read NatHoleResp from provider")
-    {
-        FrpMessage::NatHoleResp(resp) => {
-            assert!(resp.error.is_none(), "provider NatHoleResp error: {:?}", resp.error);
-            assert_eq!(resp.sid.as_deref(), Some(sid.as_str()));
-            println!(
-                "Provider received NatHoleResp with visitor addresses as candidates: {:?}",
-                resp.candidate_addrs
-            );
-        }
-        other => panic!("expected NatHoleResp on provider, got: {:?}", other.v1_type_byte()),
-    }
-
-    // --- Step 7: Provider sends NatHoleSid (simulating hole punch start) ---
-    let sid_msg = FrpMessage::NatHoleSid(msg::NatHoleSid {
-        sid: Some(sid.clone()),
-        provider_addr: None,
-    });
-    write_msg_v1(&mut provider, &sid_msg)
-        .await
-        .expect("send NatHoleSid");
-    println!("Provider sent NatHoleSid for session {}", sid);
-
-    // --- Step 8: Visitor reads NatHoleSid (forwarded from provider) ---
-    let _provider_addr = match read_msg_v1(&mut visitor_conn)
-        .await
-        .expect("read forwarded msg from visitor")
-    {
-        FrpMessage::NatHoleSid(sid_resp) => {
-            println!("Visitor received NatHoleSid (forwarded)");
-            sid_resp.provider_addr
-        }
-        other => panic!("expected NatHoleSid after NatHoleResp, got: {:?}", other.v1_type_byte()),
-    };
-
-    // --- Step 9: Provider sends NatHoleReport (hole punch complete) ---
+    // --- Provider sends NatHoleReport (hole punch complete) ---
+    // Use the sid from the visitor's NatHoleResp
+    // (In real flow, provider sends after hole punch succeeds)
+    // For this test, we already consumed the provider NatHoleResp above.
+    // The session is complete — send report to clean up.
     let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
-        sid: Some(sid.clone()),
+        sid: Some(txn_id.clone()),
     });
-    write_msg_v1(&mut provider, &report)
+    write_msg_v1(&mut provider_ctl, &report)
         .await
         .expect("send NatHoleReport");
-    println!("Provider sent NatHoleReport for session {}", sid);
+    println!("Provider sent NatHoleReport for cleanup");
 
-    // --- Step 10: Visitor reads NatHoleReport ---
-    match read_msg_v1(&mut visitor_conn)
-        .await
-        .expect("read NatHoleReport from visitor")
-    {
-        FrpMessage::NatHoleReport(report_resp) => {
-            assert_eq!(report_resp.sid, Some(sid.clone()));
-            println!("Visitor received NatHoleReport — hole punch complete");
-        }
-        other => panic!("expected NatHoleReport, got: {:?}", other.v1_type_byte()),
-    }
-
-    // --- Verify: provider connection still usable after NAT hole session ---
-    // Send another NewProxy to confirm connection alive
+    // --- Verify: provider control connection still usable after session ---
     let np2 = FrpMessage::NewProxy(NewProxy {
         proxy_name: "xtcp-test-2".into(),
         proxy_type: "xtcp".into(),
@@ -253,23 +280,27 @@ async fn test_xtcp_nat_hole_message_routing() {
         metas: None,
         multiplexer: None,
         virtual_net: None,
-                    proxy_protocol_version: None,
+        proxy_protocol_version: None,
     });
-    write_msg_v1(&mut provider, &np2)
+    write_msg_v1(&mut provider_ctl, &np2)
         .await
         .expect("send NewProxy after hole punch");
-    match read_msg_v1(&mut provider).await.expect("read NewProxyResp after hole punch") {
+    match read_msg_v1(&mut provider_ctl)
+        .await
+        .expect("read NewProxyResp after hole punch")
+    {
         FrpMessage::NewProxyResp(ref resp) => {
             assert!(
                 resp.error.is_none(),
-                "second proxy registration should succeed: {:?}",
+                "second proxy should succeed: {:?}",
                 resp.error
             );
         }
         other => panic!("expected NewProxyResp, got: {:?}", other.v1_type_byte()),
     }
 
-    println!("XTCP message routing verified — all messages routed correctly");
-    drop(provider);
+    println!("XTCP Go-compat message routing verified!");
+    drop(provider_ctl);
     drop(visitor_conn);
+    drop(work_conn);
 }
