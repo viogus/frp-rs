@@ -312,16 +312,15 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
     // Generate a random conversation ID for this session
     let conv: u32 = rand::random();
 
-    // Create channels first — the reader task needs udp_tx clone before
+    // Create channels first — the reader task needs a udp_tx clone before
     // KcpStream::new() consumes udp_rx.
-    let (udp_tx, udp_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (reader_udp_tx, udp_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     // Spawn a background task that reads UDP packets from the socket
     // and forwards them to the driver via udp_tx. The handle is stored
     // in KcpStream so it can be aborted on drop.
     let sock = socket.clone();
     let peer = remote;
-    let reader_udp_tx = udp_tx.clone();
     let reader_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         loop {
