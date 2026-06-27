@@ -27,7 +27,7 @@ pub const TYPE_CLOSE_PROXY_RESP: u8 = b'7';
 pub const TYPE_ERROR: u8 = b'8';
 
 // ---------------------------------------------------------------
-// V2 message type IDs (stubs)
+// V2 message type IDs (matching Go frp v0.69.1 wire_v2.go)
 // ---------------------------------------------------------------
 pub const V2_TYPE_LOGIN: u16 = 1;
 pub const V2_TYPE_LOGIN_RESP: u16 = 2;
@@ -37,11 +37,16 @@ pub const V2_TYPE_CLOSE_PROXY: u16 = 5;
 pub const V2_TYPE_NEW_WORK_CONN: u16 = 6;
 pub const V2_TYPE_REQ_WORK_CONN: u16 = 7;
 pub const V2_TYPE_START_WORK_CONN: u16 = 8;
+pub const V2_TYPE_NEW_VISITOR_CONN: u16 = 9;
+pub const V2_TYPE_NEW_VISITOR_CONN_RESP: u16 = 10;
 pub const V2_TYPE_PING: u16 = 11;
 pub const V2_TYPE_PONG: u16 = 12;
 pub const V2_TYPE_UDP_PACKET: u16 = 13;
-pub const V2_TYPE_NEW_VISITOR_CONN: u16 = 14;
-pub const V2_TYPE_NEW_VISITOR_CONN_RESP: u16 = 15;
+pub const V2_TYPE_NAT_HOLE_VISITOR: u16 = 14;
+pub const V2_TYPE_NAT_HOLE_CLIENT: u16 = 15;
+pub const V2_TYPE_NAT_HOLE_RESP: u16 = 16;
+pub const V2_TYPE_NAT_HOLE_SID: u16 = 17;
+pub const V2_TYPE_NAT_HOLE_REPORT: u16 = 18;
 
 // ---------------------------------------------------------------
 // Base64 helpers for UDPPacket (Go frp encodes []byte as base64)
@@ -479,20 +484,26 @@ impl FrpMessage {
 
     pub fn v2_type_id(&self) -> u16 {
         match self {
-            FrpMessage::Login(_)         => V2_TYPE_LOGIN,
-            FrpMessage::LoginResp(_)     => V2_TYPE_LOGIN_RESP,
-            FrpMessage::NewProxy(_)      => V2_TYPE_NEW_PROXY,
-            FrpMessage::NewProxyResp(_)  => V2_TYPE_NEW_PROXY_RESP,
-            FrpMessage::CloseProxy(_)    => V2_TYPE_CLOSE_PROXY,
-            FrpMessage::NewWorkConn(_)   => V2_TYPE_NEW_WORK_CONN,
-            FrpMessage::ReqWorkConn(_)   => V2_TYPE_REQ_WORK_CONN,
-            FrpMessage::StartWorkConn(_) => V2_TYPE_START_WORK_CONN,
-            FrpMessage::Ping(_)          => V2_TYPE_PING,
-            FrpMessage::Pong(_)          => V2_TYPE_PONG,
-            FrpMessage::UDPPacket(_)     => V2_TYPE_UDP_PACKET,
-            FrpMessage::NewVisitorConn(_) => V2_TYPE_NEW_VISITOR_CONN,
+            FrpMessage::Login(_)              => V2_TYPE_LOGIN,
+            FrpMessage::LoginResp(_)          => V2_TYPE_LOGIN_RESP,
+            FrpMessage::NewProxy(_)           => V2_TYPE_NEW_PROXY,
+            FrpMessage::NewProxyResp(_)       => V2_TYPE_NEW_PROXY_RESP,
+            FrpMessage::CloseProxy(_)         => V2_TYPE_CLOSE_PROXY,
+            FrpMessage::NewWorkConn(_)        => V2_TYPE_NEW_WORK_CONN,
+            FrpMessage::ReqWorkConn(_)        => V2_TYPE_REQ_WORK_CONN,
+            FrpMessage::StartWorkConn(_)      => V2_TYPE_START_WORK_CONN,
+            FrpMessage::Ping(_)               => V2_TYPE_PING,
+            FrpMessage::Pong(_)               => V2_TYPE_PONG,
+            FrpMessage::UDPPacket(_)          => V2_TYPE_UDP_PACKET,
+            FrpMessage::NewVisitorConn(_)     => V2_TYPE_NEW_VISITOR_CONN,
             FrpMessage::NewVisitorConnResp(_) => V2_TYPE_NEW_VISITOR_CONN_RESP,
-            _ => 0, // NAT hole types have no V2 equivalent yet
+            FrpMessage::NatHoleVisitor(_)     => V2_TYPE_NAT_HOLE_VISITOR,
+            FrpMessage::NatHoleClient(_)      => V2_TYPE_NAT_HOLE_CLIENT,
+            FrpMessage::NatHoleResp(_)        => V2_TYPE_NAT_HOLE_RESP,
+            FrpMessage::NatHoleSid(_)         => V2_TYPE_NAT_HOLE_SID,
+            FrpMessage::NatHoleReport(_)      => V2_TYPE_NAT_HOLE_REPORT,
+            // CloseProxyResp and Error are V1-only types, no V2 equivalent
+            _ => 0,
         }
     }
 
