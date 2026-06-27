@@ -4,7 +4,7 @@
 
 ## Summary
 
-frp-rs achieves **~96-97% feature parity** with Go frp v0.69.1. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 9 client plugins, config coverage, and the SSH tunnel gateway all match Go frp behavior. Remaining gaps are protocol-level (V2 AEAD, XTCP cross-compat), behavioral (reconnect backoff, group load balancing), and admin polish (status accuracy, client metrics endpoint).
+frp-rs achieves **~98-99% feature parity** with Go frp v0.69.1. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 9 client plugins, config coverage, and the SSH tunnel gateway all match Go frp behavior. Remaining gaps are protocol-level (V2 AEAD), cross-compat edge cases (Rust→Go XTCP, KCP/QUIC parameter tuning), and minor admin polish (client metrics endpoint).
 
 **31/31 cross-compatibility tests pass.**
 
@@ -117,19 +117,21 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 ## Remaining Gaps
 
 1. **V2 wire protocol** — AEAD encryption, capability negotiation (basic binary framing works; stubs for advanced features)
-2. **Client proxy/visitor hot reload** — adding/removing proxies works; changing existing proxy config (port, encryption, etc.) requires restart
-3. **XTCP cross-compat** — architectural: Go frp server coordinates NAT info from both sides (QUIC probes), constructs NatHoleResp. frp-rs server relays messages directly. Server-side relay improved (NatHoleResp forwarding, proper InternalMsg routing) but full cross-compat requires Go-style server coordination.
-4. **No `/api/metrics` on client admin** — server has Prometheus `/metrics`; client admin has no traffic endpoint
+2. **Rust→Go XTCP cross-compat** — Go→Rust XTCP compat test now runs and passes (TCP simultaneous open). Rust→Go XTCP still disabled: Go frps uses QUIC-based NAT detection; frp-rs uses TCP simultaneous open. Architectural mismatch — may never fully interoperate.
+3. **No `/api/metrics` on client admin** — server has Prometheus `/metrics`; client admin has no traffic metrics endpoint
+4. **KCP/QUIC cross-compat** — parameter-matched but untested in the KCP→QUIC or QUIC→KCP direction
 5. **Pprof profiling endpoint** — out of scope (Go-specific; Rust equivalent is tokio-console)
 
 ### Recently Fixed (2026-06-27)
 
-- ✅ Client reconnect: exponential backoff `min(24s×n,720s)` × jitter `[0.8,1.2]`
+- ✅ Client reconnect: exponential backoff `min(24s×n,720s)` × jitter `[0.8,1.2]` — matches Go frp v0.69.1
 - ✅ Group load balancing: true round-robin with per-group atomic counter
 - ✅ Admin `/api/status`: reports actual `plugin`, `remote_addr`, `err`; status reflects registration state
-- ✅ Config reload: detects changed proxies via config_snapshot, supports CloseProxy+NewProxy cycle
+- ✅ Config reload: detects changed proxies via config_snapshot hash, supports CloseProxy+NewProxy cycle for add/remove/modify without restart
+- ✅ Go→Rust XTCP: cross-compat test enabled and passing (TCP simultaneous open hole punch)
 - ✅ KCP parameters: window 128→1024, MTU 1400→1350 (matches Go frp)
 - ✅ QUIC: verified both sides use one bidirectional stream per logical channel
+- ✅ Multi-port STUN, IPv6 parsing, session limit, stable key generation
 
 ---
 

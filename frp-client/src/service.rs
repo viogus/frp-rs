@@ -1899,3 +1899,68 @@ async fn run_visitor_listener(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_delay_secs_failed_count_zero() {
+        // failed_count=0 → base=0 → delay=0 regardless of jitter
+        let delay = Service::reconnect_delay_secs(0);
+        assert_eq!(delay, 0, "no failures → zero delay");
+    }
+
+    #[test]
+    fn reconnect_delay_secs_failed_count_one() {
+        // failed_count=1 → base=24s → jitter [0.8, 1.2] → [19, 28]
+        for _ in 0..100 {
+            let delay = Service::reconnect_delay_secs(1);
+            assert!(delay >= 19, "delay {} too low for n=1", delay);
+            assert!(delay <= 29, "delay {} too high for n=1", delay);
+        }
+    }
+
+    #[test]
+    fn reconnect_delay_secs_linear_growth() {
+        // failed_count=2 → base=48s → [38, 57]
+        for _ in 0..100 {
+            let delay = Service::reconnect_delay_secs(2);
+            assert!(delay >= 38, "delay {} too low for n=2", delay);
+            assert!(delay <= 58, "delay {} too high for n=2", delay);
+        }
+    }
+
+    #[test]
+    fn reconnect_delay_secs_caps_at_720s() {
+        // failed_count=100 → base=min(2400, 720)=720 → [576, 864]
+        for _ in 0..100 {
+            let delay = Service::reconnect_delay_secs(100);
+            assert!(delay >= 576, "delay {} below 80% of cap", delay);
+            assert!(delay <= 864, "delay {} above 120% of cap", delay);
+        }
+    }
+
+    #[test]
+    fn reconnect_delay_secs_cap_exact() {
+        // failed_count=30 → base=min(720, 720)=720 → jitter [0.8, 1.2]
+        for _ in 0..100 {
+            let delay = Service::reconnect_delay_secs(30);
+            assert!(delay >= 576, "delay {} below 80% of cap", delay);
+            assert!(delay <= 864, "delay {} above 120% of cap", delay);
+        }
+    }
+
+    #[test]
+    fn reconnect_delay_secs_monotonic_in_mean() {
+        // Mean delay should increase with failed_count
+        fn mean_delay(n: u32) -> f64 {
+            (0..50).map(|_| Service::reconnect_delay_secs(n) as f64).sum::<f64>() / 50.0
+        }
+        let m1 = mean_delay(1);
+        let m2 = mean_delay(2);
+        let m5 = mean_delay(5);
+        assert!(m2 > m1, "mean delay should grow: {} > {}", m2, m1);
+        assert!(m5 > m2, "mean delay should grow: {} > {}", m5, m2);
+    }
+}
