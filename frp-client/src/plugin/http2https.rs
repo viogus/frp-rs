@@ -164,7 +164,6 @@ async fn handle_conn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
 
     #[tokio::test]
     async fn test_http2https_smoke_non_tls_backend() {

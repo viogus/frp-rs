@@ -77,6 +77,7 @@ async fn test_stcp_e2e_relay() {
             virtual_net: String::new(),
             health_check_http_headers: std::collections::HashMap::new(),
             proxy_protocol_version: String::new(),
+            enabled: true,
             plugin: None,
         }],
         visitors: vec![VisitorConfig {
@@ -92,6 +93,9 @@ async fn test_stcp_e2e_relay() {
             disable_assisted_addrs: false,
             use_encryption: false,
             use_compression: false,
+            keep_tunnel_open: false,
+            max_retries_an_hour: 0,
+            min_retry_interval: 0,
         }],
         ..Default::default()
     };
