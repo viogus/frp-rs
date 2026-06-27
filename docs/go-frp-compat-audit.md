@@ -6,7 +6,7 @@
 
 frp-rs achieves **~99% feature parity** with Go frp v0.69.1. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 9 client plugins, config coverage, and the SSH tunnel gateway all match Go frp behavior. Remaining gaps are protocol-level (V2 AEAD) and a cross-compat edge case (XTCP Go interop) — both documented as acknowledged limitations.
 
-**37/37 cross-compatibility tests pass.**
+**38/38 cross-compatibility tests pass.**
 
 ---
 
@@ -30,7 +30,7 @@ frp-rs achieves **~99% feature parity** with Go frp v0.69.1. Core tunneling (TCP
 | Transport | Dial | Accept | Wire Compat | Notes |
 |-----------|------|--------|-------------|-------|
 | TCP | ✅ | ✅ | ✅ | Full interop verified by compat tests |
-| WebSocket | ✅ | ✅ | ✅¹ | Go frp sends TEXT frames; frp-rs server handles this via Raw mode. ¹ WS+encryption r2g guarded: Go frps sends encrypted binary in TEXT frames; tungstenite rejects invalid UTF-8. g2r direction (Rust server) works. |
+| WebSocket | ✅ | ✅ | ✅ | Both client and server use Raw mode WsByteStream — treats all WS data frames as opaque bytes, tolerating Go frp TEXT frames with non-UTF-8 payload. Client masks outgoing frames per RFC 6455 §5.3. |
 | KCP | ✅ | ✅ | Rust only | Window 1024, MTU 1350. Rust↔Rust KCP verified. Go↔Rust guarded — Go frp uses kcp-go session layer (FEC + XOR), Rust uses raw kcp crate. |
 | QUIC | ✅ | ✅ | Rust only | ALPN `"frp"`. Rust↔Rust QUIC verified. Go↔Rust guarded — Go uses multi-stream-per-connection, Rust accepts one stream per connection. |
 | TLS | ✅ | ✅ | ✅ | `disableCustomTLSFirstByte` controls 0x17 prefix. Full interop with Go frp TLS. |
@@ -137,7 +137,7 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 - ✅ Multi-port STUN, IPv6 parsing, session limit, stable key generation
 - ✅ Rust→Go HTTPS compat test: fixed TLS termination architecture (Go frps vhostHTTPSPort forwards raw TLS; local echo server upgraded to HTTPS with proper SSL error resilience)
 - ✅ Go→Rust SOCKS5 compat test: symmetric coverage with existing r2g test
-- ✅ WebSocket + encryption compat tests: g2r + r2g directions
+- ✅ WebSocket + encryption compat tests: g2r + r2g both pass. Client-side Raw mode WsByteStream (manual WS upgrade + RFC 6455 masking) bypasses tungstenite UTF-8 validation, tolerating Go frps TEXT frames with encrypted binary payload.
 
 ---
 
