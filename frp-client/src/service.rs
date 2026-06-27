@@ -1121,7 +1121,7 @@ fn spawn_work_conn(
         match swc_result {
             Ok(FrpMessage::StartWorkConn(swc)) => {
                 let proxy_name = &swc.proxy_name;
-                info!("Work conn {} assigned to proxy '{}'", label, proxy_name);
+                debug!("Work conn {} assigned to proxy '{}'", label, proxy_name);
 
                 // Look up the proxy runtime info
                 let info = {

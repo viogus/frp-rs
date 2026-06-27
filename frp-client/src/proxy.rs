@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use tokio::net::TcpStream;
-use tracing::{info, warn, debug};
+use tracing::{warn, debug};
 
 use frp_core::bandwidth::BandwidthLimiter;
 use frp_core::metrics::{ProxyMetricsRegistry, ConnGuard};
@@ -114,7 +114,7 @@ pub async fn bridge_streams(
     bandwidth_limit_mode: &str,
     metrics: Arc<ProxyMetricsRegistry>,
 ) {
-    info!("Bridging streams for proxy: {} (encrypted: {}, compressed: {}, bw_limit: {} {})",
+    debug!("Bridging streams for proxy: {} (encrypted: {}, compressed: {}, bw_limit: {} {})",
         name, use_encryption, use_compression, bandwidth_limit, bandwidth_limit_mode);
 
     let proxy_metrics = metrics.get_or_create(name).await;
