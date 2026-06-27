@@ -84,6 +84,8 @@ pub struct WsByteStream {
     write_buf: Vec<u8>,
     write_pos: usize,
     needs_flush: bool,
+    /// When true, outgoing frames are masked (RFC 6455 §5.3 — client requirement).
+    client_mode: bool,
 }
 
 enum WsInner {
@@ -102,12 +104,14 @@ impl WsByteStream {
             write_buf: Vec::new(),
             write_pos: 0,
             needs_flush: false,
+            client_mode: false,
         }
     }
 
     /// Create from a raw TCP stream after manual WebSocket upgrade.
     /// Used on the server accept path for Go frp compat.
-    pub fn from_raw_tcp(tcp: TcpStream) -> Self {
+    /// When `client_mode` is true, outgoing frames are masked per RFC 6455 §5.3.
+    pub fn from_raw_tcp(tcp: TcpStream, client_mode: bool) -> Self {
         Self {
             inner: WsInner::Raw(tcp),
             read_buf: Vec::new(),
@@ -115,6 +119,7 @@ impl WsByteStream {
             write_buf: Vec::new(),
             write_pos: 0,
             needs_flush: false,
+            client_mode,
         }
     }
 
@@ -337,20 +342,39 @@ impl AsyncWrite for WsByteStream {
             }
             WsInner::Raw(tcp) => {
                 let tcp_ptr: *mut TcpStream = tcp;
+                let client_mode = self.client_mode;
                 if !needs_flush && !buf.is_empty() {
                     let len = buf.len();
                     self.write_buf.clear();
-                    self.write_buf.push(0x82);
-                    if len < 126 {
-                        self.write_buf.push(len as u8);
-                    } else if len <= 65535 {
-                        self.write_buf.push(126);
-                        self.write_buf.extend_from_slice(&(len as u16).to_be_bytes());
+                    self.write_buf.push(0x82); // FIN + BINARY opcode
+                    if client_mode {
+                        // Client MUST mask frames per RFC 6455 §5.3
+                        if len < 126 {
+                            self.write_buf.push(0x80 | len as u8);
+                        } else if len <= 65535 {
+                            self.write_buf.push(0x80 | 126);
+                            self.write_buf.extend_from_slice(&(len as u16).to_be_bytes());
+                        } else {
+                            self.write_buf.push(0x80 | 127);
+                            self.write_buf.extend_from_slice(&(len as u64).to_be_bytes());
+                        }
+                        let mask: [u8; 4] = rand::random();
+                        self.write_buf.extend_from_slice(&mask);
+                        for i in 0..len {
+                            self.write_buf.push(buf[i] ^ mask[i % 4]);
+                        }
                     } else {
-                        self.write_buf.push(127);
-                        self.write_buf.extend_from_slice(&(len as u64).to_be_bytes());
+                        if len < 126 {
+                            self.write_buf.push(len as u8);
+                        } else if len <= 65535 {
+                            self.write_buf.push(126);
+                            self.write_buf.extend_from_slice(&(len as u16).to_be_bytes());
+                        } else {
+                            self.write_buf.push(127);
+                            self.write_buf.extend_from_slice(&(len as u64).to_be_bytes());
+                        }
+                        self.write_buf.extend_from_slice(buf);
                     }
-                    self.write_buf.extend_from_slice(buf);
                     self.write_pos = 0;
                     self.needs_flush = true;
                 }
@@ -1095,32 +1119,42 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             } else {
                 opts.server_addr.clone()
             };
-            let url = format!(
-                "{}://{}:{}{}",
-                if is_wss { "wss" } else { "ws" },
-                host,
-                opts.server_port,
-                FRP_WEBSOCKET_PATH
-            );
-            // Build request with Origin header — Go frp v0.69.1
-            // (golang.org/x/net/websocket) requires Origin.
-            use tokio_tungstenite::tungstenite::http::Request as HttpRequest;
-            let origin = format!("http://{}:{}", host, opts.server_port);
-            let req = HttpRequest::builder()
-                .method("GET")
-                .uri(&url)
-                .header("Host", format!("{}:{}", host, opts.server_port))
-                .header("Connection", "Upgrade")
-                .header("Upgrade", "websocket")
-                .header("Sec-WebSocket-Version", "13")
-                .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
-                .header("Origin", origin)
-                .body(())
-                .map_err(|e| crate::Error::Transport(format!("WS request build: {e}")))?;
-            let (ws_stream, _) = tokio_tungstenite::connect_async(req)
-                .await
-                .map_err(|e| crate::Error::Transport(format!("WebSocket connect: {e}")))?;
-            Ok(IoStream::WebSocket(WsByteStream::new(ws_stream)))
+
+            if is_wss {
+                // WSS: use tungstenite (handles TLS internally).
+                // TODO: raw mode for WSS would avoid UTF-8 validation on TEXT
+                // frames from Go frps; need TLS wrapping before raw upgrade.
+                let url = format!(
+                    "wss://{}:{}{}",
+                    host, opts.server_port, FRP_WEBSOCKET_PATH
+                );
+                use tokio_tungstenite::tungstenite::http::Request as HttpRequest;
+                let origin = format!("https://{}:{}", host, opts.server_port);
+                let req = HttpRequest::builder()
+                    .method("GET")
+                    .uri(&url)
+                    .header("Host", format!("{}:{}", host, opts.server_port))
+                    .header("Connection", "Upgrade")
+                    .header("Upgrade", "websocket")
+                    .header("Sec-WebSocket-Version", "13")
+                    .header(
+                        "Sec-WebSocket-Key",
+                        tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+                    )
+                    .header("Origin", origin)
+                    .body(())
+                    .map_err(|e| {
+                        crate::Error::Transport(format!("WS request build: {e}"))
+                    })?;
+                let (ws_stream, _) = tokio_tungstenite::connect_async(req)
+                    .await
+                    .map_err(|e| crate::Error::Transport(format!("WebSocket connect: {e}")))?;
+                Ok(IoStream::WebSocket(WsByteStream::new(ws_stream)))
+            } else {
+                // Plain WS: use raw mode to tolerate TEXT frames with
+                // non-UTF-8 payload from Go frps (golang.org/x/net/websocket).
+                connect_ws_raw(stream, &host, opts.server_port, FRP_WEBSOCKET_PATH).await
+            }
         }
         TransportProtocol::Kcp | TransportProtocol::Quic => {
             unreachable!("KCP/QUIC handled before TCP connect")
@@ -1292,7 +1326,97 @@ pub async fn accept_websocket(stream: TcpStream) -> Result<IoStream, crate::Erro
     tcp.write_all(resp.as_bytes()).await
         .map_err(|e| crate::Error::Transport(format!("WS write response: {e}")))?;
 
-    Ok(IoStream::WebSocket(WsByteStream::from_raw_tcp(tcp)))
+    Ok(IoStream::WebSocket(WsByteStream::from_raw_tcp(tcp, false)))
+}
+
+/// Connect via WebSocket using manual HTTP upgrade (Raw mode, client side).
+/// Returns an IoStream with a WsByteStream adapter in client mode,
+/// so callers can use read_msg_v1/write_msg_v1 directly.
+///
+/// Unlike the tungstenite path, Raw mode tolerates TEXT frames containing
+/// non-UTF-8 payload — Go frp v0.69.1 (`golang.org/x/net/websocket`) sends
+/// encrypted binary data in TEXT frames, which violates RFC 6455 §5.6.
+/// Raw mode treats all data frames as opaque bytes.
+///
+/// The returned WsByteStream masks outgoing frames per RFC 6455 §5.3.
+pub async fn connect_ws_raw(
+    tcp: TcpStream,
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<IoStream, crate::Error> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let mut tcp = tcp;
+
+    // Generate WebSocket key: 16 random bytes, base64 encoded
+    let key_bytes: [u8; 16] = rand::random();
+    let key = {
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut s = String::with_capacity(24);
+        for chunk in key_bytes.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+            let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+            let triple = (b0 << 16) | (b1 << 8) | b2;
+            s.push(CHARS[((triple >> 18) & 0x3f) as usize] as char);
+            s.push(CHARS[((triple >> 12) & 0x3f) as usize] as char);
+            if chunk.len() > 1 {
+                s.push(CHARS[((triple >> 6) & 0x3f) as usize] as char);
+            } else {
+                s.push('=');
+            }
+            if chunk.len() > 2 {
+                s.push(CHARS[(triple & 0x3f) as usize] as char);
+            } else {
+                s.push('=');
+            }
+        }
+        s
+    };
+
+    let req = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host}:{port}\r\n\
+         Connection: Upgrade\r\n\
+         Upgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: {key}\r\n\
+         Origin: http://{host}:{port}\r\n\
+         \r\n"
+    );
+
+    tcp.write_all(req.as_bytes()).await
+        .map_err(|e| crate::Error::Transport(format!("WS raw connect write: {e}")))?;
+
+    // Read HTTP 101 response
+    let mut reader = BufReader::new(tcp);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).await
+        .map_err(|e| crate::Error::Transport(format!("WS raw connect read status: {e}")))?;
+
+    if !status_line.contains("101") {
+        return Err(crate::Error::Transport(format!(
+            "WS upgrade rejected: {}",
+            status_line.trim()
+        )));
+    }
+
+    // Consume response headers until \r\n\r\n
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).await
+            .map_err(|e| crate::Error::Transport(format!("WS raw connect read headers: {e}")))?;
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+    }
+
+    let tcp = reader.into_inner();
+    Ok(IoStream::WebSocket(WsByteStream::from_raw_tcp(
+        tcp,
+        true, // client mode — mask outgoing frames
+    )))
 }
 
 /// TLS configuration.
