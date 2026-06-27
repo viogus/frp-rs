@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 use tokio::io::AsyncReadExt;
 
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use tracing::{info, error, warn, debug};
 
@@ -514,13 +515,61 @@ impl Service {
                 tracing::info!("QUIC listener started on {}", quic_addr);
                 loop {
                     match listener.accept().await {
-                        Ok(stream) => {
+                        Ok((stream, conn)) => {
                             let state = quic_state.clone();
                             tokio::spawn(async move {
                                 let mut ctl = frp_core::transport::IoStream::Quic(stream);
                                 match frp_core::protocol::read_msg_v1(&mut ctl).await {
                                     Ok(frp_core::msg::FrpMessage::Login(login)) => {
+                                        // Spawn drain task concurrently: Go frp opens work
+                                        // conns as additional QUIC streams while the control
+                                        // handler is still running. Drain task reads each new
+                                        // stream and dispatches NewWorkConn via run_id routing.
+                                        // CancellationToken cancels drain when control handler exits.
+                                        let cancel = CancellationToken::new();
+                                        let drain_cancel = cancel.clone();
+                                        let drain_state = state.clone();
+                                        let drain_conn = conn.clone();
+                                        tokio::spawn(async move {
+                                            tracing::debug!("QUIC drain task started, waiting for work streams...");
+                                            loop {
+                                                tokio::select! {
+                                                    _ = drain_cancel.cancelled() => {
+                                                        tracing::debug!("QUIC drain task cancelled");
+                                                        break;
+                                                    }
+                                                    result = drain_conn.accept_bi() => {
+                                                        match result {
+                                                            Ok(work_stream) => {
+                                                                tracing::debug!("QUIC drain: accepted new work stream");
+                                                                let s = drain_state.clone();
+                                                                tokio::spawn(async move {
+                                                                    let mut wc = frp_core::transport::IoStream::Quic(work_stream);
+                                                                    match frp_core::protocol::read_msg_v1(&mut wc).await {
+                                                                        Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                                                                            handle_work_conn_inner(wc, nwc, s).await;
+                                                                        }
+                                                                        Ok(other) => {
+                                                                            tracing::warn!("Unexpected QUIC work stream msg: {:?}", other.v1_type_byte());
+                                                                        }
+                                                                        Err(e) => {
+                                                                            tracing::warn!("QUIC work stream read error: {}", e);
+                                                                        }
+                                                                    }
+                                                                });
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::debug!("QUIC drain done (conn closed): {e}");
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        });
+                                        // Run control handler on first stream (blocking)
                                         control::handle_control(ctl, login, state, None, None, false).await;
+                                        cancel.cancel();
                                     }
                                     Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                         handle_work_conn_inner(ctl, nwc, state).await;

@@ -16,6 +16,7 @@ uuid.workspace = true
 data-encoding.workspace = true
 tokio-tungstenite.workspace = true
 tokio-rustls.workspace = true
+tokio-util.workspace = true
 axum.workspace = true
 prometheus.workspace = true
 lazy_static.workspace = true

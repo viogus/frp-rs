@@ -4138,12 +4138,12 @@ test_kcp_rust_to_rust
 # test_g2r_kcp
 # test_r2g_kcp
 
-# Rust↔Rust QUIC: both sides use quinn crate, one stream per connection.
+# QUIC Rust↔Rust: both sides use quinn crate, wire-compatible.
 test_quic_rust_to_rust
-# QUIC Go↔Rust guarded: Go frp uses multi-stream-per-connection (quic-go),
-# Rust accepts one stream per QUIC connection. Work connections never arrive.
-# test_g2r_quic
-# test_r2g_quic
+# QUIC Go↔Rust: multi-stream-per-connection enabled.
+# Go frp uses quic-go (multi-stream), Rust now accepts additional streams.
+test_g2r_quic
+test_r2g_quic
 
 # --- Summary ---
 echo ""

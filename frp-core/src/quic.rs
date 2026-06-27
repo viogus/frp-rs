@@ -1,8 +1,8 @@
 //! QUIC transport — async stream via the `quinn` crate.
 //!
-//! Maps a single QUIC bidirectional stream to `AsyncRead + AsyncWrite`.
-//! The QUIC connection is established first, then a single stream is opened.
-//! This matches how Go frp uses quic-go: one stream per logical connection.
+//! `QuicStream` maps a single QUIC bidirectional stream to `AsyncRead + AsyncWrite`.
+//! `QuicConnection` wraps a Quinn connection and supports opening/accepting
+//! multiple streams over a single QUIC connection (Go frp compat).
 
 use std::io;
 use std::net::SocketAddr;
@@ -34,8 +34,33 @@ impl QuicStream {
     }
 }
 
+/// Handle to an established QUIC connection. Allows opening and accepting
+/// multiple bidirectional streams over a single connection — matching Go frp's
+/// quic-go behavior where control + work connections share one QUIC connection.
+#[derive(Clone)]
+pub struct QuicConnection {
+    conn: quinn::Connection,
+}
+
+impl QuicConnection {
+    /// Accept the next bidirectional stream from the remote peer (server side).
+    pub async fn accept_bi(&self) -> io::Result<QuicStream> {
+        let (send, recv) = self.conn.accept_bi().await
+            .map_err(|e| io::Error::other(format!("quinn accept_bi: {e}")))?;
+        Ok(QuicStream::new(self.conn.clone(), send, recv))
+    }
+
+    /// Open a new bidirectional stream to the remote peer (client side).
+    pub async fn open_bi(&self) -> io::Result<QuicStream> {
+        let (send, recv) = self.conn.open_bi().await
+            .map_err(|e| io::Error::other(format!("quinn open_bi: {e}")))?;
+        Ok(QuicStream::new(self.conn.clone(), send, recv))
+    }
+}
+
 /// QUIC listener — binds a UDP socket and accepts QUIC connections.
-/// Each accepted connection opens a single bidirectional stream.
+/// Each accepted connection returns the first bidirectional stream plus
+/// a `QuicConnection` handle for accepting/opening additional streams.
 pub struct QuicListener {
     endpoint: quinn::Endpoint,
 }
@@ -84,21 +109,25 @@ impl QuicListener {
     }
 
     /// Accept the next QUIC connection.
-    /// Opens a single bidirectional stream for the connection.
-    pub async fn accept(&self) -> io::Result<QuicStream> {
+    /// Returns the first bidirectional stream (for the control/login message)
+    /// plus a `QuicConnection` handle for accepting/opening additional streams.
+    pub async fn accept(&self) -> io::Result<(QuicStream, QuicConnection)> {
         let incoming = self.endpoint.accept().await
             .ok_or_else(|| io::Error::other("quinn endpoint closed"))?;
         let conn = incoming.await
             .map_err(|e| io::Error::other(format!("quinn accept conn: {e}")))?;
         let (send, recv) = conn.accept_bi().await
             .map_err(|e| io::Error::other(format!("quinn accept stream: {e}")))?;
-        Ok(QuicStream::new(conn, send, recv))
+        let qc = QuicConnection { conn: conn.clone() };
+        let stream = QuicStream::new(conn, send, recv);
+        Ok((stream, qc))
     }
 }
 
 /// Dial a QUIC connection to a remote peer.
-/// Opens a single bidirectional stream.
-pub async fn dial_quic(addr: &str, server_name: &str, ca_file: Option<&str>) -> io::Result<QuicStream> {
+/// Returns the first bidirectional stream plus a `QuicConnection` handle
+/// for opening additional streams (e.g., work connections).
+pub async fn dial_quic(addr: &str, server_name: &str, ca_file: Option<&str>) -> io::Result<(QuicStream, QuicConnection)> {
     let remote: SocketAddr = addr.parse().map_err(io::Error::other)?;
 
     let roots = crate::transport::build_root_store(ca_file)
@@ -136,7 +165,9 @@ pub async fn dial_quic(addr: &str, server_name: &str, ca_file: Option<&str>) -> 
     let (send, recv) = conn.open_bi().await
         .map_err(|e| io::Error::other(format!("quinn open stream: {e}")))?;
 
-    Ok(QuicStream::new(conn, send, recv))
+    let qc = QuicConnection { conn: conn.clone() };
+    let stream = QuicStream::new(conn, send, recv);
+    Ok((stream, qc))
 }
 
 // ---- AsyncRead / AsyncWrite ----
