@@ -28,6 +28,8 @@ pub struct ProxyRuntimeInfo {
     pub remote_addr: String,
     /// Last registration error, if any. Cleared on success.
     pub err: String,
+    /// Snapshot of original proxy config (JSON) for reload change detection.
+    pub config_snapshot: String,
 }
 
 // --- Types ---
