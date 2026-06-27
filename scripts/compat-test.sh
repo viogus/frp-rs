@@ -3462,8 +3462,8 @@ test_g2r_v2_tcp() {
         return
     }
 
-    # Start Rust frps (standard config — detect_and_strip_magic auto-detects V2)
-    write_rust_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    # Start Rust frps (mux required -- Go frpc V2 uses yamux)
+    write_rust_frps_config_mux "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3473,9 +3473,16 @@ test_g2r_v2_tcp() {
     }
 
     # Start Go frpc with V2 wire protocol + tcp_mux
-    write_go_frpc_config "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "v2-tcp" "$TEST_DIR/$name/frpc.toml" \
-        $'transport.wireProtocol = "v2"\ntransport.tcpMux = true'
+    # transport.wireProtocol must be above [[proxies]] (Go frp positional parsing)
+    write_go_frpc_config_mux "$frps_port" "$token" "$echo_port" "$proxy_port" \
+        "v2-tcp" "$TEST_DIR/$name/frpc.toml"
+    # Insert wireProtocol after tcpMux (portable, avoids BSD/GNU sed -i divergence)
+    local tmpconf="$TEST_DIR/$name/frpc.toml.tmp"
+    while IFS= read -r line; do
+        echo "$line"
+        [[ "$line" == "transport.tcpMux = true" ]] && echo 'transport.wireProtocol = "v2"'
+    done < "$TEST_DIR/$name/frpc.toml" > "$tmpconf"
+    mv "$tmpconf" "$TEST_DIR/$name/frpc.toml"
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -3516,11 +3523,8 @@ test_r2g_v2_tcp() {
     }
 
     # Start Go frps with V2 wire protocol + tcp_mux
-    write_go_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
-    cat >> "$TEST_DIR/$name/frps.toml" <<'TOML'
-transport.tcpMux = true
-transport.wireProtocol = "v2"
-TOML
+    write_go_frps_config_mux "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    echo 'transport.wireProtocol = "v2"' >> "$TEST_DIR/$name/frps.toml"
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3530,9 +3534,9 @@ TOML
     }
 
     # Start Rust frpc with V2 + tcp_mux
-    write_rust_frpc_config "$frps_port" "$token" "$echo_port" "$proxy_port" \
+    write_rust_frpc_config_mux "$frps_port" "$token" "$echo_port" "$proxy_port" \
         "v2-tcp" "$TEST_DIR/$name/frpc.toml" \
-        $'v2 = true\ntcp_mux = true'
+        'v2 = true'
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
