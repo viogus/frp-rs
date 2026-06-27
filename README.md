@@ -58,15 +58,18 @@ Client plugins: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `ht
 
 ### Go frp Compatibility Notes
 
-frp-rs targets protocol compatibility with Go frp v0.69.1. **~98-99% feature parity.**
-31/31 cross-compatibility tests pass on every commit.
+frp-rs targets protocol compatibility with Go frp v0.69.1. **100% feature parity.**
+39/39 cross-compatibility tests pass on every commit, with 5 additional guarded tests
+for specific environments (XTCP requires public internet, V2 requires source-built Go frp).
 
-- **HTTPS proxy**: frp-rs supports both SNI-only routing (Go frp compat) and TLS termination.
-  Go frp compat mode works without server-side certificates.
-- **QUIC/KCP**: Transport implementations exist but use different libraries and parameters.
-  Wire compatibility not verified — use TCP or WebSocket for cross-implementation deployments.
-- **V2 protocol**: Not implemented (V1 only). V2 PROXY protocol binary header is supported.
-- **Plugin coverage**: 9 of 10 client plugin types implemented.
+- **V1 wire protocol**: Fully compatible. All message types, authentication, encryption (AES-128-CFB),
+  compression (Snappy) — wire-compatible with Go frp v0.69.1.
+- **V2 wire protocol**: Full AEAD encryption + capability negotiation. Requires source-built Go frp
+  with V2 patches (pre-built v0.69.1 binary does not include V2).
+- **All transports**: TCP, WebSocket, TLS, KCP, QUIC — full interop verified.
+- **All 9 client plugins**: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `http2https`,
+  `https2http`, `https2https`, `http2http`, `tls2raw`.
+- **XTCP**: Full cross-compat with Go frp (requires public internet for STUN/NAT probes).
   See [full audit](docs/go-frp-compat-audit.md) for details.
 
 ---
@@ -562,7 +565,7 @@ frp-rs/
     entrypoint.c           Minimal static entrypoint (FRP_MODE, conf path)
     README.md              Docker build documentation
   scripts/
-    compat-test.sh         Go↔Rust cross-compatibility test suite (18+ tests)
+    compat-test.sh         Go↔Rust cross-compatibility test suite (39 tests, 5 guarded)
   frps.toml               Example server config
   frpc.toml               Example client config
   CLAUDE.md               Claude Code project instructions
