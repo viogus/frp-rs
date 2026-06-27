@@ -530,7 +530,7 @@ pub async fn handle_control<S>(
                         }
                     }
                     Ok(FrpMessage::NewProxy(np)) => {
-                        proxy_ops::handle_new_proxy(np, &run_id, &state, &mut writer, &internal_tx, &mut listener_handles, &mut udp_sockets, &mut udp_local_to_proxy).await;
+                        proxy_ops::handle_new_proxy(np, &run_id, &state, &mut writer, &internal_tx, &mut listener_handles, &mut udp_sockets, &mut udp_local_to_proxy, v2).await;
                     }
                     Ok(FrpMessage::CloseProxy(cp)) => {
                         if let Some(info) = state.proxy_manager.get(&cp.proxy_name).await {

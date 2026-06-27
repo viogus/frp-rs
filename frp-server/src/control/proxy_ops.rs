@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::write_msg_v1;
+use frp_core::protocol::{write_msg_v1, write_msg_v2};
 use frp_core::transport::IoStream;
 use frp_core::format_socket_addr;
 
@@ -15,6 +15,22 @@ use crate::service::{AppState, InternalMsg};
 /// Returns full detail when detailed_errors is enabled, otherwise generic message.
 pub(crate) fn err_msg(detailed: bool, detail: String, generic: &str) -> String {
     if detailed { detail } else { generic.to_string() }
+}
+
+/// Protocol-aware write helper: dispatches to V1 or V2 framing.
+async fn write_resp(
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    msg: &FrpMessage,
+    v2: bool,
+) {
+    let result = if v2 {
+        write_msg_v2(writer, msg).await
+    } else {
+        write_msg_v1(writer, msg).await
+    };
+    if let Err(e) = result {
+        warn!("Failed to write NewProxyResp: {e}");
+    }
 }
 
 /// Register a new proxy and start listening on its assigned port.
@@ -28,6 +44,7 @@ pub(crate) async fn handle_new_proxy(
     listener_handles: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
     udp_sockets: &mut std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
     udp_local_to_proxy: &mut std::collections::HashMap<String, String>,
+    v2: bool,
 ) {
     let raw_port = np.remote_port.unwrap_or(0);
     if raw_port < 0 || raw_port > u16::MAX as i32 {
@@ -36,7 +53,7 @@ pub(crate) async fn handle_new_proxy(
             remote_addr: None,
             error: Some(format!("remote_port {} out of valid range (0-65535)", raw_port)),
         });
-        let _ = write_msg_v1(writer, &resp).await;
+        write_resp(writer, &resp, v2).await;
         return;
     }
     let remote_port = raw_port as u16;
@@ -56,7 +73,7 @@ pub(crate) async fn handle_new_proxy(
             remote_addr: None,
             error: Some(reason),
         });
-        let _ = write_msg_v1(writer, &resp).await;
+        write_resp(writer, &resp, v2).await;
         return;
     }
 
@@ -132,7 +149,7 @@ pub(crate) async fn handle_new_proxy(
                     remote_addr: None,
                     error: Some(err_msg(state.detailed_errors_to_client, e, "proxy registration conflict")),
                 });
-                let _ = write_msg_v1(writer, &resp).await;
+                write_resp(writer, &resp, v2).await;
                 return;
             }
 
@@ -250,7 +267,7 @@ pub(crate) async fn handle_new_proxy(
                         remote_addr: None,
                         error: Some("tcpmux proxy requires custom_domains".into()),
                     });
-                    let _ = write_msg_v1(writer, &resp).await;
+                    write_resp(writer, &resp, v2).await;
                     state.proxy_manager.remove(&np.proxy_name).await;
                     return;
                 }
@@ -310,7 +327,7 @@ pub(crate) async fn handle_new_proxy(
                                     remote_addr: None,
                                     error: Some(err_msg(state.detailed_errors_to_client, format!("SUDP bind failed: {e}"), "SUDP bind failed")),
                                 });
-                                let _ = write_msg_v1(writer, &resp).await;
+                                write_resp(writer, &resp, v2).await;
                                 return;
                             }
                         }
@@ -324,7 +341,7 @@ pub(crate) async fn handle_new_proxy(
                             remote_addr: None,
                             error: Some(err_msg(state.detailed_errors_to_client, format!("UDP bind failed: {e}"), "UDP bind failed")),
                         });
-                        let _ = write_msg_v1(writer, &resp).await;
+                        write_resp(writer, &resp, v2).await;
                         return;
                     }
                 };
@@ -372,7 +389,7 @@ pub(crate) async fn handle_new_proxy(
                 remote_addr: Some(remote_addr_str),
                 error: None,
             });
-            let _ = write_msg_v1(writer, &resp).await;
+            write_resp(writer, &resp, v2).await;
 
             // Signal UDP work-conn tasks that NewProxyResp has been written.
             // This ensures ReqWorkConn is never sent to the client before the
@@ -389,7 +406,7 @@ pub(crate) async fn handle_new_proxy(
                 remote_addr: None,
                 error: Some("no available port".into()),
             });
-            let _ = write_msg_v1(writer, &resp).await;
+            write_resp(writer, &resp, v2).await;
         }
     }
 }
