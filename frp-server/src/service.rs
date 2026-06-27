@@ -132,11 +132,15 @@ pub struct AppState {
     pub tcpmux_manager: Arc<TcpMuxManager>,
     /// Per-proxy traffic metrics for dashboard API.
     pub proxy_metrics: Arc<ProxyMetricsRegistry>,
+    /// Per-client proxy count limit. 0 = unlimited.
+    pub max_ports_per_client: u64,
+    /// When false (default), internal error details are not sent to clients.
+    pub detailed_errors_to_client: bool,
 }
 
 impl AppState {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, heartbeat_timeout: i64, udp_packet_size: usize, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16, vhost_http_timeout: u64, user_conn_timeout: u64, tcp_mux_passthrough: bool, custom_404_page: String, plugin_manager: Arc<crate::plugin::HttpPluginManager>) -> Self {
+    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, heartbeat_timeout: i64, udp_packet_size: usize, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16, vhost_http_timeout: u64, user_conn_timeout: u64, tcp_mux_passthrough: bool, custom_404_page: String, plugin_manager: Arc<crate::plugin::HttpPluginManager>, max_ports_per_client: u64, nat_hole_analysis_data_reserve_hours: u64, detailed_errors_to_client: bool) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             reloadable: Arc::new(std::sync::RwLock::new(ReloadableState {
@@ -160,9 +164,10 @@ impl AppState {
             tls_only,
             oidc_verifier,
             oidc_subjects: Arc::new(RwLock::new(HashMap::new())),
-            nat_hole: Arc::new(Controller::new(Duration::from_secs(3600))),
+            nat_hole: Arc::new(Controller::new(Duration::from_secs(nat_hole_analysis_data_reserve_hours.saturating_mul(3600)))),
             tcpmux_manager: Arc::new(TcpMuxManager::new()),
             proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
+            max_ports_per_client,
             sudp_port,
             vhost_http_timeout,
             user_conn_timeout,
@@ -170,6 +175,7 @@ impl AppState {
             custom_404_page,
             plugin_manager,
             proxy_config_store: Arc::new(RwLock::new(HashMap::new())),
+            detailed_errors_to_client,
         }
     }
 }
@@ -255,6 +261,9 @@ impl Service {
             cfg.tcp_mux_passthrough,
             cfg.web_server.custom_404_page.clone(),
             Arc::new(crate::plugin::HttpPluginManager::new(cfg.http_plugins.clone())),
+            cfg.max_ports_per_client,
+            cfg.nat_hole_analysis_data_reserve_hours,
+            cfg.detailed_errors_to_client,
         );
 
         // Initialize prometheus registry when enabled

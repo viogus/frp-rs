@@ -551,6 +551,17 @@ impl Handler for SshSession {
             }
         };
 
+        // Check per-client proxy limit
+        if self.state.max_ports_per_client > 0 {
+            let count = self.state.proxy_manager.list_client_proxy_names(&self.run_id).await.len();
+            if count >= self.state.max_ports_per_client as usize {
+                return Err(anyhow!(
+                    "maximum number of proxies ({}) reached for this client",
+                    self.state.max_ports_per_client
+                ));
+            }
+        }
+
         // Register the proxy: build NewProxy V1 frame, send to control handler
         let allocated = {
             let state = self.state.clone();

@@ -74,9 +74,10 @@ async fn test_login_wrong_token_fails() {
         .expect("login should return a response");
 
     assert!(resp.error.is_some(), "expected auth error, got success");
+    let err = resp.error.unwrap().to_lowercase();
     assert!(
-        resp.error.unwrap().to_lowercase().contains("invalid"),
-        "expected 'invalid' in error message"
+        err.contains("invalid") || err.contains("authentication failed"),
+        "expected auth error, got: {err}"
     );
 }
 

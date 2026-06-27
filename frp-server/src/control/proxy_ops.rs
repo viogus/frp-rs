@@ -12,6 +12,11 @@ use frp_core::format_socket_addr;
 use crate::proxy::{ProxyInfo, allocate_port_multi};
 use crate::service::{AppState, InternalMsg};
 
+/// Returns full detail when detailed_errors is enabled, otherwise generic message.
+pub(crate) fn err_msg(detailed: bool, detail: String, generic: &str) -> String {
+    if detailed { detail } else { generic.to_string() }
+}
+
 /// Register a new proxy and start listening on its assigned port.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_new_proxy(
@@ -53,6 +58,23 @@ pub(crate) async fn handle_new_proxy(
         });
         let _ = write_msg_v1(writer, &resp).await;
         return;
+    }
+
+    // Check per-client proxy limit
+    if state.max_ports_per_client > 0 {
+        let count = state.proxy_manager.list_client_proxy_names(run_id).await.len();
+        if count >= state.max_ports_per_client as usize {
+            let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
+                proxy_name: np.proxy_name.clone(),
+                remote_addr: None,
+                error: Some(format!(
+                    "maximum number of proxies ({}) reached for this client",
+                    state.max_ports_per_client
+                )),
+            });
+            let _ = write_msg_v1(writer, &resp).await;
+            return;
+        }
     }
 
     let is_sudp = np.proxy_type == "sudp";
@@ -108,7 +130,7 @@ pub(crate) async fn handle_new_proxy(
                 let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
                     proxy_name: np.proxy_name.clone(),
                     remote_addr: None,
-                    error: Some(e),
+                    error: Some(err_msg(state.detailed_errors_to_client, e, "proxy registration conflict")),
                 });
                 let _ = write_msg_v1(writer, &resp).await;
                 return;
@@ -286,7 +308,7 @@ pub(crate) async fn handle_new_proxy(
                                 let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
                                     proxy_name: np.proxy_name.clone(),
                                     remote_addr: None,
-                                    error: Some(format!("SUDP bind failed: {e}")),
+                                    error: Some(err_msg(state.detailed_errors_to_client, format!("SUDP bind failed: {e}"), "SUDP bind failed")),
                                 });
                                 let _ = write_msg_v1(writer, &resp).await;
                                 return;
@@ -300,7 +322,7 @@ pub(crate) async fn handle_new_proxy(
                         let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
                             proxy_name: np.proxy_name.clone(),
                             remote_addr: None,
-                            error: Some(format!("UDP bind failed: {e}")),
+                            error: Some(err_msg(state.detailed_errors_to_client, format!("UDP bind failed: {e}"), "UDP bind failed")),
                         });
                         let _ = write_msg_v1(writer, &resp).await;
                         return;
