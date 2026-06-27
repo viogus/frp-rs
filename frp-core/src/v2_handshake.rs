@@ -4,10 +4,15 @@
 //! Crypto negotiation is deferred — the handshake stubs always select
 //! "json" codec with no AEAD crypto.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use crate::transport::IoStream;
 use crate::protocol::{V2_FRAME_TYPE_CLIENT_HELLO, V2_FRAME_TYPE_SERVER_HELLO, V2_FRAME_TYPE_MESSAGE};
+
+/// Timeout for V2 handshake reads (matching Go frp connReadTimeout).
+const V2_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Handshake JSON structures (matching Go frp wire.go)
@@ -159,7 +164,10 @@ pub async fn v2_handshake_client(
         .map_err(|e| crate::Error::Protocol(format!("serialize ClientHello: {e}")))?;
     stream.write_raw_v2_frame(V2_FRAME_TYPE_CLIENT_HELLO, 0, &json).await?;
 
-    let (frame_type, _flags, payload) = stream.read_raw_v2_frame().await?;
+    let (frame_type, _flags, payload) = tokio::time::timeout(
+        V2_HANDSHAKE_TIMEOUT,
+        stream.read_raw_v2_frame()
+    ).await.map_err(|_| crate::Error::Protocol("V2 handshake timeout".into()))??;
     match frame_type {
         V2_FRAME_TYPE_SERVER_HELLO => {
             let server_hello: ServerHello = serde_json::from_slice(&payload)
@@ -196,11 +204,15 @@ pub async fn v2_handshake_client(
 /// Caller must read the next frame for the first V2 message.
 ///
 /// Returns `Ok(Some(payload))` if the first frame was already a Message (type=16).
-/// Caller should decode `payload` as the first V2 message.
+/// `payload` is the raw V2 message payload: [type_id: u16 BE][JSON bytes].
+/// Caller should decode with `deserialize_v2(u16::from_be_bytes(payload[0..2]), &payload[2..])`.
 pub async fn v2_handshake_server(
     stream: &mut IoStream,
 ) -> Result<Option<Vec<u8>>, crate::Error> {
-    let (frame_type, _flags, payload) = stream.read_raw_v2_frame().await?;
+    let (frame_type, _flags, payload) = tokio::time::timeout(
+        V2_HANDSHAKE_TIMEOUT,
+        stream.read_raw_v2_frame()
+    ).await.map_err(|_| crate::Error::Protocol("V2 handshake timeout".into()))??;
 
     match frame_type {
         V2_FRAME_TYPE_CLIENT_HELLO => {

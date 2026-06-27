@@ -371,9 +371,7 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
     tracing::debug!("read V2 frame: type={}, flags={}, len={}", frame_type, flags, payload_len);
 
     if flags != 0 {
-        return Err(crate::Error::Protocol(format!(
-            "unsupported V2 frame flags: {flags}"
-        )));
+        tracing::trace!("V2 frame with non-zero flags: {flags}");
     }
     if payload_len > V2_MAX_FRAME_PAYLOAD as usize {
         return Err(crate::Error::Protocol(format!(
@@ -644,9 +642,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_v2_frame_raw_rejects_nonzero_flags() {
+    async fn test_v2_frame_raw_accepts_nonzero_flags() {
         let (mut client, mut server) = duplex(65536);
-        // Write frame with flags=1 (unsupported) manually
+        // Write frame with flags=1 (Go frp compat: non-zero flags are accepted)
         let mut header = [0u8; 8];
         header[0..2].copy_from_slice(&V2_FRAME_TYPE_MESSAGE.to_be_bytes());
         header[2..4].copy_from_slice(&1u16.to_be_bytes()); // flags=1
@@ -656,8 +654,10 @@ mod tests {
         drop(client);
 
         let result = read_v2_frame_raw(&mut server).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("flags"));
+        assert!(result.is_ok(), "non-zero flags should be accepted (Go frp compat)");
+        let (_, flags, payload) = result.unwrap();
+        assert_eq!(flags, 1);
+        assert_eq!(payload, b"data");
     }
 
     #[tokio::test]

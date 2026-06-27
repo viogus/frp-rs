@@ -119,7 +119,7 @@ impl ControlConnection {
             bind_addr: self.bind_addr.clone(),
             proxy_url: if self.proxy_url.is_empty() { None } else { Some(self.proxy_url.clone()) },
             v2: self.v2,
-            tcp_mux: propose_mux,
+            caller_handles_mux: propose_mux,
             ..Default::default()
         };
 

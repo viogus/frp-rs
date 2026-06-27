@@ -855,6 +855,8 @@ impl IoStream {
     pub fn into_encrypted(self, key: [u8; 16]) -> Self {
         match self {
             IoStream::BufferedRead(buf, pos, inner) => {
+                // Buffered bytes are preserved inside the returned Cipher wrapper;
+                // they will be replayed before encrypted reads begin.
                 debug_assert!(pos >= buf.len(), "into_encrypted called before buffered bytes consumed");
                 IoStream::BufferedRead(buf, pos, Box::new(inner.into_encrypted(key)))
             }
@@ -894,7 +896,7 @@ pub struct DialOptions {
     pub v2: bool,
     /// When true, V2 magic is NOT written on raw TCP — the caller will write
     /// it on the yamux stream after wrapping. Default: false.
-    pub tcp_mux: bool,
+    pub caller_handles_mux: bool,
 }
 
 impl Default for DialOptions {
@@ -915,7 +917,7 @@ impl Default for DialOptions {
             bind_addr: None,
             proxy_url: None,
             v2: false,
-            tcp_mux: false,
+            caller_handles_mux: false,
         }
     }
 }
@@ -1261,7 +1263,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
 
     // Write V2 magic BEFORE any TLS/WS/yamux upgrade (Go frp WriteMagicIfV2).
     // Skip when tcpMux is enabled — magic goes on the yamux stream instead.
-    if opts.v2 && !opts.tcp_mux {
+    if opts.v2 && !opts.caller_handles_mux {
         crate::protocol::write_v2_magic(&mut stream).await?;
     }
 

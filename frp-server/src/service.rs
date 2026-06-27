@@ -672,10 +672,8 @@ impl Service {
 
                                 // 0x17 = Go frp TLS prefix (already consumed, strip from replay)
                                 // 0x16 = standard TLS ClientHello (keep all bytes)
-                                if first_byte == frp_core::transport::FRP_TLS_HEAD_BYTE {
-                                    if !pre_read_bytes.is_empty() {
-                                        pre_read_bytes.remove(0); // discard 0x17
-                                    }
+                                if first_byte == frp_core::transport::FRP_TLS_HEAD_BYTE && !pre_read_bytes.is_empty() {
+                                    pre_read_bytes.remove(0); // discard 0x17
                                 }
 
                                 // --- SNI peek for HTTPS proxy routing ---
@@ -785,35 +783,7 @@ impl Service {
                                                         return;
                                                     }
                                                 };
-                                                if msg_payload.len() < 2 {
-                                                    warn!("V2 message payload too short from {}", addr);
-                                                    return;
-                                                }
-                                                let type_id = u16::from_be_bytes([msg_payload[0], msg_payload[1]]);
-                                                let msg = match frp_core::protocol::deserialize_v2(type_id, &msg_payload[2..]) {
-                                                    Ok(m) => m,
-                                                    Err(e) => {
-                                                        warn!("Failed to decode V2 TLS+yamux message from {}: {}", addr, e);
-                                                        return;
-                                                    }
-                                                };
-                                                match msg {
-                                                    FrpMessage::Login(login) => {
-                                                        control::handle_control(io, login, state, Some(addr), Some(incoming), true).await;
-                                                    }
-                                                    FrpMessage::NewWorkConn(nwc) => {
-                                                        handle_work_conn_inner(io, nwc, state).await;
-                                                    }
-                                                    FrpMessage::NewVisitorConn(vc) => {
-                                                        handle_visitor_conn_inner(io, vc, state).await;
-                                                    }
-                                                    FrpMessage::NatHoleVisitor(nhv) => {
-                                                        handle_nat_hole_visitor(io, nhv, state, None).await;
-                                                    }
-                                                    other => {
-                                                        warn!("Unexpected V2 TLS+yamux first message from {:?}: {:?}", addr, other.v2_type_id());
-                                                    }
-                                                }
+                                                dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None).await;
                                             } else {
                                                 // Not V2. Replay consumed bytes for V1 processing.
                                                 let mut io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
@@ -958,36 +928,7 @@ impl Service {
                                                 }
                                             };
 
-                                            // Decode and dispatch
-                                            if msg_payload.len() < 2 {
-                                                warn!("V2 message payload too short from {}", addr);
-                                                return;
-                                            }
-                                            let type_id = u16::from_be_bytes([msg_payload[0], msg_payload[1]]);
-                                            let msg = match frp_core::protocol::deserialize_v2(type_id, &msg_payload[2..]) {
-                                                Ok(m) => m,
-                                                Err(e) => {
-                                                    warn!("Failed to decode V2 message from {}: {}", addr, e);
-                                                    return;
-                                                }
-                                            };
-                                            match msg {
-                                                FrpMessage::Login(login) => {
-                                                    control::handle_control(io, login, state, Some(addr), Some(incoming), true).await;
-                                                }
-                                                FrpMessage::NewWorkConn(nwc) => {
-                                                    handle_work_conn_inner(io, nwc, state).await;
-                                                }
-                                                FrpMessage::NewVisitorConn(vc) => {
-                                                    handle_visitor_conn_inner(io, vc, state).await;
-                                                }
-                                                FrpMessage::NatHoleVisitor(nhv) => {
-                                                    handle_nat_hole_visitor(io, nhv, state, None).await;
-                                                }
-                                                other => {
-                                                    warn!("Unexpected V2+yamux first message from {:?}: {:?}", addr, other.v2_type_id());
-                                                }
-                                            }
+                                            dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None).await;
                                         }
                                         Err(e) => {
                                             warn!("Failed to start yamux over V2 for {:?}: {}", addr, e);
@@ -1019,37 +960,7 @@ impl Service {
                                         }
                                     };
 
-                                    // Decode and dispatch
-                                    if msg_payload.len() < 2 {
-                                        warn!("V2 message payload too short from {}", addr);
-                                        return;
-                                    }
-                                    let type_id = u16::from_be_bytes([msg_payload[0], msg_payload[1]]);
-                                    let msg = match frp_core::protocol::deserialize_v2(type_id, &msg_payload[2..]) {
-                                        Ok(m) => m,
-                                        Err(e) => {
-                                            warn!("Failed to decode V2 message from {}: {}", addr, e);
-                                            return;
-                                        }
-                                    };
-                                    match msg {
-                                        FrpMessage::Login(login) => {
-                                            control::handle_control(io, login, state, Some(addr), None, true).await;
-                                        }
-                                        FrpMessage::NewWorkConn(nwc) => {
-                                            handle_work_conn_inner(io, nwc, state).await;
-                                        }
-                                        FrpMessage::NewVisitorConn(vc) => {
-                                            handle_visitor_conn_inner(io, vc, state).await;
-                                        }
-                                        FrpMessage::NatHoleVisitor(nhv) => {
-                                            let visitor_addr = Some(addr.to_string());
-                                            handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
-                                        }
-                                        other => {
-                                            warn!("Unexpected V2 first message from {}: {:?}", addr, other.v2_type_id());
-                                        }
-                                    }
+                                    dispatch_v2_message(io, msg_payload, state, addr, None, Some(addr.to_string())).await;
                                 }
                             }
 
@@ -1107,36 +1018,7 @@ impl Service {
                                                         return;
                                                     }
                                                 };
-                                                // Decode and dispatch
-                                                if msg_payload.len() < 2 {
-                                                    warn!("V2 message payload too short from {}", addr);
-                                                    return;
-                                                }
-                                                let type_id = u16::from_be_bytes([msg_payload[0], msg_payload[1]]);
-                                                let msg = match frp_core::protocol::deserialize_v2(type_id, &msg_payload[2..]) {
-                                                    Ok(m) => m,
-                                                    Err(e) => {
-                                                        warn!("Failed to decode V2 message from {}: {}", addr, e);
-                                                        return;
-                                                    }
-                                                };
-                                                match msg {
-                                                    FrpMessage::Login(login) => {
-                                                        control::handle_control(io, login, state, Some(addr), Some(incoming), true).await;
-                                                    }
-                                                    FrpMessage::NewWorkConn(nwc) => {
-                                                        handle_work_conn_inner(io, nwc, state).await;
-                                                    }
-                                                    FrpMessage::NewVisitorConn(vc) => {
-                                                        handle_visitor_conn_inner(io, vc, state).await;
-                                                    }
-                                                    FrpMessage::NatHoleVisitor(nhv) => {
-                                                        handle_nat_hole_visitor(io, nhv, state, None).await;
-                                                    }
-                                                    other => {
-                                                        warn!("Unexpected V2+yamux first message from {:?}: {:?}", addr, other.v2_type_id());
-                                                    }
-                                                }
+                                                dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None).await;
                                             } else {
                                                 // Not V2. Replay consumed bytes and process as V1.
                                                 let mut io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
@@ -1729,6 +1611,47 @@ async fn handle_nat_hole_visitor(
         }
     }
     // reader dropped → connection closes
+}
+
+/// Decode a V2 message from raw frame payload and dispatch to the appropriate handler.
+/// `payload` is the frame payload: [type_id: u16 BE][JSON bytes].
+async fn dispatch_v2_message(
+    io: IoStream,
+    payload: Vec<u8>,
+    state: std::sync::Arc<AppState>,
+    addr: std::net::SocketAddr,
+    incoming: Option<frp_core::mux::IncomingStreams>,
+    visitor_addr: Option<String>,
+) {
+    if payload.len() < 2 {
+        warn!("V2 message payload too short from {}", addr);
+        return;
+    }
+    let type_id = u16::from_be_bytes([payload[0], payload[1]]);
+    let msg = match frp_core::protocol::deserialize_v2(type_id, &payload[2..]) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("Failed to decode V2 message from {}: {}", addr, e);
+            return;
+        }
+    };
+    match msg {
+        FrpMessage::Login(login) => {
+            control::handle_control(io, login, state, Some(addr), incoming, true).await;
+        }
+        FrpMessage::NewWorkConn(nwc) => {
+            handle_work_conn_inner(io, nwc, state).await;
+        }
+        FrpMessage::NewVisitorConn(vc) => {
+            handle_visitor_conn_inner(io, vc, state).await;
+        }
+        FrpMessage::NatHoleVisitor(nhv) => {
+            handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
+        }
+        other => {
+            warn!("Unexpected V2 first message from {}: {:?}", addr, other.v2_type_id());
+        }
+    }
 }
 
 /// Handle an incoming work connection. Verifies auth, then routes the
