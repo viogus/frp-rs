@@ -6,6 +6,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::{interval, Duration};
 use tracing::{info, warn, debug};
+use rand::Rng;
 
 use frp_core::auth::{AuthConfig, AuthMethod, OidcClient};
 use frp_core::config::ClientConfig;
@@ -278,6 +279,21 @@ impl Service {
         })
     }
 
+    /// Compute reconnect delay with exponential backoff and jitter.
+    /// Formula: min(24s × failed_count, 720s) × jitter[0.8, 1.2].
+    /// Matches Go frp v0.69.1 reconnect behavior.
+    fn reconnect_delay_secs(failed_count: u32) -> u64 {
+        let base = (24 * failed_count as u64).min(720);
+        let mut rng = rand::thread_rng();
+        let jitter: f64 = rng.gen_range(0.8..1.2);
+        ((base as f64) * jitter) as u64
+    }
+
+    async fn reconnect_delay(failed_count: u32) {
+        let secs = Self::reconnect_delay_secs(failed_count);
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+    }
+
     /// Request a config reload. Safe to call from signal handler.
     /// Returns immediately; actual reload happens asynchronously in run().
     pub fn request_reload(&self) {
@@ -416,8 +432,11 @@ impl Service {
             info!("frpc admin server starting on {}:{}", self.cfg.web_server.addr, self.cfg.web_server.port);
         }
 
-        // Main session loop with reconnection
+        // Main session loop with reconnection.
+        // Exponential backoff: 24s × failedCount with jitter [0.8, 1.2], capped at 720s.
+        // Matches Go frp v0.69.1 reconnect behavior.
         let mut did_login_once = false;
+        let mut failed_count: u32 = 0;
         loop {
             let mut ctl = ControlConnection::new(
                 self.cfg.server_addr.clone(),
@@ -446,6 +465,7 @@ impl Service {
             let (mut control_stream, run_id, yamux_session) = match ctl.login().await {
                 Ok(r) => {
                     did_login_once = true;
+                    failed_count = 0;
                     *self.server_auth_scopes.write().await = ctl.server_auth_scopes.clone();
                     // After login, wrap control stream in AES-128-CFB encryption.
                     // Go frps v0.69.1 always encrypts the control connection for V1.
@@ -454,11 +474,12 @@ impl Service {
                     (stream.into_encrypted(enc_key), run_id, yamux)
                 }
                 Err(e) => {
-                    warn!("Login failed: {}", e);
+                    failed_count += 1;
+                    warn!("Login failed (attempt {}): {}", failed_count, e);
                     if self.cfg.login_fail_exit && !did_login_once {
                         return Err(e.into());
                     }
-                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Self::reconnect_delay(failed_count).await;
                     continue;
                 }
             };
@@ -806,8 +827,12 @@ impl Service {
                 return Ok(());
             }
 
-            // Reconnect delay (login_fail_exit only applies to initial login, not session drops)
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            // Session dropped — reconnect with exponential backoff.
+            // login_fail_exit only applies to initial login, not session drops.
+            failed_count += 1;
+            warn!("Session ended, reconnecting in {}s (attempt {})...",
+                Self::reconnect_delay_secs(failed_count), failed_count);
+            Self::reconnect_delay(failed_count).await;
         }
     }
 

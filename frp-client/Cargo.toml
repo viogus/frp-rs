@@ -22,3 +22,4 @@ toml.workspace = true
 tokio-tungstenite.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
+rand.workspace = true
