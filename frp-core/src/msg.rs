@@ -492,18 +492,19 @@ impl FrpMessage {
             FrpMessage::NewWorkConn(_)        => V2_TYPE_NEW_WORK_CONN,
             FrpMessage::ReqWorkConn(_)        => V2_TYPE_REQ_WORK_CONN,
             FrpMessage::StartWorkConn(_)      => V2_TYPE_START_WORK_CONN,
+            FrpMessage::NewVisitorConn(_)     => V2_TYPE_NEW_VISITOR_CONN,
+            FrpMessage::NewVisitorConnResp(_) => V2_TYPE_NEW_VISITOR_CONN_RESP,
             FrpMessage::Ping(_)               => V2_TYPE_PING,
             FrpMessage::Pong(_)               => V2_TYPE_PONG,
             FrpMessage::UDPPacket(_)          => V2_TYPE_UDP_PACKET,
-            FrpMessage::NewVisitorConn(_)     => V2_TYPE_NEW_VISITOR_CONN,
-            FrpMessage::NewVisitorConnResp(_) => V2_TYPE_NEW_VISITOR_CONN_RESP,
             FrpMessage::NatHoleVisitor(_)     => V2_TYPE_NAT_HOLE_VISITOR,
             FrpMessage::NatHoleClient(_)      => V2_TYPE_NAT_HOLE_CLIENT,
             FrpMessage::NatHoleResp(_)        => V2_TYPE_NAT_HOLE_RESP,
             FrpMessage::NatHoleSid(_)         => V2_TYPE_NAT_HOLE_SID,
             FrpMessage::NatHoleReport(_)      => V2_TYPE_NAT_HOLE_REPORT,
-            // CloseProxyResp and Error are V1-only types, no V2 equivalent
-            _ => 0,
+            // V1-only types with no V2 equivalent
+            FrpMessage::CloseProxyResp(_) => 0,
+            FrpMessage::Error(_)          => 0,
         }
     }
 
