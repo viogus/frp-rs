@@ -125,8 +125,8 @@ async fn run_kcp_driver(
     let mut kcp = kcp::Kcp::new(conv, output);
 
     kcp.set_nodelay(config.nodelay, config.interval, config.resend, config.nc);
-    kcp.set_wndsize(128, 128);
-    let _ = kcp.set_mtu(1400);
+    kcp.set_wndsize(1024, 1024);
+    let _ = kcp.set_mtu(1350);
 
     let mut recv_buf = vec![0u8; 65536];
     let mut udp_buf = vec![0u8; 65536];
@@ -263,8 +263,8 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
     let output = UdpOutput { socket: socket.clone(), peer: remote, buf: Vec::new() };
     let mut kcp = kcp::Kcp::new(conv, output);
     kcp.set_nodelay(false, 100, 2, true);
-    kcp.set_wndsize(128, 128);
-    let _ = kcp.set_mtu(1400);
+    kcp.set_wndsize(1024, 1024);
+    let _ = kcp.set_mtu(1350);
     let _ = kcp.send(b"");
     // update() calls output.flush() internally, sending the initial packet
     let _ = kcp.update(kcp_now_ms());

@@ -119,6 +119,32 @@ impl NatHoleCoordinator {
         false
     }
 
+    /// Forward NatHoleResp to the visitor via control channel.
+    /// Carries provider-side candidate addresses for NAT traversal.
+    /// Go frp XTCP compat: the provider sends NatHoleResp after NAT detection;
+    /// the server relays it to the visitor so it can attempt hole punch.
+    pub async fn forward_nat_hole_resp_via_ctl(
+        &self,
+        sid: &str,
+        error: Option<String>,
+        candidate_addrs: Option<Vec<String>>,
+        assisted_addrs: Option<Vec<String>>,
+    ) -> bool {
+        let sessions = self.sessions.read().await;
+        if let Some(session) = sessions.get(sid) {
+            if let Some(ref tx) = session.visitor_ctl_tx {
+                let _ = tx.send(InternalMsg::WriteNatHoleResp {
+                    transaction_id: sid.to_string(),
+                    error,
+                    candidate_addrs,
+                    assisted_addrs,
+                });
+                return true;
+            }
+        }
+        false
+    }
+
     /// Forward NatHoleReport to the visitor via control channel.
     pub async fn forward_report_via_ctl(&self, sid: &str) -> bool {
         let sessions = self.sessions.read().await;

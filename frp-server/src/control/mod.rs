@@ -374,6 +374,18 @@ pub async fn handle_control<S>(
                             warn!("Failed to write NatHoleSid to visitor: {}", e);
                         }
                     }
+                    Some(InternalMsg::WriteNatHoleResp { transaction_id, error, candidate_addrs, assisted_addrs }) => {
+                        debug!("Writing NatHoleResp to visitor via control channel for {}", transaction_id);
+                        let forward = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                            transaction_id,
+                            error,
+                            candidate_addrs,
+                            assisted_addrs,
+                        });
+                        if let Err(e) = write_ctl_msg(&mut writer, &forward, v2).await {
+                            warn!("Failed to write NatHoleResp to visitor: {}", e);
+                        }
+                    }
                     Some(InternalMsg::WriteNatHoleReport { sid }) => {
                         debug!("Writing NatHoleReport to visitor via control channel for {}", sid);
                         let forward = FrpMessage::NatHoleReport(msg::NatHoleReport {
@@ -555,6 +567,34 @@ pub async fn handle_control<S>(
                             }
                         }
                     }
+                    Ok(FrpMessage::NatHoleResp(ref resp_msg)) => {
+                        debug!("Received NatHoleResp from provider: txn={}, error={:?}, candidates={:?}",
+                            resp_msg.transaction_id, resp_msg.error, resp_msg.candidate_addrs);
+                        // Relay provider's NAT hole response to visitor.
+                        // Go frp XTCP compat: visitor needs provider's candidate addresses
+                        // for TCP simultaneous open.
+                        let tid = &resp_msg.transaction_id;
+                        // Try control-channel path first.
+                        if state.nat_hole.forward_nat_hole_resp_via_ctl(
+                            tid,
+                            resp_msg.error.clone(),
+                            resp_msg.candidate_addrs.clone(),
+                            resp_msg.assisted_addrs.clone(),
+                        ).await {
+                            debug!("Forwarded NatHoleResp via control channel for {}", tid);
+                        } else if let Some(mut writer) = state.nat_hole.take_writer(tid).await {
+                            let forward = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                transaction_id: tid.clone(),
+                                error: resp_msg.error.clone(),
+                                candidate_addrs: resp_msg.candidate_addrs.clone(),
+                                assisted_addrs: resp_msg.assisted_addrs.clone(),
+                            });
+                            let _ = write_ctl_msg(&mut writer, &forward, v2).await;
+                            state.nat_hole.return_writer(tid, writer).await;
+                        } else {
+                            warn!("NatHoleResp for unknown session {}", tid);
+                        }
+                    }
                     Ok(FrpMessage::NatHoleReport(ref report_msg)) => {
                         debug!("Received NatHoleReport from provider: {:?}", report_msg.sid);
                         if let Some(ref sid) = report_msg.sid {
@@ -673,13 +713,11 @@ pub async fn handle_control<S>(
                             continue;
                         }
 
-                        // Write NatHoleResp OK to visitor
-                        let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-                            transaction_id: transaction_id.clone(),
-                            error: None,
-                            ..Default::default()
-                        });
-                        let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                        // Don't send a synthetic NatHoleResp — the provider will send
+                        // a real NatHoleResp (with candidate_addrs from NAT detection),
+                        // which is relayed to the visitor via the message loop.
+                        // Go frp v0.69.1 compat: visitor expects ONE NatHoleResp from
+                        // the provider (relayed by server), not an immediate ACK.
 
                         // Spawn task to wait for report oneshot (30s timeout)
                         let nat_hole = state.nat_hole.clone();

@@ -65,6 +65,14 @@ pub enum InternalMsg {
     WriteNatHoleReport {
         sid: String,
     },
+    /// Forward NatHoleResp to visitor via control channel (Go frp XTCP compat).
+    /// Carries provider's candidate/assisted addresses for NAT traversal.
+    WriteNatHoleResp {
+        transaction_id: String,
+        error: Option<String>,
+        candidate_addrs: Option<Vec<String>>,
+        assisted_addrs: Option<Vec<String>>,
+    },
 }
 
 #[derive(Debug, Clone)]
