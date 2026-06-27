@@ -33,15 +33,20 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      - name: Cache cargo build
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.22.0'
+
+      - name: Cache cargo + go-frp builds
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/release/
-          key: ${{ runner.os }}-cargo-compat-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-compat-
+            /tmp/frp-source-build/
+          key: ${{ runner.os }}-compat-${{ hashFiles('Cargo.lock') }}-v2
+          restore-keys: ${{ runner.os }}-compat-
 
       - name: Build frp-rs (release)
         run: cargo build --release --bin frps --bin frpc

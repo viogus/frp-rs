@@ -10,8 +10,6 @@ use tokio::time::{Duration, Instant};
 use tracing::{info, warn, debug};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 
-use crate::nathole::discovery;
-
 use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::IncomingStreams;
@@ -394,30 +392,19 @@ pub async fn handle_control<S>(
                         }
                         pending_udp.push_back((proxy_name, Instant::now()));
                     }
-                    Some(InternalMsg::NatHoleClient { proxy_name, transaction_id, visitor_addr }) => {
+                    Some(InternalMsg::NatHoleClient { proxy_name, transaction_id, visitor_addr, visitor_mapped_addrs, visitor_assisted_addrs, visitor_protocol }) => {
                         debug!("Received NatHoleClient notification for session {}", transaction_id);
 
-                        // --- Do STUN discovery to find our external addresses ---
-                        let stun_server = "stun.l.google.com:19302";
-                        let mapped_addrs = match discovery::discover(stun_server).await {
-                            Ok(addrs) => {
-                                debug!("STUN discovery for {}: {:?}", proxy_name, addrs);
-                                addrs
-                            }
-                            Err(e) => {
-                                warn!("STUN discovery failed for {}: {}", proxy_name, e);
-                                vec![]
-                            }
-                        };
-
-                        // Send NatHoleClient back with STUN addresses
+                        // Go frp v0.69.1 compat: server is a pure relay.
+                        // Forward visitor's STUN-discovered addresses and protocol
+                        // to the provider so it knows where to send hole-punch packets.
                         let reply = FrpMessage::NatHoleClient(msg::NatHoleClient {
                             transaction_id: transaction_id.clone(),
                             proxy_name: proxy_name.clone(),
                             sid: Some(transaction_id.clone()),
-                            protocol: Some("tcp".to_string()),
-                            mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
-                            assisted_addrs: None,
+                            protocol: visitor_protocol.clone(),
+                            mapped_addrs: visitor_mapped_addrs.clone(),
+                            assisted_addrs: visitor_assisted_addrs.clone(),
                             visitor_addr,
                         });
                         if let Err(e) = write_ctl_msg(&mut writer, &reply, v2).await {
@@ -800,12 +787,16 @@ pub async fn handle_control<S>(
                             }
                         };
 
-                        // Send NatHoleClient to provider
+                        // Send NatHoleClient to provider with visitor's STUN data.
+                        // Go frp v0.69.1 compat: server is a pure relay.
                         let visitor_addr = peer.as_ref().map(|a| a.to_string());
                         if provider_ctl.tx.send(InternalMsg::NatHoleClient {
                             proxy_name: proxy_name.clone(),
                             transaction_id: transaction_id.clone(),
                             visitor_addr,
+                            visitor_mapped_addrs: nhv.mapped_addrs.clone(),
+                            visitor_assisted_addrs: nhv.assisted_addrs.clone(),
+                            visitor_protocol: nhv.protocol.clone(),
                         }).is_err() {
                             warn!("Provider for run_id {} has gone away", provider_run_id);
                             state.nat_hole.remove(&transaction_id).await;

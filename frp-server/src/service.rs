@@ -57,6 +57,13 @@ pub enum InternalMsg {
         proxy_name: String,
         transaction_id: String,
         visitor_addr: Option<String>,
+        /// Visitor's STUN-discovered addresses (from NatHoleVisitor.mapped_addrs).
+        /// Forwarded to provider so it knows where to send hole-punch packets.
+        visitor_mapped_addrs: Option<Vec<String>>,
+        /// Visitor's assisted addresses (UPnP, etc. from NatHoleVisitor.assisted_addrs).
+        visitor_assisted_addrs: Option<Vec<String>>,
+        /// Visitor's NAT traversal protocol ("quic" or "tcp" from NatHoleVisitor.protocol).
+        visitor_protocol: Option<String>,
     },
     /// Forward NatHoleSid to visitor via control channel (Go frp compat).
     WriteNatHoleSid {
@@ -1459,13 +1466,19 @@ async fn handle_nat_hole_visitor(
         rx
     };
 
-    // Send NatHoleClient to provider (notification + address info)
+    // Send NatHoleClient to provider (notification + visitor address info).
+    // Forwards visitor's STUN-discovered addresses and protocol so the
+    // provider knows where to send hole-punch packets. Go frp v0.69.1 compat:
+    // the server is a pure relay — it does NOT do its own STUN.
     if ctl_tx
         .tx
         .send(InternalMsg::NatHoleClient {
             proxy_name: proxy_name.clone(),
             transaction_id: transaction_id.clone(),
             visitor_addr,
+            visitor_mapped_addrs: msg.mapped_addrs.clone(),
+            visitor_assisted_addrs: msg.assisted_addrs.clone(),
+            visitor_protocol: msg.protocol.clone(),
         })
         .is_err()
     {
@@ -1480,8 +1493,9 @@ async fn handle_nat_hole_visitor(
     );
 
     // Wait for provider's NatHoleClient with STUN addresses.
-    // The provider's control handler will do STUN discovery and send
+    // The provider does its own STUN discovery and sends
     // NatHoleClient back with mapped_addrs/assisted_addrs.
+    // Go frp v0.69.1 compat: server is a pure relay.
     // handle_client() signals notify_ch when the message arrives.
 
     let client_msg_received = tokio::time::timeout(
