@@ -2067,6 +2067,7 @@ TOML
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
+    # sleep 3: wait for HTTP proxy registration + VHost routing propagation
     sleep 3
 
     # Send HTTP request through VHost
@@ -2193,6 +2194,7 @@ TOML
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
+    # sleep 3: wait for HTTP proxy registration + VHost routing propagation
     sleep 3
 
     local result
@@ -2269,7 +2271,6 @@ TOML
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
         > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
     track_pid $!
-    sleep 2
 
     # Start Go frpc visitor (stcp visitor)
     cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
@@ -2358,7 +2359,6 @@ TOML
     RUST_LOG=debug "$RUST_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
         > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
     track_pid $!
-    sleep 2
 
     # Start Rust frpc visitor (STCP visitor)
     cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
@@ -2447,7 +2447,6 @@ TOML
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
         > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
     track_pid $!
-    sleep 2
 
     # Start Go frpc visitor (xtcp visitor)
     cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
@@ -2536,7 +2535,6 @@ TOML
     RUST_LOG=debug "$RUST_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
         > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
     track_pid $!
-    sleep 2
 
     # Start Rust frpc visitor (XTCP visitor)
     cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
@@ -2753,7 +2751,7 @@ test_g2r_tcpmux() {
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
-    sleep 2  # wait for proxy registration
+    # Python client below retries connect with 10s timeout
 
     # HTTP CONNECT through tcpmux port, then echo test
     local result
@@ -2846,7 +2844,7 @@ test_r2g_tcpmux() {
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
-    sleep 2  # wait for proxy registration
+    # Python client below retries connect with 10s timeout
 
     # HTTP CONNECT through tcpmux port, then echo test
     local result
@@ -3139,6 +3137,7 @@ TOML
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
+    # sleep 3: wait for HTTPS proxy registration + VHost routing propagation
     sleep 3
 
     # Send HTTPS request through VHost (skip TLS verification — self-signed cert)
@@ -3263,7 +3262,7 @@ TOML
         fail_test "$name" "Go frps did not start"
         return
     }
-    sleep 2  # give Go frps time to bind VHost HTTPS port
+    # wait_for_port_safe below polls for VHost HTTPS port
     wait_for_port_safe 127.0.0.1 "$vhost_https_port" 5 || {
         fail_test "$name" "VHost HTTPS port $vhost_https_port not reachable"
         return
@@ -3289,6 +3288,7 @@ TOML
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
+    # sleep 3: wait for HTTPS proxy registration + VHost routing propagation
     sleep 3
 
     # Send HTTPS request through VHost
