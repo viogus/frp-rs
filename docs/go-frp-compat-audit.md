@@ -4,7 +4,7 @@
 
 ## Summary
 
-frp-rs achieves **~98-99% feature parity** with Go frp v0.69.1. All 22 identified gaps have been closed across 5 implementation batches. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, transport protocols, client plugins, and config coverage all match Go frp behavior. Remaining differences are architectural (V2 protocol, dynamic tokens) or out of scope (SSH tunnel, PProf).
+frp-rs achieves **~96-97% feature parity** with Go frp v0.69.1. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 9 client plugins, config coverage, and the SSH tunnel gateway all match Go frp behavior. Remaining gaps are protocol-level (V2 AEAD, XTCP cross-compat), behavioral (reconnect backoff, group load balancing), and admin polish (status accuracy, client metrics endpoint).
 
 **31/31 cross-compatibility tests pass.**
 
@@ -57,9 +57,9 @@ frp-rs achieves **~98-99% feature parity** with Go frp v0.69.1. All 22 identifie
 | Token auth (MD5) | ✅ | ✅ |
 | OIDC auth | ✅ | ✅ |
 | OIDC proxy URL | ✅ | ✅ |
-| Dynamic token sourcing (file://, exec://) | ✅ | ❌ |
-| OIDC custom TLS (TrustedCaFile, etc.) | ✅ | ❌ |
-| OIDC non-caching token source fallback | ✅ | ❌ |
+| Dynamic token sourcing (file://, exec://) | ✅ | ✅ |
+| OIDC custom TLS (TrustedCaFile, etc.) | ✅ | ✅ |
+| OIDC non-caching token source fallback | ✅ | ✅ |
 | additionalAuthScopes config | ✅ | ✅ (full implementation) |
 | Auth fail delay (brute-force protection) | ✅ (200ms) | ✅ |
 
@@ -95,9 +95,9 @@ frp-rs achieves **~98-99% feature parity** with Go frp v0.69.1. All 22 identifie
 | `https2https` | ✅ |
 | `http2http` | ✅ |
 | `tls2raw` | ✅ |
-| `virtual_net` | ❌ |
+| `virtual_net` | ✅ (proxy-level field for STCP/XTCP isolation; not a standalone plugin) |
 
-**9 of 10 implemented.**
+**9 of 9 plugins implemented. `virtual_net` is not a plugin type in Go frp — it is a per-proxy namespace field for STCP/XTCP isolation, implemented in ProxyConfig and server routing.**
 
 ---
 
@@ -114,16 +114,17 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 
 ---
 
-## Missing Features (Reduced List)
+## Remaining Gaps
 
-1. **V2 wire protocol** — AEAD encryption, capability negotiation (stubs only)
-2. **Dynamic token sourcing** (file://, exec://)
-3. **OIDC custom TLS** (TrustedCaFile, etc.)
-4. **OIDC non-caching token source fallback**
-5. **Client proxy/visitor hot reload** — server reload works; client reload needs proxy reconciliation
-6. **SSH Tunnel Gateway** — out of scope (full SSH server, niche use case)
-7. **virtual_net client plugin**
-8. **Pprof profiling endpoint** — out of scope (Go-specific; Rust equivalent is tokio-console)
+1. **V2 wire protocol** — AEAD encryption, capability negotiation (basic binary framing works; stubs for advanced features)
+2. **Client proxy/visitor hot reload** — adding/removing proxies works; changing existing proxy config (port, encryption, etc.) requires restart
+3. **Client reconnect backoff** — fixed 10s delay vs Go's `24s * failedCount` with jitter (max 720s)
+4. **XTCP cross-compat** — disabled: Go frp uses QUIC-based NAT detection; frp-rs uses TCP simultaneous open. Both work standalone.
+5. **KCP/QUIC cross-compat** — parameter mismatch (KCP window 128 vs 1024, MTU 1400 vs 1350). Likely don't interoperate.
+6. **Admin `/api/status` accuracy** — always reports "online"; doesn't reflect real proxy state
+7. **No `/api/metrics` on client admin** — server has Prometheus `/metrics`; client admin has no traffic endpoint
+8. **Group load balancing** — `select_group_backend()` without `group_key` always returns first member; Go frp does true round-robin
+9. **Pprof profiling endpoint** — out of scope (Go-specific; Rust equivalent is tokio-console)
 
 ---
 
@@ -140,4 +141,5 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 | `enabled` per-proxy toggle | Disable individual proxies without removing config |
 | Selective `start` | Start only named proxies for testing/staging |
 | PROXY protocol v1+v2 | Both text and binary HAProxy PROXY protocol support |
+| SSH tunnel gateway | ✅ Full `ssh -R` support, beyond Go frp parity |
 | Rust type safety | Memory safety, no data races, compile-time guarantees |
