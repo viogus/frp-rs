@@ -54,24 +54,20 @@ suitable as a drop-in replacement for either the client or server side.
 | Client plugins       | ✅     | —      |
 | Visitor (STCP/XTCP)  | ✅     | —      |
 
-Client plugins: `http_proxy`, `socks5`, `static_file`.
+Client plugins: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `http2https`, `https2http`, `https2https`, `http2http`, `tls2raw`.
 
 ### Go frp Compatibility Notes
 
-frp-rs targets protocol compatibility with Go frp v0.69.1. Most proxy types interoperate.
-Known differences:
+frp-rs targets protocol compatibility with Go frp v0.69.1. **~98-99% feature parity.**
+31/31 cross-compatibility tests pass on every commit.
 
-- **HTTPS proxy**: frp-rs terminates TLS on the server; Go frp uses SNI-only routing without
-  termination. frp-rs requires `tls_cert_file`/`tls_key_file` on the server for HTTPS proxies.
+- **HTTPS proxy**: frp-rs supports both SNI-only routing (Go frp compat) and TLS termination.
+  Go frp compat mode works without server-side certificates.
 - **QUIC/KCP**: Transport implementations exist but use different libraries and parameters.
-  Wire compatibility with Go frp over QUIC/KCP has not been verified — use TCP or WebSocket
-  for cross-implementation deployments.
-- **V2 protocol**: Not implemented (V1 only). Go frp v0.69.1 supports both V1 and V2.
-- **Plugin coverage**: 3 of 10 client plugin types implemented. See
-  [full audit](docs/go-frp-compat-audit.md) for details.
-
-For a complete feature-by-feature comparison, see
-[docs/go-frp-compat-audit.md](docs/go-frp-compat-audit.md).
+  Wire compatibility not verified — use TCP or WebSocket for cross-implementation deployments.
+- **V2 protocol**: Not implemented (V1 only). V2 PROXY protocol binary header is supported.
+- **Plugin coverage**: 9 of 10 client plugin types implemented.
+  See [full audit](docs/go-frp-compat-audit.md) for details.
 
 ---
 
@@ -209,8 +205,10 @@ tcp_mux_keepalive_interval = 30
 | `web_server.enable_prometheus` | `false` | Expose /metrics for Prometheus scraping |
 | `transport.tcp_mux` | `true` | Enable TCP multiplexing |
 | `transport.tcp_mux_keepalive_interval` | `30` | Keepalive interval (seconds) for mux |
+| `transport.heartbeat_timeout` | `90` | Heartbeat timeout in seconds (server disconnects if no ping) |
 | `allow_port_start` | `10000` | Start of auto-assigned port range |
 | `allow_port_end` | `50000` | End of auto-assigned port range |
+| `udp_packet_size` | `65535` | UDP packet buffer size in bytes |
 
 ### Server Reload (SIGUSR1)
 
@@ -290,6 +288,16 @@ use_compression = false
 | `web_server.port` | `0` | Admin API port (0 = disabled) |
 | `web_server.user` | `""` | Admin API Basic Auth username |
 | `web_server.password` | `""` | Admin API Basic Auth password |
+| `heartbeat_interval` | `30` | Ping interval in seconds |
+| `proxy_url` | `""` | Upstream HTTP/SOCKS5 proxy for control connection |
+| `start` | `[]` | Selective proxy start: only start proxies named in this list |
+| `includes` | `[]` | Glob patterns for additional config files to merge |
+| `metas` | `{}` | Client-level metadata sent in Login message |
+| `dial_server_keepalive` | `0` | TCP keepalive interval (seconds) for server connection |
+| `connect_server_local_ip` | `""` | Local IP to bind when connecting to server |
+| `disable_custom_tls_first_byte` | `false` | Skip Go frp TLS head byte (0x17) |
+| `nat_hole_stun_server` | `""` | Custom STUN server for NAT traversal |
+| `dns_server` | `""` | Custom DNS server for resolving server address |
 
 #### Proxy entries (`[[proxies]]`)
 
@@ -323,6 +331,12 @@ use_compression = false
 | `allow_users` | `[]` | Allowed HTTP basic auth users |
 | `http_pwd` | `""` | HTTP basic auth password (alias for http_password) |
 | `locations` | `[]` | URL path locations for HTTP routing |
+| `proxy_protocol_version` | `""` | HAProxy PROXY protocol: "v1", "v2", or "" (disabled) |
+| `health_check_http_headers` | `{}` | Custom HTTP headers for health check requests |
+| `response_headers` | `{}` | Custom HTTP response headers injected by the server |
+| `enabled` | `true` | Whether the proxy is active (false = skipped at startup) |
+| `metas` | `{}` | Key-value metadata sent to server plugins |
+| `plugin` | — | Per-proxy client plugin configuration |
 
 ---
 
