@@ -693,7 +693,192 @@ mod tests {
     }
 }
 
+use std::borrow::Cow;
 use std::path::Path;
+
+use tokio::net::TcpListener;
+use russh::server::Config;
+
+/// SSH tunnel gateway listener. Binds a TCP port and accepts SSH connections.
+pub struct SshListener {
+    bind_addr: String,
+    bind_port: u16,
+    #[allow(dead_code)]
+    config: frp_core::config::SshTunnelGatewayConfig,
+    server_token: String,
+    state: std::sync::Arc<AppState>,
+    host_key: russh::keys::PrivateKey,
+    authorized_keys: Vec<russh::keys::PublicKey>,
+}
+
+impl SshListener {
+    pub async fn new(
+        cfg: &frp_core::config::ServerConfig,
+        state: std::sync::Arc<AppState>,
+        server_token: String,
+    ) -> Result<Option<Self>, String> {
+        let ssh_cfg = &cfg.ssh_tunnel_gateway;
+        if ssh_cfg.bind_port == 0 {
+            return Ok(None);
+        }
+
+        let host_key = load_or_generate_host_key(
+            &ssh_cfg.private_key_file,
+            &ssh_cfg.auto_gen_private_key_path,
+        ).await?;
+
+        let authorized_keys = if !ssh_cfg.authorized_keys_file.is_empty() {
+            let path = std::path::Path::new(&ssh_cfg.authorized_keys_file);
+            if path.exists() {
+                std::fs::read_to_string(path)
+                    .map(|s| {
+                        s.lines()
+                            .map(|l| l.trim().to_string())
+                            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                            .filter_map(|line| {
+                                // Line format: "ssh-ed25519 AAAAC3NzaC1... [comment]"
+                                let parts: Vec<&str> = line.split_whitespace().collect();
+                                if parts.len() >= 2 {
+                                    russh::keys::parse_public_key_base64(parts[1]).ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        Ok(Some(Self {
+            bind_addr: ssh_cfg.bind_addr.clone(),
+            bind_port: ssh_cfg.bind_port,
+            config: ssh_cfg.clone(),
+            server_token,
+            state,
+            host_key,
+            authorized_keys,
+        }))
+    }
+
+    pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+        let addr = format!("{}:{}", self.bind_addr, self.bind_port);
+        let listener = TcpListener::bind(&addr).await?;
+        tracing::info!("SSH tunnel gateway listening on {}", addr);
+
+        // Build russh server config, wrap in Arc (required by run_stream)
+        let mut russh_config = Config::default();
+        russh_config.keys.push(self.host_key.clone());
+        russh_config.auth_rejection_time = std::time::Duration::from_secs(3);
+        russh_config.server_id = russh::SshId::Standard(Cow::Owned(format!(
+            "SSH-2.0-frp-rs_{}",
+            env!("CARGO_PKG_VERSION")
+        )));
+        let russh_config = std::sync::Arc::new(russh_config);
+
+        loop {
+            let (stream, peer_addr) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::error!("SSH accept error: {}", e);
+                    continue;
+                }
+            };
+
+            tracing::info!("SSH connection from {}", peer_addr);
+
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let state = self.state.clone();
+            let server_token = self.server_token.clone();
+            let authorized_keys = self.authorized_keys.clone();
+            let russh_config = russh_config.clone();
+
+            tokio::spawn(async move {
+                // Create channels for virtual control and work conn requests.
+                // vc: VirtualControl (AsyncRead + AsyncWrite) for handle_control
+                // frame_tx: SSH session writes V1 frames into this
+                // work_conn_rx: receives WorkConnRequest when control handler needs work conn
+                let (vc, frame_tx, work_conn_rx) = VirtualControl::channel();
+
+                // Build synthetic Login message for the control handler
+                let login = frp_core::msg::Login {
+                    version: Some("0.69.1".into()),
+                    hostname: Some("ssh-gateway".into()),
+                    os: None,
+                    arch: None,
+                    user: Some("v0".into()),
+                    run_id: Some(run_id.clone()),
+                    client_id: None,
+                    pool_count: Some(1),
+                    timestamp: Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64,
+                    ),
+                    privilege_key: Some(server_token.clone()),
+                    metas: None,
+                    client_spec: None,
+                    multiplexer: None,
+                };
+
+                // Build SshSession — the russh Handler impl
+                let session = SshSession::new(
+                    run_id.clone(),
+                    frame_tx,
+                    work_conn_rx,
+                    server_token,
+                    authorized_keys,
+                    state.clone(),
+                );
+
+                // Spawn control handler with virtual control stream
+                let ctrl_state = state.clone();
+                let ctrl_run_id = run_id.clone();
+                tokio::spawn(async move {
+                    crate::control::handle_control(
+                        vc,
+                        login,
+                        ctrl_state,
+                        Some(peer_addr),
+                        None,  // no incoming streams (not mux)
+                        false, // V1 protocol
+                    ).await;
+                });
+
+                // Run SSH session with russh
+                let running = match russh::server::run_stream(
+                    russh_config,
+                    stream,
+                    session,
+                ).await {
+                    Ok(running) => running,
+                    Err(e) => {
+                        tracing::error!(
+                            "SSH session {} failed to start: {:?}",
+                            ctrl_run_id,
+                            e
+                        );
+                        cleanup_session(&ctrl_run_id, &state).await;
+                        return;
+                    }
+                };
+
+                match running.await {
+                    Ok(()) => tracing::debug!("SSH session {} ended normally", ctrl_run_id),
+                    Err(e) => tracing::debug!("SSH session {} error: {:?}", ctrl_run_id, e),
+                }
+
+                // Cleanup all proxies registered by this session
+                cleanup_session(&ctrl_run_id, &state).await;
+            });
+        }
+    }
+}
 
 /// Load or auto-generate the SSH host key.
 ///
@@ -704,28 +889,28 @@ use std::path::Path;
 async fn load_or_generate_host_key(
     private_key_file: &str,
     auto_gen_path: &str,
-) -> Result<russh_keys::PrivateKey, String> {
+) -> Result<russh::keys::PrivateKey, String> {
     // Try explicit key file first
     if !private_key_file.is_empty() && Path::new(private_key_file).exists() {
-        return russh_keys::load_secret_key(private_key_file, None)
+        return russh::keys::load_secret_key(private_key_file, None)
             .map_err(|e| format!("load key file {}: {}", private_key_file, e));
     }
 
     // Try auto-gen path
     if Path::new(auto_gen_path).exists() {
-        return russh_keys::load_secret_key(auto_gen_path, None)
+        return russh::keys::load_secret_key(auto_gen_path, None)
             .map_err(|e| format!("load auto-gen key {}: {}", auto_gen_path, e));
     }
 
     // Generate new Ed25519 key
-    use russh_keys::ssh_key::rand_core::OsRng;
-    let key = russh_keys::PrivateKey::random(&mut OsRng, russh_keys::Algorithm::Ed25519)
+    let mut rng = rand::rng();
+    let key = russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519)
         .map_err(|e| format!("generate key: {}", e))?;
     let pem = key
-        .to_openssh(russh_keys::ssh_key::LineEnding::default())
+        .to_openssh(russh::keys::ssh_key::LineEnding::default())
         .map_err(|e| format!("serialize key: {}", e))?;
 
-    // Write to auto-gen path
+    // Write to auto-gen path (pem is Zeroizing<String>, derefs to String)
     if let Some(parent) = Path::new(auto_gen_path).parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("create dir for key: {}", e))?;
@@ -754,7 +939,7 @@ mod key_tests {
         assert!(data.contains("BEGIN OPENSSH PRIVATE KEY"));
 
         // Verify it's an Ed25519 key
-        assert!(matches!(key.algorithm(), russh_keys::Algorithm::Ed25519));
+        assert!(matches!(key.algorithm(), russh::keys::Algorithm::Ed25519));
     }
 
     #[tokio::test]
@@ -774,9 +959,9 @@ mod key_tests {
         // File not overwritten
         assert_eq!(mtime_before, mtime_after);
         // Same key type
-        assert!(matches!(key2.algorithm(), russh_keys::Algorithm::Ed25519));
+        assert!(matches!(key2.algorithm(), russh::keys::Algorithm::Ed25519));
         // Same key: fingerprints should match
-        use russh_keys::ssh_key::HashAlg;
+        use russh::keys::ssh_key::HashAlg;
         let fp1 = key1.public_key().fingerprint(HashAlg::Sha256);
         let fp2 = key2.public_key().fingerprint(HashAlg::Sha256);
         assert_eq!(fp1.to_string(), fp2.to_string());
@@ -794,13 +979,14 @@ mod key_tests {
 
         // Create explicit key
         let explicit_path = dir.path().join("explicit_key");
-        let explicit = russh_keys::PrivateKey::random(
-            &mut russh_keys::ssh_key::rand_core::OsRng,
-            russh_keys::Algorithm::Ed25519,
+        let mut rng = rand::rng();
+        let explicit = russh::keys::PrivateKey::random(
+            &mut rng,
+            russh::keys::Algorithm::Ed25519,
         )
         .unwrap();
         let pem = explicit
-            .to_openssh(russh_keys::ssh_key::LineEnding::default())
+            .to_openssh(russh::keys::ssh_key::LineEnding::default())
             .unwrap();
         std::fs::write(&explicit_path, pem.as_bytes()).unwrap();
 
@@ -813,7 +999,7 @@ mod key_tests {
         .unwrap();
 
         // Both are Ed25519 -- verify they're different keys
-        use russh_keys::ssh_key::HashAlg;
+        use russh::keys::ssh_key::HashAlg;
         let loaded_fp = loaded.public_key().fingerprint(HashAlg::Sha256);
         let auto_fp = auto.public_key().fingerprint(HashAlg::Sha256);
         assert_ne!(loaded_fp.to_string(), auto_fp.to_string());
