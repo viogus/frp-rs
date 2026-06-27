@@ -1132,7 +1132,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 &opts.server_addr
             };
             let ca_file = opts.tls_ca_file.as_deref();
-            let stream = crate::quic::dial_quic(&addr, server_name, ca_file).await
+            let (stream, _conn) = crate::quic::dial_quic(&addr, server_name, ca_file).await
                 .map_err(|e| crate::Error::Transport(format!("QUIC dial: {e}")))?;
             return Ok(IoStream::Quic(stream));
         }

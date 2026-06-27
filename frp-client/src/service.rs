@@ -14,6 +14,7 @@ use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg, write_msg, read_msg_v1, write_msg_v1, read_msg_v2, write_msg_v2};
 use frp_core::mux::YamuxSession;
+use frp_core::quic::QuicConnection;
 use frp_core::transport::{TransportProtocol, DialOptions, dial_server, IoStream};
 
 use frp_core::metrics::ProxyMetricsRegistry;
@@ -499,16 +500,16 @@ impl Service {
                 self.cfg.proxy_url.clone(),
             );
 
-            let (mut control_stream, run_id, yamux_session) = match ctl.login().await {
+            let (mut control_stream, run_id, yamux_session, quic_conn) = match ctl.login().await {
                 Ok(r) => {
                     did_login_once = true;
                     failed_count = 0;
                     *self.server_auth_scopes.write().await = ctl.server_auth_scopes.clone();
                     // After login, wrap control stream in AES-128-CFB encryption.
                     // Go frps v0.69.1 always encrypts the control connection for V1.
-                    let (stream, run_id, yamux) = r;
+                    let (stream, run_id, yamux, quic) = r;
                     let enc_key = encryption::derive_key(&self.auth_cfg.token);
-                    (stream.into_encrypted(enc_key), run_id, yamux)
+                    (stream.into_encrypted(enc_key), run_id, yamux, quic)
                 }
                 Err(e) => {
                     failed_count += 1;
@@ -521,6 +522,7 @@ impl Service {
                 }
             };
             let yamux = yamux_session.map(std::sync::Arc::new);
+            let quic_conn = quic_conn.map(std::sync::Arc::new);
             let v2 = self.cfg.v2;
             info!("Logged in. run_id: {}", run_id);
 
@@ -615,6 +617,7 @@ impl Service {
                     self.cfg.tls_server_name.clone(),
                     if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
                     yamux.clone(),
+                    quic_conn.clone(),
                     v2,
                     self.oidc_client.clone(),
                     udp_sockets.clone(),
@@ -682,6 +685,7 @@ impl Service {
                                     self.cfg.tls_server_name.clone(),
                                     if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
                                     yamux.clone(),
+                                    quic_conn.clone(),
                                     v2,
                                     self.oidc_client.clone(),
                                     udp_sockets.clone(),
@@ -690,9 +694,9 @@ impl Service {
                                     client_scopes.clone(),
                                     server_scopes.clone(),
                                     self.cfg.disable_custom_tls_first_byte,
-                    self.cfg.dial_server_keepalive.max(0) as u64,
-                    if self.cfg.connect_server_local_ip.is_empty() { None } else { Some(self.cfg.connect_server_local_ip.clone()) },
-                    self.cfg.proxy_url.clone(),
+                                    self.cfg.dial_server_keepalive.max(0) as u64,
+                                    if self.cfg.connect_server_local_ip.is_empty() { None } else { Some(self.cfg.connect_server_local_ip.clone()) },
+                                    self.cfg.proxy_url.clone(),
                                 );
                             }
                             Ok(FrpMessage::Pong(_)) => {
@@ -1116,6 +1120,7 @@ fn spawn_work_conn(
     tls_server_name: String,
     tls_ca_file: Option<String>,
     yamux: Option<std::sync::Arc<YamuxSession>>,
+    quic_conn: Option<Arc<QuicConnection>>,
     v2: bool,
     oidc_client: Option<Arc<OidcClient>>,
     udp_sockets: Arc<tokio::sync::Mutex<HashMap<String, Arc<UdpSocket>>>>,
@@ -1147,8 +1152,21 @@ fn spawn_work_conn(
         };
 
         // Acquire the underlying transport stream.
-        // Under TcpMux: open a yamux stream instead of dialing new TCP.
-        let mut work = if let Some(ref yamux) = yamux {
+        // Priority: QUIC multi-stream > TcpMux yamux > direct dial.
+        // Go frp compat: QUIC work connections open new streams on the
+        // existing QUIC connection (multi-stream-per-connection).
+        let mut work = if let Some(ref quic) = quic_conn {
+            match quic.open_bi().await {
+                Ok(stream) => {
+                    debug!("Work conn {} opened QUIC stream", label);
+                    IoStream::Quic(stream)
+                }
+                Err(e) => {
+                    warn!("Work conn {}: QUIC open_bi failed: {}", label, e);
+                    return;
+                }
+            }
+        } else if let Some(ref yamux) = yamux {
             match yamux.open_stream().await {
                 Some(stream) => {
                     debug!("Work conn {} opened yamux stream", label);
@@ -1445,6 +1463,7 @@ fn spawn_work_conn(
                 tls_server_name,
                 tls_ca_file,
                 yamux,
+                quic_conn,
                 v2,
                 oidc_client,
                 repl_udp_sockets,
