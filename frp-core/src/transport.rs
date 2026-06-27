@@ -1364,9 +1364,6 @@ pub fn build_tls_acceptor(
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-/// Create a TLS connector for client-side TLS.
-/// If ca_file is provided, use it as a custom root CA; otherwise use webpki roots.
-/// If cert_file/key_file are provided, present client certificate to server (mTLS).
 /// Build a `RootCertStore` from an optional CA file path.
 /// If `ca_file` is Some and non-empty, loads CA certs from that file.
 /// If None or empty, uses the system's webpki roots.
@@ -1392,6 +1389,9 @@ pub fn build_root_store(ca_file: Option<&str>) -> Result<rustls::RootCertStore, 
     Ok(root_store)
 }
 
+/// Create a TLS connector for client-side TLS.
+/// If ca_file is provided, use it as a custom root CA; otherwise use webpki roots.
+/// If cert_file/key_file are provided, present client certificate to server (mTLS).
 pub fn build_tls_connector(
     ca_file: Option<&str>,
     cert_file: Option<&str>,

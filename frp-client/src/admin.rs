@@ -62,6 +62,15 @@ pub struct AdminState {
 
 // --- Handlers ---
 
+/// Escape special characters in a Prometheus label value.
+/// Per the exposition format spec, backslash, double-quote, and newline
+/// must be escaped with a backslash.
+fn prometheus_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+     .replace('"', "\\\"")
+     .replace('\n', "\\n")
+}
+
 async fn handle_metrics(State(state): State<AdminState>) -> String {
     let proxies = state.proxies.read().await;
     let mut traffic_in = String::new();
@@ -72,7 +81,11 @@ async fn handle_metrics(State(state): State<AdminState>) -> String {
     for (name, info) in proxies.iter() {
         if let Some(m) = state.proxy_metrics.get(name).await {
             let s = m.snapshot();
-            let labels = format!("{{name=\"{}\",type=\"{}\"}}", name, info.proxy_type);
+            let labels = format!(
+                "{{name=\"{}\",type=\"{}\"}}",
+                prometheus_escape(name),
+                prometheus_escape(&info.proxy_type),
+            );
             traffic_in.push_str(&format!("frp_client_traffic_in{} {}\n", labels, s.bytes_in));
             traffic_out.push_str(&format!("frp_client_traffic_out{} {}\n", labels, s.bytes_out));
             conn_counts.push_str(&format!("frp_client_connection_counts{} {}\n", labels, s.total_conns));
