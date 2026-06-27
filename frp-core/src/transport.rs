@@ -698,7 +698,7 @@ impl IoStream {
             IoStream::Yamux(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Cipher(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::SshChannel(s) => crate::protocol::read_msg_v1(s).await,
-            IoStream::PreRead(_, s) => crate::protocol::read_msg_v1(s).await,
+            IoStream::PreRead(..) => crate::protocol::read_msg_v1(self).await,
         }
     }
 
@@ -728,7 +728,7 @@ impl IoStream {
             IoStream::Yamux(s) => crate::protocol::read_msg_v2(s).await,
             IoStream::Cipher(s) => crate::protocol::read_msg_v2(s).await,
             IoStream::SshChannel(s) => crate::protocol::read_msg_v2(s).await,
-            IoStream::PreRead(_, s) => crate::protocol::read_msg_v2(s).await,
+            IoStream::PreRead(..) => crate::protocol::read_msg_v2(self).await,
         }
     }
 
@@ -759,7 +759,7 @@ impl IoStream {
             IoStream::Yamux(s) => crate::protocol::read_v2_frame_raw(s).await,
             IoStream::Cipher(s) => crate::protocol::read_v2_frame_raw(s).await,
             IoStream::SshChannel(s) => crate::protocol::read_v2_frame_raw(s).await,
-            IoStream::PreRead(_, s) => crate::protocol::read_v2_frame_raw(s).await,
+            IoStream::PreRead(..) => crate::protocol::read_v2_frame_raw(self).await,
         }
     }
 
@@ -811,7 +811,8 @@ impl IoStream {
                 let (r, w) = tokio::io::split(s);
                 (Box::new(r), Box::new(w))
             }
-            IoStream::PreRead(_, s) => {
+            IoStream::PreRead(pre_read, s) => {
+                debug_assert!(pre_read.is_empty(), "into_split called before pre_read bytes consumed");
                 let (r, w) = tokio::io::split(s);
                 (Box::new(r), Box::new(w))
             }
