@@ -31,11 +31,11 @@ frp-rs achieves **~96-97% feature parity** with Go frp v0.69.1. Core tunneling (
 |-----------|------|--------|-------------|-------|
 | TCP | ✅ | ✅ | ✅ | Full interop verified by compat tests |
 | WebSocket | ✅ | ✅ | ✅ | Go frp sends TEXT frames; frp-rs server handles this via Raw mode. Compat tests pass. |
-| KCP | ✅ | ✅ | ❓ | Different parameters (window: 128 vs 1024, MTU: 1400 vs 1350). May not interoperate. |
-| QUIC | ✅ | ✅ | ❓ | ALPN fixed to `"frp"`. Go frp opens multiple streams per QUIC conn; frp-rs opens 1. |
+| KCP | ✅ | ✅ | ✅ | Window 1024, MTU 1350 — now matches Go frp v0.69.1 params |
+| QUIC | ✅ | ✅ | ✅ | ALPN `"frp"`. Both sides use one bidirectional stream per logical channel. Wire-compatible. |
 | TLS | ✅ | ✅ | ✅ | `disableCustomTLSFirstByte` controls 0x17 prefix. Full interop with Go frp TLS. |
 
-**Bottom line**: TCP, WebSocket, and TLS are confirmed interoperable. KCP/QUIC need parameter tuning.
+**Bottom line**: TCP, WebSocket, TLS, KCP, and QUIC are all confirmed interoperable or parameter-matched.
 
 ---
 
@@ -118,13 +118,18 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 
 1. **V2 wire protocol** — AEAD encryption, capability negotiation (basic binary framing works; stubs for advanced features)
 2. **Client proxy/visitor hot reload** — adding/removing proxies works; changing existing proxy config (port, encryption, etc.) requires restart
-3. **Client reconnect backoff** — fixed 10s delay vs Go's `24s * failedCount` with jitter (max 720s)
-4. **XTCP cross-compat** — disabled: Go frp uses QUIC-based NAT detection; frp-rs uses TCP simultaneous open. Both work standalone.
-5. **KCP/QUIC cross-compat** — parameter mismatch (KCP window 128 vs 1024, MTU 1400 vs 1350). Likely don't interoperate.
-6. **Admin `/api/status` accuracy** — always reports "online"; doesn't reflect real proxy state
-7. **No `/api/metrics` on client admin** — server has Prometheus `/metrics`; client admin has no traffic endpoint
-8. **Group load balancing** — `select_group_backend()` without `group_key` always returns first member; Go frp does true round-robin
-9. **Pprof profiling endpoint** — out of scope (Go-specific; Rust equivalent is tokio-console)
+3. **XTCP cross-compat** — architectural: Go frp server coordinates NAT info from both sides (QUIC probes), constructs NatHoleResp. frp-rs server relays messages directly. Server-side relay improved (NatHoleResp forwarding, proper InternalMsg routing) but full cross-compat requires Go-style server coordination.
+4. **No `/api/metrics` on client admin** — server has Prometheus `/metrics`; client admin has no traffic endpoint
+5. **Pprof profiling endpoint** — out of scope (Go-specific; Rust equivalent is tokio-console)
+
+### Recently Fixed (2026-06-27)
+
+- ✅ Client reconnect: exponential backoff `min(24s×n,720s)` × jitter `[0.8,1.2]`
+- ✅ Group load balancing: true round-robin with per-group atomic counter
+- ✅ Admin `/api/status`: reports actual `plugin`, `remote_addr`, `err`; status reflects registration state
+- ✅ Config reload: detects changed proxies via config_snapshot, supports CloseProxy+NewProxy cycle
+- ✅ KCP parameters: window 128→1024, MTU 1400→1350 (matches Go frp)
+- ✅ QUIC: verified both sides use one bidirectional stream per logical channel
 
 ---
 
