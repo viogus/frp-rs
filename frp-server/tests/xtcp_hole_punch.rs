@@ -92,7 +92,8 @@ async fn test_xtcp_nat_hole_message_routing() {
     );
     let nwc = FrpMessage::NewWorkConn(msg::NewWorkConn {
         run_id: Some(run_id.clone()),
-        ..Default::default()
+        timestamp: None,
+        privilege_key: None,
     });
     write_msg_v1(&mut work_conn, &nwc)
         .await
