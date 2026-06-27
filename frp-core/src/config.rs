@@ -95,6 +95,10 @@ pub struct ServerConfig {
     /// Go frp compat: includes.
     #[serde(default)]
     pub includes: Vec<String>,
+    /// SSH tunnel gateway configuration.
+    /// When bind_port > 0, an SSH server listens for `ssh -R` reverse tunnels.
+    #[serde(default)]
+    pub ssh_tunnel_gateway: SshTunnelGatewayConfig,
 }
 
 fn default_allow_port_start() -> u16 { 10000 }
@@ -203,6 +207,7 @@ impl Default for ServerConfig {
             http_plugins: Vec::new(),
             feature: FeatureConfig::default(),
             includes: Vec::new(),
+            ssh_tunnel_gateway: SshTunnelGatewayConfig::default(),
         }
     }
 }
@@ -210,6 +215,50 @@ impl Default for ServerConfig {
 fn default_bind_addr() -> String { "0.0.0.0".into() }
 fn default_bind_port() -> u16 { 7000 }
 fn default_fallback_timeout_ms() -> u64 { 5000 }
+
+// ---------------------------------------------------------------
+// SSH Tunnel Gateway Configuration
+// ---------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshTunnelGatewayConfig {
+    /// SSH listen port. 0 = disabled (default).
+    #[serde(default, alias = "bindPort")]
+    pub bind_port: u16,
+
+    /// SSH listen address. Default: "0.0.0.0".
+    #[serde(default = "default_bind_addr", alias = "bindAddr")]
+    pub bind_addr: String,
+
+    /// Path to SSH host private key file. Auto-generated if empty and
+    /// auto_gen_private_key_path does not exist.
+    #[serde(default, alias = "privateKeyFile")]
+    pub private_key_file: String,
+
+    /// Path where auto-generated SSH host key is written.
+    /// Default: "./.autogen_ssh_key".
+    #[serde(default = "default_autogen_ssh_key_path", alias = "autoGenPrivateKeyPath")]
+    pub auto_gen_private_key_path: String,
+
+    /// Path to SSH authorized_keys for optional public key auth.
+    /// Empty = password auth only.
+    #[serde(default, alias = "authorizedKeysFile")]
+    pub authorized_keys_file: String,
+}
+
+fn default_autogen_ssh_key_path() -> String { "./.autogen_ssh_key".into() }
+
+impl Default for SshTunnelGatewayConfig {
+    fn default() -> Self {
+        Self {
+            bind_port: 0,
+            bind_addr: default_bind_addr(),
+            private_key_file: String::new(),
+            auto_gen_private_key_path: default_autogen_ssh_key_path(),
+            authorized_keys_file: String::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthServerConfig {
@@ -763,7 +812,6 @@ fn default_min_retry_interval() -> i64 { 30 }
 /// - `[common]` section → flatten to top level
 /// - Flat auth_*, log_*, web_server_*, transport_* → nested structs
 /// - Field name differences (protocol → transport_protocol, etc.)
-
 pub fn load_server_config_from_str(content: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let mut value: toml::Value = toml::from_str(content)?;
     normalize_server_config(&mut value);
@@ -808,6 +856,7 @@ fn toml_to_json(v: toml::Value) -> serde_json::Value {
     }
 }
 
+#[allow(clippy::collapsible_match)]
 fn normalize_server_config(value: &mut toml::Value) {
     use toml::Value;
     if let Some(table) = value.as_table_mut() {
@@ -895,6 +944,11 @@ fn normalize_server_config(value: &mut toml::Value) {
                 }
             }
         }
+
+        // Normalize camelCase section names to snake_case
+        if let Some(ssh_section) = table.remove("sshTunnelGateway") {
+            table.entry("ssh_tunnel_gateway").or_insert(ssh_section);
+        }
     }
 }
 
@@ -902,11 +956,9 @@ fn normalize_client_config(value: &mut toml::Value) {
     use toml::Value;
     if let Some(table) = value.as_table_mut() {
         // Handle [common] section
-        if let Some(common) = table.remove("common") {
-            if let Value::Table(common_table) = common {
-                for (k, v) in common_table {
-                    table.entry(k).or_insert(v);
-                }
+        if let Some(Value::Table(common_table)) = table.remove("common") {
+            for (k, v) in common_table {
+                table.entry(k).or_insert(v);
             }
         }
 
@@ -929,21 +981,17 @@ fn normalize_client_config(value: &mut toml::Value) {
         }
 
         // Extract token from [auth] table (Go frp uses auth.token, auth.method)
-        if let Some(v) = table.remove("auth") {
-            if let Value::Table(auth_table) = v {
-                if let Some(token_val) = auth_table.get("token") {
-                    table.entry("token").or_insert(token_val.clone());
-                }
+        if let Some(Value::Table(auth_table)) = table.remove("auth") {
+            if let Some(token_val) = auth_table.get("token") {
+                table.entry("token").or_insert(token_val.clone());
             }
         }
 
         // Flatten [transport] section → top-level (ClientConfig has tcp_mux at top level,
         // but Go frp config puts it under [transport])
-        if let Some(v) = table.remove("transport") {
-            if let Value::Table(tr_table) = v {
-                for (k, v) in tr_table {
-                    table.entry(k).or_insert(v);
-                }
+        if let Some(Value::Table(tr_table)) = table.remove("transport") {
+            for (k, v) in tr_table {
+                table.entry(k).or_insert(v);
             }
         }
 
@@ -1422,5 +1470,44 @@ token = "test-token"
         assert_eq!(cfg.method, "oidc");
         assert_eq!(cfg.oidc_client_id, "client-123");
         assert_eq!(cfg.oidc_audience, "https://api.example.com");
+    }
+
+    #[test]
+    fn test_ssh_tunnel_gateway_config_snake_case() {
+        let toml = r#"
+bind_port = 7000
+
+[ssh_tunnel_gateway]
+bind_port = 2200
+bind_addr = "0.0.0.0"
+private_key_file = "/etc/frp/ssh_host_key"
+auto_gen_private_key_path = "/var/lib/frp/ssh_key"
+authorized_keys_file = "/etc/frp/authorized_keys"
+"#;
+        let cfg: ServerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.ssh_tunnel_gateway.bind_port, 2200);
+        assert_eq!(cfg.ssh_tunnel_gateway.bind_addr, "0.0.0.0");
+        assert_eq!(cfg.ssh_tunnel_gateway.private_key_file, "/etc/frp/ssh_host_key");
+        assert_eq!(cfg.ssh_tunnel_gateway.auto_gen_private_key_path, "/var/lib/frp/ssh_key");
+        assert_eq!(cfg.ssh_tunnel_gateway.authorized_keys_file, "/etc/frp/authorized_keys");
+    }
+
+    #[test]
+    fn test_ssh_tunnel_gateway_config_camel_case() {
+        let toml = r#"
+bindPort = 7000
+
+[sshTunnelGateway]
+bindPort = 2200
+"#;
+        let cfg: ServerConfig = load_server_config_from_str(toml).unwrap();
+        assert_eq!(cfg.ssh_tunnel_gateway.bind_port, 2200);
+    }
+
+    #[test]
+    fn test_ssh_tunnel_gateway_default_disabled() {
+        let toml = r#"bind_port = 7000"#;
+        let cfg: ServerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.ssh_tunnel_gateway.bind_port, 0);
     }
 }

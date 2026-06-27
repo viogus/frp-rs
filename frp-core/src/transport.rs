@@ -477,6 +477,8 @@ pub enum IoStream {
     /// AES-128-CFB encrypted control stream.
     /// Created after login by wrapping the inner IoStream.
     Cipher(Box<crate::cipher_stream::CipherStream>),
+    /// SSH reverse-forward channel (type-erased).
+    SshChannel(Box<dyn AsyncReadWrite>),
 }
 
 impl std::fmt::Debug for IoStream {
@@ -489,6 +491,7 @@ impl std::fmt::Debug for IoStream {
             IoStream::WebSocket(_) => f.debug_struct("IoStream::WebSocket").finish_non_exhaustive(),
             IoStream::Yamux(_) => f.debug_struct("IoStream::Yamux").finish_non_exhaustive(),
             IoStream::Cipher(_) => f.debug_struct("IoStream::Cipher").finish_non_exhaustive(),
+            IoStream::SshChannel(_) => f.debug_struct("IoStream::SshChannel").finish_non_exhaustive(),
         }
     }
 }
@@ -508,6 +511,7 @@ impl tokio::io::AsyncRead for IoStream {
             IoStream::WebSocket(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Yamux(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Cipher(s) => Pin::new(s).poll_read(cx, buf),
+            IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -526,6 +530,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::WebSocket(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::Yamux(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::Cipher(s) => Pin::new(s).poll_write(cx, buf),
+            IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
 
@@ -538,6 +543,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::WebSocket(s) => Pin::new(s).poll_flush(cx),
             IoStream::Yamux(s) => Pin::new(s).poll_flush(cx),
             IoStream::Cipher(s) => Pin::new(s).poll_flush(cx),
+            IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
 
@@ -550,6 +556,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::WebSocket(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::Yamux(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::Cipher(s) => Pin::new(s).poll_shutdown(cx),
+            IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -565,6 +572,7 @@ impl IoStream {
             IoStream::WebSocket(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::Yamux(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::Cipher(s) => crate::protocol::write_msg_v1(s, msg).await,
+            IoStream::SshChannel(s) => crate::protocol::write_msg_v1(s, msg).await,
         }
     }
 
@@ -578,6 +586,7 @@ impl IoStream {
             IoStream::WebSocket(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Yamux(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Cipher(s) => crate::protocol::read_msg_v1(s).await,
+            IoStream::SshChannel(s) => crate::protocol::read_msg_v1(s).await,
         }
     }
 
@@ -591,6 +600,7 @@ impl IoStream {
             IoStream::WebSocket(s) => crate::protocol::write_msg_v2(s, msg).await,
             IoStream::Yamux(s) => crate::protocol::write_msg_v2(s, msg).await,
             IoStream::Cipher(s) => crate::protocol::write_msg_v2(s, msg).await,
+            IoStream::SshChannel(s) => crate::protocol::write_msg_v2(s, msg).await,
         }
     }
 
@@ -604,6 +614,7 @@ impl IoStream {
             IoStream::WebSocket(s) => crate::protocol::read_msg_v2(s).await,
             IoStream::Yamux(s) => crate::protocol::read_msg_v2(s).await,
             IoStream::Cipher(s) => crate::protocol::read_msg_v2(s).await,
+            IoStream::SshChannel(s) => crate::protocol::read_msg_v2(s).await,
         }
     }
 
@@ -611,7 +622,7 @@ impl IoStream {
     pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         match self {
             IoStream::Tcp(s) => s.peer_addr().ok(),
-            IoStream::Tls(_) | IoStream::Kcp(_) | IoStream::Quic(_) | IoStream::WebSocket(_) | IoStream::Yamux(_) | IoStream::Cipher(_) => None,
+            IoStream::Tls(_) | IoStream::Kcp(_) | IoStream::Quic(_) | IoStream::WebSocket(_) | IoStream::Yamux(_) | IoStream::Cipher(_) | IoStream::SshChannel(_) => None,
         }
     }
 
@@ -648,6 +659,10 @@ impl IoStream {
             }
             IoStream::Cipher(stream) => {
                 let (r, w) = tokio::io::split(stream);
+                (Box::new(r), Box::new(w))
+            }
+            IoStream::SshChannel(s) => {
+                let (r, w) = tokio::io::split(s);
                 (Box::new(r), Box::new(w))
             }
         }

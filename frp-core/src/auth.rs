@@ -382,6 +382,7 @@ impl OidcClient {
     ///
     /// `tls_insecure_skip_verify`: skip TLS certificate verification (dev only).
     /// Go frp compat: insecure_skip_verify.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         client_id: String,
         client_secret: String,

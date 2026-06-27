@@ -42,6 +42,7 @@ pub struct ControlConnection {
 }
 
 impl ControlConnection {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         server_addr: String,
         server_port: u16,

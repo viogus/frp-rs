@@ -311,6 +311,11 @@ pub(crate) async fn assign_work_to_proxy(
                     warn!("Cipher stream unexpected in server bridge");
                     return;
                 }
+                IoStream::SshChannel(work) => {
+                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (w_r, w_w) = tokio::io::split(work);
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
+                }
             }
         } else {
             // Write VHost pre-read bytes to work connection first (plain).

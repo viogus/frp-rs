@@ -13,6 +13,7 @@ use crate::proxy::{ProxyInfo, allocate_port_multi};
 use crate::service::{AppState, InternalMsg};
 
 /// Register a new proxy and start listening on its assigned port.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_new_proxy(
     np: msg::NewProxy,
     run_id: &str,
@@ -154,7 +155,6 @@ pub(crate) async fn handle_new_proxy(
                 // Always register HTTP proxies with VHost manager.
                 // If both domains and locations are empty, register with empty
                 // strings as catch-all routes (matches any host/path).
-                let mut domains = domains;
                 let mut locations = locations;
                 if domains.is_empty() && locations.is_empty() {
                     domains.push(String::new());   // catch-all domain
