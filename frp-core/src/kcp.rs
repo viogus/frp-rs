@@ -39,24 +39,35 @@ impl Default for KcpConfig {
 
 /// A writer that sends data to a UDP socket via `try_send_to`.
 /// Implements `std::io::Write` so it can be used as the `Kcp` output.
+///
+/// IMPORTANT: the kcp crate's internal `Kcp::flush()` calls `output.write_all()`
+/// but NOT `output.flush()`. Therefore `write()` must send immediately — the
+/// `flush()` method is only called by the user-facing `Write::flush()` on `Kcp`.
 struct UdpOutput {
     socket: Arc<UdpSocket>,
     peer: SocketAddr,
-    buf: Vec<u8>,
 }
 
 impl Write for UdpOutput {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.buf.extend_from_slice(data);
-        Ok(data.len())
+        // Send immediately — kcp crate never calls flush() on the output
+        match self.socket.try_send_to(data, self.peer) {
+            Ok(_) => Ok(data.len()),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // UDP send buffer full — return Ok to avoid breaking KCP,
+                // the packet will be retransmitted by KCP later.
+                tracing::warn!("KCP UDP send would block ({} bytes)", data.len());
+                Ok(data.len())
+            }
+            Err(e) => {
+                tracing::warn!("KCP UDP send error: {}", e);
+                Ok(data.len()) // KCP handles loss; don't break the state machine
+            }
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if !self.buf.is_empty() {
-            // Best-effort send — KCP will retransmit if needed
-            let _ = self.socket.try_send_to(&self.buf, self.peer);
-            self.buf.clear();
-        }
+        // Data is already sent in write(); nothing to flush.
         Ok(())
     }
 }
@@ -69,6 +80,9 @@ impl Write for UdpOutput {
 pub struct KcpStream {
     read_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Channel for the accept() loop or client reader to feed raw UDP packets
+    /// into the driver's KCP input. Public so KcpListener can store it.
+    pub(crate) udp_tx: mpsc::UnboundedSender<Vec<u8>>,
     read_buf: Vec<u8>,
     read_pos: usize,
     /// Remote peer address
@@ -82,18 +96,21 @@ impl KcpStream {
         socket: Arc<UdpSocket>,
         peer_addr: SocketAddr,
         config: KcpConfig,
+        initial_data: Option<Vec<u8>>,
     ) -> Self {
         let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (read_tx, read_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (udp_tx, udp_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
         let sock = socket.clone();
         let driver = tokio::spawn(async move {
-            run_kcp_driver(conv, sock, peer_addr, config, read_tx, write_rx).await;
+            run_kcp_driver(conv, sock, peer_addr, config, read_tx, write_rx, udp_rx, initial_data).await;
         });
 
         Self {
             read_rx,
             write_tx,
+            udp_tx,
             read_buf: Vec::new(),
             read_pos: 0,
             peer_addr,
@@ -120,8 +137,10 @@ async fn run_kcp_driver(
     config: KcpConfig,
     read_tx: mpsc::UnboundedSender<Vec<u8>>,
     mut write_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut udp_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    initial_data: Option<Vec<u8>>,
 ) {
-    let output = UdpOutput { socket: socket.clone(), peer: peer_addr, buf: Vec::new() };
+    let output = UdpOutput { socket: socket.clone(), peer: peer_addr };
     let mut kcp = kcp::Kcp::new(conv, output);
 
     kcp.set_nodelay(config.nodelay, config.interval, config.resend, config.nc);
@@ -129,8 +148,23 @@ async fn run_kcp_driver(
     let _ = kcp.set_mtu(1350);
 
     let mut recv_buf = vec![0u8; 65536];
-    let mut udp_buf = vec![0u8; 65536];
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(config.interval as u64));
+
+    // Feed initial data into KCP (first packet received by accept() before
+    // the driver was spawned — otherwise it would be lost).
+    if let Some(data) = initial_data {
+        if kcp.input(&data).is_err() {
+            return;
+        }
+        loop {
+            match kcp.recv(&mut recv_buf) {
+                Ok(n) if n > 0 => { let _ = read_tx.send(recv_buf[..n].to_vec()); }
+                _ => break,
+            }
+        }
+        let now = kcp_now_ms();
+        let _ = kcp.update(now);
+    }
 
     loop {
         tokio::select! {
@@ -155,14 +189,12 @@ async fn run_kcp_driver(
                 }
             }
 
-            // Incoming data from UDP network
-            result = socket.recv_from(&mut udp_buf) => {
-                match result {
-                    Ok((n, src)) => {
-                        if src != peer_addr {
-                            continue;
-                        }
-                        if kcp.input(&udp_buf[..n]).is_err() {
+            // Incoming UDP data — forwarded from accept() loop (server) or
+            // from the client-side UDP reader task.
+            maybe_udp = udp_rx.recv() => {
+                match maybe_udp {
+                    Some(data) => {
+                        if kcp.input(&data).is_err() {
                             break;
                         }
                         // Drain reassembled data
@@ -177,7 +209,7 @@ async fn run_kcp_driver(
                         let now = kcp_now_ms();
                         let _ = kcp.update(now);
                     }
-                    Err(_) => break,
+                    None => break,
                 }
             }
         }
@@ -234,9 +266,12 @@ impl KcpListener {
                 }
             }
 
-            // New session: create KCP stream, register for future packets
-            let stream = KcpStream::new(conv, self.socket.clone(), src, self.config.clone());
-            self.active.lock().unwrap().insert(key, stream.write_tx.clone());
+            // New session: create KCP stream, register for future packets.
+            // Pass the initial packet so the driver can feed it into KCP input.
+            let initial = buf[..n].to_vec();
+            let stream = KcpStream::new(conv, self.socket.clone(), src, self.config.clone(), Some(initial));
+            // Store udp_tx so subsequent packets for this session are routed to the driver.
+            self.active.lock().unwrap().insert(key, stream.udp_tx.clone());
             return Ok(stream);
         }
     }
@@ -256,18 +291,32 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
     // Generate a random conversation ID for this session
     let conv: u32 = rand::random();
 
-    // Create the stream — it spawns the driver task
-    let stream = KcpStream::new(conv, socket.clone(), remote, config);
+    // Create the stream — it spawns the driver task.
+    // No initial_data; the client driver reads UDP via the reader task below.
+    let stream = KcpStream::new(conv, socket.clone(), remote, config, None);
 
-    // Send an initial empty KCP packet to establish the session
-    let output = UdpOutput { socket: socket.clone(), peer: remote, buf: Vec::new() };
-    let mut kcp = kcp::Kcp::new(conv, output);
-    kcp.set_nodelay(false, 100, 2, true);
-    kcp.set_wndsize(1024, 1024);
-    let _ = kcp.set_mtu(1350);
-    let _ = kcp.send(b"");
-    // update() calls output.flush() internally, sending the initial packet
-    let _ = kcp.update(kcp_now_ms());
+    // Spawn a background task that reads UDP packets from the socket
+    // and forwards them to the driver via udp_tx.
+    let udp_tx = stream.udp_tx.clone();
+    let sock = socket.clone();
+    let peer = remote;
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match sock.recv_from(&mut buf).await {
+                Ok((n, src)) if src == peer => {
+                    let _ = udp_tx.send(buf[..n].to_vec());
+                }
+                Ok(_) => continue, // wrong peer
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Don't send a separate initial empty packet — the driver handles
+    // all KCP output. The first write to the stream (Login message)
+    // produces the first KCP packet, which the server's accept() uses
+    // to establish the session.
 
     Ok(stream)
 }

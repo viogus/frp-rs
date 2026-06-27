@@ -98,14 +98,11 @@ impl QuicListener {
 
 /// Dial a QUIC connection to a remote peer.
 /// Opens a single bidirectional stream.
-pub async fn dial_quic(addr: &str, server_name: &str) -> io::Result<QuicStream> {
+pub async fn dial_quic(addr: &str, server_name: &str, ca_file: Option<&str>) -> io::Result<QuicStream> {
     let remote: SocketAddr = addr.parse().map_err(io::Error::other)?;
 
-    // Use webpki roots for server certificate verification,
-    // matching the TLS connector behaviour in frp-core.
-    let roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
+    let roots = crate::transport::build_root_store(ca_file)
+        .map_err(|e| io::Error::other(format!("QUIC TLS roots: {e}")))?;
     let mut tls_config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
