@@ -358,6 +358,7 @@ pub async fn handle_control<S>(
                             proxy_name,
                             transaction_id,
                             visitor_addr,
+                            ..Default::default()
                         });
                         if let Err(e) = write_ctl_msg(&mut writer, &nhc, v2).await {
                             warn!("Failed to send NatHoleClient: {}", e);
@@ -383,6 +384,7 @@ pub async fn handle_control<S>(
                             protocol,
                             candidate_addrs,
                             assisted_addrs,
+                            ..Default::default()
                         });
                         if let Err(e) = write_ctl_msg(&mut writer, &forward, v2).await {
                             warn!("Failed to write NatHoleResp to visitor: {}", e);
@@ -594,6 +596,7 @@ pub async fn handle_control<S>(
                                 protocol: resp_msg.protocol.clone(),
                                 candidate_addrs: resp_msg.candidate_addrs.clone(),
                                 assisted_addrs: resp_msg.assisted_addrs.clone(),
+                                ..Default::default()
                             });
                             let _ = write_ctl_msg(&mut writer, &forward, v2).await;
                             state.nat_hole.return_writer(tid, writer).await;
@@ -730,6 +733,7 @@ pub async fn handle_control<S>(
                             protocol: nhv.protocol.clone(),
                             candidate_addrs: nhv.mapped_addrs.clone(),
                             assisted_addrs: nhv.assisted_addrs.clone(),
+                            ..Default::default()
                         });
                         let _ = write_ctl_msg(&mut writer, &resp, v2).await;
 

@@ -1256,6 +1256,7 @@ async fn handle_nat_hole_visitor(
         protocol: msg.protocol.clone(),
         candidate_addrs: msg.mapped_addrs.clone(),
         assisted_addrs: msg.assisted_addrs.clone(),
+        ..Default::default()
     });
     let _ = write_msg_v1(&mut writer, &resp).await;
 

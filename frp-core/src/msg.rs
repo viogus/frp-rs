@@ -328,8 +328,57 @@ pub struct NatHoleVisitor {
 pub struct NatHoleClient {
     pub transaction_id: String,
     pub proxy_name: String,
+    /// NAT hole session ID (Go frp v0.69.1 compat: sid).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+    /// NAT traversal protocol: "quic" or "tcp" (Go frp v0.69.1 compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// Provider/visitor addresses discovered via STUN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapped_addrs: Option<Vec<String>>,
+    /// Assisted addresses (UPnP, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assisted_addrs: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visitor_addr: Option<String>,
+}
+
+/// Port range for NAT hole punch candidate selection.
+/// Go frp v0.69.1 compat.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PortsRange {
+    pub from: i32,
+    pub to: i32,
+}
+
+/// Server-recommended hole-punch behavior for a peer.
+/// Go frp v0.69.1 compat: DetectBehavior in NatHoleResp.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NatHoleDetectBehavior {
+    /// Behavior mode (0-4). Determines role assignment.
+    pub mode: i32,
+    /// Role: "sender" or "receiver".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// TTL for hole-punch packets.
+    #[serde(default)]
+    pub ttl: i32,
+    /// Delay before sending (ms).
+    #[serde(default)]
+    pub send_delay_ms: i32,
+    /// Read timeout (ms).
+    #[serde(default)]
+    pub read_timeout_ms: i32,
+    /// Number of random ports to send from.
+    #[serde(default)]
+    pub send_random_ports: i32,
+    /// Number of random ports to listen on.
+    #[serde(default)]
+    pub listen_random_ports: i32,
+    /// Candidate port ranges derived from address analysis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_ports: Option<Vec<PortsRange>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -343,11 +392,14 @@ pub struct NatHoleResp {
     /// NAT traversal protocol: "quic" or "tcp" (Go frp v0.69.1 compat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
-    /// Provider-side addresses for NAT hole punch (Go frp v0.69.1 compat).
+    /// Candidate addresses for NAT hole punch (the OTHER side's STUN addresses).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_addrs: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assisted_addrs: Option<Vec<String>>,
+    /// Server-recommended hole-punch behavior (Go frp v0.69.1 compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detect_behavior: Option<NatHoleDetectBehavior>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
