@@ -95,6 +95,10 @@ pub struct ServerConfig {
     /// Go frp compat: includes.
     #[serde(default)]
     pub includes: Vec<String>,
+    /// SSH tunnel gateway configuration.
+    /// When bind_port > 0, an SSH server listens for `ssh -R` reverse tunnels.
+    #[serde(default)]
+    pub ssh_tunnel_gateway: SshTunnelGatewayConfig,
 }
 
 fn default_allow_port_start() -> u16 { 10000 }
@@ -203,6 +207,7 @@ impl Default for ServerConfig {
             http_plugins: Vec::new(),
             feature: FeatureConfig::default(),
             includes: Vec::new(),
+            ssh_tunnel_gateway: SshTunnelGatewayConfig::default(),
         }
     }
 }
@@ -210,6 +215,50 @@ impl Default for ServerConfig {
 fn default_bind_addr() -> String { "0.0.0.0".into() }
 fn default_bind_port() -> u16 { 7000 }
 fn default_fallback_timeout_ms() -> u64 { 5000 }
+
+// ---------------------------------------------------------------
+// SSH Tunnel Gateway Configuration
+// ---------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshTunnelGatewayConfig {
+    /// SSH listen port. 0 = disabled (default).
+    #[serde(default)]
+    pub bind_port: u16,
+
+    /// SSH listen address. Default: "0.0.0.0".
+    #[serde(default = "default_bind_addr")]
+    pub bind_addr: String,
+
+    /// Path to SSH host private key file. Auto-generated if empty and
+    /// auto_gen_private_key_path does not exist.
+    #[serde(default)]
+    pub private_key_file: String,
+
+    /// Path where auto-generated SSH host key is written.
+    /// Default: "./.autogen_ssh_key".
+    #[serde(default = "default_autogen_ssh_key_path")]
+    pub auto_gen_private_key_path: String,
+
+    /// Path to SSH authorized_keys for optional public key auth.
+    /// Empty = password auth only.
+    #[serde(default)]
+    pub authorized_keys_file: String,
+}
+
+fn default_autogen_ssh_key_path() -> String { "./.autogen_ssh_key".into() }
+
+impl Default for SshTunnelGatewayConfig {
+    fn default() -> Self {
+        Self {
+            bind_port: 0,
+            bind_addr: default_bind_addr(),
+            private_key_file: String::new(),
+            auto_gen_private_key_path: default_autogen_ssh_key_path(),
+            authorized_keys_file: String::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthServerConfig {
