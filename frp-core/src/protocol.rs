@@ -80,6 +80,107 @@ pub async fn write_msg_v1<W: AsyncWriteExt + Unpin>(
     write_v1_frame(writer, msg).await
 }
 
+/// Deserialize a V2 message from its type ID and JSON payload bytes.
+/// V2 uses numeric type IDs (u16) instead of V1's ASCII type bytes.
+pub fn deserialize_v2(type_id: u16, json_bytes: &[u8]) -> Result<FrpMessage, crate::Error> {
+    let msg = match type_id {
+        msg::V2_TYPE_LOGIN => {
+            let v: msg::Login = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize Login (v2): {e}")))?;
+            FrpMessage::Login(v)
+        }
+        msg::V2_TYPE_LOGIN_RESP => {
+            let v: msg::LoginResp = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize LoginResp (v2): {e}")))?;
+            FrpMessage::LoginResp(v)
+        }
+        msg::V2_TYPE_NEW_PROXY => {
+            let v: msg::NewProxy = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewProxy (v2): {e}")))?;
+            FrpMessage::NewProxy(v)
+        }
+        msg::V2_TYPE_NEW_PROXY_RESP => {
+            let v: msg::NewProxyResp = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewProxyResp (v2): {e}")))?;
+            FrpMessage::NewProxyResp(v)
+        }
+        msg::V2_TYPE_CLOSE_PROXY => {
+            let v: msg::CloseProxy = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize CloseProxy (v2): {e}")))?;
+            FrpMessage::CloseProxy(v)
+        }
+        msg::V2_TYPE_NEW_WORK_CONN => {
+            let v: msg::NewWorkConn = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewWorkConn (v2): {e}")))?;
+            FrpMessage::NewWorkConn(v)
+        }
+        msg::V2_TYPE_REQ_WORK_CONN => {
+            let v: msg::ReqWorkConn = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize ReqWorkConn (v2): {e}")))?;
+            FrpMessage::ReqWorkConn(v)
+        }
+        msg::V2_TYPE_START_WORK_CONN => {
+            let v: msg::StartWorkConn = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize StartWorkConn (v2): {e}")))?;
+            FrpMessage::StartWorkConn(v)
+        }
+        msg::V2_TYPE_NEW_VISITOR_CONN => {
+            let v: msg::NewVisitorConn = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConn (v2): {e}")))?;
+            FrpMessage::NewVisitorConn(v)
+        }
+        msg::V2_TYPE_NEW_VISITOR_CONN_RESP => {
+            let v: msg::NewVisitorConnResp = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConnResp (v2): {e}")))?;
+            FrpMessage::NewVisitorConnResp(v)
+        }
+        msg::V2_TYPE_PING => {
+            let v: msg::Ping = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize Ping (v2): {e}")))?;
+            FrpMessage::Ping(v)
+        }
+        msg::V2_TYPE_PONG => {
+            let v: msg::Pong = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize Pong (v2): {e}")))?;
+            FrpMessage::Pong(v)
+        }
+        msg::V2_TYPE_UDP_PACKET => {
+            let v: msg::UDPPacket = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize UDPPacket (v2): {e}")))?;
+            FrpMessage::UDPPacket(v)
+        }
+        msg::V2_TYPE_NAT_HOLE_VISITOR => {
+            let v: msg::NatHoleVisitor = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleVisitor (v2): {e}")))?;
+            FrpMessage::NatHoleVisitor(v)
+        }
+        msg::V2_TYPE_NAT_HOLE_CLIENT => {
+            let v: msg::NatHoleClient = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleClient (v2): {e}")))?;
+            FrpMessage::NatHoleClient(v)
+        }
+        msg::V2_TYPE_NAT_HOLE_RESP => {
+            let v: msg::NatHoleResp = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleResp (v2): {e}")))?;
+            FrpMessage::NatHoleResp(v)
+        }
+        msg::V2_TYPE_NAT_HOLE_SID => {
+            let v: msg::NatHoleSid = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleSid (v2): {e}")))?;
+            FrpMessage::NatHoleSid(v)
+        }
+        msg::V2_TYPE_NAT_HOLE_REPORT => {
+            let v: msg::NatHoleReport = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleReport (v2): {e}")))?;
+            FrpMessage::NatHoleReport(v)
+        }
+        _ => return Err(crate::Error::Protocol(format!(
+            "unknown V2 message type ID: {type_id}"
+        ))),
+    };
+    Ok(msg)
+}
+
 fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate::Error> {
     let msg = match type_byte {
         msg::TYPE_LOGIN => {
@@ -195,6 +296,15 @@ pub const V2_MAGIC_BYTES: [u8; 7] = [0x46, 0x52, 0x50, 0x00, 0x02, 0x0D, 0x0A];
 pub const V2_FRAME_TYPE_MESSAGE: u16 = 16;
 pub const V2_MAX_FRAME_PAYLOAD: u32 = 64 * 1024;
 
+/// V2 frame header size (Go wire.Conn format): type(2) + flags(2) + length(4) = 8 bytes.
+/// Does NOT include magic bytes — magic is only at connection start.
+pub const V2_FRAME_HEADER_LEN: usize = 8;
+
+/// V2 frame type constants (matching Go frp pkg/proto/wire/wire.go).
+pub const V2_FRAME_TYPE_CLIENT_HELLO: u16 = 1;
+pub const V2_FRAME_TYPE_SERVER_HELLO: u16 = 2;
+// V2_FRAME_TYPE_MESSAGE = 16 already exists above.
+
 pub async fn detect_v2_magic<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> Result<bool, crate::Error> {
@@ -215,48 +325,75 @@ pub async fn write_v2_magic<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// V2 frame header size: magic(7) + frame_type(2 BE) + payload_length(4 BE) = 13 bytes.
-pub const V2_HEADER_LEN: usize = 13;
+/// Read and verify V2 magic bytes from a stream.
+/// Returns an error if the magic doesn't match.
+/// Used on yamux streams where Go frp writes magic after yamux wrap.
+pub async fn read_v2_magic<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> Result<(), crate::Error> {
+    let mut buf = [0u8; V2_MAGIC_LEN];
+    reader.read_exact(&mut buf).await
+        .map_err(|e| crate::Error::Protocol(format!("read V2 magic: {e}")))?;
+    if buf != V2_MAGIC_BYTES {
+        return Err(crate::Error::Protocol(format!(
+            "unexpected V2 magic: expected {:02x?}, got {:02x?}",
+            V2_MAGIC_BYTES.as_slice(), buf.as_slice()
+        )));
+    }
+    Ok(())
+}
 
-/// Write a V2 frame: magic bytes + frame type (u16 BE) + payload length (u32 BE) + payload.
-pub async fn write_v2_frame<W: AsyncWriteExt + Unpin>(
+/// Write a raw V2 frame: type(2 BE) + flags(2 BE) + length(4 BE) + payload.
+/// This is the Go wire.Conn.WriteFrame format — magic is NOT repeated per frame.
+pub async fn write_v2_frame_raw<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     frame_type: u16,
+    flags: u16,
     payload: &[u8],
 ) -> Result<(), crate::Error> {
     if payload.len() > V2_MAX_FRAME_PAYLOAD as usize {
         return Err(crate::Error::Protocol(format!(
-            "V2 payload too large: {} > {}", payload.len(), V2_MAX_FRAME_PAYLOAD
+            "V2 payload too large: {} > {}",
+            payload.len(),
+            V2_MAX_FRAME_PAYLOAD
         )));
     }
-    let mut buf = Vec::with_capacity(V2_HEADER_LEN + payload.len());
-    buf.extend_from_slice(&V2_MAGIC_BYTES);
-    buf.extend_from_slice(&frame_type.to_be_bytes());
-    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    buf.extend_from_slice(payload);
-    writer.write_all(&buf).await
+    let mut header = [0u8; V2_FRAME_HEADER_LEN];
+    header[0..2].copy_from_slice(&frame_type.to_be_bytes());
+    header[2..4].copy_from_slice(&flags.to_be_bytes());
+    header[4..8].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+
+    tracing::trace!("write V2 frame: type={}, flags={}, len={}", frame_type, flags, payload.len());
+
+    let mut out = Vec::with_capacity(V2_FRAME_HEADER_LEN + payload.len());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(payload);
+    writer.write_all(&out).await
         .map_err(|e| crate::Error::Protocol(format!("write V2 frame: {e}")))?;
     Ok(())
 }
 
-/// Read a V2 frame header + payload. Returns (frame_type, payload_bytes).
-pub async fn read_v2_frame<R: AsyncReadExt + Unpin>(
+/// Read a raw V2 frame. Returns (frame_type, flags, payload).
+/// This is the Go wire.Conn.ReadFrame format.
+pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
     reader: &mut R,
-) -> Result<(u16, Vec<u8>), crate::Error> {
-    let mut header = [0u8; V2_HEADER_LEN];
+) -> Result<(u16, u16, Vec<u8>), crate::Error> {
+    let mut header = [0u8; V2_FRAME_HEADER_LEN];
     reader.read_exact(&mut header).await
-        .map_err(|e| crate::Error::Protocol(format!("read V2 header: {e}")))?;
+        .map_err(|e| crate::Error::Protocol(format!("read V2 frame: {e}")))?;
 
-    if header[..7] != V2_MAGIC_BYTES {
-        return Err(crate::Error::Protocol("invalid V2 magic".into()));
+    let frame_type = u16::from_be_bytes([header[0], header[1]]);
+    let flags = u16::from_be_bytes([header[2], header[3]]);
+    let payload_len = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+
+    tracing::debug!("read V2 frame: type={}, flags={}, len={}", frame_type, flags, payload_len);
+
+    if flags != 0 {
+        tracing::trace!("V2 frame with non-zero flags: {flags}");
     }
-
-    let frame_type = u16::from_be_bytes([header[7], header[8]]);
-    let payload_len = u32::from_be_bytes([header[9], header[10], header[11], header[12]]) as usize;
-
     if payload_len > V2_MAX_FRAME_PAYLOAD as usize {
         return Err(crate::Error::Protocol(format!(
-            "V2 payload too large: {payload_len}"
+            "V2 frame payload too large: {payload_len}"
         )));
     }
 
@@ -264,34 +401,45 @@ pub async fn read_v2_frame<R: AsyncReadExt + Unpin>(
     reader.read_exact(&mut payload).await
         .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}")))?;
 
-    Ok((frame_type, payload))
+    Ok((frame_type, flags, payload))
 }
 
-/// Write a FrpMessage using V2 framing with JSON serialization.
-/// V2 uses the same JSON payload as V1 but with proper binary framing
-/// (magic bytes, 2-byte type, 4-byte length) instead of V1's 1-byte type + 8-byte length.
-/// The frame_type is the V1 type byte (cast to u16) for correct deserialization dispatch.
+/// Write a FrpMessage using Go-compatible V2 framing.
+/// Frame: type=16(Message) flags=0, payload = type_id(2 BE) + JSON.
 pub async fn write_msg_v2<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg: &FrpMessage,
 ) -> Result<(), crate::Error> {
-    let payload = serde_json::to_vec(msg)
+    let type_id = msg.v2_type_id();
+    let json_bytes = serde_json::to_vec(msg)
         .map_err(|e| crate::Error::Protocol(format!("V2 JSON serialize: {e}")))?;
-    write_v2_frame(writer, msg.v1_type_byte() as u16, &payload).await
+
+    let mut payload = Vec::with_capacity(2 + json_bytes.len());
+    payload.extend_from_slice(&type_id.to_be_bytes());
+    payload.extend_from_slice(&json_bytes);
+
+    write_v2_frame_raw(writer, V2_FRAME_TYPE_MESSAGE, 0, &payload).await?;
+    writer.flush().await.map_err(|e| crate::Error::Protocol(format!("flush after write_msg_v2: {e}")))?;
+    Ok(())
 }
 
-/// Read a FrpMessage using V2 framing with JSON deserialization.
-/// Uses the frame_type (V1 type byte) for correct variant dispatch.
+/// Read a FrpMessage using Go-compatible V2 framing.
+/// Expects frame type=16, extracts 2-byte type ID from payload prefix.
 pub async fn read_msg_v2<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> Result<FrpMessage, crate::Error> {
-    let (frame_type, payload) = read_v2_frame(reader).await?;
-    if frame_type > u8::MAX as u16 {
+    let (frame_type, _flags, payload) = read_v2_frame_raw(reader).await?;
+    if frame_type != V2_FRAME_TYPE_MESSAGE {
         return Err(crate::Error::Protocol(format!(
-            "unknown V2 frame type: {frame_type}"
+            "unexpected V2 frame type: {frame_type}, expected {} (Message)",
+            V2_FRAME_TYPE_MESSAGE
         )));
     }
-    deserialize_v1(frame_type as u8, &payload)
+    if payload.len() < 2 {
+        return Err(crate::Error::Protocol("V2 message payload too short".into()));
+    }
+    let type_id = u16::from_be_bytes([payload[0], payload[1]]);
+    deserialize_v2(type_id, &payload[2..])
 }
 
 /// Protocol-aware message read: dispatches to V1 or V2 framing based on the `v2` flag.
@@ -436,9 +584,10 @@ mod tests {
     async fn test_v2_frame_read_write() {
         let (mut client, mut server) = duplex(65536);
         let payload = b"hello v2 world";
-        write_v2_frame(&mut client, 16, payload).await.expect("write V2 frame");
-        let (ft, data) = read_v2_frame(&mut server).await.expect("read V2 frame");
+        write_v2_frame_raw(&mut client, 16, 0, payload).await.expect("write V2 frame");
+        let (ft, flags, data) = read_v2_frame_raw(&mut server).await.expect("read V2 frame");
         assert_eq!(ft, 16);
+        assert_eq!(flags, 0);
         assert_eq!(data, payload);
     }
 
@@ -481,9 +630,9 @@ mod tests {
             FrpMessage::Ping(msg::Ping { privilege_key: None, timestamp: Some(42) }),
             FrpMessage::Pong(msg::Pong { error: None }),
             FrpMessage::CloseProxy(msg::CloseProxy { proxy_name: "test".into() }),
-            FrpMessage::CloseProxyResp(msg::CloseProxyResp { proxy_name: "test".into() }),
             FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
-            FrpMessage::Error(msg::Error { error: "err".into() }),
+            // Note: CloseProxyResp and Error are V1-only (v2_type_id() == 0),
+            // so they are excluded from this V2 roundtrip test.
         ];
 
         for msg in &messages {
@@ -495,18 +644,190 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_v2_frame_rejects_bad_magic() {
+    async fn test_v2_msg_rejects_non_message_frame_type() {
+        // Go-compatible V2: read_msg_v2 expects frame_type == 16 (Message).
+        // Write a frame with frame_type=1 (ClientHello) — should be rejected.
         let (mut client, mut server) = duplex(256);
-        client.write_all(b"BADMAGIC!!!!!").await.expect("write bad magic");
-        let result = read_v2_frame(&mut server).await;
-        assert!(result.is_err(), "should reject bad magic");
+        write_v2_frame_raw(&mut client, 1, 0, b"hello").await.expect("write frame");
+        let result = read_msg_v2(&mut server).await;
+        assert!(result.is_err(), "should reject non-Message frame type");
     }
 
     #[tokio::test]
     async fn test_v2_frame_rejects_oversized() {
         let oversized = vec![0u8; (V2_MAX_FRAME_PAYLOAD + 1) as usize];
         let mut buf = Vec::new();
-        let result = write_v2_frame(&mut buf, 16, &oversized).await;
+        let result = write_v2_frame_raw(&mut buf, 16, 0, &oversized).await;
         assert!(result.is_err(), "should reject oversized payload");
+    }
+
+    #[tokio::test]
+    async fn test_v2_frame_raw_accepts_nonzero_flags() {
+        let (mut client, mut server) = duplex(65536);
+        // Write frame with flags=1 (Go frp compat: non-zero flags are accepted)
+        let mut header = [0u8; 8];
+        header[0..2].copy_from_slice(&V2_FRAME_TYPE_MESSAGE.to_be_bytes());
+        header[2..4].copy_from_slice(&1u16.to_be_bytes()); // flags=1
+        header[4..8].copy_from_slice(&4u32.to_be_bytes()); // len=4
+        client.write_all(&header).await.unwrap();
+        client.write_all(b"data").await.unwrap();
+        drop(client);
+
+        let result = read_v2_frame_raw(&mut server).await;
+        assert!(result.is_ok(), "non-zero flags should be accepted (Go frp compat)");
+        let (_, flags, payload) = result.unwrap();
+        assert_eq!(flags, 1);
+        assert_eq!(payload, b"data");
+    }
+
+    #[tokio::test]
+    async fn test_v2_frame_raw_oversized_payload() {
+        let mut buf = Vec::new();
+        let oversized = vec![0u8; (V2_MAX_FRAME_PAYLOAD + 1) as usize];
+        let result = write_v2_frame_raw(&mut buf, V2_FRAME_TYPE_MESSAGE, 0, &oversized).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn test_v2_msg_18_types_roundtrip() {
+        // Test all 18 V2 message types survive encode -> decode roundtrip.
+        // Skip CloseProxyResp and Error (V1-only, v2_type_id returns 0).
+        // Construct each message with minimal valid fields (no Default on most).
+        fn test_addr() -> msg::UdpAddr {
+            msg::UdpAddr { ip: "0.0.0.0".into(), port: 0, zone: String::new() }
+        }
+
+        let messages: Vec<FrpMessage> = vec![
+            FrpMessage::Login(msg::Login {
+                version: Some("1.0".into()), hostname: Some("h".into()),
+                os: None, arch: None, user: None, run_id: None, client_id: None,
+                pool_count: None, timestamp: None, privilege_key: None,
+                metas: None, client_spec: None, multiplexer: None,
+            }),
+            FrpMessage::LoginResp(msg::LoginResp {
+                version: None, run_id: None, error: None,
+                server_additional_auth_scopes: None,
+            }),
+            FrpMessage::NewProxy(msg::NewProxy {
+                proxy_name: "p".into(), proxy_type: "tcp".into(),
+                use_encryption: None, use_compression: None, group: None,
+                group_key: None, local_str: None, remote_port: None, sk: None,
+                custom_domains: None, subdomain: None, locations: None,
+                http_user: None, http_pwd: None, host_header_rewrite: None,
+                headers: None, response_headers: None, route_by_http_user: None,
+                allow_users: None, bandwidth_limit: None, bandwidth_limit_mode: None,
+                annotations: None, metas: None, multiplexer: None, virtual_net: None,
+                proxy_protocol_version: None,
+            }),
+            FrpMessage::NewProxyResp(msg::NewProxyResp {
+                proxy_name: "p".into(), remote_addr: None, error: None,
+            }),
+            FrpMessage::CloseProxy(msg::CloseProxy { proxy_name: "p".into() }),
+            FrpMessage::NewWorkConn(msg::NewWorkConn {
+                run_id: None, timestamp: None, privilege_key: None,
+            }),
+            FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
+            FrpMessage::StartWorkConn(msg::StartWorkConn {
+                proxy_name: "p".into(), src_addr: None, src_port: None,
+                dst_addr: None, dst_port: None, error: None,
+            }),
+            FrpMessage::NewVisitorConn(msg::NewVisitorConn {
+                proxy_name: "p".into(), sign_key: None, timestamp: None,
+                run_id: None, use_encryption: None, use_compression: None,
+            }),
+            FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
+                proxy_name: "p".into(), error: None,
+            }),
+            FrpMessage::Ping(msg::Ping { privilege_key: None, timestamp: Some(42) }),
+            FrpMessage::Pong(msg::Pong { error: None }),
+            FrpMessage::UDPPacket(msg::UDPPacket {
+                content: b"hello".to_vec(),
+                local_addr: Some(test_addr()),
+                remote_addr: Some(test_addr()),
+            }),
+            FrpMessage::NatHoleVisitor(msg::NatHoleVisitor::default()),
+            FrpMessage::NatHoleClient(msg::NatHoleClient::default()),
+            FrpMessage::NatHoleResp(msg::NatHoleResp::default()),
+            FrpMessage::NatHoleSid(msg::NatHoleSid { sid: None, provider_addr: None }),
+            FrpMessage::NatHoleReport(msg::NatHoleReport { sid: None }),
+        ];
+
+        for msg in &messages {
+            let (mut client, mut server) = duplex(65536);
+            write_msg_v2(&mut client, msg).await.expect("write v2");
+            let back = read_msg_v2(&mut server).await.expect("read v2");
+            assert_eq!(back.v2_type_id(), msg.v2_type_id(),
+                "roundtrip type mismatch for {:?}", msg.v2_type_id());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v2_msg_unknown_type_id() {
+        let (mut client, mut server) = duplex(65536);
+        // Write frame type=Message with type_id=99 and empty JSON payload
+        let mut payload = vec![0u8; 2];
+        payload[0..2].copy_from_slice(&99u16.to_be_bytes());
+        write_v2_frame_raw(&mut client, V2_FRAME_TYPE_MESSAGE, 0, &payload).await.unwrap();
+        drop(client);
+
+        let result = read_msg_v2(&mut server).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown V2 message type ID: 99"));
+    }
+
+    #[tokio::test]
+    async fn test_v2_msg_payload_too_short() {
+        let (mut client, mut server) = duplex(65536);
+        // Write frame type=Message with only 1 byte payload (need 2 for type_id)
+        write_v2_frame_raw(&mut client, V2_FRAME_TYPE_MESSAGE, 0, b"x").await.unwrap();
+        drop(client);
+
+        let result = read_msg_v2(&mut server).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too short"));
+    }
+
+    #[tokio::test]
+    async fn test_v2_msg_wrong_frame_type() {
+        let (mut client, mut server) = duplex(65536);
+        // Write frame with type=ClientHello(1) — read_msg_v2 should reject
+        write_v2_frame_raw(&mut client, V2_FRAME_TYPE_CLIENT_HELLO, 0, b"{}").await.unwrap();
+        drop(client);
+
+        let result = read_msg_v2(&mut server).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unexpected V2 frame type: 1"));
+    }
+
+    #[tokio::test]
+    async fn test_v2_msg_login_content() {
+        let (mut client, mut server) = duplex(65536);
+        let msg = FrpMessage::Login(msg::Login {
+            version: Some("0.69.1".into()),
+            hostname: Some("testhost".into()),
+            os: Some("linux".into()),
+            arch: None,
+            user: None,
+            run_id: None,
+            client_id: None,
+            pool_count: Some(3),
+            timestamp: Some(1234567890),
+            privilege_key: Some("abc123".into()),
+            metas: None,
+            client_spec: None,
+            multiplexer: Some("yamux".into()),
+        });
+        write_msg_v2(&mut client, &msg).await.expect("write");
+        let result = read_msg_v2(&mut server).await.expect("read");
+        match result {
+            FrpMessage::Login(login) => {
+                assert_eq!(login.version.as_deref(), Some("0.69.1"));
+                assert_eq!(login.hostname.as_deref(), Some("testhost"));
+                assert_eq!(login.pool_count, Some(3));
+                assert_eq!(login.multiplexer.as_deref(), Some("yamux"));
+            }
+            other => panic!("expected Login, got {:?}", other.v2_type_id()),
+        }
     }
 }

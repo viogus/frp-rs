@@ -1009,7 +1009,14 @@ fn normalize_client_config(value: &mut toml::Value) {
         // but Go frp config puts it under [transport])
         if let Some(Value::Table(tr_table)) = table.remove("transport") {
             for (k, v) in tr_table {
-                table.entry(k).or_insert(v);
+                if k == "wireProtocol" {
+                    // transport.wireProtocol = "v2" → top-level v2 = true (Go frp compat)
+                    if v.as_str() == Some("v2") {
+                        table.insert("v2".to_string(), Value::Boolean(true));
+                    }
+                } else {
+                    table.entry(k).or_insert(v);
+                }
             }
         }
 

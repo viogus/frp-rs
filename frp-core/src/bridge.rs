@@ -167,6 +167,7 @@ pub async fn bridge_plain(
     pre_read: Vec<u8>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
+    let had_pre_read = !pre_read.is_empty();
     let user_to_work = async {
         if !pre_read.is_empty()
             && work_w.write_all(&pre_read).await.is_err() {
@@ -196,7 +197,13 @@ pub async fn bridge_plain(
             if work_w.write_all(&processed).await.is_err() { break; }
             if work_w.flush().await.is_err() { break; }
         }
-        let _ = work_w.shutdown().await;
+        // When pre_read bytes were forwarded (e.g. VHost HTTP handler consumed
+        // the user's request), leave work_w open so work_to_user can receive
+        // the backend response. The frpc side will see EOF from user_w.shutdown()
+        // in work_to_user after the response is complete.
+        if !had_pre_read {
+            let _ = work_w.shutdown().await;
+        }
     };
     let work_to_user = async {
         let mut buf = vec![0u8; 65536];

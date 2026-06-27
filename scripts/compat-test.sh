@@ -3441,6 +3441,135 @@ test_r2g_quic() {
     fi
 }
 
+# =============================================================================
+# Test: Go frpc (V2 wire protocol) -> Rust frps
+# =============================================================================
+test_g2r_v2_tcp() {
+    local name="go-to-rust-v2-tcp"
+    should_run_test "$name" || return 0
+
+    # V2 tests require Go frp compiled from latest source (v0.69.1 binaries
+    # don't support V2). Set GO_FRP_V2=1 to enable these tests.
+    if [[ "${GO_FRP_V2:-0}" != "1" ]]; then
+        log "SKIP $name: set GO_FRP_V2=1 to enable (requires Go frp source build with V2)"
+        return 0
+    fi
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-v2"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    # Start Rust frps (mux required -- Go frpc V2 uses yamux)
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "mux"
+    echo 'v2 = true' >> "$TEST_DIR/$name/frps.toml"
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Start Go frpc with V2 wire protocol + tcp_mux.
+    # Go frp >= v0.50 defaults TLS=true; disable for plain TCP test.
+    write_frpc_config go "$frps_port" "$token" "$echo_port" "$proxy_port" \
+        "v2-tcp" "$TEST_DIR/$name/frpc.toml" "mux"
+    cat >> "$TEST_DIR/$name/frpc.toml" <<'GOV2'
+transport.wireProtocol = "v2"
+transport.tls.enable = false
+GOV2
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "v2-g2r-test" "v2-g2r-test" 5)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Rust frpc (V2 wire protocol) -> Go frps
+# =============================================================================
+test_r2g_v2_tcp() {
+    local name="rust-to-go-v2-tcp"
+    should_run_test "$name" || return 0
+
+    # V2 tests require Go frp compiled from latest source (v0.69.1 binaries
+    # don't support V2). Set GO_FRP_V2=1 to enable these tests.
+    if [[ "${GO_FRP_V2:-0}" != "1" ]]; then
+        log "SKIP $name: set GO_FRP_V2=1 to enable (requires Go frp source build with V2)"
+        return 0
+    fi
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-r2g-v2"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    # Start Go frps with V2 wire protocol + tcp_mux.
+    # Go frp >= v0.50 defaults TLS=true; disable for plain TCP test.
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "mux"
+    cat >> "$TEST_DIR/$name/frps.toml" <<'GOV2SRV'
+transport.wireProtocol = "v2"
+GOV2SRV
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    # Start Rust frpc with V2 + tcp_mux
+    write_frpc_config rust "$frps_port" "$token" "$echo_port" "$proxy_port" \
+        "v2-tcp" "$TEST_DIR/$name/frpc.toml" "mux"
+    echo 'v2 = true' >> "$TEST_DIR/$name/frpc.toml"
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "v2-r2g-test" "v2-r2g-test" 5)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
 # Phase 5: Multi-proxy and edge cases (continued)
 run_test test_r2g_compression
 run_test test_r2g_multi_proxy
@@ -3472,6 +3601,10 @@ run_test test_quic_rust_to_rust
 # Go frp uses quic-go (multi-stream), Rust now accepts additional streams.
 run_test test_g2r_quic
 run_test test_r2g_quic
+
+# Phase 9: V2 wire protocol
+test_g2r_v2_tcp
+test_r2g_v2_tcp
 
 # --- Summary ---
 echo ""

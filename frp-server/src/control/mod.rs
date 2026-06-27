@@ -73,6 +73,7 @@ pub async fn handle_control<S>(
     peer: Option<SocketAddr>,
     mut incoming: Option<IncomingStreams>,
     v2: bool,
+    crypto_ctx: Option<frp_core::v2_handshake::CryptoContext>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -185,12 +186,51 @@ pub async fn handle_control<S>(
         }
     }
 
-    // --- Wrap in AES-128-CFB encryption (matches client after login) ---
-    let enc_key = encryption::derive_key(&state.reloadable.read().unwrap().auth_cfg.token);
-    let cipher = frp_core::cipher_stream::CipherStream::new(Box::new(stream), enc_key);
-
-    // --- Split encrypted stream for reading/writing ---
-    let (mut reader, mut writer) = tokio::io::split(cipher);
+    // --- Wrap in encryption (matches client after login) ---
+    // V2 with AEAD crypto: wrap stream in AEAD here, AFTER LoginResp sent
+    // (matching Go frp flow: ClientHello/ServerHello + Login/LoginResp in
+    // plaintext, then AEAD for all subsequent messages).
+    // V1 or V2 without AEAD: wrap in AES-128-CFB (CipherStream) for backward compat.
+    let (mut reader, mut writer): (
+        Box<dyn AsyncRead + Unpin + Send>,
+        Box<dyn AsyncWrite + Unpin + Send>,
+    ) = if v2 && crypto_ctx.is_some() {
+        let ctx = crypto_ctx.as_ref().unwrap();
+        let token = state.reloadable.read().unwrap().auth_cfg.token.clone();
+        match frp_core::crypto::derive_aead_control_keys(
+            token.as_bytes(), ctx.algorithm, &ctx.transcript_hash,
+        ) {
+            Ok((read_key, write_key)) => {
+                // derive_aead_control_keys returns (client_to_server, server_to_client).
+                // Server reads from client → client_to_server (= read_key).
+                // Server writes to client → server_to_client (= write_key).
+                match frp_core::crypto::AeadStream::new(
+                    Box::new(stream), ctx.algorithm, &read_key, &write_key,
+                ) {
+                    Ok(aead) => {
+                        let (r, w) = tokio::io::split(aead);
+                        (Box::new(r), Box::new(w))
+                    }
+                    Err(e) => {
+                        warn!("Failed to create AEAD stream for {:?}: {}", peer, e);
+                        proxy_ops::unregister_control(&state, &run_id).await;
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to derive AEAD keys for {:?}: {}", peer, e);
+                proxy_ops::unregister_control(&state, &run_id).await;
+                return;
+            }
+        }
+    } else {
+        // V1 or plain V2: wrap in AES-128-CFB
+        let enc_key = encryption::derive_key(&state.reloadable.read().unwrap().auth_cfg.token);
+        let cipher = frp_core::cipher_stream::CipherStream::new(Box::new(stream), enc_key);
+        let (r, w) = tokio::io::split(cipher);
+        (Box::new(r), Box::new(w))
+    };
 
     // --- Per-client state ---
     let pool_cap = login.pool_count.unwrap_or(1).max(0) as usize + WORK_POOL_EXTRA;
@@ -530,7 +570,7 @@ pub async fn handle_control<S>(
                         }
                     }
                     Ok(FrpMessage::NewProxy(np)) => {
-                        proxy_ops::handle_new_proxy(np, &run_id, &state, &mut writer, &internal_tx, &mut listener_handles, &mut udp_sockets, &mut udp_local_to_proxy).await;
+                        proxy_ops::handle_new_proxy(np, &run_id, &state, &mut writer, &internal_tx, &mut listener_handles, &mut udp_sockets, &mut udp_local_to_proxy, v2).await;
                     }
                     Ok(FrpMessage::CloseProxy(cp)) => {
                         if let Some(info) = state.proxy_manager.get(&cp.proxy_name).await {

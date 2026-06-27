@@ -996,6 +996,7 @@ impl SshListener {
                         Some(peer_addr),
                         None,  // no incoming streams (not mux)
                         false, // V1 protocol
+                        None,  // no crypto context (V1)
                     ).await;
                 });
 

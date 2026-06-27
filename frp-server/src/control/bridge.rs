@@ -1,7 +1,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, ReadBuf};
 use tracing::{debug, info, warn};
 
 use frp_core::metrics::ConnGuard;
@@ -311,34 +311,31 @@ pub(crate) async fn assign_work_to_proxy(
                     warn!("Cipher stream unexpected in server bridge");
                     return;
                 }
+                IoStream::Aead(_) => {
+                    warn!("Aead stream unexpected in server bridge");
+                    return;
+                }
                 IoStream::SshChannel(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
                 }
+                IoStream::PreRead(_, work) => {
+                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (w_r, w_w) = tokio::io::split(work);
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
+                }
+                IoStream::BufferedRead(_, _, inner) => {
+                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (w_r, w_w) = inner.into_split();
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
+                }
             }
         } else {
-            // Write VHost pre-read bytes to work connection first (plain).
-            // When pre_read was already written above, pass empty to bridge_plain
-            // so the bytes are not sent twice.
-            let bridge_pre_read = if pre_read.is_empty() {
-                Vec::new()
-            } else {
-                let write_result = match &mut work_conn {
-                    IoStream::Tcp(ref mut s) => s.write_all(&pre_read).await,
-                    IoStream::Tls(ref mut s) => s.write_all(&pre_read).await,
-                    IoStream::WebSocket(ref mut s) => s.write_all(&pre_read).await,
-                    IoStream::Yamux(ref mut s) => s.write_all(&pre_read).await,
-                    IoStream::Kcp(ref mut s) => s.write_all(&pre_read).await,
-                    IoStream::Quic(ref mut s) => s.write_all(&pre_read).await,
-                    _ => Ok(()),
-                };
-                if let Err(e) = write_result {
-                    warn!("Failed to write VHost pre-read bytes: {}", e);
-                    return;
-                }
-                Vec::new() // already written, don't pass to bridge_plain
-            };
+            // Pass VHost pre-read bytes through bridge_plain so the bridge
+            // can coordinate: write pre_read first, then skip work_w shutdown
+            // to let the backend response flow back to the user.
+            let bridge_pre_read = pre_read;
             // Plain bridge with optional compression.
             let (u_r, u_w) = req.user_conn.into_split();
             let (w_r, w_w) = work_conn.into_split();

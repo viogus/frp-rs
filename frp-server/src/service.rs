@@ -14,9 +14,9 @@ use tracing::{info, error, warn, debug};
 use frp_core::config::ServerConfig;
 use frp_core::auth::{AuthConfig, AuthMethod, OidcVerifier};
 use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1};
+use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::mux;
-use frp_core::transport::{IoStream, ConnectionType, peek_connection_type, consume_tls_head_byte, PreReadStream};
+use frp_core::transport::{IoStream, ConnectionType, detect_and_strip_magic, PreReadStream};
 use frp_core::transport::{build_tls_acceptor, accept_websocket};
 use frp_core::format_socket_addr;
 use frp_core::metrics::ProxyMetricsRegistry;
@@ -320,12 +320,12 @@ impl Service {
                             info!("New WebSocket connection from {}", addr);
                             let state = ws_state.clone();
                             tokio::spawn(async move {
-                                match frp_core::transport::accept_websocket(stream).await {
+                                match frp_core::transport::accept_websocket(IoStream::Tcp(stream)).await {
                                     Ok(mut ws) => {
                                         info!("WebSocket upgrade completed for {}", addr);
                                         match read_msg_v1(&mut ws).await {
                                             Ok(FrpMessage::Login(login)) => {
-                                                control::handle_control(ws, login, state.clone(), Some(addr), None, false).await;
+                                                control::handle_control(ws, login, state.clone(), Some(addr), None, false, None).await;
                                             }
                                             Ok(FrpMessage::NewWorkConn(nwc)) => {
                                                 handle_work_conn_inner(ws, nwc, state.clone()).await;
@@ -452,7 +452,7 @@ impl Service {
                                 let mut ctl = frp_core::transport::IoStream::Kcp(stream);
                                 match frp_core::protocol::read_msg_v1(&mut ctl).await {
                                     Ok(frp_core::msg::FrpMessage::Login(login)) => {
-                                        control::handle_control(ctl, login, state, None, None, false).await;
+                                        control::handle_control(ctl, login, state, None, None, false, None).await;
                                     }
                                     Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                         handle_work_conn_inner(ctl, nwc, state).await;
@@ -568,7 +568,7 @@ impl Service {
                                             }
                                         });
                                         // Run control handler on first stream (blocking)
-                                        control::handle_control(ctl, login, state, None, None, false).await;
+                                        control::handle_control(ctl, login, state, None, None, false, None).await;
                                         cancel.cancel();
                                     }
                                     Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
@@ -644,37 +644,46 @@ impl Service {
         // matching Go frp v0.69.1 behavior.
         loop {
             match listener.accept().await {
-                Ok((mut stream, addr)) => {
+                Ok((stream, addr)) => {
                     let state = self.state.clone();
                     let acceptor = tls_acceptor.clone();
 
                     tokio::spawn(async move {
-                        let ct = match peek_connection_type(&stream).await {
-                            Ok(c) => c,
+                        let (ct, mut stream_io) = match detect_and_strip_magic(stream).await {
+                            Ok((c, s)) => (c, s),
                             Err(e) => {
-                                warn!("Failed to peek connection type from {}: {}", addr, e);
+                                warn!("Failed to detect connection type from {}: {}", addr, e);
                                 return;
                             }
                         };
 
                         match ct {
                             ConnectionType::Tls(first_byte) => {
-                                // 0x17 = Go frp TLS prefix (must consume before handshake)
-                                // 0x16 = standard TLS ClientHello (byte is part of TLS record)
-                                if first_byte == frp_core::transport::FRP_TLS_HEAD_BYTE {
-                                    if let Err(e) = consume_tls_head_byte(&mut stream).await {
-                                        warn!("Failed to consume TLS head byte from {}: {}", addr, e);
+                                // Extract inner TcpStream and pre-read bytes.
+                                // detect_and_strip_magic consumed 7 bytes; replay them
+                                // (minus the Go frp 0x17 prefix) for TLS.
+                                let (mut pre_read_bytes, mut inner_stream) = match stream_io {
+                                    IoStream::PreRead(buf, s) => (buf, s),
+                                    _ => {
+                                        warn!("Expected PreRead for TLS connection from {}", addr);
                                         return;
                                     }
+                                };
+
+                                // 0x17 = Go frp TLS prefix (already consumed, strip from replay)
+                                // 0x16 = standard TLS ClientHello (keep all bytes)
+                                if first_byte == frp_core::transport::FRP_TLS_HEAD_BYTE && !pre_read_bytes.is_empty() {
+                                    pre_read_bytes.remove(0); // discard 0x17
                                 }
+
                                 // --- SNI peek for HTTPS proxy routing ---
-                                // Read ClientHello bytes (up to 4KB) to extract SNI.
-                                // If SNI matches an HTTPS proxy, forward raw TLS bytes
-                                // directly through the work connection (no TLS termination).
+                                // Read ClientHello bytes (up to 4KB) from inner stream.
+                                // The inner stream is positioned at byte 7 of the original
+                                // connection. Combine with pre_read_bytes for full ClientHello.
                                 let mut sni_buf = vec![0u8; 4096];
                                 let sni_peek_n = match tokio::time::timeout(
                                     std::time::Duration::from_secs(5),
-                                    stream.read(&mut sni_buf),
+                                    inner_stream.read(&mut sni_buf),
                                 ).await {
                                     Ok(Ok(n)) if n >= 43 => n,
                                     Ok(Ok(_)) => 0,
@@ -684,14 +693,14 @@ impl Service {
                                     }
                                 };
 
-                                // The consumed bytes always start with 0x16 (the TLS record).
-                                // If first_byte was 0x17 it was already consumed and discarded above.
-                                // If first_byte was 0x16 it was MSG_PEEKed (not consumed) so it is
-                                // the first byte of sni_buf.
-                                let sni_data = sni_buf[..sni_peek_n].to_vec();
+                                // Build full ClientHello data (pre-read magic bytes + SNI peek)
+                                let mut sni_data = pre_read_bytes.clone();
+                                if sni_peek_n > 0 {
+                                    sni_data.extend_from_slice(&sni_buf[..sni_peek_n]);
+                                }
 
                                 // Try SNI-based routing for HTTPS proxies
-                                if sni_peek_n > 0 {
+                                if !sni_data.is_empty() {
                                     if let Some(sni_host) = crate::vhost::extract_sni_from_client_hello(&sni_data) {
                                         debug!("SNI from {}: {}", addr, sni_host);
                                         if let Some(route) = state.vhost_manager.lookup(&sni_host).await {
@@ -704,7 +713,7 @@ impl Service {
                                                     sni_host, route.proxy_name, addr);
                                                 let _ = ctl.tx.send(InternalMsg::ProxyUserConn {
                                                     proxy_name: route.proxy_name.clone(),
-                                                    user_conn: IoStream::Tcp(stream),
+                                                    user_conn: IoStream::Tcp(inner_stream),
                                                     pre_read: sni_data,
                                                 }).ok();
                                                 return;
@@ -713,9 +722,9 @@ impl Service {
                                     }
                                 }
 
-                                // No SNI match — wrap stream to replay consumed ClientHello bytes
+                                // No SNI match — wrap stream to replay consumed bytes
                                 // for the TLS handshake fallthrough path.
-                                let stream = PreReadStream::new(sni_data, stream);
+                                let stream = PreReadStream::new(sni_data, inner_stream);
 
                                 let acceptor = match acceptor {
                                     Some(a) => a,
@@ -745,24 +754,60 @@ impl Service {
                                         Ok((control_stream, incoming)) => {
                                             let mut io = IoStream::Yamux(control_stream);
                                             info!("Yamux over TLS session established for {:?}", addr);
-                                            match read_msg_v1(&mut io).await {
-                                                Ok(FrpMessage::Login(login)) => {
-                                                    control::handle_control(io, login, state, Some(addr), Some(incoming), false).await;
-                                                }
-                                                Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                    handle_work_conn_inner(io, nwc, state).await;
-                                                }
-                                                Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                    handle_visitor_conn_inner(io, nvc, state).await;
-                                                }
-                                                Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                    handle_nat_hole_visitor(io, nhv, state, None).await;
-                                                }
-                                                Ok(other) => {
-                                                    warn!("Unexpected TLS+yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
-                                                }
-                                                Err(e) => {
-                                                    warn!("TLS+yamux read error from {}: {}", addr, e);
+
+                                            // Try V2 detection on yamux stream (Go frp: magic on stream)
+                                            let mut magic = [0u8; 7];
+                                            let is_v2 = match io.read_exact(&mut magic).await {
+                                                Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                                Err(_) => false,
+                                            };
+                                            if is_v2 {
+                                                // V2 detected on TLS+yamux stream
+                                                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                    Ok((Some(p), crypto)) => (p, crypto),
+                                                    Ok((None, crypto)) => {
+                                                        // Read Login in plaintext. AEAD wrapping happens in
+                                                        // handle_control after LoginResp (matching Go frp flow).
+                                                        match io.read_raw_v2_frame().await {
+                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                            Ok((ft, _, _)) => {
+                                                                warn!("Unexpected frame type {} after V2 TLS+yamux handshake from {}", ft, addr);
+                                                                return;
+                                                            }
+                                                            Err(e) => {
+                                                            warn!("Failed to read V2 message after TLS+yamux handshake from {}: {}", addr, e);
+                                                            return;
+                                                        }
+                                                    }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("V2 TLS+yamux handshake error from {}: {}", addr, e);
+                                                        return;
+                                                    }
+                                                };
+                                                dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None, crypto_ctx).await;
+                                            } else {
+                                                // Not V2. Replay consumed bytes for V1 processing.
+                                                let mut io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
+                                                match read_msg_v1(&mut io).await {
+                                                    Ok(FrpMessage::Login(login)) => {
+                                                        control::handle_control(io, login, state, Some(addr), Some(incoming), false, None).await;
+                                                    }
+                                                    Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                        handle_work_conn_inner(io, nwc, state).await;
+                                                    }
+                                                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                        handle_visitor_conn_inner(io, nvc, state).await;
+                                                    }
+                                                    Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                        handle_nat_hole_visitor(io, nhv, state, None).await;
+                                                    }
+                                                    Ok(other) => {
+                                                        warn!("Unexpected TLS+yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("TLS+yamux read error from {}: {}", addr, e);
+                                                    }
                                                 }
                                             }
                                         }
@@ -774,7 +819,7 @@ impl Service {
                                     let mut tls = tls_stream;
                                     match read_msg_v1(&mut tls).await {
                                         Ok(FrpMessage::Login(login)) => {
-                                            control::handle_control(tls, login, state, Some(addr), None, false).await;
+                                            control::handle_control(tls, login, state, Some(addr), None, false, None).await;
                                         }
                                         Ok(FrpMessage::NewWorkConn(nwc)) => {
                                             let io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls)));
@@ -804,15 +849,14 @@ impl Service {
                                     warn!("TLS-only mode: rejected WebSocket from {}", addr);
                                     return;
                                 }
-                                // Byte is still in buffer (MSG_PEEK), WS upgrade directly.
-                                // accept_websocket returns IoStream::WebSocket(WsByteStream)
-                                // — ready for read_msg_v1/write_msg_v1 directly.
-                                match accept_websocket(stream).await {
+                                // stream_io is IoStream::PreRead — its AsyncRead replays
+                                // the 7 consumed bytes (starting with 'G' for GET).
+                                match accept_websocket(stream_io).await {
                                     Ok(mut ws) => {
                                         info!("WebSocket upgrade on main port for {}", addr);
                                         match read_msg_v1(&mut ws).await {
                                             Ok(FrpMessage::Login(login)) => {
-                                                control::handle_control(ws, login, state.clone(), Some(addr), None, false).await;
+                                                control::handle_control(ws, login, state.clone(), Some(addr), None, false, None).await;
                                             }
                                             Ok(FrpMessage::NewWorkConn(nwc)) => {
                                                 handle_work_conn_inner(ws, nwc, state.clone()).await;
@@ -838,74 +882,112 @@ impl Service {
                             }
 
                             ConnectionType::V2 => {
-                                // V2 protocol (binary framing + JSON payload)
+                                // Already consumed V2 magic. Extract TcpStream.
+                                let inner_stream = match stream_io {
+                                    IoStream::Tcp(s) => s,
+                                    _other => {
+                                        warn!("Expected TcpStream for V2 connection from {}, got unexpected stream type", addr);
+                                        return;
+                                    }
+                                };
+
                                 if state.tls_only {
                                     warn!("TLS-only mode: rejected V2 from {}", addr);
                                     return;
                                 }
-                                // When tcp_mux is enabled, wrap in yamux BEFORE reading
-                                // the first message (same pattern as V1 + tcp_mux).
+
                                 if state.tcp_mux {
+                                    // Wrap in yamux BEFORE handshake (matches Go frp flow).
                                     let mux_cfg = mux::TcpMuxConfig {
                                         keepalive_interval: std::time::Duration::from_secs(
                                             state.tcp_mux_keepalive.max(1) as u64
                                         ),
                                     };
-                                    match mux::server_mux(stream, &mux_cfg).await {
+                                    match mux::server_mux(inner_stream, &mux_cfg).await {
                                         Ok((control_stream, incoming)) => {
                                             let mut io = IoStream::Yamux(control_stream);
                                             info!("Yamux over V2 session established for {:?}", addr);
-                                            match io.read_v2_frame().await {
-                                                Ok(FrpMessage::Login(login)) => {
-                                                    control::handle_control(io, login, state, Some(addr), Some(incoming), true).await;
-                                                }
-                                                Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                    handle_work_conn_inner(io, nwc, state).await;
-                                                }
-                                                Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                    handle_visitor_conn_inner(io, nvc, state).await;
-                                                }
-                                                Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                    handle_nat_hole_visitor(io, nhv, state, None).await;
-                                                }
-                                                Ok(other) => {
-                                                    warn!("Unexpected V2+yamux first message from {:?}: {:?}", addr, other.v2_type_id());
-                                                }
-                                                Err(e) => {
-                                                    warn!("V2+yamux read error from {}: {}", addr, e);
+
+                                            // Consume V2 magic on yamux stream if present.
+                                            // Go frp writes magic on the yamux stream (after yamux wrap).
+                                            // If magic is absent (backward compat), replay the bytes
+                                            // before the handshake.
+                                            {
+                                                let mut magic_buf = [0u8; 7];
+                                                match tokio::io::AsyncReadExt::read_exact(&mut io, &mut magic_buf).await {
+                                                    Ok(_) => {
+                                                        if magic_buf != frp_core::protocol::V2_MAGIC_BYTES {
+                                                            // Replay non-magic bytes before handshake
+                                                            io = IoStream::BufferedRead(magic_buf.to_vec(), 0, Box::new(io));
+                                                        }
+                                                        // Magic consumed — continue
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("Failed to read V2 magic from yamux stream: {}", e);
+                                                        return;
+                                                    }
                                                 }
                                             }
+
+                                            // V2 handshake: may receive ClientHello or first message
+                                            let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                Ok((Some(p), crypto)) => (p, crypto),
+                                                Ok((None, crypto)) => {
+                                                    // Read Login in plaintext. AEAD wrapping happens in
+                                                    // handle_control after LoginResp (matching Go frp flow).
+                                                    match io.read_raw_v2_frame().await {
+                                                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                        Ok((ft, _, _)) => {
+                                                            warn!("Unexpected frame type {} after V2 handshake from {}", ft, addr);
+                                                            return;
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("Failed to read V2 message after handshake from {}: {}", addr, e);
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("V2 handshake error from {}: {}", addr, e);
+                                                    return;
+                                                }
+                                            };
+
+                                            dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None, crypto_ctx).await;
                                         }
                                         Err(e) => {
                                             warn!("Failed to start yamux over V2 for {:?}: {}", addr, e);
                                         }
                                     }
                                 } else {
-                                    // No tcp_mux: read V2 directly on raw TCP
-                                    match read_msg_v2(&mut stream).await {
-                                        Ok(FrpMessage::Login(login)) => {
-                                            control::handle_control(stream, login, state, Some(addr), None, true).await;
-                                        }
-                                        Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                            let io = IoStream::Tcp(stream);
-                                            handle_work_conn_inner(io, nwc, state).await;
-                                        }
-                                        Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                            let io = IoStream::Tcp(stream);
-                                            handle_visitor_conn_inner(io, nvc, state).await;
-                                        }
-                                        Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                            let io = IoStream::Tcp(stream);
-                                            let visitor_addr = Some(addr.to_string());
-                                            handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
-                                        }
-                                        Ok(other) => {
-                                            warn!("Unexpected V2 first message from {}: {:?}", addr, other.v2_type_id());
+                                    // No tcp_mux: V2 directly on raw TCP
+                                    let mut io = IoStream::Tcp(inner_stream);
+
+                                    // V2 handshake: may receive ClientHello or first message
+                                    let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                        Ok((Some(p), crypto)) => (p, crypto),
+                                        Ok((None, crypto)) => {
+                                            // Read Login in plaintext. AEAD wrapping happens in
+                                            // handle_control after LoginResp (matching Go frp flow).
+                                            match io.read_raw_v2_frame().await {
+                                                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                Ok((ft, _, _)) => {
+                                                    warn!("Unexpected frame type {} after V2 handshake from {}", ft, addr);
+                                                    return;
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to read V2 message after handshake from {}: {}", addr, e);
+                                                    return;
+                                                }
+                                            }
                                         }
                                         Err(e) => {
-                                            warn!("Failed to read V2 first message from {}: {}", addr, e);
+                                            warn!("V2 handshake error from {}: {}", addr, e);
+                                            return;
                                         }
-                                    }
+                                    };
+
+                                    dispatch_v2_message(io, msg_payload, state, addr, None, Some(addr.to_string()), crypto_ctx).await;
                                 }
                             }
 
@@ -914,11 +996,16 @@ impl Service {
                                     warn!("TLS-only mode: rejected plain TCP from {}", addr);
                                     return;
                                 }
-                                // When tcp_mux is enabled, wrap in yamux BEFORE reading
-                                // the first message. This matches Go frp v0.69.1 behaviour:
-                                // both sides wrap immediately, then Login flows through
-                                // a yamux stream — not on raw TCP.
                                 if state.tcp_mux {
+                                    // Extract inner TcpStream and pre-read bytes.
+                                    // Wrap in PreReadStream so yamux sees the full byte stream
+                                    // (including the type byte consumed by detect_and_strip_magic).
+                                    let (pre_read, inner_tcp) = match stream_io {
+                                        IoStream::PreRead(buf, s) => (buf, s),
+                                        _ => unreachable!(),
+                                    };
+                                    let stream = PreReadStream::new(pre_read, inner_tcp);
+
                                     let mux_cfg = mux::TcpMuxConfig {
                                         keepalive_interval: std::time::Duration::from_secs(
                                             state.tcp_mux_keepalive.max(1) as u64
@@ -928,24 +1015,61 @@ impl Service {
                                         Ok((control_stream, incoming)) => {
                                             let mut io = IoStream::Yamux(control_stream);
                                             info!("Yamux session established for {:?}", addr);
-                                            match read_msg_v1(&mut io).await {
-                                                Ok(FrpMessage::Login(login)) => {
-                                                    control::handle_control(io, login, state, Some(addr), Some(incoming), false).await;
-                                                }
-                                                Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                    handle_work_conn_inner(io, nwc, state).await;
-                                                }
-                                                Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                    handle_visitor_conn_inner(io, nvc, state).await;
-                                                }
-                                                Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                    handle_nat_hole_visitor(io, nhv, state, None).await;
-                                                }
-                                                Ok(other) => {
-                                                    warn!("Unexpected yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
-                                                }
-                                                Err(e) => {
-                                                    warn!("Failed to read yamux first message from {}: {}", addr, e);
+
+                                            // Try V2 detection: read 7 magic bytes from yamux stream.
+                                            // Go frp sends V2 magic on yamux stream (not raw TCP) when tcpMux.
+                                            let mut magic = [0u8; 7];
+                                            let is_v2 = match io.read_exact(&mut magic).await {
+                                                Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                                Err(_) => false,
+                                            };
+                                            if is_v2 {
+                                                // V2 detected on yamux stream! Do V2 handshake + dispatch
+                                                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                    Ok((Some(p), crypto)) => (p, crypto),
+                                                    Ok((None, crypto)) => {
+                                                        // Read Login in plaintext. AEAD wrapping happens in
+                                                        // handle_control after LoginResp (matching Go frp flow).
+                                                        match io.read_raw_v2_frame().await {
+                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                            Ok((ft, _, _)) => {
+                                                                warn!("Unexpected frame type {} after V2 handshake from {}", ft, addr);
+                                                                return;
+                                                            }
+                                                            Err(e) => {
+                                                                warn!("Failed to read V2 message after handshake from {}: {}", addr, e);
+                                                                return;
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("V2 handshake error from {}: {}", addr, e);
+                                                        return;
+                                                    }
+                                                };
+                                                dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None, crypto_ctx).await;
+                                            } else {
+                                                // Not V2. Replay consumed bytes and process as V1.
+                                                let mut io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
+                                                match read_msg_v1(&mut io).await {
+                                                    Ok(FrpMessage::Login(login)) => {
+                                                        control::handle_control(io, login, state, Some(addr), Some(incoming), false, None).await;
+                                                    }
+                                                    Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                        handle_work_conn_inner(io, nwc, state).await;
+                                                    }
+                                                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                        handle_visitor_conn_inner(io, nvc, state).await;
+                                                    }
+                                                    Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                        handle_nat_hole_visitor(io, nhv, state, None).await;
+                                                    }
+                                                    Ok(other) => {
+                                                        warn!("Unexpected yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("Failed to read yamux first message from {}: {}", addr, e);
+                                                    }
                                                 }
                                             }
                                         }
@@ -954,23 +1078,22 @@ impl Service {
                                         }
                                     }
                                 } else {
-                                    // Byte is still in buffer, read_msg_v1 will consume it
-                                    match read_msg_v1(&mut stream).await {
+                                    // stream_io is IoStream::PreRead — its AsyncRead replays
+                                    // the consumed bytes (including type byte) before reading
+                                    // the rest from the TcpStream.
+                                    match read_msg_v1(&mut stream_io).await {
                                         Ok(FrpMessage::Login(login)) => {
-                                            control::handle_control(stream, login, state, Some(addr), None, false).await;
+                                            control::handle_control(stream_io, login, state, Some(addr), None, false, None).await;
                                         }
                                         Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                            let io = IoStream::Tcp(stream);
-                                            handle_work_conn_inner(io, nwc, state).await;
+                                            handle_work_conn_inner(stream_io, nwc, state).await;
                                         }
                                         Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                            let io = IoStream::Tcp(stream);
-                                            handle_visitor_conn_inner(io, nvc, state).await;
+                                            handle_visitor_conn_inner(stream_io, nvc, state).await;
                                         }
                                         Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                            let io = IoStream::Tcp(stream);
                                             let visitor_addr = Some(addr.to_string());
-                                            handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
+                                            handle_nat_hole_visitor(stream_io, nhv, state, visitor_addr).await;
                                         }
                                         Ok(other) => {
                                             warn!("Unexpected first message from {}: {:?}", addr, other.v1_type_byte());
@@ -1517,6 +1640,48 @@ async fn handle_nat_hole_visitor(
         }
     }
     // reader dropped → connection closes
+}
+
+/// Decode a V2 message from raw frame payload and dispatch to the appropriate handler.
+/// `payload` is the frame payload: [type_id: u16 BE][JSON bytes].
+async fn dispatch_v2_message(
+    io: IoStream,
+    payload: Vec<u8>,
+    state: std::sync::Arc<AppState>,
+    addr: std::net::SocketAddr,
+    incoming: Option<frp_core::mux::IncomingStreams>,
+    visitor_addr: Option<String>,
+    crypto_ctx: Option<frp_core::v2_handshake::CryptoContext>,
+) {
+    if payload.len() < 2 {
+        warn!("V2 message payload too short from {}", addr);
+        return;
+    }
+    let type_id = u16::from_be_bytes([payload[0], payload[1]]);
+    let msg = match frp_core::protocol::deserialize_v2(type_id, &payload[2..]) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("Failed to decode V2 message from {}: {}", addr, e);
+            return;
+        }
+    };
+    match msg {
+        FrpMessage::Login(login) => {
+            control::handle_control(io, login, state, Some(addr), incoming, true, crypto_ctx).await;
+        }
+        FrpMessage::NewWorkConn(nwc) => {
+            handle_work_conn_inner(io, nwc, state).await;
+        }
+        FrpMessage::NewVisitorConn(vc) => {
+            handle_visitor_conn_inner(io, vc, state).await;
+        }
+        FrpMessage::NatHoleVisitor(nhv) => {
+            handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
+        }
+        other => {
+            warn!("Unexpected V2 first message from {}: {:?}", addr, other.v2_type_id());
+        }
+    }
 }
 
 /// Handle an incoming work connection. Verifies auth, then routes the

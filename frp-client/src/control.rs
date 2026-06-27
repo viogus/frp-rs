@@ -118,6 +118,8 @@ impl ControlConnection {
             keepalive_secs: self.keepalive_secs,
             bind_addr: self.bind_addr.clone(),
             proxy_url: if self.proxy_url.is_empty() { None } else { Some(self.proxy_url.clone()) },
+            v2: self.v2,
+            caller_handles_mux: propose_mux,
             ..Default::default()
         };
 
@@ -134,13 +136,14 @@ impl ControlConnection {
             let ca_file = self.tls_ca_file.as_deref();
             let (stream, qc) = frp_core::quic::dial_quic(&addr, server_name, ca_file).await
                 .map_err(|e| frp_core::Error::Transport(format!("QUIC dial: {e}")))?;
+            // TODO: V2 handshake over QUIC when V2+QUIC interop needed.
             (IoStream::Quic(stream), None, Some(qc))
         } else {
             let raw_stream = dial_server(&opts).await?;
 
-            // Wrap in yamux BEFORE any protocol communication if proposing mux.
-            // The Go frp server wraps its side on accept, so the client must
-            // wrap before sending its first frame.
+            // Wrap in yamux BEFORE V2 handshake (matches Go frp flow).
+            // The server wraps its side on accept, so the client must wrap
+            // before sending ClientHello.
             if propose_mux {
                 let mux_cfg = mux::TcpMuxConfig::default();
                 match raw_stream {
@@ -163,9 +166,35 @@ impl ControlConnection {
                     }
                 }
             } else {
+                // No yamux: raw stream directly (V2 handshake happens below).
                 (raw_stream, None, None)
             }
         };
+
+        // V2: ClientHello/ServerHello handshake on yamux-wrapped stream.
+        let mut crypto_ctx = None;
+        if self.v2 {
+            // When tcpMux is enabled, write V2 magic on the yamux stream
+            // (not on raw TCP). Go frp does: yamux wrap -> write magic -> handshake.
+            if propose_mux {
+                frp_core::protocol::write_v2_magic(&mut io_stream).await?;
+            }
+            let transport_name = match self.transport_protocol {
+                TransportProtocol::Tcp => "tcp",
+                TransportProtocol::Kcp => "kcp",
+                TransportProtocol::Quic => "quic",
+                TransportProtocol::WebSocket => "websocket",
+                TransportProtocol::Wss => "wss",
+            };
+            crypto_ctx = frp_core::v2_handshake::v2_handshake_client(
+                &mut io_stream,
+                transport_name,
+                self.tls_enable,
+                self.tcp_mux,
+                true, // with_crypto
+            ).await?;
+
+        }
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -210,6 +239,24 @@ impl ControlConnection {
         } else {
             io_stream.read_v1_frame().await?
         };
+
+        // If AEAD crypto negotiated, wrap stream after LoginResp (matching Go frp flow).
+        // Login/LoginResp are exchanged in plaintext; all subsequent messages use AEAD.
+        if self.v2 {
+            if let Some(ref ctx) = crypto_ctx {
+                let token = self.auth_cfg.token.clone();
+                // derive_aead_control_keys returns (client_to_server, server_to_client)
+                let (write_key, read_key) = frp_core::crypto::derive_aead_control_keys(
+                    token.as_bytes(), ctx.algorithm, &ctx.transcript_hash,
+                ).map_err(|e| frp_core::Error::Protocol(e))?;
+                // Client reads from server → server_to_client
+                // Client writes to server → client_to_server
+                let aead = frp_core::crypto::AeadStream::new(
+                    Box::new(io_stream), ctx.algorithm, &read_key, &write_key,
+                ).map_err(|e| frp_core::Error::Protocol(e))?;
+                io_stream = IoStream::Aead(Box::new(aead));
+            }
+        }
         match resp_msg {
             FrpMessage::LoginResp(resp) => {
                 if let Some(err) = resp.error {
