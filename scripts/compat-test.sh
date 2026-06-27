@@ -220,6 +220,247 @@ finally:
 ' || echo "FAIL:PYTHON_ERROR"
 }
 
+start_udp_echo_server() {
+    local port="$1"
+    SE_UDP_PORT="$port" python3 -c '
+import os, socket
+port = int(os.environ["SE_UDP_PORT"])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", port))
+while True:
+    try:
+        data, addr = s.recvfrom(4096)
+        s.sendto(data, addr)
+    except:
+        break
+' &
+    track_pid $!
+}
+
+send_and_expect_udp() {
+    local proxy_port="$1"
+    local test_data="$2"
+    local timeout="${3:-10}"
+    _USE_PORT="$proxy_port" _USE_DATA="$test_data" _USE_TO="$timeout" \
+    python3 -c '
+import os, socket, time
+port = int(os.environ["_USE_PORT"])
+test_data = os.environ["_USE_DATA"].encode()
+timeout = float(os.environ["_USE_TO"])
+deadline = time.time() + timeout
+while True:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        s.sendto(test_data, ("127.0.0.1", port))
+        data, addr = s.recvfrom(4096)
+        s.close()
+        if data == test_data:
+            print("OK")
+        else:
+            print("FAIL:MISMATCH expected=" + repr(test_data) + " got=" + repr(data))
+        raise SystemExit(0)
+    except socket.timeout:
+        try: s.close()
+        except: pass
+        if time.time() > deadline:
+            print("FAIL:TIMEOUT")
+            raise SystemExit(0)
+        time.sleep(0.5)
+    except Exception as e:
+        try: s.close()
+        except: pass
+        print("FAIL:ERROR " + str(e))
+        raise SystemExit(0)
+' 2>&1 || echo "FAIL:PYTHON_ERROR"
+}
+
+start_http_echo_server() {
+    local port="$1"
+    local body_prefix="${2:-http-ok}"
+    SE_HTTP_PORT="$port" SE_HTTP_PREFIX="$body_prefix" python3 -c '
+import os, socket
+port = int(os.environ["SE_HTTP_PORT"])
+prefix = os.environ["SE_HTTP_PREFIX"]
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(5)
+while True:
+    try:
+        conn, _ = s.accept()
+        data = b""
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            if b"\r\n\r\n" in data:
+                hdr_end = data.index(b"\r\n\r\n") + 4
+                hdrs = data[:hdr_end].decode("utf-8", errors="ignore").lower()
+                cl = 0
+                for line in hdrs.split("\r\n"):
+                    if line.startswith("content-length:"):
+                        try:
+                            cl = int(line.split(":")[1].strip())
+                        except: pass
+                if len(data) - hdr_end >= cl:
+                    break
+        if data:
+            body = prefix.encode() + (data.split(b"\r\n\r\n", 1)[-1] if b"\r\n\r\n" in data else b"")
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+        conn.close()
+    except:
+        break
+' &
+    track_pid $!
+}
+
+send_http_test() {
+    local vhost_port="$1"
+    local host="$2"
+    local body_prefix="${3:-http-ok}"
+    local timeout="${4:-5}"
+    SE_VHOST="$vhost_port" SE_HOST="$host" SE_PREFIX="$body_prefix" SE_TO="$timeout" \
+    python3 -c '
+import os, socket
+port = int(os.environ["SE_VHOST"])
+host = os.environ["SE_HOST"]
+prefix = os.environ["SE_PREFIX"]
+timeout = float(os.environ["SE_TO"])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(timeout)
+s.connect(("127.0.0.1", port))
+req = b"POST /test HTTP/1.1\r\nHost: " + host.encode() + b"\r\nContent-Length: 5\r\n\r\nhello"
+s.sendall(req)
+data = s.recv(4096)
+s.close()
+if (prefix.encode() + b"hello") in data:
+    print("OK")
+else:
+    print("FAIL: unexpected response: " + repr(data[:200]))
+' 2>&1
+}
+
+send_https_test() {
+    local vhost_port="$1"
+    local host="$2"
+    local body_prefix="${3:-https-ok}"
+    local timeout="${4:-5}"
+    SE_VHOST="$vhost_port" SE_HOST="$host" SE_PREFIX="$body_prefix" SE_TO="$timeout" \
+    python3 -c '
+import os, socket, ssl
+port = int(os.environ["SE_VHOST"])
+host = os.environ["SE_HOST"]
+prefix = os.environ["SE_PREFIX"]
+timeout = float(os.environ["SE_TO"])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(timeout)
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+ss = ctx.wrap_socket(s, server_hostname=host)
+ss.connect(("127.0.0.1", port))
+req = b"POST /test HTTP/1.1\r\nHost: " + host.encode() + b"\r\nContent-Length: 5\r\n\r\nhello"
+ss.sendall(req)
+data = ss.recv(4096)
+ss.close()
+if (prefix.encode() + b"hello") in data:
+    print("OK")
+else:
+    print("FAIL: unexpected response: " + repr(data[:200]))
+' 2>&1
+}
+
+send_tcpmux_test() {
+    local tcpmux_port="$1"
+    local domain="$2"
+    local test_data="${3:-tcpmux-echo}"
+    local timeout="${4:-10}"
+    SE_PORT="$tcpmux_port" SE_DOMAIN="$domain" SE_DATA="$test_data" SE_TO="$timeout" \
+    python3 -c '
+import os, socket, time
+port = int(os.environ["SE_PORT"])
+domain = os.environ["SE_DOMAIN"]
+test_data = os.environ["SE_DATA"].encode()
+timeout = float(os.environ["SE_TO"])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(timeout)
+deadline = time.time() + timeout
+while True:
+    try:
+        s.connect(("127.0.0.1", port))
+        break
+    except (ConnectionRefusedError, OSError):
+        if time.time() > deadline:
+            print("FAIL:CONNECT_TIMEOUT")
+            raise SystemExit(0)
+        time.sleep(0.5)
+req = b"CONNECT " + domain.encode() + b":22 HTTP/1.1\r\nHost: " + domain.encode() + b":22\r\n\r\n"
+s.sendall(req)
+resp = b""
+while b"\r\n\r\n" not in resp:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    resp += chunk
+if not resp.startswith(b"HTTP/1.1 200"):
+    print("FAIL:CONNECT_RESPONSE " + repr(resp[:200]))
+    s.close()
+    raise SystemExit(0)
+s.sendall(test_data)
+reply = s.recv(4096)
+s.close()
+if reply == test_data:
+    print("OK:tcpmux")
+else:
+    print("FAIL:MISMATCH expected=" + repr(test_data) + " got=" + repr(reply[:200]))
+' 2>&1
+}
+
+send_socks5_test() {
+    local proxy_port="$1"
+    local echo_port="$2"
+    local test_data="${3:-socks5-test}"
+    local timeout="${4:-10}"
+    SE_PROXY="$proxy_port" SE_ECHO="$echo_port" SE_DATA="$test_data" SE_TO="$timeout" \
+    python3 -c '
+import os, socket, struct
+proxy_port = int(os.environ["SE_PROXY"])
+echo_port = int(os.environ["SE_ECHO"])
+test_data = os.environ["SE_DATA"].encode()
+timeout = float(os.environ["SE_TO"])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(timeout)
+s.connect(("127.0.0.1", proxy_port))
+# SOCKS5 handshake (no auth)
+s.sendall(b"\x05\x01\x00")
+reply = s.recv(2)
+if reply != b"\x05\x00":
+    print("FAIL:SOCKS5_HANDSHAKE " + str(reply))
+    raise SystemExit(0)
+# SOCKS5 CONNECT to echo server
+host = b"\x7f\x00\x00\x01"
+port_bytes = struct.pack(">H", echo_port)
+s.sendall(b"\x05\x01\x00\x01" + host + port_bytes)
+reply = s.recv(10)
+if len(reply) < 10 or reply[0] != 0x05:
+    print("FAIL:SOCKS5_CONNECT " + str(reply[:10]))
+    raise SystemExit(0)
+if reply[1] != 0x00:
+    print("FAIL:SOCKS5_CONNECT_REFUSED code=" + str(reply[1]))
+    raise SystemExit(0)
+# Echo test through SOCKS5 tunnel
+s.sendall(test_data)
+data = s.recv(1024)
+if data == test_data:
+    print("OK:socks5")
+else:
+    print("FAIL:MISMATCH expected=" + repr(test_data) + " got=" + repr(data))
+s.close()
+' 2>&1
+}
+
 # Write config files in the test directory
 write_rust_frps_config() {
     local port="$1" token="$2" out="$3"
@@ -1802,19 +2043,7 @@ test_g2r_udp() {
     mkdir -p "$TEST_DIR/$name"
 
     # Start UDP echo server
-    python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind(('127.0.0.1', $echo_port))
-while True:
-    try:
-        data, addr = s.recvfrom(4096)
-        s.sendto(data, addr)
-    except:
-        break
-" &
-    track_pid $!
-    sleep 0.5
+    start_udp_echo_server "$echo_port"
 
     # Start Rust frps
     write_rust_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
@@ -1847,27 +2076,9 @@ TOML
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
-    sleep 2  # UDP takes a moment to set up
-
     # Test UDP data round-trip
     local result
-    result=$(python3 -c "
-import socket, time
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.settimeout(5)
-test_data = b'udp-test-data'
-try:
-    s.sendto(test_data, ('127.0.0.1', $proxy_port))
-    data, addr = s.recvfrom(4096)
-    if data == test_data:
-        print('OK')
-    else:
-        print('FAIL:MISMATCH expected=' + repr(test_data) + ' got=' + repr(data))
-except Exception as e:
-    print('FAIL:ERROR ' + str(e))
-finally:
-    s.close()
-" 2>&1 || echo "FAIL:PYTHON_ERROR")
+    result=$(send_and_expect_udp "$proxy_port" "udp-test-data" 15)
     if [[ "$result" == "OK" ]]; then
         pass_test "$name"
     else
@@ -1891,19 +2102,7 @@ test_r2g_udp() {
     mkdir -p "$TEST_DIR/$name"
 
     # Start UDP echo server
-    python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind(('127.0.0.1', $echo_port))
-while True:
-    try:
-        data, addr = s.recvfrom(4096)
-        s.sendto(data, addr)
-    except:
-        break
-" &
-    track_pid $!
-    sleep 0.5
+    start_udp_echo_server "$echo_port"
 
     # Start Go frps
     write_go_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
@@ -1935,26 +2134,8 @@ TOML
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
-    sleep 2  # UDP takes a moment to set up
-
     local result
-    result=$(python3 -c "
-import socket, time
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.settimeout(5)
-test_data = b'r2g-udp-test'
-try:
-    s.sendto(test_data, ('127.0.0.1', $proxy_port))
-    data, addr = s.recvfrom(4096)
-    if data == test_data:
-        print('OK')
-    else:
-        print('FAIL:MISMATCH expected=' + repr(test_data) + ' got=' + repr(data))
-except Exception as e:
-    print('FAIL:ERROR ' + str(e))
-finally:
-    s.close()
-" 2>&1 || echo "FAIL:PYTHON_ERROR")
+    result=$(send_and_expect_udp "$proxy_port" "r2g-udp-test" 15)
     if [[ "$result" == "OK" ]]; then
         pass_test "$name"
     else
@@ -1978,43 +2159,7 @@ test_g2r_http() {
     mkdir -p "$TEST_DIR/$name"
 
     # Start simple HTTP echo server (returns request body)
-    python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('127.0.0.1', $echo_port))
-s.listen(5)
-while True:
-    try:
-        conn, _ = s.accept()
-        data = b''
-        while True:
-            chunk = conn.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-            # Wait until full body received (based on Content-Length)
-            if b'\r\n\r\n' in data:
-                hdr_end = data.index(b'\r\n\r\n') + 4
-                hdrs = data[:hdr_end].decode('utf-8', errors='ignore').lower()
-                cl = 0
-                for line in hdrs.split('\r\n'):
-                    if line.startswith('content-length:'):
-                        try:
-                            cl = int(line.split(':')[1].strip())
-                        except:
-                            pass
-                if len(data) - hdr_end >= cl:
-                    break
-        if data:
-            # Simple HTTP response echoing request
-            body = b'http-ok:' + data.split(b'\r\n\r\n', 1)[-1] if b'\r\n\r\n' in data else b'http-ok'
-            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
-        conn.close()
-    except:
-        break
-" &
-    track_pid $!
+    start_http_echo_server "$echo_port" "http-ok:"
     wait_for_port 127.0.0.1 "$echo_port" 3 || {
         fail_test "$name" "HTTP echo server did not start"
         return
@@ -2072,20 +2217,7 @@ TOML
 
     # Send HTTP request through VHost
     local result
-    result=$(python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(5)
-s.connect(('127.0.0.1', $vhost_port))
-req = b'POST /test HTTP/1.1\r\nHost: http-test.local\r\nContent-Length: 5\r\n\r\nhello'
-s.sendall(req)
-data = s.recv(4096)
-s.close()
-if b'http-ok:hello' in data:
-    print('OK')
-else:
-    print('FAIL: unexpected response: ' + repr(data[:200]))
-" 2>&1)
+    result=$(send_http_test "$vhost_port" "http-test.local" "http-ok:" 5)
     if [[ "$result" == "OK" ]]; then
         pass_test "$name"
     else
@@ -2109,42 +2241,7 @@ test_r2g_http() {
     mkdir -p "$TEST_DIR/$name"
 
     # Start HTTP echo server
-    python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('127.0.0.1', $echo_port))
-s.listen(5)
-while True:
-    try:
-        conn, _ = s.accept()
-        data = b''
-        while True:
-            chunk = conn.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-            # Wait until full body received (based on Content-Length)
-            if b'\r\n\r\n' in data:
-                hdr_end = data.index(b'\r\n\r\n') + 4
-                hdrs = data[:hdr_end].decode('utf-8', errors='ignore').lower()
-                cl = 0
-                for line in hdrs.split('\r\n'):
-                    if line.startswith('content-length:'):
-                        try:
-                            cl = int(line.split(':')[1].strip())
-                        except:
-                            pass
-                if len(data) - hdr_end >= cl:
-                    break
-        if data:
-            body = b'http-ok:' + data.split(b'\r\n\r\n', 1)[-1] if b'\r\n\r\n' in data else b'http-ok'
-            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
-        conn.close()
-    except:
-        break
-" &
-    track_pid $!
+    start_http_echo_server "$echo_port" "http-ok:"
     wait_for_port 127.0.0.1 "$echo_port" 3 || {
         fail_test "$name" "HTTP echo server did not start"
         return
@@ -2198,20 +2295,7 @@ TOML
     sleep 3
 
     local result
-    result=$(python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(5)
-s.connect(('127.0.0.1', $vhost_port))
-req = b'POST /test HTTP/1.1\r\nHost: http-test.local\r\nContent-Length: 5\r\n\r\nhello'
-s.sendall(req)
-data = s.recv(4096)
-s.close()
-if b'http-ok:hello' in data:
-    print('OK')
-else:
-    print('FAIL: unexpected response: ' + repr(data[:200]))
-" 2>&1)
+    result=$(send_http_test "$vhost_port" "http-test.local" "http-ok:" 5)
     if [[ "$result" == "OK" ]]; then
         pass_test "$name"
     else
@@ -2755,44 +2839,7 @@ test_g2r_tcpmux() {
 
     # HTTP CONNECT through tcpmux port, then echo test
     local result
-    result=$(python3 -c "
-import socket, time
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(10)
-deadline = time.time() + 10
-while True:
-    try:
-        s.connect(('127.0.0.1', $tcpmux_port))
-        break
-    except (ConnectionRefusedError, OSError):
-        if time.time() > deadline:
-            print('FAIL:CONNECT_TIMEOUT')
-            exit(0)
-        time.sleep(0.5)
-# Send CONNECT
-req = b'CONNECT $domain:22 HTTP/1.1\r\nHost: $domain:22\r\n\r\n'
-s.sendall(req)
-# Read HTTP response
-resp = b''
-while b'\r\n\r\n' not in resp:
-    chunk = s.recv(4096)
-    if not chunk:
-        break
-    resp += chunk
-if not resp.startswith(b'HTTP/1.1 200'):
-    print('FAIL:CONNECT_RESPONSE ' + repr(resp[:200]))
-    s.close()
-    exit(0)
-# Send test data and expect echo
-test_data = b'tcpmux-g2r-echo'
-s.sendall(test_data)
-reply = s.recv(4096)
-s.close()
-if reply == test_data:
-    print('OK:tcpmux-g2r')
-else:
-    print('FAIL:MISMATCH expected=' + repr(test_data) + ' got=' + repr(reply[:200]))
-" 2>&1)
+    result=$(send_tcpmux_test "$tcpmux_port" "$domain" "tcpmux-g2r-echo" 10)
     if [[ "$result" == OK:* ]]; then
         pass_test "$name"
     else
@@ -2848,44 +2895,7 @@ test_r2g_tcpmux() {
 
     # HTTP CONNECT through tcpmux port, then echo test
     local result
-    result=$(python3 -c "
-import socket, time
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(10)
-deadline = time.time() + 10
-while True:
-    try:
-        s.connect(('127.0.0.1', $tcpmux_port))
-        break
-    except (ConnectionRefusedError, OSError):
-        if time.time() > deadline:
-            print('FAIL:CONNECT_TIMEOUT')
-            exit(0)
-        time.sleep(0.5)
-# Send CONNECT
-req = b'CONNECT $domain:22 HTTP/1.1\r\nHost: $domain:22\r\n\r\n'
-s.sendall(req)
-# Read HTTP response
-resp = b''
-while b'\r\n\r\n' not in resp:
-    chunk = s.recv(4096)
-    if not chunk:
-        break
-    resp += chunk
-if not resp.startswith(b'HTTP/1.1 200'):
-    print('FAIL:CONNECT_RESPONSE ' + repr(resp[:200]))
-    s.close()
-    exit(0)
-# Send test data and expect echo
-test_data = b'tcpmux-r2g-echo'
-s.sendall(test_data)
-reply = s.recv(4096)
-s.close()
-if reply == test_data:
-    print('OK:tcpmux-r2g')
-else:
-    print('FAIL:MISMATCH expected=' + repr(test_data) + ' got=' + repr(reply[:200]))
-" 2>&1)
+    result=$(send_tcpmux_test "$tcpmux_port" "$domain" "tcpmux-r2g-echo" 10)
     if [[ "$result" == OK:* ]]; then
         pass_test "$name"
     else
@@ -3047,41 +3057,7 @@ test_g2r_https() {
     mkdir -p "$TEST_DIR/$name"
 
     # Start simple HTTP echo server (HTTPS proxy terminates TLS, backend is plain HTTP)
-    python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('127.0.0.1', $echo_port))
-s.listen(5)
-while True:
-    try:
-        conn, _ = s.accept()
-        data = b''
-        while True:
-            chunk = conn.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-            if b'\r\n\r\n' in data:
-                hdr_end = data.index(b'\r\n\r\n') + 4
-                hdrs = data[:hdr_end].decode('utf-8', errors='ignore').lower()
-                cl = 0
-                for line in hdrs.split('\r\n'):
-                    if line.startswith('content-length:'):
-                        try:
-                            cl = int(line.split(':')[1].strip())
-                        except:
-                            pass
-                if len(data) - hdr_end >= cl:
-                    break
-        if data:
-            body = b'https-ok:' + data.split(b'\r\n\r\n', 1)[-1] if b'\r\n\r\n' in data else b'https-ok'
-            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
-        conn.close()
-    except:
-        break
-" &
-    track_pid $!
+    start_http_echo_server "$echo_port" "https-ok:"
     wait_for_port 127.0.0.1 "$echo_port" 3 || {
         fail_test "$name" "HTTP echo server did not start"
         return
@@ -3142,24 +3118,7 @@ TOML
 
     # Send HTTPS request through VHost (skip TLS verification — self-signed cert)
     local result
-    result=$(python3 -c "
-import socket, ssl
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(5)
-ctx = ssl.create_default_context()
-ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE
-ss = ctx.wrap_socket(s, server_hostname='https-test.local')
-ss.connect(('127.0.0.1', $vhost_https_port))
-req = b'POST /test HTTP/1.1\r\nHost: https-test.local\r\nContent-Length: 5\r\n\r\nhello'
-ss.sendall(req)
-data = ss.recv(4096)
-ss.close()
-if b'https-ok:hello' in data:
-    print('OK')
-else:
-    print('FAIL: unexpected response: ' + repr(data[:200]))
-" 2>&1)
+    result=$(send_https_test "$vhost_https_port" "https-test.local" "https-ok:" 5)
     if [[ "$result" == "OK" ]]; then
         pass_test "$name"
     else
@@ -3293,24 +3252,7 @@ TOML
 
     # Send HTTPS request through VHost
     local result
-    result=$(python3 -c "
-import socket, ssl
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(5)
-ctx = ssl.create_default_context()
-ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE
-ss = ctx.wrap_socket(s, server_hostname='https-test.local')
-ss.connect(('127.0.0.1', $vhost_https_port))
-req = b'POST /test HTTP/1.1\r\nHost: https-test.local\r\nContent-Length: 5\r\n\r\nhello'
-ss.sendall(req)
-data = ss.recv(4096)
-ss.close()
-if b'https-ok:hello' in data:
-    print('OK')
-else:
-    print('FAIL: unexpected response: ' + repr(data[:200]))
-" 2>&1)
+    result=$(send_https_test "$vhost_https_port" "https-test.local" "https-ok:" 5)
     if [[ "$result" == "OK" ]]; then
         pass_test "$name"
     else
@@ -3761,42 +3703,7 @@ TOML
 
     # SOCKS5 handshake + CONNECT to echo server, then echo test
     local result
-    result=$(python3 -c "
-import socket, struct, sys
-
-# Connect to SOCKS5 proxy
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(5)
-s.connect(('127.0.0.1', $proxy_port))
-
-# SOCKS5 handshake: no auth
-s.sendall(b'\x05\x01\x00')
-reply = s.recv(2)
-if reply != b'\x05\x00':
-    print('FAIL:SOCKS5_HANDSHAKE ' + str(reply))
-    sys.exit(0)
-
-# CONNECT to echo server
-host = b'\x7f\x00\x00\x01'  # 127.0.0.1
-port = struct.pack('>H', $echo_port)
-s.sendall(b'\x05\x01\x00\x01' + host + port)
-reply = s.recv(10)
-if len(reply) < 10 or reply[0] != 0x05:
-    print('FAIL:SOCKS5_CONNECT ' + str(reply[:10]))
-    sys.exit(0)
-if reply[1] != 0x00:
-    print('FAIL:SOCKS5_CONNECT_REFUSED code=' + str(reply[1]))
-    sys.exit(0)
-
-# Echo test through proxy
-s.sendall(b'socks5-test')
-data = s.recv(1024)
-if data == b'socks5-test':
-    print('OK:socks5-test')
-else:
-    print('FAIL:MISMATCH expected=socks5-test got=' + repr(data))
-s.close()
-" 2>&1) || echo "FAIL:PYTHON_ERROR"
+    result=$(send_socks5_test "$proxy_port" "$echo_port" "socks5-test" 10)
 
     if [[ "$result" == OK:* ]]; then
         pass_test "$name"
@@ -3864,42 +3771,7 @@ TOML
 
     # SOCKS5 handshake + CONNECT to echo server, then echo test
     local result
-    result=$(python3 -c "
-import socket, struct, sys
-
-# Connect to SOCKS5 proxy
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(5)
-s.connect(('127.0.0.1', $proxy_port))
-
-# SOCKS5 handshake: no auth
-s.sendall(b'\x05\x01\x00')
-reply = s.recv(2)
-if reply != b'\x05\x00':
-    print('FAIL:SOCKS5_HANDSHAKE ' + str(reply))
-    sys.exit(0)
-
-# CONNECT to echo server
-host = b'\x7f\x00\x00\x01'  # 127.0.0.1
-port = struct.pack('>H', $echo_port)
-s.sendall(b'\x05\x01\x00\x01' + host + port)
-reply = s.recv(10)
-if len(reply) < 10 or reply[0] != 0x05:
-    print('FAIL:SOCKS5_CONNECT ' + str(reply[:10]))
-    sys.exit(0)
-if reply[1] != 0x00:
-    print('FAIL:SOCKS5_CONNECT_REFUSED code=' + str(reply[1]))
-    sys.exit(0)
-
-# Echo test through proxy
-s.sendall(b'socks5-g2r-test')
-data = s.recv(1024)
-if data == b'socks5-g2r-test':
-    print('OK:socks5-g2r-test')
-else:
-    print('FAIL:MISMATCH expected=socks5-g2r-test got=' + repr(data))
-s.close()
-" 2>&1) || echo "FAIL:PYTHON_ERROR"
+    result=$(send_socks5_test "$proxy_port" "$echo_port" "socks5-g2r-test" 10)
 
     if [[ "$result" == OK:* ]]; then
         pass_test "$name"
