@@ -180,6 +180,7 @@ impl TestHarness {
             virtual_net: String::new(),
             health_check_http_headers: std::collections::HashMap::new(),
             proxy_protocol_version: String::new(),
+            enabled: true,
             }],
             ..Default::default()
         };

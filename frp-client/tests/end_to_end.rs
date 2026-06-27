@@ -160,6 +160,7 @@ async fn test_e2e_tcp_proxy_over_websocket() {
             virtual_net: String::new(),
             health_check_http_headers: std::collections::HashMap::new(),
             proxy_protocol_version: String::new(),
+            enabled: true,
         }],
         ..Default::default()
     };
@@ -285,6 +286,7 @@ async fn test_e2e_tcp_proxy_over_tls() {
             virtual_net: String::new(),
             health_check_http_headers: std::collections::HashMap::new(),
             proxy_protocol_version: String::new(),
+            enabled: true,
         }],
         ..Default::default()
     };
@@ -384,6 +386,7 @@ async fn test_e2e_tcp_proxy_over_yamux() {
             virtual_net: String::new(),
             health_check_http_headers: std::collections::HashMap::new(),
             proxy_protocol_version: String::new(),
+            enabled: true,
         }],
         ..Default::default()
     };

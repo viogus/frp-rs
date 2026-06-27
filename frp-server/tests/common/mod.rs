@@ -81,6 +81,7 @@ pub async fn raw_login(
 }
 
 /// Like raw_login but discards the stream, returning only the LoginResp.
+#[allow(dead_code)]
 pub async fn raw_login_resp(
     addr: SocketAddr,
     privilege_key: Option<String>,
