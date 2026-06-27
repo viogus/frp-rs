@@ -573,6 +573,11 @@ pub enum IoStream {
     /// Used after connection type detection when bytes have been consumed
     /// but need to be replayed (e.g., V1 type byte in non-V2 connections).
     PreRead(Vec<u8>, TcpStream),
+    /// Buffered bytes followed by an inner IoStream.
+    /// Used when V2 magic is detected on a yamux stream: if the bytes
+    /// are NOT V2 magic, they're buffered and replayed for V1 processing.
+    /// The usize tracks the current read position into the buffer.
+    BufferedRead(Vec<u8>, usize, Box<IoStream>),
 }
 
 impl std::fmt::Debug for IoStream {
@@ -587,6 +592,7 @@ impl std::fmt::Debug for IoStream {
             IoStream::Cipher(_) => f.debug_struct("IoStream::Cipher").finish_non_exhaustive(),
             IoStream::SshChannel(_) => f.debug_struct("IoStream::SshChannel").finish_non_exhaustive(),
             IoStream::PreRead(..) => f.debug_struct("IoStream::PreRead").finish_non_exhaustive(),
+            IoStream::BufferedRead(..) => f.debug_struct("IoStream::BufferedRead").finish_non_exhaustive(),
         }
     }
 }
@@ -599,6 +605,17 @@ impl tokio::io::AsyncRead for IoStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        // BufferedRead: replay buffered bytes first, then delegate to inner IoStream.
+        if let IoStream::BufferedRead(buffered_data, pos, inner) = this {
+            if *pos < buffered_data.len() {
+                let remaining = &buffered_data[*pos..];
+                let n = remaining.len().min(buf.remaining());
+                buf.put_slice(&remaining[..n]);
+                *pos += n;
+                return Poll::Ready(Ok(()));
+            }
+            return Pin::new(inner.as_mut()).poll_read(cx, buf);
+        }
         // PreRead: replay buffered bytes first, then delegate to inner TcpStream.
         if let IoStream::PreRead(pre_read, tcp) = this {
             if !pre_read.is_empty() {
@@ -618,7 +635,7 @@ impl tokio::io::AsyncRead for IoStream {
             IoStream::Yamux(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Cipher(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
-            IoStream::PreRead(_, _) => unreachable!(),
+            IoStream::PreRead(_, _) | IoStream::BufferedRead(..) => unreachable!(),
         }
     }
 }
@@ -639,6 +656,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Cipher(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
             IoStream::PreRead(_, s) => Pin::new(s).poll_write(cx, buf),
+            IoStream::BufferedRead(_, _, inner) => Pin::new(inner.as_mut()).poll_write(cx, buf),
         }
     }
 
@@ -653,6 +671,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Cipher(s) => Pin::new(s).poll_flush(cx),
             IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_flush(cx),
             IoStream::PreRead(_, s) => Pin::new(s).poll_flush(cx),
+            IoStream::BufferedRead(_, _, inner) => Pin::new(inner.as_mut()).poll_flush(cx),
         }
     }
 
@@ -667,6 +686,7 @@ impl tokio::io::AsyncWrite for IoStream {
             IoStream::Cipher(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
             IoStream::PreRead(_, s) => Pin::new(s).poll_shutdown(cx),
+            IoStream::BufferedRead(_, _, inner) => Pin::new(inner.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -684,6 +704,7 @@ impl IoStream {
             IoStream::Cipher(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::SshChannel(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::PreRead(_, s) => crate::protocol::write_msg_v1(s, msg).await,
+            IoStream::BufferedRead(_, _, inner) => crate::protocol::write_msg_v1(inner.as_mut(), msg).await,
         }
     }
 
@@ -699,6 +720,7 @@ impl IoStream {
             IoStream::Cipher(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::SshChannel(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::PreRead(..) => crate::protocol::read_msg_v1(self).await,
+            IoStream::BufferedRead(..) => crate::protocol::read_msg_v1(self).await,
         }
     }
 
@@ -714,6 +736,7 @@ impl IoStream {
             IoStream::Cipher(s) => crate::protocol::write_msg_v2(s, msg).await,
             IoStream::SshChannel(s) => crate::protocol::write_msg_v2(s, msg).await,
             IoStream::PreRead(_, s) => crate::protocol::write_msg_v2(s, msg).await,
+            IoStream::BufferedRead(_, _, inner) => crate::protocol::write_msg_v2(inner.as_mut(), msg).await,
         }
     }
 
@@ -729,6 +752,7 @@ impl IoStream {
             IoStream::Cipher(s) => crate::protocol::read_msg_v2(s).await,
             IoStream::SshChannel(s) => crate::protocol::read_msg_v2(s).await,
             IoStream::PreRead(..) => crate::protocol::read_msg_v2(self).await,
+            IoStream::BufferedRead(..) => crate::protocol::read_msg_v2(self).await,
         }
     }
 
@@ -745,6 +769,7 @@ impl IoStream {
             IoStream::Cipher(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
             IoStream::SshChannel(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
             IoStream::PreRead(_, s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            IoStream::BufferedRead(_, _, inner) => crate::protocol::write_v2_frame_raw(inner.as_mut(), frame_type, flags, payload).await,
         }
     }
 
@@ -760,6 +785,7 @@ impl IoStream {
             IoStream::Cipher(s) => crate::protocol::read_v2_frame_raw(s).await,
             IoStream::SshChannel(s) => crate::protocol::read_v2_frame_raw(s).await,
             IoStream::PreRead(..) => crate::protocol::read_v2_frame_raw(self).await,
+            IoStream::BufferedRead(..) => crate::protocol::read_v2_frame_raw(self).await,
         }
     }
 
@@ -768,6 +794,7 @@ impl IoStream {
         match self {
             IoStream::Tcp(s) => s.peer_addr().ok(),
             IoStream::PreRead(_, s) => s.peer_addr().ok(),
+            IoStream::BufferedRead(_, _, inner) => inner.peer_addr(),
             IoStream::Tls(_) | IoStream::Kcp(_) | IoStream::Quic(_) | IoStream::WebSocket(_) | IoStream::Yamux(_) | IoStream::Cipher(_) | IoStream::SshChannel(_) => None,
         }
     }
@@ -816,14 +843,26 @@ impl IoStream {
                 let (r, w) = tokio::io::split(s);
                 (Box::new(r), Box::new(w))
             }
+            IoStream::BufferedRead(buf, pos, inner) => {
+                debug_assert!(pos >= buf.len(), "into_split called before buffered bytes consumed");
+                inner.into_split()
+            }
         }
     }
 
     /// Wrap this stream in AES-128-CFB encryption for control messages.
     /// Must be called after login (the Login message is NOT encrypted).
     pub fn into_encrypted(self, key: [u8; 16]) -> Self {
-        let c = crate::cipher_stream::CipherStream::new(Box::new(self), key);
-        IoStream::Cipher(Box::new(c))
+        match self {
+            IoStream::BufferedRead(buf, pos, inner) => {
+                debug_assert!(pos >= buf.len(), "into_encrypted called before buffered bytes consumed");
+                IoStream::BufferedRead(buf, pos, Box::new(inner.into_encrypted(key)))
+            }
+            other => {
+                let c = crate::cipher_stream::CipherStream::new(Box::new(other), key);
+                IoStream::Cipher(Box::new(c))
+            }
+        }
     }
 }
 
@@ -853,6 +892,9 @@ pub struct DialOptions {
     /// Use V2 protocol framing. Client writes V2 magic bytes and performs
     /// ClientHello/ServerHello handshake. Default: false (V1).
     pub v2: bool,
+    /// When true, V2 magic is NOT written on raw TCP — the caller will write
+    /// it on the yamux stream after wrapping. Default: false.
+    pub tcp_mux: bool,
 }
 
 impl Default for DialOptions {
@@ -873,6 +915,7 @@ impl Default for DialOptions {
             bind_addr: None,
             proxy_url: None,
             v2: false,
+            tcp_mux: false,
         }
     }
 }
@@ -1217,7 +1260,8 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
     };
 
     // Write V2 magic BEFORE any TLS/WS/yamux upgrade (Go frp WriteMagicIfV2).
-    if opts.v2 {
+    // Skip when tcpMux is enabled — magic goes on the yamux stream instead.
+    if opts.v2 && !opts.tcp_mux {
         crate::protocol::write_v2_magic(&mut stream).await?;
     }
 

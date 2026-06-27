@@ -3448,11 +3448,21 @@ test_g2r_v2_tcp() {
     local name="go-to-rust-v2-tcp"
     should_run_test "$name" || return 0
 
-    # Check if Go frp binary supports V2 protocol
-    if ! "$GO_FRPC" --help 2>&1 | grep -q "wireProtocol" && ! "$GO_FRPS" --help 2>&1 | grep -q "wireProtocol"; then
+    # Check if Go frp binary supports V2 protocol.
+    # --help doesn't list wireProtocol, so test by parsing a minimal config.
+    local _v2_test_cfg="$TEST_DIR/.v2-capability-check.toml"
+    cat > "$_v2_test_cfg" <<'V2CHECK'
+serverAddr = "127.0.0.1"
+serverPort = 1
+transport.wireProtocol = "v2"
+V2CHECK
+    if "$GO_FRPC" -c "$_v2_test_cfg" --help >/dev/null 2>&1; then :; fi
+    if "$GO_FRPC" -c "$_v2_test_cfg" 2>&1 | grep -q "unknown field"; then
         log "SKIP $name: Go binary lacks V2 support, compile from source for this test"
+        rm -f "$_v2_test_cfg"
         return 0
     fi
+    rm -f "$_v2_test_cfg"
 
     log "=== $name ==="
     local frps_port=$(random_port)
@@ -3514,11 +3524,21 @@ test_r2g_v2_tcp() {
     local name="rust-to-go-v2-tcp"
     should_run_test "$name" || return 0
 
-    # Check if Go frp binary supports V2 protocol
-    if ! "$GO_FRPC" --help 2>&1 | grep -q "wireProtocol" && ! "$GO_FRPS" --help 2>&1 | grep -q "wireProtocol"; then
+    # Check if Go frp binary supports V2 protocol.
+    # --help doesn't list wireProtocol, so test by parsing a minimal config.
+    local _v2_test_cfg="$TEST_DIR/.v2-capability-check.toml"
+    cat > "$_v2_test_cfg" <<'V2CHECK'
+serverAddr = "127.0.0.1"
+serverPort = 1
+transport.wireProtocol = "v2"
+V2CHECK
+    if "$GO_FRPC" -c "$_v2_test_cfg" --help >/dev/null 2>&1; then :; fi
+    if "$GO_FRPC" -c "$_v2_test_cfg" 2>&1 | grep -q "unknown field"; then
         log "SKIP $name: Go binary lacks V2 support, compile from source for this test"
+        rm -f "$_v2_test_cfg"
         return 0
     fi
+    rm -f "$_v2_test_cfg"
 
     log "=== $name ==="
     local frps_port=$(random_port)

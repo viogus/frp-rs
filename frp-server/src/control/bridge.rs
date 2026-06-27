@@ -321,6 +321,11 @@ pub(crate) async fn assign_work_to_proxy(
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
                 }
+                IoStream::BufferedRead(_, _, inner) => {
+                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (w_r, w_w) = inner.into_split();
+                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
+                }
             }
         } else {
             // Write VHost pre-read bytes to work connection first (plain).
@@ -336,6 +341,7 @@ pub(crate) async fn assign_work_to_proxy(
                     IoStream::Yamux(ref mut s) => s.write_all(&pre_read).await,
                     IoStream::Kcp(ref mut s) => s.write_all(&pre_read).await,
                     IoStream::Quic(ref mut s) => s.write_all(&pre_read).await,
+                    IoStream::BufferedRead(_, _, ref mut inner) => inner.as_mut().write_all(&pre_read).await,
                     _ => Ok(()),
                 };
                 if let Err(e) = write_result {

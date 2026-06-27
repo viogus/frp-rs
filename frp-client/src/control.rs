@@ -119,6 +119,7 @@ impl ControlConnection {
             bind_addr: self.bind_addr.clone(),
             proxy_url: if self.proxy_url.is_empty() { None } else { Some(self.proxy_url.clone()) },
             v2: self.v2,
+            tcp_mux: propose_mux,
             ..Default::default()
         };
 
@@ -172,6 +173,11 @@ impl ControlConnection {
 
         // V2: ClientHello/ServerHello handshake on yamux-wrapped stream.
         if self.v2 {
+            // When tcpMux is enabled, write V2 magic on the yamux stream
+            // (not on raw TCP). Go frp does: yamux wrap -> write magic -> handshake.
+            if propose_mux {
+                frp_core::protocol::write_v2_magic(&mut io_stream).await?;
+            }
             let transport_name = match self.transport_protocol {
                 TransportProtocol::Tcp => "tcp",
                 TransportProtocol::Kcp => "kcp",

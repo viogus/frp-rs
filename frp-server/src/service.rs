@@ -756,24 +756,86 @@ impl Service {
                                         Ok((control_stream, incoming)) => {
                                             let mut io = IoStream::Yamux(control_stream);
                                             info!("Yamux over TLS session established for {:?}", addr);
-                                            match read_msg_v1(&mut io).await {
-                                                Ok(FrpMessage::Login(login)) => {
-                                                    control::handle_control(io, login, state, Some(addr), Some(incoming), false).await;
+
+                                            // Try V2 detection on yamux stream (Go frp: magic on stream)
+                                            let mut magic = [0u8; 7];
+                                            let is_v2 = match io.read_exact(&mut magic).await {
+                                                Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                                Err(_) => false,
+                                            };
+                                            if is_v2 {
+                                                // V2 detected on TLS+yamux stream
+                                                let msg_payload = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                    Ok(Some(p)) => p,
+                                                    Ok(None) => {
+                                                        match io.read_raw_v2_frame().await {
+                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => p,
+                                                            Ok((ft, _, _)) => {
+                                                                warn!("Unexpected frame type {} after V2 TLS+yamux handshake from {}", ft, addr);
+                                                                return;
+                                                            }
+                                                            Err(e) => {
+                                                                warn!("Failed to read V2 message after TLS+yamux handshake from {}: {}", addr, e);
+                                                                return;
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("V2 TLS+yamux handshake error from {}: {}", addr, e);
+                                                        return;
+                                                    }
+                                                };
+                                                if msg_payload.len() < 2 {
+                                                    warn!("V2 message payload too short from {}", addr);
+                                                    return;
                                                 }
-                                                Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                    handle_work_conn_inner(io, nwc, state).await;
+                                                let type_id = u16::from_be_bytes([msg_payload[0], msg_payload[1]]);
+                                                let msg = match frp_core::protocol::deserialize_v2(type_id, &msg_payload[2..]) {
+                                                    Ok(m) => m,
+                                                    Err(e) => {
+                                                        warn!("Failed to decode V2 TLS+yamux message from {}: {}", addr, e);
+                                                        return;
+                                                    }
+                                                };
+                                                match msg {
+                                                    FrpMessage::Login(login) => {
+                                                        control::handle_control(io, login, state, Some(addr), Some(incoming), true).await;
+                                                    }
+                                                    FrpMessage::NewWorkConn(nwc) => {
+                                                        handle_work_conn_inner(io, nwc, state).await;
+                                                    }
+                                                    FrpMessage::NewVisitorConn(vc) => {
+                                                        handle_visitor_conn_inner(io, vc, state).await;
+                                                    }
+                                                    FrpMessage::NatHoleVisitor(nhv) => {
+                                                        handle_nat_hole_visitor(io, nhv, state, None).await;
+                                                    }
+                                                    other => {
+                                                        warn!("Unexpected V2 TLS+yamux first message from {:?}: {:?}", addr, other.v2_type_id());
+                                                    }
                                                 }
-                                                Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                    handle_visitor_conn_inner(io, nvc, state).await;
-                                                }
-                                                Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                    handle_nat_hole_visitor(io, nhv, state, None).await;
-                                                }
-                                                Ok(other) => {
-                                                    warn!("Unexpected TLS+yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
-                                                }
-                                                Err(e) => {
-                                                    warn!("TLS+yamux read error from {}: {}", addr, e);
+                                            } else {
+                                                // Not V2. Replay consumed bytes for V1 processing.
+                                                let mut io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
+                                                match read_msg_v1(&mut io).await {
+                                                    Ok(FrpMessage::Login(login)) => {
+                                                        control::handle_control(io, login, state, Some(addr), Some(incoming), false).await;
+                                                    }
+                                                    Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                        handle_work_conn_inner(io, nwc, state).await;
+                                                    }
+                                                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                        handle_visitor_conn_inner(io, nvc, state).await;
+                                                    }
+                                                    Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                        handle_nat_hole_visitor(io, nhv, state, None).await;
+                                                    }
+                                                    Ok(other) => {
+                                                        warn!("Unexpected TLS+yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("TLS+yamux read error from {}: {}", addr, e);
+                                                    }
                                                 }
                                             }
                                         }
@@ -1015,24 +1077,88 @@ impl Service {
                                         Ok((control_stream, incoming)) => {
                                             let mut io = IoStream::Yamux(control_stream);
                                             info!("Yamux session established for {:?}", addr);
-                                            match read_msg_v1(&mut io).await {
-                                                Ok(FrpMessage::Login(login)) => {
-                                                    control::handle_control(io, login, state, Some(addr), Some(incoming), false).await;
+
+                                            // Try V2 detection: read 7 magic bytes from yamux stream.
+                                            // Go frp sends V2 magic on yamux stream (not raw TCP) when tcpMux.
+                                            let mut magic = [0u8; 7];
+                                            let is_v2 = match io.read_exact(&mut magic).await {
+                                                Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                                Err(_) => false,
+                                            };
+                                            if is_v2 {
+                                                // V2 detected on yamux stream! Do V2 handshake + dispatch
+                                                let msg_payload = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                    Ok(Some(p)) => p,
+                                                    Ok(None) => {
+                                                        match io.read_raw_v2_frame().await {
+                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => p,
+                                                            Ok((ft, _, _)) => {
+                                                                warn!("Unexpected frame type {} after V2 handshake from {}", ft, addr);
+                                                                return;
+                                                            }
+                                                            Err(e) => {
+                                                                warn!("Failed to read V2 message after handshake from {}: {}", addr, e);
+                                                                return;
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("V2 handshake error from {}: {}", addr, e);
+                                                        return;
+                                                    }
+                                                };
+                                                // Decode and dispatch
+                                                if msg_payload.len() < 2 {
+                                                    warn!("V2 message payload too short from {}", addr);
+                                                    return;
                                                 }
-                                                Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                    handle_work_conn_inner(io, nwc, state).await;
+                                                let type_id = u16::from_be_bytes([msg_payload[0], msg_payload[1]]);
+                                                let msg = match frp_core::protocol::deserialize_v2(type_id, &msg_payload[2..]) {
+                                                    Ok(m) => m,
+                                                    Err(e) => {
+                                                        warn!("Failed to decode V2 message from {}: {}", addr, e);
+                                                        return;
+                                                    }
+                                                };
+                                                match msg {
+                                                    FrpMessage::Login(login) => {
+                                                        control::handle_control(io, login, state, Some(addr), Some(incoming), true).await;
+                                                    }
+                                                    FrpMessage::NewWorkConn(nwc) => {
+                                                        handle_work_conn_inner(io, nwc, state).await;
+                                                    }
+                                                    FrpMessage::NewVisitorConn(vc) => {
+                                                        handle_visitor_conn_inner(io, vc, state).await;
+                                                    }
+                                                    FrpMessage::NatHoleVisitor(nhv) => {
+                                                        handle_nat_hole_visitor(io, nhv, state, None).await;
+                                                    }
+                                                    other => {
+                                                        warn!("Unexpected V2+yamux first message from {:?}: {:?}", addr, other.v2_type_id());
+                                                    }
                                                 }
-                                                Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                    handle_visitor_conn_inner(io, nvc, state).await;
-                                                }
-                                                Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                    handle_nat_hole_visitor(io, nhv, state, None).await;
-                                                }
-                                                Ok(other) => {
-                                                    warn!("Unexpected yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
-                                                }
-                                                Err(e) => {
-                                                    warn!("Failed to read yamux first message from {}: {}", addr, e);
+                                            } else {
+                                                // Not V2. Replay consumed bytes and process as V1.
+                                                let mut io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
+                                                match read_msg_v1(&mut io).await {
+                                                    Ok(FrpMessage::Login(login)) => {
+                                                        control::handle_control(io, login, state, Some(addr), Some(incoming), false).await;
+                                                    }
+                                                    Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                        handle_work_conn_inner(io, nwc, state).await;
+                                                    }
+                                                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                        handle_visitor_conn_inner(io, nvc, state).await;
+                                                    }
+                                                    Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                        handle_nat_hole_visitor(io, nhv, state, None).await;
+                                                    }
+                                                    Ok(other) => {
+                                                        warn!("Unexpected yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("Failed to read yamux first message from {}: {}", addr, e);
+                                                    }
                                                 }
                                             }
                                         }
