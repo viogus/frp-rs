@@ -1,4 +1,3 @@
-use tokio::net::UnixStream;
 use tracing::debug;
 
 use frp_core::config::PluginConfig;
@@ -11,7 +10,9 @@ use super::PluginHandle;
 /// Config: plugin_local_addr = "/var/run/docker.sock"
 ///
 /// Go frp compat: UnixDomainSocketPlugin.
+#[cfg(unix)]
 pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle, frp_core::Error> {
+    use tokio::net::UnixStream;
     let path = if !cfg.local_addr.is_empty() {
         cfg.local_addr.clone()
     } else {
@@ -77,4 +78,11 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
         _task: task,
         shutdown: Some(shutdown_tx),
     })
+}
+
+#[cfg(not(unix))]
+pub async fn start_unix_socket_plugin(_cfg: &PluginConfig) -> Result<PluginHandle, frp_core::Error> {
+    Err(frp_core::Error::Transport(
+        "unix_domain_socket plugin is not supported on this platform".into(),
+    ))
 }
