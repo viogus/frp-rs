@@ -7,3 +7,4 @@ pub mod nat_hole;
 pub mod tcpmux;
 pub mod metrics;
 pub mod plugin;
+pub mod ssh_gateway;
