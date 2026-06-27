@@ -119,6 +119,7 @@ impl TestHarness {
     ///
     /// `use_encryption` enables AES-128-CFB on the proxy.
     /// `token` is the shared auth token (empty = no auth).
+    #[allow(dead_code)]
     pub async fn new(use_encryption: bool, token: &str) -> Self {
         init_tracing();
         let echo_port = allocate_port();
