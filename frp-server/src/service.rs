@@ -573,6 +573,11 @@ impl Service {
             loop {
                 interval.tick().await;
                 nat_hole.expire_sessions(Duration::from_secs(120)).await;
+                // Clean expired analyzer entries to prevent unbounded memory growth.
+                let (removed, total) = nat_hole.analyzer.clean();
+                if removed > 0 {
+                    tracing::debug!("Analyzer cleanup: removed {}/{} expired entries", removed, total);
+                }
             }
         });
 
@@ -1255,6 +1260,17 @@ async fn handle_nat_hole_visitor(
         )
         .await;
 
+    // --- Step 2: Set up notify channel BEFORE sending to provider ---
+    // Must happen before the provider notification to avoid a race:
+    // if the provider responds with NatHoleClient before we set up
+    // notify_rx, the signal is lost and we timeout spuriously.
+    let notify_rx = {
+        let mut guard = session.notify_ch.lock().await;
+        let (tx, rx) = oneshot::channel();
+        *guard = Some(tx);
+        rx
+    };
+
     // Send NatHoleClient to provider (notification + address info)
     if ctl_tx
         .tx
@@ -1275,20 +1291,13 @@ async fn handle_nat_hole_visitor(
         proxy_name, sid
     );
 
-    // --- Step 2: Wait for provider's NatHoleClient with STUN addresses ---
+    // Wait for provider's NatHoleClient with STUN addresses.
     // The provider's control handler will do STUN discovery and send
     // NatHoleClient back with mapped_addrs/assisted_addrs.
     // handle_client() signals notify_ch when the message arrives.
 
-    let notify_rx = {
-        let mut guard = session.notify_ch.lock().await;
-        let (tx, rx) = oneshot::channel();
-        *guard = Some(tx);
-        rx
-    };
-
     let client_msg_received = tokio::time::timeout(
-        Duration::from_secs(NAT_HOLE_TIMEOUT as u64),
+        Duration::from_secs(NAT_HOLE_TIMEOUT),
         notify_rx,
     )
     .await;

@@ -47,6 +47,9 @@ pub fn classify_nat_feature(addresses: &[String], local_ips: &[String]) -> Resul
     let first_port: i32 = first_parts[0]
         .parse()
         .map_err(|_| format!("invalid port in: {}", addresses[0]))?;
+    if !(0..=65535).contains(&first_port) {
+        return Err(format!("port out of range (0-65535): {}", addresses[0]));
+    }
 
     port_max = port_max.max(first_port);
     port_min = port_min.min(first_port);
@@ -66,6 +69,9 @@ pub fn classify_nat_feature(addresses: &[String], local_ips: &[String]) -> Resul
         let port: i32 = parts[0]
             .parse()
             .map_err(|_| format!("invalid port in: {}", addr))?;
+        if !(0..=65535).contains(&port) {
+            return Err(format!("port out of range (0-65535): {}", addr));
+        }
 
         if ip != first_ip {
             ip_changed = true;

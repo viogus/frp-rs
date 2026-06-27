@@ -10,7 +10,7 @@ use super::classify::{classify_feature_count, NatFeature};
 
 /// Recommended hole-punch behavior for one peer.
 #[derive(Debug, Clone)]
-pub struct RecommandBehavior {
+pub struct RecommendBehavior {
     pub role: String,            // "sender" or "receiver"
     pub ttl: i32,
     pub send_delay_ms: i32,
@@ -18,6 +18,133 @@ pub struct RecommandBehavior {
     pub ports_random_number: i32,
     pub listen_random_ports: i32,
 }
+
+// --------------- Behavior Tables (Go frp v0.69.1 compat) ---------------
+
+/// Number of entries per mode.
+const MODE_COUNTS: [usize; 5] = [10, 6, 3, 6, 3];
+
+/// All behavior pairs indexed by (mode, index).
+type BehaviorPair = (RecommendBehavior, RecommendBehavior);
+
+/// Mode 0: Both EasyNAT — 10 entries.
+/// Alternates sender/receiver roles. TTL and send_delay_ms vary.
+fn mode0_table() -> &'static [BehaviorPair] {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Vec<BehaviorPair>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        vec![
+            (sender(0, 0, 0, 0, 0),  receiver(7, 0, 0, 0, 0)),
+            (receiver(7, 0, 0, 0, 0), sender(0, 0, 0, 0, 0)),
+            (sender(0, 0, 0, 0, 0),  receiver(4, 0, 0, 0, 0)),
+            (receiver(4, 0, 0, 0, 0), sender(0, 0, 0, 0, 0)),
+            (sender(0, 0, 0, 0, 0),  receiver(0, 0, 0, 0, 0)),
+            (receiver(0, 0, 0, 0, 0), sender(0, 0, 0, 0, 0)),
+            (sender(0, 5000, 0, 0, 0), receiver(0, 0, 0, 0, 0)),
+            (sender(0, 10000, 0, 0, 0), receiver(0, 0, 0, 0, 0)),
+            (receiver(0, 0, 0, 0, 0), sender(0, 5000, 0, 0, 0)),
+            (receiver(0, 0, 0, 0, 0), sender(0, 10000, 0, 0, 0)),
+        ]
+    })
+}
+
+/// Mode 1: HardNAT sender, EasyNAT receiver, regular port changes — 6 entries.
+fn mode1_table() -> &'static [BehaviorPair] {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Vec<BehaviorPair>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        vec![
+            (sender(0, 0, 0, 0, 0),      recv_ports(7, 0, 10)),
+            (sender(0, 2000, 0, 0, 0),    recv_ports(7, 0, 10)),
+            (sender(0, 0, 0, 0, 0),      recv_ports(4, 0, 10)),
+            (sender(0, 2000, 0, 0, 0),    recv_ports(4, 0, 10)),
+            (sender(0, 0, 0, 0, 0),      recv_ports(0, 0, 10)),
+            (sender(0, 2000, 0, 0, 0),    recv_ports(0, 0, 10)),
+        ]
+    })
+}
+
+/// Mode 2: HardNAT receiver, EasyNAT sender — 3 entries.
+fn mode2_table() -> &'static [BehaviorPair] {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Vec<BehaviorPair>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        vec![
+            (sender_port(3000, 1000, 0),  recv_listen(7, 256)),
+            (sender_port(3000, 1000, 0),  recv_listen(4, 256)),
+            (sender_port(3000, 1000, 0),  recv_listen(0, 256)),
+        ]
+    })
+}
+
+/// Mode 3: Both HardNAT, both regular port changes — 6 entries.
+/// First 3: A is sender, B is receiver. Last 3: A is receiver, B is sender.
+fn mode3_table() -> &'static [BehaviorPair] {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Vec<BehaviorPair>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        vec![
+            (send_ports(0, 10),   recv_ports(7, 0, 10)),
+            (send_ports(0, 10),   recv_ports(4, 0, 10)),
+            (send_ports(0, 10),   recv_ports(0, 0, 10)),
+            (recv_ports(7, 0, 10), send_ports(0, 10)),
+            (recv_ports(4, 0, 10), send_ports(0, 10)),
+            (recv_ports(0, 0, 10), send_ports(0, 10)),
+        ]
+    })
+}
+
+/// Mode 4: Regular ports change peer is usually sender — 3 entries.
+fn mode4_table() -> &'static [BehaviorPair] {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Vec<BehaviorPair>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        vec![
+            (sender_port(3000, 1000, 0),  recv_listen_ports(7, 256, 2)),
+            (sender_port(3000, 1000, 0),  recv_listen_ports(4, 256, 2)),
+            (sender_port(3000, 1000, 0),  recv_listen_ports(0, 256, 2)),
+        ]
+    })
+}
+
+// --- Helper constructors for table entries ---
+
+fn sender(ttl: i32, delay: i32, prn: i32, prnn: i32, lrp: i32) -> RecommendBehavior {
+    RecommendBehavior { role: "sender".into(), ttl, send_delay_ms: delay,
+        ports_range_number: prn, ports_random_number: prnn, listen_random_ports: lrp }
+}
+
+fn receiver(ttl: i32, delay: i32, prn: i32, prnn: i32, lrp: i32) -> RecommendBehavior {
+    RecommendBehavior { role: "receiver".into(), ttl, send_delay_ms: delay,
+        ports_range_number: prn, ports_random_number: prnn, listen_random_ports: lrp }
+}
+
+fn recv_ports(ttl: i32, delay: i32, prn: i32) -> RecommendBehavior {
+    RecommendBehavior { role: "receiver".into(), ttl, send_delay_ms: delay,
+        ports_range_number: prn, ports_random_number: 0, listen_random_ports: 0 }
+}
+
+fn send_ports(ttl: i32, prn: i32) -> RecommendBehavior {
+    RecommendBehavior { role: "sender".into(), ttl, send_delay_ms: 0,
+        ports_range_number: prn, ports_random_number: 0, listen_random_ports: 0 }
+}
+
+fn sender_port(delay: i32, prnn: i32, lrp: i32) -> RecommendBehavior {
+    RecommendBehavior { role: "sender".into(), ttl: 0, send_delay_ms: delay,
+        ports_range_number: 0, ports_random_number: prnn, listen_random_ports: lrp }
+}
+
+fn recv_listen(ttl: i32, lrp: i32) -> RecommendBehavior {
+    RecommendBehavior { role: "receiver".into(), ttl, send_delay_ms: 0,
+        ports_range_number: 0, ports_random_number: 0, listen_random_ports: lrp }
+}
+
+fn recv_listen_ports(ttl: i32, lrp: i32, prn: i32) -> RecommendBehavior {
+    RecommendBehavior { role: "receiver".into(), ttl, send_delay_ms: 0,
+        ports_range_number: prn, ports_random_number: 0, listen_random_ports: lrp }
+}
+
+// --------------- Scoring and Records ---------------
 
 /// Score entry for a specific (mode, index) behavior pair.
 #[derive(Debug, Clone)]
@@ -34,6 +161,8 @@ struct MakeHoleRecords {
 }
 
 impl MakeHoleRecords {
+    /// Create records from client and visitor NAT features.
+    /// Scoring logic matches Go frp v0.69.1 newMakeHoleRecordsWithClock.
     fn new(c_feature: &NatFeature, v_feature: &NatFeature) -> Self {
         let features = vec![c_feature.clone(), v_feature.clone()];
         let (easy_count, hard_count, ports_changed_regular_count) =
@@ -41,40 +170,54 @@ impl MakeHoleRecords {
 
         let mut scores = Vec::new();
 
-        if easy_count == 2 {
-            // Both easy NAT: mode 0 only
-            scores.push(BehaviorScore { mode: 0, index: 0, score: 1 });
-        } else if hard_count == 1 && ports_changed_regular_count == 1 {
-            // One hard with regular port change
-            scores.push(BehaviorScore { mode: 1, index: 0, score: 1 });
-            scores.push(BehaviorScore { mode: 2, index: 0, score: 1 });
-            scores.push(BehaviorScore { mode: 0, index: 0, score: 0 });
-        } else if hard_count == 1 && ports_changed_regular_count == 0 {
-            // One hard without regular port change
-            scores.push(BehaviorScore { mode: 2, index: 0, score: 1 });
-            scores.push(BehaviorScore { mode: 1, index: 0, score: 1 });
-            scores.push(BehaviorScore { mode: 0, index: 0, score: 0 });
-        } else if hard_count == 2 && ports_changed_regular_count == 2 {
-            // Both hard, both regular
-            scores.push(BehaviorScore { mode: 3, index: 0, score: 1 });
-            scores.push(BehaviorScore { mode: 4, index: 0, score: 1 });
-        } else if hard_count == 2 && ports_changed_regular_count == 1 {
-            // Both hard, one regular
-            scores.push(BehaviorScore { mode: 4, index: 0, score: 1 });
-        } else {
-            // Fallback
-            scores.push(BehaviorScore { mode: 0, index: 0, score: 1 });
-            scores.push(BehaviorScore { mode: 1, index: 0, score: 1 });
-            scores.push(BehaviorScore { mode: 3, index: 0, score: 1 });
-        }
-
-        // Public network overrides: if client has public network, swap sender/receiver
-        if c_feature.public_network {
-            for s in &mut scores {
-                if s.mode == 0 || s.mode == 1 || s.mode == 3 {
-                    s.score = 1;
+        // Helper: append mode-0 entries with PublicNetwork-aware scoring.
+        // Go frp: if c.PublicNetwork → client always receiver (sender=0, receiver=1).
+        //         if v.PublicNetwork → client always sender (sender=1, receiver=0).
+        //         else → all scores 0.
+        let append_mode0 = |scores: &mut Vec<BehaviorScore>, c_pub: bool, v_pub: bool| {
+            for i in 0..MODE_COUNTS[0] as i32 {
+                if c_pub {
+                    scores.push(BehaviorScore { mode: 0, index: i, score: 0 });
+                } else if v_pub {
+                    scores.push(BehaviorScore { mode: 0, index: i, score: 1 });
+                } else {
+                    scores.push(BehaviorScore { mode: 0, index: i, score: 0 });
                 }
             }
+        };
+
+        // Helper: append all entries for a mode with uniform score.
+        let append_mode = |scores: &mut Vec<BehaviorScore>, mode: i32, score: i32| {
+            for i in 0..MODE_COUNTS[mode as usize] as i32 {
+                scores.push(BehaviorScore { mode, index: i, score });
+            }
+        };
+
+        if easy_count == 2 {
+            // Both easy NAT: mode 0 only, with PublicNetwork-aware scoring.
+            append_mode0(&mut scores, c_feature.public_network, v_feature.public_network);
+        } else if hard_count == 1 && ports_changed_regular_count == 1 {
+            // One hard with regular port change: mode1, mode2, mode0.
+            append_mode(&mut scores, 1, 1);
+            append_mode(&mut scores, 2, 1);
+            append_mode0(&mut scores, c_feature.public_network, v_feature.public_network);
+        } else if hard_count == 1 && ports_changed_regular_count == 0 {
+            // One hard without regular port change: mode2, mode1, mode0.
+            append_mode(&mut scores, 2, 1);
+            append_mode(&mut scores, 1, 1);
+            append_mode0(&mut scores, c_feature.public_network, v_feature.public_network);
+        } else if hard_count == 2 && ports_changed_regular_count == 2 {
+            // Both hard, both regular: mode3, mode4.
+            append_mode(&mut scores, 3, 1);
+            append_mode(&mut scores, 4, 1);
+        } else if hard_count == 2 && ports_changed_regular_count == 1 {
+            // Both hard, one regular: mode4 only.
+            append_mode(&mut scores, 4, 1);
+        } else {
+            // Fallback: single-entry modes 0, 1, 3 with score 1.
+            scores.push(BehaviorScore { mode: 0, index: 0, score: 1 });
+            scores.push(BehaviorScore { mode: 1, index: 0, score: 1 });
+            scores.push(BehaviorScore { mode: 3, index: 0, score: 1 });
         }
 
         MakeHoleRecords {
@@ -83,7 +226,7 @@ impl MakeHoleRecords {
         }
     }
 
-    /// Select highest-scored behavior, decrement it to rotate choices.
+    /// Select highest-scored (mode, index), decrement it to rotate choices.
     fn recommand(&mut self) -> (i32, i32) {
         if self.scores.is_empty() {
             return (0, 0);
@@ -100,7 +243,7 @@ impl MakeHoleRecords {
         (self.scores[best_idx].mode, self.scores[best_idx].index)
     }
 
-    /// Report success: boost the matching (mode, index) score.
+    /// Report success: boost the matching (mode, index) score, max +2 cap at 10.
     fn report_success(&mut self, mode: i32, index: i32) {
         for s in &mut self.scores {
             if s.mode == mode && s.index == index {
@@ -112,94 +255,27 @@ impl MakeHoleRecords {
     }
 }
 
-/// Predefined behavior tables for each mode.
-/// Each mode has a list of (behavior_a, behavior_b) pairs.
-/// Which peer gets which behavior is determined by role swap rules.
-fn get_behavior_by_mode_and_index(mode: i32, index: i32) -> (RecommandBehavior, RecommandBehavior) {
+// --------------- Behavior Lookup ---------------
+
+/// Look up the behavior pair for a given (mode, index).
+fn get_behavior_by_mode_and_index(mode: i32, index: i32) -> (RecommendBehavior, RecommendBehavior) {
     let idx = index as usize;
-    match mode {
-        0 => {
-            let behaviors = vec![(
-                RecommandBehavior {
-                    role: "sender".into(), ttl: 0, send_delay_ms: 2000,
-                    ports_range_number: 16, ports_random_number: 4, listen_random_ports: 0,
-                },
-                RecommandBehavior {
-                    role: "receiver".into(), ttl: 0, send_delay_ms: 0,
-                    ports_range_number: 0, ports_random_number: 0, listen_random_ports: 0,
-                },
-            )];
-            behaviors.get(idx).cloned().unwrap_or_else(|| behaviors[0].clone())
-        }
-        1 => {
-            // HardNAT is sender, EasyNAT is receiver
-            let behaviors = vec![(
-                RecommandBehavior {
-                    role: "sender".into(), ttl: 4, send_delay_ms: 2000,
-                    ports_range_number: 48, ports_random_number: 4, listen_random_ports: 0,
-                },
-                RecommandBehavior {
-                    role: "receiver".into(), ttl: 0, send_delay_ms: 0,
-                    ports_range_number: 0, ports_random_number: 0, listen_random_ports: 4,
-                },
-            )];
-            behaviors.get(idx).cloned().unwrap_or_else(|| behaviors[0].clone())
-        }
-        2 => {
-            // HardNAT is receiver, EasyNAT is sender
-            let behaviors = vec![(
-                RecommandBehavior {
-                    role: "sender".into(), ttl: 4, send_delay_ms: 2000,
-                    ports_range_number: 48, ports_random_number: 4, listen_random_ports: 4,
-                },
-                RecommandBehavior {
-                    role: "receiver".into(), ttl: 0, send_delay_ms: 0,
-                    ports_range_number: 0, ports_random_number: 0, listen_random_ports: 0,
-                },
-            )];
-            behaviors.get(idx).cloned().unwrap_or_else(|| behaviors[0].clone())
-        }
-        3 => {
-            let behaviors = vec![(
-                RecommandBehavior {
-                    role: "sender".into(), ttl: 4, send_delay_ms: 2000,
-                    ports_range_number: 48, ports_random_number: 4, listen_random_ports: 4,
-                },
-                RecommandBehavior {
-                    role: "receiver".into(), ttl: 0, send_delay_ms: 0,
-                    ports_range_number: 0, ports_random_number: 0, listen_random_ports: 4,
-                },
-            )];
-            behaviors.get(idx).cloned().unwrap_or_else(|| behaviors[0].clone())
-        }
-        4 => {
-            // Regular ports change peer is sender
-            let behaviors = vec![(
-                RecommandBehavior {
-                    role: "sender".into(), ttl: 4, send_delay_ms: 2000,
-                    ports_range_number: 48, ports_random_number: 4, listen_random_ports: 4,
-                },
-                RecommandBehavior {
-                    role: "receiver".into(), ttl: 0, send_delay_ms: 0,
-                    ports_range_number: 0, ports_random_number: 0, listen_random_ports: 0,
-                },
-            )];
-            behaviors.get(idx).cloned().unwrap_or_else(|| behaviors[0].clone())
-        }
-        _ => {
-            // Default fallback: mode 0
-            let b = RecommandBehavior {
-                role: "sender".into(), ttl: 0, send_delay_ms: 2000,
-                ports_range_number: 16, ports_random_number: 4, listen_random_ports: 0,
-            };
-            let b2 = RecommandBehavior {
-                role: "receiver".into(), ttl: 0, send_delay_ms: 0,
-                ports_range_number: 0, ports_random_number: 0, listen_random_ports: 0,
-            };
-            (b, b2)
-        }
-    }
+    let table: &[BehaviorPair] = match mode {
+        0 => mode0_table(),
+        1 => mode1_table(),
+        2 => mode2_table(),
+        3 => mode3_table(),
+        4 => mode4_table(),
+        _ => return default_fallback(),
+    };
+    table.get(idx).cloned().unwrap_or_else(default_fallback)
 }
+
+fn default_fallback() -> (RecommendBehavior, RecommendBehavior) {
+    (sender(0, 2000, 16, 4, 0), receiver(0, 0, 0, 0, 0))
+}
+
+// --------------- Analyzer ---------------
 
 /// Central analyzer: stores scored behavior histories keyed by NAT feature hash.
 pub struct Analyzer {
@@ -217,12 +293,13 @@ impl Analyzer {
 
     /// Get recommended behaviors for a hole-punch session.
     /// Returns (mode, index, c_behavior, v_behavior).
+    /// Role swap rules are applied per Go frp v0.69.1.
     pub fn get_recommand_behaviors(
         &self,
         key: &str,
         c_feature: &NatFeature,
         v_feature: &NatFeature,
-    ) -> (i32, i32, RecommandBehavior, RecommandBehavior) {
+    ) -> (i32, i32, RecommendBehavior, RecommendBehavior) {
         let (mode, index) = {
             let mut records = self.records.lock().unwrap();
             let entry = records
@@ -233,7 +310,7 @@ impl Analyzer {
 
         let (mut c_behavior, mut v_behavior) = get_behavior_by_mode_and_index(mode, index);
 
-        // Role swap rules per mode
+        // Role swap rules per mode (Go frp v0.69.1 compat).
         match mode {
             1 => {
                 // Mode 1: HardNAT is always sender. If client is EasyNAT, swap.
@@ -247,14 +324,17 @@ impl Analyzer {
                     std::mem::swap(&mut c_behavior, &mut v_behavior);
                 }
             }
+            3 => {
+                // Mode 3: No swap in default (first 3 entries have A=sender).
+                // Entries 3-5 have A=receiver, B=sender — already swapped in table.
+            }
             4 => {
                 // Mode 4: Regular ports change peer is always sender.
-                // If client lacks regular ports change, swap.
                 if !c_feature.regular_ports_change {
                     std::mem::swap(&mut c_behavior, &mut v_behavior);
                 }
             }
-            _ => {} // Modes 0, 3: no swap needed
+            _ => {} // Mode 0: behaviors already alternate in table
         }
 
         (mode, index, c_behavior, v_behavior)
@@ -278,6 +358,8 @@ impl Analyzer {
     }
 }
 
+// --------------- Tests ---------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +374,7 @@ mod tests {
 
         let (mode, _, cb, vb) = analyzer.get_recommand_behaviors("test-key", &cf, &vf);
         assert_eq!(mode, 0);
+        // First entry: sender then receiver with TTL 7
         assert_eq!(cb.role, "sender");
         assert_eq!(vb.role, "receiver");
     }
@@ -320,5 +403,36 @@ mod tests {
         analyzer.get_recommand_behaviors("test-key", &cf, &vf);
         let (removed, _total) = analyzer.clean();
         assert!(removed > 0);
+    }
+
+    #[test]
+    fn test_mode_0_has_10_entries() {
+        // Verify we can cycle through all 10 mode-0 entries
+        let analyzer = Analyzer::new(Duration::from_secs(3600));
+        let addrs = vec!["1.2.3.4:1234".into(), "1.2.3.4:1234".into()];
+        let cf = classify_nat_feature(&addrs, &[]).unwrap();
+        let vf = classify_nat_feature(&addrs, &[]).unwrap();
+
+        let mut seen_indices = std::collections::HashSet::new();
+        for _ in 0..10 {
+            let (mode, index, _, _) = analyzer.get_recommand_behaviors("cycle-key", &cf, &vf);
+            assert_eq!(mode, 0);
+            seen_indices.insert(index);
+        }
+        // All 10 entries should be visited (scores start at 0, decrement to -1, etc.)
+        assert!(
+            seen_indices.len() >= 2,
+            "should see multiple indices, got {}",
+            seen_indices.len()
+        );
+    }
+
+    #[test]
+    fn test_mode_table_counts() {
+        assert_eq!(mode0_table().len(), MODE_COUNTS[0]);
+        assert_eq!(mode1_table().len(), MODE_COUNTS[1]);
+        assert_eq!(mode2_table().len(), MODE_COUNTS[2]);
+        assert_eq!(mode3_table().len(), MODE_COUNTS[3]);
+        assert_eq!(mode4_table().len(), MODE_COUNTS[4]);
     }
 }

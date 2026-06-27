@@ -15,7 +15,7 @@ use frp_core::msg::{self, FrpMessage, NatHoleDetectBehavior, PortsRange};
 use frp_core::protocol::write_msg_v1;
 
 use crate::service::InternalMsg;
-use super::analysis::{Analyzer, RecommandBehavior};
+use super::analysis::{Analyzer, RecommendBehavior};
 use super::classify::NatFeature;
 
 /// Generates unique transaction/session IDs.
@@ -126,7 +126,6 @@ impl Controller {
         writer: Box<dyn AsyncWrite + Send + Unpin>,
     ) -> (Arc<Session>, oneshot::Receiver<msg::NatHoleReport>) {
         let (report_tx, report_rx) = oneshot::channel();
-        let (notify_tx, _notify_rx) = oneshot::channel();
         let session = Arc::new(Session {
             sid: sid.clone(),
             proxy_name,
@@ -138,7 +137,7 @@ impl Controller {
             client_msg: Mutex::new(None),
             c_resp: Mutex::new(None),
             c_nat_feature: Mutex::new(None),
-            notify_ch: Mutex::new(Some(notify_tx)),
+            notify_ch: Mutex::new(None),  // caller sets up before notifying provider
             report_tx: Mutex::new(Some(report_tx)),
             created_at: Instant::now(),
         });
@@ -377,7 +376,7 @@ pub fn build_nat_hole_response(
     mode: i32,
     candidate_addrs: Vec<String>,
     assisted_addrs: Vec<String>,
-    behavior: RecommandBehavior,
+    behavior: RecommendBehavior,
     read_timeout_ms: i32,
     ports_difference: i32,
 ) -> msg::NatHoleResp {
