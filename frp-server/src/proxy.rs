@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Mutex;
 use tokio::sync::RwLock;
 
 /// A registered proxy on the server side.
@@ -31,6 +32,8 @@ pub struct ProxyManager {
     by_client: RwLock<HashMap<String, HashMap<String, ProxyInfo>>>,
     /// group name → sorted list of proxy names (for round-robin selection)
     groups: RwLock<HashMap<String, Vec<String>>>,
+    /// Per-group round-robin counters. Incremented on each selection.
+    group_counters: Mutex<HashMap<String, u64>>,
 }
 
 impl Default for ProxyManager {
@@ -45,6 +48,7 @@ impl ProxyManager {
             proxies: RwLock::new(HashMap::new()),
             by_client: RwLock::new(HashMap::new()),
             groups: RwLock::new(HashMap::new()),
+            group_counters: Mutex::new(HashMap::new()),
         }
     }
 
@@ -88,6 +92,9 @@ impl ProxyManager {
                         members.retain(|n| n != name);
                         if members.is_empty() {
                             groups.remove(group);
+                            // Clean up stale round-robin counter
+                            let mut counters = self.group_counters.lock().unwrap();
+                            counters.remove(group);
                         }
                     }
                 }
@@ -117,6 +124,9 @@ impl ProxyManager {
                                 members.retain(|n| n != name);
                                 if members.is_empty() {
                                     groups.remove(group);
+                                    // Clean up stale round-robin counter
+                                    let mut counters = self.group_counters.lock().unwrap();
+                                    counters.remove(group);
                                 }
                             }
                             // Re-acquire for the loop
@@ -131,7 +141,8 @@ impl ProxyManager {
 
     /// Select a backend from a group for load balancing.
     /// Uses group_key for affinity: same key → same backend (hash-based).
-    /// Without group_key, returns the first available backend.
+    /// Without group_key, true round-robin selection across group members.
+    /// Matches Go frp v0.69.1 group load balancing behavior.
     pub async fn select_group_backend(&self, group: &str, group_key: &str) -> Option<String> {
         let groups = self.groups.read().await;
         let members = groups.get(group)?;
@@ -146,8 +157,12 @@ impl ProxyManager {
             let idx = hasher.finish() as usize % members.len();
             Some(members[idx].clone())
         } else {
-            // Round-robin: return first (the list is stable)
-            Some(members[0].clone())
+            // True round-robin: increment counter, modulo member count.
+            let mut counters = self.group_counters.lock().unwrap();
+            let counter = counters.entry(group.to_string()).or_insert(0);
+            let idx = (*counter as usize) % members.len();
+            *counter += 1;
+            Some(members[idx].clone())
         }
     }
 
