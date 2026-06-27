@@ -117,7 +117,7 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 ## Remaining Gaps
 
 1. **V2 wire protocol** — AEAD encryption, capability negotiation (basic binary framing works; stubs for advanced features)
-2. **Rust→Go XTCP cross-compat** — Go→Rust XTCP compat test now runs and passes (TCP simultaneous open). Rust→Go XTCP still disabled: Go frps uses QUIC-based NAT detection; frp-rs uses TCP simultaneous open. Architectural mismatch — may never fully interoperate.
+2. **XTCP cross-compat** — Both directions guarded in compat tests. Server-side routing correct (verified by xtcp_hole_punch unit test). Go frp uses QUIC-based NAT probes; frp-rs uses TCP simultaneous open. Architectural mismatch — may never fully interoperate with Go clients.
 3. **No `/api/metrics` on client admin** — server has Prometheus `/metrics`; client admin has no traffic metrics endpoint
 4. **KCP/QUIC cross-compat** — parameter-matched but untested in the KCP→QUIC or QUIC→KCP direction
 5. **Pprof profiling endpoint** — out of scope (Go-specific; Rust equivalent is tokio-console)
@@ -128,7 +128,7 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 - ✅ Group load balancing: true round-robin with per-group atomic counter
 - ✅ Admin `/api/status`: reports actual `plugin`, `remote_addr`, `err`; status reflects registration state
 - ✅ Config reload: detects changed proxies via config_snapshot hash, supports CloseProxy+NewProxy cycle for add/remove/modify without restart
-- ✅ Go→Rust XTCP: cross-compat test enabled and passing (TCP simultaneous open hole punch)
+- ✅ Go→Rust XTCP: server-side routing fixed (handle_client() for NatHoleResp wire path); compat test guarded — Go frp uses QUIC probes, frp-rs uses TCP simultaneous open
 - ✅ KCP parameters: window 128→1024, MTU 1400→1350 (matches Go frp)
 - ✅ QUIC: verified both sides use one bidirectional stream per logical channel
 - ✅ Multi-port STUN, IPv6 parsing, session limit, stable key generation
