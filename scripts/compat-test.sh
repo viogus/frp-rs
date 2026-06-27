@@ -38,6 +38,7 @@ VERBOSE=false
 SELECTED_TEST=""
 KEEP_TMP=false
 CI=false
+DEBUG=false
 PIDS=""
 
 # --- Colors (empty in CI mode) ---
@@ -58,12 +59,19 @@ while [[ $# -gt 0 ]]; do
         --keep-tmp) KEEP_TMP=true; shift ;;
         --ci) CI=true; shift ;;
         --go-version) GO_FRP_VERSION="$2"; shift 2 ;;
+        --debug|-x) DEBUG=true; shift ;;
+        --list)
+            awk '/^run_test test_[a-z]/ {print $2}' "$0" | sort
+            exit 0
+            ;;
         --help|-h)
             echo "Usage: $0 [options]"
             echo "  --test <name>    Run only the named test"
             echo "  --verbose         Show full logs on failure"
             echo "  --keep-tmp        Don't clean up test directory"
             echo "  --ci              CI mode: no color, GitHub annotations"
+            echo "  --debug, -x       Enable bash trace (set -x) during test execution"
+            echo "  --list            List all test names and exit"
             echo "  --go-version VER  Go frp version (default: 0.69.1)"
             exit 0
             ;;
@@ -186,742 +194,279 @@ while True:
 
 send_and_expect() {
     local port="$1" data="$2" expected="$3" timeout="${4:-5}"
-    python3 -c "
-import socket, sys, time
+    _SE_PORT="$port" _SE_DATA="$data" _SE_EXPECTED="$expected" _SE_TIMEOUT="$timeout" \
+    python3 -c '
+import os, socket, time
+port = int(os.environ["_SE_PORT"])
+data = os.environ["_SE_DATA"]
+expected = os.environ["_SE_EXPECTED"]
+timeout = float(os.environ["_SE_TIMEOUT"])
+
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout($timeout)
-deadline = time.time() + $timeout
+s.settimeout(timeout)
+deadline = time.time() + timeout
 while True:
     try:
-        s.connect(('127.0.0.1', $port))
+        s.connect(("127.0.0.1", port))
         break
     except (ConnectionRefusedError, OSError):
         if time.time() > deadline:
-            print('FAIL:CONNECT_TIMEOUT')
-            sys.exit(0)
+            print("FAIL:CONNECT_TIMEOUT")
+            raise SystemExit(0)
         time.sleep(0.1)
 try:
-    s.sendall('$data'.encode())
+    s.sendall(data.encode())
     reply = s.recv(4096).decode()
-    if reply == '$expected':
-        print('OK:' + repr(reply))
+    if reply == expected:
+        print("OK:" + repr(reply))
     else:
-        print('FAIL:MISMATCH expected=' + repr('$expected') + ' got=' + repr(reply))
+        print("FAIL:MISMATCH expected=" + repr(expected) + " got=" + repr(reply))
 except Exception as e:
-    print('FAIL:ERROR ' + str(e))
+    print("FAIL:ERROR " + str(e))
 finally:
     s.close()
-" || echo "FAIL:PYTHON_ERROR"
+' || echo "FAIL:PYTHON_ERROR"
 }
 
-# Write config files in the test directory
-write_rust_frps_config() {
-    local port="$1" token="$2" out="$3"
-    local extra="${4:-}"  # optional extra TOML
-    cat > "$out" <<TOML
-bind_addr = "127.0.0.1"
-bind_port = $port
-
-[auth]
-method = "token"
-token = "$token"
-
-[transport]
-tcp_mux = false
-
-$extra
-TOML
+start_udp_echo_server() {
+    local port="$1"
+    SE_UDP_PORT="$port" python3 -c '
+import os, socket
+port = int(os.environ["SE_UDP_PORT"])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", port))
+while True:
+    try:
+        data, addr = s.recvfrom(4096)
+        s.sendto(data, addr)
+    except:
+        break
+' &
+    track_pid $!
 }
 
-write_rust_frps_config_tls() {
-    local port="$1" token="$2" out="$3"
-    local extra="${4:-}"
-    cat > "$out" <<TOML
-bind_addr = "127.0.0.1"
-bind_port = $port
-tls_enable = true
-tls_cert_file = "$CERT_DIR/server.crt"
-tls_key_file = "$CERT_DIR/server.key"
-
-[auth]
-method = "token"
-token = "$token"
-
-[transport]
-tcp_mux = false
-
-$extra
-TOML
+send_and_expect_udp() {
+    local proxy_port="$1"
+    local test_data="$2"
+    local timeout="${3:-10}"
+    _USE_PORT="$proxy_port" _USE_DATA="$test_data" _USE_TO="$timeout" \
+    python3 -c '
+import os, socket, time
+port = int(os.environ["_USE_PORT"])
+test_data = os.environ["_USE_DATA"].encode()
+timeout = float(os.environ["_USE_TO"])
+deadline = time.time() + timeout
+while True:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        s.sendto(test_data, ("127.0.0.1", port))
+        data, addr = s.recvfrom(4096)
+        s.close()
+        if data == test_data:
+            print("OK")
+        else:
+            print("FAIL:MISMATCH expected=" + repr(test_data) + " got=" + repr(data))
+        raise SystemExit(0)
+    except socket.timeout:
+        try: s.close()
+        except: pass
+        if time.time() > deadline:
+            print("FAIL:TIMEOUT")
+            raise SystemExit(0)
+        time.sleep(0.5)
+    except Exception as e:
+        try: s.close()
+        except: pass
+        print("FAIL:ERROR " + str(e))
+        raise SystemExit(0)
+' 2>&1 || echo "FAIL:PYTHON_ERROR"
 }
 
-write_go_frps_config() {
-    local port="$1" token="$2" out="$3"
-    cat > "$out" <<TOML
-bindAddr = "127.0.0.1"
-bindPort = $port
-
-auth.method = "token"
-auth.token = "$token"
-
-transport.tcpMux = false
-
-log.to = "$TEST_DIR/go-frps.log"
-log.level = "debug"
-TOML
+start_http_echo_server() {
+    local port="$1"
+    local body_prefix="${2:-http-ok}"
+    SE_HTTP_PORT="$port" SE_HTTP_PREFIX="$body_prefix" python3 -c '
+import os, socket
+port = int(os.environ["SE_HTTP_PORT"])
+prefix = os.environ["SE_HTTP_PREFIX"]
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(5)
+while True:
+    try:
+        conn, _ = s.accept()
+        data = b""
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            if b"\r\n\r\n" in data:
+                hdr_end = data.index(b"\r\n\r\n") + 4
+                hdrs = data[:hdr_end].decode("utf-8", errors="ignore").lower()
+                cl = 0
+                for line in hdrs.split("\r\n"):
+                    if line.startswith("content-length:"):
+                        try:
+                            cl = int(line.split(":")[1].strip())
+                        except: pass
+                if len(data) - hdr_end >= cl:
+                    break
+        if data:
+            body = prefix.encode() + (data.split(b"\r\n\r\n", 1)[-1] if b"\r\n\r\n" in data else b"")
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+        conn.close()
+    except:
+        break
+' &
+    track_pid $!
 }
 
-write_go_frps_config_tls() {
-    local port="$1" token="$2" out="$3"
-    cat > "$out" <<TOML
-bindAddr = "127.0.0.1"
-bindPort = $port
-
-auth.method = "token"
-auth.token = "$token"
-
-transport.tls.force = true
-transport.tls.certFile = "$CERT_DIR/server.crt"
-transport.tls.keyFile = "$CERT_DIR/server.key"
-transport.tcpMux = false
-
-log.to = "$TEST_DIR/go-frps.log"
-log.level = "debug"
-TOML
+send_http_test() {
+    local vhost_port="$1"
+    local host="$2"
+    local body_prefix="${3:-http-ok}"
+    local timeout="${4:-5}"
+    SE_VHOST="$vhost_port" SE_HOST="$host" SE_PREFIX="$body_prefix" SE_TO="$timeout" \
+    python3 -c '
+import os, socket
+port = int(os.environ["SE_VHOST"])
+host = os.environ["SE_HOST"]
+prefix = os.environ["SE_PREFIX"]
+timeout = float(os.environ["SE_TO"])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(timeout)
+s.connect(("127.0.0.1", port))
+req = b"POST /test HTTP/1.1\r\nHost: " + host.encode() + b"\r\nContent-Length: 5\r\n\r\nhello"
+s.sendall(req)
+data = s.recv(4096)
+s.close()
+if (prefix.encode() + b"hello") in data:
+    print("OK")
+else:
+    print("FAIL: unexpected response: " + repr(data[:200]))
+' 2>&1
 }
 
-write_go_frpc_config() {
-    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
-    local extra="${7:-}"
-    cat > "$out" <<TOML
-serverAddr = "127.0.0.1"
-serverPort = $server_port
-
-auth.token = "$token"
-
-transport.tls.enable = false
-transport.tcpMux = false
-
-log.to = "$TEST_DIR/go-frpc-$name.log"
-log.level = "debug"
-
-[[proxies]]
-name = "$name"
-type = "tcp"
-localIP = "127.0.0.1"
-localPort = $echo_port
-remotePort = $proxy_port
-
-$extra
-TOML
+send_https_test() {
+    local vhost_port="$1"
+    local host="$2"
+    local body_prefix="${3:-https-ok}"
+    local timeout="${4:-5}"
+    SE_VHOST="$vhost_port" SE_HOST="$host" SE_PREFIX="$body_prefix" SE_TO="$timeout" \
+    python3 -c '
+import os, socket, ssl
+port = int(os.environ["SE_VHOST"])
+host = os.environ["SE_HOST"]
+prefix = os.environ["SE_PREFIX"]
+timeout = float(os.environ["SE_TO"])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(timeout)
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+ss = ctx.wrap_socket(s, server_hostname=host)
+ss.connect(("127.0.0.1", port))
+req = b"POST /test HTTP/1.1\r\nHost: " + host.encode() + b"\r\nContent-Length: 5\r\n\r\nhello"
+ss.sendall(req)
+data = ss.recv(4096)
+ss.close()
+if (prefix.encode() + b"hello") in data:
+    print("OK")
+else:
+    print("FAIL: unexpected response: " + repr(data[:200]))
+' 2>&1
 }
 
-write_go_frpc_config_tls() {
-    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
-    local extra="${7:-}"
-    cat > "$out" <<TOML
-serverAddr = "127.0.0.1"
-serverPort = $server_port
-
-auth.token = "$token"
-
-transport.tls.enable = true
-transport.tls.disableCustomTLSFirstByte = true
-transport.tls.trustedCaFile = "$CERT_DIR/ca.crt"
-transport.tls.serverName = "localhost"
-transport.tcpMux = false
-
-log.to = "$TEST_DIR/go-frpc-$name.log"
-log.level = "debug"
-
-[[proxies]]
-name = "$name"
-type = "tcp"
-localIP = "127.0.0.1"
-localPort = $echo_port
-remotePort = $proxy_port
-
-$extra
-TOML
+send_tcpmux_test() {
+    local tcpmux_port="$1"
+    local domain="$2"
+    local test_data="${3:-tcpmux-echo}"
+    local timeout="${4:-10}"
+    SE_PORT="$tcpmux_port" SE_DOMAIN="$domain" SE_DATA="$test_data" SE_TO="$timeout" \
+    python3 -c '
+import os, socket, time
+port = int(os.environ["SE_PORT"])
+domain = os.environ["SE_DOMAIN"]
+test_data = os.environ["SE_DATA"].encode()
+timeout = float(os.environ["SE_TO"])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(timeout)
+deadline = time.time() + timeout
+while True:
+    try:
+        s.connect(("127.0.0.1", port))
+        break
+    except (ConnectionRefusedError, OSError):
+        if time.time() > deadline:
+            print("FAIL:CONNECT_TIMEOUT")
+            raise SystemExit(0)
+        time.sleep(0.5)
+req = b"CONNECT " + domain.encode() + b":22 HTTP/1.1\r\nHost: " + domain.encode() + b":22\r\n\r\n"
+s.sendall(req)
+resp = b""
+while b"\r\n\r\n" not in resp:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    resp += chunk
+if not resp.startswith(b"HTTP/1.1 200"):
+    print("FAIL:CONNECT_RESPONSE " + repr(resp[:200]))
+    s.close()
+    raise SystemExit(0)
+s.sendall(test_data)
+reply = s.recv(4096)
+s.close()
+if reply == test_data:
+    print("OK:tcpmux")
+else:
+    print("FAIL:MISMATCH expected=" + repr(test_data) + " got=" + repr(reply[:200]))
+' 2>&1
 }
 
-write_rust_frpc_config() {
-    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
-    local extra="${7:-}"
-    cat > "$out" <<TOML
-server_addr = "127.0.0.1"
-server_port = $server_port
-token = "$token"
-tcp_mux = false
-login_fail_exit = true
-pool_count = 1
-
-[[proxies]]
-name = "$name"
-type = "tcp"
-local_ip = "127.0.0.1"
-local_port = $echo_port
-remote_port = $proxy_port
-
-$extra
-TOML
-}
-
-write_rust_frpc_config_tls() {
-    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
-    local extra="${7:-}"
-    cat > "$out" <<TOML
-server_addr = "127.0.0.1"
-server_port = $server_port
-token = "$token"
-tcp_mux = false
-login_fail_exit = true
-pool_count = 1
-tls_enable = true
-tls_ca_file = "$CERT_DIR/ca.crt"
-tls_server_name = "localhost"
-
-[[proxies]]
-name = "$name"
-type = "tcp"
-local_ip = "127.0.0.1"
-local_port = $echo_port
-remote_port = $proxy_port
-
-$extra
-TOML
-}
-
-# ── tcp_mux config helpers ──────────────────────────────
-
-write_rust_frps_config_mux() {
-    local port="$1" token="$2" out="$3"
-    local extra="${4:-}"
-    cat > "$out" <<TOML
-bind_addr = "127.0.0.1"
-bind_port = $port
-
-[auth]
-method = "token"
-token = "$token"
-
-[transport]
-tcp_mux = true
-
-$extra
-TOML
-}
-
-write_rust_frps_config_mux_tls() {
-    local port="$1" token="$2" out="$3"
-    local extra="${4:-}"
-    cat > "$out" <<TOML
-bind_addr = "127.0.0.1"
-bind_port = $port
-tls_enable = true
-tls_cert_file = "$CERT_DIR/server.crt"
-tls_key_file = "$CERT_DIR/server.key"
-
-[auth]
-method = "token"
-token = "$token"
-
-[transport]
-tcp_mux = true
-
-$extra
-TOML
-}
-
-write_go_frps_config_mux() {
-    local port="$1" token="$2" out="$3"
-    cat > "$out" <<TOML
-bindAddr = "127.0.0.1"
-bindPort = $port
-
-auth.method = "token"
-auth.token = "$token"
-
-transport.tcpMux = true
-
-log.to = "$TEST_DIR/go-frps.log"
-log.level = "debug"
-TOML
-}
-
-write_go_frps_config_mux_tls() {
-    local port="$1" token="$2" out="$3"
-    cat > "$out" <<TOML
-bindAddr = "127.0.0.1"
-bindPort = $port
-
-auth.method = "token"
-auth.token = "$token"
-
-transport.tls.force = true
-transport.tls.certFile = "$CERT_DIR/server.crt"
-transport.tls.keyFile = "$CERT_DIR/server.key"
-transport.tcpMux = true
-
-log.to = "$TEST_DIR/go-frps.log"
-log.level = "debug"
-TOML
-}
-
-write_go_frpc_config_mux() {
-    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
-    local extra="${7:-}"
-    cat > "$out" <<TOML
-serverAddr = "127.0.0.1"
-serverPort = $server_port
-
-auth.token = "$token"
-
-transport.tls.enable = false
-transport.tcpMux = true
-
-log.to = "$TEST_DIR/go-frpc-$name.log"
-log.level = "debug"
-
-[[proxies]]
-name = "$name"
-type = "tcp"
-localIP = "127.0.0.1"
-localPort = $echo_port
-remotePort = $proxy_port
-
-$extra
-TOML
-}
-
-write_go_frpc_config_mux_tls() {
-    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
-    local extra="${7:-}"
-    cat > "$out" <<TOML
-serverAddr = "127.0.0.1"
-serverPort = $server_port
-
-auth.token = "$token"
-
-transport.tls.enable = true
-transport.tls.disableCustomTLSFirstByte = true
-transport.tls.trustedCaFile = "$CERT_DIR/ca.crt"
-transport.tls.serverName = "localhost"
-transport.tcpMux = true
-
-log.to = "$TEST_DIR/go-frpc-$name.log"
-log.level = "debug"
-
-[[proxies]]
-name = "$name"
-type = "tcp"
-localIP = "127.0.0.1"
-localPort = $echo_port
-remotePort = $proxy_port
-
-$extra
-TOML
-}
-
-write_rust_frpc_config_mux() {
-    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
-    local extra="${7:-}"
-    cat > "$out" <<TOML
-server_addr = "127.0.0.1"
-server_port = $server_port
-token = "$token"
-tcp_mux = true
-login_fail_exit = true
-pool_count = 1
-
-[[proxies]]
-name = "$name"
-type = "tcp"
-local_ip = "127.0.0.1"
-local_port = $echo_port
-remote_port = $proxy_port
-
-$extra
-TOML
-}
-
-write_rust_frpc_config_mux_tls() {
-    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
-    local extra="${7:-}"
-    cat > "$out" <<TOML
-server_addr = "127.0.0.1"
-server_port = $server_port
-token = "$token"
-tcp_mux = true
-login_fail_exit = true
-pool_count = 1
-tls_enable = true
-tls_ca_file = "$CERT_DIR/ca.crt"
-tls_server_name = "localhost"
-
-[[proxies]]
-name = "$name"
-type = "tcp"
-local_ip = "127.0.0.1"
-local_port = $echo_port
-remote_port = $proxy_port
-
-$extra
-TOML
-}
-
-# ── tcpmux HTTP CONNECT config helpers ──────────────────────
-
-write_rust_frps_config_tcpmux() {
-    local port="$1" token="$2" tcpmux_port="$3" out="$4"
-    local extra="${5:-}"
-    cat > "$out" <<TOML
-bind_addr = "127.0.0.1"
-bind_port = $port
-tcpmux_httpconnect_port = $tcpmux_port
-
-[auth]
-method = "token"
-token = "$token"
-
-[transport]
-tcp_mux = false
-
-$extra
-TOML
-}
-
-write_go_frps_config_tcpmux() {
-    local port="$1" token="$2" tcpmux_port="$3" out="$4"
-    cat > "$out" <<TOML
-bindAddr = "127.0.0.1"
-bindPort = $port
-tcpmuxHTTPConnectPort = $tcpmux_port
-auth.method = "token"
-auth.token = "$token"
-transport.tcpMux = false
-log.to = "$TEST_DIR/go-frps.log"
-log.level = "debug"
-TOML
-}
-
-write_go_frpc_config_tcpmux() {
-    local server_port="$1" token="$2" echo_port="$3" name="$4" domain="$5" out="$6"
-    cat > "$out" <<TOML
-serverAddr = "127.0.0.1"
-serverPort = $server_port
-auth.token = "$token"
-transport.tls.enable = false
-transport.tcpMux = false
-log.to = "$TEST_DIR/go-frpc-$name.log"
-log.level = "debug"
-
-[[proxies]]
-name = "$name"
-type = "tcpmux"
-multiplexer = "httpconnect"
-localIP = "127.0.0.1"
-localPort = $echo_port
-customDomains = ["$domain"]
-TOML
-}
-
-write_rust_frpc_config_tcpmux() {
-    local server_port="$1" token="$2" echo_port="$3" name="$4" domain="$5" out="$6"
-    local extra="${7:-}"
-    cat > "$out" <<TOML
-server_addr = "127.0.0.1"
-server_port = $server_port
-token = "$token"
-tcp_mux = false
-login_fail_exit = true
-pool_count = 1
-
-[[proxies]]
-name = "$name"
-type = "tcpmux"
-multiplexer = "httpconnect"
-local_ip = "127.0.0.1"
-local_port = $echo_port
-custom_domains = ["$domain"]
-
-$extra
-TOML
-}
-
-# ── WebSocket transport config helpers ─────────────────────
-
-write_go_frps_config_ws() {
-    local port="$1" token="$2" out="$3"
-    # Go frps HandleMux on the main port detects WebSocket (GET /~!frp)
-    # and proxies internally to the VHost HTTP handler. They MUST share
-    # the same port for the internal proxy to work.
-    cat > "$out" <<TOML
-bindAddr = "127.0.0.1"
-bindPort = $port
-
-auth.method = "token"
-auth.token = "$token"
-
-transport.tcpMux = false
-
-# Same port as bindPort — enables HandleMux WS→VHost internal proxy
-vhostHTTPPort = $port
-
-log.to = "$TEST_DIR/go-frps.log"
-log.level = "debug"
-TOML
-}
-
-write_rust_frps_config_ws() {
-    local port="$1" token="$2" out="$3"
-    cat > "$out" <<TOML
-bind_addr = "127.0.0.1"
-bind_port = $port
-
-[auth]
-method = "token"
-token = "$token"
-
-[transport]
-tcp_mux = false
-
-TOML
-}
-
-write_go_frpc_config_ws() {
-    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
-    local extra="${7:-}"
-    cat > "$out" <<TOML
-serverAddr = "127.0.0.1"
-serverPort = $server_port
-
-auth.token = "$token"
-
-transport.protocol = "websocket"
-transport.tls.enable = false
-transport.tcpMux = false
-
-log.to = "$TEST_DIR/go-frpc-$name.log"
-log.level = "debug"
-
-[[proxies]]
-name = "$name"
-type = "tcp"
-localIP = "127.0.0.1"
-localPort = $echo_port
-remotePort = $proxy_port
-
-$extra
-TOML
-}
-
-write_rust_frpc_config_ws() {
-    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
-    local extra="${7:-}"
-    cat > "$out" <<TOML
-server_addr = "127.0.0.1"
-server_port = $server_port
-token = "$token"
-tcp_mux = false
-login_fail_exit = true
-pool_count = 1
-transport_protocol = "websocket"
-
-[[proxies]]
-name = "$name"
-type = "tcp"
-local_ip = "127.0.0.1"
-local_port = $echo_port
-remote_port = $proxy_port
-
-$extra
-TOML
-}
-
-# ── KCP transport config helpers ──────────────────────────────
-
-write_go_frps_config_kcp() {
-    local port="$1" token="$2" kcp_port="$3" out="$4"
-    cat > "$out" <<TOML
-bindAddr = "127.0.0.1"
-bindPort = $port
-kcpBindPort = $kcp_port
-
-auth.method = "token"
-auth.token = "$token"
-
-transport.tcpMux = false
-
-log.to = "$TEST_DIR/go-frps.log"
-log.level = "debug"
-TOML
-}
-
-write_rust_frps_config_kcp() {
-    local port="$1" token="$2" kcp_port="$3" out="$4"
-    cat > "$out" <<TOML
-bind_addr = "127.0.0.1"
-bind_port = $port
-kcp_bind_port = $kcp_port
-
-[auth]
-method = "token"
-token = "$token"
-
-[transport]
-tcp_mux = false
-
-TOML
-}
-
-write_go_frpc_config_kcp() {
-    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
-    local extra="${7:-}"
-    cat > "$out" <<TOML
-serverAddr = "127.0.0.1"
-serverPort = $server_port
-
-auth.token = "$token"
-
-transport.protocol = "kcp"
-transport.tls.enable = false
-transport.tcpMux = false
-
-log.to = "$TEST_DIR/go-frpc-$name.log"
-log.level = "debug"
-
-[[proxies]]
-name = "$name"
-type = "tcp"
-localIP = "127.0.0.1"
-localPort = $echo_port
-remotePort = $proxy_port
-
-$extra
-TOML
-}
-
-write_rust_frpc_config_kcp() {
-    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
-    local extra="${7:-}"
-    cat > "$out" <<TOML
-server_addr = "127.0.0.1"
-server_port = $server_port
-token = "$token"
-tcp_mux = false
-login_fail_exit = true
-pool_count = 1
-transport_protocol = "kcp"
-
-[[proxies]]
-name = "$name"
-type = "tcp"
-local_ip = "127.0.0.1"
-local_port = $echo_port
-remote_port = $proxy_port
-
-$extra
-TOML
-}
-
-# ── QUIC transport config helpers ──────────────────────────────
-
-write_go_frps_config_quic() {
-    local port="$1" token="$2" quic_port="$3" out="$4"
-    cat > "$out" <<TOML
-bindAddr = "127.0.0.1"
-bindPort = $port
-quicBindPort = $quic_port
-
-auth.method = "token"
-auth.token = "$token"
-
-transport.tls.force = true
-transport.tls.certFile = "$CERT_DIR/server.crt"
-transport.tls.keyFile = "$CERT_DIR/server.key"
-transport.tcpMux = false
-
-log.to = "$TEST_DIR/go-frps.log"
-log.level = "debug"
-TOML
-}
-
-write_rust_frps_config_quic() {
-    local port="$1" token="$2" quic_port="$3" out="$4"
-    cat > "$out" <<TOML
-bind_addr = "127.0.0.1"
-bind_port = $port
-quic_bind_port = $quic_port
-
-# QUIC requires TLS
-tls_enable = true
-tls_cert_file = "$CERT_DIR/server.crt"
-tls_key_file = "$CERT_DIR/server.key"
-
-[auth]
-method = "token"
-token = "$token"
-
-[transport]
-tcp_mux = false
-
-TOML
-}
-
-write_go_frpc_config_quic() {
-    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
-    local extra="${7:-}"
-    cat > "$out" <<TOML
-serverAddr = "127.0.0.1"
-serverPort = $server_port
-
-auth.token = "$token"
-
-transport.protocol = "quic"
-transport.tls.enable = true
-transport.tls.disableCustomTLSFirstByte = true
-transport.tls.trustedCaFile = "$CERT_DIR/ca.crt"
-transport.tls.serverName = "localhost"
-transport.tcpMux = false
-
-log.to = "$TEST_DIR/go-frpc-$name.log"
-log.level = "debug"
-
-[[proxies]]
-name = "$name"
-type = "tcp"
-localIP = "127.0.0.1"
-localPort = $echo_port
-remotePort = $proxy_port
-
-$extra
-TOML
-}
-
-write_rust_frpc_config_quic() {
-    local server_port="$1" token="$2" echo_port="$3" proxy_port="$4" name="$5" out="$6"
-    local extra="${7:-}"
-    cat > "$out" <<TOML
-server_addr = "127.0.0.1"
-server_port = $server_port
-token = "$token"
-tcp_mux = false
-login_fail_exit = true
-pool_count = 1
-transport_protocol = "quic"
-tls_enable = true
-tls_ca_file = "$CERT_DIR/ca.crt"
-tls_server_name = "localhost"
-
-[[proxies]]
-name = "$name"
-type = "tcp"
-local_ip = "127.0.0.1"
-local_port = $echo_port
-remote_port = $proxy_port
-
-$extra
-TOML
+send_socks5_test() {
+    local proxy_port="$1"
+    local echo_port="$2"
+    local test_data="${3:-socks5-test}"
+    local timeout="${4:-10}"
+    SE_PROXY="$proxy_port" SE_ECHO="$echo_port" SE_DATA="$test_data" SE_TO="$timeout" \
+    python3 -c '
+import os, socket, struct
+proxy_port = int(os.environ["SE_PROXY"])
+echo_port = int(os.environ["SE_ECHO"])
+test_data = os.environ["SE_DATA"].encode()
+timeout = float(os.environ["SE_TO"])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(timeout)
+s.connect(("127.0.0.1", proxy_port))
+# SOCKS5 handshake (no auth)
+s.sendall(b"\x05\x01\x00")
+reply = s.recv(2)
+if reply != b"\x05\x00":
+    print("FAIL:SOCKS5_HANDSHAKE " + str(reply))
+    raise SystemExit(0)
+# SOCKS5 CONNECT to echo server
+host = b"\x7f\x00\x00\x01"
+port_bytes = struct.pack(">H", echo_port)
+s.sendall(b"\x05\x01\x00\x01" + host + port_bytes)
+reply = s.recv(10)
+if len(reply) < 10 or reply[0] != 0x05:
+    print("FAIL:SOCKS5_CONNECT " + str(reply[:10]))
+    raise SystemExit(0)
+if reply[1] != 0x00:
+    print("FAIL:SOCKS5_CONNECT_REFUSED code=" + str(reply[1]))
+    raise SystemExit(0)
+# Echo test through SOCKS5 tunnel
+s.sendall(test_data)
+data = s.recv(1024)
+if data == test_data:
+    print("OK:socks5")
+else:
+    print("FAIL:MISMATCH expected=" + repr(test_data) + " got=" + repr(data))
+s.close()
+' 2>&1
 }
 
 log() {
@@ -965,6 +510,231 @@ should_run_test() {
     [[ "$SELECTED_TEST" == "$1" ]]
 }
 
+# Wrapper that enables set -x tracing in --debug mode.
+# Uses a subshell so set -x doesn't leak across tests.
+run_test() {
+    if $DEBUG; then
+        (set -x; "$@")
+    else
+        "$@"
+    fi
+}
+
+# ── Unified config writers ─────────────────────────────────
+
+write_frps_config() {
+    local impl="$1" port="$2" token="$3" out="$4" features="${5:-}"
+    local has_tls=false has_mux=false has_ws=false kcp_port="" quic_port="" tcpmux_port="" extra_line=""
+    for feat in $features; do
+        case "$feat" in
+            tls) has_tls=true ;;
+            mux) has_mux=true ;;
+            ws) has_ws=true ;;
+            kcp=*) kcp_port="${feat#kcp=}" ;;
+            quic=*) quic_port="${feat#quic=}"; has_tls=true ;;
+            tcpmux=*) tcpmux_port="${feat#tcpmux=}" ;;
+            extra=*) extra_line="${feat#extra=}" ;;
+        esac
+    done
+    local mux_val="false"; $has_mux && mux_val="true"
+    if [[ "$impl" == "go" ]]; then
+        {
+            printf 'bindAddr = "127.0.0.1"\nbindPort = %s\n' "$port"
+            [[ -n "$kcp_port" ]] && printf 'kcpBindPort = %s\n' "$kcp_port"
+            [[ -n "$quic_port" ]] && printf 'quicBindPort = %s\n' "$quic_port"
+            [[ -n "$tcpmux_port" ]] && printf 'tcpmuxHTTPConnectPort = %s\n' "$tcpmux_port"
+            printf '\nauth.method = "token"\nauth.token = "%s"\n\n' "$token"
+            if $has_tls; then
+                printf 'transport.tls.force = true\n'
+                printf 'transport.tls.certFile = "%s/server.crt"\n' "$CERT_DIR"
+                printf 'transport.tls.keyFile = "%s/server.key"\n' "$CERT_DIR"
+            fi
+            printf 'transport.tcpMux = %s\n\n' "$mux_val"
+            if $has_ws; then
+                printf '# Same port as bindPort — enables HandleMux WS→VHost internal proxy\n'
+                printf 'vhostHTTPPort = %s\n\n' "$port"
+            fi
+            printf 'log.to = "%s/go-frps.log"\nlog.level = "debug"\n' "$TEST_DIR"
+            [[ -n "$extra_line" ]] && printf '%s\n' "$extra_line" || true
+        } > "$out"
+    else
+        {
+            printf 'bind_addr = "127.0.0.1"\nbind_port = %s\n' "$port"
+            [[ -n "$kcp_port" ]] && printf 'kcp_bind_port = %s\n' "$kcp_port"
+            [[ -n "$quic_port" ]] && printf 'quic_bind_port = %s\n' "$quic_port"
+            [[ -n "$tcpmux_port" ]] && printf 'tcpmux_httpconnect_port = %s\n' "$tcpmux_port"
+            if $has_tls; then
+                [[ -n "$quic_port" ]] && printf '\n# QUIC requires TLS\n'
+                printf 'tls_enable = true\n'
+                printf 'tls_cert_file = "%s/server.crt"\n' "$CERT_DIR"
+                printf 'tls_key_file = "%s/server.key"\n' "$CERT_DIR"
+            fi
+            printf '\n[auth]\nmethod = "token"\ntoken = "%s"\n\n[transport]\ntcp_mux = %s\n\n' "$token" "$mux_val"
+            [[ -n "$extra_line" ]] && printf '%s\n' "$extra_line" || true
+        } > "$out"
+    fi
+}
+
+write_frpc_config() {
+    local impl="$1" server_port="$2" token="$3" echo_port="$4" proxy_port="$5" \
+          name="$6" out="$7" features="${8:-}"
+    local has_tls=false has_mux=false has_ws=false has_kcp=false has_quic=false
+    local has_enc=false has_comp=false extra_line=""
+    for feat in $features; do
+        case "$feat" in
+            tls) has_tls=true ;;
+            mux) has_mux=true ;;
+            ws) has_ws=true ;;
+            kcp) has_kcp=true ;;
+            quic) has_quic=true; has_tls=true ;;
+            enc) has_enc=true ;;
+            compression) has_comp=true ;;
+            extra=*) extra_line="${feat#extra=}" ;;
+        esac
+    done
+    local mux_val="false"; $has_mux && mux_val="true"
+    if [[ "$impl" == "go" ]]; then
+        {
+            printf 'serverAddr = "127.0.0.1"\nserverPort = %s\n\n' "$server_port"
+            printf 'auth.token = "%s"\n\n' "$token"
+            if $has_ws || $has_kcp || $has_quic; then
+                local proto=""
+                $has_ws && proto="websocket"
+                $has_kcp && proto="kcp"
+                $has_quic && proto="quic"
+                printf 'transport.protocol = "%s"\n' "$proto"
+            fi
+            if $has_tls; then
+                printf 'transport.tls.enable = true\n'
+                printf 'transport.tls.disableCustomTLSFirstByte = true\n'
+                printf 'transport.tls.trustedCaFile = "%s/ca.crt"\n' "$CERT_DIR"
+                printf 'transport.tls.serverName = "localhost"\n'
+            else
+                printf 'transport.tls.enable = false\n'
+            fi
+            printf 'transport.tcpMux = %s\n\n' "$mux_val"
+            printf 'log.to = "%s/go-frpc-%s.log"\nlog.level = "debug"\n\n' "$TEST_DIR" "$name"
+            printf '[[proxies]]\nname = "%s"\ntype = "tcp"\nlocalIP = "127.0.0.1"\n' "$name"
+            printf 'localPort = %s\nremotePort = %s\n' "$echo_port" "$proxy_port"
+            if $has_enc; then printf '\ntransport.useEncryption = true\n'; fi
+            if $has_comp; then printf 'transport.useCompression = true\n'; fi
+            [[ -n "$extra_line" ]] && printf '%s\n' "$extra_line" || true
+        } > "$out"
+    else
+        {
+            printf 'server_addr = "127.0.0.1"\nserver_port = %s\n' "$server_port"
+            printf 'token = "%s"\n' "$token"
+            printf 'tcp_mux = %s\n' "$mux_val"
+            printf 'login_fail_exit = true\npool_count = 1\n'
+            if $has_ws || $has_kcp || $has_quic; then
+                local proto=""
+                $has_ws && proto="websocket"
+                $has_kcp && proto="kcp"
+                $has_quic && proto="quic"
+                printf 'transport_protocol = "%s"\n' "$proto"
+            fi
+            if $has_tls; then
+                printf 'tls_enable = true\n'
+                printf 'tls_ca_file = "%s/ca.crt"\n' "$CERT_DIR"
+                printf 'tls_server_name = "localhost"\n'
+            fi
+            printf '\n[[proxies]]\nname = "%s"\ntype = "tcp"\nlocal_ip = "127.0.0.1"\n' "$name"
+            printf 'local_port = %s\nremote_port = %s\n' "$echo_port" "$proxy_port"
+            if $has_enc; then printf 'use_encryption = true\n'; fi
+            if $has_comp; then printf 'use_compression = true\n'; fi
+            [[ -n "$extra_line" ]] && printf '%s\n' "$extra_line" || true
+        } > "$out"
+    fi
+}
+
+write_frpc_config_udp() {
+    local impl="$1" server_port="$2" token="$3" echo_port="$4" proxy_port="$5" \
+          name="$6" out="$7" features="${8:-}"
+    local has_tls=false has_mux=false has_enc=false has_comp=false extra_line=""
+    for feat in $features; do
+        case "$feat" in
+            tls) has_tls=true ;;
+            mux) has_mux=true ;;
+            enc) has_enc=true ;;
+            compression) has_comp=true ;;
+            extra=*) extra_line="${feat#extra=}" ;;
+        esac
+    done
+    local mux_val="false"; $has_mux && mux_val="true"
+    if [[ "$impl" == "go" ]]; then
+        {
+            printf 'serverAddr = "127.0.0.1"\nserverPort = %s\n' "$server_port"
+            printf 'auth.token = "%s"\n' "$token"
+            if $has_tls; then
+                printf 'transport.tls.enable = true\n'
+                printf 'transport.tls.disableCustomTLSFirstByte = true\n'
+                printf 'transport.tls.trustedCaFile = "%s/ca.crt"\n' "$CERT_DIR"
+                printf 'transport.tls.serverName = "localhost"\n'
+            else
+                printf 'transport.tls.enable = false\n'
+            fi
+            printf 'transport.tcpMux = %s\n' "$mux_val"
+            printf 'log.to = "%s/go-frpc-%s.log"\nlog.level = "debug"\n\n' "$TEST_DIR" "$name"
+            printf '[[proxies]]\nname = "%s"\ntype = "udp"\nlocalIP = "127.0.0.1"\n' "$name"
+            printf 'localPort = %s\nremotePort = %s\n' "$echo_port" "$proxy_port"
+            [[ -n "$extra_line" ]] && printf '%s\n' "$extra_line" || true
+        } > "$out"
+    else
+        {
+            printf 'server_addr = "127.0.0.1"\nserver_port = %s\n' "$server_port"
+            printf 'token = "%s"\n' "$token"
+            printf 'tcp_mux = %s\n' "$mux_val"
+            printf 'login_fail_exit = true\npool_count = 1\n'
+            printf '\n[[proxies]]\nname = "%s"\ntype = "udp"\nlocal_ip = "127.0.0.1"\n' "$name"
+            printf 'local_port = %s\nremote_port = %s\n' "$echo_port" "$proxy_port"
+            [[ -n "$extra_line" ]] && printf '%s\n' "$extra_line" || true
+        } > "$out"
+    fi
+}
+
+write_frpc_config_tcpmux() {
+    local impl="$1" server_port="$2" token="$3" echo_port="$4" \
+          name="$5" domain="$6" out="$7" features="${8:-}"
+    local has_tls=false has_mux=false extra_line=""
+    for feat in $features; do
+        case "$feat" in
+            tls) has_tls=true ;;
+            mux) has_mux=true ;;
+            extra=*) extra_line="${feat#extra=}" ;;
+        esac
+    done
+    local mux_val="false"; $has_mux && mux_val="true"
+    if [[ "$impl" == "go" ]]; then
+        {
+            printf 'serverAddr = "127.0.0.1"\nserverPort = %s\n' "$server_port"
+            printf 'auth.token = "%s"\n' "$token"
+            if $has_tls; then
+                printf 'transport.tls.enable = true\n'
+                printf 'transport.tls.disableCustomTLSFirstByte = true\n'
+                printf 'transport.tls.trustedCaFile = "%s/ca.crt"\n' "$CERT_DIR"
+                printf 'transport.tls.serverName = "localhost"\n'
+            else
+                printf 'transport.tls.enable = false\n'
+            fi
+            printf 'transport.tcpMux = %s\n' "$mux_val"
+            printf 'log.to = "%s/go-frpc-%s.log"\nlog.level = "debug"\n\n' "$TEST_DIR" "$name"
+            printf '[[proxies]]\nname = "%s"\ntype = "tcpmux"\nmultiplexer = "httpconnect"\n' "$name"
+            printf 'localIP = "127.0.0.1"\nlocalPort = %s\ncustomDomains = ["%s"]\n' "$echo_port" "$domain"
+            [[ -n "$extra_line" ]] && printf '%s\n' "$extra_line" || true
+        } > "$out"
+    else
+        {
+            printf 'server_addr = "127.0.0.1"\nserver_port = %s\n' "$server_port"
+            printf 'token = "%s"\n' "$token"
+            printf 'tcp_mux = %s\n' "$mux_val"
+            printf 'login_fail_exit = true\npool_count = 1\n'
+            printf '\n[[proxies]]\nname = "%s"\ntype = "tcpmux"\nmultiplexer = "httpconnect"\n' "$name"
+            printf 'local_ip = "127.0.0.1"\nlocal_port = %s\ncustom_domains = ["%s"]\n' "$echo_port" "$domain"
+            [[ -n "$extra_line" ]] && printf '%s\n' "$extra_line" || true
+        } > "$out"
+    fi
+}
+
 # =============================================================================
 # Test: Go frpc -> Rust frps, plain TCP
 # =============================================================================
@@ -988,7 +758,7 @@ test_g2r_tcp_plain() {
     }
 
     # Start Rust frps
-    write_rust_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -998,8 +768,7 @@ test_g2r_tcp_plain() {
     }
 
     # Start Go frpc
-    write_go_frpc_config "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "tcp-plain" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config go "$frps_port" "$token" "$echo_port" "$proxy_port" "tcp-plain" "$TEST_DIR/$name/frpc.toml" ""
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -1041,7 +810,7 @@ test_g2r_tcp_encrypted() {
         return
     }
 
-    write_rust_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -1050,9 +819,7 @@ test_g2r_tcp_encrypted() {
         return
     }
 
-    write_go_frpc_config "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "tcp-enc" "$TEST_DIR/$name/frpc.toml" \
-        "transport.useEncryption = true"
+    write_frpc_config go "$frps_port" "$token" "$echo_port" "$proxy_port" "tcp-enc" "$TEST_DIR/$name/frpc.toml" "enc"
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -1092,7 +859,7 @@ test_g2r_tcp_tls() {
         return
     }
 
-    write_rust_frps_config_tls "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "tls"
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -1101,8 +868,7 @@ test_g2r_tcp_tls() {
         return
     }
 
-    write_go_frpc_config_tls "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "tcp-tls" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config go "$frps_port" "$token" "$echo_port" "$proxy_port" "tcp-tls" "$TEST_DIR/$name/frpc.toml" "tls"
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -1142,7 +908,7 @@ test_g2r_tcp_tls_encrypt() {
         return
     }
 
-    write_rust_frps_config_tls "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "tls"
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -1151,9 +917,7 @@ test_g2r_tcp_tls_encrypt() {
         return
     }
 
-    write_go_frpc_config_tls "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "tcp-tls-enc" "$TEST_DIR/$name/frpc.toml" \
-        "transport.useEncryption = true"
+    write_frpc_config go "$frps_port" "$token" "$echo_port" "$proxy_port" "tcp-tls-enc" "$TEST_DIR/$name/frpc.toml" "tls enc"
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -1193,7 +957,7 @@ test_g2r_mux_plain() {
         return
     }
 
-    write_rust_frps_config_mux "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "mux"
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -1202,8 +966,7 @@ test_g2r_mux_plain() {
         return
     }
 
-    write_go_frpc_config_mux "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "mux-plain" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config go "$frps_port" "$token" "$echo_port" "$proxy_port" "mux-plain" "$TEST_DIR/$name/frpc.toml" "mux"
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -1243,7 +1006,7 @@ test_g2r_mux_encrypted() {
         return
     }
 
-    write_rust_frps_config_mux "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "mux"
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -1252,9 +1015,7 @@ test_g2r_mux_encrypted() {
         return
     }
 
-    write_go_frpc_config_mux "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "mux-enc" "$TEST_DIR/$name/frpc.toml" \
-        "transport.useEncryption = true"
+    write_frpc_config go "$frps_port" "$token" "$echo_port" "$proxy_port" "mux-enc" "$TEST_DIR/$name/frpc.toml" "mux enc"
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -1294,7 +1055,7 @@ test_g2r_mux_tls() {
         return
     }
 
-    write_rust_frps_config_mux_tls "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "tls mux"
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -1303,8 +1064,7 @@ test_g2r_mux_tls() {
         return
     }
 
-    write_go_frpc_config_mux_tls "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "mux-tls" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config go "$frps_port" "$token" "$echo_port" "$proxy_port" "mux-tls" "$TEST_DIR/$name/frpc.toml" "tls mux"
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -1344,7 +1104,7 @@ test_g2r_mux_tls_encrypt() {
         return
     }
 
-    write_rust_frps_config_mux_tls "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "tls mux"
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -1353,9 +1113,7 @@ test_g2r_mux_tls_encrypt() {
         return
     }
 
-    write_go_frpc_config_mux_tls "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "mux-tls-enc" "$TEST_DIR/$name/frpc.toml" \
-        "transport.useEncryption = true"
+    write_frpc_config go "$frps_port" "$token" "$echo_port" "$proxy_port" "mux-tls-enc" "$TEST_DIR/$name/frpc.toml" "tls mux enc"
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -1396,7 +1154,7 @@ test_r2g_tcp_plain() {
     }
 
     # Start Go frps
-    write_go_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -1406,8 +1164,7 @@ test_r2g_tcp_plain() {
     }
 
     # Start Rust frpc
-    write_rust_frpc_config "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "tcp-plain" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config rust "$frps_port" "$token" "$echo_port" "$proxy_port" "tcp-plain" "$TEST_DIR/$name/frpc.toml" ""
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -1447,7 +1204,7 @@ test_r2g_tcp_encrypted() {
         return
     }
 
-    write_go_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -1456,9 +1213,7 @@ test_r2g_tcp_encrypted() {
         return
     }
 
-    write_rust_frpc_config "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "tcp-enc" "$TEST_DIR/$name/frpc.toml" \
-        "use_encryption = true"
+    write_frpc_config rust "$frps_port" "$token" "$echo_port" "$proxy_port" "tcp-enc" "$TEST_DIR/$name/frpc.toml" "enc"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -1498,7 +1253,7 @@ test_r2g_tcp_tls() {
         return
     }
 
-    write_go_frps_config_tls "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "tls"
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -1507,8 +1262,7 @@ test_r2g_tcp_tls() {
         return
     }
 
-    write_rust_frpc_config_tls "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "tcp-tls" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config rust "$frps_port" "$token" "$echo_port" "$proxy_port" "tcp-tls" "$TEST_DIR/$name/frpc.toml" "tls"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -1548,7 +1302,7 @@ test_r2g_tcp_tls_encrypt() {
         return
     }
 
-    write_go_frps_config_tls "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "tls"
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -1557,9 +1311,7 @@ test_r2g_tcp_tls_encrypt() {
         return
     }
 
-    write_rust_frpc_config_tls "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "tcp-tls-enc" "$TEST_DIR/$name/frpc.toml" \
-        "use_encryption = true"
+    write_frpc_config rust "$frps_port" "$token" "$echo_port" "$proxy_port" "tcp-tls-enc" "$TEST_DIR/$name/frpc.toml" "tls enc"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -1599,7 +1351,7 @@ test_r2g_mux_plain() {
         return
     }
 
-    write_go_frps_config_mux "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "mux"
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -1608,8 +1360,7 @@ test_r2g_mux_plain() {
         return
     }
 
-    write_rust_frpc_config_mux "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "mux-plain" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config rust "$frps_port" "$token" "$echo_port" "$proxy_port" "mux-plain" "$TEST_DIR/$name/frpc.toml" "mux"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -1649,7 +1400,7 @@ test_r2g_mux_encrypted() {
         return
     }
 
-    write_go_frps_config_mux "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "mux"
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -1658,9 +1409,7 @@ test_r2g_mux_encrypted() {
         return
     }
 
-    write_rust_frpc_config_mux "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "mux-enc" "$TEST_DIR/$name/frpc.toml" \
-        "use_encryption = true"
+    write_frpc_config rust "$frps_port" "$token" "$echo_port" "$proxy_port" "mux-enc" "$TEST_DIR/$name/frpc.toml" "mux enc"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -1700,7 +1449,7 @@ test_r2g_mux_tls() {
         return
     }
 
-    write_go_frps_config_mux_tls "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "tls mux"
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -1709,8 +1458,7 @@ test_r2g_mux_tls() {
         return
     }
 
-    write_rust_frpc_config_mux_tls "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "mux-tls" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config rust "$frps_port" "$token" "$echo_port" "$proxy_port" "mux-tls" "$TEST_DIR/$name/frpc.toml" "tls mux"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -1750,7 +1498,7 @@ test_r2g_mux_tls_encrypt() {
         return
     }
 
-    write_go_frps_config_mux_tls "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "tls mux"
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -1759,9 +1507,7 @@ test_r2g_mux_tls_encrypt() {
         return
     }
 
-    write_rust_frpc_config_mux_tls "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "mux-tls-enc" "$TEST_DIR/$name/frpc.toml" \
-        "use_encryption = true"
+    write_frpc_config rust "$frps_port" "$token" "$echo_port" "$proxy_port" "mux-tls-enc" "$TEST_DIR/$name/frpc.toml" "tls mux enc"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -1796,22 +1542,10 @@ test_g2r_udp() {
     mkdir -p "$TEST_DIR/$name"
 
     # Start UDP echo server
-    python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind(('127.0.0.1', $echo_port))
-while True:
-    try:
-        data, addr = s.recvfrom(4096)
-        s.sendto(data, addr)
-    except:
-        break
-" &
-    track_pid $!
-    sleep 0.5
+    start_udp_echo_server "$echo_port"
 
     # Start Rust frps
-    write_rust_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -1821,47 +1555,14 @@ while True:
     }
 
     # Start Go frpc with UDP proxy
-    cat > "$TEST_DIR/$name/frpc.toml" <<TOML
-serverAddr = "127.0.0.1"
-serverPort = $frps_port
-auth.token = "$token"
-transport.tls.enable = false
-transport.tcpMux = false
-log.to = "$TEST_DIR/go-frpc-$name.log"
-log.level = "debug"
-
-[[proxies]]
-name = "udp-echo"
-type = "udp"
-localIP = "127.0.0.1"
-localPort = $echo_port
-remotePort = $proxy_port
-TOML
+    write_frpc_config_udp go "$frps_port" "$token" "$echo_port" "$proxy_port" "udp-echo" "$TEST_DIR/$name/frpc.toml" ""
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
-    sleep 2  # UDP takes a moment to set up
-
     # Test UDP data round-trip
     local result
-    result=$(python3 -c "
-import socket, time
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.settimeout(5)
-test_data = b'udp-test-data'
-try:
-    s.sendto(test_data, ('127.0.0.1', $proxy_port))
-    data, addr = s.recvfrom(4096)
-    if data == test_data:
-        print('OK')
-    else:
-        print('FAIL:MISMATCH expected=' + repr(test_data) + ' got=' + repr(data))
-except Exception as e:
-    print('FAIL:ERROR ' + str(e))
-finally:
-    s.close()
-" 2>&1 || echo "FAIL:PYTHON_ERROR")
+    result=$(send_and_expect_udp "$proxy_port" "udp-test-data" 15)
     if [[ "$result" == "OK" ]]; then
         pass_test "$name"
     else
@@ -1885,22 +1586,10 @@ test_r2g_udp() {
     mkdir -p "$TEST_DIR/$name"
 
     # Start UDP echo server
-    python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind(('127.0.0.1', $echo_port))
-while True:
-    try:
-        data, addr = s.recvfrom(4096)
-        s.sendto(data, addr)
-    except:
-        break
-" &
-    track_pid $!
-    sleep 0.5
+    start_udp_echo_server "$echo_port"
 
     # Start Go frps
-    write_go_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -1910,45 +1599,13 @@ while True:
     }
 
     # Start Rust frpc with UDP proxy
-    cat > "$TEST_DIR/$name/frpc.toml" <<TOML
-server_addr = "127.0.0.1"
-server_port = $frps_port
-token = "$token"
-tcp_mux = false
-login_fail_exit = true
-pool_count = 1
-
-[[proxies]]
-name = "udp-echo"
-type = "udp"
-local_ip = "127.0.0.1"
-local_port = $echo_port
-remote_port = $proxy_port
-TOML
+    write_frpc_config_udp rust "$frps_port" "$token" "$echo_port" "$proxy_port" "udp-echo" "$TEST_DIR/$name/frpc.toml" ""
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
-    sleep 2  # UDP takes a moment to set up
-
     local result
-    result=$(python3 -c "
-import socket, time
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.settimeout(5)
-test_data = b'r2g-udp-test'
-try:
-    s.sendto(test_data, ('127.0.0.1', $proxy_port))
-    data, addr = s.recvfrom(4096)
-    if data == test_data:
-        print('OK')
-    else:
-        print('FAIL:MISMATCH expected=' + repr(test_data) + ' got=' + repr(data))
-except Exception as e:
-    print('FAIL:ERROR ' + str(e))
-finally:
-    s.close()
-" 2>&1 || echo "FAIL:PYTHON_ERROR")
+    result=$(send_and_expect_udp "$proxy_port" "r2g-udp-test" 15)
     if [[ "$result" == "OK" ]]; then
         pass_test "$name"
     else
@@ -1972,43 +1629,7 @@ test_g2r_http() {
     mkdir -p "$TEST_DIR/$name"
 
     # Start simple HTTP echo server (returns request body)
-    python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('127.0.0.1', $echo_port))
-s.listen(5)
-while True:
-    try:
-        conn, _ = s.accept()
-        data = b''
-        while True:
-            chunk = conn.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-            # Wait until full body received (based on Content-Length)
-            if b'\r\n\r\n' in data:
-                hdr_end = data.index(b'\r\n\r\n') + 4
-                hdrs = data[:hdr_end].decode('utf-8', errors='ignore').lower()
-                cl = 0
-                for line in hdrs.split('\r\n'):
-                    if line.startswith('content-length:'):
-                        try:
-                            cl = int(line.split(':')[1].strip())
-                        except:
-                            pass
-                if len(data) - hdr_end >= cl:
-                    break
-        if data:
-            # Simple HTTP response echoing request
-            body = b'http-ok:' + data.split(b'\r\n\r\n', 1)[-1] if b'\r\n\r\n' in data else b'http-ok'
-            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
-        conn.close()
-    except:
-        break
-" &
-    track_pid $!
+    start_http_echo_server "$echo_port" "http-ok:"
     wait_for_port 127.0.0.1 "$echo_port" 3 || {
         fail_test "$name" "HTTP echo server did not start"
         return
@@ -2061,24 +1682,12 @@ TOML
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
+    # sleep 3: wait for HTTP proxy registration + VHost routing propagation
     sleep 3
 
     # Send HTTP request through VHost
     local result
-    result=$(python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(5)
-s.connect(('127.0.0.1', $vhost_port))
-req = b'POST /test HTTP/1.1\r\nHost: http-test.local\r\nContent-Length: 5\r\n\r\nhello'
-s.sendall(req)
-data = s.recv(4096)
-s.close()
-if b'http-ok:hello' in data:
-    print('OK')
-else:
-    print('FAIL: unexpected response: ' + repr(data[:200]))
-" 2>&1)
+    result=$(send_http_test "$vhost_port" "http-test.local" "http-ok:" 5)
     if [[ "$result" == "OK" ]]; then
         pass_test "$name"
     else
@@ -2102,42 +1711,7 @@ test_r2g_http() {
     mkdir -p "$TEST_DIR/$name"
 
     # Start HTTP echo server
-    python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('127.0.0.1', $echo_port))
-s.listen(5)
-while True:
-    try:
-        conn, _ = s.accept()
-        data = b''
-        while True:
-            chunk = conn.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-            # Wait until full body received (based on Content-Length)
-            if b'\r\n\r\n' in data:
-                hdr_end = data.index(b'\r\n\r\n') + 4
-                hdrs = data[:hdr_end].decode('utf-8', errors='ignore').lower()
-                cl = 0
-                for line in hdrs.split('\r\n'):
-                    if line.startswith('content-length:'):
-                        try:
-                            cl = int(line.split(':')[1].strip())
-                        except:
-                            pass
-                if len(data) - hdr_end >= cl:
-                    break
-        if data:
-            body = b'http-ok:' + data.split(b'\r\n\r\n', 1)[-1] if b'\r\n\r\n' in data else b'http-ok'
-            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
-        conn.close()
-    except:
-        break
-" &
-    track_pid $!
+    start_http_echo_server "$echo_port" "http-ok:"
     wait_for_port 127.0.0.1 "$echo_port" 3 || {
         fail_test "$name" "HTTP echo server did not start"
         return
@@ -2187,23 +1761,11 @@ TOML
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
+    # sleep 3: wait for HTTP proxy registration + VHost routing propagation
     sleep 3
 
     local result
-    result=$(python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(5)
-s.connect(('127.0.0.1', $vhost_port))
-req = b'POST /test HTTP/1.1\r\nHost: http-test.local\r\nContent-Length: 5\r\n\r\nhello'
-s.sendall(req)
-data = s.recv(4096)
-s.close()
-if b'http-ok:hello' in data:
-    print('OK')
-else:
-    print('FAIL: unexpected response: ' + repr(data[:200]))
-" 2>&1)
+    result=$(send_http_test "$vhost_port" "http-test.local" "http-ok:" 5)
     if [[ "$result" == "OK" ]]; then
         pass_test "$name"
     else
@@ -2234,7 +1796,7 @@ test_g2r_stcp() {
     }
 
     # Start Rust frps
-    write_rust_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
     RUST_LOG=debug "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -2263,7 +1825,6 @@ TOML
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
         > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
     track_pid $!
-    sleep 2
 
     # Start Go frpc visitor (stcp visitor)
     cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
@@ -2324,7 +1885,7 @@ test_r2g_stcp() {
     }
 
     # Start Go frps
-    write_go_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -2352,7 +1913,6 @@ TOML
     RUST_LOG=debug "$RUST_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
         > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
     track_pid $!
-    sleep 2
 
     # Start Rust frpc visitor (STCP visitor)
     cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
@@ -2412,7 +1972,7 @@ test_g2r_xtcp() {
     }
 
     # Start Rust frps
-    write_rust_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
     RUST_LOG=debug "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -2441,7 +2001,6 @@ TOML
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
         > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
     track_pid $!
-    sleep 2
 
     # Start Go frpc visitor (xtcp visitor)
     cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
@@ -2502,7 +2061,7 @@ test_r2g_xtcp() {
     }
 
     # Start Go frps
-    write_go_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -2530,7 +2089,6 @@ TOML
     RUST_LOG=debug "$RUST_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
         > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
     track_pid $!
-    sleep 2
 
     # Start Rust frpc visitor (XTCP visitor)
     cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
@@ -2595,7 +2153,7 @@ test_multi_proxy() {
         return
     }
 
-    write_rust_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -2673,7 +2231,7 @@ test_g2r_compression() {
         return
     }
 
-    write_rust_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -2682,9 +2240,7 @@ test_g2r_compression() {
         return
     }
 
-    write_go_frpc_config "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "tcp-comp" "$TEST_DIR/$name/frpc.toml" \
-        "transport.useCompression = true"
+    write_frpc_config go "$frps_port" "$token" "$echo_port" "$proxy_port" "tcp-comp" "$TEST_DIR/$name/frpc.toml" "compression"
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -2726,8 +2282,7 @@ test_g2r_tcpmux() {
     }
 
     # Start Rust frps with tcpmux HTTP CONNECT port
-    write_rust_frps_config_tcpmux "$frps_port" "$token" "$tcpmux_port" \
-        "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "tcpmux=$tcpmux_port"
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -2741,54 +2296,16 @@ test_g2r_tcpmux() {
     }
 
     # Start Go frpc with tcpmux proxy
-    write_go_frpc_config_tcpmux "$frps_port" "$token" "$echo_port" \
-        "tcpmux-g2r" "$domain" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config_tcpmux go "$frps_port" "$token" "$echo_port" "tcpmux-g2r" "$domain" "$TEST_DIR/$name/frpc.toml" ""
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
-    sleep 2  # wait for proxy registration
+    # Python client below retries connect with 10s timeout
 
     # HTTP CONNECT through tcpmux port, then echo test
     local result
-    result=$(python3 -c "
-import socket, time
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(10)
-deadline = time.time() + 10
-while True:
-    try:
-        s.connect(('127.0.0.1', $tcpmux_port))
-        break
-    except (ConnectionRefusedError, OSError):
-        if time.time() > deadline:
-            print('FAIL:CONNECT_TIMEOUT')
-            exit(0)
-        time.sleep(0.5)
-# Send CONNECT
-req = b'CONNECT $domain:22 HTTP/1.1\r\nHost: $domain:22\r\n\r\n'
-s.sendall(req)
-# Read HTTP response
-resp = b''
-while b'\r\n\r\n' not in resp:
-    chunk = s.recv(4096)
-    if not chunk:
-        break
-    resp += chunk
-if not resp.startswith(b'HTTP/1.1 200'):
-    print('FAIL:CONNECT_RESPONSE ' + repr(resp[:200]))
-    s.close()
-    exit(0)
-# Send test data and expect echo
-test_data = b'tcpmux-g2r-echo'
-s.sendall(test_data)
-reply = s.recv(4096)
-s.close()
-if reply == test_data:
-    print('OK:tcpmux-g2r')
-else:
-    print('FAIL:MISMATCH expected=' + repr(test_data) + ' got=' + repr(reply[:200]))
-" 2>&1)
+    result=$(send_tcpmux_test "$tcpmux_port" "$domain" "tcpmux-g2r-echo" 10)
     if [[ "$result" == OK:* ]]; then
         pass_test "$name"
     else
@@ -2819,8 +2336,7 @@ test_r2g_tcpmux() {
     }
 
     # Start Go frps with tcpmux HTTP CONNECT port
-    write_go_frps_config_tcpmux "$frps_port" "$token" "$tcpmux_port" \
-        "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "tcpmux=$tcpmux_port"
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -2834,54 +2350,16 @@ test_r2g_tcpmux() {
     }
 
     # Start Rust frpc with tcpmux proxy
-    write_rust_frpc_config_tcpmux "$frps_port" "$token" "$echo_port" \
-        "tcpmux-r2g" "$domain" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config_tcpmux rust "$frps_port" "$token" "$echo_port" "tcpmux-r2g" "$domain" "$TEST_DIR/$name/frpc.toml" ""
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
-    sleep 2  # wait for proxy registration
+    # Python client below retries connect with 10s timeout
 
     # HTTP CONNECT through tcpmux port, then echo test
     local result
-    result=$(python3 -c "
-import socket, time
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(10)
-deadline = time.time() + 10
-while True:
-    try:
-        s.connect(('127.0.0.1', $tcpmux_port))
-        break
-    except (ConnectionRefusedError, OSError):
-        if time.time() > deadline:
-            print('FAIL:CONNECT_TIMEOUT')
-            exit(0)
-        time.sleep(0.5)
-# Send CONNECT
-req = b'CONNECT $domain:22 HTTP/1.1\r\nHost: $domain:22\r\n\r\n'
-s.sendall(req)
-# Read HTTP response
-resp = b''
-while b'\r\n\r\n' not in resp:
-    chunk = s.recv(4096)
-    if not chunk:
-        break
-    resp += chunk
-if not resp.startswith(b'HTTP/1.1 200'):
-    print('FAIL:CONNECT_RESPONSE ' + repr(resp[:200]))
-    s.close()
-    exit(0)
-# Send test data and expect echo
-test_data = b'tcpmux-r2g-echo'
-s.sendall(test_data)
-reply = s.recv(4096)
-s.close()
-if reply == test_data:
-    print('OK:tcpmux-r2g')
-else:
-    print('FAIL:MISMATCH expected=' + repr(test_data) + ' got=' + repr(reply[:200]))
-" 2>&1)
+    result=$(send_tcpmux_test "$tcpmux_port" "$domain" "tcpmux-r2g-echo" 10)
     if [[ "$result" == OK:* ]]; then
         pass_test "$name"
     else
@@ -2945,7 +2423,7 @@ test_kcp_rust_to_rust() {
         return
     }
 
-    write_rust_frps_config_kcp "$frps_port" "$token" "$kcp_port" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "kcp=$kcp_port"
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -2955,8 +2433,7 @@ test_kcp_rust_to_rust() {
         return
     }
 
-    write_rust_frpc_config_kcp "$kcp_port" "$token" "$echo_port" "$proxy_port" \
-        "kcp-r2r" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config rust "$kcp_port" "$token" "$echo_port" "$proxy_port" "kcp-r2r" "$TEST_DIR/$name/frpc.toml" "kcp"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -2997,7 +2474,7 @@ test_quic_rust_to_rust() {
         return
     }
 
-    write_rust_frps_config_quic "$frps_port" "$token" "$quic_port" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "quic=$quic_port"
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3007,8 +2484,7 @@ test_quic_rust_to_rust() {
         return
     }
 
-    write_rust_frpc_config_quic "$quic_port" "$token" "$echo_port" "$proxy_port" \
-        "quic-r2r" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config rust "$quic_port" "$token" "$echo_port" "$proxy_port" "quic-r2r" "$TEST_DIR/$name/frpc.toml" "quic"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -3043,41 +2519,7 @@ test_g2r_https() {
     mkdir -p "$TEST_DIR/$name"
 
     # Start simple HTTP echo server (HTTPS proxy terminates TLS, backend is plain HTTP)
-    python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('127.0.0.1', $echo_port))
-s.listen(5)
-while True:
-    try:
-        conn, _ = s.accept()
-        data = b''
-        while True:
-            chunk = conn.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-            if b'\r\n\r\n' in data:
-                hdr_end = data.index(b'\r\n\r\n') + 4
-                hdrs = data[:hdr_end].decode('utf-8', errors='ignore').lower()
-                cl = 0
-                for line in hdrs.split('\r\n'):
-                    if line.startswith('content-length:'):
-                        try:
-                            cl = int(line.split(':')[1].strip())
-                        except:
-                            pass
-                if len(data) - hdr_end >= cl:
-                    break
-        if data:
-            body = b'https-ok:' + data.split(b'\r\n\r\n', 1)[-1] if b'\r\n\r\n' in data else b'https-ok'
-            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
-        conn.close()
-    except:
-        break
-" &
-    track_pid $!
+    start_http_echo_server "$echo_port" "https-ok:"
     wait_for_port 127.0.0.1 "$echo_port" 3 || {
         fail_test "$name" "HTTP echo server did not start"
         return
@@ -3133,28 +2575,12 @@ TOML
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
+    # sleep 3: wait for HTTPS proxy registration + VHost routing propagation
     sleep 3
 
     # Send HTTPS request through VHost (skip TLS verification — self-signed cert)
     local result
-    result=$(python3 -c "
-import socket, ssl
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(5)
-ctx = ssl.create_default_context()
-ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE
-ss = ctx.wrap_socket(s, server_hostname='https-test.local')
-ss.connect(('127.0.0.1', $vhost_https_port))
-req = b'POST /test HTTP/1.1\r\nHost: https-test.local\r\nContent-Length: 5\r\n\r\nhello'
-ss.sendall(req)
-data = ss.recv(4096)
-ss.close()
-if b'https-ok:hello' in data:
-    print('OK')
-else:
-    print('FAIL: unexpected response: ' + repr(data[:200]))
-" 2>&1)
+    result=$(send_https_test "$vhost_https_port" "https-test.local" "https-ok:" 5)
     if [[ "$result" == "OK" ]]; then
         pass_test "$name"
     else
@@ -3257,7 +2683,7 @@ TOML
         fail_test "$name" "Go frps did not start"
         return
     }
-    sleep 2  # give Go frps time to bind VHost HTTPS port
+    # wait_for_port_safe below polls for VHost HTTPS port
     wait_for_port_safe 127.0.0.1 "$vhost_https_port" 5 || {
         fail_test "$name" "VHost HTTPS port $vhost_https_port not reachable"
         return
@@ -3283,28 +2709,12 @@ TOML
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
+    # sleep 3: wait for HTTPS proxy registration + VHost routing propagation
     sleep 3
 
     # Send HTTPS request through VHost
     local result
-    result=$(python3 -c "
-import socket, ssl
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(5)
-ctx = ssl.create_default_context()
-ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE
-ss = ctx.wrap_socket(s, server_hostname='https-test.local')
-ss.connect(('127.0.0.1', $vhost_https_port))
-req = b'POST /test HTTP/1.1\r\nHost: https-test.local\r\nContent-Length: 5\r\n\r\nhello'
-ss.sendall(req)
-data = ss.recv(4096)
-ss.close()
-if b'https-ok:hello' in data:
-    print('OK')
-else:
-    print('FAIL: unexpected response: ' + repr(data[:200]))
-" 2>&1)
+    result=$(send_https_test "$vhost_https_port" "https-test.local" "https-ok:" 5)
     if [[ "$result" == "OK" ]]; then
         pass_test "$name"
     else
@@ -3314,50 +2724,50 @@ else:
 
 # --- Run tests ---
 # Phase 2: Go frpc -> Rust frps TCP data plane
-test_g2r_tcp_plain
-test_g2r_tcp_encrypted
-test_g2r_tcp_tls
-test_g2r_tcp_tls_encrypt
+run_test test_g2r_tcp_plain
+run_test test_g2r_tcp_encrypted
+run_test test_g2r_tcp_tls
+run_test test_g2r_tcp_tls_encrypt
 
 # Phase 2b: Go frpc -> Rust frps, tcp_mux
-test_g2r_mux_plain
-test_g2r_mux_encrypted
-test_g2r_mux_tls
-test_g2r_mux_tls_encrypt
+run_test test_g2r_mux_plain
+run_test test_g2r_mux_encrypted
+run_test test_g2r_mux_tls
+run_test test_g2r_mux_tls_encrypt
 
 # Phase 3: Rust frpc -> Go frps TCP data plane
-test_r2g_tcp_plain
-test_r2g_tcp_encrypted
-test_r2g_tcp_tls
-test_r2g_tcp_tls_encrypt
+run_test test_r2g_tcp_plain
+run_test test_r2g_tcp_encrypted
+run_test test_r2g_tcp_tls
+run_test test_r2g_tcp_tls_encrypt
 
 # Phase 3b: Rust frpc -> Go frps, tcp_mux
-test_r2g_mux_plain
-test_r2g_mux_encrypted
-test_r2g_mux_tls
-test_r2g_mux_tls_encrypt
+run_test test_r2g_mux_plain
+run_test test_r2g_mux_encrypted
+run_test test_r2g_mux_tls
+run_test test_r2g_mux_tls_encrypt
 
 # Phase 4: Other proxy types
-test_g2r_udp
-test_r2g_udp
+run_test test_g2r_udp
+run_test test_r2g_udp
 # SUDP not tested cross-compat: Go frp uses server-side sudp_port with type="udp",
 # while frp-rs has type="sudp" as a distinct proxy type. SUDP logic tested via unit tests.
-test_g2r_http
-test_r2g_http
-test_g2r_https
-test_r2g_https
+run_test test_g2r_http
+run_test test_r2g_http
+run_test test_g2r_https
+run_test test_r2g_https
 # Phase 4b: tcpmux HTTP CONNECT
-test_g2r_tcpmux
-test_r2g_tcpmux
-test_g2r_stcp
-test_r2g_stcp
+run_test test_g2r_tcpmux
+run_test test_r2g_tcpmux
+run_test test_g2r_stcp
+run_test test_r2g_stcp
 # XTCP Go-Rust: server coordinates NAT analysis and address exchange.
 # test_g2r_xtcp  # guarded: Go frp XTCP protocol doesn't interoperate (TCP simultaneous open vs QUIC NAT probes)
 # test_r2g_xtcp
 
 # Phase 5: Multi-proxy and edge cases
-test_multi_proxy
-test_g2r_compression
+run_test test_multi_proxy
+run_test test_g2r_compression
 # =============================================================================
 # Test: Compression (useCompression) — Rust client → Go server
 # =============================================================================
@@ -3379,7 +2789,7 @@ test_r2g_compression() {
         return
     }
 
-    write_go_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3388,9 +2798,7 @@ test_r2g_compression() {
         return
     }
 
-    write_rust_frpc_config "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "tcp-comp" "$TEST_DIR/$name/frpc.toml" \
-        "use_compression = true"
+    write_frpc_config rust "$frps_port" "$token" "$echo_port" "$proxy_port" "tcp-comp" "$TEST_DIR/$name/frpc.toml" "compression"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -3437,7 +2845,7 @@ test_r2g_multi_proxy() {
         return
     }
 
-    write_go_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3514,7 +2922,7 @@ test_g2r_ws_plain() {
         return
     }
 
-    write_rust_frps_config_ws "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "ws"
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3523,8 +2931,7 @@ test_g2r_ws_plain() {
         return
     }
 
-    write_go_frpc_config_ws "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "ws-plain" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config go "$frps_port" "$token" "$echo_port" "$proxy_port" "ws-plain" "$TEST_DIR/$name/frpc.toml" "ws"
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -3564,7 +2971,7 @@ test_r2g_ws_plain() {
         return
     }
 
-    write_go_frps_config_ws "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "ws"
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3575,8 +2982,7 @@ test_r2g_ws_plain() {
 
     # Rust frpc connects via WebSocket to Go frps main port (bindPort).
     # Go frps HandleMux detects WS and proxies internally to VHost handler.
-    write_rust_frpc_config_ws "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "ws-plain" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config rust "$frps_port" "$token" "$echo_port" "$proxy_port" "ws-plain" "$TEST_DIR/$name/frpc.toml" "ws"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -3616,7 +3022,7 @@ test_g2r_ws_encrypted() {
         return
     }
 
-    write_rust_frps_config_ws "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "ws"
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3625,9 +3031,7 @@ test_g2r_ws_encrypted() {
         return
     }
 
-    write_go_frpc_config_ws "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "ws-enc" "$TEST_DIR/$name/frpc.toml" \
-        "transport.useEncryption = true"
+    write_frpc_config go "$frps_port" "$token" "$echo_port" "$proxy_port" "ws-enc" "$TEST_DIR/$name/frpc.toml" "ws enc"
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -3667,7 +3071,7 @@ test_r2g_ws_encrypted() {
         return
     }
 
-    write_go_frps_config_ws "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "ws"
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3676,9 +3080,7 @@ test_r2g_ws_encrypted() {
         return
     }
 
-    write_rust_frpc_config_ws "$frps_port" "$token" "$echo_port" "$proxy_port" \
-        "ws-enc" "$TEST_DIR/$name/frpc.toml" \
-        "use_encryption = true"
+    write_frpc_config rust "$frps_port" "$token" "$echo_port" "$proxy_port" "ws-enc" "$TEST_DIR/$name/frpc.toml" "ws enc"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -3718,7 +3120,7 @@ test_r2g_socks5() {
         return
     }
 
-    write_go_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3755,42 +3157,7 @@ TOML
 
     # SOCKS5 handshake + CONNECT to echo server, then echo test
     local result
-    result=$(python3 -c "
-import socket, struct, sys
-
-# Connect to SOCKS5 proxy
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(5)
-s.connect(('127.0.0.1', $proxy_port))
-
-# SOCKS5 handshake: no auth
-s.sendall(b'\x05\x01\x00')
-reply = s.recv(2)
-if reply != b'\x05\x00':
-    print('FAIL:SOCKS5_HANDSHAKE ' + str(reply))
-    sys.exit(0)
-
-# CONNECT to echo server
-host = b'\x7f\x00\x00\x01'  # 127.0.0.1
-port = struct.pack('>H', $echo_port)
-s.sendall(b'\x05\x01\x00\x01' + host + port)
-reply = s.recv(10)
-if len(reply) < 10 or reply[0] != 0x05:
-    print('FAIL:SOCKS5_CONNECT ' + str(reply[:10]))
-    sys.exit(0)
-if reply[1] != 0x00:
-    print('FAIL:SOCKS5_CONNECT_REFUSED code=' + str(reply[1]))
-    sys.exit(0)
-
-# Echo test through proxy
-s.sendall(b'socks5-test')
-data = s.recv(1024)
-if data == b'socks5-test':
-    print('OK:socks5-test')
-else:
-    print('FAIL:MISMATCH expected=socks5-test got=' + repr(data))
-s.close()
-" 2>&1) || echo "FAIL:PYTHON_ERROR"
+    result=$(send_socks5_test "$proxy_port" "$echo_port" "socks5-test" 10)
 
     if [[ "$result" == OK:* ]]; then
         pass_test "$name"
@@ -3820,7 +3187,7 @@ test_g2r_socks5() {
         return
     }
 
-    write_rust_frps_config "$frps_port" "$token" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3858,42 +3225,7 @@ TOML
 
     # SOCKS5 handshake + CONNECT to echo server, then echo test
     local result
-    result=$(python3 -c "
-import socket, struct, sys
-
-# Connect to SOCKS5 proxy
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(5)
-s.connect(('127.0.0.1', $proxy_port))
-
-# SOCKS5 handshake: no auth
-s.sendall(b'\x05\x01\x00')
-reply = s.recv(2)
-if reply != b'\x05\x00':
-    print('FAIL:SOCKS5_HANDSHAKE ' + str(reply))
-    sys.exit(0)
-
-# CONNECT to echo server
-host = b'\x7f\x00\x00\x01'  # 127.0.0.1
-port = struct.pack('>H', $echo_port)
-s.sendall(b'\x05\x01\x00\x01' + host + port)
-reply = s.recv(10)
-if len(reply) < 10 or reply[0] != 0x05:
-    print('FAIL:SOCKS5_CONNECT ' + str(reply[:10]))
-    sys.exit(0)
-if reply[1] != 0x00:
-    print('FAIL:SOCKS5_CONNECT_REFUSED code=' + str(reply[1]))
-    sys.exit(0)
-
-# Echo test through proxy
-s.sendall(b'socks5-g2r-test')
-data = s.recv(1024)
-if data == b'socks5-g2r-test':
-    print('OK:socks5-g2r-test')
-else:
-    print('FAIL:MISMATCH expected=socks5-g2r-test got=' + repr(data))
-s.close()
-" 2>&1) || echo "FAIL:PYTHON_ERROR"
+    result=$(send_socks5_test "$proxy_port" "$echo_port" "socks5-g2r-test" 10)
 
     if [[ "$result" == OK:* ]]; then
         pass_test "$name"
@@ -3924,7 +3256,7 @@ test_g2r_kcp() {
         return
     }
 
-    write_rust_frps_config_kcp "$frps_port" "$token" "$kcp_port" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "kcp=$kcp_port"
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3935,8 +3267,7 @@ test_g2r_kcp() {
     }
 
     # Go frpc with transport.protocol=kcp connects to the KCP port directly
-    write_go_frpc_config_kcp "$kcp_port" "$token" "$echo_port" "$proxy_port" \
-        "kcp-plain" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config go "$kcp_port" "$token" "$echo_port" "$proxy_port" "kcp-plain" "$TEST_DIR/$name/frpc.toml" "kcp"
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -3977,7 +3308,7 @@ test_r2g_kcp() {
         return
     }
 
-    write_go_frps_config_kcp "$frps_port" "$token" "$kcp_port" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "kcp=$kcp_port"
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3988,8 +3319,7 @@ test_r2g_kcp() {
     }
 
     # Rust frpc with transport_protocol=kcp connects to the KCP port directly
-    write_rust_frpc_config_kcp "$kcp_port" "$token" "$echo_port" "$proxy_port" \
-        "kcp-plain" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config rust "$kcp_port" "$token" "$echo_port" "$proxy_port" "kcp-plain" "$TEST_DIR/$name/frpc.toml" "kcp"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -4030,7 +3360,7 @@ test_g2r_quic() {
         return
     }
 
-    write_rust_frps_config_quic "$frps_port" "$token" "$quic_port" "$TEST_DIR/$name/frps.toml"
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "quic=$quic_port"
     RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -4041,8 +3371,7 @@ test_g2r_quic() {
     }
 
     # Go frpc with transport.protocol=quic connects to the QUIC port directly
-    write_go_frpc_config_quic "$quic_port" "$token" "$echo_port" "$proxy_port" \
-        "quic-plain" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config go "$quic_port" "$token" "$echo_port" "$proxy_port" "quic-plain" "$TEST_DIR/$name/frpc.toml" "quic"
     run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -4083,7 +3412,7 @@ test_r2g_quic() {
         return
     }
 
-    write_go_frps_config_quic "$frps_port" "$token" "$quic_port" "$TEST_DIR/$name/frps.toml"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "quic=$quic_port"
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -4093,8 +3422,7 @@ test_r2g_quic() {
     }
 
     # Rust frpc with transport_protocol=quic connects to the QUIC port directly
-    write_rust_frpc_config_quic "$quic_port" "$token" "$echo_port" "$proxy_port" \
-        "quic-plain" "$TEST_DIR/$name/frpc.toml"
+    write_frpc_config rust "$quic_port" "$token" "$echo_port" "$proxy_port" "quic-plain" "$TEST_DIR/$name/frpc.toml" "quic"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -4114,36 +3442,36 @@ test_r2g_quic() {
 }
 
 # Phase 5: Multi-proxy and edge cases (continued)
-test_r2g_compression
-test_r2g_multi_proxy
+run_test test_r2g_compression
+run_test test_r2g_multi_proxy
 
 # Phase 6: WebSocket transport
-test_g2r_ws_plain
-test_r2g_ws_plain
-test_g2r_ws_encrypted
-test_r2g_ws_encrypted
+run_test test_g2r_ws_plain
+run_test test_r2g_ws_plain
+run_test test_g2r_ws_encrypted
+run_test test_r2g_ws_encrypted
 
 # Phase 7: Plugin
-test_g2r_socks5
-test_r2g_socks5
+run_test test_g2r_socks5
+run_test test_r2g_socks5
 
 # =============================================================================
 # Test: Rust frps -> Rust frpc, KCP transport (Rust↔Rust)
 # =============================================================================
 # Phase 8: KCP + QUIC transport cross-compat
 # Rust↔Rust KCP: both sides use raw kcp crate, wire-compatible.
-test_kcp_rust_to_rust
+run_test test_kcp_rust_to_rust
 # KCP Go↔Rust guarded: Go frp uses kcp-go session layer (FEC + XOR encryption),
 # Rust uses raw kcp crate. Different wire formats -- incompatible.
 # test_g2r_kcp
 # test_r2g_kcp
 
 # QUIC Rust↔Rust: both sides use quinn crate, wire-compatible.
-test_quic_rust_to_rust
+run_test test_quic_rust_to_rust
 # QUIC Go↔Rust: multi-stream-per-connection enabled.
 # Go frp uses quic-go (multi-stream), Rust now accepts additional streams.
-test_g2r_quic
-test_r2g_quic
+run_test test_g2r_quic
+run_test test_r2g_quic
 
 # --- Summary ---
 echo ""
