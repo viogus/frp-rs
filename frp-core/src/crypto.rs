@@ -41,15 +41,18 @@ pub enum AeadAlgorithm {
     XChaCha20Poly1305,
 }
 
-impl AeadAlgorithm {
-    pub fn from_str(s: &str) -> Option<Self> {
+impl std::str::FromStr for AeadAlgorithm {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "aes-256-gcm" => Some(Self::Aes256Gcm),
-            "xchacha20-poly1305" => Some(Self::XChaCha20Poly1305),
-            _ => None,
+            "aes-256-gcm" => Ok(Self::Aes256Gcm),
+            "xchacha20-poly1305" => Ok(Self::XChaCha20Poly1305),
+            _ => Err(()),
         }
     }
+}
 
+impl AeadAlgorithm {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Aes256Gcm => "aes-256-gcm",
@@ -81,7 +84,7 @@ impl AeadAlgorithm {
 // ---------------------------------------------------------------------------
 
 enum AeadCipher {
-    Aes256Gcm(Aes256Gcm),
+    Aes256Gcm(Box<Aes256Gcm>),
     XChaCha20Poly1305(XChaCha20Poly1305),
 }
 
@@ -94,7 +97,7 @@ impl AeadCipher {
             AeadAlgorithm::Aes256Gcm => {
                 let cipher = Aes256Gcm::new_from_slice(key)
                     .map_err(|e| format!("aes-256-gcm init: {e}"))?;
-                Ok(Self::Aes256Gcm(cipher))
+                Ok(Self::Aes256Gcm(Box::new(cipher)))
             }
             AeadAlgorithm::XChaCha20Poly1305 => {
                 let cipher = XChaCha20Poly1305::new_from_slice(key)
@@ -183,10 +186,9 @@ impl<W: AsyncWrite + Unpin> AeadStreamWriter<W> {
     fn write_frame(&mut self, plaintext: &[u8], cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if let Some(ref max) = self.max_frame_count {
             if self.frame_count >= *max {
-                let e = io::Error::new(io::ErrorKind::Other,
-                    format!("AEAD stream frame count limit {} exceeded", max));
+                let e = io::Error::other(format!("AEAD stream frame count limit {} exceeded", max));
                 self.write_err = Some(e);
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "frame count exceeded")));
+                return Poll::Ready(Err(io::Error::other("frame count exceeded")));
             }
         }
 
@@ -213,17 +215,17 @@ impl<W: AsyncWrite + Unpin> AeadStreamWriter<W> {
         let sealed = match self.cipher.encrypt(&self.nonce, plaintext, &aad) {
             Ok(s) => s,
             Err(e) => {
-                let io_err = io::Error::new(io::ErrorKind::Other, e);
+                let io_err = io::Error::other(e);
                 self.write_err = Some(io_err);
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "encrypt failed")));
+                return Poll::Ready(Err(io::Error::other("encrypt failed")));
             }
         };
 
         // Increment nonce (big-endian)
         if !increment_nonce(&mut self.nonce) {
-            let e = io::Error::new(io::ErrorKind::Other, "AEAD nonce exhausted");
+            let e = io::Error::other("AEAD nonce exhausted");
             self.write_err = Some(e);
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "nonce exhausted")));
+            return Poll::Ready(Err(io::Error::other("nonce exhausted")));
         }
         self.frame_count += 1;
 
@@ -364,8 +366,7 @@ impl<R: AsyncRead + Unpin> AeadStreamReader<R> {
 
         if let Some(ref max) = self.max_frame_count {
             if self.frame_count >= *max {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other,
-                    "AEAD stream frame count limit exceeded")));
+                return Poll::Ready(Err(io::Error::other("AEAD stream frame count limit exceeded")));
             }
         }
 
@@ -403,8 +404,7 @@ impl<R: AsyncRead + Unpin> AeadStreamReader<R> {
         };
 
         if !increment_nonce(&mut self.nonce) {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other,
-                "AEAD nonce exhausted")));
+            return Poll::Ready(Err(io::Error::other("AEAD nonce exhausted")));
         }
         self.frame_count += 1;
 
@@ -425,7 +425,7 @@ impl<R: AsyncRead + Unpin> AeadStreamReader<R> {
                         continue;
                     }
                     // Check if we got EOF
-                    if buf.filled().len() == 0 {
+                    if buf.filled().is_empty() {
                         return Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof,
                             "AEAD stream: unexpected EOF")));
                     }
@@ -667,8 +667,7 @@ impl AeadStream {
 
         if let Some(ref max) = self.read_max_frame_count {
             if self.read_frame_count >= *max {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other,
-                    "AEAD read frame count limit exceeded")));
+                return Poll::Ready(Err(io::Error::other("AEAD read frame count limit exceeded")));
             }
         }
 
@@ -712,7 +711,7 @@ impl AeadStream {
         };
 
         if !increment_nonce(&mut self.read_nonce) {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "AEAD read nonce exhausted")));
+            return Poll::Ready(Err(io::Error::other("AEAD read nonce exhausted")));
         }
         self.read_frame_count += 1;
 
@@ -779,9 +778,9 @@ impl AsyncWrite for AeadStream {
         // Build a new frame
         if let Some(ref max) = this.write_max_frame_count {
             if this.write_frame_count >= *max {
-                let e = io::Error::new(io::ErrorKind::Other, "AEAD write frame count limit exceeded");
+                let e = io::Error::other("AEAD write frame count limit exceeded");
                 this.write_err = Some(e);
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "frame count exceeded")));
+                return Poll::Ready(Err(io::Error::other("frame count exceeded")));
             }
         }
 
@@ -805,9 +804,9 @@ impl AsyncWrite for AeadStream {
             let sealed = match this.write_cipher.encrypt(&this.write_nonce, plaintext, &aad) {
                 Ok(s) => s,
                 Err(e) => {
-                    let io_err = io::Error::new(io::ErrorKind::Other, e);
+                    let io_err = io::Error::other(e);
                     this.write_err = Some(io_err);
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "encrypt failed")));
+                    return Poll::Ready(Err(io::Error::other("encrypt failed")));
                 }
             };
 
@@ -815,7 +814,7 @@ impl AsyncWrite for AeadStream {
             pending.extend_from_slice(&sealed);
 
             if !increment_nonce(&mut this.write_nonce) {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "AEAD write nonce exhausted")));
+                return Poll::Ready(Err(io::Error::other("AEAD write nonce exhausted")));
             }
             this.write_frame_count += 1;
             this.write_header_sent = true;
@@ -836,14 +835,14 @@ impl AsyncWrite for AeadStream {
             let sealed = match this.write_cipher.encrypt(&this.write_nonce, plaintext, &aad) {
                 Ok(s) => s,
                 Err(e) => {
-                    let io_err = io::Error::new(io::ErrorKind::Other, e);
+                    let io_err = io::Error::other(e);
                     this.write_err = Some(io_err);
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "encrypt failed")));
+                    return Poll::Ready(Err(io::Error::other("encrypt failed")));
                 }
             };
 
             if !increment_nonce(&mut this.write_nonce) {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "AEAD write nonce exhausted")));
+                return Poll::Ready(Err(io::Error::other("AEAD write nonce exhausted")));
             }
             this.write_frame_count += 1;
 
@@ -972,6 +971,7 @@ pub fn generate_random(len: usize) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn test_increment_nonce() {
@@ -987,9 +987,9 @@ mod tests {
 
     #[test]
     fn test_aead_algorithm_from_str() {
-        assert_eq!(AeadAlgorithm::from_str("aes-256-gcm"), Some(AeadAlgorithm::Aes256Gcm));
-        assert_eq!(AeadAlgorithm::from_str("xchacha20-poly1305"), Some(AeadAlgorithm::XChaCha20Poly1305));
-        assert_eq!(AeadAlgorithm::from_str("unknown"), None);
+        assert_eq!(AeadAlgorithm::from_str("aes-256-gcm"), Ok(AeadAlgorithm::Aes256Gcm));
+        assert_eq!(AeadAlgorithm::from_str("xchacha20-poly1305"), Ok(AeadAlgorithm::XChaCha20Poly1305));
+        assert_eq!(AeadAlgorithm::from_str("unknown"), Err(()));
     }
 
     #[test]

@@ -248,12 +248,12 @@ impl ControlConnection {
                 // derive_aead_control_keys returns (client_to_server, server_to_client)
                 let (write_key, read_key) = frp_core::crypto::derive_aead_control_keys(
                     token.as_bytes(), ctx.algorithm, &ctx.transcript_hash,
-                ).map_err(|e| frp_core::Error::Protocol(e))?;
+                ).map_err(frp_core::Error::Protocol)?;
                 // Client reads from server → server_to_client
                 // Client writes to server → client_to_server
                 let aead = frp_core::crypto::AeadStream::new(
                     Box::new(io_stream), ctx.algorithm, &read_key, &write_key,
-                ).map_err(|e| frp_core::Error::Protocol(e))?;
+                ).map_err(frp_core::Error::Protocol)?;
                 io_stream = IoStream::Aead(Box::new(aead));
             }
         }

@@ -194,8 +194,7 @@ pub async fn handle_control<S>(
     let (mut reader, mut writer): (
         Box<dyn AsyncRead + Unpin + Send>,
         Box<dyn AsyncWrite + Unpin + Send>,
-    ) = if v2 && crypto_ctx.is_some() {
-        let ctx = crypto_ctx.as_ref().unwrap();
+    ) = if let (true, Some(ctx)) = (v2, crypto_ctx.as_ref()) {
         let token = state.reloadable.read().unwrap().auth_cfg.token.clone();
         match frp_core::crypto::derive_aead_control_keys(
             token.as_bytes(), ctx.algorithm, &ctx.transcript_hash,

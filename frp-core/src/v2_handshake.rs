@@ -9,6 +9,7 @@
 //! 4. Both sides derive directional AEAD keys via HKDF-SHA256
 //! 5. All subsequent V2 frames are encrypted with the selected AEAD algorithm
 
+use std::str::FromStr;
 use std::time::Duration;
 
 use base64::Engine;
@@ -185,7 +186,7 @@ pub fn preferred_aead_algorithms() -> Vec<String> {
 /// Select first algorithm from client list that we support.
 pub fn select_aead_algorithm(client_algorithms: &[String]) -> Option<AeadAlgorithm> {
     for alg in client_algorithms {
-        if let Some(a) = AeadAlgorithm::from_str(alg) {
+        if let Ok(a) = AeadAlgorithm::from_str(alg) {
             return Some(a);
         }
     }
@@ -302,9 +303,9 @@ pub fn compute_transcript_hash(client_hello_payload: &[u8], server_hello_payload
 }
 
 fn write_transcript_part(h: &mut Sha256, label: &str, payload: &[u8]) {
-    h.update(&[0u8]);
+    h.update([0u8]);
     h.update(label.as_bytes());
-    h.update(&[0u8]);
+    h.update([0u8]);
     h.update((payload.len() as u64).to_be_bytes());
     h.update(payload);
 }
@@ -362,7 +363,7 @@ pub async fn v2_handshake_client(
             // If server selected crypto, validate and build context
             if let Some(ref crypto_sel) = server_hello.selected.crypto {
                 let algorithm = AeadAlgorithm::from_str(&crypto_sel.algorithm)
-                    .ok_or_else(|| crate::Error::Protocol(format!(
+                    .map_err(|_| crate::Error::Protocol(format!(
                         "server selected unknown algorithm: {}", crypto_sel.algorithm
                     )))?;
                 if crypto_sel.server_random.len() != CRYPTO_RANDOM_SIZE {
@@ -373,7 +374,7 @@ pub async fn v2_handshake_client(
                 }
                 // Validate server selected algo was in our offer
                 let offered = &hello.capabilities.crypto.algorithms;
-                if !offered.iter().any(|a| AeadAlgorithm::from_str(a) == Some(algorithm)) {
+                if !offered.iter().any(|a| AeadAlgorithm::from_str(a) == Ok(algorithm)) {
                     return Err(crate::Error::Protocol(format!(
                         "server selected algorithm not offered by client: {}", crypto_sel.algorithm
                     )));
