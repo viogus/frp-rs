@@ -73,15 +73,29 @@ async fn test_ssh_gateway_disabled_by_default() {
 
     let (_handle, _port) = start_test_server(cfg).await;
 
-    // Verify a random port is not serving SSH (use allocate_port to get a
-    // free port — it was free microseconds ago, so it should be refused).
-    let random_port = allocate_port();
-    let result = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", random_port)).await;
-    assert!(
-        result.is_err(),
-        "random port {} should NOT accept connections when SSH is disabled",
-        random_port
-    );
+    // Connect to the server's main FRP port and verify it does NOT serve SSH.
+    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", bind_port))
+        .await
+        .expect("FRP port should accept connections");
+
+    // FRP doesn't send data unsolicited — a read will time out.
+    // The key assertion: the response must NOT start with "SSH-".
+    let mut buf = [0u8; 32];
+    let result = timeout(Duration::from_millis(500), stream.read(&mut buf)).await;
+    match result {
+        Ok(Ok(n)) if n > 0 => {
+            let data = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                !data.starts_with("SSH-"),
+                "FRP main port should not serve SSH banner, got: {}",
+                data
+            );
+        }
+        _ => {
+            // Timeout or error is fine — FRP doesn't send data unsolicited.
+            // The port accepted the connection but didn't speak SSH.
+        }
+    }
 }
 
 /// Verify multiple SSH connections are accepted (each gets unique run_id).

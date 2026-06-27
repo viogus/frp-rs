@@ -166,16 +166,19 @@ impl VirtualControl {
     /// - `stream`: the AsyncRead+AsyncWrite stream to pass to handle_control()
     /// - `frame_tx`: sender for plain V1 frames from the SSH session
     /// - `work_conn_rx`: receiver for intercepted ReqWorkConn signals
+    /// - `phase2_ready`: resolves once LoginResp consumed + CipherStream ready
     pub fn channel(
         enc_key: [u8; 16],
     ) -> (
         impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
         mpsc::UnboundedSender<Vec<u8>>,
         mpsc::UnboundedReceiver<WorkConnRequest>,
+        tokio::sync::oneshot::Receiver<()>,
     ) {
         let (to_handler, from_ssh) = tokio::io::duplex(65536);
         let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (work_tx, work_rx) = mpsc::unbounded_channel::<WorkConnRequest>();
+        let (phase2_tx, phase2_rx) = tokio::sync::oneshot::channel();
 
         // Spawn background task that bridges the duplex to the mpsc channels,
         // with encryption matching handle_control's CipherStream.
@@ -189,7 +192,7 @@ impl VirtualControl {
             use tokio::io::AsyncWriteExt;
 
             const V1_HDR: usize = 9;
-            let mut buf = vec![0u8; 65536];
+            let mut buf = [0u8; 512];
             let mut accumulated = Vec::new();
             let mut from_ssh = from_ssh;
 
@@ -232,6 +235,7 @@ impl VirtualControl {
             }
 
             // ---- Phase 2: wrap in CipherStream, split for concurrent r/w ----
+            let _ = phase2_tx.send(());
             let encrypted = frp_core::cipher_stream::CipherStream::new(
                 Box::new(from_ssh),
                 enc_key,
@@ -240,45 +244,24 @@ impl VirtualControl {
             let read_work_tx = work_tx;
             drop(accumulated); // free the LoginResp-phase buffer
 
-            // Read task: decrypt V1 frames, intercept ReqWorkConn
+            // Read task: decrypt V1 frames with canonical parser, intercept ReqWorkConn
             let read_task: tokio::task::JoinHandle<()> = tokio::spawn(async move {
-                let mut buf = vec![0u8; 65536];
-                let mut accumulated = Vec::new();
                 loop {
-                    match enc_reader.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            accumulated.extend_from_slice(&buf[..n]);
-                            while accumulated.len() >= V1_HDR {
-                                let plen = u64::from_be_bytes([
-                                    accumulated[1],
-                                    accumulated[2],
-                                    accumulated[3],
-                                    accumulated[4],
-                                    accumulated[5],
-                                    accumulated[6],
-                                    accumulated[7],
-                                    accumulated[8],
-                                ]) as usize;
-                                if plen > 65536
-                                    || accumulated.len() < V1_HDR + plen
-                                {
-                                    break;
-                                }
-                                if accumulated[0]
-                                    == frp_core::msg::TYPE_REQ_WORK_CONN
-                                {
-                                    tracing::debug!(
-                                        "bridge: intercepted ReqWorkConn -> WorkConnRequest"
-                                    );
-                                    let _ = read_work_tx.send(WorkConnRequest {
-                                        proxy_name: String::new(),
-                                    });
-                                }
-                                accumulated.drain(..V1_HDR + plen);
+                    match frp_core::protocol::read_v1_frame(&mut enc_reader).await {
+                        Ok((type_byte, _payload)) => {
+                            if type_byte == frp_core::msg::TYPE_REQ_WORK_CONN {
+                                tracing::debug!(
+                                    "bridge: intercepted ReqWorkConn -> WorkConnRequest"
+                                );
+                                let _ = read_work_tx.send(WorkConnRequest {
+                                    proxy_name: String::new(),
+                                });
                             }
                         }
-                        Err(_) => break,
+                        Err(e) => {
+                            tracing::debug!("bridge: read task exiting: {e}");
+                            break;
+                        }
                     }
                 }
             });
@@ -294,7 +277,7 @@ impl VirtualControl {
             let _ = read_task.await;
         });
 
-        (to_handler, frame_tx, work_rx)
+        (to_handler, frame_tx, work_rx, phase2_rx)
     }
 }
 
@@ -955,7 +938,7 @@ impl SshListener {
                 // vc: duplex stream for handle_control (wrapped in CipherStream by handle_control)
                 // frame_tx: SSH session writes plain V1 frames into this
                 // work_conn_rx: receives WorkConnRequest when control handler needs work conn
-                let (vc, frame_tx, work_conn_rx) = VirtualControl::channel(enc_key);
+                let (vc, frame_tx, work_conn_rx, _phase2) = VirtualControl::channel(enc_key);
 
                 // Build synthetic Login message for the control handler.
                 // privilege_key must be MD5(token + timestamp), matching
@@ -1168,33 +1151,40 @@ mod virtual_ctrl_tests {
     /// Helper: build a plaintext LoginResp V1 frame matching what
     /// handle_control writes before wrapping in CipherStream.
     fn make_login_resp_frame() -> Vec<u8> {
-        let payload = br#"{"version":"0.69.1","run_id":"test"}"#;
+        let msg = FrpMessage::LoginResp(frp_core::msg::LoginResp {
+            version: Some("0.69.1".into()),
+            run_id: Some("test".into()),
+            error: None,
+            server_additional_auth_scopes: None,
+        });
+        let payload = serde_json::to_vec(&msg).unwrap();
         let mut frame = Vec::with_capacity(9 + payload.len());
         frame.push(frp_core::msg::TYPE_LOGIN_RESP);
         frame.extend_from_slice(&(payload.len() as i64).to_be_bytes());
-        frame.extend_from_slice(payload);
+        frame.extend_from_slice(&payload);
         frame
     }
 
     /// Helper: write a LoginResp to `vc` so the VirtualControl bg task
     /// can consume it (Phase 1) and transition to encrypted mode (Phase 2).
+    /// Awaits `phase2_ready` (oneshot signal from the bg task) before
+    /// returning — subsequent writes go through the live CipherStream.
     async fn feed_login_resp(
         vc: &mut (impl tokio::io::AsyncWrite + Unpin),
+        phase2_ready: tokio::sync::oneshot::Receiver<()>,
     ) {
         use tokio::io::AsyncWriteExt;
         vc.write_all(&make_login_resp_frame()).await.unwrap();
-        // Small yield so the bg task processes the LoginResp before
-        // subsequent writes arrive through the CipherStream.
-        tokio::task::yield_now().await;
+        phase2_ready.await.expect("bg task should reach Phase 2");
     }
 
     #[tokio::test]
     async fn test_virtual_control_channel_creation() {
         // Verify VirtualControl::channel creates a working duplex + mpsc channels
         let enc_key = frp_core::encryption::derive_key("test-token");
-        let (mut vc, tx, _work_rx) = VirtualControl::channel(enc_key);
+        let (mut vc, tx, _work_rx, phase2) = VirtualControl::channel(enc_key);
         // Feed LoginResp so the bg task transitions to encrypted mode
-        feed_login_resp(&mut vc).await;
+        feed_login_resp(&mut vc, phase2).await;
         // Channel should be alive — sending a frame should work
         assert!(tx.send(vec![0x04, 0, 0, 0, 0, 0, 0, 0, 0]).is_ok());
     }
@@ -1205,10 +1195,10 @@ mod virtual_ctrl_tests {
         // it arrives on the other side (after encryption + decryption).
         use tokio::io::AsyncReadExt;
         let enc_key = frp_core::encryption::derive_key("test-key");
-        let (mut vc, tx, _work_rx) = VirtualControl::channel(enc_key);
+        let (mut vc, tx, _work_rx, phase2) = VirtualControl::channel(enc_key);
 
         // Phase 1: feed plaintext LoginResp so the bg task starts encryption
-        feed_login_resp(&mut vc).await;
+        feed_login_resp(&mut vc, phase2).await;
 
         // Phase 2: send a plain frame through frame_tx. The bg task encrypts
         // it and writes to the duplex. We read the encrypted data from vc
