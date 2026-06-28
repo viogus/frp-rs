@@ -947,11 +947,20 @@ impl Default for DialOptions {
 }
 
 /// Resolve a hostname to an IP address using a specific DNS server.
+///
+/// Sends a standard DNS A-record query over UDP. Handles name compression
+/// pointers in the response. IPv6 (AAAA) is not supported — the custom DNS
+/// server option is typically used with IPv4-only internal resolvers.
 async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<String, crate::Error> {
-    use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
-    use hickory_resolver::TokioAsyncResolver;
     use std::net::SocketAddr;
     use std::str::FromStr;
+    use tokio::net::UdpSocket;
+    use tokio::time::{timeout, Duration};
+
+    // If host is already an IP, return it as-is
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(host.to_string());
+    }
 
     // Parse DNS server address (default port 53)
     let dns_addr = if dns_server.contains(':') {
@@ -962,28 +971,100 @@ async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<String, c
             .map_err(|e| crate::Error::Transport(format!("invalid dns_server '{dns_server}': {e}")))?
     };
 
-    let ns_config = NameServerConfig {
-        socket_addr: dns_addr,
-        protocol: Protocol::Udp,
-        tls_dns_name: None,
-        trust_negative_responses: true,
-        bind_addr: None,
-    };
-    let config = ResolverConfig::from_parts(None, vec![], vec![ns_config]);
-    let resolver = TokioAsyncResolver::tokio(config, ResolverOpts::default());
+    // Build DNS A-record query
+    let mut query = Vec::with_capacity(64);
+    let txid: u16 = rand::random();
+    query.extend_from_slice(&txid.to_be_bytes());
+    query.extend_from_slice(&[0x01, 0x00]); // flags: standard query, RD=1
+    query.extend_from_slice(&[0x00, 0x01]); // QDCOUNT = 1
+    query.extend_from_slice(&[0x00, 0x00]); // ANCOUNT = 0
+    query.extend_from_slice(&[0x00, 0x00]); // NSCOUNT = 0
+    query.extend_from_slice(&[0x00, 0x00]); // ARCOUNT = 0
+    for label in host.split('.') {
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.push(0x00); // terminator
+    query.extend_from_slice(&[0x00, 0x01]); // QTYPE = A
+    query.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
 
-    // If host is already an IP, return it as-is
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return Ok(host.to_string());
+    // Send query over UDP
+    let socket = UdpSocket::bind("0.0.0.0:0").await
+        .map_err(|e| crate::Error::Transport(format!("DNS: bind: {e}")))?;
+    socket.connect(dns_addr).await
+        .map_err(|e| crate::Error::Transport(format!("DNS: connect {dns_server}: {e}")))?;
+    socket.send(&query).await
+        .map_err(|e| crate::Error::Transport(format!("DNS: send to {dns_server}: {e}")))?;
+
+    let mut buf = [0u8; 512];
+    let n = timeout(Duration::from_secs(5), socket.recv(&mut buf)).await
+        .map_err(|_| crate::Error::Transport("DNS: timeout".into()))?
+        .map_err(|e| crate::Error::Transport(format!("DNS: recv: {e}")))?;
+
+    // Parse response
+    let response = &buf[..n];
+    if response.len() < 12 {
+        return Err(crate::Error::Transport("DNS: response too short".into()));
     }
 
-    let response = resolver.lookup_ip(host).await
-        .map_err(|e| crate::Error::Transport(format!("DNS resolve {host} via {dns_server}: {e}")))?;
+    // Verify transaction ID
+    let resp_txid = u16::from_be_bytes([response[0], response[1]]);
+    if resp_txid != txid {
+        return Err(crate::Error::Transport(format!(
+            "DNS: txid mismatch (sent {txid}, got {resp_txid})"
+        )));
+    }
 
-    response.iter()
-        .next()
-        .map(|ip| ip.to_string())
-        .ok_or_else(|| crate::Error::Transport(format!("DNS resolve {host}: no records found")))
+    let ancount = u16::from_be_bytes([response[6], response[7]]) as usize;
+    if ancount == 0 {
+        return Err(crate::Error::Transport(format!("DNS resolve {host}: no records found")));
+    }
+
+    // Skip 12-byte header + question section to reach answers
+    let mut pos = 12;
+    pos = skip_dns_name(response, pos); // QNAME
+    pos += 4; // QTYPE (2) + QCLASS (2)
+
+    // Read answers
+    for _ in 0..ancount {
+        if pos + 10 > response.len() {
+            return Err(crate::Error::Transport("DNS: truncated answer section".into()));
+        }
+        pos = skip_dns_name(response, pos); // NAME (may be compression pointer)
+        let qtype = u16::from_be_bytes([response[pos], response[pos + 1]]);
+        let rdlength = u16::from_be_bytes([response[pos + 8], response[pos + 9]]) as usize;
+        pos += 10; // past TYPE(2)+CLASS(2)+TTL(4)+RDLENGTH(2)
+        if pos + rdlength > response.len() {
+            return Err(crate::Error::Transport("DNS: truncated RDATA".into()));
+        }
+        if qtype == 1 && rdlength == 4 {
+            // A record: 4-byte IPv4 address
+            let ip = std::net::Ipv4Addr::new(response[pos], response[pos + 1],
+                                              response[pos + 2], response[pos + 3]);
+            return Ok(ip.to_string());
+        }
+        pos += rdlength;
+    }
+
+    Err(crate::Error::Transport(format!("DNS resolve {host}: no A record found")))
+}
+
+/// Skip a DNS name in the response, handling compression pointers.
+/// Returns the new position after the name.
+fn skip_dns_name(response: &[u8], mut pos: usize) -> usize {
+    loop {
+        if pos >= response.len() {
+            return pos;
+        }
+        let len = response[pos];
+        if len == 0 {
+            return pos + 1; // end of name
+        }
+        if len & 0xC0 == 0xC0 {
+            return pos + 2; // compression pointer (2 bytes total)
+        }
+        pos += 1 + len as usize; // label
+    }
 }
 
 /// Direct TCP connection with optional bind and keepalive.

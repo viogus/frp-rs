@@ -36,7 +36,7 @@ yamux.workspace = true
 tokio-util.workspace = true
 kcp.workspace = true
 quinn.workspace = true
-hickory-resolver.workspace = true
+
 socket2.workspace = true
 jsonwebtoken.workspace = true
 reqwest.workspace = true
