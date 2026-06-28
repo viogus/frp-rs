@@ -272,6 +272,148 @@ pub async fn bridge_plain(
     let _ = tokio::join!(user_to_work, work_to_user);
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Plain bridge: basic bidirectional data flow.
+    #[tokio::test]
+    async fn test_bridge_plain_bidirectional() {
+        let (mut u_w_test, u_r_bridge) = tokio::io::duplex(65536);
+        let (w_w_bridge, mut w_r_test) = tokio::io::duplex(65536);
+        let (mut w_w_test, w_r_bridge) = tokio::io::duplex(65536);
+        let (u_w_bridge, mut u_r_test) = tokio::io::duplex(65536);
+
+        tokio::spawn(async move {
+            bridge_plain(
+                u_r_bridge, u_w_bridge, w_r_bridge, w_w_bridge,
+                false, vec![], None,
+            ).await;
+        });
+
+        // User → Work
+        u_w_test.write_all(b"user->work").await.unwrap();
+        u_w_test.flush().await.unwrap();
+        let mut buf = vec![0u8; 1024];
+        let n = w_r_test.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"user->work");
+
+        // Work → User
+        w_w_test.write_all(b"work->user").await.unwrap();
+        w_w_test.flush().await.unwrap();
+        let n2 = u_r_test.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n2], b"work->user");
+    }
+
+    /// Plain bridge with pre_read: bytes forwarded before main loop.
+    #[tokio::test]
+    async fn test_bridge_plain_pre_read() {
+        let (mut u_w_test, u_r_bridge) = tokio::io::duplex(65536);
+        let (w_w_bridge, mut w_r_test) = tokio::io::duplex(65536);
+        let (_w_w_test, w_r_bridge) = tokio::io::duplex(65536);
+        let (u_w_bridge, _u_r_test) = tokio::io::duplex(65536);
+
+        let pre_read = b"pre-read body".to_vec();
+
+        tokio::spawn(async move {
+            bridge_plain(
+                u_r_bridge, u_w_bridge, w_r_bridge, w_w_bridge,
+                false, pre_read, None,
+            ).await;
+        });
+
+        let mut buf = vec![0u8; 1024];
+        let n = w_r_test.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"pre-read body");
+
+        u_w_test.write_all(b"after").await.unwrap();
+        u_w_test.flush().await.unwrap();
+        let n2 = w_r_test.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n2], b"after");
+    }
+
+    /// Encrypted bridge: smoke test — starts, processes data, completes without panic.
+    /// Content verification is done in cipher_stream tests.
+    /// Note: bridge uses tokio::join! — both directions must complete. We drop
+    /// both write sides to signal EOF on both read sides.
+    #[tokio::test]
+    async fn test_encrypted_bridge_smoke() {
+        let key = crate::encryption::derive_key("smoke_test_key_42");
+
+        let (mut u_w_test, u_r_bridge) = tokio::io::duplex(65536);
+        let (w_w_bridge, _w_r_test) = tokio::io::duplex(65536);
+        let (w_w_test, w_r_bridge) = tokio::io::duplex(65536);
+        let (u_w_bridge, _u_r_test) = tokio::io::duplex(65536);
+
+        let handle = tokio::spawn(async move {
+            bridge_encrypted(
+                u_r_bridge, u_w_bridge, w_r_bridge, w_w_bridge,
+                &key, false, vec![], None, None, None,
+            ).await;
+        });
+
+        u_w_test.write_all(b"hello encrypted world").await.unwrap();
+        u_w_test.flush().await.unwrap();
+        drop(u_w_test); // EOF on user_r
+        drop(w_w_test); // EOF on work_r (so enc_work_r.read() returns 0)
+
+        handle.await.unwrap();
+    }
+
+    /// Encrypted bridge with compression: smoke test.
+    #[tokio::test]
+    async fn test_encrypted_bridge_compression_smoke() {
+        let key = crate::encryption::derive_key("comp_smoke_key_99");
+
+        let (mut u_w_test, u_r_bridge) = tokio::io::duplex(65536);
+        let (w_w_bridge, _w_r_test) = tokio::io::duplex(65536);
+        let (w_w_test, w_r_bridge) = tokio::io::duplex(65536);
+        let (u_w_bridge, _u_r_test) = tokio::io::duplex(65536);
+
+        let handle = tokio::spawn(async move {
+            bridge_encrypted(
+                u_r_bridge, u_w_bridge, w_r_bridge, w_w_bridge,
+                &key, true, vec![], None, None, None,
+            ).await;
+        });
+
+        let msg = b"AAAA".repeat(256);
+        u_w_test.write_all(&msg).await.unwrap();
+        u_w_test.flush().await.unwrap();
+        drop(u_w_test);
+        drop(w_w_test);
+
+        handle.await.unwrap();
+    }
+
+    /// Encrypted bridge: large data smoke test.
+    #[tokio::test]
+    async fn test_encrypted_bridge_large_smoke() {
+        let key = crate::encryption::derive_key("large_smoke_12345");
+
+        let (mut u_w_test, u_r_bridge) = tokio::io::duplex(256 * 1024);
+        let (w_w_bridge, _w_r_test) = tokio::io::duplex(256 * 1024);
+        let (w_w_test, w_r_bridge) = tokio::io::duplex(256 * 1024);
+        let (u_w_bridge, _u_r_test) = tokio::io::duplex(256 * 1024);
+
+        let handle = tokio::spawn(async move {
+            bridge_encrypted(
+                u_r_bridge, u_w_bridge, w_r_bridge, w_w_bridge,
+                &key, false, vec![], None, None, None,
+            ).await;
+        });
+
+        let large_msg = vec![0x42u8; 100_000];
+        u_w_test.write_all(&large_msg).await.unwrap();
+        u_w_test.flush().await.unwrap();
+        drop(u_w_test);
+        drop(w_w_test);
+
+        handle.await.unwrap();
+    }
+}
+
 /// Plain (unencrypted) bidirectional bridge with optional bandwidth limiting.
 ///
 /// Uses the same `join!`-of-two-halves pattern as `bridge_encrypted` so that
