@@ -52,22 +52,18 @@ pub enum InternalMsg {
     /// Sent when a new control connection claims the same run_id.
     /// The old handler should stop listening and clean up.
     Shutdown,
-    /// NAT hole punch: server tells provider to initiate hole punch (Rust frpc compat).
-    /// DEPRECATED: Go frp compat uses NatHoleSidOnWorkConn — provider does its own
-    /// STUN, server is pure relay. Remove this variant once Rust frpc XTCP is verified.
-    #[allow(dead_code)]
+    /// NAT hole punch: server tells provider to initiate hole punch.
     NatHoleClient {
         proxy_name: String,
         transaction_id: String,
         visitor_addr: Option<String>,
     },
-    /// Send NatHoleSid to provider on a work connection (Go frp v0.69.1 XTCP compat).
-    /// The server writes NatHoleSid on a pooled work connection to notify
-    /// the provider that a new XTCP visitor has arrived. The provider then
-    /// does its own STUN discovery and sends NatHoleClient back on the
-    /// control connection with its mapped addresses.
+    /// Send NatHoleSid to provider on a work connection (Go frp XTCP compat).
+    /// proxy_name is needed so StartWorkConn can be written first to route
+    /// the work connection to the correct XTCP proxy handler on the provider.
     NatHoleSidOnWorkConn {
         sid: String,
+        proxy_name: String,
     },
     /// Forward NatHoleSid to visitor via control channel (Go frp compat).
     WriteNatHoleSid {
@@ -1378,7 +1374,7 @@ async fn handle_nat_hole_visitor(
     stream: IoStream,
     msg: msg::NatHoleVisitor,
     state: Arc<AppState>,
-    _visitor_addr: Option<String>, // not used in Go compat path; kept for callers
+    _visitor_addr: Option<String>, // unused in Go compat path
 ) {
     let transaction_id = msg.transaction_id.clone();
     let proxy_name = msg.proxy_name.clone();
@@ -1438,15 +1434,10 @@ async fn handle_nat_hole_visitor(
         }
     };
 
-    // --- Go frp v0.69.1 compat: pre_check validates proxy and permissions
-    // without creating a session. Visitor proceeds to STUN after receiving OK.
-    // Check mapped_addrs.is_none() to distinguish from clients that send
-    // pre_check=true with full data (treating it as a full request).
+    // Go frp v0.69.1 compat: pre_check validates proxy and permissions
+    // without creating a session. Visitor proceeds to STUN after OK.
     if msg.pre_check && msg.mapped_addrs.is_none() {
-        debug!(
-            "NatHoleVisitor pre_check for proxy '{}': OK",
-            proxy_name
-        );
+        debug!("NatHoleVisitor pre_check for proxy '{}': OK", proxy_name);
         let (_, mut writer) = stream.into_split();
         let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
             transaction_id: transaction_id.clone(),
@@ -1489,14 +1480,12 @@ async fn handle_nat_hole_visitor(
         rx
     };
 
-    // Send NatHoleSid to provider ON A WORK CONNECTION (Go frp v0.69.1 compat).
-    // The provider reads NatHoleSid from the work connection, does its own STUN,
-    // and sends NatHoleClient back on its control connection with its mapped addresses.
-    // handle_client() signals notify_ch when the provider's response arrives.
+    // Send NatHoleSid to provider on a work connection (Go frp v0.69.1 compat).
     if ctl_tx
         .tx
         .send(InternalMsg::NatHoleSidOnWorkConn {
             sid: sid.clone(),
+            proxy_name: proxy_name.clone(),
         })
         .is_err()
     {
@@ -1511,9 +1500,8 @@ async fn handle_nat_hole_visitor(
     );
 
     // Wait for provider's NatHoleClient with STUN addresses.
-    // The provider does its own STUN discovery and sends
+    // The provider's control handler will do STUN discovery and send
     // NatHoleClient back with mapped_addrs/assisted_addrs.
-    // Go frp v0.69.1 compat: server is a pure relay.
     // handle_client() signals notify_ch when the message arrives.
 
     let client_msg_received = tokio::time::timeout(
