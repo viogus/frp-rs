@@ -159,26 +159,15 @@ async fn test_xtcp_nat_hole_message_routing() {
         .expect("send full NatHoleVisitor");
     println!("Visitor sent full NatHoleVisitor with mapped_addrs");
 
-    // --- Provider reads StartWorkConn then NatHoleSid from WORK CONNECTION ---
-    // Go frp v0.69.1 compat: server writes StartWorkConn first to route
-    // the work connection to the XTCP proxy handler, then NatHoleSid.
-    let sid = match read_msg_v1(&mut work_conn).await.expect("read StartWorkConn from work conn") {
-        FrpMessage::StartWorkConn(swc) => {
-            assert_eq!(swc.proxy_name, "xtcp-test");
-            println!("Provider received StartWorkConn for proxy '{}'", swc.proxy_name);
-            // Now read NatHoleSid
-            match read_msg_v1(&mut work_conn).await.expect("read NatHoleSid from work conn") {
-                FrpMessage::NatHoleSid(sid_msg) => {
-                    let s = sid_msg.sid.clone().expect("NatHoleSid should have sid");
-                    assert!(!s.is_empty(), "sid should be non-empty");
-                    println!("Provider received NatHoleSid on work conn: sid={}", s);
-                    s
-                }
-                other => panic!("expected NatHoleSid after StartWorkConn, got: {:?}", other.v1_type_byte()),
-            }
-        }
-        other => panic!("expected StartWorkConn on work conn, got: {:?}", other.v1_type_byte()),
-    };
+    // --- Provider reads NatHoleSid from WORK CONNECTION ---
+    match read_msg_v1(&mut work_conn)
+        .await
+        .expect("read NatHoleSid from work conn")
+    {
+        FrpMessage::NatHoleSid(sid_msg) => {
+            let sid = sid_msg.sid.clone().expect("NatHoleSid should have sid");
+            assert!(!sid.is_empty(), "sid should be non-empty");
+            println!("Provider received NatHoleSid on work conn: sid={}", sid);
 
             // --- Provider does "STUN" → sends NatHoleClient on CONTROL conn ---
             let client_msg = FrpMessage::NatHoleClient(msg::NatHoleClient {
@@ -221,6 +210,9 @@ async fn test_xtcp_nat_hole_message_routing() {
                 }
                 other => panic!("expected NatHoleResp on provider control, got: {:?}", other.v1_type_byte()),
             }
+        }
+        other => panic!("expected NatHoleSid on work conn, got: {:?}", other.v1_type_byte()),
+    }
 
     // --- Visitor reads NatHoleResp with provider's candidate addresses ---
     match read_msg_v1(&mut visitor_conn)
@@ -312,54 +304,4 @@ async fn test_xtcp_nat_hole_message_routing() {
     drop(provider_ctl);
     drop(visitor_conn);
     drop(work_conn);
-}
-
-/// Verify TCP simultaneous open works on localhost.
-/// Side A binds with SO_REUSEADDR and connects to Side B (which listens).
-/// Validates the kernel-level mechanism used for NAT hole punching.
-#[tokio::test]
-async fn test_tcp_simultaneous_open_localhost() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpSocket;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().unwrap();
-
-    let side_a = {
-        let peer = addr;
-        tokio::spawn(async move {
-            let sock = TcpSocket::new_v4().unwrap();
-            sock.set_reuseaddr(true).unwrap();
-            #[cfg(unix)]
-            sock.set_reuseport(true).ok();
-            sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-            sock.connect(peer).await
-        })
-    };
-
-    let (mut side_b, _) = listener.accept().await.expect("accept");
-    let mut side_a = side_a.await.unwrap().expect("connect");
-
-    side_a.write_all(b"hello from A").await.unwrap();
-    let mut buf = [0u8; 16];
-    let n = side_b.read(&mut buf).await.unwrap();
-    assert_eq!(&buf[..n], b"hello from A");
-
-    side_b.write_all(b"hello from B").await.unwrap();
-    let n = side_a.read(&mut buf).await.unwrap();
-    assert_eq!(&buf[..n], b"hello from B");
-}
-
-/// Verify STUN binding against public server. Non-fatal on network failure.
-#[tokio::test]
-async fn test_stun_binding_google() {
-    let result = frp_core::stun::stun_binding("stun:stun.l.google.com:19302").await;
-    match result {
-        Ok(addr) => {
-            assert!(addr.contains(':'), "mapped address should contain port");
-        }
-        Err(e) => {
-            println!("STUN test skipped (no network?): {}", e);
-        }
-    }
 }

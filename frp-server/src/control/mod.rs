@@ -8,14 +8,13 @@ use std::collections::VecDeque;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant};
 use tracing::{info, warn, debug};
+use crate::nathole::NAT_HOLE_TIMEOUT;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 
 use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::IncomingStreams;
 use frp_core::protocol::{read_msg_v1, write_msg_v1, read_msg_v2, write_msg_v2};
-
-use crate::nathole::NAT_HOLE_TIMEOUT;
 
 /// Protocol-aware read: dispatches to V1 or V2 framing based on the `v2` flag.
 async fn read_ctl_msg<R: AsyncReadExt + Unpin>(
@@ -187,6 +186,10 @@ pub async fn handle_control<S>(
     }
 
     // --- Wrap in encryption (matches client after login) ---
+    // V2 with AEAD crypto: wrap stream in AEAD here, AFTER LoginResp sent
+    // (matching Go frp flow: ClientHello/ServerHello + Login/LoginResp in
+    // plaintext, then AEAD for all subsequent messages).
+    // V1 or V2 without AEAD: wrap in AES-128-CFB (CipherStream) for backward compat.
     let (mut reader, mut writer): (
         Box<dyn AsyncRead + Unpin + Send>,
         Box<dyn AsyncWrite + Unpin + Send>,
@@ -196,6 +199,9 @@ pub async fn handle_control<S>(
             token.as_bytes(), ctx.algorithm, &ctx.transcript_hash,
         ) {
             Ok((read_key, write_key)) => {
+                // derive_aead_control_keys returns (client_to_server, server_to_client).
+                // Server reads from client → client_to_server (= read_key).
+                // Server writes to client → server_to_client (= write_key).
                 match frp_core::crypto::AeadStream::new(
                     Box::new(stream), ctx.algorithm, &read_key, &write_key,
                 ) {
@@ -217,6 +223,7 @@ pub async fn handle_control<S>(
             }
         }
     } else {
+        // V1 or plain V2: wrap in AES-128-CFB
         let enc_key = encryption::derive_key(&state.reloadable.read().unwrap().auth_cfg.token);
         let cipher = frp_core::cipher_stream::CipherStream::new(Box::new(stream), enc_key);
         let (r, w) = tokio::io::split(cipher);
@@ -228,9 +235,12 @@ pub async fn handle_control<S>(
     let mut work_pool: VecDeque<IoStream> = VecDeque::new();
     let mut pending_requests: VecDeque<PendingRequest> = VecDeque::new();
     let mut pending_udp: VecDeque<(String, Instant)> = VecDeque::new();
-    let mut pending_nat_hole_sids: VecDeque<(String, String, Instant)> = VecDeque::new();
+    let mut pending_nat_hole_sids: VecDeque<(String, Instant)> = VecDeque::new();
+    // TCP/HTTP/STCP listener handles. UDP listeners are managed via the work-connection
+    // mechanism (UdpNeedsWorkConn → ReqWorkConn → assign_udp_work_conn).
     let mut listener_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> = std::collections::HashMap::new();
     let mut udp_sockets: std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>> = std::collections::HashMap::new();
+    // Reverse mapping: local_addr → proxy_name for routing UDPPacket responses
     let mut udp_local_to_proxy: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut last_ping = Instant::now();
 
@@ -262,24 +272,18 @@ pub async fn handle_control<S>(
                     Some(InternalMsg::NewWorkConn(mut stream)) => {
                         debug!("Got work conn for run_id {}", run_id);
                         // Expire stale pending NatHoleSid entries first.
-                        while let Some((_, _, ts)) = pending_nat_hole_sids.front() {
+                        while let Some((_, ts)) = pending_nat_hole_sids.front() {
                             if ts.elapsed() > PENDING_REQUEST_TIMEOUT {
-                                let (sid, _, _) = pending_nat_hole_sids.pop_front().unwrap();
+                                let (sid, _) = pending_nat_hole_sids.pop_front().unwrap();
                                 debug!("Pending NatHoleSid {} timed out", sid);
                             } else {
                                 break;
                             }
                         }
                         // Check NatHoleSid delivery first (Go frp XTCP compat).
-                        if let Some((sid, proxy_name, _ts)) = pending_nat_hole_sids.pop_front() {
-                            debug!("Delivering pending NatHoleSid {} for {} to provider", sid, proxy_name);
-                            // Go frp compat: StartWorkConn first for routing.
-                            let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
-                                proxy_name: proxy_name.clone(),
-                                src_addr: None, src_port: None,
-                                dst_addr: None, dst_port: None, error: None,
-                            });
-                            let _ = write_ctl_msg(&mut stream, &swc, v2).await;
+                        // Pending sids take priority — they unblock waiting visitors.
+                        if let Some((sid, _ts)) = pending_nat_hole_sids.pop_front() {
+                            debug!("Delivering pending NatHoleSid {} to provider", sid);
                             let forward = FrpMessage::NatHoleSid(msg::NatHoleSid {
                                 sid: Some(sid.clone()),
                                 provider_addr: None,
@@ -350,6 +354,8 @@ pub async fn handle_control<S>(
                     }
                     Some(InternalMsg::ProxyUserConn { proxy_name, user_conn, pre_read }) => {
                         debug!("User conn for proxy {} on run_id {}", proxy_name, run_id);
+                        // Group load balancing: if proxy belongs to a group,
+                        // select a backend (possibly on a different run_id).
                         let (target_proxy, target_run_id) = {
                             let p = state.proxy_manager.get(&proxy_name).await;
                             let group = p.as_ref().and_then(|p| p.group.clone()).filter(|g| !g.is_empty());
@@ -366,6 +372,7 @@ pub async fn handle_control<S>(
                                 (proxy_name.clone(), run_id.clone())
                             }
                         };
+                        // If backend is on a different run_id, forward to that handler
                         if target_run_id != run_id {
                             let ctl_tx = {
                                 let map = state.run_id_to_ctl_tx.read().await;
@@ -412,7 +419,10 @@ pub async fn handle_control<S>(
                     }
                     Some(InternalMsg::NatHoleClient { proxy_name, transaction_id, visitor_addr }) => {
                         debug!("Received NatHoleClient notification for session {}", transaction_id);
-                        // Send NatHoleClient to provider (Rust frpc compat path).
+
+                        // Server-side STUN for Rust frpc XTCP compat path.
+                        // The Rust frpc provider uses NatHoleClient.visitor_addr for
+                        // TCP simultaneous open to the visitor.
                         // For Go frp compat, the NatHoleSidOnWorkConn path is used instead.
                         let reply = FrpMessage::NatHoleClient(msg::NatHoleClient {
                             transaction_id: transaction_id.clone(),
@@ -463,21 +473,9 @@ pub async fn handle_control<S>(
                             warn!("Failed to write NatHoleReport to visitor: {}", e);
                         }
                     }
-                    Some(InternalMsg::NatHoleSidOnWorkConn { sid, proxy_name }) => {
-                        debug!("Sending NatHoleSid {} for proxy {} on work conn", sid, proxy_name);
+                    Some(InternalMsg::NatHoleSidOnWorkConn { sid }) => {
+                        debug!("Sending NatHoleSid {} to provider on work conn", sid);
                         if let Some(mut work_conn) = work_pool.pop_front() {
-                            // Go frp v0.69.1 compat: write StartWorkConn FIRST so the
-                            // client routes this work connection to the XTCP proxy handler.
-                            // Then write NatHoleSid as the actual XTCP notification.
-                            let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
-                                proxy_name: proxy_name.clone(),
-                                src_addr: None,
-                                src_port: None,
-                                dst_addr: None,
-                                dst_port: None,
-                                error: None,
-                            });
-                            let _ = write_ctl_msg(&mut work_conn, &swc, v2).await;
                             let forward = FrpMessage::NatHoleSid(msg::NatHoleSid {
                                 sid: Some(sid.clone()),
                                 provider_addr: None,
@@ -485,16 +483,18 @@ pub async fn handle_control<S>(
                             if let Err(e) = write_ctl_msg(&mut work_conn, &forward, v2).await {
                                 warn!("Failed to send NatHoleSid on work conn: {}", e);
                             } else {
-                                debug!("Sent StartWorkConn+NatHoleSid {} to provider on work conn", sid);
+                                debug!("Sent NatHoleSid {} to provider on work conn", sid);
                             }
+                            // Connection consumed — Go frp doesn't reuse after NatHoleSid.
                             drop(work_conn);
                         } else {
+                            // No pooled work conn — request one, queue sid.
                             debug!("No pooled work conn for NatHoleSid {}, requesting via ReqWorkConn", sid);
                             if let Err(e) = write_ctl_msg(&mut writer,
                                 &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
                                 warn!("Failed to send ReqWorkConn for NatHoleSid: {}", e);
                             }
-                            pending_nat_hole_sids.push_back((sid, proxy_name, Instant::now()));
+                            pending_nat_hole_sids.push_back((sid, Instant::now()));
                         }
                     }
                     Some(InternalMsg::Shutdown) => {
@@ -509,6 +509,8 @@ pub async fn handle_control<S>(
             }
 
             // Accept yamux streams (TcpMux work connections).
+            // Go frp compat: client sends NewWorkConn on each yamux stream.
+            // Read it to validate, then pool or assign.
             incoming_msg = async {
                 match &mut incoming {
                     Some(inc) => inc.recv().await,
@@ -517,27 +519,6 @@ pub async fn handle_control<S>(
             } => {
                 if let Some(stream) = incoming_msg {
                     let mut io = IoStream::Yamux(stream);
-                    // Consume V2 magic on yamux work connection streams.
-                    // Both Rust frpc and Go frpc write V2 magic on yamux
-                    // work conn streams (after yamux stream open), matching
-                    // Go frp's messageConnector.Connect() which calls
-                    // WriteMagicIfV2 before returning the stream.
-                    if v2 {
-                        let mut magic = [0u8; 7];
-                        match io.read_exact(&mut magic).await {
-                            Ok(_) if magic == frp_core::protocol::V2_MAGIC_BYTES => {
-                                // V2 magic consumed — io is positioned at first frame
-                            }
-                            Ok(_) => {
-                                // Not V2 magic — replay bytes, read as V1
-                                io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
-                            }
-                            Err(_) => {
-                                // Read error — stream closed early
-                                continue;
-                            }
-                        }
-                    }
                     match read_ctl_msg(&mut io, v2).await {
                         Ok(FrpMessage::NewWorkConn(nwc)) => {
                             let stream_run_id = nwc.run_id.as_deref().unwrap_or("");
@@ -579,8 +560,10 @@ pub async fn handle_control<S>(
                 match msg {
                     Ok(FrpMessage::UDPPacket(up)) => {
                         debug!("UDPPacket from client: {} bytes to {:?}", up.content.len(), up.remote_addr);
+                        // Forward via the proxy's UDP socket (bidirectional NAT, Go frp compat).
                         let local_addr_str = up.local_addr.as_ref().map(|a| a.to_string()).unwrap_or_default();
                         let proxy_name = udp_local_to_proxy.get(&local_addr_str).cloned();
+                        // Cache local_addr → proxy_name mapping from incoming packets
                         if !local_addr_str.is_empty() && !udp_local_to_proxy.contains_key(&local_addr_str) {
                             let fallback_pn = proxy_name
                                 .clone()
@@ -589,6 +572,7 @@ pub async fn handle_control<S>(
                                 udp_local_to_proxy.insert(local_addr_str.clone(), pn.clone());
                             }
                         }
+                        // Decrypt/decompress if the proxy requires it
                         let mut payload = up.content.clone();
                         if let Some(ref pn) = proxy_name {
                             if let Some(proxy_info) = state.proxy_manager.get(pn.as_str()).await {
@@ -629,19 +613,23 @@ pub async fn handle_control<S>(
                             if let Some(port) = info.remote_port {
                                 state.used_ports.write().await.remove(&port);
                             }
+                            // Clean up STCP sk_index
                             if let Some(ref sk) = info.sk {
                                 if !sk.is_empty() {
                                     state.sk_index.write().await.remove(sk);
                                 }
                             }
+                            // Clean up VHost routes
                             state.vhost_manager.unregister(&cp.proxy_name).await;
                             state.proxy_metrics.remove(&cp.proxy_name).await;
                         }
+                        // Stop the listener task
                         if let Some(handle) = listener_handles.remove(&cp.proxy_name) {
                             handle.abort();
                         }
                         state.proxy_manager.remove(&cp.proxy_name).await;
                         info!("Proxy closed: {}", cp.proxy_name);
+                        // Server plugin: close_proxy hook (fire-and-forget)
                         let plugin_state = state.clone();
                         let pn = cp.proxy_name.clone();
                         let rid = run_id.clone();
@@ -651,6 +639,7 @@ pub async fn handle_control<S>(
                                 serde_json::json!({ "proxy_name": pn, "run_id": rid }),
                             ).await;
                         });
+                        // Send CloseProxyResp back to client (Go frp compat)
                         let cpr = FrpMessage::CloseProxyResp(msg::CloseProxyResp {
                             proxy_name: cp.proxy_name.clone(),
                         });
@@ -667,9 +656,11 @@ pub async fn handle_control<S>(
                         debug!("Received NatHoleSid from provider: {:?}", sid_msg.sid);
                         if let Some(ref sid) = sid_msg.sid {
                             let provider_addr = peer.as_ref().map(|a| a.to_string());
+                            // Try control-channel path first (Go frp compat).
                             if state.nat_hole.forward_sid_via_ctl(sid, provider_addr.clone()).await {
                                 debug!("Forwarded NatHoleSid via control channel for {}", sid);
                             } else if let Some(mut writer) = state.nat_hole.take_writer(sid).await {
+                                // Fallback: accept-loop writer path
                                 let forward = FrpMessage::NatHoleSid(msg::NatHoleSid {
                                     sid: Some(sid.clone()),
                                     provider_addr,
@@ -688,7 +679,11 @@ pub async fn handle_control<S>(
                     Ok(FrpMessage::NatHoleResp(ref resp_msg)) => {
                         debug!("Received NatHoleResp from provider: txn={}, error={:?}, candidates={:?}",
                             resp_msg.transaction_id, resp_msg.error, resp_msg.candidate_addrs);
+                        // Relay provider's NAT hole response to visitor.
+                        // Go frp XTCP compat: visitor needs provider's candidate addresses
+                        // for TCP simultaneous open.
                         let tid = &resp_msg.transaction_id;
+                        // Try control-channel path first.
                         if state.nat_hole.forward_nat_hole_resp_via_ctl(
                             tid,
                             resp_msg.error.clone(),
@@ -713,6 +708,11 @@ pub async fn handle_control<S>(
                         } else {
                             warn!("NatHoleResp for unknown session {}", tid);
                         }
+                        // Signal the session so handle_nat_hole_visitor wakes up.
+                        // Go frp v0.69.1 sends NatHoleResp (type 'm') from provider
+                        // with its discovered addresses. We store them as if they
+                        // arrived via NatHoleClient so the accept-loop path can
+                        // build the combined NatHoleResp for both sides.
                         state.nat_hole.handle_client(msg::NatHoleClient {
                             sid: resp_msg.sid.clone().or_else(|| Some(tid.clone())),
                             transaction_id: tid.clone(),
@@ -726,7 +726,9 @@ pub async fn handle_control<S>(
                     Ok(FrpMessage::NatHoleReport(ref report_msg)) => {
                         debug!("Received NatHoleReport from provider: {:?}", report_msg.sid);
                         if let Some(ref sid) = report_msg.sid {
+                            // Try control-channel path first (Go frp compat).
                             if !state.nat_hole.forward_report_via_ctl(sid).await {
+                                // Fallback: accept-loop writer path
                                 if let Some(mut writer) = state.nat_hole.take_writer(sid).await {
                                     let forward = FrpMessage::NatHoleReport(msg::NatHoleReport {
                                         sid: Some(sid.clone()),
@@ -738,6 +740,8 @@ pub async fn handle_control<S>(
                         }
                     }
                     Ok(FrpMessage::Ping(ref ping_msg)) => {
+                        // Validate ping auth (Go frp v0.69.1 compat).
+                        // Only validate when "HeartBeats" is in additional_auth_scopes.
                         let requires_ping_auth = state.reloadable.read().unwrap()
                             .additional_auth_scopes.iter().any(|s| s == "HeartBeats");
                         let ping_auth_result = if !requires_ping_auth {
@@ -800,7 +804,8 @@ pub async fn handle_control<S>(
                             }
                         };
 
-                        // Go frp v0.69.1 pre_check compat
+                        // Go frp v0.69.1 pre_check compat: validate and return OK,
+                        // no session created, no provider notified.
                         if nhv.pre_check && nhv.mapped_addrs.is_none() {
                             debug!("NatHoleVisitor pre_check on ctl channel: proxy='{}' OK", proxy_name);
                             let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
@@ -853,23 +858,26 @@ pub async fn handle_control<S>(
                             rx
                         };
 
-                        // Send NatHoleSid to provider on a work connection (Go frp compat)
+                        // Send NatHoleSid to provider ON A WORK CONNECTION (Go frp compat).
                         if provider_ctl.tx.send(InternalMsg::NatHoleSidOnWorkConn {
                             sid: transaction_id.clone(),
-                            proxy_name: proxy_name.clone(),
                         }).is_err() {
                             warn!("Provider for run_id {} has gone away", provider_run_id);
                             state.nat_hole.remove(&transaction_id).await;
                             continue;
                         }
 
-                        // Spawn task for full Go-compat analysis flow
+                        // Spawn task for full Go-compat analysis flow.
+                        // Waits for provider's NatHoleClient on control, runs NAT analysis,
+                        // and sends NatHoleResp to both sides.
                         let nat_hole = state.nat_hole.clone();
                         let visitor_tx = internal_tx.clone();
                         let provider_tx = provider_ctl.tx.clone();
                         let tid = transaction_id.clone();
                         let visitor_msg = nhv.clone();
+                        let _proxy = proxy_name.clone();
                         tokio::spawn(async move {
+                            // Wait for provider's NatHoleClient with STUN addresses
                             let client_received = tokio::time::timeout(
                                 Duration::from_secs(NAT_HOLE_TIMEOUT),
                                 notify_rx,
@@ -882,8 +890,8 @@ pub async fn handle_control<S>(
                             }
 
                             let client_msg_opt = {
-                                let sessions = nat_hole.sessions.read().await;
-                                if let Some(s) = sessions.get(&tid) {
+                                let session_ref = nat_hole.sessions.read().await;
+                                if let Some(s) = session_ref.get(&tid) {
                                     s.client_msg.lock().await.take()
                                 } else {
                                     None
@@ -903,11 +911,13 @@ pub async fn handle_control<S>(
                             let visitor_mapped = visitor_msg.mapped_addrs.unwrap_or_default();
                             let visitor_assisted = visitor_msg.assisted_addrs.unwrap_or_default();
 
+                            // Classify NAT features
                             use crate::nathole::classify;
                             use crate::nathole::controller as nathole_ctrl;
                             let v_feature = classify::classify_nat_feature(&visitor_mapped, &[]).ok();
                             let c_feature = classify::classify_nat_feature(&client_mapped, &[]).ok();
 
+                            // Run analysis and build responses
                             let (v_resp, c_resp) = if let (Some(ref vf), Some(ref cf)) = (&v_feature, &c_feature) {
                                 let key = nathole_ctrl::gen_analysis_key(cf, vf);
                                 let (mode, _index, c_behavior, v_behavior) =
@@ -950,6 +960,7 @@ pub async fn handle_control<S>(
                                 (v_resp, Some(c_resp))
                             };
 
+                            // Send NatHoleResp to visitor via control channel
                             let _ = visitor_tx.send(InternalMsg::WriteNatHoleResp {
                                 transaction_id: v_resp.transaction_id.clone(),
                                 error: v_resp.error.clone(),
@@ -959,6 +970,7 @@ pub async fn handle_control<S>(
                                 assisted_addrs: v_resp.assisted_addrs.clone(),
                             });
 
+                            // Send NatHoleResp to provider via control channel
                             if let Some(ref cr) = c_resp {
                                 let _ = provider_tx.send(InternalMsg::WriteNatHoleResp {
                                     transaction_id: cr.transaction_id.clone(),
@@ -970,6 +982,7 @@ pub async fn handle_control<S>(
                                 });
                             }
 
+                            // Wait for report
                             match tokio::time::timeout(Duration::from_secs(30), report_rx).await {
                                 Ok(Ok(_)) => debug!("NatHole ctl session {}: completed", tid),
                                 Ok(Err(_)) | Err(_) => {
