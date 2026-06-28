@@ -56,7 +56,7 @@ fn base64_deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>
     }
 }
 
-fn base64_serialize_non_null<S: Serializer>(bytes: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+fn base64_serialize_non_null<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
     let encoded = BASE64.encode(bytes);
     s.serialize_str(&encoded)
 }

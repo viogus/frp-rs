@@ -378,66 +378,196 @@ impl Service {
                             let state = quic_state.clone();
                             tokio::spawn(async move {
                                 let mut ctl = frp_core::transport::IoStream::Quic(stream);
-                                match frp_core::protocol::read_msg_v1(&mut ctl).await {
-                                    Ok(frp_core::msg::FrpMessage::Login(login)) => {
-                                        // Spawn drain task concurrently: Go frp opens work
-                                        // conns as additional QUIC streams while the control
-                                        // handler is still running. Drain task reads each new
-                                        // stream and dispatches NewWorkConn via run_id routing.
-                                        // CancellationToken cancels drain when control handler exits.
-                                        let cancel = CancellationToken::new();
-                                        let drain_cancel = cancel.clone();
-                                        let drain_state = state.clone();
-                                        let drain_conn = conn.clone();
-                                        tokio::spawn(async move {
-                                            tracing::debug!("QUIC drain task started, waiting for work streams...");
-                                            loop {
-                                                tokio::select! {
-                                                    _ = drain_cancel.cancelled() => {
-                                                        tracing::debug!("QUIC drain task cancelled");
-                                                        break;
-                                                    }
-                                                    result = drain_conn.accept_bi() => {
-                                                        match result {
-                                                            Ok(work_stream) => {
-                                                                tracing::debug!("QUIC drain: accepted new work stream");
-                                                                let s = drain_state.clone();
-                                                                tokio::spawn(async move {
-                                                                    let mut wc = frp_core::transport::IoStream::Quic(work_stream);
+
+                                // Try V2 magic detection on first stream.
+                                // Per-stream independence: each QUIC stream gets its own
+                                // V2 detection, matching Go frp's WriteMagicIfV2() per stream.
+                                let mut magic = [0u8; 7];
+                                let is_v2 = match ctl.read_exact(&mut magic).await {
+                                    Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                    Err(_) => false,
+                                };
+
+                                if is_v2 {
+                                    // --- V2 path ---
+                                    // ClientHello/ServerHello handshake → AEAD crypto negotiation.
+                                    // Login is read as plaintext V2 message; AEAD wrapping happens
+                                    // inside handle_control after LoginResp (matching Go frp flow).
+                                    let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ctl).await {
+                                        Ok((Some(p), crypto)) => (p, crypto),
+                                        Ok((None, crypto)) => {
+                                            match ctl.read_raw_v2_frame().await {
+                                                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                Ok((ft, _, _)) => {
+                                                    tracing::warn!("QUIC V2: unexpected frame type {} after handshake", ft);
+                                                    return;
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!("QUIC V2: failed to read message after handshake: {}", e);
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("QUIC V2 handshake error: {}", e);
+                                            return;
+                                        }
+                                    };
+
+                                    // Get remote address before moving conn into drain task.
+                                    let addr: std::net::SocketAddr = conn.remote_address();
+
+                                    // Universal drain task: handles both V2 and V1 work streams.
+                                    // Each accepted stream independently detects V2 magic — if V2,
+                                    // reads first V2 message; if V1, replays consumed bytes + read_msg_v1.
+                                    let cancel = CancellationToken::new();
+                                    let drain_cancel = cancel.clone();
+                                    let drain_state = state.clone();
+                                    let drain_conn = conn.clone();
+                                    tokio::spawn(async move {
+                                        tracing::debug!("QUIC drain (V2 ctl) started");
+                                        loop {
+                                            tokio::select! {
+                                                _ = drain_cancel.cancelled() => {
+                                                    tracing::debug!("QUIC drain (V2 ctl) cancelled");
+                                                    break;
+                                                }
+                                                result = drain_conn.accept_bi() => {
+                                                    match result {
+                                                        Ok(work_stream) => {
+                                                            tracing::debug!("QUIC drain (V2 ctl): accepted new stream");
+                                                            let s = drain_state.clone();
+                                                            tokio::spawn(async move {
+                                                                let mut wc = frp_core::transport::IoStream::Quic(work_stream);
+                                                                let mut wmagic = [0u8; 7];
+                                                                let w_is_v2 = match wc.read_exact(&mut wmagic).await {
+                                                                    Ok(_) => wmagic == frp_core::protocol::V2_MAGIC_BYTES,
+                                                                    Err(_) => false,
+                                                                };
+                                                                if w_is_v2 {
+                                                                    match wc.read_v2_frame().await {
+                                                                        Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                                                                            crate::handlers::handle_work_conn_inner(wc, nwc, s).await;
+                                                                        }
+                                                                        Ok(other) => {
+                                                                            tracing::warn!("QUIC V2 drain: unexpected msg type_id={:?}", other.v2_type_id());
+                                                                        }
+                                                                        Err(e) => {
+                                                                            tracing::warn!("QUIC V2 drain: read error: {}", e);
+                                                                        }
+                                                                    }
+                                                                } else {
+                                                                    let mut wc = frp_core::transport::IoStream::BufferedRead(wmagic.to_vec(), 0, Box::new(wc));
                                                                     match frp_core::protocol::read_msg_v1(&mut wc).await {
                                                                         Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                                                             crate::handlers::handle_work_conn_inner(wc, nwc, s).await;
                                                                         }
                                                                         Ok(other) => {
-                                                                            tracing::warn!("Unexpected QUIC work stream msg: {:?}", other.v1_type_byte());
+                                                                            tracing::warn!("QUIC V1 drain: unexpected msg type_byte={:?}", other.v1_type_byte());
                                                                         }
                                                                         Err(e) => {
-                                                                            tracing::warn!("QUIC work stream read error: {}", e);
+                                                                            tracing::warn!("QUIC V1 drain: read error: {}", e);
                                                                         }
                                                                     }
-                                                                });
-                                                            }
-                                                            Err(e) => {
-                                                                tracing::debug!("QUIC drain done (conn closed): {e}");
-                                                                break;
-                                                            }
+                                                                }
+                                                            });
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::debug!("QUIC drain (V2 ctl) done: {e}");
+                                                            break;
                                                         }
                                                     }
                                                 }
                                             }
-                                        });
-                                        // Run control handler on first stream (blocking)
-                                        control::handle_control(ctl, login, state, None, None, false, None).await;
-                                        cancel.cancel();
-                                    }
-                                    Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
-                                        crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
-                                    }
-                                    Ok(other) => {
-                                        tracing::warn!("Unexpected QUIC message: {:?}", other.v1_type_byte());
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("QUIC read error: {}", e);
+                                        }
+                                    });
+
+                                    // Dispatch V2 Login → handle_control(v2=true, crypto_ctx).
+                                    // handle_control wraps stream in AEAD after LoginResp.
+                                    crate::handlers::dispatch_v2_message(ctl, msg_payload, state, addr, None, None, crypto_ctx).await;
+                                    cancel.cancel();
+                                } else {
+                                    // --- V1 fallback ---
+                                    // Replay consumed 7 bytes so read_msg_v1 sees the full V1 header.
+                                    let mut ctl = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ctl));
+
+                                    match frp_core::protocol::read_msg_v1(&mut ctl).await {
+                                        Ok(frp_core::msg::FrpMessage::Login(login)) => {
+                                            // Universal drain task (V2-aware, same pattern as V2 path above).
+                                            let cancel = CancellationToken::new();
+                                            let drain_cancel = cancel.clone();
+                                            let drain_state = state.clone();
+                                            let drain_conn = conn.clone();
+                                            tokio::spawn(async move {
+                                                tracing::debug!("QUIC drain (V1 ctl) started");
+                                                loop {
+                                                    tokio::select! {
+                                                        _ = drain_cancel.cancelled() => {
+                                                            tracing::debug!("QUIC drain (V1 ctl) cancelled");
+                                                            break;
+                                                        }
+                                                        result = drain_conn.accept_bi() => {
+                                                            match result {
+                                                                Ok(work_stream) => {
+                                                                    tracing::debug!("QUIC drain (V1 ctl): accepted new stream");
+                                                                    let s = drain_state.clone();
+                                                                    tokio::spawn(async move {
+                                                                        let mut wc = frp_core::transport::IoStream::Quic(work_stream);
+                                                                        let mut wmagic = [0u8; 7];
+                                                                        let w_is_v2 = match wc.read_exact(&mut wmagic).await {
+                                                                            Ok(_) => wmagic == frp_core::protocol::V2_MAGIC_BYTES,
+                                                                            Err(_) => false,
+                                                                        };
+                                                                        if w_is_v2 {
+                                                                            match wc.read_v2_frame().await {
+                                                                                Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                                                                                    crate::handlers::handle_work_conn_inner(wc, nwc, s).await;
+                                                                                }
+                                                                                Ok(other) => {
+                                                                                    tracing::warn!("QUIC V2 drain: unexpected msg type_id={:?}", other.v2_type_id());
+                                                                                }
+                                                                                Err(e) => {
+                                                                                    tracing::warn!("QUIC V2 drain: read error: {}", e);
+                                                                                }
+                                                                            }
+                                                                        } else {
+                                                                            let mut wc = frp_core::transport::IoStream::BufferedRead(wmagic.to_vec(), 0, Box::new(wc));
+                                                                            match frp_core::protocol::read_msg_v1(&mut wc).await {
+                                                                                Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                                                                                    crate::handlers::handle_work_conn_inner(wc, nwc, s).await;
+                                                                                }
+                                                                                Ok(other) => {
+                                                                                    tracing::warn!("QUIC V1 drain: unexpected msg type_byte={:?}", other.v1_type_byte());
+                                                                                }
+                                                                                Err(e) => {
+                                                                                    tracing::warn!("QUIC V1 drain: read error: {}", e);
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    });
+                                                                }
+                                                                Err(e) => {
+                                                                    tracing::debug!("QUIC drain (V1 ctl) done: {e}");
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                            // Run control handler on first stream (blocking).
+                                            control::handle_control(ctl, login, state, None, None, false, None).await;
+                                            cancel.cancel();
+                                        }
+                                        Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                                            crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
+                                        }
+                                        Ok(other) => {
+                                            tracing::warn!("Unexpected QUIC message: {:?}", other.v1_type_byte());
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("QUIC read error: {}", e);
+                                        }
                                     }
                                 }
                             });

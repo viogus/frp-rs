@@ -680,8 +680,7 @@ impl tokio::io::AsyncRead for IoStream {
                 // PreRead/BufferedRead are ephemeral — they only exist to carry
                 // pre-consumed bytes after detect_and_strip_magic. By the time
                 // poll_read is called they should have been unwrapped.
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Other,
+                Poll::Ready(Err(io::Error::other(
                     "IoStream::PreRead/BufferedRead is ephemeral — stream was not unwrapped before use",
                 )))
             }
@@ -1554,7 +1553,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
         }
         #[cfg(any(feature = "kcp", feature = "quic"))]
         TransportProtocol::Kcp | TransportProtocol::Quic => {
-            return Err(io::Error::new(
+            Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "KCP/QUIC should be handled before TCP connect path",
             )

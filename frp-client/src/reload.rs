@@ -8,7 +8,6 @@ use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::write_msg;
 
 use crate::admin::ProxyRuntimeInfo;
-use crate::proxy;
 
 /// Build a config snapshot string for reload change detection.
 /// Includes all fields that matter for proxy registration.
