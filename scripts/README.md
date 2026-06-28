@@ -136,9 +136,20 @@ No TOCTOU fix needed — acceptable race for CI. VPS frps lifetime is per-test (
 
 ## VPS Setup (Manual Prerequisites)
 
-Phase 1 CI requires a VPS with public IP. Follow these steps before tests can run.
+Phase 1 CI requires a VPS with public IP. **Run `scripts/vps-setup.sh` as root on the VPS** to automate steps 1–4 below.
 
-### 1. Create restricted user
+```bash
+# On your local machine: generate a dedicated key pair
+ssh-keygen -t ed25519 -f ~/.ssh/xtcp-ci -C "xtcp-ci" -N ""
+
+# Copy vps-setup.sh to VPS and run as root
+scp scripts/vps-setup.sh root@<VPS_IP>:/tmp/
+ssh root@<VPS_IP> "bash /tmp/vps-setup.sh '$(cat ~/.ssh/xtcp-ci.pub)'"
+```
+
+Then add GitHub Secrets (step 5 below).
+
+### Manual steps (if not using vps-setup.sh)
 
 ```bash
 # On VPS (as root)
