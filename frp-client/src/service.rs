@@ -8,7 +8,7 @@ use tracing::{info, warn, debug};
 use rand::Rng;
 
 use frp_core::auth::{AuthConfig, AuthMethod, OidcClient};
-use frp_core::config::{ClientConfig, ProxyConfig};
+use frp_core::config::ClientConfig;
 use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg, write_msg};

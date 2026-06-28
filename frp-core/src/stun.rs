@@ -101,10 +101,8 @@ pub fn parse_binding_response(data: &[u8], expected_tx_id: &[u8; 12]) -> Result<
                     return Ok(addr);
                 }
             }
-            ATTR_MAPPED_ADDRESS => {
-                if mapped.is_none() {
-                    mapped = parse_mapped_address(value);
-                }
+            ATTR_MAPPED_ADDRESS if mapped.is_none() => {
+                mapped = parse_mapped_address(value);
             }
             _ => {}
         }

@@ -1,12 +1,11 @@
 use std::net::SocketAddr;
-use tokio::net::{TcpListener, TcpStream, TcpSocket};
+use tokio::net::{TcpStream, TcpSocket};
 use tokio::time::Duration;
 use tracing::{info, warn, debug};
 
 use frp_core::transport::{TransportProtocol, DialOptions, dial_server};
 use frp_core::msg::{self, FrpMessage};
 
-use crate::proxy;
 
 /// Attempt TCP simultaneous open to `peer_addr`.
 ///
