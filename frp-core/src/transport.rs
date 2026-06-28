@@ -4,7 +4,9 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(feature = "websocket")]
 use tokio_tungstenite::tungstenite::Message;
+#[cfg(feature = "websocket")]
 use futures_util::stream::Stream;
+#[cfg(feature = "websocket")]
 use futures_util::sink::Sink;
 use tokio::net::{TcpListener, TcpStream};
 #[cfg(feature = "websocket")]
@@ -34,6 +36,7 @@ pub enum ConnectionType {
     /// The caller must check the byte to decide whether to skip it before TLS handshake.
     Tls(u8),
     /// 'G' (GET) → HTTP WebSocket upgrade
+    #[cfg(feature = "websocket")]
     WebSocket,
     /// V1 type byte → plain frp protocol (the byte is the V1 message type)
     V1(u8),
@@ -1400,12 +1403,14 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
     };
 
     match opts.protocol {
+        #[cfg(feature = "kcp")]
         TransportProtocol::Kcp => {
             let addr = format!("{}:{}", opts.server_addr, opts.server_port);
             let stream = crate::kcp::dial_kcp(&addr, Default::default()).await
                 .map_err(|e| crate::Error::Transport(format!("KCP dial: {e}")))?;
             return Ok(IoStream::Kcp(stream));
         }
+        #[cfg(feature = "quic")]
         TransportProtocol::Quic => {
             let addr = format!("{}:{}", opts.server_addr, opts.server_port);
             let server_name = if !opts.tls_server_name.is_empty() {
@@ -1466,6 +1471,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 Ok(IoStream::Tcp(stream))
             }
         }
+        #[cfg(feature = "websocket")]
         TransportProtocol::WebSocket | TransportProtocol::Wss => {
             let is_wss = opts.protocol == TransportProtocol::Wss || opts.tls_enable;
             let host = if !opts.tls_server_name.is_empty() {
@@ -1502,6 +1508,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 connect_ws_raw(stream, &host, opts.server_port, FRP_WEBSOCKET_PATH, "http").await
             }
         }
+        #[cfg(any(feature = "kcp", feature = "quic"))]
         TransportProtocol::Kcp | TransportProtocol::Quic => {
             unreachable!("KCP/QUIC handled before TCP connect")
         }
@@ -1541,6 +1548,7 @@ pub async fn detect_and_strip_magic(
     let first_byte = magic_buf[0];
     let ct = match first_byte {
         FRP_TLS_HEAD_BYTE | FRP_TLS_DIRECT_BYTE => ConnectionType::Tls(first_byte),
+        #[cfg(feature = "websocket")]
         b'G' => ConnectionType::WebSocket,
         b => ConnectionType::V1(b),
     };
@@ -1563,6 +1571,7 @@ pub async fn detect_and_strip_magic(
 ///
 /// This implementation handles the HTTP upgrade manually and returns a
 /// WsByteStream in Raw mode — all data frames are treated as opaque bytes.
+#[cfg(feature = "websocket")]
 pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -1664,6 +1673,7 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
 /// Raw mode treats all data frames as opaque bytes.
 ///
 /// The returned WsByteStream masks outgoing frames per RFC 6455 §5.3.
+#[cfg(feature = "websocket")]
 pub async fn connect_ws_raw<S>(
     stream: S,
     host: &str,

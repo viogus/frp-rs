@@ -102,8 +102,6 @@ impl AuthConfig {
 
 #[cfg(feature = "oidc")]
 mod oidc_impl {
-    use super::*;
-
     /// Information extracted from a verified OIDC login token.
     #[derive(Debug, Clone)]
     pub struct LoginOidcToken {
