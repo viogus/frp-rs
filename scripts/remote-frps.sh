@@ -23,7 +23,7 @@ GO_FRP_VERSION="${GO_FRP_VERSION:-0.69.1}"
 # VPS target is always linux/amd64
 GO_FRP_ARCH="linux_amd64"
 REMOTE_DIR="/tmp/frp-xtcp-test"
-SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=30"
+SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ControlMaster=auto -o ControlPath=/tmp/frp-ssh-ctl-%h-%r -o ControlPersist=120"
 
 usage() {
     cat >&2 <<EOF
@@ -163,7 +163,7 @@ cmd_start() {
     }
 
     # --- Upload binary and config ---
-    local scp_opts="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
+    local scp_opts="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ControlPath=/tmp/frp-ssh-ctl-%h-%r"
     local scp_err
     scp_err=$(scp $scp_opts -i "$ssh_key" "$binary_path" "${VPS_USER}@${host}:${REMOTE_DIR}/frps" 2>&1 1>/dev/null) || {
         rm -f "$config_path"
