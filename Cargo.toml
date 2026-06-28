@@ -48,7 +48,7 @@ quinn = "0.11"
 
 socket2 = "0.5"
 chacha20poly1305 = "0.10"
-
+criterion = "0.5"
 
 # Release profile: slim, LTO, single codegen unit, stripped symbols, abort on panic.
 # After cargo build --release, compress further with:
