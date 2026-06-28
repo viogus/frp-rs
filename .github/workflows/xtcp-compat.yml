@@ -25,19 +25,34 @@ jobs:
   xtcp:
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    # Clean skip if VPS secrets are not configured
-    if: ${{ vars.XTCP_VPS_HOST != '' || secrets.XTCP_VPS_HOST != '' }}
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check VPS secrets
+        id: check
+        run: |
+          if [[ -n "${XTCP_VPS_HOST:-}" ]] && [[ -n "${XTCP_VPS_SSH_KEY:-}" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "VPS host configured: yes"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "SKIP: XTCP_VPS_HOST or XTCP_VPS_SSH_KEY not set."
+          fi
+        env:
+          XTCP_VPS_HOST: ${{ secrets.XTCP_VPS_HOST }}
+          XTCP_VPS_SSH_KEY: ${{ secrets.XTCP_VPS_SSH_KEY }}
+
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        if: steps.check.outputs.configured == 'true'
 
       - uses: actions/setup-go@v5
+        if: steps.check.outputs.configured == 'true'
         with:
           go-version: '>=1.22.0'
 
       - name: Cache cargo + go-frp
+        if: steps.check.outputs.configured == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -49,12 +64,15 @@ jobs:
           restore-keys: ${{ runner.os }}-xtcp-
 
       - name: Build frp-rs (release)
+        if: steps.check.outputs.configured == 'true'
         run: cargo build --release --bin frps --bin frpc
 
       - name: Download Go frp
+        if: steps.check.outputs.configured == 'true'
         run: bash scripts/download-go-frp.sh 0.69.1
 
       - name: Run XTCP compat tests
+        if: steps.check.outputs.configured == 'true'
         run: |
           bash scripts/compat-test.sh \
             --frps-remote "$XTCP_VPS_HOST" \
@@ -68,5 +86,8 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          echo "XTCP compat tests completed."
-          echo "VPS host configured: yes"
+          if [[ "${{ steps.check.outputs.configured }}" == "true" ]]; then
+            echo "XTCP compat tests completed."
+          else
+            echo "XTCP compat tests skipped (secrets not configured)."
+          fi
