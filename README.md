@@ -537,7 +537,7 @@ frp-rs/
       metrics/
         mod.rs            Metrics module root
         prom.rs           Prometheus gauge registry + /metrics rendering
-      nat_hole.rs         XTCP NAT hole punch coordinator
+      nathole/            XTCP NAT hole punch coordinator (controller, classify, analysis)
   frps/                   Server binary
     Cargo.toml
     src/main.rs

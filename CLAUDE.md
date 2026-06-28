@@ -84,8 +84,8 @@ Internal message variants drive the work connection lifecycle:
 - `ProxyUserConn` / `VisitorConn` → check `work_pool` → if empty, send `ReqWorkConn` and push to `pending_requests`
 - `NewWorkConn` → if `pending_requests` is non-empty, pop and bridge immediately; otherwise push to `work_pool`
 - `UdpNeedsWorkConn` → triggers work connection creation for UDP proxy
-- `NatHoleClient` → forwarded to provider control handler to initiate NAT hole punch
-- `WriteNatHoleSid` / `WriteNatHoleReport` → forwarded to visitor via control channel (Go frp compat path)
+- `NatHoleSidOnWorkConn` → sends StartWorkConn+NatHoleSid on pooled work conn to notify provider of XTCP visitor; if pool empty, queues in `pending_nat_hole_sids` + sends `ReqWorkConn` (Go frp compat: server is pure relay, provider does own STUN)
+- `WriteNatHoleSid` / `WriteNatHoleResp` / `WriteNatHoleReport` → forwarded to visitor via control channel (Go frp compat path)
 - `Shutdown` → old control handler stops when superseded by new connection with same run_id
 
 **Bridging** (`assign_work_to_proxy` in `control.rs`): sends `StartWorkConn` over the work connection, writes any pre-read bytes (from HTTP VHost parsing), then either uses `tokio::io::copy_bidirectional` (plain) or `bridge::bridge_encrypted` (AES-128-CFB + Snappy, 4-byte BE length prefix framing).
@@ -120,15 +120,19 @@ Note: Go frp v0.69.1 golib source says salt `"crypto"` but the pre-built binary 
 
 ### XTCP NAT Hole Punching
 
-`frp-server/src/nat_hole.rs`: `NatHoleCoordinator` manages hole-punch sessions.
+`frp-server/src/nathole/`: `NatHoleCoordinator` manages hole-punch sessions. Module structure:
+- `mod.rs` — module root, `NAT_HOLE_TIMEOUT = 10s`
+- `controller.rs` — session management, provider registration, `build_nat_hole_response()`
+- `classify.rs` — NAT feature classification (EasyNAT vs HardNAT, behavior detection)
+- `analysis.rs` — 5-mode behavior table, score-based `Analyzer` with success feedback
 
 Two paths for visitor connections:
-1. **Fresh TCP connection** (accept loop): visitor sends `NatHoleVisitor` on a new connection. Writer stored in session for `NatHoleSid`/`NatHoleReport` forwarding.
-2. **Control connection** (Go frp compat): Go frpc v0.69.1 sends `NatHoleVisitor` on its existing control channel. Uses `InternalMsg::WriteNatHoleSid`/`WriteNatHoleReport` for forwarding.
+1. **Fresh TCP connection** (accept loop): visitor sends `NatHoleVisitor` on a new TCP connection. Server creates session, sends `NatHoleSidOnWorkConn` internal msg → provider control handler writes `StartWorkConn`+`NatHoleSid` on work conn. Provider does STUN, sends `NatHoleClient` on control, server runs NAT analysis, sends `NatHoleResp` to both sides.
+2. **Control connection** (Go frp compat): Go frpc v0.69.1 sends `NatHoleVisitor` on its existing control channel. Server creates session with `create_session_with_ctl`, spawns task that waits for provider's `NatHoleClient` on control, runs NAT analysis (classify + analyzer), and sends `NatHoleResp` to both sides via `InternalMsg::WriteNatHoleSid`/`WriteNatHoleResp`/`WriteNatHoleReport`.
 
-Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleClient via InternalMsg) → Provider→Server(NatHoleSid) → Server→Visitor(NatHoleSid forwarded) → ... → Provider→Server(NatHoleReport) → session complete.
+Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkConn → StartWorkConn+NatHoleSid on work conn) → Provider does STUN → Provider→Server(NatHoleClient on control) → Server NAT analysis → Server→Visitor(NatHoleResp) + Server→Provider(NatHoleResp) → both sides TCP simultaneous open → bridge p2p → Provider→Server(NatHoleReport) → session complete.
 
-**Status:** Fully implemented. Both sides use TCP simultaneous open for hole punching. Provider-side (`frp-client/src/service.rs`) handles `NatHoleClient` → TCP simultaneous open → bridge to local. Visitor-side (`frp-client/src/service.rs`) handles `NatHoleVisitor` → TCP simultaneous open → bridge to user. e2e test in `frp-server/tests/xtcp_hole_punch.rs`.
+**Status:** Fully implemented. Server operates as pure relay (no server-side STUN — provider and visitor each do their own STUN). Both sides use TCP simultaneous open for hole punching. Provider-side (`frp-client/src/service.rs`) reads StartWorkConn+NatHoleSid from work conn, does STUN, sends NatHoleClient on control, reads NatHoleResp, TCP simultaneous open → bridge to local. Visitor-side (`frp-client/src/service.rs`) handles `NatHoleVisitor` → PreCheck + STUN + full NatHoleVisitor → TCP simultaneous open → bridge to user. STCP fallback if hole punch fails. e2e test in `frp-server/tests/xtcp_hole_punch.rs`.
 
 ### Transport Status
 
