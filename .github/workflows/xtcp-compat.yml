@@ -65,6 +65,8 @@ jobs:
 
       - name: Build frp-rs (release)
         if: steps.check.outputs.configured == 'true'
+        env:
+          RUSTFLAGS: ""   # override setup-rust-toolchain's -D warnings
         run: cargo build --release --bin frps --bin frpc
 
       - name: Download Go frp
