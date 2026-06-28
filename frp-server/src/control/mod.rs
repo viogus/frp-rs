@@ -517,6 +517,27 @@ pub async fn handle_control<S>(
             } => {
                 if let Some(stream) = incoming_msg {
                     let mut io = IoStream::Yamux(stream);
+                    // Consume V2 magic on yamux work connection streams.
+                    // Both Rust frpc and Go frpc write V2 magic on yamux
+                    // work conn streams (after yamux stream open), matching
+                    // Go frp's messageConnector.Connect() which calls
+                    // WriteMagicIfV2 before returning the stream.
+                    if v2 {
+                        let mut magic = [0u8; 7];
+                        match io.read_exact(&mut magic).await {
+                            Ok(_) if magic == frp_core::protocol::V2_MAGIC_BYTES => {
+                                // V2 magic consumed — io is positioned at first frame
+                            }
+                            Ok(_) => {
+                                // Not V2 magic — replay bytes, read as V1
+                                io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
+                            }
+                            Err(_) => {
+                                // Read error — stream closed early
+                                continue;
+                            }
+                        }
+                    }
                     match read_ctl_msg(&mut io, v2).await {
                         Ok(FrpMessage::NewWorkConn(nwc)) => {
                             let stream_run_id = nwc.run_id.as_deref().unwrap_or("");

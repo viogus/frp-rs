@@ -1365,6 +1365,16 @@ fn spawn_work_conn(
                     nwc_msg.timestamp = Some(timestamp);
                 }
             }
+            // Write V2 magic before NewWorkConn on work connection streams.
+            // Both Go frp and Rust frp write V2 magic on yamux work conn
+            // streams, matching Go frp's messageConnector.Connect() which
+            // calls WriteMagicIfV2 before returning the stream.
+            if v2 {
+                if let Err(e) = frp_core::protocol::write_v2_magic(&mut work).await {
+                    warn!("Work conn {} failed to write V2 magic: {}", label, e);
+                    return;
+                }
+            }
             let nwc = FrpMessage::NewWorkConn(nwc_msg);
             let write_result = if v2 {
                 work.write_v2_frame(&nwc).await
