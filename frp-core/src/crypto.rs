@@ -22,9 +22,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use aes_gcm::{Aes256Gcm, KeyInit, aead::{Aead, Payload}};
 use chacha20poly1305::XChaCha20Poly1305;
-use hkdf::Hkdf;
 use rand::RngCore;
-use sha2::Sha256;
+use ring::hkdf::{Salt, HKDF_SHA256};
 
 const AEAD_KEY_SIZE: usize = 32;
 const AEAD_FRAME_HEADER_SIZE: usize = 4;
@@ -928,11 +927,15 @@ fn derive_aead_control_key(
     direction: &str,
 ) -> Result<Vec<u8>, String> {
     let info = format!("frp wire v2 control aead {} {}", algorithm.as_str(), direction);
-    let hkdf = Hkdf::<Sha256>::new(Some(transcript_hash), token);
-    let mut okm = vec![0u8; AEAD_KEY_SIZE];
-    hkdf.expand(info.as_bytes(), &mut okm)
-        .map_err(|e| format!("HKDF expand: {e}"))?;
-    Ok(okm)
+    let salt = Salt::new(HKDF_SHA256, transcript_hash);
+    let prk = salt.extract(token);
+    let info_bytes = [info.as_bytes()];
+    let okm = prk.expand(&info_bytes, HKDF_SHA256)
+        .map_err(|_| "HKDF expand failed".to_string())?;
+    let mut okm_bytes = vec![0u8; AEAD_KEY_SIZE];
+    okm.fill(&mut okm_bytes)
+        .map_err(|_| "HKDF fill failed".to_string())?;
+    Ok(okm_bytes)
 }
 
 // ---------------------------------------------------------------------------
