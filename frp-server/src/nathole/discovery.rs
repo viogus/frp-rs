@@ -27,9 +27,11 @@ const PROBE_COUNT: usize = 3;
 /// Uses tokio async UDP to avoid blocking the worker thread during
 /// STUN queries (up to 3s timeout per probe × 3 probes = 9s worst case).
 pub async fn discover(stun_server: &str) -> Result<Vec<String>, String> {
-    let server_addr: SocketAddr = stun_server
-        .parse()
-        .map_err(|e| format!("invalid STUN server address '{}': {}", stun_server, e))?;
+    let server_addr: SocketAddr = tokio::net::lookup_host(stun_server)
+        .await
+        .map_err(|e| format!("failed to resolve STUN server '{}': {}", stun_server, e))?
+        .next()
+        .ok_or_else(|| format!("STUN server '{}' resolved to no addresses", stun_server))?;
 
     let mut seen = HashSet::new();
     let recv_timeout = Duration::from_secs(3);

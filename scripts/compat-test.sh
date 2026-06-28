@@ -108,6 +108,48 @@ run_go() {
         "$@"
 }
 
+# --- Source-built Go frp for V2 tests ---
+# Pre-built Go frp v0.69.1 binary lacks V2 support. When Go is available,
+# auto-build from source and cache in /tmp/frp-source-build.
+GO_FRP_SOURCE_DIR="${GO_FRP_SOURCE_DIR:-/tmp/frp-source-build}"
+GO_FRPS_V2="$GO_FRP_SOURCE_DIR/frps"
+GO_FRPC_V2="$GO_FRP_SOURCE_DIR/frpc"
+
+build_go_frp_v2() {
+    # Return 0 if source-built binaries already cached
+    if [[ -x "$GO_FRPS_V2" ]] && [[ -x "$GO_FRPC_V2" ]]; then
+        return 0
+    fi
+
+    if ! command -v go &>/dev/null; then
+        log "SKIP V2: Go compiler not found. Install Go 1.22+ for V2 compat tests."
+        return 1
+    fi
+
+    log "Building Go frp from source (v0.69.1, V2 support)..."
+    local clone_dir="/tmp/frp-clone"
+
+    if [[ ! -d "$clone_dir" ]]; then
+        git clone -q --depth 1 --branch v0.69.1 \
+            https://github.com/fatedier/frp.git "$clone_dir" 2>&1 || {
+            log "SKIP V2: failed to clone Go frp source"
+            return 1
+        }
+    fi
+
+    mkdir -p "$GO_FRP_SOURCE_DIR"
+    (cd "$clone_dir" && go build -tags "frps,noweb" -o "$GO_FRPS_V2" ./cmd/frps) 2>&1 || {
+        log "SKIP V2: failed to build Go frps from source"
+        return 1
+    }
+    (cd "$clone_dir" && go build -tags "frpc,noweb" -o "$GO_FRPC_V2" ./cmd/frpc) 2>&1 || {
+        log "SKIP V2: failed to build Go frpc from source"
+        return 1
+    }
+    log "Go frp source build complete: frps=$GO_FRPS_V2 frpc=$GO_FRPC_V2"
+    return 0
+}
+
 cleanup() {
     for pid in $PIDS; do
         kill "$pid" 2>/dev/null || true
@@ -2784,10 +2826,10 @@ run_test test_g2r_tcpmux
 run_test test_r2g_tcpmux
 run_test test_g2r_stcp
 run_test test_r2g_stcp
-# XTCP Go-Rust: server coordinates NAT analysis and address exchange.
-# GUARDED: XTCP requires public internet access for STUN (stun.l.google.com:19302)
-# and NAT hole punching to public IPs. These tests cannot work on isolated localhost.
-# Set RUN_XTCP=1 to enable when running on a host with public internet access.
+# XTCP Go-Rust: server is a pure relay (Go frp v0.69.1 compat).
+# Server does NOT do its own STUN — just forwards visitor↔provider addresses.
+# Go frpc clients do their own STUN; requires public internet for NAT probes.
+# Guard behind RUN_XTCP=1 (default 0).
 if [[ "${RUN_XTCP:-0}" == "1" ]]; then
     run_test test_g2r_xtcp
     run_test test_r2g_xtcp
@@ -3481,12 +3523,8 @@ test_g2r_v2_tcp() {
     local name="go-to-rust-v2-tcp"
     should_run_test "$name" || return 0
 
-    # V2 tests require Go frp compiled from latest source (v0.69.1 binaries
-    # don't support V2). Set GO_FRP_V2=1 to enable these tests.
-    if [[ "${GO_FRP_V2:-0}" != "1" ]]; then
-        log "SKIP $name: set GO_FRP_V2=1 to enable (requires Go frp source build with V2)"
-        return 0
-    fi
+    # V2 needs Go frp source build (pre-built v0.69.1 binary lacks V2).
+    build_go_frp_v2 || return 0
 
     log "=== $name ==="
     local frps_port=$(random_port)
@@ -3513,15 +3551,17 @@ test_g2r_v2_tcp() {
         return
     }
 
-    # Start Go frpc with V2 wire protocol + tcp_mux.
-    # Go frp >= v0.50 defaults TLS=true; disable for plain TCP test.
+    # Start Go frpc (source-built, V2 + tcp_mux).
     write_frpc_config go "$frps_port" "$token" "$echo_port" "$proxy_port" \
         "v2-tcp" "$TEST_DIR/$name/frpc.toml" "mux"
-    cat >> "$TEST_DIR/$name/frpc.toml" <<'GOV2'
+    # Insert V2 wire protocol BEFORE transport.tls.enable. Inserting before
+    # [[proxies]] with tls.enable included duplicates the key, causing
+    # Go frp to fail with "toml: key enable is already defined".
+    sed -i.bak '/^transport\.tls\.enable/i\
 transport.wireProtocol = "v2"
-transport.tls.enable = false
-GOV2
-    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+' "$TEST_DIR/$name/frpc.toml"
+    rm -f "$TEST_DIR/$name/frpc.toml.bak"
+    run_go "$GO_FRPC_V2" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
@@ -3546,13 +3586,8 @@ test_r2g_v2_tcp() {
     local name="rust-to-go-v2-tcp"
     should_run_test "$name" || return 0
 
-    # V2 tests require Go frp compiled from latest source (v0.69.1 binaries
-    # don't support V2). Set GO_FRP_V2=1 to enable these tests.
-    if [[ "${GO_FRP_V2:-0}" != "1" ]]; then
-        log "SKIP $name: set GO_FRP_V2=1 to enable (requires Go frp source build with V2)"
-        return 0
-    fi
-
+    # Go frps auto-detects V2 from connection magic bytes — no server-side
+    # config needed. Pre-built binary has CheckMagic() in its server path.
     log "=== $name ==="
     local frps_port=$(random_port)
     local proxy_port=$(random_port)
@@ -3567,12 +3602,8 @@ test_r2g_v2_tcp() {
         return
     }
 
-    # Start Go frps with V2 wire protocol + tcp_mux.
-    # Go frp >= v0.50 defaults TLS=true; disable for plain TCP test.
+    # Start Go frps (pre-built, auto-detects V2 from magic bytes).
     write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "mux"
-    cat >> "$TEST_DIR/$name/frps.toml" <<'GOV2SRV'
-transport.wireProtocol = "v2"
-GOV2SRV
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3584,8 +3615,12 @@ GOV2SRV
     # Start Rust frpc with V2 + tcp_mux
     write_frpc_config rust "$frps_port" "$token" "$echo_port" "$proxy_port" \
         "v2-tcp" "$TEST_DIR/$name/frpc.toml" "mux"
-    echo 'v2 = true' >> "$TEST_DIR/$name/frpc.toml"
-    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+    # Insert v2 = true BEFORE [[proxies]] section
+    sed -i.bak '/^\[\[proxies\]\]/i\
+v2 = true\
+' "$TEST_DIR/$name/frpc.toml"
+    rm -f "$TEST_DIR/$name/frpc.toml.bak"
+    "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
 
@@ -3630,23 +3665,23 @@ run_test test_kcp_rust_to_rust
 
 # QUIC Rust↔Rust: both sides use quinn crate, wire-compatible.
 run_test test_quic_rust_to_rust
-# QUIC Rust→Go: works because Rust frpc correctly opens new QUIC streams.
-# QUIC Go→Rust: guarded — Go frp v0.69.1 pre-built binary may not support
-# QUIC work connections (new QUIC streams for proxy data).
-# Set RUN_QUIC_G2R=1 to force-enable if using a patched Go frp build.
-if [[ "${RUN_QUIC_G2R:-0}" == "1" ]]; then
-    run_test test_g2r_quic
-else
-    log "SKIP go-to-rust-quic: Go frpc v0.69.1 QUIC work-conn issue. Set RUN_QUIC_G2R=1 to force."
-fi
+# QUIC Go↔Rust: multi-stream-per-connection enabled.
+# Go frp v0.69.1 uses quic-go (multi-stream), Rust accepts additional streams.
+# Both pre-built and source-built Go frp binaries work with release Rust build.
+run_test test_g2r_quic
 run_test test_r2g_quic
 
-# Phase 9: V2 wire protocol (requires Go frp source build with V2 support)
-if [[ "${GO_FRP_V2:-0}" == "1" ]]; then
+# Phase 9: V2 wire protocol
+# g2r: Go frpc needs source build for transport.wireProtocol config support.
+#      Auto-builds via build_go_frp_v2() when Go is available.
+# r2g: Go frps auto-detects V2 from connection magic bytes — pre-built binary works.
+# NOTE: V2 tests fail due to known protocol bug (V2 frame parsing on yamux streams).
+# Guarded in CI; enabled locally when Go is available or GO_FRP_V2=1 is set.
+if [[ "${CI:-false}" != "true" ]] || [[ "${GO_FRP_V2:-0}" == "1" ]]; then
     run_test test_g2r_v2_tcp
     run_test test_r2g_v2_tcp
 else
-    log "SKIP V2 tests: set GO_FRP_V2=1 to enable (requires Go frp source build with V2 patches)"
+    log "SKIP V2 tests: known protocol bug (V2 frame parsing). Set GO_FRP_V2=1 to enable in CI."
 fi
 
 # --- Summary ---
