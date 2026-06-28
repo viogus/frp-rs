@@ -221,7 +221,12 @@ impl ControlConnection {
             // - TCP mux: yamux stream needs explicit magic (caller_handles_mux=true in dial opts)
             // - QUIC: dial_quic() doesn't write magic (per-stream independence)
             // - TCP non-mux/KCP/WS/WSS: magic already written by dial_server() (opts.v2=true)
-            if propose_mux || matches!(self.transport_protocol, TransportProtocol::Quic) {
+            #[cfg(feature = "quic")]
+            let needs_v2_magic = propose_mux || matches!(self.transport_protocol, TransportProtocol::Quic);
+            #[cfg(not(feature = "quic"))]
+            let needs_v2_magic = propose_mux;
+
+            if needs_v2_magic {
                 frp_core::protocol::write_v2_magic(&mut io_stream).await?;
             }
             let transport_name = match self.transport_protocol {
