@@ -284,12 +284,18 @@ pub async fn handle_control<S>(
                         // Pending sids take priority — they unblock waiting visitors.
                         if let Some((sid, proxy_name, _ts)) = pending_nat_hole_sids.pop_front() {
                             debug!("Delivering pending NatHoleSid {} for {} to provider", sid, proxy_name);
+                            // Look up proxy flags for StartWorkConn (encryption/compression propagation)
+                            let (use_enc, use_comp) = state.proxy_manager.get(&proxy_name).await
+                                .map(|p| (p.use_encryption, p.use_compression))
+                                .unwrap_or((false, false));
                             // Go frp v0.69.1 compat: StartWorkConn first to route the
                             // work connection to the XTCP proxy handler.
                             let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
                                 proxy_name: proxy_name.clone(),
                                 src_addr: None, src_port: None,
                                 dst_addr: None, dst_port: None, error: None,
+                                use_encryption: if use_enc { Some(true) } else { None },
+                                use_compression: if use_comp { Some(true) } else { None },
                             });
                             let _ = write_ctl_msg(&mut stream, &swc, v2).await;
                             let forward = FrpMessage::NatHoleSid(msg::NatHoleSid {
@@ -462,12 +468,18 @@ pub async fn handle_control<S>(
                     Some(InternalMsg::NatHoleSidOnWorkConn { sid, proxy_name }) => {
                         debug!("Sending NatHoleSid {} for proxy {} to provider on work conn", sid, proxy_name);
                         if let Some(mut work_conn) = work_pool.pop_front() {
+                            // Look up proxy flags for StartWorkConn (encryption/compression propagation)
+                            let (use_enc, use_comp) = state.proxy_manager.get(&proxy_name).await
+                                .map(|p| (p.use_encryption, p.use_compression))
+                                .unwrap_or((false, false));
                             // Go frp v0.69.1 compat: write StartWorkConn FIRST to route
                             // the work connection to the XTCP proxy handler.
                             let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
                                 proxy_name: proxy_name.clone(),
                                 src_addr: None, src_port: None,
                                 dst_addr: None, dst_port: None, error: None,
+                                use_encryption: if use_enc { Some(true) } else { None },
+                                use_compression: if use_comp { Some(true) } else { None },
                             });
                             let _ = write_ctl_msg(&mut work_conn, &swc, v2).await;
                             let forward = FrpMessage::NatHoleSid(msg::NatHoleSid {
