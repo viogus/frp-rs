@@ -3,57 +3,62 @@
 //! Same data source as the dashboard API (single metrics system).
 
 use prometheus::{Encoder, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
+use std::sync::LazyLock;
 
 use crate::service::AppState;
 
-lazy_static::lazy_static! {
-    /// Registry holding all 6 frp_server metrics.
-    static ref REGISTRY: Registry = Registry::new();
+/// Registry holding all 6 frp_server metrics.
+static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 
-    // --- 6 metrics matching Go frp v0.69.1 ---
+// --- 6 metrics matching Go frp v0.69.1 ---
 
-    /// frp_server_client_counts — current number of connected clients.
-    static ref CLIENT_COUNTS: IntGauge =
-        IntGauge::with_opts(Opts::new("frp_server_client_counts", "current client counts"))
-            .expect("metric definition must be valid");
+/// frp_server_client_counts — current number of connected clients.
+static CLIENT_COUNTS: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::with_opts(Opts::new("frp_server_client_counts", "current client counts"))
+        .expect("metric definition must be valid")
+});
 
-    /// frp_server_proxy_counts — current proxy count, labeled by type.
-    static ref PROXY_COUNTS: IntGaugeVec =
-        IntGaugeVec::new(Opts::new("frp_server_proxy_counts", "current proxy counts"), &["type"])
-            .expect("metric definition must be valid");
+/// frp_server_proxy_counts — current proxy count, labeled by type.
+static PROXY_COUNTS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(Opts::new("frp_server_proxy_counts", "current proxy counts"), &["type"])
+        .expect("metric definition must be valid")
+});
 
-    /// frp_server_proxy_counts_detailed — current proxy count, labeled by type and name.
-    static ref PROXY_COUNTS_DETAILED: IntGaugeVec =
-        IntGaugeVec::new(
-            Opts::new("frp_server_proxy_counts_detailed", "current proxy counts"),
-            &["type", "name"],
-        )
-        .expect("metric definition must be valid");
+/// frp_server_proxy_counts_detailed — current proxy count, labeled by type and name.
+static PROXY_COUNTS_DETAILED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new("frp_server_proxy_counts_detailed", "current proxy counts"),
+        &["type", "name"],
+    )
+    .expect("metric definition must be valid")
+});
 
-    /// frp_server_connection_counts — current connection count per proxy.
-    static ref CONNECTION_COUNTS: IntGaugeVec =
-        IntGaugeVec::new(
-            Opts::new("frp_server_connection_counts", "current connection counts"),
-            &["name", "type"],
-        )
-        .expect("metric definition must be valid");
+/// frp_server_connection_counts — current connection count per proxy.
+static CONNECTION_COUNTS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new("frp_server_connection_counts", "current connection counts"),
+        &["name", "type"],
+    )
+    .expect("metric definition must be valid")
+});
 
-    /// frp_server_traffic_in — total inbound traffic bytes per proxy.
-    static ref TRAFFIC_IN: IntGaugeVec =
-        IntGaugeVec::new(
-            Opts::new("frp_server_traffic_in", "total inbound traffic"),
-            &["name", "type"],
-        )
-        .expect("metric definition must be valid");
+/// frp_server_traffic_in — total inbound traffic bytes per proxy.
+static TRAFFIC_IN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new("frp_server_traffic_in", "total inbound traffic"),
+        &["name", "type"],
+    )
+    .expect("metric definition must be valid")
+});
 
-    /// frp_server_traffic_out — total outbound traffic bytes per proxy.
-    static ref TRAFFIC_OUT: IntGaugeVec =
-        IntGaugeVec::new(
-            Opts::new("frp_server_traffic_out", "total outbound traffic"),
-            &["name", "type"],
-        )
-        .expect("metric definition must be valid");
-}
+/// frp_server_traffic_out — total outbound traffic bytes per proxy.
+static TRAFFIC_OUT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new("frp_server_traffic_out", "total outbound traffic"),
+        &["name", "type"],
+    )
+    .expect("metric definition must be valid")
+});
 
 /// Register all 6 metrics with the registry. Called once at startup.
 /// Idempotent — safe to call multiple times (subsequent calls are no-ops).
