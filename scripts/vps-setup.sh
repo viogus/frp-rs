@@ -76,18 +76,18 @@ AUTH_FILE="$SSH_DIR/authorized_keys"
 
 mkdir -p "$SSH_DIR"
 
-# Write authorized_keys with command restriction
-# restrict: no port forwarding, no agent forwarding, no pty, no X11
-# command=: limits to running commands only in /tmp/frp-xtcp-test
+# Write authorized_keys with restrict (no command= — remote-frps.sh needs
+# to run mkdir, nohup, and other commands via SSH; restrict alone disables
+# port forwarding, agent forwarding, pty, and X11)
 cat > "$AUTH_FILE" <<EOF
-restrict,command="/bin/bash -c 'cd /tmp/frp-xtcp-test && exec bash'" ${PUBLIC_KEY}
+restrict ${PUBLIC_KEY}
 EOF
 
 chmod 700 "$SSH_DIR"
 chmod 600 "$AUTH_FILE"
 chown -R frp-test:frp-test "$SSH_DIR"
 
-log "SSH authorized_keys configured (restrict + command=)"
+log "SSH authorized_keys configured (restrict — no port/agent/pty/X11 forwarding)"
 log "Key comment: ${PUBLIC_KEY##* }"
 
 # ── 3. Open firewall ports 17000–17100 ──
