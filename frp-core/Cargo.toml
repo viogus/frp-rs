@@ -14,7 +14,7 @@ thiserror.workspace = true
 bytes.workspace = true
 axum.workspace = true
 uuid.workspace = true
-tokio-tungstenite.workspace = true
+tokio-tungstenite = { workspace = true, optional = true }
 sha1.workspace = true
 md-5.workspace = true
 hex.workspace = true
@@ -33,13 +33,20 @@ ring = { workspace = true }
 libc.workspace = true
 yamux.workspace = true
 tokio-util.workspace = true
-kcp.workspace = true
-quinn.workspace = true
+kcp = { workspace = true, optional = true }
+quinn = { workspace = true, optional = true }
 
 socket2.workspace = true
-jsonwebtoken.workspace = true
+jsonwebtoken = { workspace = true, optional = true }
 reqwest.workspace = true
 chacha20poly1305.workspace = true
+
+[features]
+default = ["quic", "kcp", "websocket", "oidc"]
+quic = ["dep:quinn"]
+kcp = ["dep:kcp"]
+websocket = ["dep:tokio-tungstenite"]
+oidc = ["dep:jsonwebtoken"]
 
 
 [dev-dependencies]

@@ -287,20 +287,35 @@ pub(crate) async fn assign_work_to_proxy(
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
                 }
+                #[cfg(feature = "kcp")]
                 IoStream::Kcp(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
                 }
+                #[cfg(not(feature = "kcp"))]
+                IoStream::Kcp(_work) => {
+                    warn!("KCP work bridge but kcp feature disabled");
+                }
+                #[cfg(feature = "websocket")]
                 IoStream::WebSocket(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
                 }
+                #[cfg(not(feature = "websocket"))]
+                IoStream::WebSocket(_work) => {
+                    warn!("WebSocket work bridge but websocket feature disabled");
+                }
+                #[cfg(feature = "quic")]
                 IoStream::Quic(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = work.into_split();
                     frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
+                }
+                #[cfg(not(feature = "quic"))]
+                IoStream::Quic(_work) => {
+                    warn!("QUIC work bridge but quic feature disabled");
                 }
                 IoStream::Yamux(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();

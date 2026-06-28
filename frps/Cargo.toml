@@ -4,6 +4,8 @@ version = "0.3.1"
 edition = "2021"
 
 [features]
+default = ["full"]
+full = ["frp-server/default"]
 # Enable debug/trace logging for development. Default: info only.
 debug-logs = []
 
@@ -20,4 +22,9 @@ serde.workspace = true
 
 [[bin]]
 name = "frps"
+path = "src/main.rs"
+required-features = ["full"]
+
+[[bin]]
+name = "frps-tiny"
 path = "src/main.rs"

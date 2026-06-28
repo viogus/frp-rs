@@ -14,6 +14,7 @@ use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg, write_msg, read_msg_v1, write_msg_v1, read_msg_v2, write_msg_v2};
 use frp_core::mux::YamuxSession;
+#[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
 use frp_core::transport::{TransportProtocol, DialOptions, dial_server, IoStream};
 
@@ -528,16 +529,24 @@ impl Service {
                 self.cfg.proxy_url.clone(),
             );
 
-            let (mut control_stream, run_id, yamux_session, quic_conn) = match ctl.login().await {
+            #[cfg(feature = "quic")]
+            let quic_conn: Option<QuicConnection>;
+
+            let (mut control_stream, run_id, yamux_session) = match ctl.login().await {
                 Ok(r) => {
                     did_login_once = true;
                     failed_count = 0;
                     *self.server_auth_scopes.write().await = ctl.server_auth_scopes.clone();
                     // After login, wrap control stream in AES-128-CFB encryption.
                     // Go frps v0.69.1 always encrypts the control connection for V1.
+                    #[cfg(feature = "quic")]
                     let (stream, run_id, yamux, quic) = r;
+                    #[cfg(not(feature = "quic"))]
+                    let (stream, run_id, yamux) = r;
                     let enc_key = encryption::derive_key(&self.auth_cfg.token);
-                    (stream.into_encrypted(enc_key), run_id, yamux, quic)
+                    #[cfg(feature = "quic")]
+                    { quic_conn = quic; }
+                    (stream.into_encrypted(enc_key), run_id, yamux)
                 }
                 Err(e) => {
                     failed_count += 1;
@@ -550,6 +559,7 @@ impl Service {
                 }
             };
             let yamux = yamux_session.map(std::sync::Arc::new);
+            #[cfg(feature = "quic")]
             let quic_conn = quic_conn.map(std::sync::Arc::new);
             let v2 = self.cfg.v2;
             info!("Logged in. run_id: {}", run_id);

@@ -18,8 +18,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub vhost_https_port: u16,
     #[serde(default)]
+    #[cfg(feature = "kcp")]
     pub kcp_bind_port: u16,
     #[serde(default)]
+    #[cfg(feature = "quic")]
     pub quic_bind_port: u16,
     /// Shared UDP port for SUDP proxies. When > 0, SUDP proxies
     /// share this port instead of allocating individual ports.
@@ -32,6 +34,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub sub_domain_host: String,
     #[serde(default)]
+    #[cfg(feature = "websocket")]
     pub websocket_port: u16,
     #[serde(default)]
     pub tls_enable: bool,
@@ -197,11 +200,14 @@ impl Default for ServerConfig {
             proxy_bind_addr: String::new(),
             vhost_http_port: 0,
             vhost_https_port: 0,
+            #[cfg(feature = "kcp")]
             kcp_bind_port: 0,
+            #[cfg(feature = "quic")]
             quic_bind_port: 0,
             sudp_port: 0,
             tcpmux_httpconnect_port: 0,
             sub_domain_host: String::new(),
+            #[cfg(feature = "websocket")]
             websocket_port: 0,
             tls_enable: false,
             tls_cert_file: String::new(),

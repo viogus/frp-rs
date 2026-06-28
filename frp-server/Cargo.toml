@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 frp-core = { path = "../frp-core" }
-russh = { workspace = true }
+russh = { workspace = true, optional = true }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -14,14 +14,23 @@ tracing.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 data-encoding.workspace = true
-tokio-tungstenite.workspace = true
+tokio-tungstenite = { workspace = true, optional = true }
 tokio-rustls.workspace = true
 tokio-util.workspace = true
-axum.workspace = true
-prometheus.workspace = true
-lazy_static.workspace = true
+axum = { workspace = true, optional = true }
+prometheus = { workspace = true, optional = true }
+lazy_static = { workspace = true, optional = true }
 reqwest.workspace = true
-rand = "0.10"
+rand.workspace = true
+
+[features]
+default = ["ssh", "dashboard", "websocket", "quic", "kcp", "oidc"]
+ssh = ["dep:russh"]
+dashboard = ["dep:prometheus", "dep:axum", "dep:lazy_static"]
+websocket = ["dep:tokio-tungstenite", "frp-core/websocket"]
+quic = ["frp-core/quic"]
+kcp = ["frp-core/kcp"]
+oidc = ["frp-core/oidc"]
 
 [dev-dependencies]
 tempfile = "3"

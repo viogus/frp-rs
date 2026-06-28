@@ -11,7 +11,9 @@ pub mod bandwidth;
 pub mod metrics;
 pub mod admin_auth;
 pub mod args;
+#[cfg(feature = "kcp")]
 pub mod kcp;
+#[cfg(feature = "quic")]
 pub mod quic;
 pub mod v2_handshake;
 pub mod crypto;

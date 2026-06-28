@@ -2,12 +2,16 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+#[cfg(feature = "websocket")]
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::stream::Stream;
 use futures_util::sink::Sink;
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(feature = "websocket")]
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+#[cfg(feature = "kcp")]
 use crate::kcp::KcpStream;
+#[cfg(feature = "quic")]
 use crate::quic::QuicStream;
 
 use std::sync::Arc;
@@ -44,9 +48,13 @@ pub const FRP_WEBSOCKET_PATH: &str = "/~!frp";
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransportProtocol {
     Tcp,
+    #[cfg(feature = "kcp")]
     Kcp,
+    #[cfg(feature = "websocket")]
     WebSocket,
+    #[cfg(feature = "websocket")]
     Wss,
+    #[cfg(feature = "quic")]
     Quic,
 }
 
@@ -54,9 +62,13 @@ impl std::str::FromStr for TransportProtocol {
     type Err = ();
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s.to_lowercase().as_str() {
+            #[cfg(feature = "kcp")]
             "kcp" => TransportProtocol::Kcp,
+            #[cfg(feature = "websocket")]
             "websocket" | "ws" => TransportProtocol::WebSocket,
+            #[cfg(feature = "websocket")]
             "wss" => TransportProtocol::Wss,
+            #[cfg(feature = "quic")]
             "quic" => TransportProtocol::Quic,
             _ => TransportProtocol::Tcp,
         })
@@ -76,6 +88,7 @@ impl std::str::FromStr for TransportProtocol {
 /// - Tungstenite: client side (binary frames, RFC 6455 compliant)
 /// - Raw: server side (manual framing, tolerates text frames with non-UTF-8
 ///   payload — Go frp v0.69.1 sends these via golang.org/x/net/websocket)
+#[cfg(feature = "websocket")]
 pub struct WsByteStream {
     inner: WsInner,
     read_buf: Vec<u8>,
@@ -88,6 +101,7 @@ pub struct WsByteStream {
     client_mode: bool,
 }
 
+#[cfg(feature = "websocket")]
 enum WsInner {
     Tungstenite(Pin<Box<WebSocketStream<MaybeTlsStream<TcpStream>>>>),
     /// Raw stream post-upgrade. Manual WebSocket frame handling.
@@ -95,6 +109,7 @@ enum WsInner {
     Raw(Box<dyn AsyncReadWrite>),
 }
 
+#[cfg(feature = "websocket")]
 impl WsInner {
     /// Poll-write logic for the Raw variant.
     /// Takes buffer state as separate params to avoid borrow conflicts
@@ -196,6 +211,7 @@ impl WsInner {
     }
 }
 
+#[cfg(feature = "websocket")]
 impl WsByteStream {
     pub fn new(ws: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
         Self {
@@ -234,6 +250,7 @@ impl WsByteStream {
     }
 }
 
+#[cfg(feature = "websocket")]
 impl AsyncRead for WsByteStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -395,6 +412,7 @@ impl AsyncRead for WsByteStream {
     }
 }
 
+#[cfg(feature = "websocket")]
 impl AsyncWrite for WsByteStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -560,8 +578,11 @@ pub enum IoStream {
     /// Boxed TLS stream — type-erased to accept any TLS-wrapped transport
     /// (e.g. TlsStream<TcpStream> or TlsStream<PreReadStream<TcpStream>>).
     Tls(Box<dyn AsyncReadWrite>),
+    #[cfg(feature = "kcp")]
     Kcp(KcpStream),
+    #[cfg(feature = "quic")]
     Quic(QuicStream),
+    #[cfg(feature = "websocket")]
     WebSocket(WsByteStream),
     Yamux(YamuxStream),
     /// AES-128-CFB encrypted control stream.
@@ -588,8 +609,11 @@ impl std::fmt::Debug for IoStream {
         match self {
             IoStream::Tcp(_) => f.debug_struct("IoStream::Tcp").finish_non_exhaustive(),
             IoStream::Tls(_) => f.debug_struct("IoStream::Tls").finish_non_exhaustive(),
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(_) => f.debug_struct("IoStream::Kcp").finish_non_exhaustive(),
+            #[cfg(feature = "quic")]
             IoStream::Quic(_) => f.debug_struct("IoStream::Quic").finish_non_exhaustive(),
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(_) => f.debug_struct("IoStream::WebSocket").finish_non_exhaustive(),
             IoStream::Yamux(_) => f.debug_struct("IoStream::Yamux").finish_non_exhaustive(),
             IoStream::Cipher(_) => f.debug_struct("IoStream::Cipher").finish_non_exhaustive(),
@@ -633,8 +657,11 @@ impl tokio::io::AsyncRead for IoStream {
         match this {
             IoStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Yamux(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Cipher(s) => Pin::new(s).poll_read(cx, buf),
@@ -654,8 +681,11 @@ impl tokio::io::AsyncWrite for IoStream {
         match self.get_mut() {
             IoStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::Yamux(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::Cipher(s) => Pin::new(s).poll_write(cx, buf),
@@ -670,8 +700,11 @@ impl tokio::io::AsyncWrite for IoStream {
         match self.get_mut() {
             IoStream::Tcp(s) => Pin::new(s).poll_flush(cx),
             IoStream::Tls(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => Pin::new(s).poll_flush(cx),
             IoStream::Yamux(s) => Pin::new(s).poll_flush(cx),
             IoStream::Cipher(s) => Pin::new(s).poll_flush(cx),
@@ -686,8 +719,11 @@ impl tokio::io::AsyncWrite for IoStream {
         match self.get_mut() {
             IoStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::Yamux(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::Cipher(s) => Pin::new(s).poll_shutdown(cx),
@@ -705,8 +741,11 @@ impl IoStream {
         match self {
             IoStream::Tcp(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::Tls(s) => crate::protocol::write_msg_v1(s, msg).await,
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::write_msg_v1(s, msg).await,
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => crate::protocol::write_msg_v1(s, msg).await,
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::Yamux(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::Cipher(s) => crate::protocol::write_msg_v1(s, msg).await,
@@ -722,8 +761,11 @@ impl IoStream {
         match self {
             IoStream::Tcp(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Tls(s) => crate::protocol::read_msg_v1(s).await,
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::read_msg_v1(s).await,
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => crate::protocol::read_msg_v1(s).await,
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Yamux(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Cipher(s) => crate::protocol::read_msg_v1(s).await,
@@ -740,8 +782,11 @@ impl IoStream {
         match self {
             IoStream::Tcp(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
             IoStream::Tls(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
             IoStream::Yamux(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
             IoStream::Cipher(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
@@ -758,8 +803,11 @@ impl IoStream {
         match self {
             IoStream::Tcp(s) => crate::protocol::read_msg_v2(s).await,
             IoStream::Tls(s) => crate::protocol::read_msg_v2(s).await,
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::read_msg_v2(s).await,
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => crate::protocol::read_msg_v2(s).await,
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => crate::protocol::read_msg_v2(s).await,
             IoStream::Yamux(s) => crate::protocol::read_msg_v2(s).await,
             IoStream::Cipher(s) => crate::protocol::read_msg_v2(s).await,
@@ -776,8 +824,11 @@ impl IoStream {
         match self {
             IoStream::Tcp(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
             IoStream::Tls(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
             IoStream::Yamux(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
             IoStream::Cipher(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
@@ -793,8 +844,11 @@ impl IoStream {
         match self {
             IoStream::Tcp(s) => crate::protocol::read_v2_frame_raw(s).await,
             IoStream::Tls(s) => crate::protocol::read_v2_frame_raw(s).await,
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::read_v2_frame_raw(s).await,
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => crate::protocol::read_v2_frame_raw(s).await,
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => crate::protocol::read_v2_frame_raw(s).await,
             IoStream::Yamux(s) => crate::protocol::read_v2_frame_raw(s).await,
             IoStream::Cipher(s) => crate::protocol::read_v2_frame_raw(s).await,
@@ -811,7 +865,17 @@ impl IoStream {
             IoStream::Tcp(s) => s.peer_addr().ok(),
             IoStream::PreRead(_, s) => s.peer_addr().ok(),
             IoStream::BufferedRead(_, _, inner) => inner.peer_addr(),
-            IoStream::Tls(_) | IoStream::Kcp(_) | IoStream::Quic(_) | IoStream::WebSocket(_) | IoStream::Yamux(_) | IoStream::Cipher(_) | IoStream::Aead(_) | IoStream::SshChannel(_) => None,
+            IoStream::Tls(_)
+            | IoStream::Yamux(_)
+            | IoStream::Cipher(_)
+            | IoStream::Aead(_)
+            | IoStream::SshChannel(_) => None,
+            #[cfg(feature = "kcp")]
+            IoStream::Kcp(_) => None,
+            #[cfg(feature = "quic")]
+            IoStream::Quic(_) => None,
+            #[cfg(feature = "websocket")]
+            IoStream::WebSocket(_) => None,
         }
     }
 
@@ -831,13 +895,16 @@ impl IoStream {
                 let (r, w) = tokio::io::split(s);
                 (Box::new(r), Box::new(w))
             }
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(stream) => {
                 let (r, w) = tokio::io::split(stream);
                 (Box::new(r), Box::new(w))
             }
+            #[cfg(feature = "quic")]
             IoStream::Quic(stream) => {
                 stream.into_split()
             }
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(adapter) => {
                 let (r, w) = tokio::io::split(adapter);
                 (Box::new(r), Box::new(w))

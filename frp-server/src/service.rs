@@ -215,6 +215,7 @@ impl Service {
             additional_auth_scopes: cfg.auth.additional_auth_scopes.clone(),
         };
 
+        #[cfg(feature = "oidc")]
         let oidc_verifier = if auth_cfg.method == AuthMethod::Oidc {
             match OidcVerifier::new(
                 auth_cfg.oidc_issuer.clone(),
@@ -237,6 +238,8 @@ impl Service {
         } else {
             None
         };
+        #[cfg(not(feature = "oidc"))]
+        let oidc_verifier: Option<std::sync::Arc<OidcVerifier>> = None;
 
         let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
         let allow_ports = if !cfg.allow_ports.is_empty() {
@@ -273,6 +276,7 @@ impl Service {
         );
 
         // Initialize prometheus registry when enabled
+        #[cfg(feature = "dashboard")]
         if cfg.web_server.port > 0 && cfg.web_server.enable_prometheus {
             crate::metrics::prom::register_all();
         }
@@ -313,6 +317,7 @@ impl Service {
         info!("frps listener started on {}", bind_addr);
 
         // Optional WebSocket listener
+        #[cfg(feature = "websocket")]
         if self.cfg.websocket_port > 0 {
             let ws_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.websocket_port);
             let ws_addr2 = ws_addr.clone();
@@ -410,6 +415,7 @@ impl Service {
         }
 
         // Start SSH tunnel gateway if configured
+        #[cfg(feature = "ssh")]
         if self.cfg.ssh_tunnel_gateway.bind_port > 0 {
             let ssh_state = self.state.clone();
             let ssh_cfg = self.cfg.clone();
@@ -436,6 +442,7 @@ impl Service {
         }
 
         // Start KCP listener if configured
+        #[cfg(feature = "kcp")]
         if self.cfg.kcp_bind_port > 0 {
             let kcp_state = self.state.clone();
             let kcp_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.kcp_bind_port);
@@ -482,6 +489,7 @@ impl Service {
         }
 
         // Start QUIC listener if configured (requires TLS cert/key)
+        #[cfg(feature = "quic")]
         if self.cfg.quic_bind_port > 0 && self.cfg.tls_enable {
             let quic_state = self.state.clone();
             let quic_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.quic_bind_port);
@@ -599,6 +607,7 @@ impl Service {
         }
 
         // Start dashboard server if configured
+        #[cfg(feature = "dashboard")]
         if self.cfg.web_server.port > 0 {
             let dash_addr = format_socket_addr(&self.cfg.web_server.addr, self.cfg.web_server.port);
             let dash_addr2 = dash_addr.clone();
@@ -849,6 +858,7 @@ impl Service {
                                 }
                             }
 
+                            #[cfg(feature = "websocket")]
                             ConnectionType::WebSocket => {
                                 if state.tls_only {
                                     warn!("TLS-only mode: rejected WebSocket from {}", addr);
@@ -884,6 +894,10 @@ impl Service {
                                         warn!("WebSocket upgrade failed for {}: {}", addr, e);
                                     }
                                 }
+                            }
+                            #[cfg(not(feature = "websocket"))]
+                            ConnectionType::WebSocket => {
+                                warn!("WebSocket connection from {} but websocket feature disabled", addr);
                             }
 
                             ConnectionType::V2 => {
