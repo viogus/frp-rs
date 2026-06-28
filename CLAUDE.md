@@ -14,6 +14,18 @@ cargo run --bin frpc -- -c frpc.toml
 RUST_LOG=debug cargo run --bin frps -- -c frps.toml  # Enable debug logging
 ```
 
+### Tiny Binaries
+
+Build without optional protocols (QUIC, KCP, WebSocket, SSH, OIDC, metrics):
+
+```bash
+cargo build --release -p frps -p frpc --no-default-features
+# Output: target/release/frps-tiny (~2.8MB), frpc-tiny (~2.7MB)
+```
+
+Optional protocols controlled by feature flags: `quic`, `kcp`, `websocket`, `oidc`, `ssh`, `dashboard`.
+All enabled by default. Full binary: `cargo build --release -p frps -p frpc`.
+
 - No `cargo check` variation needed — use `cargo build` for the full workspace.
 - Tests live inline (`#[cfg(test)] mod tests`), no separate test crates.
 
