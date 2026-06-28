@@ -30,7 +30,6 @@ rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 ring = { workspace = true }
-libc.workspace = true
 yamux.workspace = true
 tokio-util.workspace = true
 kcp = { workspace = true, optional = true }
