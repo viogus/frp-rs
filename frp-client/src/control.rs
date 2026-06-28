@@ -312,9 +312,13 @@ impl ControlConnection {
                 self.server_auth_scopes = resp.server_additional_auth_scopes.unwrap_or_default();
                 info!("Logged in. run_id: {}", self.run_id);
                 #[cfg(feature = "quic")]
-                Ok((io_stream, self.run_id.clone(), yamux_session, quic_conn))
+                {
+                    Ok((io_stream, self.run_id.clone(), yamux_session, quic_conn))
+                }
                 #[cfg(not(feature = "quic"))]
-                Ok((io_stream, self.run_id.clone(), yamux_session))
+                {
+                    Ok((io_stream, self.run_id.clone(), yamux_session))
+                }
             }
             _ => Err(frp_core::Error::Protocol("Unexpected response to login".into())),
         }

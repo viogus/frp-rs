@@ -642,6 +642,11 @@ impl Service {
                 .unwrap_or_default();
             let server_scopes = self.server_auth_scopes.read().await.clone();
             for i in 0..pool_count {
+                #[cfg(feature = "quic")]
+                let quic_arg = quic_conn.clone();
+                #[cfg(not(feature = "quic"))]
+                let quic_arg: QuicConnOpt = ();
+
                 spawn_work_conn(
                     &self.cfg.server_addr,
                     self.cfg.server_port,
@@ -655,7 +660,7 @@ impl Service {
                     self.cfg.tls_server_name.clone(),
                     if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
                     yamux.clone(),
-                    quic_conn.clone(),
+                    quic_arg,
                     v2,
                     self.oidc_client.clone(),
                     udp_sockets.clone(),
@@ -714,6 +719,10 @@ impl Service {
                         match msg {
                             Ok(FrpMessage::ReqWorkConn(_)) => {
                                 debug!("Received ReqWorkConn, creating work connection");
+                                #[cfg(feature = "quic")]
+                                let quic_arg = quic_conn.clone();
+                                #[cfg(not(feature = "quic"))]
+                                let quic_arg: QuicConnOpt = ();
                                 spawn_work_conn(
                                     &self.cfg.server_addr,
                                     self.cfg.server_port,
@@ -727,7 +736,7 @@ impl Service {
                                     self.cfg.tls_server_name.clone(),
                                     if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
                                     yamux.clone(),
-                                    quic_conn.clone(),
+                                    quic_arg,
                                     v2,
                                     self.oidc_client.clone(),
                                     udp_sockets.clone(),
@@ -1176,6 +1185,13 @@ impl Service {
 // Work connection management
 // ---------------------------------------------------------------
 
+/// Conditional type for the QUIC connection parameter.
+/// When the `quic` feature is disabled, the parameter is `()` (ZST, no-op).
+#[cfg(feature = "quic")]
+type QuicConnOpt = Option<Arc<QuicConnection>>;
+#[cfg(not(feature = "quic"))]
+type QuicConnOpt = ();
+
 /// Spawn a single work connection task.
 ///
 /// The task:
@@ -1256,7 +1272,7 @@ fn spawn_work_conn(
     tls_server_name: String,
     tls_ca_file: Option<String>,
     yamux: Option<std::sync::Arc<YamuxSession>>,
-    quic_conn: Option<Arc<QuicConnection>>,
+    quic_conn: QuicConnOpt,
     v2: bool,
     oidc_client: Option<Arc<OidcClient>>,
     udp_sockets: Arc<tokio::sync::Mutex<HashMap<String, Arc<UdpSocket>>>>,
@@ -1293,6 +1309,7 @@ fn spawn_work_conn(
         // Priority: QUIC multi-stream > TcpMux yamux > direct dial.
         // Go frp compat: QUIC work connections open new streams on the
         // existing QUIC connection (multi-stream-per-connection).
+        #[cfg(feature = "quic")]
         let mut work = if let Some(ref quic) = quic_conn {
             match quic.open_bi().await {
                 Ok(stream) => {
@@ -1305,6 +1322,42 @@ fn spawn_work_conn(
                 }
             }
         } else if let Some(ref yamux) = yamux {
+            match yamux.open_stream().await {
+                Some(stream) => {
+                    debug!("Work conn {} opened yamux stream", label);
+                    IoStream::Yamux(stream)
+                }
+                None => {
+                    warn!("Work conn {}: yamux open stream failed, session closed?", label);
+                    return;
+                }
+            }
+        } else {
+            debug!("Work conn {} dialing server", label);
+            let opts = DialOptions {
+                server_addr: server_addr.clone(),
+                server_port,
+                protocol: protocol.clone(),
+                tls_enable,
+                tls_server_name: tls_server_name.clone(),
+                tls_ca_file: tls_ca_file.clone(),
+                disable_custom_tls_first_byte,
+                keepalive_secs,
+                bind_addr: bind_addr.clone(),
+                proxy_url: if proxy_url.is_empty() { None } else { Some(proxy_url.clone()) },
+                ..Default::default()
+            };
+            match dial_server(&opts).await {
+                Ok(io) => io,
+                Err(e) => {
+                    debug!("Work conn {} dial failed: {}", label, e);
+                    return;
+                }
+            }
+        };
+
+        #[cfg(not(feature = "quic"))]
+        let mut work = if let Some(ref yamux) = yamux {
             match yamux.open_stream().await {
                 Some(stream) => {
                     debug!("Work conn {} opened yamux stream", label);
