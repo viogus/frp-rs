@@ -3675,14 +3675,8 @@ run_test test_r2g_quic
 # g2r: Go frpc needs source build for transport.wireProtocol config support.
 #      Auto-builds via build_go_frp_v2() when Go is available.
 # r2g: Go frps auto-detects V2 from connection magic bytes — pre-built binary works.
-# NOTE: V2 tests fail due to known protocol bug (V2 frame parsing on yamux streams).
-# Guarded in CI; enabled locally when Go is available or GO_FRP_V2=1 is set.
-if [[ "${CI:-false}" != "true" ]] || [[ "${GO_FRP_V2:-0}" == "1" ]]; then
-    run_test test_g2r_v2_tcp
-    run_test test_r2g_v2_tcp
-else
-    log "SKIP V2 tests: known protocol bug (V2 frame parsing). Set GO_FRP_V2=1 to enable in CI."
-fi
+	run_test test_g2r_v2_tcp
+	run_test test_r2g_v2_tcp
 
 # --- Summary ---
 echo ""
