@@ -1251,7 +1251,7 @@ async fn write_proxy_protocol_v2(
             buf.extend_from_slice(&s6.octets());
             buf.extend_from_slice(&d6.octets());
         }
-        _ => unreachable!(),
+        _ => return Err("v2 PROXY protocol requires src and dst to be the same IP version".into()),
     }
     buf.extend_from_slice(&src_port.to_be_bytes());
     buf.extend_from_slice(&dst_port.to_be_bytes());

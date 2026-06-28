@@ -1032,7 +1032,13 @@ impl Service {
                                     // (including the type byte consumed by detect_and_strip_magic).
                                     let (pre_read, inner_tcp) = match stream_io {
                                         IoStream::PreRead(buf, s) => (buf, s),
-                                        _ => unreachable!(),
+                                        _ => {
+                                            warn!(
+                                                "Expected PreRead stream after detect_and_strip_magic from {}, got unexpected stream type",
+                                                addr
+                                            );
+                                            return;
+                                        }
                                     };
                                     let stream = PreReadStream::new(pre_read, inner_tcp);
 
