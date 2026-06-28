@@ -56,6 +56,11 @@ impl QuicConnection {
             .map_err(|e| io::Error::other(format!("quinn open_bi: {e}")))?;
         Ok(QuicStream::new(self.conn.clone(), send, recv))
     }
+
+    /// Return the remote peer's socket address.
+    pub fn remote_address(&self) -> std::net::SocketAddr {
+        self.conn.remote_address()
+    }
 }
 
 /// QUIC listener — binds a UDP socket and accepts QUIC connections.
