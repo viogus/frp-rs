@@ -1,0 +1,74 @@
+# XTCP cross-compatibility test workflow (VPS-backed)
+#
+# Required GitHub Secrets:
+#   XTCP_VPS_HOST    - VPS public IP or hostname (must have a public IP)
+#   XTCP_VPS_SSH_KEY - SSH private key for the frp-test user on the VPS
+#
+# The VPS must have the frp-test user pre-configured with the SSH key,
+# and firewall rules must allow the port ranges used by XTCP tests.
+
+name: XTCP Compat
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *'  # daily, off-peak (UTC 03:17)
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  XTCP_VPS_USER: frp-test
+
+jobs:
+  xtcp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Clean skip if VPS secrets are not configured
+    if: ${{ vars.XTCP_VPS_HOST != '' || secrets.XTCP_VPS_HOST != '' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.22.0'
+
+      - name: Cache cargo + go-frp
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/release/
+            /tmp/frp_0.69.1_linux_amd64/
+          key: ${{ runner.os }}-xtcp-${{ hashFiles('Cargo.lock') }}-v1
+          restore-keys: ${{ runner.os }}-xtcp-
+
+      - name: Build frp-rs (release)
+        run: cargo build --release --bin frps --bin frpc
+
+      - name: Download Go frp
+        run: bash scripts/download-go-frp.sh 0.69.1
+
+      - name: Run XTCP compat tests
+        run: |
+          bash scripts/compat-test.sh \
+            --frps-remote "$XTCP_VPS_HOST" \
+            --xtcp-only \
+            --ci \
+            --verbose
+        env:
+          XTCP_VPS_HOST: ${{ secrets.XTCP_VPS_HOST }}
+          XTCP_VPS_SSH_KEY: ${{ secrets.XTCP_VPS_SSH_KEY }}
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "XTCP compat tests completed."
+          echo "VPS host: $XTCP_VPS_HOST"
+        env:
+          XTCP_VPS_HOST: ${{ secrets.XTCP_VPS_HOST }}
