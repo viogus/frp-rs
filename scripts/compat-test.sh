@@ -2215,6 +2215,10 @@ test_xtcp_g2g_enc() { run_xtcp_test "xtcp-g2g-enc" go go go "enc compression"; }
 test_xtcp_r2r_enc() { run_xtcp_test "xtcp-r2r-enc" rust rust rust "enc compression"; }
 test_xtcp_g2r_enc() { run_xtcp_test "xtcp-g2r-enc" rust go go "enc compression"; }
 test_xtcp_r2g_enc() { run_xtcp_test "xtcp-r2g-enc" go rust rust "enc compression"; }
+test_xtcp_go_frps_go_prov_rust_vis_enc() { run_xtcp_test "xtcp-go-frps-go-prov-rust-vis-enc" go go rust "enc compression"; }
+test_xtcp_go_frps_rust_prov_go_vis_enc() { run_xtcp_test "xtcp-go-frps-rust-prov-go-vis-enc" go rust go "enc compression"; }
+test_xtcp_rust_frps_go_prov_rust_vis_enc() { run_xtcp_test "xtcp-rust-frps-go-prov-rust-vis-enc" rust go rust "enc compression"; }
+test_xtcp_rust_frps_rust_prov_go_vis_enc() { run_xtcp_test "xtcp-rust-frps-rust-prov-go-vis-enc" rust rust go "enc compression"; }
 
 # =============================================================================
 # Test: Multi-proxy (2 TCP proxies on same client)
@@ -2880,6 +2884,10 @@ if ${XTCP_ONLY:-false} || [[ "${RUN_XTCP:-0}" == "1" ]]; then
     run_test test_xtcp_r2r_enc
     run_test test_xtcp_g2r_enc
     run_test test_xtcp_r2g_enc
+    run_test test_xtcp_go_frps_go_prov_rust_vis_enc
+    run_test test_xtcp_go_frps_rust_prov_go_vis_enc
+    run_test test_xtcp_rust_frps_go_prov_rust_vis_enc
+    run_test test_xtcp_rust_frps_rust_prov_go_vis_enc
 else
     log "SKIP XTCP tests: requires public internet (STUN + NAT probes). Set RUN_XTCP=1 to enable."
 fi
