@@ -107,29 +107,33 @@ GitHub Secrets required:
 
 3. **XTCP guard override:** When `--frps-remote` is set, automatically enable `RUN_XTCP=1`.
 
-### Test Matrix (10 tests)
+### Test Matrix: Full Pairwise (12 tests)
 
-**Baseline (same-implementation):** Verify each frp implementation's XTCP works against itself before cross-testing.
+2³ = 8 combinations (frps × provider × visitor, each Go or Rust) + 4 encrypted variants.
 
-| Test | frps | Provider | Visitor | Encryption | Coverage |
-|------|------|----------|---------|:----------:|----------|
-| `xtcp-g2g-basic` | Go | Go | Go | — | Go baseline: Go→Go |
-| `xtcp-g2g-enc` | Go | Go | Go | ✅ enc+comp | Go baseline encrypted |
-| `xtcp-r2r-basic` | Rust | Rust | Rust | — | Rust baseline: Rust→Rust |
-| `xtcp-r2r-enc` | Rust | Rust | Rust | ✅ enc+comp | Rust baseline encrypted |
+**Unencrypted — full 2³ matrix:**
 
-**Cross-implementation:** Validate Go↔Rust interop for each direction.
+| # | frps | Provider | Visitor | Test name |
+|---|------|----------|---------|------------|
+| 1 | Go | Go | Go | `xtcp-g2g-basic` |
+| 2 | Go | Go | Rust | `xtcp-gprv-visr` |
+| 3 | Go | Rust | Go | `xtcp-grpv-gvis` |
+| 4 | Go | Rust | Rust | `xtcp-r2g-basic` |
+| 5 | Rust | Go | Go | `xtcp-g2r-basic` |
+| 6 | Rust | Go | Rust | `xtcp-rprv-gvis` |
+| 7 | Rust | Rust | Go | `xtcp-mixed-go-visitor` |
+| 8 | Rust | Rust | Rust | `xtcp-r2r-basic` |
 
-| Test | frps | Provider | Visitor | Encryption | Coverage |
-|------|------|----------|---------|:----------:|----------|
-| `xtcp-g2r-basic` | Rust | Go | Go | — | Go frpc against Rust frps |
-| `xtcp-r2g-basic` | Go | Rust | Rust | — | Rust frpc against Go frps |
-| `xtcp-g2r-enc` | Rust | Go | Go | ✅ enc+comp | Go→Rust encrypted bridge |
-| `xtcp-r2g-enc` | Go | Rust | Rust | ✅ enc+comp | Rust→Go encrypted bridge |
-| `xtcp-mixed-go-visitor` | Rust | Rust | Go | — | Go visitor + Rust provider |
-| `xtcp-mixed-rust-visitor` | Go | Go | Rust | — | Rust visitor + Go provider |
+**Encrypted (enc+comp) — key cross combinations:**
 
-**Testing order:** Baselines first (g2g → r2r). If baseline fails, all cross-tests for that frps are suspect. Cross-tests second.
+| # | frps | Provider | Visitor | Test name |
+|---|------|----------|---------|------------|
+| 9 | Go | Go | Go | `xtcp-g2g-enc` |
+| 10 | Go | Rust | Rust | `xtcp-r2g-enc` |
+| 11 | Rust | Go | Go | `xtcp-g2r-enc` |
+| 12 | Rust | Rust | Rust | `xtcp-r2r-enc` |
+
+**Testing order:** Baselines first (g2g-basic → r2r-basic). If a baseline fails, all tests involving that frps are suspect. Cross-tests second. Encrypted variants last.
 
 Each test:
 - Starts echo server on GitHub Actions runner
