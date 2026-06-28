@@ -154,9 +154,9 @@ impl OidcVerifier {
             return Err(format!("OIDC: openid-configuration returned {}", resp.status()));
         }
 
-        let config: serde_json::Value = resp
-            .json()
-            .await
+        let body = resp.text().await
+            .map_err(|e| format!("OIDC: failed to read openid-configuration: {e}"))?;
+        let config: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| format!("OIDC: failed to parse openid-configuration: {e}"))?;
 
         let jwks_uri = config["jwks_uri"]
@@ -204,9 +204,9 @@ impl OidcVerifier {
             return Err(format!("OIDC: JWKS endpoint returned {}", resp.status()));
         }
 
-        let jwks_json: serde_json::Value = resp
-            .json()
-            .await
+        let body = resp.text().await
+            .map_err(|e| format!("OIDC: failed to read JWKS: {e}"))?;
+        let jwks_json: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| format!("OIDC: failed to parse JWKS: {e}"))?;
 
         let mut cache = self.jwks.write().await;
@@ -433,9 +433,9 @@ impl OidcClient {
                 return Err(format!("OIDC client: openid-configuration returned {}", resp.status()));
             }
 
-            let config: serde_json::Value = resp
-                .json()
-                .await
+            let body = resp.text().await
+                .map_err(|e| format!("OIDC client: failed to read openid-configuration: {e}"))?;
+            let config: serde_json::Value = serde_json::from_str(&body)
                 .map_err(|e| format!("OIDC client: failed to parse openid-configuration: {e}"))?;
 
             config["token_endpoint"]
@@ -496,9 +496,9 @@ impl OidcClient {
             return Err(format!("OIDC client: token endpoint returned error: {body}"));
         }
 
-        let body: serde_json::Value = resp
-            .json()
-            .await
+        let resp_text = resp.text().await
+            .map_err(|e| format!("OIDC client: failed to read token response: {e}"))?;
+        let body: serde_json::Value = serde_json::from_str(&resp_text)
             .map_err(|e| format!("OIDC client: failed to parse token response: {e}"))?;
 
         let token = body["access_token"]
