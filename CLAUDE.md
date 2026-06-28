@@ -40,7 +40,7 @@ Feature flags across crates:
 | `websocket` | frp-core/server | WebSocket transport (tokio-tungstenite) |
 | `oidc` | frp-core | OIDC auth (jsonwebtoken, reqwest) |
 | `ssh` | frp-server | SSH gateway (russh) |
-| `dashboard` | frp-server | Metrics/status API (prometheus, axum, lazy_static) |
+| `dashboard` | frp-server | Metrics/status API (prometheus, axum) |
 | `tls` | frp-core/server/client | TLS encryption (rustls, webpki-roots, axum TlsListener) |
 | `compression` | frp-core | Snappy bridge compression (snap) |
 | `chacha20` | frp-core | XChaCha20-Poly1305 V2 cipher (AES-256-GCM stays) |
@@ -202,7 +202,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 | Crypto (Go compat) | `aes` + `cfb-mode`, `pbkdf2` + `sha1`, `md-5` | AES-128-CFB, PBKDF2-SHA1, MD5 — ring lacks these |
 | Crypto (V2 XChaCha20) | `chacha20poly1305` | ring only has ChaCha20 (96-bit nonce), V2 needs XChaCha20 (192-bit) |
 | TLS | `rustls` + `tokio-rustls` + `rustls-pemfile` + `webpki-roots` | ring backend, tls12 |
-| SSH | `russh` | ring backend (NOT aws-lc-rs) |
+| SSH | `russh` | ring backend (NOT aws-lc-rs), features: ring+rsa only |
 | HTTP client | `reqwest` | rustls-tls only (no json, no socks features) |
 | HTTP server | `axum` | dashboard, admin auth |
 | WebSocket | `tokio-tungstenite` | |
@@ -215,7 +215,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 | Logging | `tracing` + `tracing-subscriber` + `tracing-appender` | env-filter |
 | Error handling | `anyhow` + `thiserror` | |
 | Random | `rand` | 0.8 |
-| Misc | `bytes`, `uuid`, `futures-util`, `tokio-util`, `socket2`, `libc`, `lazy_static`, `prometheus` | |
+| Misc | `bytes`, `uuid`, `futures-util`, `tokio-util`, `socket2`, `prometheus` | |
 
 **Removed and banned** (do not reintroduce without approval):
 - `aws-lc-sys` / `aws-lc-rs` — replaced by ring (russh default → ring feature)
@@ -225,6 +225,8 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 - `aes-gcm` — replaced by ring (AES-256-GCM)
 - `hkdf` — replaced by ring (HKDF-SHA256)
 - `hickory-resolver` — replaced by custom DNS-over-UDP client
+- `lazy_static` — replaced by `std::sync::LazyLock` (stable since Rust 1.80)
+- `libc` — dead direct dependency (transitively available via quinn→core-foundation on macOS)
 
 ### Workspace Dependencies
 
