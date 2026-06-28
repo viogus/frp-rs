@@ -156,30 +156,32 @@ cmd_start() {
     config_path=$(write_frps_config "$impl" "$actual_port" "$token")
 
     # --- Ensure remote directory exists ---
-    ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" "mkdir -p $REMOTE_DIR" 2>/dev/null || {
+    local ssh_err
+    ssh_err=$(ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" "mkdir -p $REMOTE_DIR" 2>&1 1>/dev/null) || {
         rm -f "$config_path"
-        die "failed to create remote directory $REMOTE_DIR on $host"
+        die "failed to create remote directory $REMOTE_DIR on $host: $ssh_err"
     }
 
     # --- Upload binary and config ---
     local scp_opts="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
-    if ! scp $scp_opts -i "$ssh_key" "$binary_path" "${VPS_USER}@${host}:${REMOTE_DIR}/frps" 2>/dev/null; then
+    local scp_err
+    scp_err=$(scp $scp_opts -i "$ssh_key" "$binary_path" "${VPS_USER}@${host}:${REMOTE_DIR}/frps" 2>&1 1>/dev/null) || {
         rm -f "$config_path"
-        die "failed to upload frps binary to $host"
-    fi
-    if ! scp $scp_opts -i "$ssh_key" "$config_path" "${VPS_USER}@${host}:${REMOTE_DIR}/frps.toml" 2>/dev/null; then
+        die "failed to upload frps binary to $host: $scp_err"
+    }
+    scp_err=$(scp $scp_opts -i "$ssh_key" "$config_path" "${VPS_USER}@${host}:${REMOTE_DIR}/frps.toml" 2>&1 1>/dev/null) || {
         rm -f "$config_path"
-        die "failed to upload frps config to $host"
-    fi
+        die "failed to upload frps config to $host: $scp_err"
+    }
 
     # Clean up local config
     rm -f "$config_path"
 
     # --- Start frps on VPS ---
     # Redirect all fds to detach from SSH session; nohup ensures survival
-    ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
-        "cd $REMOTE_DIR && chmod +x frps && nohup ./frps -c frps.toml > frps.log 2>&1 < /dev/null & echo \$! > frps.pid" 2>/dev/null || {
-        die "failed to start frps on $host"
+    ssh_err=$(ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
+        "cd $REMOTE_DIR && chmod +x frps && nohup ./frps -c frps.toml > frps.log 2>&1 < /dev/null & echo \$! > frps.pid" 2>&1 1>/dev/null) || {
+        die "failed to start frps on $host: $ssh_err"
     }
 
     # --- Wait for frps to be ready ---
