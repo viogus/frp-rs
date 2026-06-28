@@ -183,6 +183,49 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 - `login_fail_exit` defaults to `true` in `ClientConfig::default()` but README example shows `false` — be aware the code default is `true`
 - `#[serde(untagged)]` on `FrpMessage` enum — ordering matters for serde matching, but V1 protocol dispatches by type byte first via `deserialize_v1()`, so untagged matching is not involved in wire deserialization
 
+### Dependency Policy (mandatory)
+
+**No new dependencies without explicit justification.** Every new crate added to the workspace must have a documented reason covering:
+
+1. **Why it's needed** — what problem it solves that existing deps cannot
+2. **Why the alternative was rejected** — why an existing dep can't be used (e.g., ring for crypto, data_encoding for encoding)
+3. **Binary size impact** — approximate cost to frps/frpc release binary
+
+Pre-approved tech stack. Use these unless strong reason to deviate:
+
+| Domain | Crate | Notes |
+|--------|-------|-------|
+| Async runtime | `tokio` | net, io-util, time, sync, macros, rt-multi-thread, signal |
+| Serialization | `serde` + `serde_json` | derive feature |
+| Config | `toml` | 0.8 |
+| Crypto (general) | `ring` | 0.17 — SHA256, AES-256-GCM, HKDF, HMAC |
+| Crypto (Go compat) | `aes` + `cfb-mode`, `pbkdf2` + `sha1`, `md-5` | AES-128-CFB, PBKDF2-SHA1, MD5 — ring lacks these |
+| Crypto (V2 XChaCha20) | `chacha20poly1305` | ring only has ChaCha20 (96-bit nonce), V2 needs XChaCha20 (192-bit) |
+| TLS | `rustls` + `tokio-rustls` + `rustls-pemfile` + `webpki-roots` | ring backend, tls12 |
+| SSH | `russh` | ring backend (NOT aws-lc-rs) |
+| HTTP client | `reqwest` | rustls-tls only (no json, no socks features) |
+| HTTP server | `axum` | dashboard, admin auth |
+| WebSocket | `tokio-tungstenite` | |
+| Encoding | `data_encoding` | BASE64 (also: `hex` for debug logging) |
+| Compression | `snap` | Snappy, pure Rust |
+| QUIC | `quinn` | |
+| KCP | `kcp` | |
+| TcpMux | `yamux` | |
+| OIDC/JWT | `jsonwebtoken` | |
+| Logging | `tracing` + `tracing-subscriber` + `tracing-appender` | env-filter |
+| Error handling | `anyhow` + `thiserror` | |
+| Random | `rand` | 0.8 |
+| Misc | `bytes`, `uuid`, `futures-util`, `tokio-util`, `socket2`, `libc`, `lazy_static`, `prometheus` | |
+
+**Removed and banned** (do not reintroduce without approval):
+- `aws-lc-sys` / `aws-lc-rs` — replaced by ring (russh default → ring feature)
+- `hmac` — dead dependency, ring covers HMAC
+- `base64` — replaced by data_encoding
+- `sha2` — replaced by ring
+- `aes-gcm` — replaced by ring (AES-256-GCM)
+- `hkdf` — replaced by ring (HKDF-SHA256)
+- `hickory-resolver` — replaced by custom DNS-over-UDP client
+
 ### Workspace Dependencies
 
 Cargo workspace uses `resolver = "2"` with `[workspace.dependencies]` for all crates. Adding a new dependency: add to workspace level, then reference by name (no version) in sub-crates.

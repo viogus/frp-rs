@@ -5,9 +5,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(feature = "websocket")]
 use tokio_tungstenite::tungstenite::Message;
 #[cfg(feature = "websocket")]
-use futures_util::stream::Stream;
-#[cfg(feature = "websocket")]
-use futures_util::sink::Sink;
+use futures_util::{sink::Sink, Stream};
 use tokio::net::TcpStream;
 #[cfg(feature = "tls")]
 use tokio::net::TcpListener;
