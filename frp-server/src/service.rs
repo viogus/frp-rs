@@ -53,7 +53,9 @@ pub enum InternalMsg {
     /// The old handler should stop listening and clean up.
     Shutdown,
     /// NAT hole punch: server tells provider to initiate hole punch (Rust frpc compat).
-    /// For Go frp compat, use NatHoleSidOnWorkConn instead.
+    /// DEPRECATED: Go frp compat uses NatHoleSidOnWorkConn — provider does its own
+    /// STUN, server is pure relay. Remove this variant once Rust frpc XTCP is verified.
+    #[allow(dead_code)]
     NatHoleClient {
         proxy_name: String,
         transaction_id: String,
