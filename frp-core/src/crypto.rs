@@ -569,11 +569,6 @@ impl AeadStream {
         })
     }
 
-    /// Consume self and return inner stream (for upgrade scenarios).
-    #[allow(dead_code)]
-    pub fn into_inner(self) -> Box<dyn AsyncReadWriteUnpin> {
-        self.inner
-    }
 }
 
 // --- AsyncRead impl ---

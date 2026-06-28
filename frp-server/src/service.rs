@@ -52,15 +52,8 @@ pub enum InternalMsg {
     /// Sent when a new control connection claims the same run_id.
     /// The old handler should stop listening and clean up.
     Shutdown,
-    /// NAT hole punch: server tells provider to initiate hole punch (Rust frpc compat).
-    /// DEPRECATED: Go frp compat uses NatHoleSidOnWorkConn — provider does its own
-    /// STUN, server is pure relay. Remove this variant once Rust frpc XTCP is verified.
-    #[allow(dead_code)]
-    NatHoleClient {
-        proxy_name: String,
-        transaction_id: String,
-        visitor_addr: Option<String>,
-    },
+    // NatHoleClient variant removed — dead code. Go frp compat uses
+    // NatHoleSidOnWorkConn path (server is pure relay, provider does STUN).
     /// Send NatHoleSid to provider on a work connection (Go frp v0.69.1 XTCP compat).
     /// The server writes NatHoleSid on a pooled work connection to notify
     /// the provider that a new XTCP visitor has arrived. The provider then
@@ -68,6 +61,7 @@ pub enum InternalMsg {
     /// control connection with its mapped addresses.
     NatHoleSidOnWorkConn {
         sid: String,
+        proxy_name: String,
     },
     /// Forward NatHoleSid to visitor via control channel (Go frp compat).
     WriteNatHoleSid {
@@ -1497,6 +1491,7 @@ async fn handle_nat_hole_visitor(
         .tx
         .send(InternalMsg::NatHoleSidOnWorkConn {
             sid: sid.clone(),
+            proxy_name: proxy_name.clone(),
         })
         .is_err()
     {

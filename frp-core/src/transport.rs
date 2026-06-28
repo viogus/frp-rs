@@ -1400,17 +1400,8 @@ pub async fn detect_and_strip_magic(
     Ok((ct, IoStream::PreRead(magic_buf.to_vec(), stream)))
 }
 
-/// After detection classified the connection as TLS, consume the 0x17 head byte.
-/// DEPRECATED: use detect_and_strip_magic instead, which consumes magic upfront.
-/// Kept for frp-server/src/service.rs migration in Task 6.
-pub async fn consume_tls_head_byte(stream: &mut TcpStream) -> Result<(), crate::Error> {
-    let mut buf = [0u8; 1];
-    tokio::io::AsyncReadExt::read_exact(stream, &mut buf)
-        .await
-        .map_err(|e| crate::Error::Transport(format!("consume TLS head byte: {e}")))?;
-    debug_assert_eq!(buf[0], FRP_TLS_HEAD_BYTE, "expected TLS head byte 0x17");
-    Ok(())
-}
+// consume_tls_head_byte removed — dead code. detect_and_strip_magic
+// consumes TLS magic upfront during connection classification.
 
 /// Accept a WebSocket upgrade on the server side.
 /// Returns an IoStream with a WsByteStream adapter already applied,

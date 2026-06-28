@@ -3,7 +3,7 @@
 pub mod classify;
 pub mod analysis;
 pub mod controller;
-pub mod discovery;
+
 
 /// Timeout waiting for provider's NatHoleClient message (seconds).
 /// Go frp v0.69.1 compat: var NatHoleTimeout.

@@ -847,8 +847,6 @@ use russh::server::Config;
 pub struct SshListener {
     bind_addr: String,
     bind_port: u16,
-    #[allow(dead_code)]
-    config: frp_core::config::SshTunnelGatewayConfig,
     server_token: String,
     state: std::sync::Arc<AppState>,
     host_key: russh::keys::PrivateKey,
@@ -901,7 +899,6 @@ impl SshListener {
         Ok(Some(Self {
             bind_addr: ssh_cfg.bind_addr.clone(),
             bind_port: ssh_cfg.bind_port,
-            config: ssh_cfg.clone(),
             server_token,
             state,
             host_key,

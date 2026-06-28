@@ -202,18 +202,6 @@ pub struct ProxyEntry {
     pub info: ProxyInfo,
 }
 
-/// Allocate a port for a proxy, auto-assigning if port is 0.
-/// Iterates over all configured ranges. Kept for backward compat.
-#[allow(dead_code)]
-pub fn allocate_port(
-    used_ports: &mut std::collections::HashSet<u16>,
-    port: u16,
-    max_attempts: u16,
-    base_port: u16,
-) -> Option<u16> {
-    allocate_port_multi(used_ports, port, &[(base_port, base_port.saturating_add(max_attempts).saturating_sub(1))])
-}
-
 /// Allocate a port across multiple ranges.
 /// If `port` > 0, try to allocate exactly that port. If already used, return None.
 /// If `port` == 0, scan all ranges in order and return the first available port.
