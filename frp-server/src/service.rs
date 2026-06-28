@@ -82,7 +82,7 @@ impl Service {
             None
         };
         #[cfg(not(feature = "oidc"))]
-        let oidc_verifier: Option<std::sync::Arc<OidcVerifier>> = None;
+        let oidc_verifier = None;
 
         let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
         let allow_ports = if !cfg.allow_ports.is_empty() {
