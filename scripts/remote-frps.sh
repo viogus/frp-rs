@@ -99,7 +99,7 @@ bindAddr = "0.0.0.0"
 bindPort = $port
 auth.method = "token"
 auth.token = "$token"
-log.to = "$REMOTE_DIR/frps.log"
+log.to = "./frps.log"
 log.level = "debug"
 transport.tcpMux = false
 TOML
@@ -155,21 +155,27 @@ cmd_start() {
     local config_path
     config_path=$(write_frps_config "$impl" "$actual_port" "$token")
 
-    # --- Ensure remote directory exists ---
+    # --- Ensure remote directory exists (create unique writable dir) ---
+    local remote_dir
     local ssh_err
-    ssh_err=$(ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" "mkdir -p $REMOTE_DIR" 2>&1 1>/dev/null) || {
+    # mktemp creates a directory owned by frp-test, avoiding root-owned /tmp/frp-xtcp-test
+    remote_dir=$(ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
+        "mktemp -d /tmp/frp-xtcp-XXXXXX" 2>&1) || {
         rm -f "$config_path"
-        die "failed to create remote directory $REMOTE_DIR on $host: $ssh_err"
+        die "failed to create remote directory on $host: $remote_dir"
     }
+    # Store path for stop/status to find later
+    ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
+        "echo '$remote_dir' > /tmp/.frp-xtcp-dir" 2>/dev/null || true
 
     # --- Upload binary and config ---
     local scp_opts="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ControlPath=/tmp/frp-ssh-ctl-%h-%r"
     local scp_err
-    scp_err=$(scp $scp_opts -i "$ssh_key" "$binary_path" "${VPS_USER}@${host}:${REMOTE_DIR}/frps" 2>&1 1>/dev/null) || {
+    scp_err=$(scp $scp_opts -i "$ssh_key" "$binary_path" "${VPS_USER}@${host}:${remote_dir}/frps" 2>&1 1>/dev/null) || {
         rm -f "$config_path"
         die "failed to upload frps binary to $host: $scp_err"
     }
-    scp_err=$(scp $scp_opts -i "$ssh_key" "$config_path" "${VPS_USER}@${host}:${REMOTE_DIR}/frps.toml" 2>&1 1>/dev/null) || {
+    scp_err=$(scp $scp_opts -i "$ssh_key" "$config_path" "${VPS_USER}@${host}:${remote_dir}/frps.toml" 2>&1 1>/dev/null) || {
         rm -f "$config_path"
         die "failed to upload frps config to $host: $scp_err"
     }
@@ -180,7 +186,7 @@ cmd_start() {
     # --- Start frps on VPS ---
     # Redirect all fds to detach from SSH session; nohup ensures survival
     ssh_err=$(ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
-        "cd $REMOTE_DIR && chmod +x frps && nohup ./frps -c frps.toml > frps.log 2>&1 < /dev/null & echo \$! > frps.pid" 2>&1 1>/dev/null) || {
+        "cd $remote_dir && chmod +x frps && nohup ./frps -c frps.toml > frps.log 2>&1 < /dev/null & echo \$! > frps.pid" 2>&1 1>/dev/null) || {
         die "failed to start frps on $host: $ssh_err"
     }
 
@@ -200,26 +206,44 @@ cmd_stop() {
 
     # Run cleanup script on VPS. Suppress stderr (SSH warnings, kill output).
     # || true ensures we don't fail if the remote dir is already gone.
+    # Read stored directory from /tmp/.frp-xtcp-dir if available
     ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" "bash -s" 2>/dev/null <<'REMOTE_SCRIPT' || true
 set -euo pipefail
-PID_FILE="/tmp/frp-xtcp-test/frps.pid"
-if [[ -f "$PID_FILE" ]]; then
-    pid=$(cat "$PID_FILE")
-    if kill -0 "$pid" 2>/dev/null; then
+# Find all frp-xtcp temp dirs
+for d in /tmp/frp-xtcp-??????; do
+    if [[ -d "$d" ]]; then
+        PID_FILE="$d/frps.pid"
+        if [[ -f "$PID_FILE" ]]; then
+            pid=$(cat "$PID_FILE")
+            if kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
+                # Graceful shutdown: wait up to 10s
+                for i in $(seq 1 10); do
+                    kill -0 "$pid" 2>/dev/null || break
+                    sleep 1
+                done
+                # Force kill if still alive
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        fi
+        # Remove this temp directory
+        rm -rf "$d" 2>/dev/null || true
+    fi
+done
+# Also try legacy dir
+if [[ -d "/tmp/frp-xtcp-test" ]]; then
+    PID_FILE="/tmp/frp-xtcp-test/frps.pid"
+    if [[ -f "$PID_FILE" ]]; then
+        pid=$(cat "$PID_FILE")
         kill "$pid" 2>/dev/null || true
-        # Graceful shutdown: wait up to 10s
-        for i in $(seq 1 10); do
-            kill -0 "$pid" 2>/dev/null || break
-            sleep 1
-        done
-        # Force kill if still alive
+        sleep 1
         kill -9 "$pid" 2>/dev/null || true
     fi
+    rm -rf "/tmp/frp-xtcp-test" 2>/dev/null || true
 fi
 # Clean up any straggler frps processes
 pkill -f "frps -c frps.toml" 2>/dev/null || true
-# Remove remote directory
-rm -rf /tmp/frp-xtcp-test 2>/dev/null || true
+rm -f /tmp/.frp-xtcp-dir 2>/dev/null || true
 REMOTE_SCRIPT
     echo "stopped"
 }
@@ -233,14 +257,33 @@ cmd_status() {
 
     local running
     running=$(ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" "bash -s" 2>/dev/null <<'REMOTE_SCRIPT'
-PID_FILE="/tmp/frp-xtcp-test/frps.pid"
-if [[ -f "$PID_FILE" ]]; then
-    pid=$(cat "$PID_FILE")
+# Check all frp-xtcp temp dirs
+found=0
+for d in /tmp/frp-xtcp-??????; do
+    if [[ -d "$d" ]]; then
+        found=1
+        PID_FILE="$d/frps.pid"
+        if [[ -f "$PID_FILE" ]]; then
+            pid=$(cat "$PID_FILE")
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "running (pid=$pid, dir=$d)"
+                exit 0
+            else
+                echo "stopped (stale pid=$pid, dir=$d)"
+            fi
+        fi
+    fi
+done
+# Also check legacy dir
+if [[ -f "/tmp/frp-xtcp-test/frps.pid" ]]; then
+    pid=$(cat "/tmp/frp-xtcp-test/frps.pid")
     if kill -0 "$pid" 2>/dev/null; then
         echo "running (pid=$pid)"
-    else
-        echo "stopped (stale pid=$pid)"
+        exit 0
     fi
+fi
+if [[ $found -eq 1 ]]; then
+    echo "stopped (stale)"
 else
     if pgrep -f "frps -c frps.toml" > /dev/null 2>&1; then
         echo "running (no pid file)"
