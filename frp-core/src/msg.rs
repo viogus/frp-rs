@@ -232,6 +232,12 @@ pub struct StartWorkConn {
     pub dst_port: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Whether encryption is enabled for the data bridge (Go frp compat).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_encryption: Option<bool>,
+    /// Whether compression is enabled for the data bridge (Go frp compat).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_compression: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -564,6 +570,7 @@ impl FrpMessage {
             TYPE_START_WORK_CONN => Some(FrpMessage::StartWorkConn(StartWorkConn {
                 proxy_name: String::new(), src_addr: None, src_port: None,
                 dst_addr: None, dst_port: None, error: None,
+                use_encryption: None, use_compression: None,
             })),
             TYPE_PING          => Some(FrpMessage::Ping(Ping { privilege_key: None, timestamp: None })),
             TYPE_PONG          => Some(FrpMessage::Pong(Pong { error: None })),
@@ -774,6 +781,8 @@ mod tests {
             dst_addr: None,
             dst_port: None,
             error: None,
+            use_encryption: None,
+            use_compression: None,
         };
         roundtrip(&swc, r#"{"proxy_name":"p1","src_addr":"1.2.3.4","src_port":12345}"#);
     }

@@ -132,6 +132,8 @@ pub(crate) async fn assign_udp_work_conn(
         src_port: None,
         dst_port: None,
         error: None,
+        use_encryption: None,
+        use_compression: None,
     });
     if v2 {
         if let Err(e) = work_conn.write_v2_frame(&swc).await {
@@ -253,6 +255,8 @@ pub(crate) async fn assign_work_to_proxy(
         dst_addr: if !proxy_protocol_version.is_empty() && !dst_addr.is_empty() { Some(dst_addr) } else { None },
         dst_port: if !proxy_protocol_version.is_empty() && dst_port != 0 { Some(dst_port) } else { None },
         error: None,
+        use_encryption: if req.use_encryption { Some(true) } else { None },
+        use_compression: if req.use_compression { Some(true) } else { None },
     });
 
     let write_result = if v2 {
