@@ -105,142 +105,96 @@ impl Service {
         // Start plugins for proxies that have them configured.
         let mut plugin_handles = Vec::new();
         let mut plugin_addrs: HashMap<String, String> = HashMap::new();
+
+        // Register a successfully started plugin.
+        fn record_plugin(
+            plugin_type: &str,
+            proxy_name: &str,
+            result: Result<PluginHandle, frp_core::Error>,
+            addrs: &mut HashMap<String, String>,
+            handles: &mut Vec<PluginHandle>,
+        ) {
+            match result {
+                Ok(handle) => {
+                    let addr = handle.local_addr.to_string();
+                    info!("{plugin_type} plugin for '{proxy_name}' started on {addr}");
+                    addrs.insert(proxy_name.to_string(), addr);
+                    handles.push(handle);
+                }
+                Err(e) => {
+                    warn!("Failed to start {plugin_type} plugin for '{proxy_name}': {e}");
+                }
+            }
+        }
+
         for p in &cfg.proxies {
             if let Some(ref plugin_cfg) = p.plugin {
-                if plugin_cfg.plugin_type == "http_proxy" {
-                    match plugin::start_http_proxy(plugin_cfg).await {
-                        Ok(handle) => {
-                            let addr = handle.local_addr.to_string();
-                            info!("http_proxy plugin for '{}' started on {}", p.name, addr);
-                            plugin_addrs.insert(p.name.clone(), addr);
-                            plugin_handles.push(handle);
-                        }
-                        Err(e) => {
-                            warn!("Failed to start http_proxy plugin for '{}': {}", p.name, e);
-                        }
+                match plugin_cfg.plugin_type.as_str() {
+                    "http_proxy" => {
+                        record_plugin("http_proxy", &p.name,
+                            plugin::start_http_proxy(plugin_cfg).await,
+                            &mut plugin_addrs, &mut plugin_handles);
                     }
-                } else if plugin_cfg.plugin_type == "socks5" {
-                    match plugin::start_socks5_proxy(plugin_cfg).await {
-                        Ok(handle) => {
-                            let addr = handle.local_addr.to_string();
-                            info!("socks5 plugin for '{}' started on {}", p.name, addr);
-                            plugin_addrs.insert(p.name.clone(), addr);
-                            plugin_handles.push(handle);
-                        }
-                        Err(e) => {
-                            warn!("Failed to start socks5 plugin for '{}': {}", p.name, e);
-                        }
+                    "socks5" => {
+                        record_plugin("socks5", &p.name,
+                            plugin::start_socks5_proxy(plugin_cfg).await,
+                            &mut plugin_addrs, &mut plugin_handles);
                     }
-                } else if plugin_cfg.plugin_type == "static_file" {
-                    match plugin::start_static_file_proxy(plugin_cfg).await {
-                        Ok(handle) => {
-                            let addr = handle.local_addr.to_string();
-                            info!("static_file plugin for '{}' started on {}", p.name, addr);
-                            plugin_addrs.insert(p.name.clone(), addr);
-                            plugin_handles.push(handle);
-                        }
-                        Err(e) => {
-                            warn!("Failed to start static_file plugin for '{}': {}", p.name, e);
-                        }
+                    "static_file" => {
+                        record_plugin("static_file", &p.name,
+                            plugin::start_static_file_proxy(plugin_cfg).await,
+                            &mut plugin_addrs, &mut plugin_handles);
                     }
-                } else if plugin_cfg.plugin_type == "unix_domain_socket" {
-                    match plugin::start_unix_socket_plugin(plugin_cfg).await {
-                        Ok(handle) => {
-                            let addr = handle.local_addr.to_string();
-                            info!("unix_domain_socket plugin for '{}' started on {}", p.name, addr);
-                            plugin_addrs.insert(p.name.clone(), addr);
-                            plugin_handles.push(handle);
-                        }
-                        Err(e) => {
-                            warn!("Failed to start unix_domain_socket plugin for '{}': {}", p.name, e);
-                        }
+                    "unix_domain_socket" => {
+                        record_plugin("unix_domain_socket", &p.name,
+                            plugin::start_unix_socket_plugin(plugin_cfg).await,
+                            &mut plugin_addrs, &mut plugin_handles);
                     }
-                } else if plugin_cfg.plugin_type == "tls2raw" {
-                    match plugin::start_tls2raw_plugin(plugin_cfg).await {
-                        Ok(handle) => {
-                            let addr = handle.local_addr.to_string();
-                            info!("tls2raw plugin for '{}' started on {}", p.name, addr);
-                            plugin_addrs.insert(p.name.clone(), addr);
-                            plugin_handles.push(handle);
-                        }
-                        Err(e) => {
-                            warn!("Failed to start tls2raw plugin for '{}': {}", p.name, e);
-                        }
+                    "tls2raw" => {
+                        record_plugin("tls2raw", &p.name,
+                            plugin::start_tls2raw_plugin(plugin_cfg).await,
+                            &mut plugin_addrs, &mut plugin_handles);
                     }
-                } else if plugin_cfg.plugin_type == "http2http" {
-                    match plugin::start_http2http_plugin(plugin_cfg).await {
-                        Ok(handle) => {
-                            let addr = handle.local_addr.to_string();
-                            info!("http2http plugin for '{}' started on {}", p.name, addr);
-                            plugin_addrs.insert(p.name.clone(), addr);
-                            plugin_handles.push(handle);
-                        }
-                        Err(e) => {
-                            warn!("Failed to start http2http plugin for '{}': {}", p.name, e);
-                        }
+                    "http2http" => {
+                        record_plugin("http2http", &p.name,
+                            plugin::start_http2http_plugin(plugin_cfg).await,
+                            &mut plugin_addrs, &mut plugin_handles);
                     }
-                } else if plugin_cfg.plugin_type == "http2https" {
-                    match plugin::start_http2https_plugin(plugin_cfg).await {
-                        Ok(handle) => {
-                            let addr = handle.local_addr.to_string();
-                            info!("http2https plugin for '{}' started on {}", p.name, addr);
-                            plugin_addrs.insert(p.name.clone(), addr);
-                            plugin_handles.push(handle);
-                        }
-                        Err(e) => {
-                            warn!("Failed to start http2https plugin for '{}': {}", p.name, e);
-                        }
+                    "http2https" => {
+                        record_plugin("http2https", &p.name,
+                            plugin::start_http2https_plugin(plugin_cfg).await,
+                            &mut plugin_addrs, &mut plugin_handles);
                     }
-                } else if plugin_cfg.plugin_type == "https2http" {
-                    match plugin::start_https2http_plugin(plugin_cfg).await {
-                        Ok(handle) => {
-                            let addr = handle.local_addr.to_string();
-                            info!("https2http plugin for '{}' started on {}", p.name, addr);
-                            plugin_addrs.insert(p.name.clone(), addr);
-                            plugin_handles.push(handle);
-                        }
-                        Err(e) => {
-                            warn!("Failed to start https2http plugin for '{}': {}", p.name, e);
-                        }
+                    "https2http" => {
+                        record_plugin("https2http", &p.name,
+                            plugin::start_https2http_plugin(plugin_cfg).await,
+                            &mut plugin_addrs, &mut plugin_handles);
                     }
-                } else if plugin_cfg.plugin_type == "https2https" {
-                    match plugin::start_https2https_plugin(plugin_cfg).await {
-                        Ok(handle) => {
-                            let addr = handle.local_addr.to_string();
-                            info!("https2https plugin for '{}' started on {}", p.name, addr);
-                            plugin_addrs.insert(p.name.clone(), addr);
-                            plugin_handles.push(handle);
-                        }
-                        Err(e) => {
-                            warn!("Failed to start https2https plugin for '{}': {}", p.name, e);
-                        }
+                    "https2https" => {
+                        record_plugin("https2https", &p.name,
+                            plugin::start_https2https_plugin(plugin_cfg).await,
+                            &mut plugin_addrs, &mut plugin_handles);
                     }
-                } else if plugin_cfg.plugin_type == "visitor_plugin" {
-                    let plugin_ctx = PluginContext {
-                        server_addr: cfg.server_addr.clone(),
-                        server_port: cfg.server_port,
-                        transport_protocol: cfg.transport_protocol.clone(),
-                        tls_enable: cfg.tls_enable,
-                        tls_server_name: cfg.tls_server_name.clone(),
-                        tls_ca_file: if cfg.tls_ca_file.is_empty() { None } else { Some(cfg.tls_ca_file.clone()) },
-                        use_encryption: p.use_encryption,
-                        use_compression: p.use_compression,
-                        token: auth_cfg.token.clone(),
-                        oidc_client: oidc_client.clone(),
-                    };
-                    match plugin::start_visitor_plugin(plugin_cfg, plugin_ctx).await {
-                        Ok(handle) => {
-                            let addr = handle.local_addr.to_string();
-                            info!("visitor plugin for '{}' started on {}", p.name, addr);
-                            plugin_addrs.insert(p.name.clone(), addr);
-                            plugin_handles.push(handle);
-                        }
-                        Err(e) => {
-                            warn!("Failed to start visitor plugin for '{}': {}", p.name, e);
-                        }
+                    "visitor_plugin" => {
+                        let plugin_ctx = PluginContext {
+                            server_addr: cfg.server_addr.clone(),
+                            server_port: cfg.server_port,
+                            transport_protocol: cfg.transport_protocol.clone(),
+                            tls_enable: cfg.tls_enable,
+                            tls_server_name: cfg.tls_server_name.clone(),
+                            tls_ca_file: if cfg.tls_ca_file.is_empty() { None } else { Some(cfg.tls_ca_file.clone()) },
+                            use_encryption: p.use_encryption,
+                            use_compression: p.use_compression,
+                            token: auth_cfg.token.clone(),
+                            oidc_client: oidc_client.clone(),
+                        };
+                        record_plugin("visitor", &p.name,
+                            plugin::start_visitor_plugin(plugin_cfg, plugin_ctx).await,
+                            &mut plugin_addrs, &mut plugin_handles);
                     }
-                } else {
-                    warn!("Unknown plugin type '{}' for proxy '{}'", plugin_cfg.plugin_type, p.name);
+                    other => {
+                        warn!("Unknown plugin type '{other}' for proxy '{}'", p.name);
+                    }
                 }
             }
         }
