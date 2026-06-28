@@ -42,10 +42,16 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         if self.complete {
+            // SAFETY: get_unchecked_mut is sound here because:
+            // 1. We never move out of `self` — only access fields through `&mut`.
+            // 2. `R: Unpin` ensures `inner` can be safely unpinned before polling.
+            // 3. The returned reference does not escape this function.
             let this = unsafe { self.as_mut().get_unchecked_mut() };
             return Pin::new(&mut this.inner).poll_read(cx, buf);
         }
 
+        // SAFETY: Same justification as above — field access only, no moves,
+        // `R: Unpin` guarantees sound unpinning of `inner`.
         let this = unsafe { self.as_mut().get_unchecked_mut() };
 
         // Read from inner into our buffer
