@@ -1,0 +1,583 @@
+use std::sync::Arc;
+use std::collections::HashMap;
+use tokio::io::AsyncWriteExt;
+use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, Mutex, RwLock};
+use tracing::{info, warn, debug};
+
+use frp_core::auth::{AuthConfig, AuthMethod, OidcClient};
+use frp_core::encryption;
+use frp_core::msg::{self, FrpMessage};
+use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1, write_msg_v2};
+use frp_core::mux::YamuxSession;
+#[cfg(feature = "quic")]
+use frp_core::quic::QuicConnection;
+use frp_core::transport::{DialOptions, dial_server, IoStream};
+use frp_core::metrics::ProxyMetricsRegistry;
+
+use crate::proxy;
+use crate::admin::ProxyRuntimeInfo;
+
+/// Conditional type for the QUIC connection parameter.
+/// When the `quic` feature is disabled, the parameter is `()` (ZST, no-op).
+#[cfg(feature = "quic")]
+type QuicConnOpt = Option<Arc<QuicConnection>>;
+#[cfg(not(feature = "quic"))]
+type QuicConnOpt = ();
+
+/// Notification from a work connection that an XTCP NatHoleSid was received.
+/// Sent to the control message loop so it can do STUN and send NatHoleClient.
+#[derive(Debug)]
+pub(crate) struct XtcpNotification {
+    pub sid: String,
+    pub proxy_name: String,
+}
+
+/// Check if an auth scope is enabled, considering both client and server config.
+pub(crate) fn scope_requires_auth(client_scopes: &[String], server_scopes: &[String], scope: &str) -> bool {
+    client_scopes.iter().any(|s| s == scope) || server_scopes.iter().any(|s| s == scope)
+}
+
+/// Configuration for spawning a work connection.
+pub(crate) struct WorkConnConfig {
+    pub server_addr: String,
+    pub server_port: u16,
+    pub protocol: frp_core::transport::TransportProtocol,
+    pub run_id: String,
+    pub proxy_info_map: Arc<RwLock<HashMap<String, ProxyRuntimeInfo>>>,
+    pub enc_key: [u8; 16],
+    pub pool_id: i32,
+    pub auth_token: String,
+    pub tls_enable: bool,
+    pub tls_server_name: String,
+    pub tls_ca_file: Option<String>,
+    pub yamux: Option<Arc<YamuxSession>>,
+    pub quic_conn: QuicConnOpt,
+    pub v2: bool,
+    pub oidc_client: Option<Arc<OidcClient>>,
+    pub udp_sockets: Arc<Mutex<HashMap<String, Arc<UdpSocket>>>>,
+    pub udp_enc_cfg: Arc<Mutex<HashMap<String, (bool, bool)>>>,
+    pub proxy_metrics: Arc<ProxyMetricsRegistry>,
+    pub client_auth_scopes: Vec<String>,
+    pub server_auth_scopes: Vec<String>,
+    pub disable_custom_tls_first_byte: bool,
+    pub keepalive_secs: u64,
+    pub bind_addr: Option<String>,
+    pub proxy_url: String,
+    pub xtcp_tx: mpsc::UnboundedSender<XtcpNotification>,
+}
+
+/// Write HAProxy PROXY protocol v2 binary header to the stream.
+///
+/// Format: 12-byte signature + 4-byte header + address block (binary).
+async fn write_proxy_protocol_v2(
+    stream: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+    src_addr: &str,
+    dst_addr: &str,
+    src_port: u16,
+    dst_port: u16,
+) -> Result<(), String> {
+    // Parse source address
+    let src_ip: std::net::IpAddr = src_addr.parse().map_err(|e| format!("v2 src_addr parse: {e}"))?;
+    let dst_ip: std::net::IpAddr = dst_addr.parse().map_err(|e| format!("v2 dst_addr parse: {e}"))?;
+
+    // Determine transport and address families
+    let (transport_byte, addr_len) = match (&src_ip, &dst_ip) {
+        (std::net::IpAddr::V4(_), std::net::IpAddr::V4(_)) => (0x11u8, 12u16),
+        (std::net::IpAddr::V6(_), std::net::IpAddr::V6(_)) => (0x21u8, 36u16),
+        _ => return Err("v2 PROXY: mismatched address families (IPv4/IPv6)".into()),
+    };
+
+    let mut buf = Vec::with_capacity(16 + addr_len as usize);
+
+    // 12-byte v2 signature
+    buf.extend_from_slice(b"\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A");
+
+    // 1 byte: version (0x20) | command (0x01 = PROXY for locally-terminated connections)
+    buf.push(0x21);
+
+    // 1 byte: transport protocol (0x11 = TCPv4, 0x21 = TCPv6)
+    buf.push(transport_byte);
+
+    // 2 bytes: address length (big-endian)
+    buf.extend_from_slice(&addr_len.to_be_bytes());
+
+    // Address block: src_addr + dst_addr + src_port + dst_port (all binary)
+    match (&src_ip, &dst_ip) {
+        (std::net::IpAddr::V4(s4), std::net::IpAddr::V4(d4)) => {
+            buf.extend_from_slice(&s4.octets());
+            buf.extend_from_slice(&d4.octets());
+        }
+        (std::net::IpAddr::V6(s6), std::net::IpAddr::V6(d6)) => {
+            buf.extend_from_slice(&s6.octets());
+            buf.extend_from_slice(&d6.octets());
+        }
+        _ => unreachable!(),
+    }
+    buf.extend_from_slice(&src_port.to_be_bytes());
+    buf.extend_from_slice(&dst_port.to_be_bytes());
+
+    stream.write_all(&buf).await.map_err(|e| format!("v2 PROXY write: {e}"))?;
+    Ok(())
+}
+
+/// Spawn a single work connection task.
+///
+/// The task:
+/// 1. Under TcpMux: opens a yamux stream on the shared session
+///    Without TcpMux: dials the server via TCP/TLS/WS
+/// 2. Without TcpMux: sends NewWorkConn (with run_id + auth)
+/// 3. Reads StartWorkConn from the server
+/// 4. Connects to the local service
+/// 5. Bridges data bidirectionally
+///
+/// `pool_id` is for logging only (< 0 means on-demand).
+pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
+    tokio::spawn(async move {
+        let WorkConnConfig {
+            server_addr,
+            server_port,
+            protocol,
+            run_id,
+            proxy_info_map,
+            enc_key,
+            pool_id,
+            auth_token,
+            tls_enable,
+            tls_server_name,
+            tls_ca_file,
+            yamux,
+            quic_conn,
+            v2,
+            oidc_client,
+            udp_sockets,
+            udp_enc_cfg,
+            proxy_metrics,
+            client_auth_scopes: client_scopes,
+            server_auth_scopes: server_scopes,
+            disable_custom_tls_first_byte,
+            keepalive_secs,
+            bind_addr,
+            proxy_url,
+            xtcp_tx,
+        } = cfg;
+
+        // Clones for replenishment (before any field is consumed)
+        let repl_udp_sockets = udp_sockets.clone();
+        let repl_udp_enc_cfg = udp_enc_cfg.clone();
+        let repl_proxy_metrics = proxy_metrics.clone();
+        let repl_proxy_url = proxy_url.clone();
+        let repl_xtcp_tx = xtcp_tx.clone();
+
+        let label = if pool_id >= 0 {
+            format!("pool-{}", pool_id)
+        } else {
+            "on-demand".to_string()
+        };
+
+        // Acquire the underlying transport stream.
+        // Priority: QUIC multi-stream > TcpMux yamux > direct dial.
+        // Go frp compat: QUIC work connections open new streams on the
+        // existing QUIC connection (multi-stream-per-connection).
+        #[cfg(feature = "quic")]
+        let mut work = if let Some(ref quic) = quic_conn {
+            match quic.open_bi().await {
+                Ok(stream) => {
+                    debug!("Work conn {} opened QUIC stream", label);
+                    IoStream::Quic(stream)
+                }
+                Err(e) => {
+                    warn!("Work conn {}: QUIC open_bi failed: {}", label, e);
+                    return;
+                }
+            }
+        } else if let Some(ref yamux) = yamux {
+            match yamux.open_stream().await {
+                Some(stream) => {
+                    debug!("Work conn {} opened yamux stream", label);
+                    IoStream::Yamux(stream)
+                }
+                None => {
+                    warn!("Work conn {}: yamux open stream failed, session closed?", label);
+                    return;
+                }
+            }
+        } else {
+            debug!("Work conn {} dialing server", label);
+            let opts = DialOptions {
+                server_addr: server_addr.clone(),
+                server_port,
+                protocol: protocol.clone(),
+                tls_enable,
+                tls_server_name: tls_server_name.clone(),
+                tls_ca_file: tls_ca_file.clone(),
+                disable_custom_tls_first_byte,
+                keepalive_secs,
+                bind_addr: bind_addr.clone(),
+                proxy_url: if proxy_url.is_empty() { None } else { Some(proxy_url.clone()) },
+                ..Default::default()
+            };
+            match dial_server(&opts).await {
+                Ok(io) => io,
+                Err(e) => {
+                    debug!("Work conn {} dial failed: {}", label, e);
+                    return;
+                }
+            }
+        };
+
+        #[cfg(not(feature = "quic"))]
+        let mut work = if let Some(ref yamux) = yamux {
+            match yamux.open_stream().await {
+                Some(stream) => {
+                    debug!("Work conn {} opened yamux stream", label);
+                    IoStream::Yamux(stream)
+                }
+                None => {
+                    warn!("Work conn {}: yamux open stream failed, session closed?", label);
+                    return;
+                }
+            }
+        } else {
+            debug!("Work conn {} dialing server", label);
+            let opts = DialOptions {
+                server_addr: server_addr.clone(),
+                server_port,
+                protocol: protocol.clone(),
+                tls_enable,
+                tls_server_name: tls_server_name.clone(),
+                tls_ca_file: tls_ca_file.clone(),
+                disable_custom_tls_first_byte,
+                keepalive_secs,
+                bind_addr: bind_addr.clone(),
+                proxy_url: if proxy_url.is_empty() { None } else { Some(proxy_url.clone()) },
+                ..Default::default()
+            };
+            match dial_server(&opts).await {
+                Ok(io) => io,
+                Err(e) => {
+                    debug!("Work conn {} dial failed: {}", label, e);
+                    return;
+                }
+            }
+        };
+
+        // Send NewWorkConn — required for both yamux and raw transports.
+        // Go frps needs the run_id and auth to associate the stream.
+        {
+            let nwc_token = auth_token.clone();
+            let mut nwc_msg = msg::NewWorkConn {
+                run_id: Some(run_id.clone()),
+                timestamp: None,
+                privilege_key: None,
+            };
+            let requires_auth = scope_requires_auth(&client_scopes, &server_scopes, "NewWorkConns");
+            if requires_auth {
+                if let Some(ref oidc) = oidc_client {
+                    if let Err(e) = oidc.set_new_work_conn(&mut nwc_msg).await {
+                        warn!("Work conn {} OIDC NewWorkConn auth failed: {}", label, e);
+                        return;
+                    }
+                } else {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let auth_cfg = AuthConfig {
+                        method: AuthMethod::Token,
+                        token: nwc_token,
+                        oidc_issuer: String::new(),
+                        oidc_audience: String::new(),
+                        oidc_skip_expiry: false,
+                        oidc_skip_issuer: false,
+                        additional_data: None,
+                        oidc_proxy_url: String::new(),
+                        additional_auth_scopes: Vec::new(),
+                    };
+                    nwc_msg.privilege_key = auth_cfg.generate_login_key(timestamp);
+                    nwc_msg.timestamp = Some(timestamp);
+                }
+            }
+            // Write V2 magic before NewWorkConn on work connection streams.
+            // Both Go frp and Rust frp write V2 magic on yamux work conn
+            // streams, matching Go frp's messageConnector.Connect() which
+            // calls WriteMagicIfV2 before returning the stream.
+            if v2 {
+                if let Err(e) = frp_core::protocol::write_v2_magic(&mut work).await {
+                    warn!("Work conn {} failed to write V2 magic: {}", label, e);
+                    return;
+                }
+            }
+            let nwc = FrpMessage::NewWorkConn(nwc_msg);
+            let write_result = if v2 {
+                work.write_v2_frame(&nwc).await
+            } else {
+                work.write_v1_frame(&nwc).await
+            };
+            if let Err(e) = write_result {
+                warn!("Work conn {} failed to send NewWorkConn: {}", label, e);
+                return;
+            }
+            debug!("Work conn {} sent NewWorkConn, waiting for StartWorkConn", label);
+        }
+
+        // Read StartWorkConn
+        let swc_result = if v2 {
+            work.read_v2_frame().await
+        } else {
+            work.read_v1_frame().await
+        };
+        match swc_result {
+            Ok(FrpMessage::StartWorkConn(swc)) => {
+                let proxy_name = &swc.proxy_name;
+                debug!("Work conn {} assigned to proxy '{}'", label, proxy_name);
+
+                // Look up the proxy runtime info
+                let info = {
+                    let map = proxy_info_map.read().await;
+                    map.get(proxy_name).cloned()
+                };
+                let info = match info {
+                    Some(info) => info,
+                    None => {
+                        warn!("Work conn {}: unknown proxy '{}'", label, proxy_name);
+                        return;
+                    }
+                };
+
+                if info.proxy_type == "xtcp" {
+                    // XTCP proxy: read NatHoleSid from work conn, notify control loop.
+                    // The control loop handles STUN, NatHoleClient, and hole punch.
+                    let sid_result = if v2 {
+                        work.read_v2_frame().await
+                    } else {
+                        work.read_v1_frame().await
+                    };
+                    match sid_result {
+                        Ok(FrpMessage::NatHoleSid(sid_msg)) => {
+                            if let Some(sid) = sid_msg.sid {
+                                debug!("XTCP work conn {} received NatHoleSid for '{}'", label, proxy_name);
+                                let _ = xtcp_tx.send(XtcpNotification {
+                                    sid,
+                                    proxy_name: proxy_name.clone(),
+                                });
+                            } else {
+                                warn!("XTCP work conn {}: NatHoleSid without sid", label);
+                            }
+                        }
+                        Ok(other) => {
+                            warn!("XTCP work conn {}: expected NatHoleSid, got type 0x{:02x}", label, other.v1_type_byte());
+                        }
+                        Err(e) => {
+                            warn!("XTCP work conn {}: failed to read NatHoleSid: {}", label, e);
+                        }
+                    }
+                    return;
+                }
+
+                if info.proxy_type == "udp" {
+                    // UDP proxy: bridge work conn ↔ local UDP socket
+                    let sock = {
+                        let map = udp_sockets.lock().await;
+                        map.get(proxy_name).cloned()
+                    };
+                    let sock = match sock {
+                        Some(s) => s,
+                        None => {
+                            warn!("Work conn {}: no UDP socket for proxy '{}'", label, proxy_name);
+                            return;
+                        }
+                    };
+                    let enc_cfg = {
+                        let cfg = udp_enc_cfg.lock().await;
+                        cfg.get(proxy_name).copied().unwrap_or((false, false))
+                    };
+                    let (use_enc, use_comp) = enc_cfg;
+
+                    info!("Work conn {} bridging UDP for '{}' (enc={}, comp={})",
+                        label, proxy_name, use_enc, use_comp);
+
+                    let (mut w_r, mut w_w) = work.into_split();
+
+                    // Shared last_remote_addr: the server tells us the remote user's address
+                    // in each UDPPacket. We must echo it back so the server can route
+                    // the response to the correct remote user (not the local echo service).
+                    let last_remote: Arc<Mutex<Option<msg::UdpAddr>>> =
+                        Arc::new(Mutex::new(None));
+
+                    // Reader: work conn → local UDP socket
+                    // Decrypt/decompress before forwarding to local service
+                    let sock_r = sock.clone();
+                    let pn_r = proxy_name.clone();
+                    let enc_key_r = enc_key;
+                    let last_remote_r = last_remote.clone();
+                    tokio::spawn(async move {
+                        debug!("UDP reader '{}' started", pn_r);
+                        loop {
+                            let result = if v2 {
+                                read_msg_v2(&mut w_r).await
+                            } else {
+                                read_msg_v1(&mut w_r).await
+                            };
+                            match result {
+                                Ok(FrpMessage::UDPPacket(up)) => {
+                                    // Save the original remote address for the response
+                                    if let Some(ref ra) = up.remote_addr {
+                                        *last_remote_r.lock().await = Some(ra.clone());
+                                    }
+                                    let n = up.content.len();
+                                    let mut payload = up.content;
+                                    if use_enc {
+                                        if let Ok(d) = encryption::decrypt(&payload, &enc_key_r) {
+                                            payload = d;
+                                        }
+                                    }
+                                    if use_comp {
+                                        if let Ok(d) = encryption::decompress(&payload) {
+                                            payload = d;
+                                        }
+                                    }
+                                    debug!("UDP reader '{}': forwarding {} bytes to local", pn_r, n);
+                                    if let Err(e) = sock_r.send(&payload).await {
+                                        debug!("UDP '{}' send to local failed: {}", pn_r, e);
+                                        break;
+                                    }
+                                }
+                                Ok(FrpMessage::Ping(_)) | Ok(FrpMessage::Pong(_)) => continue,
+                                Ok(other) => {
+                                    debug!("UDP work conn '{}': unexpected msg 0x{:02x}", pn_r, other.v1_type_byte());
+                                }
+                                Err(e) => {
+                                    debug!("UDP work conn '{}' read closed: {}", pn_r, e);
+                                    break;
+                                }
+                            }
+                        }
+                    });
+
+                    // Writer: local UDP socket → work conn
+                    // Encrypt/compress before sending to server
+                    let pn_w = proxy_name.clone();
+                    let local_addr_str = info.local_addr.clone();
+                    let last_remote_w = last_remote.clone();
+                    tokio::spawn(async move {
+                        debug!("UDP writer '{}' started", pn_w);
+                        let mut buf = vec![0u8; 65535];
+                        loop {
+                            match sock.recv_from(&mut buf).await {
+                                Ok((n, src)) => {
+                                    debug!("UDP writer '{}': recv'd {} bytes from local {}", pn_w, n, src);
+                                    let mut payload = buf[..n].to_vec();
+                                    if use_comp {
+                                        if let Ok(c) = encryption::compress(&payload) { payload = c; }
+                                    }
+                                    if use_enc {
+                                        if let Ok(e) = encryption::encrypt(&payload, &enc_key) { payload = e; }
+                                    }
+                                    // Use saved remote_addr from server (the true remote user)
+                                    let remote = last_remote_w.lock().await.clone();
+                                    let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
+                                        content: payload,
+                                        local_addr: msg::UdpAddr::from_string(&local_addr_str),
+                                        remote_addr: remote,
+                                    });
+                                    let write_result = if v2 {
+                                        write_msg_v2(&mut w_w, &pkt).await
+                                    } else {
+                                        write_msg_v1(&mut w_w, &pkt).await
+                                    };
+                                    if let Err(e) = write_result {
+                                        debug!("UDP '{}' send to work conn failed: {}", pn_w, e);
+                                        break;
+                                    }
+                                    debug!("UDP writer '{}': sent {} bytes to work conn", pn_w, n);
+                                }
+                                Err(e) => {
+                                    debug!("UDP '{}' recv from local failed: {}", pn_w, e);
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    // TCP/HTTP/STCP: connect to local TCP service and bridge
+                    match proxy::connect_local(&info.local_addr).await {
+                        Ok(mut local) => {
+                            // Write PROXY protocol header if configured
+                            if !info.proxy_protocol_version.is_empty() {
+                                if let Some(ref src) = swc.src_addr {
+                                    if info.proxy_protocol_version == "v1" {
+                                        let header = format!(
+                                            "PROXY TCP4 {} {} {} {}\r\n",
+                                            src,
+                                            swc.dst_addr.as_deref().unwrap_or("0.0.0.0"),
+                                            swc.src_port.unwrap_or(0),
+                                            swc.dst_port.unwrap_or(0),
+                                        );
+                                        if let Err(e) = local.write_all(header.as_bytes()).await {
+                                            warn!("Failed to write PROXY v1 header: {}", e);
+                                        }
+                                    } else if info.proxy_protocol_version == "v2" {
+                                        if let Err(e) = write_proxy_protocol_v2(
+                                            &mut local, src,
+                                            swc.dst_addr.as_deref().unwrap_or("0.0.0.0"),
+                                            swc.src_port.unwrap_or(0) as u16,
+                                            swc.dst_port.unwrap_or(0) as u16,
+                                        ).await {
+                                            warn!("Failed to write PROXY v2 header: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                            let enc = if info.use_encryption { Some(&enc_key) } else { None };
+                            proxy::bridge_streams(local, work, proxy_name, info.use_encryption, info.use_compression, enc, info.bandwidth_limit, &info.bandwidth_limit_mode, proxy_metrics).await;
+                        }
+                        Err(e) => {
+                            warn!("Work conn {}: failed to connect to local {}: {}", label, info.local_addr, e);
+                        }
+                    }
+                }
+            }
+            Ok(other) => {
+                warn!("Work conn {}: unexpected message: {:?}", label, other.v1_type_byte());
+            }
+            Err(e) => {
+                debug!("Work conn {}: read error: {}", label, e);
+            }
+        }
+
+        debug!("Work conn {} completed", label);
+
+        // Replenish pool: spawn replacement to maintain pool_count
+        // (Go frp v0.69.1 compat — idle work conns refilled after use)
+        if pool_id >= 0 {
+            spawn_work_conn(WorkConnConfig {
+                server_addr: server_addr.clone(),
+                server_port,
+                protocol: protocol.clone(),
+                run_id: run_id.clone(),
+                proxy_info_map: proxy_info_map.clone(),
+                enc_key,
+                pool_id,
+                auth_token,
+                tls_enable,
+                tls_server_name,
+                tls_ca_file,
+                yamux,
+                quic_conn,
+                v2,
+                oidc_client,
+                udp_sockets: repl_udp_sockets,
+                udp_enc_cfg: repl_udp_enc_cfg,
+                proxy_metrics: repl_proxy_metrics,
+                client_auth_scopes: client_scopes,
+                server_auth_scopes: server_scopes,
+                disable_custom_tls_first_byte,
+                keepalive_secs,
+                bind_addr,
+                proxy_url: repl_proxy_url,
+                xtcp_tx: repl_xtcp_tx,
+            });
+        }
+    });
+}
