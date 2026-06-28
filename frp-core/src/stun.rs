@@ -61,7 +61,7 @@ fn build_binding_request(tx_id: &[u8; 12]) -> Vec<u8> {
     pkt
 }
 
-fn parse_binding_response(data: &[u8], expected_tx_id: &[u8; 12]) -> Result<String, String> {
+pub fn parse_binding_response(data: &[u8], expected_tx_id: &[u8; 12]) -> Result<String, String> {
     let msg_type = u16::from_be_bytes([data[0], data[1]]);
     if msg_type != 0x0101 {
         return Err(format!("unexpected STUN message type: 0x{msg_type:04x}"));
