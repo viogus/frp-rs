@@ -69,6 +69,4 @@ jobs:
         if: always()
         run: |
           echo "XTCP compat tests completed."
-          echo "VPS host: $XTCP_VPS_HOST"
-        env:
-          XTCP_VPS_HOST: ${{ secrets.XTCP_VPS_HOST }}
+          echo "VPS host configured: yes"

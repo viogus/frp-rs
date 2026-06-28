@@ -132,7 +132,7 @@ cmd_start() {
         die "invalid impl '$impl': must be 'rust' or 'go'"
     fi
     if [[ ! -f "$ssh_key" ]]; then
-        die "SSH key not found: $ssh_key"
+        die "SSH key not found (check XTCP_VPS_SSH_KEY)"
     fi
 
     # --- Find available port (dies if none in range) ---
@@ -193,7 +193,7 @@ cmd_stop() {
     local host="$1" ssh_key="$2"
 
     if [[ ! -f "$ssh_key" ]]; then
-        die "SSH key not found: $ssh_key"
+        die "SSH key not found (check XTCP_VPS_SSH_KEY)"
     fi
 
     # Run cleanup script on VPS. Suppress stderr (SSH warnings, kill output).
@@ -226,7 +226,7 @@ cmd_status() {
     local host="$1" ssh_key="$2"
 
     if [[ ! -f "$ssh_key" ]]; then
-        die "SSH key not found: $ssh_key"
+        die "SSH key not found (check XTCP_VPS_SSH_KEY)"
     fi
 
     local running

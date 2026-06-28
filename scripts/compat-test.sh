@@ -2106,6 +2106,11 @@ run_xtcp_test() {
     local server_host="127.0.0.1"
     if [[ -n "${XTCP_FRPS_REMOTE:-}" ]]; then
         server_host="$XTCP_FRPS_REMOTE"
+        # SECURITY: --debug traces all commands including secrets. Refuse.
+        if ${DEBUG:-false}; then
+            fail_test "$name" "DEBUG mode incompatible with --frps-remote (exposes secrets via set -x)"
+            return
+        fi
         # Start frps on remote VPS — capture actual port (handles port conflicts)
         local actual_port
         actual_port=$(bash "$SCRIPT_DIR/remote-frps.sh" start "$frps_impl" "$XTCP_FRPS_REMOTE" \
@@ -2114,7 +2119,7 @@ run_xtcp_test() {
             return
         }
         frps_port="$actual_port"
-        log "Remote frps started on $XTCP_FRPS_REMOTE:$frps_port"
+        log "Remote frps ready on port $frps_port"
     else
         # Start frps locally
         write_frps_config "$frps_impl" "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
