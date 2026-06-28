@@ -47,6 +47,8 @@ pub const V2_TYPE_NAT_HOLE_CLIENT: u16 = 15;
 pub const V2_TYPE_NAT_HOLE_RESP: u16 = 16;
 pub const V2_TYPE_NAT_HOLE_SID: u16 = 17;
 pub const V2_TYPE_NAT_HOLE_REPORT: u16 = 18;
+pub const V2_TYPE_CLOSE_PROXY_RESP: u16 = 19;
+pub const V2_TYPE_ERROR: u16 = 20;
 
 // ---------------------------------------------------------------
 // Base64 helpers for UDPPacket (Go frp encodes []byte as base64)
@@ -502,9 +504,8 @@ impl FrpMessage {
             FrpMessage::NatHoleResp(_)        => V2_TYPE_NAT_HOLE_RESP,
             FrpMessage::NatHoleSid(_)         => V2_TYPE_NAT_HOLE_SID,
             FrpMessage::NatHoleReport(_)      => V2_TYPE_NAT_HOLE_REPORT,
-            // V1-only types with no V2 equivalent
-            FrpMessage::CloseProxyResp(_) => 0,
-            FrpMessage::Error(_)          => 0,
+            FrpMessage::CloseProxyResp(_) => V2_TYPE_CLOSE_PROXY_RESP,
+            FrpMessage::Error(_)          => V2_TYPE_ERROR,
         }
     }
 

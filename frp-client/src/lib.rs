@@ -3,3 +3,7 @@ pub mod control;
 pub mod proxy;
 pub mod plugin;
 pub mod admin;
+pub mod health;
+pub mod visitor;
+pub mod work_conn;
+pub mod reload;

@@ -174,6 +174,16 @@ pub fn deserialize_v2(type_id: u16, json_bytes: &[u8]) -> Result<FrpMessage, cra
                 .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleReport (v2): {e}")))?;
             FrpMessage::NatHoleReport(v)
         }
+        msg::V2_TYPE_CLOSE_PROXY_RESP => {
+            let v: msg::CloseProxyResp = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize CloseProxyResp (v2): {e}")))?;
+            FrpMessage::CloseProxyResp(v)
+        }
+        msg::V2_TYPE_ERROR => {
+            let v: msg::Error = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize Error (v2): {e}")))?;
+            FrpMessage::Error(v)
+        }
         _ => return Err(crate::Error::Protocol(format!(
             "unknown V2 message type ID: {type_id}"
         ))),
