@@ -96,11 +96,14 @@ pub async fn bridge_encrypted(
     // Work → User: read from work (decrypted), decompress, write to user
     let work_to_user = async {
         let mut buf = vec![0u8; 65536];
+        #[cfg(feature = "compression")]
         let mut decompressor = if use_compression {
             Some(encryption::SnappyDecompressor::new())
         } else {
             None
         };
+        #[cfg(not(feature = "compression"))]
+        let mut decompressor: Option<encryption::SnappyDecompressor> = None;
         loop {
             let n = match enc_work_r.read(&mut buf).await {
                 Ok(0) => break,
@@ -112,10 +115,13 @@ pub async fn bridge_encrypted(
             let plaintext = if let Some(ref mut dec) = decompressor {
                 match dec.feed(decrypted) {
                     Ok(p) => p,
+                    #[cfg(feature = "compression")]
                     Err(e) => {
                         tracing::warn!("snappy decompress error in encrypted bridge: {}", e);
                         break;
                     }
+                    #[cfg(not(feature = "compression"))]
+                    Err(_) => break,
                 }
             } else {
                 decrypted.to_vec()
@@ -145,6 +151,7 @@ pub async fn bridge_encrypted(
                     }
                     let _ = user_w.flush().await;
                 }
+                #[cfg(feature = "compression")]
                 Err(e) => {
                     tracing::warn!("snappy flush error in encrypted bridge: {}", e);
                 }
@@ -207,11 +214,14 @@ pub async fn bridge_plain(
     };
     let work_to_user = async {
         let mut buf = vec![0u8; 65536];
+        #[cfg(feature = "compression")]
         let mut decompressor = if use_compression {
             Some(encryption::SnappyDecompressor::new())
         } else {
             None
         };
+        #[cfg(not(feature = "compression"))]
+        let mut decompressor: Option<encryption::SnappyDecompressor> = None;
         loop {
             let n = match work_r.read(&mut buf).await {
                 Ok(0) => break,
@@ -221,10 +231,13 @@ pub async fn bridge_plain(
             let plaintext = if let Some(ref mut dec) = decompressor {
                 match dec.feed(&buf[..n]) {
                     Ok(p) => p,
+                    #[cfg(feature = "compression")]
                     Err(e) => {
                         tracing::warn!("snappy decompress error in bridge: {}", e);
                         break;
                     }
+                    #[cfg(not(feature = "compression"))]
+                    Err(_) => break,
                 }
             } else {
                 buf[..n].to_vec()
@@ -247,6 +260,7 @@ pub async fn bridge_plain(
                     }
                     let _ = user_w.flush().await;
                 }
+                #[cfg(feature = "compression")]
                 Err(e) => {
                     tracing::warn!("snappy flush error in bridge: {}", e);
                 }

@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 use tokio::io::AsyncReadExt;
 
 use tokio::sync::{mpsc, oneshot};
+#[cfg(feature = "quic")]
 use tokio_util::sync::CancellationToken;
 
 use tracing::{info, error, warn, debug};
@@ -17,7 +18,10 @@ use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::mux;
 use frp_core::transport::{IoStream, ConnectionType, detect_and_strip_magic, PreReadStream};
-use frp_core::transport::{build_tls_acceptor, accept_websocket};
+#[cfg(feature = "tls")]
+use frp_core::transport::build_tls_acceptor;
+#[cfg(feature = "websocket")]
+use frp_core::transport::accept_websocket;
 use frp_core::format_socket_addr;
 use frp_core::metrics::ProxyMetricsRegistry;
 
@@ -202,6 +206,7 @@ impl Service {
     pub async fn new(cfg: ServerConfig, config_file: Option<String>) -> Result<Self, String> {
         let auth_cfg = AuthConfig {
             method: match cfg.auth.method.to_lowercase().as_str() {
+                #[cfg(feature = "oidc")]
                 "oidc" => AuthMethod::Oidc,
                 _ => AuthMethod::Token,
             },
@@ -215,6 +220,7 @@ impl Service {
             additional_auth_scopes: cfg.auth.additional_auth_scopes.clone(),
         };
 
+        #[cfg(feature = "oidc")]
         let oidc_verifier = if auth_cfg.method == AuthMethod::Oidc {
             match OidcVerifier::new(
                 auth_cfg.oidc_issuer.clone(),
@@ -237,6 +243,8 @@ impl Service {
         } else {
             None
         };
+        #[cfg(not(feature = "oidc"))]
+        let oidc_verifier: Option<std::sync::Arc<OidcVerifier>> = None;
 
         let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
         let allow_ports = if !cfg.allow_ports.is_empty() {
@@ -273,6 +281,7 @@ impl Service {
         );
 
         // Initialize prometheus registry when enabled
+        #[cfg(feature = "dashboard")]
         if cfg.web_server.port > 0 && cfg.web_server.enable_prometheus {
             crate::metrics::prom::register_all();
         }
@@ -293,6 +302,7 @@ impl Service {
         let bind_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.bind_port);
         info!("frps starting on {}", bind_addr);
 
+        #[cfg(feature = "tls")]
         let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = if self.cfg.tls_enable {
             let ca_file = if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.as_str()) };
             match build_tls_acceptor(&self.cfg.tls_cert_file, &self.cfg.tls_key_file, ca_file) {
@@ -308,11 +318,14 @@ impl Service {
         } else {
             None
         };
+        #[cfg(not(feature = "tls"))]
+        let _tls_acceptor: Option<()> = None;
 
         let listener = TcpListener::bind(&bind_addr).await?;
         info!("frps listener started on {}", bind_addr);
 
         // Optional WebSocket listener
+        #[cfg(feature = "websocket")]
         if self.cfg.websocket_port > 0 {
             let ws_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.websocket_port);
             let ws_addr2 = ws_addr.clone();
@@ -410,6 +423,7 @@ impl Service {
         }
 
         // Start SSH tunnel gateway if configured
+        #[cfg(feature = "ssh")]
         if self.cfg.ssh_tunnel_gateway.bind_port > 0 {
             let ssh_state = self.state.clone();
             let ssh_cfg = self.cfg.clone();
@@ -436,6 +450,7 @@ impl Service {
         }
 
         // Start KCP listener if configured
+        #[cfg(feature = "kcp")]
         if self.cfg.kcp_bind_port > 0 {
             let kcp_state = self.state.clone();
             let kcp_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.kcp_bind_port);
@@ -482,6 +497,7 @@ impl Service {
         }
 
         // Start QUIC listener if configured (requires TLS cert/key)
+        #[cfg(feature = "quic")]
         if self.cfg.quic_bind_port > 0 && self.cfg.tls_enable {
             let quic_state = self.state.clone();
             let quic_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.quic_bind_port);
@@ -599,6 +615,7 @@ impl Service {
         }
 
         // Start dashboard server if configured
+        #[cfg(feature = "dashboard")]
         if self.cfg.web_server.port > 0 {
             let dash_addr = format_socket_addr(&self.cfg.web_server.addr, self.cfg.web_server.port);
             let dash_addr2 = dash_addr.clone();
@@ -651,6 +668,7 @@ impl Service {
             match listener.accept().await {
                 Ok((stream, addr)) => {
                     let state = self.state.clone();
+                    #[cfg(feature = "tls")]
                     let acceptor = tls_acceptor.clone();
 
                     tokio::spawn(async move {
@@ -663,7 +681,8 @@ impl Service {
                         };
 
                         match ct {
-                            ConnectionType::Tls(first_byte) => {
+                            #[cfg(feature = "tls")]
+                        ConnectionType::Tls(first_byte) => {
                                 // Extract inner TcpStream and pre-read bytes.
                                 // detect_and_strip_magic consumed 7 bytes; replay them
                                 // (minus the Go frp 0x17 prefix) for TLS.
@@ -849,6 +868,12 @@ impl Service {
                                 }
                             }
 
+                            #[cfg(not(feature = "tls"))]
+                            ConnectionType::Tls(_) => {
+                                warn!("TLS connection from {} but TLS feature not enabled", addr);
+                            }
+
+                            #[cfg(feature = "websocket")]
                             ConnectionType::WebSocket => {
                                 if state.tls_only {
                                     warn!("TLS-only mode: rejected WebSocket from {}", addr);
@@ -1136,6 +1161,7 @@ impl Service {
         // Build new reloadable state
         let new_auth_cfg = AuthConfig {
             method: match new_cfg.auth.method.to_lowercase().as_str() {
+                #[cfg(feature = "oidc")]
                 "oidc" => AuthMethod::Oidc,
                 _ => AuthMethod::Token,
             },

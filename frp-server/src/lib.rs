@@ -2,9 +2,11 @@ pub mod service;
 pub mod control;
 pub mod proxy;
 pub mod vhost;
+#[cfg(feature = "dashboard")]
 pub mod dashboard;
 pub mod nathole;
 pub mod tcpmux;
 pub mod metrics;
 pub mod plugin;
+#[cfg(feature = "ssh")]
 pub mod ssh_gateway;

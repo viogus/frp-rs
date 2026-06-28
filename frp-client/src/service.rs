@@ -14,6 +14,7 @@ use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg, write_msg, read_msg_v1, write_msg_v1, read_msg_v2, write_msg_v2};
 use frp_core::mux::YamuxSession;
+#[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
 use frp_core::transport::{TransportProtocol, DialOptions, dial_server, IoStream};
 
@@ -98,11 +99,14 @@ pub struct Service {
 impl Service {
     pub async fn new(cfg: ClientConfig, config_file: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
         // Determine auth method from [auth] section if present, otherwise token
+        #[cfg(feature = "oidc")]
         let auth_method = if let Some(ref ac) = cfg.auth {
             if ac.method == "oidc" { AuthMethod::Oidc } else { AuthMethod::Token }
         } else {
             AuthMethod::Token
         };
+        #[cfg(not(feature = "oidc"))]
+        let auth_method = AuthMethod::Token;
 
         let auth_cfg = AuthConfig {
             method: auth_method.clone(),
@@ -119,6 +123,7 @@ impl Service {
         let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
 
         // Create OIDC client if auth method is OIDC
+        #[cfg(feature = "oidc")]
         let oidc_client = if auth_method == AuthMethod::Oidc {
             let ac = cfg.auth.as_ref().ok_or("OIDC auth requires [auth] section in config")?;
             let client = OidcClient::new(
@@ -138,6 +143,8 @@ impl Service {
         } else {
             None
         };
+        #[cfg(not(feature = "oidc"))]
+        let oidc_client: Option<Arc<OidcClient>> = None;
 
         // Start plugins for proxies that have them configured.
         let mut plugin_handles = Vec::new();
@@ -528,16 +535,24 @@ impl Service {
                 self.cfg.proxy_url.clone(),
             );
 
-            let (mut control_stream, run_id, yamux_session, quic_conn) = match ctl.login().await {
+            #[cfg(feature = "quic")]
+            let quic_conn: Option<QuicConnection>;
+
+            let (mut control_stream, run_id, yamux_session) = match ctl.login().await {
                 Ok(r) => {
                     did_login_once = true;
                     failed_count = 0;
                     *self.server_auth_scopes.write().await = ctl.server_auth_scopes.clone();
                     // After login, wrap control stream in AES-128-CFB encryption.
                     // Go frps v0.69.1 always encrypts the control connection for V1.
+                    #[cfg(feature = "quic")]
                     let (stream, run_id, yamux, quic) = r;
+                    #[cfg(not(feature = "quic"))]
+                    let (stream, run_id, yamux) = r;
                     let enc_key = encryption::derive_key(&self.auth_cfg.token);
-                    (stream.into_encrypted(enc_key), run_id, yamux, quic)
+                    #[cfg(feature = "quic")]
+                    { quic_conn = quic; }
+                    (stream.into_encrypted(enc_key), run_id, yamux)
                 }
                 Err(e) => {
                     failed_count += 1;
@@ -550,6 +565,7 @@ impl Service {
                 }
             };
             let yamux = yamux_session.map(std::sync::Arc::new);
+            #[cfg(feature = "quic")]
             let quic_conn = quic_conn.map(std::sync::Arc::new);
             let v2 = self.cfg.v2;
             info!("Logged in. run_id: {}", run_id);
@@ -632,6 +648,11 @@ impl Service {
                 .unwrap_or_default();
             let server_scopes = self.server_auth_scopes.read().await.clone();
             for i in 0..pool_count {
+                #[cfg(feature = "quic")]
+                let quic_arg = quic_conn.clone();
+                #[cfg(not(feature = "quic"))]
+                let quic_arg: QuicConnOpt = ();
+
                 spawn_work_conn(
                     &self.cfg.server_addr,
                     self.cfg.server_port,
@@ -645,7 +666,7 @@ impl Service {
                     self.cfg.tls_server_name.clone(),
                     if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
                     yamux.clone(),
-                    quic_conn.clone(),
+                    quic_arg,
                     v2,
                     self.oidc_client.clone(),
                     udp_sockets.clone(),
@@ -704,6 +725,10 @@ impl Service {
                         match msg {
                             Ok(FrpMessage::ReqWorkConn(_)) => {
                                 debug!("Received ReqWorkConn, creating work connection");
+                                #[cfg(feature = "quic")]
+                                let quic_arg = quic_conn.clone();
+                                #[cfg(not(feature = "quic"))]
+                                let quic_arg: QuicConnOpt = ();
                                 spawn_work_conn(
                                     &self.cfg.server_addr,
                                     self.cfg.server_port,
@@ -717,7 +742,7 @@ impl Service {
                                     self.cfg.tls_server_name.clone(),
                                     if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
                                     yamux.clone(),
-                                    quic_conn.clone(),
+                                    quic_arg,
                                     v2,
                                     self.oidc_client.clone(),
                                     udp_sockets.clone(),
@@ -1166,6 +1191,13 @@ impl Service {
 // Work connection management
 // ---------------------------------------------------------------
 
+/// Conditional type for the QUIC connection parameter.
+/// When the `quic` feature is disabled, the parameter is `()` (ZST, no-op).
+#[cfg(feature = "quic")]
+type QuicConnOpt = Option<Arc<QuicConnection>>;
+#[cfg(not(feature = "quic"))]
+type QuicConnOpt = ();
+
 /// Spawn a single work connection task.
 ///
 /// The task:
@@ -1246,7 +1278,7 @@ fn spawn_work_conn(
     tls_server_name: String,
     tls_ca_file: Option<String>,
     yamux: Option<std::sync::Arc<YamuxSession>>,
-    quic_conn: Option<Arc<QuicConnection>>,
+    quic_conn: QuicConnOpt,
     v2: bool,
     oidc_client: Option<Arc<OidcClient>>,
     udp_sockets: Arc<tokio::sync::Mutex<HashMap<String, Arc<UdpSocket>>>>,
@@ -1283,6 +1315,7 @@ fn spawn_work_conn(
         // Priority: QUIC multi-stream > TcpMux yamux > direct dial.
         // Go frp compat: QUIC work connections open new streams on the
         // existing QUIC connection (multi-stream-per-connection).
+        #[cfg(feature = "quic")]
         let mut work = if let Some(ref quic) = quic_conn {
             match quic.open_bi().await {
                 Ok(stream) => {
@@ -1295,6 +1328,42 @@ fn spawn_work_conn(
                 }
             }
         } else if let Some(ref yamux) = yamux {
+            match yamux.open_stream().await {
+                Some(stream) => {
+                    debug!("Work conn {} opened yamux stream", label);
+                    IoStream::Yamux(stream)
+                }
+                None => {
+                    warn!("Work conn {}: yamux open stream failed, session closed?", label);
+                    return;
+                }
+            }
+        } else {
+            debug!("Work conn {} dialing server", label);
+            let opts = DialOptions {
+                server_addr: server_addr.clone(),
+                server_port,
+                protocol: protocol.clone(),
+                tls_enable,
+                tls_server_name: tls_server_name.clone(),
+                tls_ca_file: tls_ca_file.clone(),
+                disable_custom_tls_first_byte,
+                keepalive_secs,
+                bind_addr: bind_addr.clone(),
+                proxy_url: if proxy_url.is_empty() { None } else { Some(proxy_url.clone()) },
+                ..Default::default()
+            };
+            match dial_server(&opts).await {
+                Ok(io) => io,
+                Err(e) => {
+                    debug!("Work conn {} dial failed: {}", label, e);
+                    return;
+                }
+            }
+        };
+
+        #[cfg(not(feature = "quic"))]
+        let mut work = if let Some(ref yamux) = yamux {
             match yamux.open_stream().await {
                 Some(stream) => {
                     debug!("Work conn {} opened yamux stream", label);

@@ -10,6 +10,7 @@ use serde::Serialize;
 use tokio::sync::{mpsc, RwLock, oneshot};
 
 use frp_core::metrics::ProxyMetricsRegistry;
+#[cfg(feature = "tls")]
 use frp_core::admin_auth::apply_admin_auth;
 
 // Re-export for service.rs
@@ -220,11 +221,13 @@ pub async fn run_admin_server(
                 .layer(DefaultBodyLimit::max(1024 * 1024))
         );
 
+    #[cfg(feature = "tls")]
     let app = apply_admin_auth(app, &auth_user, &auth_password);
     let app = app.with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
+    #[cfg(feature = "tls")]
     match (tls_cert_file, tls_key_file) {
         (Some(cert), Some(key)) if !cert.is_empty() && !key.is_empty() => {
             let acceptor = frp_core::transport::build_tls_acceptor(&cert, &key, None)?;
@@ -236,6 +239,12 @@ pub async fn run_admin_server(
             tracing::info!("frpc admin server listening on {}", addr);
             axum::serve(listener, app).await?;
         }
+    }
+    #[cfg(not(feature = "tls"))]
+    {
+        let _ = (&auth_user, &auth_password, &tls_cert_file, &tls_key_file);
+        tracing::info!("frpc admin server listening on {}", addr);
+        axum::serve(listener, app).await?;
     }
     Ok(())
 }

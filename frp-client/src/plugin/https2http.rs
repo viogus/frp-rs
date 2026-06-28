@@ -12,16 +12,23 @@
 //! - host_header_rewrite: optional Host header override
 
 
+#[cfg(feature = "tls")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "tls")]
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(feature = "tls")]
 use tracing::{debug, warn};
 
 use frp_core::config::PluginConfig;
+#[cfg(feature = "tls")]
 use frp_core::transport::build_tls_acceptor;
 
-use super::{PluginHandle, split_host_port};
+use super::PluginHandle;
+#[cfg(feature = "tls")]
+use super::split_host_port;
 
 /// Start an https2http plugin server.
+#[cfg(feature = "tls")]
 pub async fn start_https2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle, frp_core::Error> {
     let target_addr = if !cfg.local_addr.is_empty() {
         cfg.local_addr.clone()
@@ -95,6 +102,14 @@ pub async fn start_https2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
     })
 }
 
+#[cfg(not(feature = "tls"))]
+pub async fn start_https2http_plugin(_cfg: &PluginConfig) -> Result<PluginHandle, frp_core::Error> {
+    Err(frp_core::Error::Transport(
+        "https2http plugin: TLS support not compiled in".into(),
+    ))
+}
+
+#[cfg(feature = "tls")]
 async fn handle_conn(
     mut tls: tokio_rustls::server::TlsStream<TcpStream>,
     target: &str,
@@ -162,7 +177,7 @@ async fn handle_conn(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tls"))]
 mod tests {
     use super::*;
 

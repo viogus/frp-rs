@@ -49,21 +49,32 @@ jobs:
             | tar xJ -C /tmp
           echo "/tmp/zig-linux-x86_64-0.14.0" >> "$GITHUB_PATH"
 
-      - name: Build
+      - name: Build (full)
         run: cargo zigbuild --target ${{ matrix.target }} --release
+
+      - name: Build (tiny)
+        run: cargo zigbuild --target ${{ matrix.target }} --release --no-default-features --features tiny
+
+      - name: Build (micro)
+        run: cargo zigbuild --target ${{ matrix.target }} --release --no-default-features --features micro
 
       - name: Package
         run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/frps dist/
-          cp target/${{ matrix.target }}/release/frpc dist/
-          cd dist
-          tar czf frp-rs_${{ github.ref_name }}_${{ matrix.target }}.tar.gz frps frpc
+          mkdir -p dist dist/tiny dist/micro
+          cp target/${{ matrix.target }}/release/frps dist/frps
+          cp target/${{ matrix.target }}/release/frpc dist/frpc
+          tar czf frp-rs_${{ github.ref_name }}_${{ matrix.target }}.tar.gz -C dist frps frpc
+          cp target/${{ matrix.target }}/release/frps-tiny dist/tiny/frps
+          cp target/${{ matrix.target }}/release/frpc-tiny dist/tiny/frpc
+          tar czf frp-rs_${{ github.ref_name }}_${{ matrix.target }}-tiny.tar.gz -C dist/tiny frps frpc
+          cp target/${{ matrix.target }}/release/frps-micro dist/micro/frps
+          cp target/${{ matrix.target }}/release/frpc-micro dist/micro/frpc
+          tar czf frp-rs_${{ github.ref_name }}_${{ matrix.target }}-micro.tar.gz -C dist/micro frps frpc
 
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.target }}
-          path: dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}.tar.gz
+          path: dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}*.tar.gz
 
   # ── macOS: native builds ─────────────────────────────
   build-macos:
@@ -81,21 +92,32 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
-      - name: Build
+      - name: Build (full)
         run: cargo build --target ${{ matrix.target }} --release
+
+      - name: Build (tiny)
+        run: cargo build --target ${{ matrix.target }} --release --no-default-features --features tiny
+
+      - name: Build (micro)
+        run: cargo build --target ${{ matrix.target }} --release --no-default-features --features micro
 
       - name: Package
         run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/frps dist/
-          cp target/${{ matrix.target }}/release/frpc dist/
-          cd dist
-          tar czf frp-rs_${{ github.ref_name }}_${{ matrix.target }}.tar.gz frps frpc
+          mkdir -p dist dist/tiny dist/micro
+          cp target/${{ matrix.target }}/release/frps dist/frps
+          cp target/${{ matrix.target }}/release/frpc dist/frpc
+          tar czf frp-rs_${{ github.ref_name }}_${{ matrix.target }}.tar.gz -C dist frps frpc
+          cp target/${{ matrix.target }}/release/frps-tiny dist/tiny/frps
+          cp target/${{ matrix.target }}/release/frpc-tiny dist/tiny/frpc
+          tar czf frp-rs_${{ github.ref_name }}_${{ matrix.target }}-tiny.tar.gz -C dist/tiny frps frpc
+          cp target/${{ matrix.target }}/release/frps-micro dist/micro/frps
+          cp target/${{ matrix.target }}/release/frpc-micro dist/micro/frpc
+          tar czf frp-rs_${{ github.ref_name }}_${{ matrix.target }}-micro.tar.gz -C dist/micro frps frpc
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.target }}
-          path: dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}.tar.gz
+          path: dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}*.tar.gz
 
   # ── Windows: native builds ──────────────────────────
   build-windows:
@@ -113,21 +135,36 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
-      - name: Build
+      - name: Build (full)
         run: cargo build --target ${{ matrix.target }} --release
+
+      - name: Build (tiny)
+        run: cargo build --target ${{ matrix.target }} --release --no-default-features --features tiny
+
+      - name: Build (micro)
+        run: cargo build --target ${{ matrix.target }} --release --no-default-features --features micro
 
       - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path dist -Force
+          # Full
           Copy-Item target/${{ matrix.target }}/release/frps.exe dist/
           Copy-Item target/${{ matrix.target }}/release/frpc.exe dist/
           Compress-Archive -Path dist/frps.exe, dist/frpc.exe -DestinationPath dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}.zip
+          # Tiny
+          Copy-Item target/${{ matrix.target }}/release/frps-tiny.exe dist/frps.exe -Force
+          Copy-Item target/${{ matrix.target }}/release/frpc-tiny.exe dist/frpc.exe -Force
+          Compress-Archive -Path dist/frps.exe, dist/frpc.exe -DestinationPath dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}-tiny.zip
+          # Micro
+          Copy-Item target/${{ matrix.target }}/release/frps-micro.exe dist/frps.exe -Force
+          Copy-Item target/${{ matrix.target }}/release/frpc-micro.exe dist/frpc.exe -Force
+          Compress-Archive -Path dist/frps.exe, dist/frpc.exe -DestinationPath dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}-micro.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-${{ matrix.target }}
-          path: dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}.zip
+          path: dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}*.zip
 
   # ── collect & upload to release ──────────────────────
   publish:

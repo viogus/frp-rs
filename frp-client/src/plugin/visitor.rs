@@ -145,8 +145,11 @@ async fn handle_visitor_conn(
 ) -> Result<(), String> {
     // 1. Dial frps server
     let protocol = match transport_protocol {
+        #[cfg(feature = "kcp")]
         "kcp" => TransportProtocol::Kcp,
+        #[cfg(feature = "quic")]
         "quic" => TransportProtocol::Quic,
+        #[cfg(feature = "websocket")]
         "websocket" => TransportProtocol::WebSocket,
         _ => TransportProtocol::Tcp,
     };
