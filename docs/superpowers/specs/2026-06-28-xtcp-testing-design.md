@@ -107,16 +107,29 @@ GitHub Secrets required:
 
 3. **XTCP guard override:** When `--frps-remote` is set, automatically enable `RUN_XTCP=1`.
 
-### Test Matrix (6 tests)
+### Test Matrix (10 tests)
+
+**Baseline (same-implementation):** Verify each frp implementation's XTCP works against itself before cross-testing.
 
 | Test | frps | Provider | Visitor | Encryption | Coverage |
 |------|------|----------|---------|:----------:|----------|
-| `xtcp-g2r-basic` | Rust | Go | Go | — | Go→Rust happy path |
-| `xtcp-r2g-basic` | Go | Rust | Rust | — | Rust→Go happy path |
+| `xtcp-g2g-basic` | Go | Go | Go | — | Go baseline: Go→Go |
+| `xtcp-g2g-enc` | Go | Go | Go | ✅ enc+comp | Go baseline encrypted |
+| `xtcp-r2r-basic` | Rust | Rust | Rust | — | Rust baseline: Rust→Rust |
+| `xtcp-r2r-enc` | Rust | Rust | Rust | ✅ enc+comp | Rust baseline encrypted |
+
+**Cross-implementation:** Validate Go↔Rust interop for each direction.
+
+| Test | frps | Provider | Visitor | Encryption | Coverage |
+|------|------|----------|---------|:----------:|----------|
+| `xtcp-g2r-basic` | Rust | Go | Go | — | Go frpc against Rust frps |
+| `xtcp-r2g-basic` | Go | Rust | Rust | — | Rust frpc against Go frps |
 | `xtcp-g2r-enc` | Rust | Go | Go | ✅ enc+comp | Go→Rust encrypted bridge |
 | `xtcp-r2g-enc` | Go | Rust | Rust | ✅ enc+comp | Rust→Go encrypted bridge |
-| `xtcp-mixed-go-visitor` | Rust | Rust | Go | — | Go visitor ↔ Rust provider |
-| `xtcp-mixed-rust-visitor` | Go | Go | Rust | — | Rust visitor ↔ Go provider |
+| `xtcp-mixed-go-visitor` | Rust | Rust | Go | — | Go visitor + Rust provider |
+| `xtcp-mixed-rust-visitor` | Go | Go | Rust | — | Rust visitor + Go provider |
+
+**Testing order:** Baselines first (g2g → r2r). If baseline fails, all cross-tests for that frps are suspect. Cross-tests second.
 
 Each test:
 - Starts echo server on GitHub Actions runner
