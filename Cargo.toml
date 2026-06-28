@@ -37,6 +37,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "tls1
 rustls-pemfile = "2"
 futures-util = "0.3"
 webpki-roots = "0.26"
+ring = "0.17"
 jsonwebtoken = "9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "socks"] }
 axum = "0.8.9"
