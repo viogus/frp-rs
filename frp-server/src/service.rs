@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 use tokio::io::AsyncReadExt;
 
 use tokio::sync::{mpsc, oneshot};
+#[cfg(feature = "quic")]
 use tokio_util::sync::CancellationToken;
 
 use tracing::{info, error, warn, debug};
@@ -17,6 +18,7 @@ use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::mux;
 use frp_core::transport::{IoStream, ConnectionType, detect_and_strip_magic, PreReadStream};
+#[cfg(feature = "tls")]
 use frp_core::transport::build_tls_acceptor;
 #[cfg(feature = "websocket")]
 use frp_core::transport::accept_websocket;
@@ -300,6 +302,7 @@ impl Service {
         let bind_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.bind_port);
         info!("frps starting on {}", bind_addr);
 
+        #[cfg(feature = "tls")]
         let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = if self.cfg.tls_enable {
             let ca_file = if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.as_str()) };
             match build_tls_acceptor(&self.cfg.tls_cert_file, &self.cfg.tls_key_file, ca_file) {
@@ -315,6 +318,8 @@ impl Service {
         } else {
             None
         };
+        #[cfg(not(feature = "tls"))]
+        let _tls_acceptor: Option<()> = None;
 
         let listener = TcpListener::bind(&bind_addr).await?;
         info!("frps listener started on {}", bind_addr);
@@ -663,6 +668,7 @@ impl Service {
             match listener.accept().await {
                 Ok((stream, addr)) => {
                     let state = self.state.clone();
+                    #[cfg(feature = "tls")]
                     let acceptor = tls_acceptor.clone();
 
                     tokio::spawn(async move {
@@ -675,7 +681,8 @@ impl Service {
                         };
 
                         match ct {
-                            ConnectionType::Tls(first_byte) => {
+                            #[cfg(feature = "tls")]
+                        ConnectionType::Tls(first_byte) => {
                                 // Extract inner TcpStream and pre-read bytes.
                                 // detect_and_strip_magic consumed 7 bytes; replay them
                                 // (minus the Go frp 0x17 prefix) for TLS.
@@ -859,6 +866,11 @@ impl Service {
                                         }
                                     }
                                 }
+                            }
+
+                            #[cfg(not(feature = "tls"))]
+                            ConnectionType::Tls(_) => {
+                                warn!("TLS connection from {} but TLS feature not enabled", addr);
                             }
 
                             #[cfg(feature = "websocket")]

@@ -20,7 +20,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+#[cfg(feature = "chacha20")]
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
+#[cfg(feature = "chacha20")]
 use chacha20poly1305::aead::Aead;
 use rand::RngCore;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
@@ -38,6 +40,7 @@ const MAX_AES_GCM_FRAME_COUNT: u64 = 1u64 << 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AeadAlgorithm {
     Aes256Gcm,
+    #[cfg(feature = "chacha20")]
     XChaCha20Poly1305,
 }
 
@@ -46,6 +49,7 @@ impl std::str::FromStr for AeadAlgorithm {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "aes-256-gcm" => Ok(Self::Aes256Gcm),
+            #[cfg(feature = "chacha20")]
             "xchacha20-poly1305" => Ok(Self::XChaCha20Poly1305),
             _ => Err(()),
         }
@@ -56,6 +60,7 @@ impl AeadAlgorithm {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Aes256Gcm => "aes-256-gcm",
+            #[cfg(feature = "chacha20")]
             Self::XChaCha20Poly1305 => "xchacha20-poly1305",
         }
     }
@@ -63,6 +68,7 @@ impl AeadAlgorithm {
     fn nonce_size(&self) -> usize {
         match self {
             Self::Aes256Gcm => 12,   // AES-256-GCM standard nonce
+            #[cfg(feature = "chacha20")]
             Self::XChaCha20Poly1305 => 24, // XChaCha20-Poly1305 extended nonce
         }
     }
@@ -74,6 +80,7 @@ impl AeadAlgorithm {
     fn max_frame_count(&self) -> Option<u64> {
         match self {
             Self::Aes256Gcm => Some(MAX_AES_GCM_FRAME_COUNT),
+            #[cfg(feature = "chacha20")]
             Self::XChaCha20Poly1305 => None,
         }
     }
@@ -86,6 +93,7 @@ impl AeadAlgorithm {
 enum AeadCipher {
     /// ring-based AES-256-GCM (via LessSafeKey for non-96-bit nonce support).
     Aes256Gcm(Box<LessSafeKey>),
+    #[cfg(feature = "chacha20")]
     XChaCha20Poly1305(XChaCha20Poly1305),
 }
 
@@ -100,6 +108,7 @@ impl AeadCipher {
                     .map_err(|e| format!("aes-256-gcm init: {e}"))?;
                 Ok(Self::Aes256Gcm(Box::new(LessSafeKey::new(unbound))))
             }
+            #[cfg(feature = "chacha20")]
             AeadAlgorithm::XChaCha20Poly1305 => {
                 let cipher = XChaCha20Poly1305::new_from_slice(key)
                     .map_err(|e| format!("xchacha20-poly1305 init: {e}"))?;
@@ -120,6 +129,7 @@ impl AeadCipher {
                     .map_err(|e| format!("aes-gcm encrypt: {e}"))?;
                 Ok(in_out)
             }
+            #[cfg(feature = "chacha20")]
             Self::XChaCha20Poly1305(c) => {
                 let nonce = chacha20poly1305::XNonce::from_slice(nonce);
                 let payload = chacha20poly1305::aead::Payload { msg: plaintext, aad };
@@ -140,6 +150,7 @@ impl AeadCipher {
                     .map_err(|e| format!("aes-gcm decrypt: {e}"))?;
                 Ok(plaintext.to_vec())
             }
+            #[cfg(feature = "chacha20")]
             Self::XChaCha20Poly1305(c) => {
                 let nonce = chacha20poly1305::XNonce::from_slice(nonce);
                 let payload = chacha20poly1305::aead::Payload { msg: ciphertext, aad };
@@ -997,6 +1008,7 @@ mod tests {
     #[test]
     fn test_aead_algorithm_from_str() {
         assert_eq!(AeadAlgorithm::from_str("aes-256-gcm"), Ok(AeadAlgorithm::Aes256Gcm));
+        #[cfg(feature = "chacha20")]
         assert_eq!(AeadAlgorithm::from_str("xchacha20-poly1305"), Ok(AeadAlgorithm::XChaCha20Poly1305));
         assert_eq!(AeadAlgorithm::from_str("unknown"), Err(()));
     }
@@ -1030,6 +1042,7 @@ mod tests {
         test_aead_combined_roundtrip(AeadAlgorithm::Aes256Gcm).await;
     }
 
+    #[cfg(feature = "chacha20")]
     #[tokio::test]
     async fn test_aead_stream_combined_roundtrip_xchacha20() {
         test_aead_combined_roundtrip(AeadAlgorithm::XChaCha20Poly1305).await;

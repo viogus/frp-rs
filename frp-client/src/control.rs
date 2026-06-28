@@ -159,6 +159,7 @@ impl ControlConnection {
                             info!("Yamux session established");
                             (IoStream::Yamux(control_stream), Some(session), None)
                         }
+                        #[cfg(feature = "tls")]
                         IoStream::Tls(tls_stream) => {
                             let (control_stream, session) = mux::client_mux(tls_stream, &mux_cfg).await?;
                             info!("Yamux session established over TLS");
@@ -193,6 +194,7 @@ impl ControlConnection {
                         info!("Yamux session established");
                         (IoStream::Yamux(control_stream), Some(session))
                     }
+                    #[cfg(feature = "tls")]
                     IoStream::Tls(tls_stream) => {
                         let (control_stream, session) = mux::client_mux(tls_stream, &mux_cfg).await?;
                         info!("Yamux session established over TLS");

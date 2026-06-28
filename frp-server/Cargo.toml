@@ -15,22 +15,24 @@ thiserror.workspace = true
 uuid.workspace = true
 data-encoding.workspace = true
 tokio-tungstenite = { workspace = true, optional = true }
-tokio-rustls.workspace = true
+tokio-rustls = { workspace = true, optional = true }
 tokio-util.workspace = true
 axum = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 lazy_static = { workspace = true, optional = true }
-reqwest.workspace = true
+reqwest = { workspace = true, optional = true }
 rand = "0.10"
 
 [features]
-default = ["ssh", "dashboard", "websocket", "quic", "kcp", "oidc"]
+default = ["ssh", "dashboard", "websocket", "quic", "kcp", "oidc", "tls", "http-proxy"]
 ssh = ["dep:russh"]
 dashboard = ["dep:prometheus", "dep:axum", "dep:lazy_static"]
 websocket = ["dep:tokio-tungstenite", "frp-core/websocket"]
 quic = ["frp-core/quic"]
 kcp = ["frp-core/kcp"]
 oidc = ["frp-core/oidc"]
+tls = ["frp-core/tls", "dep:tokio-rustls"]
+http-proxy = ["dep:reqwest"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -8,7 +8,9 @@ use tokio_tungstenite::tungstenite::Message;
 use futures_util::stream::Stream;
 #[cfg(feature = "websocket")]
 use futures_util::sink::Sink;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
+#[cfg(feature = "tls")]
+use tokio::net::TcpListener;
 #[cfg(feature = "websocket")]
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 #[cfg(feature = "kcp")]
@@ -16,8 +18,11 @@ use crate::kcp::KcpStream;
 #[cfg(feature = "quic")]
 use crate::quic::QuicStream;
 
+#[cfg(feature = "tls")]
 use std::sync::Arc;
+#[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
+#[cfg(feature = "tls")]
 use tokio_rustls::TlsConnector;
 
 use crate::mux::YamuxStream;
@@ -580,6 +585,7 @@ pub enum IoStream {
     Tcp(TcpStream),
     /// Boxed TLS stream — type-erased to accept any TLS-wrapped transport
     /// (e.g. TlsStream<TcpStream> or TlsStream<PreReadStream<TcpStream>>).
+    #[cfg(feature = "tls")]
     Tls(Box<dyn AsyncReadWrite>),
     #[cfg(feature = "kcp")]
     Kcp(KcpStream),
@@ -611,6 +617,7 @@ impl std::fmt::Debug for IoStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             IoStream::Tcp(_) => f.debug_struct("IoStream::Tcp").finish_non_exhaustive(),
+            #[cfg(feature = "tls")]
             IoStream::Tls(_) => f.debug_struct("IoStream::Tls").finish_non_exhaustive(),
             #[cfg(feature = "kcp")]
             IoStream::Kcp(_) => f.debug_struct("IoStream::Kcp").finish_non_exhaustive(),
@@ -659,6 +666,7 @@ impl tokio::io::AsyncRead for IoStream {
         }
         match this {
             IoStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => Pin::new(s).poll_read(cx, buf),
@@ -683,6 +691,7 @@ impl tokio::io::AsyncWrite for IoStream {
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             IoStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => Pin::new(s).poll_write(cx, buf),
@@ -702,6 +711,7 @@ impl tokio::io::AsyncWrite for IoStream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             IoStream::Tcp(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => Pin::new(s).poll_flush(cx),
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => Pin::new(s).poll_flush(cx),
@@ -721,6 +731,7 @@ impl tokio::io::AsyncWrite for IoStream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             IoStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => Pin::new(s).poll_shutdown(cx),
@@ -743,6 +754,7 @@ impl IoStream {
     pub async fn write_v1_frame(&mut self, msg: &crate::msg::FrpMessage) -> Result<(), crate::Error> {
         match self {
             IoStream::Tcp(s) => crate::protocol::write_msg_v1(s, msg).await,
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => crate::protocol::write_msg_v1(s, msg).await,
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::write_msg_v1(s, msg).await,
@@ -763,6 +775,7 @@ impl IoStream {
     pub async fn read_v1_frame(&mut self) -> Result<crate::msg::FrpMessage, crate::Error> {
         match self {
             IoStream::Tcp(s) => crate::protocol::read_msg_v1(s).await,
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => crate::protocol::read_msg_v1(s).await,
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::read_msg_v1(s).await,
@@ -784,6 +797,7 @@ impl IoStream {
         use tokio::io::AsyncWriteExt;
         match self {
             IoStream::Tcp(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
@@ -805,6 +819,7 @@ impl IoStream {
     pub async fn read_v2_frame(&mut self) -> Result<crate::msg::FrpMessage, crate::Error> {
         match self {
             IoStream::Tcp(s) => crate::protocol::read_msg_v2(s).await,
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => crate::protocol::read_msg_v2(s).await,
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::read_msg_v2(s).await,
@@ -826,6 +841,7 @@ impl IoStream {
     pub async fn write_raw_v2_frame(&mut self, frame_type: u16, flags: u16, payload: &[u8]) -> Result<(), crate::Error> {
         match self {
             IoStream::Tcp(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
@@ -846,6 +862,7 @@ impl IoStream {
     pub async fn read_raw_v2_frame(&mut self) -> Result<(u16, u16, Vec<u8>), crate::Error> {
         match self {
             IoStream::Tcp(s) => crate::protocol::read_v2_frame_raw(s).await,
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => crate::protocol::read_v2_frame_raw(s).await,
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::read_v2_frame_raw(s).await,
@@ -868,8 +885,9 @@ impl IoStream {
             IoStream::Tcp(s) => s.peer_addr().ok(),
             IoStream::PreRead(_, s) => s.peer_addr().ok(),
             IoStream::BufferedRead(_, _, inner) => inner.peer_addr(),
-            IoStream::Tls(_)
-            | IoStream::Yamux(_)
+            #[cfg(feature = "tls")]
+            IoStream::Tls(_) => None,
+            IoStream::Yamux(_)
             | IoStream::Cipher(_)
             | IoStream::Aead(_)
             | IoStream::SshChannel(_) => None,
@@ -894,6 +912,7 @@ impl IoStream {
                 let (r, w) = tokio::io::split(s);
                 (Box::new(r), Box::new(w))
             }
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => {
                 let (r, w) = tokio::io::split(s);
                 (Box::new(r), Box::new(w))
@@ -1372,6 +1391,7 @@ fn parse_proxy_url(url: &str) -> Result<(&str, &str, u16), crate::Error> {
 
 /// Connect to the server with the given options.
 pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
+    #[cfg(any(feature = "tls", feature = "websocket"))]
     use tokio::io::AsyncWriteExt;
 
     // Resolve server_addr via custom DNS server if configured.
@@ -1447,26 +1467,35 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
     match opts.protocol {
         TransportProtocol::Tcp => {
             if opts.tls_enable {
-                if !opts.disable_custom_tls_first_byte {
-                    // Write FRPTLSHeadByte (0x17) before TLS handshake, matching Go frp v0.69.1
-                    stream.write_all(&[FRP_TLS_HEAD_BYTE]).await
-                        .map_err(|e| crate::Error::Transport(format!("write TLS head byte: {e}")))?;
+                #[cfg(not(feature = "tls"))]
+                {
+                    Err(crate::Error::Transport(
+                        "TLS support not compiled (enable the 'tls' feature)".into(),
+                    ))
                 }
-                let connector = build_tls_connector(
-                    opts.tls_ca_file.as_deref(),
-                    opts.tls_cert_file.as_deref(),
-                    opts.tls_key_file.as_deref(),
-                )?;
-                let server_name = if !opts.tls_server_name.is_empty() {
-                    opts.tls_server_name.clone()
-                } else {
-                    opts.server_addr.clone()
-                };
-                let server_name = rustls::pki_types::ServerName::try_from(server_name)
-                    .map_err(|e| crate::Error::Transport(format!("invalid server name: {e}")))?;
-                let tls = connector.connect(server_name, stream).await
-                    .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}")))?;
-                Ok(IoStream::Tls(Box::new(tokio_rustls::TlsStream::Client(tls))))
+                #[cfg(feature = "tls")]
+                {
+                    if !opts.disable_custom_tls_first_byte {
+                        // Write FRPTLSHeadByte (0x17) before TLS handshake, matching Go frp v0.69.1
+                        stream.write_all(&[FRP_TLS_HEAD_BYTE]).await
+                            .map_err(|e| crate::Error::Transport(format!("write TLS head byte: {e}")))?;
+                    }
+                    let connector = build_tls_connector(
+                        opts.tls_ca_file.as_deref(),
+                        opts.tls_cert_file.as_deref(),
+                        opts.tls_key_file.as_deref(),
+                    )?;
+                    let server_name = if !opts.tls_server_name.is_empty() {
+                        opts.tls_server_name.clone()
+                    } else {
+                        opts.server_addr.clone()
+                    };
+                    let server_name = rustls::pki_types::ServerName::try_from(server_name)
+                        .map_err(|e| crate::Error::Transport(format!("invalid server name: {e}")))?;
+                    let tls = connector.connect(server_name, stream).await
+                        .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}")))?;
+                    Ok(IoStream::Tls(Box::new(tokio_rustls::TlsStream::Client(tls))))
+                }
             } else {
                 Ok(IoStream::Tcp(stream))
             }
@@ -1483,25 +1512,34 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             if is_wss {
                 // WSS raw mode: TLS handshake + manual HTTP upgrade.
                 // Avoids tungstenite UTF-8 validation on TEXT frames from Go frps.
-                if !opts.disable_custom_tls_first_byte {
-                    stream.write_all(&[FRP_TLS_HEAD_BYTE]).await
-                        .map_err(|e| crate::Error::Transport(format!("write TLS head byte: {e}")))?;
+                #[cfg(not(feature = "tls"))]
+                {
+                    return Err(crate::Error::Transport(
+                        "TLS support not compiled (enable the 'tls' feature for WSS)".into(),
+                    ));
                 }
-                let connector = build_tls_connector(
-                    opts.tls_ca_file.as_deref(),
-                    opts.tls_cert_file.as_deref(),
-                    opts.tls_key_file.as_deref(),
-                )?;
-                let server_name = if !opts.tls_server_name.is_empty() {
-                    opts.tls_server_name.clone()
-                } else {
-                    opts.server_addr.clone()
-                };
-                let server_name = rustls::pki_types::ServerName::try_from(server_name)
-                    .map_err(|e| crate::Error::Transport(format!("invalid server name: {e}")))?;
-                let tls_stream = connector.connect(server_name, stream).await
-                    .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}")))?;
-                connect_ws_raw(tls_stream, &host, opts.server_port, FRP_WEBSOCKET_PATH, "https").await
+                #[cfg(feature = "tls")]
+                {
+                    if !opts.disable_custom_tls_first_byte {
+                        stream.write_all(&[FRP_TLS_HEAD_BYTE]).await
+                            .map_err(|e| crate::Error::Transport(format!("write TLS head byte: {e}")))?;
+                    }
+                    let connector = build_tls_connector(
+                        opts.tls_ca_file.as_deref(),
+                        opts.tls_cert_file.as_deref(),
+                        opts.tls_key_file.as_deref(),
+                    )?;
+                    let server_name = if !opts.tls_server_name.is_empty() {
+                        opts.tls_server_name.clone()
+                    } else {
+                        opts.server_addr.clone()
+                    };
+                    let server_name = rustls::pki_types::ServerName::try_from(server_name)
+                        .map_err(|e| crate::Error::Transport(format!("invalid server name: {e}")))?;
+                    let tls_stream = connector.connect(server_name, stream).await
+                        .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}")))?;
+                    connect_ws_raw(tls_stream, &host, opts.server_port, FRP_WEBSOCKET_PATH, "https").await
+                }
             } else {
                 // Plain WS: use raw mode to tolerate TEXT frames with
                 // non-UTF-8 payload from Go frps (golang.org/x/net/websocket).
@@ -1772,6 +1810,7 @@ where
 }
 
 /// TLS configuration.
+#[cfg(feature = "tls")]
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
     pub enable: bool,
@@ -1782,6 +1821,7 @@ pub struct TlsConfig {
 
 /// Create a TLS acceptor from PEM-encoded cert and key files.
 /// If ca_file is provided, client certificates will be verified against it (mTLS).
+#[cfg(feature = "tls")]
 pub fn build_tls_acceptor(
     cert_file: &str,
     key_file: &str,
@@ -1843,6 +1883,7 @@ pub fn build_tls_acceptor(
 /// Build a `RootCertStore` from an optional CA file path.
 /// If `ca_file` is Some and non-empty, loads CA certs from that file.
 /// If None or empty, uses the system's webpki roots.
+#[cfg(feature = "tls")]
 pub fn build_root_store(ca_file: Option<&str>) -> Result<rustls::RootCertStore, crate::Error> {
     let mut root_store = rustls::RootCertStore::empty();
 
@@ -1868,6 +1909,7 @@ pub fn build_root_store(ca_file: Option<&str>) -> Result<rustls::RootCertStore, 
 /// Create a TLS connector for client-side TLS.
 /// If ca_file is provided, use it as a custom root CA; otherwise use webpki roots.
 /// If cert_file/key_file are provided, present client certificate to server (mTLS).
+#[cfg(feature = "tls")]
 pub fn build_tls_connector(
     ca_file: Option<&str>,
     cert_file: Option<&str>,
@@ -1913,17 +1955,20 @@ pub fn build_tls_connector(
 
 /// TLS listener wrapper implementing axum's Listener trait.
 /// Used by dashboard and admin API servers to accept TLS connections.
+#[cfg(feature = "tls")]
 pub struct TlsListener {
     inner: TcpListener,
     acceptor: TlsAcceptor,
 }
 
+#[cfg(feature = "tls")]
 impl TlsListener {
     pub fn new(inner: TcpListener, acceptor: TlsAcceptor) -> Self {
         Self { inner, acceptor }
     }
 }
 
+#[cfg(feature = "tls")]
 impl axum::serve::Listener for TlsListener {
     type Io = tokio_rustls::server::TlsStream<TcpStream>;
     type Addr = std::net::SocketAddr;
@@ -2007,12 +2052,14 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "tls")]
     fn test_build_tls_connector_with_default_roots() {
         let result = build_tls_connector(None, None, None);
         assert!(result.is_ok(), "TLS connector with default roots should build");
     }
 
     #[test]
+    #[cfg(feature = "tls")]
     fn test_build_tls_acceptor_missing_cert() {
         let result = build_tls_acceptor(
             "/nonexistent/cert.pem",

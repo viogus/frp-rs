@@ -19,12 +19,13 @@ thiserror.workspace = true
 uuid.workspace = true
 axum.workspace = true
 toml.workspace = true
-rustls.workspace = true
-tokio-rustls.workspace = true
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
 rand.workspace = true
 
 [features]
-default = ["quic", "kcp", "websocket", "oidc"]
+default = ["tls", "quic", "kcp", "websocket", "oidc"]
+tls = ["frp-core/tls", "dep:rustls", "dep:tokio-rustls"]
 quic = ["frp-core/quic"]
 kcp = ["frp-core/kcp"]
 websocket = ["frp-core/websocket"]

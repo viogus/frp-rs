@@ -14,17 +14,39 @@ cargo run --bin frpc -- -c frpc.toml
 RUST_LOG=debug cargo run --bin frps -- -c frps.toml  # Enable debug logging
 ```
 
-### Tiny Binaries
+### Binary Variants
 
-Build without optional protocols (QUIC, KCP, WebSocket, SSH, OIDC, metrics):
+Three size tiers via feature flags:
 
 ```bash
-cargo build --release -p frps -p frpc --no-default-features
-# Output: target/release/frps-tiny (~2.8MB), frpc-tiny (~2.7MB)
+# Full (all features)
+cargo build --release -p frps -p frpc
+# → frps (~4.6MB), frpc (~3.4MB)
+
+# Tiny (no heavy protocols: QUIC/KCP/WS/SSH/OIDC/dashboard; keeps TLS)
+cargo build --release -p frps -p frpc --no-default-features --features tiny
+# → frps-tiny (~2.8MB), frpc-tiny (~2.6MB)
+
+# Micro (core only: no TLS, compression, chacha20, HTTP proxy)
+cargo build --release -p frps -p frpc --no-default-features --features micro
+# → frps-micro (~1.5MB), frpc-micro (~1.9MB)
 ```
 
-Optional protocols controlled by feature flags: `quic`, `kcp`, `websocket`, `oidc`, `ssh`, `dashboard`.
-All enabled by default. Full binary: `cargo build --release -p frps -p frpc`.
+Feature flags across crates:
+| Feature | Crate | Removes |
+|---------|-------|---------|
+| `quic` | frp-core | QUIC transport (quinn, ~1MB) |
+| `kcp` | frp-core | KCP transport (kcp) |
+| `websocket` | frp-core/server | WebSocket transport (tokio-tungstenite) |
+| `oidc` | frp-core | OIDC auth (jsonwebtoken, reqwest) |
+| `ssh` | frp-server | SSH gateway (russh) |
+| `dashboard` | frp-server | Metrics/status API (prometheus, axum, lazy_static) |
+| `tls` | frp-core/server/client | TLS encryption (rustls, webpki-roots, axum TlsListener) |
+| `compression` | frp-core | Snappy bridge compression (snap) |
+| `chacha20` | frp-core | XChaCha20-Poly1305 V2 cipher (AES-256-GCM stays) |
+| `http-proxy` | frp-server | HTTP proxy plugin (reqwest) |
+
+All features default ON. `quic` implies `tls`. `oidc` implies `reqwest`.
 
 - No `cargo check` variation needed — use `cargo build` for the full workspace.
 - Tests live inline (`#[cfg(test)] mod tests`), no separate test crates.

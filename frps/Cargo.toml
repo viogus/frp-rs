@@ -6,6 +6,10 @@ edition = "2021"
 [features]
 default = ["full"]
 full = ["frp-server/default"]
+# Tiny: removes heavy protocols (QUIC/KCP/WS/SSH/OIDC/dashboard) but keeps TLS + http-proxy
+tiny = ["frp-server/tls", "frp-server/http-proxy"]
+# Micro: absolutely minimal — just TCP + V1/V2 core, no optional deps
+micro = []
 # Enable debug/trace logging for development. Default: info only.
 debug-logs = []
 
@@ -28,3 +32,9 @@ required-features = ["full"]
 [[bin]]
 name = "frps-tiny"
 path = "src/main.rs"
+required-features = ["tiny"]
+
+[[bin]]
+name = "frps-micro"
+path = "src/main.rs"
+required-features = ["micro"]
