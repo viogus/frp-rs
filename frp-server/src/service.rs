@@ -1,21 +1,19 @@
 use std::sync::Arc;
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::io::AsyncReadExt;
 
-use tokio::sync::{mpsc, oneshot};
 #[cfg(feature = "quic")]
 use tokio_util::sync::CancellationToken;
 
 use tracing::{info, error, warn, debug};
 
 use frp_core::config::ServerConfig;
-use frp_core::auth::{AuthConfig, AuthMethod, OidcVerifier};
-use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::{read_msg_v1, write_msg_v1};
+use frp_core::auth::{AuthConfig, AuthMethod};
+#[cfg(feature = "oidc")]
+use frp_core::auth::OidcVerifier;
+use frp_core::msg::FrpMessage;
+use frp_core::protocol::read_msg_v1;
 use frp_core::mux;
 use frp_core::transport::{IoStream, ConnectionType, detect_and_strip_magic, PreReadStream};
 #[cfg(feature = "tls")]
@@ -23,172 +21,12 @@ use frp_core::transport::build_tls_acceptor;
 #[cfg(feature = "websocket")]
 use frp_core::transport::accept_websocket;
 use frp_core::format_socket_addr;
-use frp_core::metrics::ProxyMetricsRegistry;
 
-use crate::proxy::ProxyManager;
 use crate::control;
-use crate::nathole::controller::{self as nathole_ctrl, Controller};
-use crate::nathole::{classify, NAT_HOLE_TIMEOUT};
-use crate::vhost::VhostManager;
-use crate::tcpmux::TcpMuxManager;
 
-// ---------------------------------------------------------------
-// Shared state for cross-task communication
-// ---------------------------------------------------------------
-
-#[derive(Debug)]
-pub enum InternalMsg {
-    NewWorkConn(IoStream),
-    VisitorConn {
-        proxy_name: String,
-        visitor_conn: IoStream,
-    },
-    ProxyUserConn {
-        proxy_name: String,
-        user_conn: IoStream,
-        pre_read: Vec<u8>,
-    },
-    /// UDP proxy needs a work connection for data forwarding
-    /// (Go frp v0.69.1 uses work connections, not control connection).
-    UdpNeedsWorkConn {
-        proxy_name: String,
-    },
-    /// Sent when a new control connection claims the same run_id.
-    /// The old handler should stop listening and clean up.
-    Shutdown,
-    // NatHoleClient variant removed — dead code. Go frp compat uses
-    // NatHoleSidOnWorkConn path (server is pure relay, provider does STUN).
-    /// Send NatHoleSid to provider on a work connection (Go frp v0.69.1 XTCP compat).
-    /// The server writes NatHoleSid on a pooled work connection to notify
-    /// the provider that a new XTCP visitor has arrived. The provider then
-    /// does its own STUN discovery and sends NatHoleClient back on the
-    /// control connection with its mapped addresses.
-    NatHoleSidOnWorkConn {
-        sid: String,
-        proxy_name: String,
-    },
-    /// Forward NatHoleSid to visitor via control channel (Go frp compat).
-    WriteNatHoleSid {
-        sid: String,
-        provider_addr: Option<String>,
-    },
-    /// Forward NatHoleReport to visitor via control channel (Go frp compat).
-    WriteNatHoleReport {
-        sid: String,
-    },
-    /// Forward NatHoleResp to visitor via control channel (Go frp XTCP compat).
-    /// Carries provider's candidate/assisted addresses for NAT traversal.
-    WriteNatHoleResp {
-        transaction_id: String,
-        error: Option<String>,
-        sid: Option<String>,
-        protocol: Option<String>,
-        candidate_addrs: Option<Vec<String>>,
-        assisted_addrs: Option<Vec<String>>,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct ControlTx {
-    pub tx: mpsc::UnboundedSender<InternalMsg>,
-    pub client_addr: Option<SocketAddr>,
-    pub login_time: Instant,
-}
-
-/// Hot-reloadable server configuration subset, updated atomically on SIGUSR1.
-#[derive(Debug, Clone)]
-pub struct ReloadableState {
-    pub auth_cfg: Arc<AuthConfig>,
-    pub encryption_key: [u8; 16],
-    pub allow_ports: Vec<(u16, u16)>,
-    pub additional_auth_scopes: Vec<String>,
-}
-
-pub struct AppState {
-    pub proxy_manager: Arc<ProxyManager>,
-    /// Hot-reloadable config (auth, encryption, allow_ports).
-    /// Uses std::sync::RwLock — blocking read has no async overhead.
-    /// Writes only happen on SIGUSR1 reload (vanishingly rare).
-    pub reloadable: Arc<std::sync::RwLock<ReloadableState>>,
-    pub used_ports: Arc<RwLock<std::collections::HashSet<u16>>>,
-    pub run_id_to_ctl_tx: Arc<RwLock<HashMap<String, ControlTx>>>,
-    pub proxy_bind_addr: String,
-    pub vhost_manager: Arc<VhostManager>,
-    pub vhost_http_port: u16,
-    pub sk_index: Arc<RwLock<HashMap<String, String>>>,
-    pub dashboard_start: std::time::Instant,
-    pub sub_domain_host: String,
-    pub tcp_mux: bool,
-    pub tcp_mux_keepalive: i64,
-    pub heartbeat_timeout: i64,
-    pub udp_packet_size: usize,
-    pub tls_only: bool,
-    pub oidc_verifier: Option<Arc<OidcVerifier>>,
-    pub oidc_subjects: Arc<RwLock<HashMap<String, String>>>,
-    pub nat_hole: Arc<Controller>,
-    /// Shared UDP port for SUDP proxies. When > 0, all SUDP proxies
-    /// use this port instead of their individual remote_port.
-    pub sudp_port: u16,
-    pub vhost_http_timeout: u64,
-    pub user_conn_timeout: u64,
-    pub tcp_mux_passthrough: bool,
-    /// Custom 404 page body (HTML) from WebServerConfig.
-    pub custom_404_page: String,
-    /// Server-side HTTP plugin manager for lifecycle hooks.
-    pub plugin_manager: Arc<crate::plugin::HttpPluginManager>,
-    /// In-memory store for proxy configs submitted via dashboard Store API.
-    pub proxy_config_store: Arc<RwLock<HashMap<String, frp_core::config::ProxyConfig>>>,
-    /// TCPMux HTTP CONNECT route table (domain → proxy mapping).
-    pub tcpmux_manager: Arc<TcpMuxManager>,
-    /// Per-proxy traffic metrics for dashboard API.
-    pub proxy_metrics: Arc<ProxyMetricsRegistry>,
-    /// Per-client proxy count limit. 0 = unlimited.
-    pub max_ports_per_client: u64,
-    /// When false (default), internal error details are not sent to clients.
-    pub detailed_errors_to_client: bool,
-}
-
-impl AppState {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, heartbeat_timeout: i64, udp_packet_size: usize, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16, vhost_http_timeout: u64, user_conn_timeout: u64, tcp_mux_passthrough: bool, custom_404_page: String, plugin_manager: Arc<crate::plugin::HttpPluginManager>, max_ports_per_client: u64, nat_hole_analysis_data_reserve_hours: u64, detailed_errors_to_client: bool) -> Self {
-        Self {
-            proxy_manager: Arc::new(ProxyManager::new()),
-            reloadable: Arc::new(std::sync::RwLock::new(ReloadableState {
-                auth_cfg: Arc::new(auth_cfg.clone()),
-                encryption_key,
-                allow_ports,
-                additional_auth_scopes: auth_cfg.additional_auth_scopes.clone(),
-            })),
-            used_ports: Arc::new(RwLock::new(std::collections::HashSet::new())),
-            run_id_to_ctl_tx: Arc::new(RwLock::new(HashMap::new())),
-            proxy_bind_addr,
-            vhost_manager: Arc::new(VhostManager::new()),
-            vhost_http_port: 0, // set by Service::run() before starting listeners
-            dashboard_start: std::time::Instant::now(),
-            sk_index: Arc::new(RwLock::new(HashMap::new())),
-            sub_domain_host,
-            tcp_mux,
-            tcp_mux_keepalive,
-            heartbeat_timeout,
-            udp_packet_size,
-            tls_only,
-            oidc_verifier,
-            oidc_subjects: Arc::new(RwLock::new(HashMap::new())),
-            nat_hole: Arc::new(Controller::new(Duration::from_secs(nat_hole_analysis_data_reserve_hours.saturating_mul(3600)))),
-            tcpmux_manager: Arc::new(TcpMuxManager::new()),
-            proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
-            max_ports_per_client,
-            sudp_port,
-            vhost_http_timeout,
-            user_conn_timeout,
-            tcp_mux_passthrough,
-            custom_404_page,
-            plugin_manager,
-            proxy_config_store: Arc::new(RwLock::new(HashMap::new())),
-            detailed_errors_to_client,
-        }
-    }
-}
+// Re-export state types for backward compatibility.
+// All existing `use crate::service::*` imports continue to work.
+pub use crate::state::{InternalMsg, ControlTx, ReloadableState, AppState};
 
 // ---------------------------------------------------------------
 // Service
@@ -346,13 +184,13 @@ impl Service {
                                                 control::handle_control(ws, login, state.clone(), Some(addr), None, false, None).await;
                                             }
                                             Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                handle_work_conn_inner(ws, nwc, state.clone()).await;
+                                                crate::handlers::handle_work_conn_inner(ws, nwc, state.clone()).await;
                                             }
                                             Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                handle_visitor_conn_inner(ws, nvc, state.clone()).await;
+                                                crate::handlers::handle_visitor_conn_inner(ws, nvc, state.clone()).await;
                                             }
                                             Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                handle_nat_hole_visitor(ws, nhv, state.clone(), None).await;
+                                                crate::handlers::handle_nat_hole_visitor(ws, nhv, state.clone(), None).await;
                                             }
                                             Ok(other) => {
                                                 warn!("Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
@@ -475,7 +313,7 @@ impl Service {
                                         control::handle_control(ctl, login, state, None, None, false, None).await;
                                     }
                                     Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
-                                        handle_work_conn_inner(ctl, nwc, state).await;
+                                        crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
                                     }
                                     Ok(other) => {
                                         tracing::warn!("Unexpected KCP message: {:?}", other.v1_type_byte());
@@ -568,7 +406,7 @@ impl Service {
                                                                     let mut wc = frp_core::transport::IoStream::Quic(work_stream);
                                                                     match frp_core::protocol::read_msg_v1(&mut wc).await {
                                                                         Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
-                                                                            handle_work_conn_inner(wc, nwc, s).await;
+                                                                            crate::handlers::handle_work_conn_inner(wc, nwc, s).await;
                                                                         }
                                                                         Ok(other) => {
                                                                             tracing::warn!("Unexpected QUIC work stream msg: {:?}", other.v1_type_byte());
@@ -593,7 +431,7 @@ impl Service {
                                         cancel.cancel();
                                     }
                                     Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
-                                        handle_work_conn_inner(ctl, nwc, state).await;
+                                        crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
                                     }
                                     Ok(other) => {
                                         tracing::warn!("Unexpected QUIC message: {:?}", other.v1_type_byte());
@@ -809,7 +647,7 @@ impl Service {
                                                         return;
                                                     }
                                                 };
-                                                dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None, crypto_ctx).await;
+                                                crate::handlers::dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None, crypto_ctx).await;
                                             } else {
                                                 // Not V2. Replay consumed bytes for V1 processing.
                                                 let mut io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
@@ -818,13 +656,13 @@ impl Service {
                                                         control::handle_control(io, login, state, Some(addr), Some(incoming), false, None).await;
                                                     }
                                                     Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                        handle_work_conn_inner(io, nwc, state).await;
+                                                        crate::handlers::handle_work_conn_inner(io, nwc, state).await;
                                                     }
                                                     Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                        handle_visitor_conn_inner(io, nvc, state).await;
+                                                        crate::handlers::handle_visitor_conn_inner(io, nvc, state).await;
                                                     }
                                                     Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                        handle_nat_hole_visitor(io, nhv, state, None).await;
+                                                        crate::handlers::handle_nat_hole_visitor(io, nhv, state, None).await;
                                                     }
                                                     Ok(other) => {
                                                         warn!("Unexpected TLS+yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
@@ -847,16 +685,16 @@ impl Service {
                                         }
                                         Ok(FrpMessage::NewWorkConn(nwc)) => {
                                             let io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls)));
-                                            handle_work_conn_inner(io, nwc, state).await;
+                                            crate::handlers::handle_work_conn_inner(io, nwc, state).await;
                                         }
                                         Ok(FrpMessage::NewVisitorConn(nvc)) => {
                                             let io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls)));
-                                            handle_visitor_conn_inner(io, nvc, state).await;
+                                            crate::handlers::handle_visitor_conn_inner(io, nvc, state).await;
                                         }
                                         Ok(FrpMessage::NatHoleVisitor(nhv)) => {
                                             let io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls)));
                                             let visitor_addr = Some(addr.to_string());
-                                            handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
+                                            crate::handlers::handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
                                         }
                                         Ok(other) => {
                                             debug!("Unexpected TLS first message from {}: {:?}", addr, other.v1_type_byte());
@@ -889,13 +727,13 @@ impl Service {
                                                 control::handle_control(ws, login, state.clone(), Some(addr), None, false, None).await;
                                             }
                                             Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                handle_work_conn_inner(ws, nwc, state.clone()).await;
+                                                crate::handlers::handle_work_conn_inner(ws, nwc, state.clone()).await;
                                             }
                                             Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                handle_visitor_conn_inner(ws, nvc, state.clone()).await;
+                                                crate::handlers::handle_visitor_conn_inner(ws, nvc, state.clone()).await;
                                             }
                                             Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                handle_nat_hole_visitor(ws, nhv, state.clone(), None).await;
+                                                crate::handlers::handle_nat_hole_visitor(ws, nhv, state.clone(), None).await;
                                             }
                                             Ok(other) => {
                                                 warn!("Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
@@ -983,7 +821,7 @@ impl Service {
                                                 }
                                             };
 
-                                            dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None, crypto_ctx).await;
+                                            crate::handlers::dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None, crypto_ctx).await;
                                         }
                                         Err(e) => {
                                             warn!("Failed to start yamux over V2 for {:?}: {}", addr, e);
@@ -1017,7 +855,7 @@ impl Service {
                                         }
                                     };
 
-                                    dispatch_v2_message(io, msg_payload, state, addr, None, Some(addr.to_string()), crypto_ctx).await;
+                                    crate::handlers::dispatch_v2_message(io, msg_payload, state, addr, None, Some(addr.to_string()), crypto_ctx).await;
                                 }
                             }
 
@@ -1083,7 +921,7 @@ impl Service {
                                                         return;
                                                     }
                                                 };
-                                                dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None, crypto_ctx).await;
+                                                crate::handlers::dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None, crypto_ctx).await;
                                             } else {
                                                 // Not V2. Replay consumed bytes and process as V1.
                                                 let mut io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
@@ -1092,13 +930,13 @@ impl Service {
                                                         control::handle_control(io, login, state, Some(addr), Some(incoming), false, None).await;
                                                     }
                                                     Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                        handle_work_conn_inner(io, nwc, state).await;
+                                                        crate::handlers::handle_work_conn_inner(io, nwc, state).await;
                                                     }
                                                     Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                        handle_visitor_conn_inner(io, nvc, state).await;
+                                                        crate::handlers::handle_visitor_conn_inner(io, nvc, state).await;
                                                     }
                                                     Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                        handle_nat_hole_visitor(io, nhv, state, None).await;
+                                                        crate::handlers::handle_nat_hole_visitor(io, nhv, state, None).await;
                                                     }
                                                     Ok(other) => {
                                                         warn!("Unexpected yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
@@ -1122,14 +960,14 @@ impl Service {
                                             control::handle_control(stream_io, login, state, Some(addr), None, false, None).await;
                                         }
                                         Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                            handle_work_conn_inner(stream_io, nwc, state).await;
+                                            crate::handlers::handle_work_conn_inner(stream_io, nwc, state).await;
                                         }
                                         Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                            handle_visitor_conn_inner(stream_io, nvc, state).await;
+                                            crate::handlers::handle_visitor_conn_inner(stream_io, nvc, state).await;
                                         }
                                         Ok(FrpMessage::NatHoleVisitor(nhv)) => {
                                             let visitor_addr = Some(addr.to_string());
-                                            handle_nat_hole_visitor(stream_io, nhv, state, visitor_addr).await;
+                                            crate::handlers::handle_nat_hole_visitor(stream_io, nhv, state, visitor_addr).await;
                                         }
                                         Ok(other) => {
                                             warn!("Unexpected first message from {}: {:?}", addr, other.v1_type_byte());
@@ -1252,549 +1090,3 @@ impl Service {
 
 }
 
-/// Handle an incoming STCP visitor connection. Looks up the proxy and
-/// routes the IoStream to the provider's control handler.
-///
-/// Supports two auth modes:
-/// 1. Go-compatible: sign_key = MD5(proxy.sk + timestamp), lookup by proxy_name
-///    then validate the hash against the registered sk.
-/// 2. Legacy Rust: sign_key = raw sk value, looked up directly in sk_index.
-async fn handle_visitor_conn_inner(
-    mut stream: IoStream,
-    msg: msg::NewVisitorConn,
-    state: Arc<AppState>,
-) {
-    let sign_key = msg.sign_key.unwrap_or_default();
-    let timestamp = msg.timestamp.unwrap_or(0);
-
-    if sign_key.is_empty() {
-        warn!("NewVisitorConn without sign_key, ignoring");
-        return;
-    }
-
-    // --- Mode 1: Go-compatible — lookup by proxy_name, validate MD5(sk + timestamp) ---
-    let proxy_name = if let Some(proxy_info) = state.proxy_manager.get(&msg.proxy_name).await {
-        if let Some(ref sk) = proxy_info.sk {
-            if !sk.is_empty() {
-                let expected = frp_core::auth::generate_token(sk, timestamp);
-                if expected == sign_key {
-                    debug!("STCP visitor auth OK (Go-compat MD5) for proxy '{}'", msg.proxy_name);
-                    Some(msg.proxy_name.clone())
-                } else {
-                    warn!("STCP visitor MD5 auth mismatch for proxy '{}'", msg.proxy_name);
-                    None
-                }
-            } else {
-                // Proxy has no sk — no auth required (allow)
-                debug!("STCP visitor: proxy '{}' has no sk, allowing", msg.proxy_name);
-                Some(msg.proxy_name.clone())
-            }
-        } else {
-            // Proxy has no sk — no auth required (allow)
-            debug!("STCP visitor: proxy '{}' has no sk, allowing", msg.proxy_name);
-            Some(msg.proxy_name.clone())
-        }
-    } else {
-        None
-    };
-
-    // --- Mode 2: Legacy Rust — raw sk_index lookup (backward compat) ---
-    let proxy_name = match proxy_name {
-        Some(pn) => pn,
-        None => {
-            // Fall back to raw sk lookup for old Rust clients that send raw sk as sign_key
-            let pn = state.sk_index.read().await.get(&sign_key).cloned();
-            match pn {
-                Some(pn) => {
-                    debug!("STCP visitor auth OK (raw sk_index lookup) for proxy '{}'", pn);
-                    pn
-                }
-                None => {
-                    warn!("NewVisitorConn: no STCP proxy found for proxy_name='{}', sign_key='{}...'",
-                        msg.proxy_name, &sign_key[..sign_key.len().min(8)]);
-                    // Send error response to visitor (Go frp expects NewVisitorConnResp)
-                    let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
-                        proxy_name: msg.proxy_name.clone(),
-                        error: Some("proxy not found".into()),
-                    });
-                    let _ = write_msg_v1(&mut stream, &resp).await;
-                    return;
-                }
-            }
-        }
-    };
-
-    // Look up the provider's run_id from proxy_manager
-    let run_id = state.proxy_manager.get_run_id(&proxy_name).await;
-    let run_id = match run_id {
-        Some(id) => id,
-        None => {
-            warn!("NewVisitorConn: no run_id found for proxy '{}'", proxy_name);
-     // Send error response to visitor
-     let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
-         proxy_name: proxy_name.clone(),
-         error: Some("provider not found".into()),
-     });
-     let _ = write_msg_v1(&mut stream, &resp).await;
-     return;
-        }
-    };
-
-    // --- allow_users check (Go frp compat: XTCP/STCP access control) ---
-    if let Some(proxy_info) = state.proxy_manager.get(&proxy_name).await {
-        if !proxy_info.allow_users.is_empty() {
-            let visitor_run_id = msg.run_id.as_deref().unwrap_or("");
-            if !proxy_info.allow_users.iter().any(|u| u == visitor_run_id) {
-                warn!("STCP visitor '{}' not in allow_users for proxy '{}'", visitor_run_id, proxy_name);
-                let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
-                    proxy_name: proxy_name.clone(),
-                    error: Some("visitor not allowed".into()),
-                });
-                let _ = write_msg_v1(&mut stream, &resp).await;
-                return;
-            }
-        }
-    }
-
-    let ctl_tx = {
-        let map = state.run_id_to_ctl_tx.read().await;
-        map.get(&run_id).cloned()
-    };
-
-    match ctl_tx {
-        Some(ctl) => {
-            info!("STCP visitor for proxy '{}' routed to provider {}", proxy_name, run_id);
-       // Send success response to visitor BEFORE forwarding the stream
-       // (Go frp visitor expects NewVisitorConnResp on the same connection)
-       let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
-           proxy_name: proxy_name.clone(),
-           error: None,
-       });
-       if let Err(e) = write_msg_v1(&mut stream, &resp).await {
-           warn!("Failed to send NewVisitorConnResp for proxy '{}': {}", proxy_name, e);
-           return;
-       }
-            if ctl.tx.send(InternalMsg::VisitorConn {
-                proxy_name,
-                visitor_conn: stream,
-            }).is_err() {
-                warn!("Provider for run_id {} has gone away", run_id);
-            }
-        }
-        None => {
-            warn!("No provider found for run_id {}", run_id);
-       // Send error response to visitor
-       let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
-           proxy_name: proxy_name.clone(),
-           error: Some("provider disconnected".into()),
-       });
-       let _ = write_msg_v1(&mut stream, &resp).await;
-        }
-    }
-}
-
-/// Handle an incoming XTCP NatHoleVisitor connection.
-///
-/// Uses transaction_id and proxy_name from the message directly.
-/// Validates proxy exists, looks up the provider, creates a NAT session,
-/// forwards NatHoleClient to the provider via InternalMsg,
-/// writes NatHoleResp (OK or error) to the visitor via the accept-loop writer,
-/// and waits for the provider's report signal.
-async fn handle_nat_hole_visitor(
-    stream: IoStream,
-    msg: msg::NatHoleVisitor,
-    state: Arc<AppState>,
-    _visitor_addr: Option<String>, // not used in Go compat path; kept for callers
-) {
-    let transaction_id = msg.transaction_id.clone();
-    let proxy_name = msg.proxy_name.clone();
-
-    if proxy_name.is_empty() {
-        warn!("NatHoleVisitor without proxy_name, ignoring");
-        return;
-    }
-
-    // Validate proxy exists
-    if state.proxy_manager.get(&proxy_name).await.is_none() {
-        warn!("NatHoleVisitor: proxy '{}' not found", proxy_name);
-        let mut writer = stream.into_split().1;
-        let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-            transaction_id: transaction_id.clone(),
-            error: Some("proxy not found".into()),
-            ..Default::default()
-        });
-        let _ = write_msg_v1(&mut writer, &resp).await;
-        return;
-    }
-
-    // Look up the provider's run_id from proxy_manager
-    let run_id = state.proxy_manager.get_run_id(&proxy_name).await;
-    let run_id = match run_id {
-        Some(id) => id,
-        None => {
-            warn!("NatHoleVisitor: no run_id found for proxy '{}'", proxy_name);
-            let mut writer = stream.into_split().1;
-            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-                transaction_id: transaction_id.clone(),
-                error: Some("provider offline".into()),
-                ..Default::default()
-            });
-            let _ = write_msg_v1(&mut writer, &resp).await;
-            return;
-        }
-    };
-
-    let ctl_tx = {
-        let map = state.run_id_to_ctl_tx.read().await;
-        map.get(&run_id).cloned()
-    };
-
-    let ctl_tx = match ctl_tx {
-        Some(ctl) => ctl,
-        None => {
-            warn!("No provider control handler for run_id {}", run_id);
-            let mut writer = stream.into_split().1;
-            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-                transaction_id: transaction_id.clone(),
-                error: Some("provider disconnected".into()),
-                ..Default::default()
-            });
-            let _ = write_msg_v1(&mut writer, &resp).await;
-            return;
-        }
-    };
-
-    // --- Go frp v0.69.1 compat: pre_check validates proxy and permissions
-    // without creating a session. Visitor proceeds to STUN after receiving OK.
-    // Check mapped_addrs.is_none() to distinguish from clients that send
-    // pre_check=true with full data (treating it as a full request).
-    if msg.pre_check && msg.mapped_addrs.is_none() {
-        debug!(
-            "NatHoleVisitor pre_check for proxy '{}': OK",
-            proxy_name
-        );
-        let (_, mut writer) = stream.into_split();
-        let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-            transaction_id: transaction_id.clone(),
-            error: None,
-            ..Default::default()
-        });
-        let _ = write_msg_v1(&mut writer, &resp).await;
-        return;
-    }
-
-    let (reader, writer) = stream.into_split();
-    let sid = transaction_id.clone();
-
-    // --- Step 1: Create session and notify provider ---
-    let (session, report_rx) = match state
-        .nat_hole
-        .create_session_with_writer(
-            sid.clone(),
-            proxy_name.clone(),
-            msg.clone(),
-            writer,
-        )
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("NatHole session creation failed: {}", e);
-            return;
-        }
-    };
-
-    // --- Step 2: Set up notify channel BEFORE sending to provider ---
-    // Must happen before the provider notification to avoid a race:
-    // if the provider responds with NatHoleClient before we set up
-    // notify_rx, the signal is lost and we timeout spuriously.
-    let notify_rx = {
-        let mut guard = session.notify_ch.lock().await;
-        let (tx, rx) = oneshot::channel();
-        *guard = Some(tx);
-        rx
-    };
-
-    // Send NatHoleSid to provider ON A WORK CONNECTION (Go frp v0.69.1 compat).
-    // The provider reads NatHoleSid from the work connection, does its own STUN,
-    // and sends NatHoleClient back on its control connection with its mapped addresses.
-    // handle_client() signals notify_ch when the provider's response arrives.
-    if ctl_tx
-        .tx
-        .send(InternalMsg::NatHoleSidOnWorkConn {
-            sid: sid.clone(),
-            proxy_name: proxy_name.clone(),
-        })
-        .is_err()
-    {
-        warn!("Provider for run_id {} has gone away", run_id);
-        state.nat_hole.remove(&transaction_id).await;
-        return;
-    }
-
-    info!(
-        "NatHoleVisitor for proxy '{}': created session {}, waiting for provider",
-        proxy_name, sid
-    );
-
-    // Wait for provider's NatHoleClient with STUN addresses.
-    // The provider does its own STUN discovery and sends
-    // NatHoleClient back with mapped_addrs/assisted_addrs.
-    // Go frp v0.69.1 compat: server is a pure relay.
-    // handle_client() signals notify_ch when the message arrives.
-
-    let client_msg_received = tokio::time::timeout(
-        Duration::from_secs(NAT_HOLE_TIMEOUT),
-        notify_rx,
-    )
-    .await;
-
-    if client_msg_received.is_err() {
-        warn!(
-            "NatHole session {}: timeout waiting for provider NatHoleClient",
-            sid
-        );
-        let mut writer_guard = session.visitor_writer.lock().await;
-        if let Some(ref mut w) = *writer_guard {
-            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-                transaction_id: transaction_id.clone(),
-                error: Some("provider NAT detection timeout".into()),
-                ..Default::default()
-            });
-            let _ = write_msg_v1(w, &resp).await;
-        }
-        state.nat_hole.remove(&sid).await;
-        drop(reader);
-        return;
-    }
-
-    // --- Step 3: Get provider's addresses from session ---
-    let client_msg_opt = session.client_msg.lock().await.take();
-    let client_msg = match client_msg_opt {
-        Some(m) => m,
-        None => {
-            warn!("NatHole session {}: no client message after notify", sid);
-            state.nat_hole.remove(&sid).await;
-            drop(reader);
-            return;
-        }
-    };
-
-    let client_mapped = client_msg.mapped_addrs.unwrap_or_default();
-    let client_assisted = client_msg.assisted_addrs.unwrap_or_default();
-    let visitor_mapped = msg.mapped_addrs.unwrap_or_default();
-    let visitor_assisted = msg.assisted_addrs.unwrap_or_default();
-
-    // --- Step 4: Classify both NAT features ---
-    let v_feature = classify::classify_nat_feature(&visitor_mapped, &[]).ok();
-    let c_feature = classify::classify_nat_feature(&client_mapped, &[]).ok();
-
-    // Store features on session
-    if let Some(ref vf) = v_feature {
-        *session.v_nat_feature.lock().await = Some(vf.clone());
-    }
-    if let Some(ref cf) = c_feature {
-        *session.c_nat_feature.lock().await = Some(cf.clone());
-    }
-
-    // --- Step 5: Run analysis and build responses ---
-    let (v_resp, c_resp) = if let (Some(ref vf), Some(ref cf)) = (&v_feature, &c_feature) {
-        let key = nathole_ctrl::gen_analysis_key(cf, vf);
-        let (mode, _index, c_behavior, v_behavior) =
-            state.nat_hole.analyzer.get_recommand_behaviors(&key, cf, vf);
-
-        let timeout_ms = c_behavior.send_delay_ms.max(v_behavior.send_delay_ms) + 5000;
-        let v_read_timeout = timeout_ms - v_behavior.send_delay_ms;
-        let c_read_timeout = timeout_ms - c_behavior.send_delay_ms;
-        let c_ports_diff = cf.ports_difference;
-        let v_ports_diff = vf.ports_difference;
-
-        let v_resp = nathole_ctrl::build_nat_hole_response(
-            &transaction_id,
-            &sid,
-            msg.protocol.clone(),
-            mode,
-            client_mapped.clone(),  // visitor gets PROVIDER's addresses
-            client_assisted.clone(),
-            v_behavior,
-            v_read_timeout,
-            c_ports_diff,
-        );
-
-        let c_resp = nathole_ctrl::build_nat_hole_response(
-            &client_msg.transaction_id,
-            &sid,
-            client_msg.protocol.clone(),
-            mode,
-            visitor_mapped.clone(),  // provider gets VISITOR's addresses
-            visitor_assisted.clone(),
-            c_behavior,
-            c_read_timeout,
-            v_ports_diff,
-        );
-
-        (v_resp, Some(c_resp))
-    } else {
-        // Fallback: simple exchange without analysis
-        let v_resp = msg::NatHoleResp {
-            transaction_id: transaction_id.clone(),
-            error: None,
-            sid: Some(sid.clone()),
-            protocol: msg.protocol.clone(),
-            candidate_addrs: if client_mapped.is_empty() { None } else { Some(client_mapped) },
-            assisted_addrs: if client_assisted.is_empty() { None } else { Some(client_assisted) },
-            ..Default::default()
-        };
-        let c_resp = msg::NatHoleResp {
-            transaction_id: client_msg.transaction_id.clone(),
-            error: None,
-            sid: Some(sid.clone()),
-            protocol: client_msg.protocol.clone(),
-            candidate_addrs: if visitor_mapped.is_empty() { None } else { Some(visitor_mapped) },
-            assisted_addrs: if visitor_assisted.is_empty() { None } else { Some(visitor_assisted) },
-            ..Default::default()
-        };
-        (v_resp, Some(c_resp))
-    };
-
-    // Store v_resp for reporting
-    *session.v_resp.lock().await = Some(v_resp.clone());
-
-    // --- Step 6: Send NatHoleResp to both sides ---
-    // Send to visitor via writer
-    {
-        let mut writer_guard = session.visitor_writer.lock().await;
-        if let Some(ref mut w) = *writer_guard {
-            let _ = write_msg_v1(w, &FrpMessage::NatHoleResp(v_resp)).await;
-        }
-    }
-
-    // Send to provider via control channel
-    if let Some(ref cr) = c_resp {
-        let _ = ctl_tx.tx.send(InternalMsg::WriteNatHoleResp {
-            transaction_id: cr.transaction_id.clone(),
-            error: cr.error.clone(),
-            sid: cr.sid.clone(),
-            protocol: cr.protocol.clone(),
-            candidate_addrs: cr.candidate_addrs.clone(),
-            assisted_addrs: cr.assisted_addrs.clone(),
-        });
-    }
-
-    info!("NatHole session {}: NatHoleResp sent to both sides", sid);
-
-    // --- Step 7: Wait for report ---
-    match tokio::time::timeout(Duration::from_secs(30), report_rx).await {
-        Ok(Ok(_report)) => {
-            debug!("NatHole session {}: provider completed", sid);
-        }
-        Ok(Err(_)) => {
-            debug!("NatHole session {}: provider dropped without report", sid);
-            state.nat_hole.remove(&sid).await;
-        }
-        Err(_) => {
-            warn!("NatHole session {}: timed out waiting for provider report", sid);
-            state.nat_hole.remove(&sid).await;
-            drop(reader);
-        }
-    }
-    // reader dropped → connection closes
-}
-
-/// Decode a V2 message from raw frame payload and dispatch to the appropriate handler.
-/// `payload` is the frame payload: [type_id: u16 BE][JSON bytes].
-async fn dispatch_v2_message(
-    io: IoStream,
-    payload: Vec<u8>,
-    state: std::sync::Arc<AppState>,
-    addr: std::net::SocketAddr,
-    incoming: Option<frp_core::mux::IncomingStreams>,
-    visitor_addr: Option<String>,
-    crypto_ctx: Option<frp_core::v2_handshake::CryptoContext>,
-) {
-    if payload.len() < 2 {
-        warn!("V2 message payload too short from {}", addr);
-        return;
-    }
-    let type_id = u16::from_be_bytes([payload[0], payload[1]]);
-    let msg = match frp_core::protocol::deserialize_v2(type_id, &payload[2..]) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("Failed to decode V2 message from {}: {}", addr, e);
-            return;
-        }
-    };
-    match msg {
-        FrpMessage::Login(login) => {
-            control::handle_control(io, login, state, Some(addr), incoming, true, crypto_ctx).await;
-        }
-        FrpMessage::NewWorkConn(nwc) => {
-            handle_work_conn_inner(io, nwc, state).await;
-        }
-        FrpMessage::NewVisitorConn(vc) => {
-            handle_visitor_conn_inner(io, vc, state).await;
-        }
-        FrpMessage::NatHoleVisitor(nhv) => {
-            handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
-        }
-        other => {
-            warn!("Unexpected V2 first message from {}: {:?}", addr, other.v2_type_id());
-        }
-    }
-}
-
-/// Handle an incoming work connection. Verifies auth, then routes the
-/// IoStream to the appropriate control handler via InternalMsg.
-async fn handle_work_conn_inner(
-    stream: IoStream,
-    msg: msg::NewWorkConn,
-    state: Arc<AppState>,
-) {
-    let run_id = match msg.run_id {
-        Some(id) => id,
-        None => {
-            warn!("NewWorkConn without run_id, ignoring");
-            return;
-        }
-    };
-
-    // Verify work connection auth (Go frp v0.69.1 compat).
-    // Only validate when "NewWorkConns" is in additional_auth_scopes.
-    let requires_nwc_auth = state.reloadable.read().unwrap()
-        .additional_auth_scopes.iter().any(|s| s == "NewWorkConns");
-    let nwc_auth_result = if !requires_nwc_auth {
-        Ok(())
-    } else if let Some(ref verifier) = state.oidc_verifier {
-        let expected_sub = state.oidc_subjects.read().await
-            .get(&run_id).cloned().unwrap_or_default();
-        verifier.verify_new_work_conn(
-            msg.privilege_key.as_deref().unwrap_or(""),
-            &expected_sub,
-        ).await
-    } else {
-        state.reloadable.read().unwrap().auth_cfg.validate_login(
-            msg.privilege_key.as_deref(),
-            msg.timestamp,
-        ).map(|_| ())
-    };
-    if let Err(e) = nwc_auth_result {
-        warn!("Work conn auth failed for run_id {}: {}", run_id, e);
-        return;
-    }
-
-    let ctl_tx = {
-        let map = state.run_id_to_ctl_tx.read().await;
-        map.get(&run_id).cloned()
-    };
-
-    match ctl_tx {
-        Some(ctl) => {
-            if ctl.tx.send(InternalMsg::NewWorkConn(stream)).is_err() {
-                warn!("Control handler for {} has gone away", run_id);
-            }
-        }
-        None => {
-            warn!("No control handler found for run_id {}", run_id);
-        }
-    }
-}
