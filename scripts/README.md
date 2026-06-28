@@ -104,7 +104,7 @@ VPS may have other programs using ports. `remote-frps.sh start` handles this:
 
 No TOCTOU fix needed — acceptable race for CI. VPS frps lifetime is per-test (~5 seconds).
 
-## Test Matrix: 12 Pairwise Tests
+## Test Matrix: 16 Pairwise Tests
 
 ### Unencrypted (2³ = 8 combinations)
 
@@ -119,14 +119,18 @@ No TOCTOU fix needed — acceptable race for CI. VPS frps lifetime is per-test (
 | 7 | Rust | Rust | Go | `xtcp-rust-frps-rust-prov-go-vis` |
 | 8 | Rust | Rust | Rust | `xtcp-r2r-basic` |
 
-### Encrypted (+ compression)
+### Encrypted (+ compression) — same 8 combos
 
 | # | frps | Provider | Visitor | Test name |
 |---|------|----------|---------|------------|
 | 9 | Go | Go | Go | `xtcp-g2g-enc` |
-| 10 | Go | Rust | Rust | `xtcp-r2g-enc` |
-| 11 | Rust | Go | Go | `xtcp-g2r-enc` |
-| 12 | Rust | Rust | Rust | `xtcp-r2r-enc` |
+| 10 | Go | Go | Rust | `xtcp-go-frps-go-prov-rust-vis-enc` |
+| 11 | Go | Rust | Go | `xtcp-go-frps-rust-prov-go-vis-enc` |
+| 12 | Go | Rust | Rust | `xtcp-r2g-enc` |
+| 13 | Rust | Go | Go | `xtcp-g2r-enc` |
+| 14 | Rust | Go | Rust | `xtcp-rust-frps-go-prov-rust-vis-enc` |
+| 15 | Rust | Rust | Go | `xtcp-rust-frps-rust-prov-go-vis-enc` |
+| 16 | Rust | Rust | Rust | `xtcp-r2r-enc` |
 
 **Execution order:** Baselines first (`g2g-basic` → `r2r-basic`). If baseline fails, all tests using that frps are suspect. Then cross-tests. Encrypted variants last.
 
