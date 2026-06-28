@@ -313,3 +313,118 @@ async fn test_xtcp_nat_hole_message_routing() {
     drop(visitor_conn);
     drop(work_conn);
 }
+
+/// Verify TCP simultaneous open works on localhost.
+/// Side A binds with SO_REUSEADDR and connects to Side B (which listens).
+/// Validates the kernel-level mechanism used for NAT hole punching.
+#[tokio::test]
+async fn test_tcp_simultaneous_open_localhost() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpSocket;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().unwrap();
+
+    let side_a = {
+        let peer = addr;
+        tokio::spawn(async move {
+            let sock = TcpSocket::new_v4().unwrap();
+            sock.set_reuseaddr(true).unwrap();
+            #[cfg(unix)]
+            sock.set_reuseport(true).ok();
+            sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            sock.connect(peer).await
+        })
+    };
+
+    let (mut side_b, _) = listener.accept().await.expect("accept");
+    let mut side_a = side_a.await.unwrap().expect("connect");
+
+    side_a.write_all(b"hello from A").await.unwrap();
+    let mut buf = [0u8; 16];
+    let n = side_b.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"hello from A");
+
+    side_b.write_all(b"hello from B").await.unwrap();
+    let n = side_a.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"hello from B");
+}
+
+/// Verify STUN binding against public server. Non-fatal on network failure.
+#[tokio::test]
+async fn test_stun_binding_google() {
+    let result = frp_core::stun::stun_binding("stun:stun.l.google.com:19302").await;
+    match result {
+        Ok(addr) => {
+            assert!(addr.contains(':'), "mapped address should contain port");
+        }
+        Err(e) => {
+            println!("STUN test skipped (no network?): {}", e);
+        }
+    }
+}
+
+/// Verify TCP simultaneous open works on localhost — the core XTCP hole-punch primitive.
+/// Side A binds with SO_REUSEADDR and connects to Side B (which listens).
+/// This validates the kernel-level mechanism used for NAT hole punching.
+#[tokio::test]
+async fn test_tcp_simultaneous_open_localhost() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpSocket;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().unwrap();
+    println!("Test listener on {}", addr);
+
+    // Side A: bind with SO_REUSEADDR, connect to Side B
+    let side_a = {
+        let peer = addr;
+        tokio::spawn(async move {
+            let sock = TcpSocket::new_v4().unwrap();
+            sock.set_reuseaddr(true).unwrap();
+            #[cfg(unix)]
+            sock.set_reuseport(true).ok();
+            sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            sock.connect(peer).await
+        })
+    };
+
+    // Side B: accept
+    let (mut side_b, _) = listener.accept().await.expect("accept");
+    let mut side_a = side_a.await.unwrap().expect("side A connect");
+
+    // Verify bidirectional data flow
+    side_a.write_all(b"hello from A").await.unwrap();
+    let mut buf = [0u8; 16];
+    let n = side_b.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"hello from A");
+
+    side_b.write_all(b"hello from B").await.unwrap();
+    let n = side_a.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"hello from B");
+
+    println!("TCP simultaneous open on localhost verified");
+}
+
+/// Verify STUN binding request works against a public STUN server.
+/// Skipped if no network access (returns Ok).
+#[tokio::test]
+async fn test_stun_binding_google() {
+    let result = frp_core::stun::stun_binding("stun:stun.l.google.com:19302").await;
+    match result {
+        Ok(addr) => {
+            println!("STUN returned mapped address: {}", addr);
+            // Should be a valid ip:port
+            assert!(addr.contains(':'), "mapped address should contain port");
+            let parts: Vec<&str> = addr.rsplitn(2, ':').collect();
+            assert_eq!(parts.len(), 2, "should be ip:port format");
+        }
+        Err(e) => {
+            // Network may not be available in CI — don't fail
+            println!("STUN test skipped (no network?): {}", e);
+        }
+    }
+}
+

@@ -15,6 +15,7 @@ pub mod kcp;
 pub mod quic;
 pub mod v2_handshake;
 pub mod crypto;
+pub mod stun;
 
 use thiserror::Error;
 
