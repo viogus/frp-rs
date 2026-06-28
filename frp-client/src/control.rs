@@ -217,9 +217,11 @@ impl ControlConnection {
         // V2: ClientHello/ServerHello handshake on yamux-wrapped stream.
         let mut crypto_ctx = None;
         if self.v2 {
-            // When tcpMux is enabled, write V2 magic on the yamux stream
-            // (not on raw TCP). Go frp does: yamux wrap -> write magic -> handshake.
-            if propose_mux {
+            // Write V2 magic on transports that haven't already done so:
+            // - TCP mux: yamux stream needs explicit magic (caller_handles_mux=true in dial opts)
+            // - QUIC: dial_quic() doesn't write magic (per-stream independence)
+            // - TCP non-mux/KCP/WS/WSS: magic already written by dial_server() (opts.v2=true)
+            if propose_mux || matches!(self.transport_protocol, TransportProtocol::Quic) {
                 frp_core::protocol::write_v2_magic(&mut io_stream).await?;
             }
             let transport_name = match self.transport_protocol {
