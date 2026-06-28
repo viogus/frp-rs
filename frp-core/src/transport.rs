@@ -2,16 +2,27 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+#[cfg(feature = "websocket")]
 use tokio_tungstenite::tungstenite::Message;
+#[cfg(feature = "websocket")]
 use futures_util::stream::Stream;
+#[cfg(feature = "websocket")]
 use futures_util::sink::Sink;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
+#[cfg(feature = "tls")]
+use tokio::net::TcpListener;
+#[cfg(feature = "websocket")]
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+#[cfg(feature = "kcp")]
 use crate::kcp::KcpStream;
+#[cfg(feature = "quic")]
 use crate::quic::QuicStream;
 
+#[cfg(feature = "tls")]
 use std::sync::Arc;
+#[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
+#[cfg(feature = "tls")]
 use tokio_rustls::TlsConnector;
 
 use crate::mux::YamuxStream;
@@ -30,6 +41,7 @@ pub enum ConnectionType {
     /// The caller must check the byte to decide whether to skip it before TLS handshake.
     Tls(u8),
     /// 'G' (GET) → HTTP WebSocket upgrade
+    #[cfg(feature = "websocket")]
     WebSocket,
     /// V1 type byte → plain frp protocol (the byte is the V1 message type)
     V1(u8),
@@ -44,9 +56,13 @@ pub const FRP_WEBSOCKET_PATH: &str = "/~!frp";
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransportProtocol {
     Tcp,
+    #[cfg(feature = "kcp")]
     Kcp,
+    #[cfg(feature = "websocket")]
     WebSocket,
+    #[cfg(feature = "websocket")]
     Wss,
+    #[cfg(feature = "quic")]
     Quic,
 }
 
@@ -54,9 +70,13 @@ impl std::str::FromStr for TransportProtocol {
     type Err = ();
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s.to_lowercase().as_str() {
+            #[cfg(feature = "kcp")]
             "kcp" => TransportProtocol::Kcp,
+            #[cfg(feature = "websocket")]
             "websocket" | "ws" => TransportProtocol::WebSocket,
+            #[cfg(feature = "websocket")]
             "wss" => TransportProtocol::Wss,
+            #[cfg(feature = "quic")]
             "quic" => TransportProtocol::Quic,
             _ => TransportProtocol::Tcp,
         })
@@ -76,6 +96,7 @@ impl std::str::FromStr for TransportProtocol {
 /// - Tungstenite: client side (binary frames, RFC 6455 compliant)
 /// - Raw: server side (manual framing, tolerates text frames with non-UTF-8
 ///   payload — Go frp v0.69.1 sends these via golang.org/x/net/websocket)
+#[cfg(feature = "websocket")]
 pub struct WsByteStream {
     inner: WsInner,
     read_buf: Vec<u8>,
@@ -88,6 +109,7 @@ pub struct WsByteStream {
     client_mode: bool,
 }
 
+#[cfg(feature = "websocket")]
 enum WsInner {
     Tungstenite(Pin<Box<WebSocketStream<MaybeTlsStream<TcpStream>>>>),
     /// Raw stream post-upgrade. Manual WebSocket frame handling.
@@ -95,6 +117,7 @@ enum WsInner {
     Raw(Box<dyn AsyncReadWrite>),
 }
 
+#[cfg(feature = "websocket")]
 impl WsInner {
     /// Poll-write logic for the Raw variant.
     /// Takes buffer state as separate params to avoid borrow conflicts
@@ -196,6 +219,7 @@ impl WsInner {
     }
 }
 
+#[cfg(feature = "websocket")]
 impl WsByteStream {
     pub fn new(ws: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
         Self {
@@ -234,6 +258,7 @@ impl WsByteStream {
     }
 }
 
+#[cfg(feature = "websocket")]
 impl AsyncRead for WsByteStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -395,6 +420,7 @@ impl AsyncRead for WsByteStream {
     }
 }
 
+#[cfg(feature = "websocket")]
 impl AsyncWrite for WsByteStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -559,9 +585,13 @@ pub enum IoStream {
     Tcp(TcpStream),
     /// Boxed TLS stream — type-erased to accept any TLS-wrapped transport
     /// (e.g. TlsStream<TcpStream> or TlsStream<PreReadStream<TcpStream>>).
+    #[cfg(feature = "tls")]
     Tls(Box<dyn AsyncReadWrite>),
+    #[cfg(feature = "kcp")]
     Kcp(KcpStream),
+    #[cfg(feature = "quic")]
     Quic(QuicStream),
+    #[cfg(feature = "websocket")]
     WebSocket(WsByteStream),
     Yamux(YamuxStream),
     /// AES-128-CFB encrypted control stream.
@@ -587,9 +617,13 @@ impl std::fmt::Debug for IoStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             IoStream::Tcp(_) => f.debug_struct("IoStream::Tcp").finish_non_exhaustive(),
+            #[cfg(feature = "tls")]
             IoStream::Tls(_) => f.debug_struct("IoStream::Tls").finish_non_exhaustive(),
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(_) => f.debug_struct("IoStream::Kcp").finish_non_exhaustive(),
+            #[cfg(feature = "quic")]
             IoStream::Quic(_) => f.debug_struct("IoStream::Quic").finish_non_exhaustive(),
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(_) => f.debug_struct("IoStream::WebSocket").finish_non_exhaustive(),
             IoStream::Yamux(_) => f.debug_struct("IoStream::Yamux").finish_non_exhaustive(),
             IoStream::Cipher(_) => f.debug_struct("IoStream::Cipher").finish_non_exhaustive(),
@@ -632,9 +666,13 @@ impl tokio::io::AsyncRead for IoStream {
         }
         match this {
             IoStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Yamux(s) => Pin::new(s).poll_read(cx, buf),
             IoStream::Cipher(s) => Pin::new(s).poll_read(cx, buf),
@@ -653,9 +691,13 @@ impl tokio::io::AsyncWrite for IoStream {
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             IoStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::Yamux(s) => Pin::new(s).poll_write(cx, buf),
             IoStream::Cipher(s) => Pin::new(s).poll_write(cx, buf),
@@ -669,9 +711,13 @@ impl tokio::io::AsyncWrite for IoStream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             IoStream::Tcp(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => Pin::new(s).poll_flush(cx),
             IoStream::Yamux(s) => Pin::new(s).poll_flush(cx),
             IoStream::Cipher(s) => Pin::new(s).poll_flush(cx),
@@ -685,9 +731,13 @@ impl tokio::io::AsyncWrite for IoStream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             IoStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::Yamux(s) => Pin::new(s).poll_shutdown(cx),
             IoStream::Cipher(s) => Pin::new(s).poll_shutdown(cx),
@@ -704,9 +754,13 @@ impl IoStream {
     pub async fn write_v1_frame(&mut self, msg: &crate::msg::FrpMessage) -> Result<(), crate::Error> {
         match self {
             IoStream::Tcp(s) => crate::protocol::write_msg_v1(s, msg).await,
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => crate::protocol::write_msg_v1(s, msg).await,
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::write_msg_v1(s, msg).await,
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => crate::protocol::write_msg_v1(s, msg).await,
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::Yamux(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::Cipher(s) => crate::protocol::write_msg_v1(s, msg).await,
@@ -721,9 +775,13 @@ impl IoStream {
     pub async fn read_v1_frame(&mut self) -> Result<crate::msg::FrpMessage, crate::Error> {
         match self {
             IoStream::Tcp(s) => crate::protocol::read_msg_v1(s).await,
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => crate::protocol::read_msg_v1(s).await,
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::read_msg_v1(s).await,
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => crate::protocol::read_msg_v1(s).await,
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Yamux(s) => crate::protocol::read_msg_v1(s).await,
             IoStream::Cipher(s) => crate::protocol::read_msg_v1(s).await,
@@ -739,9 +797,13 @@ impl IoStream {
         use tokio::io::AsyncWriteExt;
         match self {
             IoStream::Tcp(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
             IoStream::Yamux(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
             IoStream::Cipher(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}")))?; }
@@ -757,9 +819,13 @@ impl IoStream {
     pub async fn read_v2_frame(&mut self) -> Result<crate::msg::FrpMessage, crate::Error> {
         match self {
             IoStream::Tcp(s) => crate::protocol::read_msg_v2(s).await,
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => crate::protocol::read_msg_v2(s).await,
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::read_msg_v2(s).await,
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => crate::protocol::read_msg_v2(s).await,
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => crate::protocol::read_msg_v2(s).await,
             IoStream::Yamux(s) => crate::protocol::read_msg_v2(s).await,
             IoStream::Cipher(s) => crate::protocol::read_msg_v2(s).await,
@@ -775,9 +841,13 @@ impl IoStream {
     pub async fn write_raw_v2_frame(&mut self, frame_type: u16, flags: u16, payload: &[u8]) -> Result<(), crate::Error> {
         match self {
             IoStream::Tcp(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
             IoStream::Yamux(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
             IoStream::Cipher(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
@@ -792,9 +862,13 @@ impl IoStream {
     pub async fn read_raw_v2_frame(&mut self) -> Result<(u16, u16, Vec<u8>), crate::Error> {
         match self {
             IoStream::Tcp(s) => crate::protocol::read_v2_frame_raw(s).await,
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => crate::protocol::read_v2_frame_raw(s).await,
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::read_v2_frame_raw(s).await,
+            #[cfg(feature = "quic")]
             IoStream::Quic(s) => crate::protocol::read_v2_frame_raw(s).await,
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => crate::protocol::read_v2_frame_raw(s).await,
             IoStream::Yamux(s) => crate::protocol::read_v2_frame_raw(s).await,
             IoStream::Cipher(s) => crate::protocol::read_v2_frame_raw(s).await,
@@ -811,7 +885,18 @@ impl IoStream {
             IoStream::Tcp(s) => s.peer_addr().ok(),
             IoStream::PreRead(_, s) => s.peer_addr().ok(),
             IoStream::BufferedRead(_, _, inner) => inner.peer_addr(),
-            IoStream::Tls(_) | IoStream::Kcp(_) | IoStream::Quic(_) | IoStream::WebSocket(_) | IoStream::Yamux(_) | IoStream::Cipher(_) | IoStream::Aead(_) | IoStream::SshChannel(_) => None,
+            #[cfg(feature = "tls")]
+            IoStream::Tls(_) => None,
+            IoStream::Yamux(_)
+            | IoStream::Cipher(_)
+            | IoStream::Aead(_)
+            | IoStream::SshChannel(_) => None,
+            #[cfg(feature = "kcp")]
+            IoStream::Kcp(_) => None,
+            #[cfg(feature = "quic")]
+            IoStream::Quic(_) => None,
+            #[cfg(feature = "websocket")]
+            IoStream::WebSocket(_) => None,
         }
     }
 
@@ -827,17 +912,21 @@ impl IoStream {
                 let (r, w) = tokio::io::split(s);
                 (Box::new(r), Box::new(w))
             }
+            #[cfg(feature = "tls")]
             IoStream::Tls(s) => {
                 let (r, w) = tokio::io::split(s);
                 (Box::new(r), Box::new(w))
             }
+            #[cfg(feature = "kcp")]
             IoStream::Kcp(stream) => {
                 let (r, w) = tokio::io::split(stream);
                 (Box::new(r), Box::new(w))
             }
+            #[cfg(feature = "quic")]
             IoStream::Quic(stream) => {
                 stream.into_split()
             }
+            #[cfg(feature = "websocket")]
             IoStream::WebSocket(adapter) => {
                 let (r, w) = tokio::io::split(adapter);
                 (Box::new(r), Box::new(w))
@@ -947,11 +1036,20 @@ impl Default for DialOptions {
 }
 
 /// Resolve a hostname to an IP address using a specific DNS server.
+///
+/// Sends a standard DNS A-record query over UDP. Handles name compression
+/// pointers in the response. IPv6 (AAAA) is not supported — the custom DNS
+/// server option is typically used with IPv4-only internal resolvers.
 async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<String, crate::Error> {
-    use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
-    use hickory_resolver::TokioAsyncResolver;
     use std::net::SocketAddr;
     use std::str::FromStr;
+    use tokio::net::UdpSocket;
+    use tokio::time::{timeout, Duration};
+
+    // If host is already an IP, return it as-is
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(host.to_string());
+    }
 
     // Parse DNS server address (default port 53)
     let dns_addr = if dns_server.contains(':') {
@@ -962,28 +1060,100 @@ async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<String, c
             .map_err(|e| crate::Error::Transport(format!("invalid dns_server '{dns_server}': {e}")))?
     };
 
-    let ns_config = NameServerConfig {
-        socket_addr: dns_addr,
-        protocol: Protocol::Udp,
-        tls_dns_name: None,
-        trust_negative_responses: true,
-        bind_addr: None,
-    };
-    let config = ResolverConfig::from_parts(None, vec![], vec![ns_config]);
-    let resolver = TokioAsyncResolver::tokio(config, ResolverOpts::default());
+    // Build DNS A-record query
+    let mut query = Vec::with_capacity(64);
+    let txid: u16 = rand::random();
+    query.extend_from_slice(&txid.to_be_bytes());
+    query.extend_from_slice(&[0x01, 0x00]); // flags: standard query, RD=1
+    query.extend_from_slice(&[0x00, 0x01]); // QDCOUNT = 1
+    query.extend_from_slice(&[0x00, 0x00]); // ANCOUNT = 0
+    query.extend_from_slice(&[0x00, 0x00]); // NSCOUNT = 0
+    query.extend_from_slice(&[0x00, 0x00]); // ARCOUNT = 0
+    for label in host.split('.') {
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.push(0x00); // terminator
+    query.extend_from_slice(&[0x00, 0x01]); // QTYPE = A
+    query.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
 
-    // If host is already an IP, return it as-is
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return Ok(host.to_string());
+    // Send query over UDP
+    let socket = UdpSocket::bind("0.0.0.0:0").await
+        .map_err(|e| crate::Error::Transport(format!("DNS: bind: {e}")))?;
+    socket.connect(dns_addr).await
+        .map_err(|e| crate::Error::Transport(format!("DNS: connect {dns_server}: {e}")))?;
+    socket.send(&query).await
+        .map_err(|e| crate::Error::Transport(format!("DNS: send to {dns_server}: {e}")))?;
+
+    let mut buf = [0u8; 512];
+    let n = timeout(Duration::from_secs(5), socket.recv(&mut buf)).await
+        .map_err(|_| crate::Error::Transport("DNS: timeout".into()))?
+        .map_err(|e| crate::Error::Transport(format!("DNS: recv: {e}")))?;
+
+    // Parse response
+    let response = &buf[..n];
+    if response.len() < 12 {
+        return Err(crate::Error::Transport("DNS: response too short".into()));
     }
 
-    let response = resolver.lookup_ip(host).await
-        .map_err(|e| crate::Error::Transport(format!("DNS resolve {host} via {dns_server}: {e}")))?;
+    // Verify transaction ID
+    let resp_txid = u16::from_be_bytes([response[0], response[1]]);
+    if resp_txid != txid {
+        return Err(crate::Error::Transport(format!(
+            "DNS: txid mismatch (sent {txid}, got {resp_txid})"
+        )));
+    }
 
-    response.iter()
-        .next()
-        .map(|ip| ip.to_string())
-        .ok_or_else(|| crate::Error::Transport(format!("DNS resolve {host}: no records found")))
+    let ancount = u16::from_be_bytes([response[6], response[7]]) as usize;
+    if ancount == 0 {
+        return Err(crate::Error::Transport(format!("DNS resolve {host}: no records found")));
+    }
+
+    // Skip 12-byte header + question section to reach answers
+    let mut pos = 12;
+    pos = skip_dns_name(response, pos); // QNAME
+    pos += 4; // QTYPE (2) + QCLASS (2)
+
+    // Read answers
+    for _ in 0..ancount {
+        if pos + 10 > response.len() {
+            return Err(crate::Error::Transport("DNS: truncated answer section".into()));
+        }
+        pos = skip_dns_name(response, pos); // NAME (may be compression pointer)
+        let qtype = u16::from_be_bytes([response[pos], response[pos + 1]]);
+        let rdlength = u16::from_be_bytes([response[pos + 8], response[pos + 9]]) as usize;
+        pos += 10; // past TYPE(2)+CLASS(2)+TTL(4)+RDLENGTH(2)
+        if pos + rdlength > response.len() {
+            return Err(crate::Error::Transport("DNS: truncated RDATA".into()));
+        }
+        if qtype == 1 && rdlength == 4 {
+            // A record: 4-byte IPv4 address
+            let ip = std::net::Ipv4Addr::new(response[pos], response[pos + 1],
+                                              response[pos + 2], response[pos + 3]);
+            return Ok(ip.to_string());
+        }
+        pos += rdlength;
+    }
+
+    Err(crate::Error::Transport(format!("DNS resolve {host}: no A record found")))
+}
+
+/// Skip a DNS name in the response, handling compression pointers.
+/// Returns the new position after the name.
+fn skip_dns_name(response: &[u8], mut pos: usize) -> usize {
+    loop {
+        if pos >= response.len() {
+            return pos;
+        }
+        let len = response[pos];
+        if len == 0 {
+            return pos + 1; // end of name
+        }
+        if len & 0xC0 == 0xC0 {
+            return pos + 2; // compression pointer (2 bytes total)
+        }
+        pos += 1 + len as usize; // label
+    }
 }
 
 /// Direct TCP connection with optional bind and keepalive.
@@ -1221,6 +1391,7 @@ fn parse_proxy_url(url: &str) -> Result<(&str, &str, u16), crate::Error> {
 
 /// Connect to the server with the given options.
 pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
+    #[cfg(any(feature = "tls", feature = "websocket"))]
     use tokio::io::AsyncWriteExt;
 
     // Resolve server_addr via custom DNS server if configured.
@@ -1252,12 +1423,14 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
     };
 
     match opts.protocol {
+        #[cfg(feature = "kcp")]
         TransportProtocol::Kcp => {
             let addr = format!("{}:{}", opts.server_addr, opts.server_port);
             let stream = crate::kcp::dial_kcp(&addr, Default::default()).await
                 .map_err(|e| crate::Error::Transport(format!("KCP dial: {e}")))?;
             return Ok(IoStream::Kcp(stream));
         }
+        #[cfg(feature = "quic")]
         TransportProtocol::Quic => {
             let addr = format!("{}:{}", opts.server_addr, opts.server_port);
             let server_name = if !opts.tls_server_name.is_empty() {
@@ -1294,30 +1467,40 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
     match opts.protocol {
         TransportProtocol::Tcp => {
             if opts.tls_enable {
-                if !opts.disable_custom_tls_first_byte {
-                    // Write FRPTLSHeadByte (0x17) before TLS handshake, matching Go frp v0.69.1
-                    stream.write_all(&[FRP_TLS_HEAD_BYTE]).await
-                        .map_err(|e| crate::Error::Transport(format!("write TLS head byte: {e}")))?;
+                #[cfg(not(feature = "tls"))]
+                {
+                    Err(crate::Error::Transport(
+                        "TLS support not compiled (enable the 'tls' feature)".into(),
+                    ))
                 }
-                let connector = build_tls_connector(
-                    opts.tls_ca_file.as_deref(),
-                    opts.tls_cert_file.as_deref(),
-                    opts.tls_key_file.as_deref(),
-                )?;
-                let server_name = if !opts.tls_server_name.is_empty() {
-                    opts.tls_server_name.clone()
-                } else {
-                    opts.server_addr.clone()
-                };
-                let server_name = rustls::pki_types::ServerName::try_from(server_name)
-                    .map_err(|e| crate::Error::Transport(format!("invalid server name: {e}")))?;
-                let tls = connector.connect(server_name, stream).await
-                    .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}")))?;
-                Ok(IoStream::Tls(Box::new(tokio_rustls::TlsStream::Client(tls))))
+                #[cfg(feature = "tls")]
+                {
+                    if !opts.disable_custom_tls_first_byte {
+                        // Write FRPTLSHeadByte (0x17) before TLS handshake, matching Go frp v0.69.1
+                        stream.write_all(&[FRP_TLS_HEAD_BYTE]).await
+                            .map_err(|e| crate::Error::Transport(format!("write TLS head byte: {e}")))?;
+                    }
+                    let connector = build_tls_connector(
+                        opts.tls_ca_file.as_deref(),
+                        opts.tls_cert_file.as_deref(),
+                        opts.tls_key_file.as_deref(),
+                    )?;
+                    let server_name = if !opts.tls_server_name.is_empty() {
+                        opts.tls_server_name.clone()
+                    } else {
+                        opts.server_addr.clone()
+                    };
+                    let server_name = rustls::pki_types::ServerName::try_from(server_name)
+                        .map_err(|e| crate::Error::Transport(format!("invalid server name: {e}")))?;
+                    let tls = connector.connect(server_name, stream).await
+                        .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}")))?;
+                    Ok(IoStream::Tls(Box::new(tokio_rustls::TlsStream::Client(tls))))
+                }
             } else {
                 Ok(IoStream::Tcp(stream))
             }
         }
+        #[cfg(feature = "websocket")]
         TransportProtocol::WebSocket | TransportProtocol::Wss => {
             let is_wss = opts.protocol == TransportProtocol::Wss || opts.tls_enable;
             let host = if !opts.tls_server_name.is_empty() {
@@ -1329,31 +1512,41 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             if is_wss {
                 // WSS raw mode: TLS handshake + manual HTTP upgrade.
                 // Avoids tungstenite UTF-8 validation on TEXT frames from Go frps.
-                if !opts.disable_custom_tls_first_byte {
-                    stream.write_all(&[FRP_TLS_HEAD_BYTE]).await
-                        .map_err(|e| crate::Error::Transport(format!("write TLS head byte: {e}")))?;
+                #[cfg(not(feature = "tls"))]
+                {
+                    return Err(crate::Error::Transport(
+                        "TLS support not compiled (enable the 'tls' feature for WSS)".into(),
+                    ));
                 }
-                let connector = build_tls_connector(
-                    opts.tls_ca_file.as_deref(),
-                    opts.tls_cert_file.as_deref(),
-                    opts.tls_key_file.as_deref(),
-                )?;
-                let server_name = if !opts.tls_server_name.is_empty() {
-                    opts.tls_server_name.clone()
-                } else {
-                    opts.server_addr.clone()
-                };
-                let server_name = rustls::pki_types::ServerName::try_from(server_name)
-                    .map_err(|e| crate::Error::Transport(format!("invalid server name: {e}")))?;
-                let tls_stream = connector.connect(server_name, stream).await
-                    .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}")))?;
-                connect_ws_raw(tls_stream, &host, opts.server_port, FRP_WEBSOCKET_PATH, "https").await
+                #[cfg(feature = "tls")]
+                {
+                    if !opts.disable_custom_tls_first_byte {
+                        stream.write_all(&[FRP_TLS_HEAD_BYTE]).await
+                            .map_err(|e| crate::Error::Transport(format!("write TLS head byte: {e}")))?;
+                    }
+                    let connector = build_tls_connector(
+                        opts.tls_ca_file.as_deref(),
+                        opts.tls_cert_file.as_deref(),
+                        opts.tls_key_file.as_deref(),
+                    )?;
+                    let server_name = if !opts.tls_server_name.is_empty() {
+                        opts.tls_server_name.clone()
+                    } else {
+                        opts.server_addr.clone()
+                    };
+                    let server_name = rustls::pki_types::ServerName::try_from(server_name)
+                        .map_err(|e| crate::Error::Transport(format!("invalid server name: {e}")))?;
+                    let tls_stream = connector.connect(server_name, stream).await
+                        .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}")))?;
+                    connect_ws_raw(tls_stream, &host, opts.server_port, FRP_WEBSOCKET_PATH, "https").await
+                }
             } else {
                 // Plain WS: use raw mode to tolerate TEXT frames with
                 // non-UTF-8 payload from Go frps (golang.org/x/net/websocket).
                 connect_ws_raw(stream, &host, opts.server_port, FRP_WEBSOCKET_PATH, "http").await
             }
         }
+        #[cfg(any(feature = "kcp", feature = "quic"))]
         TransportProtocol::Kcp | TransportProtocol::Quic => {
             unreachable!("KCP/QUIC handled before TCP connect")
         }
@@ -1393,6 +1586,7 @@ pub async fn detect_and_strip_magic(
     let first_byte = magic_buf[0];
     let ct = match first_byte {
         FRP_TLS_HEAD_BYTE | FRP_TLS_DIRECT_BYTE => ConnectionType::Tls(first_byte),
+        #[cfg(feature = "websocket")]
         b'G' => ConnectionType::WebSocket,
         b => ConnectionType::V1(b),
     };
@@ -1415,6 +1609,7 @@ pub async fn detect_and_strip_magic(
 ///
 /// This implementation handles the HTTP upgrade manually and returns a
 /// WsByteStream in Raw mode — all data frames are treated as opaque bytes.
+#[cfg(feature = "websocket")]
 pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -1516,6 +1711,7 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
 /// Raw mode treats all data frames as opaque bytes.
 ///
 /// The returned WsByteStream masks outgoing frames per RFC 6455 §5.3.
+#[cfg(feature = "websocket")]
 pub async fn connect_ws_raw<S>(
     stream: S,
     host: &str,
@@ -1614,6 +1810,7 @@ where
 }
 
 /// TLS configuration.
+#[cfg(feature = "tls")]
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
     pub enable: bool,
@@ -1624,6 +1821,7 @@ pub struct TlsConfig {
 
 /// Create a TLS acceptor from PEM-encoded cert and key files.
 /// If ca_file is provided, client certificates will be verified against it (mTLS).
+#[cfg(feature = "tls")]
 pub fn build_tls_acceptor(
     cert_file: &str,
     key_file: &str,
@@ -1685,6 +1883,7 @@ pub fn build_tls_acceptor(
 /// Build a `RootCertStore` from an optional CA file path.
 /// If `ca_file` is Some and non-empty, loads CA certs from that file.
 /// If None or empty, uses the system's webpki roots.
+#[cfg(feature = "tls")]
 pub fn build_root_store(ca_file: Option<&str>) -> Result<rustls::RootCertStore, crate::Error> {
     let mut root_store = rustls::RootCertStore::empty();
 
@@ -1710,6 +1909,7 @@ pub fn build_root_store(ca_file: Option<&str>) -> Result<rustls::RootCertStore, 
 /// Create a TLS connector for client-side TLS.
 /// If ca_file is provided, use it as a custom root CA; otherwise use webpki roots.
 /// If cert_file/key_file are provided, present client certificate to server (mTLS).
+#[cfg(feature = "tls")]
 pub fn build_tls_connector(
     ca_file: Option<&str>,
     cert_file: Option<&str>,
@@ -1755,17 +1955,20 @@ pub fn build_tls_connector(
 
 /// TLS listener wrapper implementing axum's Listener trait.
 /// Used by dashboard and admin API servers to accept TLS connections.
+#[cfg(feature = "tls")]
 pub struct TlsListener {
     inner: TcpListener,
     acceptor: TlsAcceptor,
 }
 
+#[cfg(feature = "tls")]
 impl TlsListener {
     pub fn new(inner: TcpListener, acceptor: TlsAcceptor) -> Self {
         Self { inner, acceptor }
     }
 }
 
+#[cfg(feature = "tls")]
 impl axum::serve::Listener for TlsListener {
     type Io = tokio_rustls::server::TlsStream<TcpStream>;
     type Addr = std::net::SocketAddr;
@@ -1849,12 +2052,14 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "tls")]
     fn test_build_tls_connector_with_default_roots() {
         let result = build_tls_connector(None, None, None);
         assert!(result.is_ok(), "TLS connector with default roots should build");
     }
 
     #[test]
+    #[cfg(feature = "tls")]
     fn test_build_tls_acceptor_missing_cert() {
         let result = build_tls_acceptor(
             "/nonexistent/cert.pem",

@@ -12,10 +12,10 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use rand::RngCore;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use data_encoding::BASE64;
+use rand::RngCore;
 use ring::digest;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::crypto::AeadAlgorithm;
 use crate::transport::IoStream;
@@ -175,10 +175,13 @@ pub struct CryptoContext {
 /// AES-NI, otherwise XChaCha20-Poly1305 first. We always prefer AES-256-GCM
 /// on modern hardware.
 pub fn preferred_aead_algorithms() -> Vec<String> {
-    vec![
+    #[allow(unused_mut)]
+    let mut algs = vec![
         AeadAlgorithm::Aes256Gcm.as_str().to_string(),
-        AeadAlgorithm::XChaCha20Poly1305.as_str().to_string(),
-    ]
+    ];
+    #[cfg(feature = "chacha20")]
+    algs.push(AeadAlgorithm::XChaCha20Poly1305.as_str().to_string());
+    algs
 }
 
 /// Select first algorithm from client list that we support.

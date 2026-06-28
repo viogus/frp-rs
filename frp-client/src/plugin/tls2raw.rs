@@ -1,8 +1,12 @@
+#[cfg(feature = "tls")]
 use tokio::net::TcpStream;
+#[cfg(feature = "tls")]
 use rustls::pki_types::ServerName;
+#[cfg(feature = "tls")]
 use tracing::debug;
 
 use frp_core::config::PluginConfig;
+#[cfg(feature = "tls")]
 use frp_core::transport::build_tls_connector;
 
 use super::PluginHandle;
@@ -16,6 +20,7 @@ use super::PluginHandle;
 ///
 /// Config:
 /// - plugin_local_addr: "127.0.0.1:8080" (the local TLS service)
+#[cfg(feature = "tls")]
 pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, frp_core::Error> {
     let target_addr = if !cfg.local_addr.is_empty() {
         cfg.local_addr.clone()
@@ -122,4 +127,11 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
         _task: task,
         shutdown: Some(shutdown_tx),
     })
+}
+
+#[cfg(not(feature = "tls"))]
+pub async fn start_tls2raw_plugin(_cfg: &PluginConfig) -> Result<PluginHandle, frp_core::Error> {
+    Err(frp_core::Error::Transport(
+        "tls2raw plugin: TLS support not compiled in".into(),
+    ))
 }

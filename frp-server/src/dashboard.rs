@@ -481,10 +481,18 @@ pub async fn run_dashboard(
 
     match (tls_cert_file, tls_key_file) {
         (Some(cert), Some(key)) if !cert.is_empty() && !key.is_empty() => {
-            let acceptor = frp_core::transport::build_tls_acceptor(&cert, &key, None)?;
-            tracing::info!("Dashboard listening on {} (TLS)", addr);
-            let tls_listener = frp_core::transport::TlsListener::new(listener, acceptor);
-            axum::serve(tls_listener, app).await?;
+            #[cfg(feature = "tls")]
+            {
+                let acceptor = frp_core::transport::build_tls_acceptor(&cert, &key, None)?;
+                tracing::info!("Dashboard listening on {} (TLS)", addr);
+                let tls_listener = frp_core::transport::TlsListener::new(listener, acceptor);
+                axum::serve(tls_listener, app).await?;
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                tracing::error!("TLS feature not enabled; cannot serve dashboard with TLS");
+                return Err("TLS feature not enabled".into());
+            }
         }
         _ => {
             tracing::info!("Dashboard listening on {}", addr);

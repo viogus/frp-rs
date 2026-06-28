@@ -70,14 +70,29 @@ impl HttpPluginManager {
             let event = PluginEvent { op, content: content.clone() };
             let timeout = Duration::from_secs(plugin.cfg.timeout.max(1));
 
+            let body = match serde_json::to_string(&event) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("Server plugin '{}' JSON serialize error: {}", plugin.cfg.name, e);
+                    continue;
+                }
+            };
             match tokio::time::timeout(timeout, self.client
                 .post(&plugin.cfg.url)
-                .json(&event)
+                .header("Content-Type", "application/json")
+                .body(body)
                 .send()
             ).await {
                 Ok(Ok(resp)) => {
                     if plugin.cfg.enable_control {
-                        if let Ok(pr) = resp.json::<PluginResponse>().await {
+                        let resp_text = match resp.text().await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                tracing::warn!("Server plugin '{}' read response error: {}", plugin.cfg.name, e);
+                                continue;
+                            }
+                        };
+                        if let Ok(pr) = serde_json::from_str::<PluginResponse>(&resp_text) {
                             if pr.reject {
                                 let reason = if pr.reject_reason.is_empty() {
                                     "rejected by plugin".to_string()

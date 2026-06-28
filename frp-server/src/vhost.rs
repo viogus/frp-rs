@@ -266,12 +266,14 @@ pub async fn run_vhost_http_listener(
 
 /// Run an HTTPS VHost listener on the given address.
 /// Performs TLS handshake, then extracts Host header and routes via InternalMsg.
+#[cfg(feature = "tls")]
 pub async fn run_vhost_https_listener(
     addr: String,
     tls_cert_file: String,
     tls_key_file: String,
     state: std::sync::Arc<crate::service::AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "tls")]
     use frp_core::transport::build_tls_acceptor;
     let acceptor = build_tls_acceptor(&tls_cert_file, &tls_key_file, None)?;
     let listener = TcpListener::bind(&addr).await?;
@@ -354,6 +356,16 @@ pub async fn run_vhost_https_listener(
             }
         });
     }
+}
+
+#[cfg(not(feature = "tls"))]
+pub async fn run_vhost_https_listener(
+    _addr: String,
+    _tls_cert_file: String,
+    _tls_key_file: String,
+    _state: std::sync::Arc<crate::service::AppState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("TLS feature not enabled".into())
 }
 
 /// Extract the URL path from the HTTP request line.

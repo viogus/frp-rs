@@ -8,8 +8,14 @@ use frp_core::protocol::write_msg_v1;
 use frp_core::auth::{AuthConfig, OidcClient};
 use frp_core::mux::{self, YamuxSession};
 use frp_core::transport::{IoStream, TransportProtocol, DialOptions, dial_server};
+#[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
 use frp_core::VERSION;
+
+#[cfg(feature = "quic")]
+type LoginRet = (IoStream, String, Option<YamuxSession>, Option<QuicConnection>);
+#[cfg(not(feature = "quic"))]
+type LoginRet = (IoStream, String, Option<YamuxSession>);
 
 use crate::proxy;
 
@@ -97,7 +103,7 @@ impl ControlConnection {
     /// Connect to the server and login.
     /// Returns the control stream, run_id, optional yamux session, and optional
     /// QUIC connection (for opening additional streams for work connections).
-    pub async fn login(&mut self) -> Result<(IoStream, String, Option<YamuxSession>, Option<QuicConnection>), frp_core::Error> {
+    pub async fn login(&mut self) -> Result<LoginRet, frp_core::Error> {
         // Go frp servers with tcpMux=true wrap every incoming TCP connection
         // in yamux immediately, so the client MUST wrap BEFORE sending Login.
         // Works over both plain TCP and TLS (yamux sits on top of TLS).
@@ -123,24 +129,60 @@ impl ControlConnection {
             ..Default::default()
         };
 
+        // Establish transport connection.
         // QUIC transport: dial directly via dial_quic() to capture the
         // QuicConnection handle. Other transports go through dial_server().
-        let (mut io_stream, yamux_session, quic_conn): (IoStream, Option<YamuxSession>, Option<QuicConnection>) =
+        #[cfg(feature = "quic")]
+        let (mut io_stream, yamux_session, quic_conn): (IoStream, Option<YamuxSession>, Option<QuicConnection>) = {
             if self.transport_protocol == TransportProtocol::Quic {
-            let addr = format!("{}:{}", self.server_addr, self.server_port);
-            let server_name = if !self.tls_server_name.is_empty() {
-                &self.tls_server_name
+                let addr = format!("{}:{}", self.server_addr, self.server_port);
+                let server_name = if !self.tls_server_name.is_empty() {
+                    &self.tls_server_name
+                } else {
+                    &self.server_addr
+                };
+                let ca_file = self.tls_ca_file.as_deref();
+                let (stream, qc) = frp_core::quic::dial_quic(&addr, server_name, ca_file).await
+                    .map_err(|e| frp_core::Error::Transport(format!("QUIC dial: {e}")))?;
+                // TODO: V2 handshake over QUIC when V2+QUIC interop needed.
+                (IoStream::Quic(stream), None, Some(qc))
             } else {
-                &self.server_addr
-            };
-            let ca_file = self.tls_ca_file.as_deref();
-            let (stream, qc) = frp_core::quic::dial_quic(&addr, server_name, ca_file).await
-                .map_err(|e| frp_core::Error::Transport(format!("QUIC dial: {e}")))?;
-            // TODO: V2 handshake over QUIC when V2+QUIC interop needed.
-            (IoStream::Quic(stream), None, Some(qc))
-        } else {
-            let raw_stream = dial_server(&opts).await?;
+                let raw_stream = dial_server(&opts).await?;
+                // Wrap in yamux BEFORE V2 handshake (matches Go frp flow).
+                // The server wraps its side on accept, so the client must wrap
+                // before sending ClientHello.
+                if propose_mux {
+                    let mux_cfg = mux::TcpMuxConfig::default();
+                    match raw_stream {
+                        IoStream::Tcp(tcp_stream) => {
+                            let (control_stream, session) = mux::client_mux(tcp_stream, &mux_cfg).await?;
+                            info!("Yamux session established");
+                            (IoStream::Yamux(control_stream), Some(session), None)
+                        }
+                        #[cfg(feature = "tls")]
+                        IoStream::Tls(tls_stream) => {
+                            let (control_stream, session) = mux::client_mux(tls_stream, &mux_cfg).await?;
+                            info!("Yamux session established over TLS");
+                            (IoStream::Yamux(control_stream), Some(session), None)
+                        }
+                        other => {
+                            warn!(
+                                "Unexpected transport {:?} for mux proposal — yamux not applied",
+                                std::mem::discriminant(&other)
+                            );
+                            (other, None, None)
+                        }
+                    }
+                } else {
+                    // No yamux: raw stream directly (V2 handshake happens below).
+                    (raw_stream, None, None)
+                }
+            }
+        };
 
+        #[cfg(not(feature = "quic"))]
+        let (mut io_stream, yamux_session): (IoStream, Option<YamuxSession>) = {
+            let raw_stream = dial_server(&opts).await?;
             // Wrap in yamux BEFORE V2 handshake (matches Go frp flow).
             // The server wraps its side on accept, so the client must wrap
             // before sending ClientHello.
@@ -150,24 +192,25 @@ impl ControlConnection {
                     IoStream::Tcp(tcp_stream) => {
                         let (control_stream, session) = mux::client_mux(tcp_stream, &mux_cfg).await?;
                         info!("Yamux session established");
-                        (IoStream::Yamux(control_stream), Some(session), None)
+                        (IoStream::Yamux(control_stream), Some(session))
                     }
+                    #[cfg(feature = "tls")]
                     IoStream::Tls(tls_stream) => {
                         let (control_stream, session) = mux::client_mux(tls_stream, &mux_cfg).await?;
                         info!("Yamux session established over TLS");
-                        (IoStream::Yamux(control_stream), Some(session), None)
+                        (IoStream::Yamux(control_stream), Some(session))
                     }
                     other => {
                         warn!(
                             "Unexpected transport {:?} for mux proposal — yamux not applied",
                             std::mem::discriminant(&other)
                         );
-                        (other, None, None)
+                        (other, None)
                     }
                 }
             } else {
                 // No yamux: raw stream directly (V2 handshake happens below).
-                (raw_stream, None, None)
+                (raw_stream, None)
             }
         };
 
@@ -181,10 +224,16 @@ impl ControlConnection {
             }
             let transport_name = match self.transport_protocol {
                 TransportProtocol::Tcp => "tcp",
+                #[cfg(feature = "kcp")]
                 TransportProtocol::Kcp => "kcp",
+                #[cfg(feature = "quic")]
                 TransportProtocol::Quic => "quic",
+                #[cfg(feature = "websocket")]
                 TransportProtocol::WebSocket => "websocket",
+                #[cfg(feature = "websocket")]
                 TransportProtocol::Wss => "wss",
+                #[allow(unreachable_patterns)]
+                _ => "tcp",
             };
             crypto_ctx = frp_core::v2_handshake::v2_handshake_client(
                 &mut io_stream,
@@ -265,7 +314,14 @@ impl ControlConnection {
                 self.run_id = resp.run_id.clone().unwrap_or_default();
                 self.server_auth_scopes = resp.server_additional_auth_scopes.unwrap_or_default();
                 info!("Logged in. run_id: {}", self.run_id);
-                Ok((io_stream, self.run_id.clone(), yamux_session, quic_conn))
+                #[cfg(feature = "quic")]
+                {
+                    Ok((io_stream, self.run_id.clone(), yamux_session, quic_conn))
+                }
+                #[cfg(not(feature = "quic"))]
+                {
+                    Ok((io_stream, self.run_id.clone(), yamux_session))
+                }
             }
             _ => Err(frp_core::Error::Protocol("Unexpected response to login".into())),
         }

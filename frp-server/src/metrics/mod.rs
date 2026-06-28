@@ -7,4 +7,5 @@
 //! The `prom` module renders Prometheus text format on each scrape by
 //! syncing gauge values from the live AppState + ProxyMetricsRegistry.
 
+#[cfg(feature = "dashboard")]
 pub mod prom;

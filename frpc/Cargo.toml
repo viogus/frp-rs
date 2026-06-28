@@ -4,12 +4,18 @@ version = "0.3.1"
 edition = "2021"
 
 [features]
+default = ["full"]
+full = ["frp-client/default"]
+# Tiny: removes heavy protocols (QUIC/KCP/WS/OIDC) but keeps TLS
+tiny = ["frp-client/tls"]
+# Micro: absolutely minimal — just TCP + V1/V2 core, no optional deps
+micro = []
 # Enable debug/trace logging for development. Default: info only.
 debug-logs = []
 
 [dependencies]
-frp-core = { path = "../frp-core" }
-frp-client = { path = "../frp-client" }
+frp-core = { path = "../frp-core", default-features = false }
+frp-client = { path = "../frp-client", default-features = false }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
@@ -21,3 +27,14 @@ serde.workspace = true
 [[bin]]
 name = "frpc"
 path = "src/main.rs"
+required-features = ["full"]
+
+[[bin]]
+name = "frpc-tiny"
+path = "src/main.rs"
+required-features = ["tiny"]
+
+[[bin]]
+name = "frpc-micro"
+path = "src/main.rs"
+required-features = ["micro"]

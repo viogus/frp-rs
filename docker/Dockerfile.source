@@ -12,6 +12,7 @@
 FROM --platform=$BUILDPLATFORM rust:1-slim-bookworm AS builder
 ARG TARGETARCH
 ARG FRP_COMPONENT=frps
+ARG FRP_FEATURES=
 
 # Map Docker TARGETARCH to:
 #  - Rust target triple (for cargo-zigbuild): musl, fully static
@@ -59,7 +60,7 @@ COPY frp-client/ frp-client/
 COPY frps/ frps/
 COPY frpc/ frpc/
 
-RUN cargo zigbuild --target $(cat /tmp/rust_target) --release && \
+RUN cargo zigbuild --target $(cat /tmp/rust_target) --release ${FRP_FEATURES} && \
     cp target/$(cat /tmp/rust_target)/release/${FRP_COMPONENT} /usr/bin/frp && \
     strip /usr/bin/frp || true
 

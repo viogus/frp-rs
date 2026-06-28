@@ -21,10 +21,8 @@ tracing-appender = "0.2"
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
 tokio-tungstenite = "0.24"
-ring = "0.17"
 sha1 = "0.10"
 md-5 = "0.10"
-hmac = "0.12"
 hex = "0.4"
 data-encoding = "2"
 aes = "0.8"
@@ -37,21 +35,22 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "tls1
 rustls-pemfile = "2"
 futures-util = "0.3"
 webpki-roots = "0.26"
+ring = "0.17"
 jsonwebtoken = "9"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 axum = "0.8.9"
 prometheus = "0.13"
 lazy_static = "1.5"
 libc = "0.2"
 yamux = "0.14"
-russh = "0.61"
+russh = { version = "0.61", default-features = false, features = ["ring", "rsa", "flate2"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 kcp = "0.6"
 quinn = "0.11"
-hickory-resolver = "0.24"
+
 socket2 = "0.5"
-aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
+
 
 # Release profile: slim, LTO, single codegen unit, stripped symbols, abort on panic.
 # After cargo build --release, compress further with:

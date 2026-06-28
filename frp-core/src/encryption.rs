@@ -40,6 +40,7 @@ pub fn decrypt(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
 }
 
 /// Compress data using Snappy (matching Go frp v0.69.1).
+#[cfg(feature = "compression")]
 pub fn compress(data: &[u8]) -> Result<Vec<u8>, String> {
     use snap::write::FrameEncoder;
     use std::io::Write;
@@ -52,7 +53,13 @@ pub fn compress(data: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("snappy finalize: {e}"))
 }
 
+#[cfg(not(feature = "compression"))]
+pub fn compress(_data: &[u8]) -> Result<Vec<u8>, String> {
+    Err("compression not compiled".into())
+}
+
 /// Decompress Snappy-compressed data.
+#[cfg(feature = "compression")]
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     use snap::read::FrameDecoder;
     use std::io::Read;
@@ -64,22 +71,30 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(result)
 }
 
+#[cfg(not(feature = "compression"))]
+pub fn decompress(_data: &[u8]) -> Result<Vec<u8>, String> {
+    Err("compression not compiled".into())
+}
+
 /// Streaming Snappy decompressor for use in bridges.
 ///
 /// Unlike [`decompress`], this handles data arriving in arbitrary TCP chunks:
 /// partial snappy frames are buffered internally until a complete frame is
 /// available, then decompressed.  This avoids "unexpected EOF" errors when a
 /// `read()` boundary does not align with a snappy frame boundary.
+#[cfg(feature = "compression")]
 pub struct SnappyDecompressor {
     buf: Vec<u8>,
 }
 
+#[cfg(feature = "compression")]
 impl Default for SnappyDecompressor {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "compression")]
 impl SnappyDecompressor {
     pub fn new() -> Self {
         Self { buf: Vec::new() }
@@ -191,6 +206,30 @@ impl SnappyDecompressor {
     }
 }
 
+// Stub SnappyDecompressor when compression feature is disabled.
+#[cfg(not(feature = "compression"))]
+pub struct SnappyDecompressor;
+
+#[cfg(not(feature = "compression"))]
+impl Default for SnappyDecompressor {
+    fn default() -> Self {
+        Self
+    }
+}
+
+#[cfg(not(feature = "compression"))]
+impl SnappyDecompressor {
+    pub fn new() -> Self {
+        Self
+    }
+    pub fn feed(&mut self, _data: &[u8]) -> Result<Vec<u8>, String> {
+        Err("compression not compiled".into())
+    }
+    pub fn flush(&mut self) -> Result<Vec<u8>, String> {
+        Ok(Vec::new())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +255,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compression")]
     fn test_compression() {
         let data = b"Hello, frp-rs! Hello, frp-rs! Hello, frp-rs!";
         let compressed = compress(data).unwrap();
@@ -225,6 +265,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compression")]
     fn test_snappy_decompressor_streaming() {
         // Simulate data arriving in chunks: split mid-stream-identifier
         // to exercise the partial-frame and multi-chunk paths.
@@ -250,6 +291,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compression")]
     fn test_snappy_decompressor_all_at_once() {
         let plaintext = b"all-at-once-compression-test-data";
         let compressed = compress(plaintext).unwrap();
@@ -260,6 +302,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compression")]
     fn test_snappy_decompressor_empty() {
         let mut dec = SnappyDecompressor::new();
         assert!(dec.feed(b"").unwrap().is_empty());
