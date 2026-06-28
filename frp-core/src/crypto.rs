@@ -20,11 +20,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use aes_gcm::{Aes256Gcm, KeyInit, aead::{Aead, Payload}};
-use chacha20poly1305::XChaCha20Poly1305;
-use hkdf::Hkdf;
+use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
+use chacha20poly1305::aead::Aead;
 use rand::RngCore;
-use sha2::Sha256;
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use ring::hkdf::{Salt, HKDF_SHA256};
 
 const AEAD_KEY_SIZE: usize = 32;
 const AEAD_FRAME_HEADER_SIZE: usize = 4;
@@ -84,7 +84,8 @@ impl AeadAlgorithm {
 // ---------------------------------------------------------------------------
 
 enum AeadCipher {
-    Aes256Gcm(Box<Aes256Gcm>),
+    /// ring-based AES-256-GCM (via LessSafeKey for non-96-bit nonce support).
+    Aes256Gcm(Box<LessSafeKey>),
     XChaCha20Poly1305(XChaCha20Poly1305),
 }
 
@@ -95,9 +96,9 @@ impl AeadCipher {
         }
         match algorithm {
             AeadAlgorithm::Aes256Gcm => {
-                let cipher = Aes256Gcm::new_from_slice(key)
+                let unbound = UnboundKey::new(&AES_256_GCM, key)
                     .map_err(|e| format!("aes-256-gcm init: {e}"))?;
-                Ok(Self::Aes256Gcm(Box::new(cipher)))
+                Ok(Self::Aes256Gcm(Box::new(LessSafeKey::new(unbound))))
             }
             AeadAlgorithm::XChaCha20Poly1305 => {
                 let cipher = XChaCha20Poly1305::new_from_slice(key)
@@ -108,15 +109,20 @@ impl AeadCipher {
     }
 
     fn encrypt(&self, nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
-        let payload = Payload { msg: plaintext, aad };
         match self {
-            Self::Aes256Gcm(c) => {
-                let nonce = aes_gcm::Nonce::from_slice(nonce);
-                c.encrypt(nonce, payload)
-                    .map_err(|e| format!("aes-gcm encrypt: {e}"))
+            Self::Aes256Gcm(key) => {
+                let nonce = Nonce::try_assume_unique_for_key(nonce)
+                    .map_err(|e| format!("aes-gcm nonce: {e}"))?;
+                let aad = Aad::from(aad);
+                let mut in_out = plaintext.to_vec();
+                // Tag is appended by seal_in_place
+                key.seal_in_place_append_tag(nonce, aad, &mut in_out)
+                    .map_err(|e| format!("aes-gcm encrypt: {e}"))?;
+                Ok(in_out)
             }
             Self::XChaCha20Poly1305(c) => {
                 let nonce = chacha20poly1305::XNonce::from_slice(nonce);
+                let payload = chacha20poly1305::aead::Payload { msg: plaintext, aad };
                 c.encrypt(nonce, payload)
                     .map_err(|e| format!("xchacha20 encrypt: {e}"))
             }
@@ -124,15 +130,19 @@ impl AeadCipher {
     }
 
     fn decrypt(&self, nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
-        let payload = Payload { msg: ciphertext, aad };
         match self {
-            Self::Aes256Gcm(c) => {
-                let nonce = aes_gcm::Nonce::from_slice(nonce);
-                c.decrypt(nonce, payload)
-                    .map_err(|e| format!("aes-gcm decrypt: {e}"))
+            Self::Aes256Gcm(key) => {
+                let nonce = Nonce::try_assume_unique_for_key(nonce)
+                    .map_err(|e| format!("aes-gcm nonce: {e}"))?;
+                let aad = Aad::from(aad);
+                let mut in_out = ciphertext.to_vec();
+                let plaintext = key.open_in_place(nonce, aad, &mut in_out)
+                    .map_err(|e| format!("aes-gcm decrypt: {e}"))?;
+                Ok(plaintext.to_vec())
             }
             Self::XChaCha20Poly1305(c) => {
                 let nonce = chacha20poly1305::XNonce::from_slice(nonce);
+                let payload = chacha20poly1305::aead::Payload { msg: ciphertext, aad };
                 c.decrypt(nonce, payload)
                     .map_err(|e| format!("xchacha20 decrypt: {e}"))
             }
@@ -928,10 +938,14 @@ fn derive_aead_control_key(
     direction: &str,
 ) -> Result<Vec<u8>, String> {
     let info = format!("frp wire v2 control aead {} {}", algorithm.as_str(), direction);
-    let hkdf = Hkdf::<Sha256>::new(Some(transcript_hash), token);
+    let salt = Salt::new(HKDF_SHA256, transcript_hash);
+    let prk = salt.extract(token);
     let mut okm = vec![0u8; AEAD_KEY_SIZE];
-    hkdf.expand(info.as_bytes(), &mut okm)
+    let info_refs = [info.as_bytes()];
+    let okm_result = prk.expand(&info_refs, HKDF_SHA256)
         .map_err(|e| format!("HKDF expand: {e}"))?;
+    okm_result.fill(&mut okm)
+        .map_err(|e| format!("HKDF fill: {e}"))?;
     Ok(okm)
 }
 
