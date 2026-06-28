@@ -159,15 +159,26 @@ async fn test_xtcp_nat_hole_message_routing() {
         .expect("send full NatHoleVisitor");
     println!("Visitor sent full NatHoleVisitor with mapped_addrs");
 
-    // --- Provider reads NatHoleSid from WORK CONNECTION ---
-    match read_msg_v1(&mut work_conn)
-        .await
-        .expect("read NatHoleSid from work conn")
-    {
-        FrpMessage::NatHoleSid(sid_msg) => {
-            let sid = sid_msg.sid.clone().expect("NatHoleSid should have sid");
-            assert!(!sid.is_empty(), "sid should be non-empty");
-            println!("Provider received NatHoleSid on work conn: sid={}", sid);
+    // --- Provider reads StartWorkConn then NatHoleSid from WORK CONNECTION ---
+    // Go frp v0.69.1 compat: server writes StartWorkConn first to route
+    // the work connection to the XTCP proxy handler, then NatHoleSid.
+    let sid = match read_msg_v1(&mut work_conn).await.expect("read StartWorkConn from work conn") {
+        FrpMessage::StartWorkConn(swc) => {
+            assert_eq!(swc.proxy_name, "xtcp-test");
+            println!("Provider received StartWorkConn for proxy '{}'", swc.proxy_name);
+            // Now read NatHoleSid
+            match read_msg_v1(&mut work_conn).await.expect("read NatHoleSid from work conn") {
+                FrpMessage::NatHoleSid(sid_msg) => {
+                    let s = sid_msg.sid.clone().expect("NatHoleSid should have sid");
+                    assert!(!s.is_empty(), "sid should be non-empty");
+                    println!("Provider received NatHoleSid on work conn: sid={}", s);
+                    s
+                }
+                other => panic!("expected NatHoleSid after StartWorkConn, got: {:?}", other.v1_type_byte()),
+            }
+        }
+        other => panic!("expected StartWorkConn on work conn, got: {:?}", other.v1_type_byte()),
+    };
 
             // --- Provider does "STUN" → sends NatHoleClient on CONTROL conn ---
             let client_msg = FrpMessage::NatHoleClient(msg::NatHoleClient {
@@ -210,9 +221,6 @@ async fn test_xtcp_nat_hole_message_routing() {
                 }
                 other => panic!("expected NatHoleResp on provider control, got: {:?}", other.v1_type_byte()),
             }
-        }
-        other => panic!("expected NatHoleSid on work conn, got: {:?}", other.v1_type_byte()),
-    }
 
     // --- Visitor reads NatHoleResp with provider's candidate addresses ---
     match read_msg_v1(&mut visitor_conn)
