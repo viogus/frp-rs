@@ -40,9 +40,8 @@ jsonwebtoken = "9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 axum = "0.8.9"
 prometheus = "0.13"
-libc = "0.2"
 yamux = "0.14"
-russh = { version = "0.61", default-features = false, features = ["ring", "rsa", "flate2"] }
+russh = { version = "0.61", default-features = false, features = ["ring", "rsa"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 kcp = "0.6"
 quinn = "0.11"
