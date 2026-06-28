@@ -249,6 +249,18 @@ fn v2_quic_r2r_tcp_proxy() {
         return;
     }
 
+    // Skip if frps/frpc binaries not built (CI test job runs cargo test without building them).
+    let frps_bin = workspace_bin("frps");
+    let frpc_bin = workspace_bin("frpc");
+    if !frps_bin.exists() || !frpc_bin.exists() {
+        eprintln!(
+            "Skipping: binaries not found ({}, {}) — build with: cargo build -p frps -p frpc --features quic",
+            frps_bin.display(),
+            frpc_bin.display(),
+        );
+        return;
+    }
+
     let (server_cert, server_key, ca_cert) = ensure_tls_certs();
 
     // Start backend TCP echo server.
