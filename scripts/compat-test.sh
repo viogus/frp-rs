@@ -2111,10 +2111,20 @@ run_xtcp_test() {
             fail_test "$name" "DEBUG mode incompatible with --frps-remote (exposes secrets via set -x)"
             return
         fi
+        # Resolve SSH key: accept file path or inline key content
+        local ssh_key_path="${XTCP_VPS_SSH_KEY:-}"
+        if [[ -n "$ssh_key_path" ]] && [[ ! -f "$ssh_key_path" ]]; then
+            # Not a file — assume inline key content, write to temp file
+            local tmp_key="$TEST_DIR/$name/ssh-key"
+            printf '%s\n' "$ssh_key_path" > "$tmp_key"
+            chmod 600 "$tmp_key"
+            ssh_key_path="$tmp_key"
+        fi
+
         # Start frps on remote VPS — capture actual port (handles port conflicts)
         local actual_port
         actual_port=$(bash "$SCRIPT_DIR/remote-frps.sh" start "$frps_impl" "$XTCP_FRPS_REMOTE" \
-            "$frps_port" "$token" "${XTCP_VPS_SSH_KEY:-}" | tail -1) || {
+            "$frps_port" "$token" "$ssh_key_path" | tail -1) || {
             fail_test "$name" "remote frps ($frps_impl) did not start"
             return
         }
@@ -2173,7 +2183,7 @@ run_xtcp_test() {
     if ! wait_for_port_safe 127.0.0.1 "$visitor_port" 30; then
         fail_test "$name" "visitor port $visitor_port not reachable"
         if [[ -n "${XTCP_FRPS_REMOTE:-}" ]]; then
-            bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "${XTCP_VPS_SSH_KEY:-}" 2>/dev/null || true
+            bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "$ssh_key_path" 2>/dev/null || true
         fi
         return
     fi
@@ -2189,7 +2199,7 @@ run_xtcp_test() {
 
     # Cleanup remote frps
     if [[ -n "${XTCP_FRPS_REMOTE:-}" ]]; then
-        bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "${XTCP_VPS_SSH_KEY:-}" 2>/dev/null || true
+        bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "$ssh_key_path" 2>/dev/null || true
     fi
 }
 
