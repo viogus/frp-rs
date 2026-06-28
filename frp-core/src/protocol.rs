@@ -731,6 +731,7 @@ mod tests {
             FrpMessage::StartWorkConn(msg::StartWorkConn {
                 proxy_name: "p".into(), src_addr: None, src_port: None,
                 dst_addr: None, dst_port: None, error: None,
+                use_encryption: None, use_compression: None,
             }),
             FrpMessage::NewVisitorConn(msg::NewVisitorConn {
                 proxy_name: "p".into(), sign_key: None, timestamp: None,

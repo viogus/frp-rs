@@ -313,3 +313,114 @@ async fn test_xtcp_nat_hole_message_routing() {
     drop(visitor_conn);
     drop(work_conn);
 }
+
+/// Server correctly ignores NatHoleClient with sid=None.
+/// The control channel remains usable after the ignored message.
+#[tokio::test]
+async fn test_xtcp_ignore_nat_hole_client_no_sid() {
+    let port = allocate_port();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: port,
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    let (mut provider_ctl, resp) = raw_login(addr, None, None, "").await.expect("login");
+    let _run_id = resp.run_id.expect("run_id");
+
+    // Register XTCP proxy
+    let np = FrpMessage::NewProxy(NewProxy {
+        proxy_name: "ignore-no-sid".into(),
+        proxy_type: "xtcp".into(),
+        sk: Some("ignore-no-sid-sk".to_string()),
+        use_encryption: None,
+        use_compression: None,
+        group: None,
+        group_key: None,
+        local_str: Some("127.0.0.1:29999".into()),
+        remote_port: Some(0),
+        custom_domains: None,
+        subdomain: None,
+        locations: None,
+        http_user: None,
+        http_pwd: None,
+        host_header_rewrite: None,
+        headers: None,
+        response_headers: None,
+        route_by_http_user: None,
+        allow_users: None,
+        bandwidth_limit: None,
+        bandwidth_limit_mode: None,
+        annotations: None,
+        metas: None,
+        multiplexer: None,
+        virtual_net: None,
+        proxy_protocol_version: None,
+    });
+    write_msg_v1(&mut provider_ctl, &np).await.expect("send NewProxy");
+    match read_msg_v1(&mut provider_ctl).await.expect("NewProxyResp") {
+        FrpMessage::NewProxyResp(ref resp) => {
+            assert!(resp.error.is_none(), "reg error: {:?}", resp.error);
+        }
+        other => panic!("expected NewProxyResp, got {:?}", other.v1_type_byte()),
+    }
+
+    // Send NatHoleClient WITHOUT sid - server should silently drop it
+    let bogus = FrpMessage::NatHoleClient(msg::NatHoleClient {
+        transaction_id: "no-sid-txn".into(),
+        proxy_name: "ignore-no-sid".into(),
+        sid: None,
+        protocol: Some("tcp".to_string()),
+        mapped_addrs: Some(vec!["10.0.0.1:9999".to_string()]),
+        ..Default::default()
+    });
+    write_msg_v1(&mut provider_ctl, &bogus)
+        .await
+        .expect("send bogus NatHoleClient");
+
+    // Verify control channel is still operational
+    let np2 = FrpMessage::NewProxy(NewProxy {
+        proxy_name: "after-no-sid-2".into(),
+        proxy_type: "xtcp".into(),
+        sk: Some("after-no-sid-sk-2".to_string()),
+        use_encryption: None,
+        use_compression: None,
+        group: None,
+        group_key: None,
+        local_str: Some("127.0.0.1:29998".into()),
+        remote_port: Some(0),
+        custom_domains: None,
+        subdomain: None,
+        locations: None,
+        http_user: None,
+        http_pwd: None,
+        host_header_rewrite: None,
+        headers: None,
+        response_headers: None,
+        route_by_http_user: None,
+        allow_users: None,
+        bandwidth_limit: None,
+        bandwidth_limit_mode: None,
+        annotations: None,
+        metas: None,
+        multiplexer: None,
+        virtual_net: None,
+        proxy_protocol_version: None,
+    });
+    write_msg_v1(&mut provider_ctl, &np2).await.expect("send NewProxy 2");
+    match read_msg_v1(&mut provider_ctl).await.expect("NewProxyResp 2") {
+        FrpMessage::NewProxyResp(ref resp) => {
+            assert!(
+                resp.error.is_none(),
+                "control channel still usable: {:?}",
+                resp.error
+            );
+        }
+        other => panic!("expected NewProxyResp, got {:?}", other.v1_type_byte()),
+    }
+
+    println!("Server correctly ignored NatHoleClient with sid=None");
+    drop(provider_ctl);
+}
