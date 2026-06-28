@@ -76,18 +76,17 @@ AUTH_FILE="$SSH_DIR/authorized_keys"
 
 mkdir -p "$SSH_DIR"
 
-# Write authorized_keys with restrict (no command= — remote-frps.sh needs
-# to run mkdir, nohup, and other commands via SSH; restrict alone disables
-# port forwarding, agent forwarding, pty, and X11)
+# Write authorized_keys (plain key, no options — restrict causes SSH agent hang
+# on some OpenSSH versions. frp-test has no sudo, so minimal risk.)
 cat > "$AUTH_FILE" <<EOF
-restrict ${PUBLIC_KEY}
+${PUBLIC_KEY}
 EOF
 
 chmod 700 "$SSH_DIR"
 chmod 600 "$AUTH_FILE"
 chown -R frp-test:frp-test "$SSH_DIR"
 
-log "SSH authorized_keys configured (restrict — no port/agent/pty/X11 forwarding)"
+log "SSH authorized_keys configured (key-only auth, no restrictions)"
 log "Key comment: ${PUBLIC_KEY##* }"
 
 # ── 3. Open firewall ports 17000–17100 ──
