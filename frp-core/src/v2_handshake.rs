@@ -12,10 +12,10 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use base64::Engine;
+use data_encoding::BASE64;
 use rand::RngCore;
+use ring::digest;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use sha2::{Digest, Sha256};
 
 use crate::crypto::AeadAlgorithm;
 use crate::transport::IoStream;
@@ -37,7 +37,7 @@ const CRYPTO_TRANSCRIPT_LABEL: &str = "frp wire v2 crypto transcript";
 fn base64_serialize<S: Serializer>(bytes: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
     match bytes {
         Some(b) => {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(b);
+            let encoded = BASE64.encode(b);
             s.serialize_some(&encoded)
         }
         None => s.serialize_none(),
@@ -48,8 +48,7 @@ fn base64_deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>
     let opt: Option<String> = Option::deserialize(d)?;
     match opt {
         Some(s) => {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(s.as_bytes())
+            let bytes = BASE64.decode(s.as_bytes())
                 .map_err(serde::de::Error::custom)?;
             Ok(Some(bytes))
         }
@@ -58,14 +57,13 @@ fn base64_deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>
 }
 
 fn base64_serialize_non_null<S: Serializer>(bytes: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let encoded = BASE64.encode(bytes);
     s.serialize_str(&encoded)
 }
 
 fn base64_deserialize_non_null<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
     let s: String = String::deserialize(d)?;
-    base64::engine::general_purpose::STANDARD
-        .decode(s.as_bytes())
+    BASE64.decode(s.as_bytes())
         .map_err(serde::de::Error::custom)
 }
 
@@ -295,19 +293,19 @@ impl ServerHello {
 ///   SHA256("frp wire v2 crypto transcript" || part("client hello", ch) || part("server hello", sh))
 /// where part(label, payload) = "\x00" || label || "\x00" || BE64(len(payload)) || payload
 pub fn compute_transcript_hash(client_hello_payload: &[u8], server_hello_payload: &[u8]) -> Vec<u8> {
-    let mut h = Sha256::new();
-    h.update(CRYPTO_TRANSCRIPT_LABEL.as_bytes());
-    write_transcript_part(&mut h, "client hello", client_hello_payload);
-    write_transcript_part(&mut h, "server hello", server_hello_payload);
-    h.finalize().to_vec()
+    let mut ctx = digest::Context::new(&digest::SHA256);
+    ctx.update(CRYPTO_TRANSCRIPT_LABEL.as_bytes());
+    write_transcript_part(&mut ctx, "client hello", client_hello_payload);
+    write_transcript_part(&mut ctx, "server hello", server_hello_payload);
+    ctx.finish().as_ref().to_vec()
 }
 
-fn write_transcript_part(h: &mut Sha256, label: &str, payload: &[u8]) {
-    h.update([0u8]);
-    h.update(label.as_bytes());
-    h.update([0u8]);
-    h.update((payload.len() as u64).to_be_bytes());
-    h.update(payload);
+fn write_transcript_part(ctx: &mut digest::Context, label: &str, payload: &[u8]) {
+    ctx.update(&[0u8]);
+    ctx.update(label.as_bytes());
+    ctx.update(&[0u8]);
+    ctx.update(&(payload.len() as u64).to_be_bytes());
+    ctx.update(payload);
 }
 
 // ---------------------------------------------------------------------------
