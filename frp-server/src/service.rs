@@ -17,7 +17,9 @@ use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::mux;
 use frp_core::transport::{IoStream, ConnectionType, detect_and_strip_magic, PreReadStream};
-use frp_core::transport::{build_tls_acceptor, accept_websocket};
+use frp_core::transport::build_tls_acceptor;
+#[cfg(feature = "websocket")]
+use frp_core::transport::accept_websocket;
 use frp_core::format_socket_addr;
 use frp_core::metrics::ProxyMetricsRegistry;
 
@@ -202,6 +204,7 @@ impl Service {
     pub async fn new(cfg: ServerConfig, config_file: Option<String>) -> Result<Self, String> {
         let auth_cfg = AuthConfig {
             method: match cfg.auth.method.to_lowercase().as_str() {
+                #[cfg(feature = "oidc")]
                 "oidc" => AuthMethod::Oidc,
                 _ => AuthMethod::Token,
             },
@@ -895,10 +898,6 @@ impl Service {
                                     }
                                 }
                             }
-                            #[cfg(not(feature = "websocket"))]
-                            ConnectionType::WebSocket => {
-                                warn!("WebSocket connection from {} but websocket feature disabled", addr);
-                            }
 
                             ConnectionType::V2 => {
                                 // Already consumed V2 magic. Extract TcpStream.
@@ -1150,6 +1149,7 @@ impl Service {
         // Build new reloadable state
         let new_auth_cfg = AuthConfig {
             method: match new_cfg.auth.method.to_lowercase().as_str() {
+                #[cfg(feature = "oidc")]
                 "oidc" => AuthMethod::Oidc,
                 _ => AuthMethod::Token,
             },

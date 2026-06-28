@@ -10,8 +10,8 @@ full = ["frp-client/default"]
 debug-logs = []
 
 [dependencies]
-frp-core = { path = "../frp-core" }
-frp-client = { path = "../frp-client" }
+frp-core = { path = "../frp-core", default-features = false }
+frp-client = { path = "../frp-client", default-features = false }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

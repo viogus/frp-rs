@@ -9,7 +9,7 @@ tracing-subscriber.workspace = true
 md-5.workspace = true
 
 [dependencies]
-frp-core = { path = "../frp-core" }
+frp-core = { path = "../frp-core", default-features = false }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

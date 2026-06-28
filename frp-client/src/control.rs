@@ -228,6 +228,7 @@ impl ControlConnection {
                 TransportProtocol::Quic => "quic",
                 #[cfg(feature = "websocket")]
                 TransportProtocol::WebSocket => "websocket",
+                #[cfg(feature = "websocket")]
                 TransportProtocol::Wss => "wss",
                 #[allow(unreachable_patterns)]
                 _ => "tcp",

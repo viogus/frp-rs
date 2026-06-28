@@ -4,7 +4,7 @@ version = "0.3.1"
 edition = "2021"
 
 [dependencies]
-frp-core = { path = "../frp-core" }
+frp-core = { path = "../frp-core", default-features = false }
 russh = { workspace = true, optional = true }
 tokio.workspace = true
 serde.workspace = true
@@ -21,7 +21,7 @@ axum = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 lazy_static = { workspace = true, optional = true }
 reqwest.workspace = true
-rand.workspace = true
+rand = "0.10"
 
 [features]
 default = ["ssh", "dashboard", "websocket", "quic", "kcp", "oidc"]

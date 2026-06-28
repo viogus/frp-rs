@@ -572,6 +572,50 @@ mod oidc_impl {
 #[cfg(feature = "oidc")]
 pub use oidc_impl::{LoginOidcToken, OidcVerifier, OidcClient};
 
+// Stub types for when the oidc feature is disabled. These exist so that
+// type-level references (struct fields, function parameters, Option<Arc<...>>)
+// compile without per-site #[cfg] gates. Actual OIDC logic paths are gated
+// by AuthMethod::Oidc which is behind #[cfg(feature = "oidc")].
+#[cfg(not(feature = "oidc"))]
+pub struct OidcClient;
+#[cfg(not(feature = "oidc"))]
+pub struct OidcVerifier;
+#[cfg(not(feature = "oidc"))]
+pub struct LoginOidcToken {
+    pub subject: String,
+    pub expiry: i64,
+}
+#[cfg(not(feature = "oidc"))]
+impl OidcClient {
+    /// Stub — the oidc feature is disabled; AuthMethod::Oidc is unreachable.
+    pub async fn set_login(&self, _login: &mut crate::msg::Login) -> Result<(), String> {
+        Err("OIDC feature disabled at compile time".into())
+    }
+    /// Stub.
+    pub async fn set_ping(&self, _ping: &mut crate::msg::Ping) -> Result<(), String> {
+        Err("OIDC feature disabled at compile time".into())
+    }
+    /// Stub.
+    pub async fn set_new_work_conn(&self, _nwc: &mut crate::msg::NewWorkConn) -> Result<(), String> {
+        Err("OIDC feature disabled at compile time".into())
+    }
+}
+#[cfg(not(feature = "oidc"))]
+impl OidcVerifier {
+    /// Stub.
+    pub async fn verify_login(&self, _token: &str) -> Result<LoginOidcToken, String> {
+        Err("OIDC feature disabled at compile time".into())
+    }
+    /// Stub.
+    pub async fn verify_ping(&self, _token: &str, _expected_sub: &str) -> Result<(), String> {
+        Err("OIDC feature disabled at compile time".into())
+    }
+    /// Stub.
+    pub async fn verify_new_work_conn(&self, _token: &str, _expected_sub: &str) -> Result<(), String> {
+        Err("OIDC feature disabled at compile time".into())
+    }
+}
+
 /// Resolve a token that may use a URL scheme for dynamic sourcing.
 ///
 /// Supported schemes:

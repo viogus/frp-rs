@@ -99,11 +99,14 @@ pub struct Service {
 impl Service {
     pub async fn new(cfg: ClientConfig, config_file: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
         // Determine auth method from [auth] section if present, otherwise token
+        #[cfg(feature = "oidc")]
         let auth_method = if let Some(ref ac) = cfg.auth {
             if ac.method == "oidc" { AuthMethod::Oidc } else { AuthMethod::Token }
         } else {
             AuthMethod::Token
         };
+        #[cfg(not(feature = "oidc"))]
+        let auth_method = AuthMethod::Token;
 
         let auth_cfg = AuthConfig {
             method: auth_method.clone(),
@@ -120,6 +123,7 @@ impl Service {
         let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
 
         // Create OIDC client if auth method is OIDC
+        #[cfg(feature = "oidc")]
         let oidc_client = if auth_method == AuthMethod::Oidc {
             let ac = cfg.auth.as_ref().ok_or("OIDC auth requires [auth] section in config")?;
             let client = OidcClient::new(
@@ -139,6 +143,8 @@ impl Service {
         } else {
             None
         };
+        #[cfg(not(feature = "oidc"))]
+        let oidc_client: Option<Arc<OidcClient>> = None;
 
         // Start plugins for proxies that have them configured.
         let mut plugin_handles = Vec::new();
