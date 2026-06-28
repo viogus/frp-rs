@@ -13,16 +13,21 @@ All notable changes to frp-rs.
 - g2r V2 test: removed duplicate `transport.tls.enable=false` causing Go frpc TOML parse error
 - r2g V2 test: added missing Rust frpc launch (test wrote config but never started frpc)
 - g2r_quic test: enabled by default (was guarded behind `RUN_QUIC_G2R=1`); root cause was stale debug build, release build works
-- XTCP relay: server now acts as pure relay — forwards visitor STUN data to provider, provider does own STUN discovery (Go frp v0.69.1 compat)
+- XTCP message routing: server now matches Go frp v0.69.1 architecture exactly:
+  - Provider notification via `NatHoleSid` on **work connection** (prefixed with `StartWorkConn` for routing)
+  - `NatHoleClient` direction reversed: **provider→server** (not server→provider)
+  - Address crossover corrected: visitor gets provider's STUN addresses, provider gets visitor's
+  - PreCheck: stateless validation returns `NatHoleResp(OK)` without session creation
+  - Server NEVER does STUN — pure relay (Go frp compat)
 - STUN discovery: use `tokio::net::lookup_host` for DNS resolution of STUN server hostnames
 - `pending_nat_hole_sids` queue: added 10s timeout eviction (matches other pending queues)
 - xtcp_hole_punch test: fixed `NewWorkConn` Default compile error
 
 ### Changed
-- XTCP tests guarded behind `RUN_XTCP=1` (requires public internet for STUN/NAT probes)
+- XTCP tests guarded behind `RUN_XTCP=1` (requires public internet for actual QUIC/UDP hole punching)
 - V2 tests: enabled locally (auto-detect Go), skipped in CI by default due to known V2 frame parsing bug (`V2 frame payload too large: 34408960`). Set `GO_FRP_V2=1` to enable in CI
 - Compat test suite: 40 default tests pass, 2 guarded (was 39 default, 5 guarded)
-- `InternalMsg::NatHoleClient` marked deprecated — Go frp compat uses `NatHoleSidOnWorkConn` instead
+- `InternalMsg::NatHoleClient` deprecated — Go frp compat uses `NatHoleSidOnWorkConn` on work connections
 
 ## [0.3.0] - 2026-06-28
 
