@@ -159,6 +159,10 @@ cmd_start() {
                  kill -0 \"\$pid\" 2>/dev/null && kill -9 \"\$pid\" 2>/dev/null || true; \
                fi; \
              fi; \
+                          for p in \$(seq $((17000 + shard * 100)) $((17000 + shard * 100 + 99))); do \
+                            fpid=\$(ss -tlnp 2>/dev/null | grep ":${p}\b" | grep -o 'pid=[0-9]*' | cut -d= -f2); \
+                            if [ -n "\$fpid" ]; then kill "\$fpid" 2>/dev/null || true; fi; \
+                          done; \
              rm -rf '$remote_dir'; \
              mkdir -p '$remote_dir'" 2>/dev/null || true
     else
@@ -248,6 +252,7 @@ cmd_stop() {
     local result
     if [[ -n "$shard" ]]; then
         # CI matrix isolation: only kill this shard's frps, only clean its dir
+        local base_port=$((17000 + shard * 100))
         local remote_dir="/tmp/frp-xtcp-shard-${shard}"
         result=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
             "if [ -f '$remote_dir/frps.pid' ]; then \
@@ -258,6 +263,12 @@ cmd_stop() {
                  kill -0 \"\$pid\" 2>/dev/null && kill -9 \"\$pid\" 2>/dev/null || true; \
                fi; \
              fi; \
+                          for p in \$(seq ${base_port} $((base_port + 99))); do \
+                            fpid=\$(ss -tlnp 2>/dev/null | grep ":${p}\b" | grep -o 'pid=[0-9]*' | cut -d= -f2); \
+                            if [ -n "\$fpid" ]; then \
+                              kill "\$fpid" 2>/dev/null || true; \
+                            fi; \
+                          done; \
              rm -rf '$remote_dir'; \
              echo ok" 2>&1) || {
             echo "WARNING: remote stop on $host failed: $result" >&2
