@@ -354,12 +354,45 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     // Go frps sends a separate NatHoleSid V1 frame after (old).
                     // Check the embedded field first, then fall back to byte-peek.
                     if let Some(sid) = swc.nat_hole_sid.clone() {
-                        debug!("XTCP work conn {}: NatHoleSid in StartWorkConn for '{}'", label, proxy_name);
-                        let _ = xtcp_tx.send(XtcpNotification {
-                            sid,
-                            proxy_name: proxy_name.clone(),
-                        });
-                        return; // XTCP notification: work conn consumed
+                        if sid.is_empty() {
+                            // STCP fallback marker from Rust frps.
+                            // Server sent a dummy NatHoleSid V1 frame after
+                            // StartWorkConn for Go frpc compat. Consume it
+                            // before entering bridge mode so it doesn't leak
+                            // as garbage data to the local service.
+                            if !v2 {
+                                // Read and discard the dummy NatHoleSid frame.
+                                // Use the raw V1 read path since we don't need
+                                // to deserialize — just skip past it.
+                                use tokio::io::AsyncReadExt;
+                                let mut header = [0u8; 9];
+                                match work.read_exact(&mut header).await {
+                                    Ok(_) if header[0] == msg::TYPE_NAT_HOLE_SID => {
+                                        let length = i64::from_be_bytes(header[1..9].try_into().unwrap());
+                                        if length > 0 && length <= frp_core::protocol::V1_MAX_MSG_LENGTH {
+                                            let mut payload = vec![0u8; length as usize];
+                                            let _ = work.read_exact(&mut payload).await;
+                                        }
+                                        debug!("XTCP work conn {}: consumed STCP fallback NatHoleSid (Go frpc compat)", label);
+                                    }
+                                    Ok(_) => {
+                                        // Unexpected type byte — wrap consumed header.
+                                        work = IoStream::BufferedRead(header.to_vec(), 0, Box::new(work));
+                                    }
+                                    Err(_) => {
+                                        // Header read failed — bridge will get partial data.
+                                    }
+                                }
+                            }
+                            // Fall through to bridging
+                        } else {
+                            debug!("XTCP work conn {}: NatHoleSid in StartWorkConn for '{}'", label, proxy_name);
+                            let _ = xtcp_tx.send(XtcpNotification {
+                                sid,
+                                proxy_name: proxy_name.clone(),
+                            });
+                            return; // XTCP notification: work conn consumed
+                        }
                     }
 
                     // No embedded sid. Could be Go frps XTCP notification

@@ -259,7 +259,10 @@ pub(crate) async fn assign_work_to_proxy(
         error: None,
         use_encryption: if req.use_encryption { Some(true) } else { None },
         use_compression: if req.use_compression { Some(true) } else { None },
-        nat_hole_sid: None,
+        // For XTCP STCP fallback: set empty nat_hole_sid marker so Rust frpc
+        // knows to consume the dummy NatHoleSid frame (sent for Go frpc compat)
+        // before entering bridge mode.
+        nat_hole_sid: if req.proxy_type == "xtcp" { Some(String::new()) } else { None },
         nat_hole_visitor_addr: None,
     });
 
@@ -274,11 +277,25 @@ pub(crate) async fn assign_work_to_proxy(
         return;
     }
 
-    // For XTCP proxies in STCP fallback mode: nat_hole_sid is absent from
-    // StartWorkConn (not set above). The frpc work_conn handler detects this
-    // and falls through to STCP bridging — no separate NatHoleSid frame needed.
-    // This avoids breaking Go frpc, which doesn't expect a NatHoleSid frame
-    // after StartWorkConn and would misinterpret it as bridge data.
+    // For XTCP proxies: send a dummy NatHoleSid frame after StartWorkConn
+    // for Go frpc compat. Go frpc's InWorkConn ALWAYS reads NatHoleSid after
+    // StartWorkConn; without this frame it reads raw bridge data and crashes
+    // with "message type error". The dummy frame has an empty sid so Go frpc
+    // doesn't get a valid session — it will retry hole punch (which fails in
+    // colocated CI) instead of crashing.
+    // Rust frpc detects the empty nat_hole_sid marker in StartWorkConn and
+    // consumes this dummy frame before bridging.
+    if req.proxy_type == "xtcp" {
+        let dummy_nhs = FrpMessage::NatHoleSid(msg::NatHoleSid {
+            sid: Some(String::new()),
+            provider_addr: None,
+        });
+        // Always write as V1 — Go frp doesn't support V2.
+        if let Err(e) = work_conn.write_v1_frame(&dummy_nhs).await {
+            debug!("Failed to send STCP fallback NatHoleSid (non-fatal): {}", e);
+        }
+    }
+
     info!("Bridging user conn to work conn for proxy '{}' (type={})", req.proxy_name, req.proxy_type);
 
     let proxy_name = req.proxy_name.clone();
