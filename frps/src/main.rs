@@ -15,21 +15,17 @@ async fn main() {
 
 fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     // Merge log settings: CLI > config [log] > defaults
-    let level = if cli.log_level != "info" {
-        cli.log_level.clone()
-    } else {
+    let level = cli.log_level.clone().unwrap_or_else(|| {
         cfg.map(|c| c.log.level.as_str()).unwrap_or(
             #[cfg(feature = "debug-logs")]
             "debug",
             #[cfg(not(feature = "debug-logs"))]
             "info",
         ).to_string()
-    };
-    let file = if cli.log_file != "console" {
-        Some(cli.log_file.clone())
-    } else {
+    });
+    let file = cli.log_file.clone().or_else(|| {
         cfg.and_then(|c| if c.log.file.is_empty() { None } else { Some(c.log.file.clone()) })
-    };
+    });
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(&level));

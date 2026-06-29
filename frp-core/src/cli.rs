@@ -13,31 +13,35 @@ use bpaf::Parser;
 // ──────────────────────────────────────────────────────────────────────
 
 /// CLI arguments for frps (server). Mirrors Go frp v0.69.1 frps flags.
+///
+/// Fields that can also appear in the config file use `Option<T>`: `Some`
+/// means the user explicitly passed the flag on the CLI and it should
+/// override the config value.  `None` means the config value is used.
 #[derive(Debug, Clone)]
 pub struct FrpsArgs {
     pub config: String,
     pub config_dir: Option<String>,
-    pub bind_addr: String,
-    pub bind_port: u16,
+    pub bind_addr: Option<String>,
+    pub bind_port: Option<u16>,
     pub token: Option<String>,
     pub allow_ports: Option<String>,
     pub allow_unsafe: Vec<String>,
-    pub dashboard_addr: String,
+    pub dashboard_addr: Option<String>,
     pub dashboard_port: Option<u16>,
-    pub dashboard_user: String,
-    pub dashboard_pwd: String,
+    pub dashboard_user: Option<String>,
+    pub dashboard_pwd: Option<String>,
     pub dashboard_tls_cert_file: Option<String>,
     pub dashboard_tls_key_file: Option<String>,
     pub dashboard_tls_mode: bool,
     pub enable_prometheus: bool,
     pub disable_log_color: bool,
-    pub log_file: String,
-    pub log_level: String,
-    pub log_max_days: i32,
+    pub log_file: Option<String>,
+    pub log_level: Option<String>,
+    pub log_max_days: Option<i32>,
     pub kcp_bind_port: Option<u16>,
     pub quic_bind_port: Option<u16>,
     pub max_ports_per_client: Option<u64>,
-    pub proxy_bind_addr: String,
+    pub proxy_bind_addr: Option<String>,
     pub subdomain_host: Option<String>,
     pub tls_only: bool,
     pub vhost_http_port: Option<u16>,
@@ -56,9 +60,9 @@ struct SvrMeta {
 }
 
 struct SvrBind {
-    bind_addr: String,
-    bind_port: u16,
-    proxy_bind_addr: String,
+    bind_addr: Option<String>,
+    bind_port: Option<u16>,
+    proxy_bind_addr: Option<String>,
 }
 
 struct SvrAuth {
@@ -68,10 +72,10 @@ struct SvrAuth {
 }
 
 struct SvrDashboard {
-    dashboard_addr: String,
+    dashboard_addr: Option<String>,
     dashboard_port: Option<u16>,
-    dashboard_user: String,
-    dashboard_pwd: String,
+    dashboard_user: Option<String>,
+    dashboard_pwd: Option<String>,
     dashboard_tls_cert_file: Option<String>,
     dashboard_tls_key_file: Option<String>,
     dashboard_tls_mode: bool,
@@ -79,9 +83,9 @@ struct SvrDashboard {
 }
 
 struct SvrLog {
-    log_file: String,
-    log_level: String,
-    log_max_days: i32,
+    log_file: Option<String>,
+    log_level: Option<String>,
+    log_max_days: Option<i32>,
     disable_log_color: bool,
 }
 
@@ -164,16 +168,16 @@ fn svr_bind() -> impl Parser<SvrBind> {
     let bind_addr = long("bind-addr")
         .long("bind_addr")
         .argument::<String>("IP")
-        .fallback("0.0.0.0".into());
+        .optional();
     let bind_port = long("bind-port")
         .short('p')
         .long("bind_port")
         .argument::<u16>("PORT")
-        .fallback(7000);
+        .optional();
     let proxy_bind_addr = long("proxy-bind-addr")
         .long("proxy_bind_addr")
         .argument::<String>("IP")
-        .fallback("0.0.0.0".into());
+        .optional();
     construct!(SvrBind { bind_addr, bind_port, proxy_bind_addr })
 }
 
@@ -195,7 +199,7 @@ fn svr_dashboard() -> impl Parser<SvrDashboard> {
     let dashboard_addr = long("dashboard-addr")
         .long("dashboard_addr")
         .argument::<String>("IP")
-        .fallback("0.0.0.0".into());
+        .optional();
     let dashboard_port = long("dashboard-port")
         .long("dashboard_port")
         .argument::<u16>("PORT")
@@ -203,11 +207,11 @@ fn svr_dashboard() -> impl Parser<SvrDashboard> {
     let dashboard_user = long("dashboard-user")
         .long("dashboard_user")
         .argument::<String>("USER")
-        .fallback("admin".into());
+        .optional();
     let dashboard_pwd = long("dashboard-pwd")
         .long("dashboard_pwd")
         .argument::<String>("PWD")
-        .fallback("admin".into());
+        .optional();
     let dashboard_tls_cert_file = long("dashboard-tls-cert-file")
         .long("dashboard_tls_cert_file")
         .argument::<String>("FILE")
@@ -233,15 +237,15 @@ fn svr_log() -> impl Parser<SvrLog> {
     let log_file = long("log-file")
         .long("log_file")
         .argument::<String>("FILE")
-        .fallback("console".into());
+        .optional();
     let log_level = long("log-level")
         .long("log_level")
         .argument::<String>("LEVEL")
-        .fallback("info".into());
+        .optional();
     let log_max_days = long("log-max-days")
         .long("log_max_days")
         .argument::<i32>("DAYS")
-        .fallback(3);
+        .optional();
     let disable_log_color = long("disable-log-color")
         .long("disable_log_color")
         .switch();
@@ -638,18 +642,19 @@ pub fn parse_frpc_args() -> FrpcCmd {
 // ──────────────────────────────────────────────────────────────────────
 
 impl FrpsArgs {
-    /// Override ServerConfig fields with CLI values. CLI wins when both specify a value.
+    /// Override ServerConfig fields with CLI values. Only fields explicitly
+    /// set on the command line (`Some`) override config file values.
     pub fn override_server_config(&self, cfg: &mut crate::config::ServerConfig) {
         if let Some(ref v) = self.token { cfg.auth.token = v.clone(); }
         if let Some(ref v) = self.allow_ports { cfg.allow_ports = v.clone(); }
-        cfg.bind_addr = self.bind_addr.clone();
-        cfg.bind_port = self.bind_port;
-        cfg.proxy_bind_addr = self.proxy_bind_addr.clone();
+        if let Some(ref v) = self.bind_addr { cfg.bind_addr = v.clone(); }
+        if let Some(v) = self.bind_port { cfg.bind_port = v; }
+        if let Some(ref v) = self.proxy_bind_addr { cfg.proxy_bind_addr = v.clone(); }
 
         // Log
-        if self.log_file != "console" { cfg.log.file = self.log_file.clone(); }
-        cfg.log.level = self.log_level.clone();
-        cfg.log.max_days = self.log_max_days;
+        if let Some(ref v) = self.log_file { cfg.log.file = v.clone(); }
+        if let Some(ref v) = self.log_level { cfg.log.level = v.clone(); }
+        if let Some(v) = self.log_max_days { cfg.log.max_days = v; }
 
         // Transport / ports
         if let Some(v) = self.kcp_bind_port { cfg.kcp_bind_port = v; }
@@ -662,8 +667,8 @@ impl FrpsArgs {
 
         // Dashboard
         if let Some(v) = self.dashboard_port { cfg.web_server.port = v; }
-        if self.dashboard_user != "admin" { cfg.web_server.user = self.dashboard_user.clone(); }
-        if self.dashboard_pwd != "admin" { cfg.web_server.password = self.dashboard_pwd.clone(); }
+        if let Some(ref v) = self.dashboard_user { cfg.web_server.user = v.clone(); }
+        if let Some(ref v) = self.dashboard_pwd { cfg.web_server.password = v.clone(); }
         if self.enable_prometheus { cfg.web_server.enable_prometheus = true; }
     }
 }
