@@ -293,7 +293,12 @@ pub(crate) async fn run_visitor_listener(
                         };
 
                         let stcp_proxy_name = if fb_to.is_empty() { sn.clone() } else { fb_to.clone() };
-                        let nvc = crate::proxy::create_visitor_conn_msg(&stcp_proxy_name, &sk, use_encryption, use_compression);
+                        // STCP fallback is always plain relay through server.
+                        // P2P encryption uses derive_key(sk) on the direct P2P channel.
+                        // Sending use_encryption=true in NewVisitorConn would cause
+                        // Go frps to encrypt the server↔provider work conn bridge,
+                        // but the visitor side uses plain copy_bidirectional → mismatch.
+                        let nvc = crate::proxy::create_visitor_conn_msg(&stcp_proxy_name, &sk, false, false);
                         debug!("Visitor '{}': NewVisitorConn JSON: {}", visitor_name, serde_json::to_string(&nvc).unwrap_or_default());
                         if let Err(e) = server_conn.write_v1_frame(&nvc).await {
                             warn!("Visitor '{}': STCP fallback send NewVisitorConn failed: {}", visitor_name, e);
