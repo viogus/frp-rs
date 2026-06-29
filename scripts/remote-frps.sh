@@ -160,7 +160,7 @@ cmd_start() {
                fi; \
              fi; \
                           for p in \$(seq $((17000 + shard * 100)) $((17000 + shard * 100 + 99))); do \
-                            fpid=\$(ss -tlnp 2>/dev/null | grep ":${p}\b" | grep -o 'pid=[0-9]*' | cut -d= -f2); \
+                            fpid=\$(ss -tlnp 2>/dev/null | grep ":\${p}\b" | grep -o 'pid=[0-9]*' | cut -d= -f2); \
                             if [ -n "\$fpid" ]; then kill "\$fpid" 2>/dev/null || true; fi; \
                           done; \
              rm -rf '$remote_dir'; \
@@ -264,7 +264,7 @@ cmd_stop() {
                fi; \
              fi; \
                           for p in \$(seq ${base_port} $((base_port + 99))); do \
-                            fpid=\$(ss -tlnp 2>/dev/null | grep ":${p}\b" | grep -o 'pid=[0-9]*' | cut -d= -f2); \
+                            fpid=\$(ss -tlnp 2>/dev/null | grep ":\${p}\b" | grep -o 'pid=[0-9]*' | cut -d= -f2); \
                             if [ -n "\$fpid" ]; then \
                               kill "\$fpid" 2>/dev/null || true; \
                             fi; \
