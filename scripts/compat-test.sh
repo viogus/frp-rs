@@ -253,7 +253,10 @@ data = os.environ["_SE_DATA"]
 expected = os.environ["_SE_EXPECTED"]
 timeout = float(os.environ["_SE_TIMEOUT"])
 deadline = time.time() + timeout
-per_attempt = min(3.0, timeout / 3)
+# XTCP failover (hole punch timeout + STCP fallback) takes ~6s.
+# Use generous per-attempt timeout so the first connection can survive
+# through the entire XTCP→STCP transition without disconnecting.
+per_attempt = min(15.0, timeout)
 while True:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
