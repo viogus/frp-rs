@@ -134,6 +134,8 @@ pub(crate) async fn assign_udp_work_conn(
         error: None,
         use_encryption: None,
         use_compression: None,
+        nat_hole_sid: None,
+        nat_hole_visitor_addr: None,
     });
     if v2 {
         if let Err(e) = work_conn.write_v2_frame(&swc).await {
@@ -257,6 +259,8 @@ pub(crate) async fn assign_work_to_proxy(
         error: None,
         use_encryption: if req.use_encryption { Some(true) } else { None },
         use_compression: if req.use_compression { Some(true) } else { None },
+        nat_hole_sid: None,
+        nat_hole_visitor_addr: None,
     });
 
     let write_result = if v2 {
@@ -270,25 +274,12 @@ pub(crate) async fn assign_work_to_proxy(
         return;
     }
 
-    // For XTCP proxies in STCP fallback mode: send NatHoleSid with no sid
-    // so the frpc work_conn handler knows this is a bridging work connection,
-    // not a NatHoleSid delivery. The frpc reads NatHoleSid after StartWorkConn
-    // for XTCP proxies; without this marker it would read bridge data as a V1
-    // frame (cause: invalid V1 msg length, hex decodes to bridged TCP stream).
-    let proxy_type = req.proxy_type.clone();
-    if proxy_type == "xtcp" {
-        let stcp_marker = FrpMessage::NatHoleSid(msg::NatHoleSid {
-            sid: None, // None = STCP fallback, Some = XTCP notification
-            provider_addr: None,
-        });
-        let _ = if v2 {
-            work_conn.write_v2_frame(&stcp_marker).await
-        } else {
-            work_conn.write_v1_frame(&stcp_marker).await
-        };
-    }
-
-    info!("Bridging user conn to work conn for proxy '{}'", req.proxy_name);
+    // For XTCP proxies in STCP fallback mode: nat_hole_sid is absent from
+    // StartWorkConn (not set above). The frpc work_conn handler detects this
+    // and falls through to STCP bridging — no separate NatHoleSid frame needed.
+    // This avoids breaking Go frpc, which doesn't expect a NatHoleSid frame
+    // after StartWorkConn and would misinterpret it as bridge data.
+    info!("Bridging user conn to work conn for proxy '{}' (type={})", req.proxy_name, req.proxy_type);
 
     let proxy_name = req.proxy_name.clone();
     let metrics = state.proxy_metrics.get_or_create(&proxy_name).await;

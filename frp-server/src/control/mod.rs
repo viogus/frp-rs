@@ -288,22 +288,20 @@ pub async fn handle_control<S>(
                             let (use_enc, use_comp) = state.proxy_manager.get(&proxy_name).await
                                 .map(|p| (p.use_encryption, p.use_compression))
                                 .unwrap_or((false, false));
-                            // Go frp v0.69.1 compat: StartWorkConn first to route the
-                            // work connection to the XTCP proxy handler.
+                            // Embed NatHoleSid info directly in StartWorkConn JSON.
+                            // This avoids a separate NatHoleSid frame after StartWorkConn
+                            // which Go frpc would misinterpret as bridge data.
                             let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
                                 proxy_name: proxy_name.clone(),
                                 src_addr: None, src_port: None,
                                 dst_addr: None, dst_port: None, error: None,
                                 use_encryption: if use_enc { Some(true) } else { None },
                                 use_compression: if use_comp { Some(true) } else { None },
+                                nat_hole_sid: Some(sid.clone()),
+                                nat_hole_visitor_addr: None,
                             });
-                            let _ = write_ctl_msg(&mut stream, &swc, v2).await;
-                            let forward = FrpMessage::NatHoleSid(msg::NatHoleSid {
-                                sid: Some(sid.clone()),
-                                provider_addr: None,
-                            });
-                            if let Err(e) = write_ctl_msg(&mut stream, &forward, v2).await {
-                                warn!("Failed to send pending NatHoleSid: {}", e);
+                            if let Err(e) = write_ctl_msg(&mut stream, &swc, v2).await {
+                                warn!("Failed to send pending StartWorkConn with NatHoleSid: {}", e);
                             }
                             // Work conn consumed for XTCP notification — drop it.
                         } else {
@@ -472,24 +470,24 @@ pub async fn handle_control<S>(
                             let (use_enc, use_comp) = state.proxy_manager.get(&proxy_name).await
                                 .map(|p| (p.use_encryption, p.use_compression))
                                 .unwrap_or((false, false));
-                            // Go frp v0.69.1 compat: write StartWorkConn FIRST to route
-                            // the work connection to the XTCP proxy handler.
+                            // Embed NatHoleSid info directly in StartWorkConn JSON.
+                            // This avoids a separate NatHoleSid frame after StartWorkConn
+                            // which Go frpc would misinterpret as bridge data.
+                            // Go frp ignores unknown JSON fields, so the embedded fields
+                            // are backward-compatible.
                             let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
                                 proxy_name: proxy_name.clone(),
                                 src_addr: None, src_port: None,
                                 dst_addr: None, dst_port: None, error: None,
                                 use_encryption: if use_enc { Some(true) } else { None },
                                 use_compression: if use_comp { Some(true) } else { None },
+                                nat_hole_sid: Some(sid.clone()),
+                                nat_hole_visitor_addr: None,
                             });
-                            let _ = write_ctl_msg(&mut work_conn, &swc, v2).await;
-                            let forward = FrpMessage::NatHoleSid(msg::NatHoleSid {
-                                sid: Some(sid.clone()),
-                                provider_addr: None,
-                            });
-                            if let Err(e) = write_ctl_msg(&mut work_conn, &forward, v2).await {
-                                warn!("Failed to send NatHoleSid on work conn: {}", e);
+                            if let Err(e) = write_ctl_msg(&mut work_conn, &swc, v2).await {
+                                warn!("Failed to send StartWorkConn with NatHoleSid on work conn: {}", e);
                             } else {
-                                debug!("Sent StartWorkConn+NatHoleSid {} to provider on work conn", sid);
+                                debug!("Sent StartWorkConn with NatHoleSid {} to provider on work conn", sid);
                             }
                             // Connection consumed — Go frp doesn't reuse after NatHoleSid.
                             drop(work_conn);

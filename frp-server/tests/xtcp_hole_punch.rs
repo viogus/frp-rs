@@ -159,23 +159,18 @@ async fn test_xtcp_nat_hole_message_routing() {
         .expect("send full NatHoleVisitor");
     println!("Visitor sent full NatHoleVisitor with mapped_addrs");
 
-    // --- Provider reads StartWorkConn then NatHoleSid from WORK CONNECTION ---
-    // Go frp v0.69.1 compat: server writes StartWorkConn first to route
-    // the work connection to the XTCP proxy handler, then NatHoleSid.
+    // --- Provider reads StartWorkConn from WORK CONNECTION ---
+    // NatHoleSid is embedded in StartWorkConn JSON (Rust frp extension).
+    // Go frp sends a separate NatHoleSid frame after; Rust frp embeds it.
     let sid = match read_msg_v1(&mut work_conn).await.expect("read StartWorkConn from work conn") {
         FrpMessage::StartWorkConn(swc) => {
             assert_eq!(swc.proxy_name, "xtcp-test");
             println!("Provider received StartWorkConn for proxy '{}'", swc.proxy_name);
-            // Now read NatHoleSid
-            match read_msg_v1(&mut work_conn).await.expect("read NatHoleSid from work conn") {
-                FrpMessage::NatHoleSid(sid_msg) => {
-                    let s = sid_msg.sid.clone().expect("NatHoleSid should have sid");
-                    assert!(!s.is_empty(), "sid should be non-empty");
-                    println!("Provider received NatHoleSid on work conn: sid={}", s);
-                    s
-                }
-                other => panic!("expected NatHoleSid after StartWorkConn, got: {:?}", other.v1_type_byte()),
-            }
+            // NatHoleSid embedded in StartWorkConn
+            let s = swc.nat_hole_sid.clone().expect("StartWorkConn should have nat_hole_sid");
+            assert!(!s.is_empty(), "sid should be non-empty");
+            println!("Provider received NatHoleSid in StartWorkConn: sid={}", s);
+            s
         }
         other => panic!("expected StartWorkConn on work conn, got: {:?}", other.v1_type_byte()),
     };

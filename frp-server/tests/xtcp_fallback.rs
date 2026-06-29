@@ -448,30 +448,21 @@ async fn test_xtcp_nat_hole_report_cleanup() {
         .await
         .expect("send full NatHoleVisitor");
 
-    // --- Provider reads StartWorkConn then NatHoleSid from work conn ---
+    // --- Provider reads StartWorkConn from work conn ---
+    // NatHoleSid embedded in StartWorkConn JSON (Rust frp extension).
     let sid = match read_msg_v1(&mut work_conn)
         .await
         .expect("read StartWorkConn from work conn")
     {
         FrpMessage::StartWorkConn(swc) => {
             assert_eq!(swc.proxy_name, "xtcp-cleanup");
-            match read_msg_v1(&mut work_conn)
-                .await
-                .expect("read NatHoleSid from work conn")
-            {
-                FrpMessage::NatHoleSid(sid_msg) => {
-                    let s = sid_msg
-                        .sid
-                        .clone()
-                        .expect("NatHoleSid should have sid");
-                    assert!(!s.is_empty(), "sid must be non-empty");
-                    s
-                }
-                other => panic!(
-                    "expected NatHoleSid after StartWorkConn, got: {:?}",
-                    other.v1_type_byte()
-                ),
-            }
+            // NatHoleSid embedded in StartWorkConn
+            let s = swc
+                .nat_hole_sid
+                .clone()
+                .expect("StartWorkConn should have nat_hole_sid");
+            assert!(!s.is_empty(), "sid must be non-empty");
+            s
         }
         other => panic!(
             "expected StartWorkConn on work conn, got: {:?}",

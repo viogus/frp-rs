@@ -346,36 +346,91 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                 };
 
                 if info.proxy_type == "xtcp" {
-                    // XTCP proxy: read NatHoleSid from work conn.
-                    // - sid=Some: XTCP notification delivery → notify control loop, return
-                    // - sid=None: STCP fallback → fall through to normal bridging below
-                    let sid_result = if v2 {
-                        work.read_v2_frame().await
-                    } else {
-                        work.read_v1_frame().await
-                    };
-                    match sid_result {
-                        Ok(FrpMessage::NatHoleSid(sid_msg)) => {
-                            if let Some(sid) = sid_msg.sid {
-                                debug!("XTCP work conn {} received NatHoleSid for '{}'", label, proxy_name);
-                                let _ = xtcp_tx.send(XtcpNotification {
-                                    sid,
-                                    proxy_name: proxy_name.clone(),
-                                });
-                                return; // XTCP notification: work conn consumed, don't bridge
+                    // XTCP proxy: after StartWorkConn, the next data on the work
+                    // connection is either a NatHoleSid frame (XTCP notification)
+                    // or raw bridge data (STCP fallback).
+                    //
+                    // Rust frps embeds nat_hole_sid in StartWorkConn JSON (new).
+                    // Go frps sends a separate NatHoleSid V1 frame after (old).
+                    // Check the embedded field first, then fall back to byte-peek.
+                    if let Some(sid) = swc.nat_hole_sid.clone() {
+                        debug!("XTCP work conn {}: NatHoleSid in StartWorkConn for '{}'", label, proxy_name);
+                        let _ = xtcp_tx.send(XtcpNotification {
+                            sid,
+                            proxy_name: proxy_name.clone(),
+                        });
+                        return; // XTCP notification: work conn consumed
+                    }
+
+                    // No embedded sid. Could be Go frps XTCP notification
+                    // (separate NatHoleSid V1 frame with type byte 0x35 follows)
+                    // or STCP fallback (bridge data follows).
+                    // Byte-peek: read 1 byte, check if it's NatHoleSid type.
+                    if !v2 {
+                        use tokio::io::AsyncReadExt;
+                        let mut peek = [0u8; 1];
+                        match work.read_exact(&mut peek).await {
+                            Ok(_) if peek[0] == msg::TYPE_NAT_HOLE_SID => {
+                                // Likely Go frps NatHoleSid V1 frame.
+                                // Read remaining 8 header bytes + payload.
+                                let mut header = [0u8; 8];
+                                let mut consumed = vec![msg::TYPE_NAT_HOLE_SID];
+                                match work.read_exact(&mut header).await {
+                                    Ok(_) => {
+                                        consumed.extend_from_slice(&header);
+                                        let length = i64::from_be_bytes(header);
+                                        if (0..=frp_core::protocol::V1_MAX_MSG_LENGTH).contains(&length) {
+                                            let mut payload = vec![0u8; length as usize];
+                                            if work.read_exact(&mut payload).await.is_ok() {
+                                                consumed.extend_from_slice(&payload);
+                                                match serde_json::from_slice::<msg::NatHoleSid>(&payload) {
+                                                    Ok(sid_msg) => {
+                                                        if let Some(sid) = sid_msg.sid {
+                                                            debug!("XTCP work conn {}: NatHoleSid (Go frps) for '{}'", label, proxy_name);
+                                                            let _ = xtcp_tx.send(XtcpNotification {
+                                                                sid,
+                                                                proxy_name: proxy_name.clone(),
+                                                            });
+                                                            return;
+                                                        }
+                                                        // sid=None: STCP fallback (Go frps — unlikely)
+                                                        debug!("XTCP work conn {}: NatHoleSid without sid (Go frps STCP fallback)", label);
+                                                        // Fall through to bridging — no pre-read needed (NatHoleSid consumed).
+                                                    }
+                                                    _ => {
+                                                        // Parsed as non-NatHoleSid — bridge data with a
+                                                        // very unlikely 0x35 collision. Wrap consumed bytes.
+                                                        work = IoStream::BufferedRead(consumed, 0, Box::new(work));
+                                                    }
+                                                }
+                                            } else {
+                                                // Payload read failed — wrap consumed header bytes.
+                                                work = IoStream::BufferedRead(consumed, 0, Box::new(work));
+                                            }
+                                        } else {
+                                            // Invalid V1 length — wrap consumed header bytes.
+                                            work = IoStream::BufferedRead(consumed, 0, Box::new(work));
+                                        }
+                                    }
+                                    Err(_) => {
+                                        // Header read failed after 0x35 — wrap 1 byte.
+                                        work = IoStream::BufferedRead(consumed, 0, Box::new(work));
+                                    }
+                                }
                             }
-                            // sid=None: STCP fallback — continue to bridging below
-                            debug!("XTCP work conn {}: NatHoleSid without sid (STCP fallback), bridging", label);
-                        }
-                        Ok(other) => {
-                            warn!("XTCP work conn {}: expected NatHoleSid, got type 0x{:02x}", label, other.v1_type_byte());
-                            return;
-                        }
-                        Err(e) => {
-                            warn!("XTCP work conn {}: failed to read NatHoleSid: {}", label, e);
-                            return;
+                            Ok(_) => {
+                                // Not 0x35 — STCP fallback. Wrap the peeked byte
+                                // as pre-read bridge data.
+                                work = IoStream::BufferedRead(vec![peek[0]], 0, Box::new(work));
+                            }
+                            Err(_) => {
+                                // EOF after StartWorkConn — bridge will get 0 bytes.
+                            }
                         }
                     }
+                    // V2: byte-peek not implemented (V2 is stubs-only). Fall through
+                    // to STCP bridging. Go frp doesn't support V2 XTCP.
+
                     // Fall through to normal bridging for STCP fallback
                 }
 
