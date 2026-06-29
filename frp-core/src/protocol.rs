@@ -315,16 +315,6 @@ pub const V2_FRAME_TYPE_CLIENT_HELLO: u16 = 1;
 pub const V2_FRAME_TYPE_SERVER_HELLO: u16 = 2;
 // V2_FRAME_TYPE_MESSAGE = 16 already exists above.
 
-pub async fn detect_v2_magic<R: AsyncReadExt + Unpin>(
-    reader: &mut R,
-) -> Result<bool, crate::Error> {
-    let mut buf = [0u8; V2_MAGIC_LEN];
-    match reader.read_exact(&mut buf).await {
-        Ok(_) => Ok(buf == V2_MAGIC_BYTES),
-        Err(e) => Err(crate::Error::Protocol(format!("detect V2 magic: {e}"))),
-    }
-}
-
 pub async fn write_v2_magic<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
 ) -> Result<(), crate::Error> {
@@ -335,22 +325,21 @@ pub async fn write_v2_magic<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// Read and verify V2 magic bytes from a stream.
-/// Returns an error if the magic doesn't match.
-/// Used on yamux streams where Go frp writes magic after yamux wrap.
-pub async fn read_v2_magic<R: AsyncReadExt + Unpin>(
+/// Read and check V2 magic bytes from a stream.
+/// Returns `Ok(None)` if magic matches (consumed).
+/// Returns `Ok(Some(bytes))` if magic doesn't match — caller should replay these bytes.
+/// Returns `Err` if the read itself fails.
+pub async fn read_v2_magic_or_replay<R: AsyncReadExt + Unpin>(
     reader: &mut R,
-) -> Result<(), crate::Error> {
+) -> Result<Option<Vec<u8>>, crate::Error> {
     let mut buf = [0u8; V2_MAGIC_LEN];
     reader.read_exact(&mut buf).await
         .map_err(|e| crate::Error::Protocol(format!("read V2 magic: {e}")))?;
-    if buf != V2_MAGIC_BYTES {
-        return Err(crate::Error::Protocol(format!(
-            "unexpected V2 magic: expected {:02x?}, got {:02x?}",
-            V2_MAGIC_BYTES.as_slice(), buf.as_slice()
-        )));
+    if buf == V2_MAGIC_BYTES {
+        Ok(None)
+    } else {
+        Ok(Some(buf.to_vec()))
     }
-    Ok(())
 }
 
 /// Write a raw V2 frame: type(2 BE) + flags(2 BE) + length(4 BE) + payload.
