@@ -18,6 +18,12 @@
 # =============================================================================
 set -euo pipefail
 
+# Debug trap: log script exit point and reason (helps diagnose set -e failures)
+trap 'echo "TRACE: exit=$? line=$LINENO cmd=${BASH_COMMAND:-}" >&2' EXIT
+if [[ "${BASH_VERSINFO[0]:-0}" -ge 4 ]]; then
+    trap 'echo "TRACE: ERR at line=$LINENO cmd=$BASH_COMMAND" >&2' ERR
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 VPS_USER="${XTCP_VPS_USER:-frp-test}"
@@ -190,8 +196,12 @@ cmd_start() {
     # --- Find available port (dies if none in range) ---
     local actual_port
     echo "DBG: find_available_port host=$host port=$port" >&2
-    actual_port=$(find_available_port "$host" "$port" "$ssh_key")
+    # ||true prevents errexit on bash <4.4 if subshell exits non-zero
+    actual_port=$(find_available_port "$host" "$port" "$ssh_key") || true
     echo "DBG: found port=$actual_port" >&2
+    if [[ -z "$actual_port" ]]; then
+        die "find_available_port failed — no port returned (all busy or SSH error)"
+    fi
 
     # --- Determine binary path ---
     local binary_path
@@ -226,25 +236,35 @@ cmd_start() {
 
     # --- Upload binary and config ---
     local scp_opts="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ControlPath=/tmp/frp-ssh-ctl-%h-%r"
-    local scp_err
-    scp_err=$(scp $scp_opts -i "$ssh_key" "$binary_path" "${VPS_USER}@${host}:${remote_dir}/frps" 2>&1 1>/dev/null) || {
+    local scp_err scp_rc=0
+    echo "DBG: uploading frps binary (${binary_path##*/}) to $host" >&2
+    scp_err=$(scp $scp_opts -i "$ssh_key" "$binary_path" "${VPS_USER}@${host}:${remote_dir}/frps" 2>&1 1>/dev/null) || scp_rc=$?
+    echo "DBG: binary upload done rc=$scp_rc" >&2
+    if [[ $scp_rc -ne 0 ]]; then
         rm -f "$config_path"
         die "failed to upload frps binary to $host: $scp_err"
-    }
-    scp_err=$(scp $scp_opts -i "$ssh_key" "$config_path" "${VPS_USER}@${host}:${remote_dir}/frps.toml" 2>&1 1>/dev/null) || {
+    fi
+    scp_rc=0
+    echo "DBG: uploading frps config to $host" >&2
+    scp_err=$(scp $scp_opts -i "$ssh_key" "$config_path" "${VPS_USER}@${host}:${remote_dir}/frps.toml" 2>&1 1>/dev/null) || scp_rc=$?
+    echo "DBG: config upload done rc=$scp_rc" >&2
+    if [[ $scp_rc -ne 0 ]]; then
         rm -f "$config_path"
         die "failed to upload frps config to $host: $scp_err"
-    }
+    fi
 
     # Clean up local config
     rm -f "$config_path"
 
     # --- Start frps on VPS ---
     # Redirect all fds to detach from SSH session; nohup ensures survival
-    local start_output start_rc
+    # Use ||rc=$? pattern (not ||true) so we capture exit code while preventing
+    # errexit from killing the script on bash <4.4 where var=$(failing_cmd) triggers it.
+    local start_output start_rc=0
+    echo "DBG: starting frps via SSH on $host:$actual_port dir=$remote_dir" >&2
     start_output=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-        "cd $remote_dir && chmod +x frps && nohup ./frps -c frps.toml > frps.log 2>&1 < /dev/null & echo \$! > frps.pid" 2>&1)
-    start_rc=$?
+        "cd $remote_dir && chmod +x frps && nohup ./frps -c frps.toml > frps.log 2>&1 < /dev/null & echo \$! > frps.pid" 2>&1) || start_rc=$?
+    echo "DBG: SSH start complete rc=$start_rc output_len=${#start_output}" >&2
     if [[ $start_rc -ne 0 ]]; then
         die "failed to start frps on $host (exit=$start_rc): $start_output"
     fi
