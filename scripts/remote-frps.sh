@@ -76,20 +76,31 @@ find_available_port() {
 
 # Wait for frps to be listening on the given port
 wait_remote_port() {
-    local host="$1" port="$2" ssh_key="$3"
+    local host="$1" port="$2" ssh_key="$3" remote_dir="${4:-}"
     local max_attempts=30
 
     local i
     for i in $(seq 1 "$max_attempts"); do
-        local listening
+        local listening ssh_rc
         listening=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-            "ss -tlnp 2>/dev/null | grep ':${port}\b' || true" 2>/dev/null)
+            "ss -tlnp 2>/dev/null | grep ':${port}\b' || true" 2>/dev/null) || true
+        ssh_rc=$?
+        if [[ $ssh_rc -ne 0 ]]; then
+            echo "WARNING: SSH to $host failed (exit=$ssh_rc) during port check $i/$max_attempts" >&2
+        fi
         if [[ -n "$listening" ]]; then
             return 0
         fi
         sleep 1
     done
-    die "frps on $host:$port did not become ready within ${max_attempts}s"
+
+    # Fetch frps log to help diagnose why it didn't start
+    local frps_log="(unavailable)"
+    if [[ -n "$remote_dir" ]]; then
+        frps_log=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+            "cat '$remote_dir/frps.log' 2>/dev/null || echo '(no log)'" 2>/dev/null) || true
+    fi
+    die "frps on $host:$port did not become ready within ${max_attempts}s. frps.log: $frps_log"
 }
 
 # =============================================================================
@@ -160,7 +171,7 @@ cmd_start() {
                fi; \
              fi; \
                           for p in \$(seq $((17000 + shard * 100)) $((17000 + shard * 100 + 99))); do \
-                            fpid=\$(ss -tlnp 2>/dev/null | grep ":\${p}\b" | grep -o 'pid=[0-9]*' | cut -d= -f2); \
+                            fpid=\$(ss -tlnp 2>/dev/null | grep \":\${p}\b\" | grep -o 'pid=[0-9]*' | cut -d= -f2); \
                             if [ -n "\$fpid" ]; then kill "\$fpid" 2>/dev/null || true; fi; \
                           done; \
              rm -rf '$remote_dir'; \
@@ -235,8 +246,21 @@ cmd_start() {
         die "failed to start frps on $host (exit=$start_rc): $start_output"
     fi
 
+    # Quick liveness check: if frps exits immediately (config parse error, etc.),
+    # we can fail fast with the log instead of waiting 30s for wait_remote_port.
+    sleep 2
+    local alive_check
+    alive_check=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+        "pid=\$(cat '$remote_dir/frps.pid' 2>/dev/null); if [ -n \"\$pid\" ] && kill -0 \"\$pid\" 2>/dev/null; then echo alive; else echo dead; fi" 2>/dev/null) || true
+    if [[ "$alive_check" == "dead" ]]; then
+        local early_log
+        early_log=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+            "cat '$remote_dir/frps.log' 2>/dev/null || echo '(no log)'" 2>/dev/null) || true
+        die "frps on $host exited immediately after start. frps.log: $early_log"
+    fi
+
     # --- Wait for frps to be ready ---
-    wait_remote_port "$host" "$actual_port" "$ssh_key"
+    wait_remote_port "$host" "$actual_port" "$ssh_key" "$remote_dir"
 
     # Echo actual port (MUST be last line of stdout for compat-test.sh integration)
     echo "$actual_port"
@@ -264,7 +288,7 @@ cmd_stop() {
                fi; \
              fi; \
                           for p in \$(seq ${base_port} $((base_port + 99))); do \
-                            fpid=\$(ss -tlnp 2>/dev/null | grep ":\${p}\b" | grep -o 'pid=[0-9]*' | cut -d= -f2); \
+                            fpid=\$(ss -tlnp 2>/dev/null | grep \":\${p}\b\" | grep -o 'pid=[0-9]*' | cut -d= -f2); \
                             if [ -n "\$fpid" ]; then \
                               kill "\$fpid" 2>/dev/null || true; \
                             fi; \
