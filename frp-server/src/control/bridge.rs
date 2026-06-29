@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 use tracing::{debug, info, warn};
@@ -283,11 +284,22 @@ pub(crate) async fn assign_work_to_proxy(
         return;
     }
 
-    // For XTCP STCP fallback: no dummy NatHoleSid frame needed.
-    // The StartWorkConn's nat_hole_sid: Some("") (empty string) is the sole
-    // signal to the Rust frpc provider that this is an STCP fallback bridge.
-    // Go frpc provider already cannot do XTCP STCP fallback (InWorkConn always
-    // expects a real NatHoleSid), so the dummy frame served no purpose.
+    // For XTCP STCP fallback: send a dummy NatHoleSid V1 frame with
+    // empty sid after StartWorkConn for Go frpc compatibility.
+    // Go frpc's InWorkConn expects either an embedded nat_hole_sid in
+    // StartWorkConn JSON (newer frp) or a separate NatHoleSid V1 frame
+    // immediately after StartWorkConn (Go frp v0.69.1). Our Rust frpc
+    // provider's byte-peek handles both formats.
+    // The copy_bidirectional bridge (used for XTCP STCP fallback below)
+    // doesn't send a premature FIN, so the provider can safely consume
+    // this frame without the old ECONNRESET race.
+    if req.proxy_type == "xtcp" {
+        let dummy = FrpMessage::NatHoleSid(msg::NatHoleSid {
+            sid: None,
+            provider_addr: None,
+        });
+        let _ = work_conn.write_v1_frame(&dummy).await;
+    }
 
     info!("Bridging user conn to work conn for proxy '{}' (type={})", req.proxy_name, req.proxy_type);
 
@@ -376,14 +388,39 @@ pub(crate) async fn assign_work_to_proxy(
             // can coordinate: write pre_read first, then skip work_w shutdown
             // to let the backend response flow back to the user.
             let bridge_pre_read = pre_read;
-            // Plain bridge with optional compression.
-            let (u_r, u_w) = req.user_conn.into_split();
-            let (w_r, w_w) = work_conn.into_split();
-            if !req.response_headers.is_empty() && req.proxy_type.starts_with("http") {
-                let injector = ResponseHeaderInjector::new(w_r, req.response_headers);
-                frp_core::bridge::bridge_plain(u_r, u_w, injector, w_w, comp_key, bridge_pre_read, Some(metrics.clone())).await;
+
+            // XTCP STCP fallback: use copy_bidirectional directly instead of
+            // bridge_plain. bridge_plain's join! pattern drops the work writer
+            // (sending FIN) as soon as the user reader reaches EOF. For STCP
+            // fallback the visitor's test client half-closes after sending data,
+            // so the server sees EOF on the user side ~60ms before the provider
+            // starts its bridge. The premature FIN on the work connection races
+            // with the provider's copy_bidirectional startup and produces
+            // ECONNRESET on VPS (Linux TCP stack behavior differs from macOS).
+            // copy_bidirectional avoids this: both directions run to completion
+            // within the same function, and the work side is only shut down
+            // after the full bidirectional copy finishes.
+            if proxy_type == "xtcp" {
+                let mut user_conn = req.user_conn;
+                match tokio::io::copy_bidirectional(&mut user_conn, &mut work_conn).await {
+                    Ok((a, b)) => {
+                        metrics.bytes_in.fetch_add(a, Ordering::Relaxed);
+                        metrics.bytes_out.fetch_add(b, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        debug!("XTCP STCP fallback bridge closed: {}", e);
+                    }
+                }
             } else {
-                frp_core::bridge::bridge_plain(u_r, u_w, w_r, w_w, comp_key, bridge_pre_read, Some(metrics.clone())).await;
+                // Plain bridge with optional compression.
+                let (u_r, u_w) = req.user_conn.into_split();
+                let (w_r, w_w) = work_conn.into_split();
+                if !req.response_headers.is_empty() && req.proxy_type.starts_with("http") {
+                    let injector = ResponseHeaderInjector::new(w_r, req.response_headers);
+                    frp_core::bridge::bridge_plain(u_r, u_w, injector, w_w, comp_key, bridge_pre_read, Some(metrics.clone())).await;
+                } else {
+                    frp_core::bridge::bridge_plain(u_r, u_w, w_r, w_w, comp_key, bridge_pre_read, Some(metrics.clone())).await;
+                }
             }
         }
         info!("Proxy '{}' bridge completed", req.proxy_name);
