@@ -826,8 +826,7 @@ write_frpc_config_xtcp_provider() {
             printf '\n[[proxies]]\nname = "%s-stcp"\ntype = "stcp"\n' "$name"
             printf 'secretKey = "%s"\n' "$sk"
             printf 'localIP = "127.0.0.1"\nlocalPort = %s\n' "$echo_port"
-            if $has_enc; then printf 'transport.useEncryption = true\n'; fi
-            if $has_comp; then printf 'transport.useCompression = true\n'; fi
+            # STCP fallback proxy is always plain relay — encryption is P2P-only
         } > "$out"
     else
         {
@@ -843,8 +842,7 @@ write_frpc_config_xtcp_provider() {
             printf '\n[[proxies]]\nname = "%s-stcp"\ntype = "stcp"\n' "$name"
             printf 'sk = "%s"\n' "$sk"
             printf 'local_ip = "127.0.0.1"\nlocal_port = %s\n' "$echo_port"
-            if $has_enc; then printf 'use_encryption = true\n'; fi
-            if $has_comp; then printf 'use_compression = true\n'; fi
+            # STCP fallback proxy is always plain relay — encryption is P2P-only
         } > "$out"
     fi
 }
@@ -875,8 +873,7 @@ write_frpc_config_xtcp_visitor() {
             printf 'serverName = "%s-stcp"\n' "$server_name"
             printf 'secretKey = "%s"\n' "$sk"
             printf 'bindAddr = "127.0.0.1"\nbindPort = -1\n'
-            if $has_enc; then printf 'transport.useEncryption = true\n'; fi
-            if $has_comp; then printf 'transport.useCompression = true\n'; fi
+            # STCP fallback visitor is always plain relay — encryption is P2P-only
         } > "$out"
     else
         {
