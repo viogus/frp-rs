@@ -356,34 +356,12 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     if let Some(sid) = swc.nat_hole_sid.clone() {
                         if sid.is_empty() {
                             // STCP fallback marker from Rust frps.
-                            // Server sent a dummy NatHoleSid V1 frame after
-                            // StartWorkConn for Go frpc compat. Consume it
-                            // before entering bridge mode so it doesn't leak
-                            // as garbage data to the local service.
-                            if !v2 {
-                                // Read and discard the dummy NatHoleSid frame.
-                                // Use the raw V1 read path since we don't need
-                                // to deserialize — just skip past it.
-                                use tokio::io::AsyncReadExt;
-                                let mut header = [0u8; 9];
-                                match work.read_exact(&mut header).await {
-                                    Ok(_) if header[0] == msg::TYPE_NAT_HOLE_SID => {
-                                        let length = i64::from_be_bytes(header[1..9].try_into().unwrap());
-                                        if length > 0 && length <= frp_core::protocol::V1_MAX_MSG_LENGTH {
-                                            let mut payload = vec![0u8; length as usize];
-                                            let _ = work.read_exact(&mut payload).await;
-                                        }
-                                        debug!("XTCP work conn {}: consumed STCP fallback NatHoleSid (Go frpc compat)", label);
-                                    }
-                                    Ok(_) => {
-                                        // Unexpected type byte — wrap consumed header.
-                                        work = IoStream::BufferedRead(header.to_vec(), 0, Box::new(work));
-                                    }
-                                    Err(_) => {
-                                        // Header read failed — bridge will get partial data.
-                                    }
-                                }
-                            }
+                            // nat_hole_sid: Some("") (empty string) signals
+                            // that this work conn is for STCP bridging, not
+                            // XTCP notification. No dummy frame follows —
+                            // the StartWorkConn payload is immediately
+                            // followed by bridge data.
+                            debug!("XTCP work conn {}: STCP fallback for '{}'", label, proxy_name);
                             // Fall through to bridging
                         } else {
                             debug!("XTCP work conn {}: NatHoleSid in StartWorkConn for '{}'", label, proxy_name);

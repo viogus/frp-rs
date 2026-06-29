@@ -283,24 +283,11 @@ pub(crate) async fn assign_work_to_proxy(
         return;
     }
 
-    // For XTCP proxies: send a dummy NatHoleSid frame after StartWorkConn
-    // for Go frpc compat. Go frpc's InWorkConn ALWAYS reads NatHoleSid after
-    // StartWorkConn; without this frame it reads raw bridge data and crashes
-    // with "message type error". The dummy frame has an empty sid so Go frpc
-    // doesn't get a valid session — it will retry hole punch (which fails in
-    // colocated CI) instead of crashing.
-    // Rust frpc detects the empty nat_hole_sid marker in StartWorkConn and
-    // consumes this dummy frame before bridging.
-    if req.proxy_type == "xtcp" {
-        let dummy_nhs = FrpMessage::NatHoleSid(msg::NatHoleSid {
-            sid: Some(String::new()),
-            provider_addr: None,
-        });
-        // Always write as V1 — Go frp doesn't support V2.
-        if let Err(e) = work_conn.write_v1_frame(&dummy_nhs).await {
-            debug!("Failed to send STCP fallback NatHoleSid (non-fatal): {}", e);
-        }
-    }
+    // For XTCP STCP fallback: no dummy NatHoleSid frame needed.
+    // The StartWorkConn's nat_hole_sid: Some("") (empty string) is the sole
+    // signal to the Rust frpc provider that this is an STCP fallback bridge.
+    // Go frpc provider already cannot do XTCP STCP fallback (InWorkConn always
+    // expects a real NatHoleSid), so the dummy frame served no purpose.
 
     info!("Bridging user conn to work conn for proxy '{}' (type={})", req.proxy_name, req.proxy_type);
 
