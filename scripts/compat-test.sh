@@ -2217,7 +2217,19 @@ run_xtcp_test() {
     else
         RUST_LOG=debug "$RUST_FRPC" -c "$TEST_DIR/$name/frpc-visitor.toml" \
             > "$TEST_DIR/$name/frpc-visitor.log" 2>&1 &
-        track_pid $!
+        local _rpid=$!
+        track_pid $_rpid
+        # Quick health check: if frpc exits immediately, the log will show the error
+        sleep 1
+        if ! kill -0 $_rpid 2>/dev/null; then
+            wait $_rpid 2>/dev/null || true
+            local _rc=$?
+            fail_test "$name" "Rust frpc visitor PID $_rpid exited immediately (rc=$_rc)"
+            if [[ -n "${XTCP_FRPS_REMOTE:-}" ]]; then
+                bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "$ssh_key_path" "$shard_index" || true
+            fi
+            return
+        fi
     fi
 
     # XTCP NAT hole punch coordination time
