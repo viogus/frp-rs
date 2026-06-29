@@ -417,8 +417,13 @@ impl ControlConnection {
                     return Ok(resp);
                 }
                 FrpMessage::ReqWorkConn(_) => {
-                    debug!("Skipping ReqWorkConn during visitor registration");
-                    continue;
+                    // Go frps v0.69.1 responds to NewVisitorConn with ReqWorkConn
+                    // instead of NewVisitorConnResp. Treat as success.
+                    info!("Visitor '{}' registered (Go frps compat: ReqWorkConn after NewVisitorConn)", v.name);
+                    return Ok(msg::NewVisitorConnResp {
+                        proxy_name: v.server_name.clone(),
+                        error: None,
+                    });
                 }
                 other => {
                     warn!("Unexpected message during NewVisitorConn registration for '{}': {:?}", v.name, other);
