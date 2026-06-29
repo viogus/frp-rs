@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use tokio::net::{TcpStream, TcpSocket};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 use tracing::{info, warn, debug};
 
@@ -84,6 +85,7 @@ pub(crate) async fn run_visitor_listener(
     max_retries_an_hour: i32,
     min_retry_interval: i64,
     stun_server: String,
+    visitor_tx: mpsc::UnboundedSender<crate::service::VisitorRequest>,
 ) {
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
@@ -109,9 +111,10 @@ pub(crate) async fn run_visitor_listener(
                 let tls_ca = tls_ca_file.clone();
                 let vt = visitor_type.clone();
                 let stun_server = stun_server.clone();
+                let vtx = visitor_tx.clone();
 
                 tokio::spawn(async move {
-                    // Connect to the server
+                    // Dial options for STCP fallback (fresh connections only).
                     let opts = DialOptions {
                         server_addr: sa.clone(),
                         server_port: sp,
@@ -123,7 +126,11 @@ pub(crate) async fn run_visitor_listener(
                     };
 
                     if vt == "xtcp" {
-                        // --- XTCP NAT hole punch path (Go frp v0.69.1 two-phase compat) ---
+                        // --- XTCP NAT hole punch via control connection ---
+                        // Go frps v0.69.1 only handles NatHoleVisitor on the existing
+                        // control connection path, not on fresh TCP connections.
+                        // We send the message through the control loop and receive the
+                        // NatHoleResp via a oneshot channel.
                         let max_retries = if keep_tunnel_open { max_retries_an_hour.max(0) as usize } else { 0 };
                         let retry_delay = Duration::from_secs(min_retry_interval.max(1) as u64);
                         let mut hole_punch_ok = false;
@@ -137,59 +144,6 @@ pub(crate) async fn run_visitor_listener(
                                 tokio::time::sleep(retry_delay).await;
                             }
 
-                            // --- Phase 1: PreCheck ---
-                            let mut precheck_conn = match dial_server(&opts).await {
-                                Ok(io) => io,
-                                Err(e) => {
-                                    warn!("Visitor '{}': precheck dial failed: {}", visitor_name, e);
-                                    if keep_tunnel_open && attempt < max_retries { continue; }
-                                    return;
-                                }
-                            };
-                            let precheck_txn = uuid::Uuid::new_v4().to_string();
-                            let nhv = FrpMessage::NatHoleVisitor(msg::NatHoleVisitor {
-                                transaction_id: precheck_txn,
-                                proxy_name: sn.clone(),
-                                pre_check: true,
-                                ..Default::default()
-                            });
-                            if let Err(e) = precheck_conn.write_v1_frame(&nhv).await {
-                                warn!("Visitor '{}': precheck send failed: {}", visitor_name, e);
-                                if keep_tunnel_open && attempt < max_retries { continue; }
-                                return;
-                            }
-                            debug!("Visitor '{}': sent NatHoleVisitor pre_check for '{}'", visitor_name, sn);
-
-                            // SAFETY: pre_check is an optimization — Go frps v0.69.1 does not
-                            // respond to pre_check=true messages, closing the connection
-                            // with early-eof. Fall through to full NatHoleVisitor phase
-                            // instead of aborting. Proxy validation still happens in Phase 2.
-                            let _precheck_ok = match precheck_conn.read_v1_frame().await {
-                                Ok(FrpMessage::NatHoleResp(resp)) => {
-                                    if let Some(err) = resp.error {
-                                        warn!("Visitor '{}': precheck error: {}", visitor_name, err);
-                                        if keep_tunnel_open && attempt < max_retries { continue; }
-                                        // Server rejected proxy — skip precheck, try full phase
-                                        // (might be transient; full phase validates again)
-                                        false
-                                    } else {
-                                        debug!("Visitor '{}': precheck OK", visitor_name);
-                                        true
-                                    }
-                                }
-                                Ok(other) => {
-                                    warn!("Visitor '{}': unexpected precheck response 0x{:02x} (server may not support precheck)",
-                                        visitor_name, other.v1_type_byte());
-                                    false
-                                }
-                                Err(e) => {
-                                    warn!("Visitor '{}': precheck read failed: {} (server may not support precheck)",
-                                        visitor_name, e);
-                                    false
-                                }
-                            };
-                            drop(precheck_conn);
-
                             // --- STUN Discovery ---
                             let mapped_addrs = match frp_core::stun::stun_binding(&stun_server.clone()).await {
                                 Ok(addr) => {
@@ -202,80 +156,71 @@ pub(crate) async fn run_visitor_listener(
                                 }
                             };
 
-                            // --- Phase 2: Full NatHoleVisitor ---
-                            let mut full_conn = match dial_server(&opts).await {
-                                Ok(io) => io,
-                                Err(e) => {
-                                    warn!("Visitor '{}': full phase dial failed: {}", visitor_name, e);
+                            // --- Send NatHoleVisitor on control connection ---
+                            let txn_id = uuid::Uuid::new_v4().to_string();
+                            let (reply_tx, reply_rx) = oneshot::channel();
+                            let nhv = crate::service::VisitorRequest {
+                                nhv: msg::NatHoleVisitor {
+                                    transaction_id: txn_id.clone(),
+                                    proxy_name: sn.clone(),
+                                    pre_check: false,
+                                    protocol: Some("tcp".to_string()),
+                                    mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
+                                    ..Default::default()
+                                },
+                                reply: reply_tx,
+                            };
+                            if let Err(_) = vtx.send(nhv) {
+                                warn!("Visitor '{}': failed to send NatHoleVisitor to control loop (channel closed)", visitor_name);
+                                return;
+                            }
+                            debug!("Visitor '{}': sent NatHoleVisitor on control connection for '{}'", visitor_name, sn);
+
+                            // --- Wait for NatHoleResp from control loop ---
+                            let resp = match reply_rx.await {
+                                Ok(Ok(resp)) => resp,
+                                Ok(Err(e)) => {
+                                    warn!("Visitor '{}': NatHoleResp error from server: {}", visitor_name, e);
+                                    if keep_tunnel_open && attempt < max_retries { continue; }
+                                    return;
+                                }
+                                Err(_) => {
+                                    warn!("Visitor '{}': NatHoleResp channel closed (control loop dropped)", visitor_name);
                                     if keep_tunnel_open && attempt < max_retries { continue; }
                                     return;
                                 }
                             };
-                            let txn_id = uuid::Uuid::new_v4().to_string();
-                            let nhv2 = FrpMessage::NatHoleVisitor(msg::NatHoleVisitor {
-                                transaction_id: txn_id,
-                                proxy_name: sn.clone(),
-                                pre_check: false,
-                                protocol: Some("tcp".to_string()),
-                                mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
-                                ..Default::default()
-                            });
-                            if let Err(e) = full_conn.write_v1_frame(&nhv2).await {
-                                warn!("Visitor '{}': full NatHoleVisitor send failed: {}", visitor_name, e);
-                                if keep_tunnel_open && attempt < max_retries { continue; }
-                                return;
-                            }
-                            debug!("Visitor '{}': sent full NatHoleVisitor for '{}'", visitor_name, sn);
+                            debug!("Visitor '{}': received NatHoleResp from server", visitor_name);
 
-                            // Read NatHoleResp with provider's candidate addresses
-                            match full_conn.read_v1_frame().await {
-                                Ok(FrpMessage::NatHoleResp(resp)) => {
-                                    if let Some(err) = resp.error {
-                                        warn!("Visitor '{}': NatHoleResp error: {}", visitor_name, err);
-                                        if keep_tunnel_open && attempt < max_retries { continue; }
-                                        return;
-                                    }
-                                    let candidates = resp.candidate_addrs.unwrap_or_default();
-                                    debug!("Visitor '{}': got {} candidate addresses from server", visitor_name, candidates.len());
+                            let candidates = resp.candidate_addrs.unwrap_or_default();
+                            debug!("Visitor '{}': got {} candidate addresses from server", visitor_name, candidates.len());
 
-                                    // TCP simultaneous open to each candidate
-                                    for addr in &candidates {
-                                        debug!("Visitor '{}': trying simultaneous open to {}", visitor_name, addr);
-                                        match tcp_simultaneous_open(addr, fallback_timeout_ms).await {
-                                            Ok(p2p_stream) => {
-                                                info!("Visitor '{}': XTCP P2P connected to {}", visitor_name, addr);
-                                                let mut p2p = p2p_stream;
-                                                match tokio::io::copy_bidirectional(&mut user_conn, &mut p2p).await {
-                                                    Ok((to_p2p, to_user)) => {
-                                                        debug!("Visitor '{}' XTCP closed: {}B to P2P, {}B to user",
-                                                            visitor_name, to_p2p, to_user);
-                                                    }
-                                                    Err(e) => {
-                                                        debug!("Visitor '{}' XTCP bridge error: {}", visitor_name, e);
-                                                    }
-                                                }
-                                                hole_punch_ok = true;
-                                                break; // P2P succeeded
+                            // TCP simultaneous open to each candidate
+                            for addr in &candidates {
+                                debug!("Visitor '{}': trying simultaneous open to {}", visitor_name, addr);
+                                match tcp_simultaneous_open(addr, fallback_timeout_ms).await {
+                                    Ok(p2p_stream) => {
+                                        info!("Visitor '{}': XTCP P2P connected to {}", visitor_name, addr);
+                                        let mut p2p = p2p_stream;
+                                        match tokio::io::copy_bidirectional(&mut user_conn, &mut p2p).await {
+                                            Ok((to_p2p, to_user)) => {
+                                                debug!("Visitor '{}' XTCP closed: {}B to P2P, {}B to user",
+                                                    visitor_name, to_p2p, to_user);
                                             }
                                             Err(e) => {
-                                                debug!("Visitor '{}': hole punch to {} failed: {}", visitor_name, addr, e);
+                                                debug!("Visitor '{}' XTCP bridge error: {}", visitor_name, e);
                                             }
                                         }
+                                        hole_punch_ok = true;
+                                        break; // P2P succeeded
                                     }
-                                    if hole_punch_ok {
-                                        break; // Exit retry loop
+                                    Err(e) => {
+                                        debug!("Visitor '{}': hole punch to {} failed: {}", visitor_name, addr, e);
                                     }
                                 }
-                                Ok(other) => {
-                                    warn!("Visitor '{}': unexpected NatHole response 0x{:02x}", visitor_name, other.v1_type_byte());
-                                    if keep_tunnel_open && attempt < max_retries { continue; }
-                                    return;
-                                }
-                                Err(e) => {
-                                    warn!("Visitor '{}': read NatHoleResp failed: {}", visitor_name, e);
-                                    if keep_tunnel_open && attempt < max_retries { continue; }
-                                    return;
-                                }
+                            }
+                            if hole_punch_ok {
+                                break; // Exit retry loop
                             }
                         }
 

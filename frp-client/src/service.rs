@@ -2,7 +2,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock, oneshot};
+
+/// Internal request from a visitor task to the control loop.
+/// Visitor sends NatHoleVisitor on the control connection (Go frps compat:
+/// fresh TCP connections with NatHoleVisitor are not handled by Go frps v0.69.1).
+/// The oneshot delivers the server's NatHoleResp back to the waiting visitor.
+pub(crate) struct VisitorRequest {
+    pub nhv: msg::NatHoleVisitor,
+    pub reply: oneshot::Sender<Result<msg::NatHoleResp, String>>,
+}
 use tokio::time::{interval, Duration};
 use tracing::{info, warn, debug};
 use rand::Rng;
@@ -46,10 +55,15 @@ pub struct Service {
     reload_rx: Mutex<Option<mpsc::UnboundedReceiver<ReloadRequest>>>,
     /// STUN server address for XTCP NAT traversal.
     nat_hole_stun_server: String,
-    /// Channel from work connection tasks to the control loop for XTCP.
+    /// Channel from work connection tasks to the control loop for XTCP (provider side).
     xtcp_tx: mpsc::UnboundedSender<XtcpNotification>,
     /// Receiver side of XTCP channel — consumed by run().
     xtcp_rx: Mutex<Option<mpsc::UnboundedReceiver<XtcpNotification>>>,
+    /// Channel from visitor tasks to the control loop (Go frps compat:
+    /// NatHoleVisitor is sent on the control connection, not fresh TCP).
+    visitor_tx: mpsc::UnboundedSender<VisitorRequest>,
+    /// Receiver side of visitor channel — consumed by run().
+    visitor_rx: Mutex<Option<mpsc::UnboundedReceiver<VisitorRequest>>>,
 }
 
 impl Service {
@@ -233,6 +247,7 @@ impl Service {
 
         let (reload_tx, reload_rx) = mpsc::unbounded_channel::<ReloadRequest>();
         let (xtcp_tx, xtcp_rx) = mpsc::unbounded_channel::<XtcpNotification>();
+        let (visitor_tx, visitor_rx) = mpsc::unbounded_channel::<VisitorRequest>();
 
         let nat_hole_stun_server = if cfg.nat_hole_stun_server.is_empty() {
             "stun:stun.l.google.com:19302".to_string()
@@ -255,6 +270,8 @@ impl Service {
             nat_hole_stun_server,
             xtcp_tx,
             xtcp_rx: Mutex::new(Some(xtcp_rx)),
+            visitor_tx,
+            visitor_rx: Mutex::new(Some(visitor_rx)),
         })
     }
 
@@ -375,6 +392,8 @@ impl Service {
             .expect("reload_rx already taken — run() called twice?");
         let mut xtcp_rx = self.xtcp_rx.lock().await.take()
             .expect("xtcp_rx already taken — run() called twice?");
+        let mut visitor_rx = self.visitor_rx.lock().await.take()
+            .expect("visitor_rx already taken — run() called twice?");
         let xtcp_tx = self.xtcp_tx.clone();
         let nat_hole_stun_server = self.nat_hole_stun_server.clone();
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel::<()>();
@@ -615,16 +634,19 @@ impl Service {
                 let max_retries_an_hour = v.max_retries_an_hour;
                 let min_retry_interval = v.min_retry_interval;
                 let stun_server = nat_hole_stun_server.clone();
+                let vtx = self.visitor_tx.clone();
                 tokio::spawn(async move {
                     crate::visitor::run_visitor_listener(sa, sp, pt, server_name, secret_key, bind_addr, use_enc, use_comp, name,
                         tls_enable, tls_server_name, tls_ca_file, visitor_type, fallback_timeout_ms,
-                        keep_tunnel_open, max_retries_an_hour, min_retry_interval, stun_server).await;
+                        keep_tunnel_open, max_retries_an_hour, min_retry_interval, stun_server, vtx).await;
                 });
             }
 
             // --- Message loop ---
-            // Map sid -> proxy_name for XTCP NatHoleResp routing.
+            // Map sid -> proxy_name for XTCP NatHoleResp routing (provider side).
             let mut pending_xtcp: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            // Map sid -> oneshot sender for visitor NatHoleResp routing (Go frps compat).
+            let mut visitor_pending: std::collections::HashMap<String, oneshot::Sender<Result<msg::NatHoleResp, String>>> = std::collections::HashMap::new();
             let ping_secs = self.cfg.heartbeat_interval.max(1) as u64;
         info!("Heartbeat interval: {}s", ping_secs);
         let mut ping_interval = interval(Duration::from_secs(ping_secs));
@@ -757,6 +779,13 @@ impl Service {
                                 }
                             }
                             Ok(FrpMessage::NatHoleResp(resp)) => {
+                                // Route to waiting visitor first (Go frps compat path).
+                                let sid = resp.sid.clone().unwrap_or_default();
+                                if let Some(tx) = visitor_pending.remove(&sid) {
+                                    info!("XTCP visitor: received NatHoleResp for sid '{}'", sid);
+                                    let _ = tx.send(Ok(resp));
+                                    continue;
+                                }
                                 // Provider receives server's analysis with visitor's candidate addresses.
                                 if let Some(err) = resp.error {
                                     warn!("XTCP NatHoleResp error: {}", err);
@@ -766,7 +795,6 @@ impl Service {
                                     }
                                     continue;
                                 }
-                                let sid = resp.sid.clone().unwrap_or_default();
                                 let proxy_name = pending_xtcp.remove(&sid).unwrap_or_default();
                                 if proxy_name.is_empty() {
                                     warn!("XTCP NatHoleResp: unknown sid '{}'", sid);
@@ -924,6 +952,24 @@ impl Service {
                         } else {
                             // Track sid→proxy_name for NatHoleResp routing
                             pending_xtcp.insert(sid, proxy_name);
+                        }
+                    }
+
+                    // Visitor requests: send NatHoleVisitor on control connection.
+                    // Go frps v0.69.1 only handles NatHoleVisitor on the control
+                    // connection path, not on fresh TCP connections.
+                    Some(vreq) = visitor_rx.recv() => {
+                        let txn_id = vreq.nhv.transaction_id.clone();
+                        let nhv = FrpMessage::NatHoleVisitor(vreq.nhv);
+                        match write_msg(&mut *writer.lock().await, &nhv, v2).await {
+                            Ok(()) => {
+                                debug!("Visitor: sent NatHoleVisitor on control, sid={}", txn_id);
+                                visitor_pending.insert(txn_id, vreq.reply);
+                            }
+                            Err(e) => {
+                                warn!("Visitor: failed to send NatHoleVisitor on control: {}", e);
+                                let _ = vreq.reply.send(Err(format!("send failed: {e}")));
+                            }
                         }
                     }
 
