@@ -779,6 +779,50 @@ pub async fn handle_control<S>(
                         }
                         debug!("Ping from {:?}", peer);
                     }
+                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                        debug!("NewVisitorConn on control channel: proxy='{}'", nvc.proxy_name);
+                        // Visitor registration on the control connection.
+                        // Rust frpc sends NewVisitorConn on control before sending
+                        // NatHoleVisitor for XTCP hole punching. Go frps v0.69.1
+                        // responds with ReqWorkConn but we send NewVisitorConnResp
+                        // with no error — the visitor just needs acknowledgment.
+                        let sign_key = nvc.sign_key.unwrap_or_default();
+                        let timestamp = nvc.timestamp.unwrap_or(0);
+
+                        // Validate proxy exists and sign_key matches
+                        let ok = if let Some(proxy_info) = state.proxy_manager.get(&nvc.proxy_name).await {
+                            if let Some(ref sk) = proxy_info.sk {
+                                if sk.is_empty() {
+                                    true // No sk — allow without auth
+                                } else {
+                                    let expected = frp_core::auth::generate_token(sk, timestamp);
+                                    expected == sign_key
+                                }
+                            } else {
+                                true // No sk configured
+                            }
+                        } else {
+                            false // Proxy not found
+                        };
+
+                        if ok {
+                            info!("Visitor '{}' registered on control channel for proxy '{}'",
+                                nvc.proxy_name, nvc.proxy_name);
+                            // Go frps v0.69.1 compat: respond with ReqWorkConn.
+                            // Rust frpc control.rs register_visitor() treats
+                            // ReqWorkConn as success (just like Go frps does).
+                            let rwc = FrpMessage::ReqWorkConn(msg::ReqWorkConn {});
+                            let _ = write_ctl_msg(&mut writer, &rwc, v2).await;
+                        } else {
+                            warn!("NewVisitorConn auth failed on control channel for proxy '{}'",
+                                nvc.proxy_name);
+                            let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
+                                proxy_name: nvc.proxy_name.clone(),
+                                error: Some("auth failed".into()),
+                            });
+                            let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                        }
+                    }
                     Ok(FrpMessage::NatHoleVisitor(nhv)) => {
                         debug!("NatHoleVisitor on control channel: proxy='{}', txn='{}'",
                             nhv.proxy_name, nhv.transaction_id);
