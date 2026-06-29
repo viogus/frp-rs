@@ -3356,7 +3356,7 @@ test_r2g_ws_encrypted() {
 # =============================================================================
 # Test: Go frpc -> Rust frps, WSS transport
 # =============================================================================
-test_wss_g2r_plain() {
+test_g2r_wss_plain() {
     local name="go-to-rust-wss-plain"
     should_run_test "$name" || return 0
 
@@ -3405,7 +3405,7 @@ test_wss_g2r_plain() {
 # =============================================================================
 # Test: Rust frpc -> Go frps, WSS transport
 # =============================================================================
-test_wss_r2g_plain() {
+test_r2g_wss_plain() {
     local name="rust-to-go-wss-plain"
     should_run_test "$name" || return 0
 
@@ -3454,7 +3454,7 @@ test_wss_r2g_plain() {
 # =============================================================================
 # Test: Go frpc -> Rust frps, WSS transport + encryption
 # =============================================================================
-test_wss_g2r_enc() {
+test_g2r_wss_encrypted() {
     local name="go-to-rust-wss-encrypted"
     should_run_test "$name" || return 0
 
@@ -3503,7 +3503,7 @@ test_wss_g2r_enc() {
 # =============================================================================
 # Test: Rust frpc -> Go frps, WSS transport + encryption
 # =============================================================================
-test_wss_r2g_enc() {
+test_r2g_wss_encrypted() {
     local name="rust-to-go-wss-encrypted"
     should_run_test "$name" || return 0
 
@@ -4027,10 +4027,10 @@ run_test test_g2r_ws_encrypted
 run_test test_r2g_ws_encrypted
 
 # Phase 6b: WebSocket Secure (WSS) transport
-run_test test_wss_g2r_plain
-run_test test_wss_r2g_plain
-run_test test_wss_g2r_enc
-run_test test_wss_r2g_enc
+run_test test_g2r_wss_plain
+run_test test_r2g_wss_plain
+run_test test_g2r_wss_encrypted
+run_test test_r2g_wss_encrypted
 
 # Phase 7: Plugin
 run_test test_g2r_socks5
