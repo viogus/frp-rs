@@ -302,6 +302,17 @@ pub async fn handle_control<S>(
                             });
                             if let Err(e) = write_ctl_msg(&mut stream, &swc, v2).await {
                                 warn!("Failed to send pending StartWorkConn with NatHoleSid: {}", e);
+                            } else {
+                                // Also send a separate NatHoleSid V1 frame for Go frpc compat.
+                                // Go frp ignores unknown JSON fields (embedded nat_hole_sid),
+                                // so it needs the standalone frame to recognize the XTCP notification.
+                                let nhs = FrpMessage::NatHoleSid(msg::NatHoleSid {
+                                    sid: Some(sid.clone()),
+                                    provider_addr: None,
+                                });
+                                if let Err(e) = write_ctl_msg(&mut stream, &nhs, v2).await {
+                                    debug!("Failed to send separate NatHoleSid frame (non-fatal): {}", e);
+                                }
                             }
                             // Work conn consumed for XTCP notification — drop it.
                         } else {
@@ -487,7 +498,19 @@ pub async fn handle_control<S>(
                             if let Err(e) = write_ctl_msg(&mut work_conn, &swc, v2).await {
                                 warn!("Failed to send StartWorkConn with NatHoleSid on work conn: {}", e);
                             } else {
-                                debug!("Sent StartWorkConn with NatHoleSid {} to provider on work conn", sid);
+                                debug!("Sent StartWorkConn with embedded NatHoleSid {} to provider on work conn", sid);
+                                // Also send a separate NatHoleSid V1 frame for Go frpc compat.
+                                // Go frp ignores unknown JSON fields (embedded nat_hole_sid),
+                                // so it needs the standalone frame to recognize the XTCP notification.
+                                // Rust frpc checks the embedded field first and returns early,
+                                // so the separate frame is harmlessly dropped with the connection.
+                                let nhs = FrpMessage::NatHoleSid(msg::NatHoleSid {
+                                    sid: Some(sid.clone()),
+                                    provider_addr: None,
+                                });
+                                if let Err(e) = write_ctl_msg(&mut work_conn, &nhs, v2).await {
+                                    debug!("Failed to send separate NatHoleSid frame (non-fatal): {}", e);
+                                }
                             }
                             // Connection consumed — Go frp doesn't reuse after NatHoleSid.
                             drop(work_conn);
