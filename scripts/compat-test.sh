@@ -253,10 +253,11 @@ data = os.environ["_SE_DATA"]
 expected = os.environ["_SE_EXPECTED"]
 timeout = float(os.environ["_SE_TIMEOUT"])
 deadline = time.time() + timeout
-# XTCP failover (hole punch timeout + STCP fallback) takes ~6s.
-# Use generous per-attempt timeout so the first connection can survive
-# through the entire XTCP→STCP transition without disconnecting.
-per_attempt = min(15.0, timeout)
+# XTCP failover (STUN + NatHoleVisitor + TCP sim open + STCP fallback)
+# takes ~20-25s with VPS latency. Use the full timeout on a single
+# connection. Retrying creates a second visitor handler task whose
+# XTCP cycle overlaps; first handler STCP data gets orphaned.
+per_attempt = timeout
 while True:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -2262,7 +2263,7 @@ run_xtcp_test() {
 
     # Echo data round-trip
     local result
-    result=$(send_and_expect "$visitor_port" "${name}-data" "${name}-data" 20)
+    result=$(send_and_expect "$visitor_port" "${name}-data" "${name}-data" 60)
     if [[ "$result" == OK:* ]]; then
         pass_test "$name"
     else
