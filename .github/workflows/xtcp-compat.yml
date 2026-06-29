@@ -60,8 +60,10 @@ jobs:
             ~/.cargo/git/db/
             target/release/
             /tmp/frp_0.69.1_linux_amd64/
-          key: ${{ runner.os }}-xtcp-${{ hashFiles('Cargo.lock') }}-v1
-          restore-keys: ${{ runner.os }}-xtcp-
+          key: ${{ runner.os }}-xtcp-${{ hashFiles('**/Cargo.toml') }}-v2
+          restore-keys: |
+            ${{ runner.os }}-xtcp-${{ hashFiles('**/Cargo.toml') }}-
+            ${{ runner.os }}-xtcp-
 
       - name: Build frp-rs (release)
         if: steps.check.outputs.configured == 'true'
