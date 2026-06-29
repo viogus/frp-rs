@@ -234,6 +234,7 @@ impl Service {
                 proxy_type: p.proxy_type.clone(),
                 use_encryption: p.use_encryption,
                 use_compression: p.use_compression,
+                sk: p.sk.clone(),
                 bandwidth_limit: bw_limit,
                 bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
                 proxy_protocol_version: p.proxy_protocol_version.clone(),
@@ -724,9 +725,13 @@ impl Service {
                                 let visitor_addr = nhc.visitor_addr.unwrap_or_default();
                                 let proxy_name = nhc.proxy_name.clone();
                                 let sid = nhc.transaction_id.clone();
-                                let local_addr = self.proxy_info_map.read().await
+                                let proxy_info = self.proxy_info_map.read().await
                                     .get(&proxy_name)
-                                    .map(|p| p.local_addr.clone());
+                                    .map(|p| (p.local_addr.clone(), p.use_encryption, p.use_compression, p.sk.clone()));
+                                let local_addr = proxy_info.as_ref().map(|p| p.0.clone());
+                                let xtcp_use_enc = proxy_info.as_ref().map(|p| p.1).unwrap_or(false);
+                                let xtcp_use_comp = proxy_info.as_ref().map(|p| p.2).unwrap_or(false);
+                                let xtcp_sk = proxy_info.as_ref().map(|p| p.3.clone()).unwrap_or_default();
 
                                 if visitor_addr.is_empty() {
                                     warn!("NatHoleClient without visitor_addr for '{}'", proxy_name);
@@ -754,17 +759,26 @@ impl Service {
                                         if let Some(ref local) = local_addr {
                                             match tokio::net::TcpStream::connect(local).await {
                                                 Ok(local_stream) => {
+                                                    let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
+                                                    let use_comp = xtcp_use_comp;
+                                                    let sk = xtcp_sk.clone();
+                                                    let pn = proxy_name.clone();
                                                     tokio::spawn(async move {
-                                                        let mut p2p = p2p_stream;
-                                                        let mut local = local_stream;
-                                                        match tokio::io::copy_bidirectional(&mut p2p, &mut local).await {
-                                                            Ok((to_local, to_p2p)) => {
-                                                                debug!("XTCP provider '{}' closed: {}B to local, {}B to P2P",
-                                                                    proxy_name, to_local, to_p2p);
-                                                            }
-                                                            Err(e) => {
-                                                                debug!("XTCP provider '{}' bridge error: {}", proxy_name, e);
-                                                            }
+                                                        let (p2p_r, p2p_w) = p2p_stream.into_split();
+                                                        let (local_r, local_w) = local_stream.into_split();
+                                                        if use_enc {
+                                                            let key = frp_core::encryption::derive_key(&sk);
+                                                            frp_core::bridge::bridge_encrypted(
+                                                                local_r, local_w, p2p_r, p2p_w,
+                                                                &key, use_comp, vec![], None, None, None,
+                                                            ).await;
+                                                            debug!("XTCP provider '{}' encrypted P2P closed", pn);
+                                                        } else {
+                                                            frp_core::bridge::bridge_plain(
+                                                                local_r, local_w, p2p_r, p2p_w,
+                                                                use_comp, vec![], None,
+                                                            ).await;
+                                                            debug!("XTCP provider '{}' P2P closed", pn);
                                                         }
                                                     });
                                                     // Don't send NatHoleReport — Go frp uses implicit success.
@@ -831,27 +845,39 @@ impl Service {
                                     proxy_name, candidate_addrs.len());
 
                                 // Spawn hole punch task (don't block control loop)
-                                let local_addr = self.proxy_info_map.read().await
+                                let proxy_info = self.proxy_info_map.read().await
                                     .get(&proxy_name)
-                                    .map(|p| p.local_addr.clone());
+                                    .map(|p| (p.local_addr.clone(), p.use_encryption, p.use_compression, p.sk.clone()));
+                                let local_addr = proxy_info.as_ref().map(|p| p.0.clone());
+                                let xtcp_use_enc = proxy_info.as_ref().map(|p| p.1).unwrap_or(false);
+                                let xtcp_use_comp = proxy_info.as_ref().map(|p| p.2).unwrap_or(false);
+                                let xtcp_sk = proxy_info.as_ref().map(|p| p.3.clone()).unwrap_or_default();
                                 let proxy_name_clone = proxy_name.clone();
                                 tokio::spawn(async move {
                                     for addr in &candidate_addrs {
                                         debug!("XTCP provider '{}': trying simultaneous open to {}", proxy_name_clone, addr);
                                         match crate::visitor::tcp_simultaneous_open(addr, 5000).await {
-                                            Ok(mut p2p) => {
+                                            Ok(p2p) => {
                                                 info!("XTCP provider '{}': P2P connected to {}", proxy_name_clone, addr);
                                                 if let Some(ref local) = local_addr {
                                                     match tokio::net::TcpStream::connect(local).await {
-                                                        Ok(mut local_conn) => {
-                                                            match tokio::io::copy_bidirectional(&mut p2p, &mut local_conn).await {
-                                                                Ok((to_local, to_p2p)) => {
-                                                                    debug!("XTCP provider '{}' closed: {}B to local, {}B to P2P",
-                                                                        proxy_name_clone, to_local, to_p2p);
-                                                                }
-                                                                Err(e) => {
-                                                                    debug!("XTCP provider '{}' bridge error: {}", proxy_name_clone, e);
-                                                                }
+                                                        Ok(local_conn) => {
+                                                            let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
+                                                            let (p2p_r, p2p_w) = p2p.into_split();
+                                                            let (local_r, local_w) = local_conn.into_split();
+                                                            if use_enc {
+                                                                let key = frp_core::encryption::derive_key(&xtcp_sk);
+                                                                frp_core::bridge::bridge_encrypted(
+                                                                    local_r, local_w, p2p_r, p2p_w,
+                                                                    &key, xtcp_use_comp, vec![], None, None, None,
+                                                                ).await;
+                                                                debug!("XTCP provider '{}' encrypted P2P closed", proxy_name_clone);
+                                                            } else {
+                                                                frp_core::bridge::bridge_plain(
+                                                                    local_r, local_w, p2p_r, p2p_w,
+                                                                    xtcp_use_comp, vec![], None,
+                                                                ).await;
+                                                                debug!("XTCP provider '{}' P2P closed", proxy_name_clone);
                                                             }
                                                         }
                                                         Err(e) => {

@@ -99,7 +99,7 @@ pub(crate) async fn run_visitor_listener(
 
     loop {
         match listener.accept().await {
-            Ok((mut user_conn, peer)) => {
+            Ok((user_conn, peer)) => {
                 debug!("Visitor '{}': user connection from {}", name, peer);
 
                 let sa = server_addr.clone();
@@ -148,6 +148,8 @@ pub(crate) async fn run_visitor_listener(
                             Duration::from_secs(2) // Quick retry for one-shot mode
                         };
                         let mut hole_punch_ok = false;
+                        // Wrap in Option — P2P success arm moves it out via take().
+                        let mut user_conn = Some(user_conn);
 
                         for attempt in 0..=max_retries {
                             if attempt > 0 {
@@ -236,15 +238,23 @@ pub(crate) async fn run_visitor_listener(
                                 match tcp_simultaneous_open(addr, fallback_timeout_ms).await {
                                     Ok(p2p_stream) => {
                                         info!("Visitor '{}': XTCP P2P connected to {}", visitor_name, addr);
-                                        let mut p2p = p2p_stream;
-                                        match tokio::io::copy_bidirectional(&mut user_conn, &mut p2p).await {
-                                            Ok((to_p2p, to_user)) => {
-                                                debug!("Visitor '{}' XTCP closed: {}B to P2P, {}B to user",
-                                                    visitor_name, to_p2p, to_user);
-                                            }
-                                            Err(e) => {
-                                                debug!("Visitor '{}' XTCP bridge error: {}", visitor_name, e);
-                                            }
+                                        // Encrypt P2P channel if configured (matches Go frp wrapVisitorConn).
+                                        let use_enc = use_encryption && !sk.is_empty();
+                                        let (user_r, user_w) = user_conn.take().unwrap().into_split();
+                                        let (p2p_r, p2p_w) = p2p_stream.into_split();
+                                        if use_enc {
+                                            let key = frp_core::encryption::derive_key(&sk);
+                                            frp_core::bridge::bridge_encrypted(
+                                                user_r, user_w, p2p_r, p2p_w,
+                                                &key, use_compression, vec![], None, None, None,
+                                            ).await;
+                                            debug!("Visitor '{}' XTCP encrypted P2P closed", visitor_name);
+                                        } else {
+                                            frp_core::bridge::bridge_plain(
+                                                user_r, user_w, p2p_r, p2p_w,
+                                                use_compression, vec![], None,
+                                            ).await;
+                                            debug!("Visitor '{}' XTCP closed", visitor_name);
                                         }
                                         hole_punch_ok = true;
                                         break; // P2P succeeded
@@ -262,6 +272,9 @@ pub(crate) async fn run_visitor_listener(
                         if hole_punch_ok {
                             return; // XTCP P2P succeeded
                         }
+
+                        // Unwrap user_conn for STCP fallback (hole punch failed, so not moved).
+                        let user_conn = user_conn.expect("user_conn not consumed when hole_punch_ok=false");
 
                         // --- STCP fallback (hole punch failed) ---
                         // STCP relay via NewVisitorConn on a fresh connection works against
