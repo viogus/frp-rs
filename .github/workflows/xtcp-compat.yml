@@ -67,8 +67,7 @@ jobs:
         if: steps.check.outputs.configured == 'true'
         env:
           RUSTFLAGS: ""   # override setup-rust-toolchain's -D warnings
-          CARGO_PROFILE_RELEASE_LTO: "off"   # CI: LTO too slow on 2-core runners
-        run: cargo build --release --bin frps --bin frpc
+        run: cargo build --release --config 'profile.release.lto=false' --bin frps --bin frpc
 
       - name: Download Go frp
         if: steps.check.outputs.configured == 'true'
