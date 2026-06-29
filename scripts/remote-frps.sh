@@ -65,7 +65,7 @@ find_available_port() {
     for p in $(seq "$port" "$max"); do
         local in_use
         in_use=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-            "ss -tlnp 2>/dev/null | grep ':${p}\b' || true" 2>/dev/null)
+            "ss -tlnp 2>/dev/null | grep ':${p}\b' || true" 2>/dev/null) || true
         if [[ -z "$in_use" ]]; then
             echo "$p"
             return 0
@@ -80,6 +80,7 @@ wait_remote_port() {
     local max_attempts=30
 
     local i
+    echo "DBG: wait_remote_port host=$host port=$port max_attempts=$max_attempts remote_dir=$remote_dir" >&2
     for i in $(seq 1 "$max_attempts"); do
         local listening ssh_rc
         listening=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
@@ -188,7 +189,9 @@ cmd_start() {
 
     # --- Find available port (dies if none in range) ---
     local actual_port
+    echo "DBG: find_available_port host=$host port=$port" >&2
     actual_port=$(find_available_port "$host" "$port" "$ssh_key")
+    echo "DBG: found port=$actual_port" >&2
 
     # --- Determine binary path ---
     local binary_path
@@ -249,6 +252,7 @@ cmd_start() {
     # Quick liveness check: if frps exits immediately (config parse error, etc.),
     # we can fail fast with the log instead of waiting 30s for wait_remote_port.
     sleep 2
+    echo "DBG: checking liveness of frps on $host:$actual_port dir=$remote_dir" >&2
     local alive_check
     alive_check=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
         "pid=\$(cat '$remote_dir/frps.pid' 2>/dev/null); if [ -n \"\$pid\" ] && kill -0 \"\$pid\" 2>/dev/null; then echo alive; else echo dead; fi" 2>/dev/null) || true
@@ -258,6 +262,7 @@ cmd_start() {
             "cat '$remote_dir/frps.log' 2>/dev/null || echo '(no log)'" 2>/dev/null) || true
         die "frps on $host exited immediately after start. frps.log: $early_log"
     fi
+    echo "DBG: alive check passed (result='$alive_check'), entering wait_remote_port" >&2
 
     # --- Wait for frps to be ready ---
     wait_remote_port "$host" "$actual_port" "$ssh_key" "$remote_dir"
