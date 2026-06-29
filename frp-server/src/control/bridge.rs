@@ -285,21 +285,26 @@ pub(crate) async fn assign_work_to_proxy(
         return;
     }
 
-    // For XTCP STCP fallback: send a dummy NatHoleSid V1 frame with
+    // For XTCP STCP fallback: send a dummy NatHoleSid frame with
     // empty sid after StartWorkConn for Go frpc compatibility.
     // Go frpc's InWorkConn expects either an embedded nat_hole_sid in
-    // StartWorkConn JSON (newer frp) or a separate NatHoleSid V1 frame
+    // StartWorkConn JSON (newer frp) or a separate NatHoleSid frame
     // immediately after StartWorkConn (Go frp v0.69.1). Our Rust frpc
-    // provider's byte-peek handles both formats.
+    // provider's byte-peek (V1) / V2 frame read handles both formats.
     // The copy_bidirectional bridge (used for XTCP STCP fallback below)
     // doesn't send a premature FIN, so the provider can safely consume
     // this frame without the old ECONNRESET race.
+    // V2-aware: use V2 or V1 framing based on protocol version.
     if req.proxy_type == "xtcp" {
         let dummy = FrpMessage::NatHoleSid(msg::NatHoleSid {
             sid: None,
             provider_addr: None,
         });
-        let _ = work_conn.write_v1_frame(&dummy).await;
+        if v2 {
+            let _ = work_conn.write_v2_frame(&dummy).await;
+        } else {
+            let _ = work_conn.write_v1_frame(&dummy).await;
+        }
     }
 
     info!("Bridging user conn to work conn for proxy '{}' (type={})", req.proxy_name, req.proxy_type);

@@ -187,10 +187,10 @@ impl Service {
                                                 crate::handlers::handle_work_conn_inner(ws, nwc, state.clone()).await;
                                             }
                                             Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                crate::handlers::handle_visitor_conn_inner(ws, nvc, state.clone()).await;
+                                                crate::handlers::handle_visitor_conn_inner(ws, nvc, state.clone(), false).await;
                                             }
                                             Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                crate::handlers::handle_nat_hole_visitor(ws, nhv, state.clone(), None).await;
+                                                crate::handlers::handle_nat_hole_visitor(ws, nhv, state.clone(), None, false).await;
                                             }
                                             Ok(other) => {
                                                 warn!("Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
@@ -789,10 +789,10 @@ impl Service {
                                                         crate::handlers::handle_work_conn_inner(io, nwc, state).await;
                                                     }
                                                     Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                        crate::handlers::handle_visitor_conn_inner(io, nvc, state).await;
+                                                        crate::handlers::handle_visitor_conn_inner(io, nvc, state, false).await;
                                                     }
                                                     Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                        crate::handlers::handle_nat_hole_visitor(io, nhv, state, None).await;
+                                                        crate::handlers::handle_nat_hole_visitor(io, nhv, state, None, false).await;
                                                     }
                                                     Ok(other) => {
                                                         warn!("Unexpected TLS+yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
@@ -819,12 +819,12 @@ impl Service {
                                         }
                                         Ok(FrpMessage::NewVisitorConn(nvc)) => {
                                             let io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls)));
-                                            crate::handlers::handle_visitor_conn_inner(io, nvc, state).await;
+                                            crate::handlers::handle_visitor_conn_inner(io, nvc, state, false).await;
                                         }
                                         Ok(FrpMessage::NatHoleVisitor(nhv)) => {
                                             let io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls)));
                                             let visitor_addr = Some(addr.to_string());
-                                            crate::handlers::handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
+                                            crate::handlers::handle_nat_hole_visitor(io, nhv, state, visitor_addr, false).await;
                                         }
                                         Ok(other) => {
                                             debug!("Unexpected TLS first message from {}: {:?}", addr, other.v1_type_byte());
@@ -860,10 +860,10 @@ impl Service {
                                                 crate::handlers::handle_work_conn_inner(ws, nwc, state.clone()).await;
                                             }
                                             Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                crate::handlers::handle_visitor_conn_inner(ws, nvc, state.clone()).await;
+                                                crate::handlers::handle_visitor_conn_inner(ws, nvc, state.clone(), false).await;
                                             }
                                             Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                crate::handlers::handle_nat_hole_visitor(ws, nhv, state.clone(), None).await;
+                                                crate::handlers::handle_nat_hole_visitor(ws, nhv, state.clone(), None, false).await;
                                             }
                                             Ok(other) => {
                                                 warn!("Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
@@ -1063,10 +1063,10 @@ impl Service {
                                                         crate::handlers::handle_work_conn_inner(io, nwc, state).await;
                                                     }
                                                     Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                        crate::handlers::handle_visitor_conn_inner(io, nvc, state).await;
+                                                        crate::handlers::handle_visitor_conn_inner(io, nvc, state, false).await;
                                                     }
                                                     Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                        crate::handlers::handle_nat_hole_visitor(io, nhv, state, None).await;
+                                                        crate::handlers::handle_nat_hole_visitor(io, nhv, state, None, false).await;
                                                     }
                                                     Ok(other) => {
                                                         warn!("Unexpected yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
@@ -1093,11 +1093,11 @@ impl Service {
                                             crate::handlers::handle_work_conn_inner(stream_io, nwc, state).await;
                                         }
                                         Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                            crate::handlers::handle_visitor_conn_inner(stream_io, nvc, state).await;
+                                            crate::handlers::handle_visitor_conn_inner(stream_io, nvc, state, false).await;
                                         }
                                         Ok(FrpMessage::NatHoleVisitor(nhv)) => {
                                             let visitor_addr = Some(addr.to_string());
-                                            crate::handlers::handle_nat_hole_visitor(stream_io, nhv, state, visitor_addr).await;
+                                            crate::handlers::handle_nat_hole_visitor(stream_io, nhv, state, visitor_addr, false).await;
                                         }
                                         Ok(other) => {
                                             warn!("Unexpected first message from {}: {:?}", addr, other.v1_type_byte());

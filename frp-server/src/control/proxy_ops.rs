@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::{write_msg_v1, write_msg_v2};
+use frp_core::protocol::write_msg;
 use frp_core::transport::IoStream;
 use frp_core::format_socket_addr;
 
@@ -17,19 +17,15 @@ pub(crate) fn err_msg(detailed: bool, detail: String, generic: &str) -> String {
     if detailed { detail } else { generic.to_string() }
 }
 
-/// Protocol-aware write helper: dispatches to V1 or V2 framing.
+/// Protocol-aware write helper: dispatches to V1 or V2 framing via
+/// `frp_core::protocol::write_msg`, logging errors (connection likely dead).
 async fn write_resp(
     writer: &mut (impl AsyncWriteExt + Unpin),
     msg: &FrpMessage,
     v2: bool,
 ) {
-    let result = if v2 {
-        write_msg_v2(writer, msg).await
-    } else {
-        write_msg_v1(writer, msg).await
-    };
-    if let Err(e) = result {
-        warn!("Failed to write NewProxyResp: {e}");
+    if let Err(e) = write_msg(writer, msg, v2).await {
+        warn!("Failed to write response: {e}");
     }
 }
 
@@ -89,7 +85,7 @@ pub(crate) async fn handle_new_proxy(
                     state.max_ports_per_client
                 )),
             });
-            let _ = write_msg_v1(writer, &resp).await;
+            write_resp(writer, &resp, v2).await;
             return;
         }
     }
