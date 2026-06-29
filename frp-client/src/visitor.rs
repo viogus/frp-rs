@@ -160,26 +160,34 @@ pub(crate) async fn run_visitor_listener(
                             }
                             debug!("Visitor '{}': sent NatHoleVisitor pre_check for '{}'", visitor_name, sn);
 
-                            match precheck_conn.read_v1_frame().await {
+                            // SAFETY: pre_check is an optimization — Go frps v0.69.1 does not
+                            // respond to pre_check=true messages, closing the connection
+                            // with early-eof. Fall through to full NatHoleVisitor phase
+                            // instead of aborting. Proxy validation still happens in Phase 2.
+                            let _precheck_ok = match precheck_conn.read_v1_frame().await {
                                 Ok(FrpMessage::NatHoleResp(resp)) => {
                                     if let Some(err) = resp.error {
                                         warn!("Visitor '{}': precheck error: {}", visitor_name, err);
                                         if keep_tunnel_open && attempt < max_retries { continue; }
-                                        return;
+                                        // Server rejected proxy — skip precheck, try full phase
+                                        // (might be transient; full phase validates again)
+                                        false
+                                    } else {
+                                        debug!("Visitor '{}': precheck OK", visitor_name);
+                                        true
                                     }
-                                    debug!("Visitor '{}': precheck OK", visitor_name);
                                 }
                                 Ok(other) => {
-                                    warn!("Visitor '{}': unexpected precheck response 0x{:02x}", visitor_name, other.v1_type_byte());
-                                    if keep_tunnel_open && attempt < max_retries { continue; }
-                                    return;
+                                    warn!("Visitor '{}': unexpected precheck response 0x{:02x} (server may not support precheck)",
+                                        visitor_name, other.v1_type_byte());
+                                    false
                                 }
                                 Err(e) => {
-                                    warn!("Visitor '{}': precheck read failed: {}", visitor_name, e);
-                                    if keep_tunnel_open && attempt < max_retries { continue; }
-                                    return;
+                                    warn!("Visitor '{}': precheck read failed: {} (server may not support precheck)",
+                                        visitor_name, e);
+                                    false
                                 }
-                            }
+                            };
                             drop(precheck_conn);
 
                             // --- STUN Discovery ---

@@ -837,7 +837,11 @@ write_frpc_config_xtcp_provider() {
 
 write_frpc_config_xtcp_visitor() {
     local impl="$1" server_host="$2" server_port="$3" token="$4" visitor_port="$5" \
-          server_name="$6" sk="$7" out="$8"
+          server_name="$6" sk="$7" out="$8" features="${9:-}"
+    local has_enc=false has_comp=false
+    for feat in $features; do
+        case "$feat" in enc) has_enc=true ;; compression) has_comp=true ;; esac
+    done
     if [[ "$impl" == "go" ]]; then
         {
             printf 'serverAddr = "%s"\nserverPort = %s\n\n' "$server_host" "$server_port"
@@ -849,6 +853,8 @@ write_frpc_config_xtcp_visitor() {
             printf 'serverName = "%s"\n' "$server_name"
             printf 'secretKey = "%s"\n' "$sk"
             printf 'bindAddr = "127.0.0.1"\nbindPort = %s\n' "$visitor_port"
+            if $has_enc; then printf 'transport.useEncryption = true\n'; fi
+            if $has_comp; then printf 'transport.useCompression = true\n'; fi
         } > "$out"
     else
         {
@@ -860,6 +866,8 @@ write_frpc_config_xtcp_visitor() {
             printf 'server_name = "%s"\n' "$server_name"
             printf 'sk = "%s"\n' "$sk"
             printf 'bind_addr = "127.0.0.1"\nbind_port = %s\n' "$visitor_port"
+            if $has_enc; then printf 'use_encryption = true\n'; fi
+            if $has_comp; then printf 'use_compression = true\n'; fi
         } > "$out"
     fi
 }
@@ -2200,7 +2208,7 @@ run_xtcp_test() {
 
     # Start visitor frpc
     write_frpc_config_xtcp_visitor "$vis_impl" "$server_host" "$frps_port" \
-        "$token" "$visitor_port" "$name" "$sk" "$TEST_DIR/$name/frpc-visitor.toml"
+        "$token" "$visitor_port" "$name" "$sk" "$TEST_DIR/$name/frpc-visitor.toml" "$features"
 
     if [[ "$vis_impl" == "go" ]]; then
         run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc-visitor.toml" \
