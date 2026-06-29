@@ -20,6 +20,8 @@ pub struct ProxyRuntimeInfo {
     pub proxy_type: String,
     pub use_encryption: bool,
     pub use_compression: bool,
+    /// Secret key (sk) for XTCP/STCP proxy encryption.
+    pub sk: String,
     pub bandwidth_limit: u64,
     pub bandwidth_limit_mode: String,
     pub proxy_protocol_version: String,

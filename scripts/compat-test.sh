@@ -253,7 +253,11 @@ data = os.environ["_SE_DATA"]
 expected = os.environ["_SE_EXPECTED"]
 timeout = float(os.environ["_SE_TIMEOUT"])
 deadline = time.time() + timeout
-per_attempt = min(3.0, timeout / 3)
+# XTCP failover (STUN + NatHoleVisitor + TCP sim open + STCP fallback)
+# takes ~20-25s with VPS latency. Use the full timeout on a single
+# connection. Retrying creates a second visitor handler task whose
+# XTCP cycle overlaps; first handler STCP data gets orphaned.
+per_attempt = timeout
 while True:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -557,7 +561,8 @@ fail_test() {
     FAILURES+=("$name: $reason")
     if $VERBOSE; then
         echo "--- logs for $name ---"
-        for f in "$TEST_DIR"/*.log; do
+        # Collect logs from both top-level (Go frpc) and subdirectories (Rust frpc)
+        for f in "$TEST_DIR"/*.log "$TEST_DIR"/*/*.log; do
             if [[ -f "$f" ]]; then
                 echo "=== $(basename "$f") ==="
                 tail -30 "$f"
@@ -818,6 +823,10 @@ write_frpc_config_xtcp_provider() {
             printf 'localIP = "127.0.0.1"\nlocalPort = %s\n' "$echo_port"
             if $has_enc; then printf 'transport.useEncryption = true\n'; fi
             if $has_comp; then printf 'transport.useCompression = true\n'; fi
+            printf '\n[[proxies]]\nname = "%s-stcp"\ntype = "stcp"\n' "$name"
+            printf 'secretKey = "%s"\n' "$sk"
+            printf 'localIP = "127.0.0.1"\nlocalPort = %s\n' "$echo_port"
+            # STCP fallback proxy is always plain relay — encryption is P2P-only
         } > "$out"
     else
         {
@@ -830,13 +839,21 @@ write_frpc_config_xtcp_provider() {
             printf 'local_ip = "127.0.0.1"\nlocal_port = %s\n' "$echo_port"
             if $has_enc; then printf 'use_encryption = true\n'; fi
             if $has_comp; then printf 'use_compression = true\n'; fi
+            printf '\n[[proxies]]\nname = "%s-stcp"\ntype = "stcp"\n' "$name"
+            printf 'sk = "%s"\n' "$sk"
+            printf 'local_ip = "127.0.0.1"\nlocal_port = %s\n' "$echo_port"
+            # STCP fallback proxy is always plain relay — encryption is P2P-only
         } > "$out"
     fi
 }
 
 write_frpc_config_xtcp_visitor() {
     local impl="$1" server_host="$2" server_port="$3" token="$4" visitor_port="$5" \
-          server_name="$6" sk="$7" out="$8"
+          server_name="$6" sk="$7" out="$8" features="${9:-}"
+    local has_enc=false has_comp=false
+    for feat in $features; do
+        case "$feat" in enc) has_enc=true ;; compression) has_comp=true ;; esac
+    done
     if [[ "$impl" == "go" ]]; then
         {
             printf 'serverAddr = "%s"\nserverPort = %s\n\n' "$server_host" "$server_port"
@@ -848,6 +865,15 @@ write_frpc_config_xtcp_visitor() {
             printf 'serverName = "%s"\n' "$server_name"
             printf 'secretKey = "%s"\n' "$sk"
             printf 'bindAddr = "127.0.0.1"\nbindPort = %s\n' "$visitor_port"
+            printf 'fallbackTo = "%s-stcp-visitor"\n' "$server_name"
+            printf 'fallbackTimeoutMs = 2000\n'
+            if $has_enc; then printf 'transport.useEncryption = true\n'; fi
+            if $has_comp; then printf 'transport.useCompression = true\n'; fi
+            printf '\n[[visitors]]\nname = "%s-stcp-visitor"\ntype = "stcp"\n' "$server_name"
+            printf 'serverName = "%s-stcp"\n' "$server_name"
+            printf 'secretKey = "%s"\n' "$sk"
+            printf 'bindAddr = "127.0.0.1"\nbindPort = -1\n'
+            # STCP fallback visitor is always plain relay — encryption is P2P-only
         } > "$out"
     else
         {
@@ -859,6 +885,10 @@ write_frpc_config_xtcp_visitor() {
             printf 'server_name = "%s"\n' "$server_name"
             printf 'sk = "%s"\n' "$sk"
             printf 'bind_addr = "127.0.0.1"\nbind_port = %s\n' "$visitor_port"
+            printf 'fallback_to = "%s-stcp"\n' "$server_name"
+            printf 'fallback_timeout_ms = 2000\n'
+            if $has_enc; then printf 'use_encryption = true\n'; fi
+            if $has_comp; then printf 'use_compression = true\n'; fi
         } > "$out"
     fi
 }
@@ -2094,8 +2124,34 @@ run_xtcp_test() {
     fi
     should_run_test "$name" || return 0
 
+    # Kill any frpc/frps processes leaked from previous tests.
+    # Old Go frpc processes keep trying to reconnect with stale tokens,
+    # causing noise ("token doesn't match") and potential port conflicts.
+    pkill -f "frpc -c" 2>/dev/null || true
+    pkill -f "frps -c" 2>/dev/null || true
+    sleep 0.5
+    # Also kill local processes bound to our shard's base port
+    local _sp
+    if [[ -n "${shard_index:-}" ]]; then
+        _sp=$((17000 + shard_index * 100))
+        # fuser is available on all Linux distros (psmisc), no root needed
+        local _pid
+        _pid=$(fuser "${_sp}/tcp" 2>/dev/null || true)
+        if [[ -n "$_pid" ]]; then
+            kill $_pid 2>/dev/null || true
+            sleep 0.3
+        fi
+    fi
+
     log "=== $name ==="
-    local frps_port=$(random_port)
+    local frps_port
+    if [[ -n "$shard_index" ]]; then
+        # Per-shard port range prevents TOCTOU race on shared VPS.
+        # Shard 0: 17000-17099, Shard 1: 17100-17199, etc.
+        frps_port=$((17000 + shard_index * 100))
+    else
+        frps_port=$(random_port)
+    fi
     local echo_port=$(random_port)
     local visitor_port=$(random_port)
     local token="${name}-token-$(date +%s)"
@@ -2134,6 +2190,7 @@ run_xtcp_test() {
         actual_port=$(bash "$SCRIPT_DIR/remote-frps.sh" start "$frps_impl" "$XTCP_FRPS_REMOTE" \
             "$frps_port" "$token" "$ssh_key_path" "$shard_index" | tail -1) || {
             fail_test "$name" "remote frps ($frps_impl) did not start"
+            bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "$ssh_key_path" "$shard_index" || true
             return
         }
         frps_port="$actual_port"
@@ -2172,7 +2229,7 @@ run_xtcp_test() {
 
     # Start visitor frpc
     write_frpc_config_xtcp_visitor "$vis_impl" "$server_host" "$frps_port" \
-        "$token" "$visitor_port" "$name" "$sk" "$TEST_DIR/$name/frpc-visitor.toml"
+        "$token" "$visitor_port" "$name" "$sk" "$TEST_DIR/$name/frpc-visitor.toml" "$features"
 
     if [[ "$vis_impl" == "go" ]]; then
         run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc-visitor.toml" \
@@ -2181,7 +2238,32 @@ run_xtcp_test() {
     else
         RUST_LOG=debug "$RUST_FRPC" -c "$TEST_DIR/$name/frpc-visitor.toml" \
             > "$TEST_DIR/$name/frpc-visitor.log" 2>&1 &
-        track_pid $!
+        local _rpid=$!
+        track_pid $_rpid
+        # Quick health checks: verify process alive and producing log output
+        sleep 1
+        if ! kill -0 $_rpid 2>/dev/null; then
+            wait $_rpid 2>/dev/null || true
+            local _rc=$?
+            fail_test "$name" "Rust frpc visitor PID $_rpid exited immediately (rc=$_rc)"
+            if [[ -n "${XTCP_FRPS_REMOTE:-}" ]]; then
+                bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "$ssh_key_path" "$shard_index" || true
+            fi
+            return
+        fi
+        # Check if log is being written
+        sleep 2
+        local _logsize
+        _logsize=$(wc -c < "$TEST_DIR/$name/frpc-visitor.log" 2>/dev/null || echo 0)
+        if [[ $_logsize -eq 0 ]]; then
+            fail_test "$name" "Rust frpc visitor log empty after 3s (pid $_rpid alive but no output)"
+            kill $_rpid 2>/dev/null || true
+            if [[ -n "${XTCP_FRPS_REMOTE:-}" ]]; then
+                bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "$ssh_key_path" "$shard_index" || true
+            fi
+            return
+        fi
+        echo "DBG: Rust frpc visitor log has ${_logsize}B after 3s" >&2
     fi
 
     # XTCP NAT hole punch coordination time
@@ -2198,7 +2280,7 @@ run_xtcp_test() {
 
     # Echo data round-trip
     local result
-    result=$(send_and_expect "$visitor_port" "${name}-data" "${name}-data" 20)
+    result=$(send_and_expect "$visitor_port" "${name}-data" "${name}-data" 60)
     if [[ "$result" == OK:* ]]; then
         pass_test "$name"
     else

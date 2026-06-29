@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use tokio::net::{TcpStream, TcpSocket};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 use tracing::{info, warn, debug};
 
@@ -84,6 +85,8 @@ pub(crate) async fn run_visitor_listener(
     max_retries_an_hour: i32,
     min_retry_interval: i64,
     stun_server: String,
+    visitor_tx: mpsc::UnboundedSender<crate::service::VisitorRequest>,
+    fallback_to: String,
 ) {
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
@@ -96,7 +99,7 @@ pub(crate) async fn run_visitor_listener(
 
     loop {
         match listener.accept().await {
-            Ok((mut user_conn, peer)) => {
+            Ok((user_conn, peer)) => {
                 debug!("Visitor '{}': user connection from {}", name, peer);
 
                 let sa = server_addr.clone();
@@ -109,9 +112,11 @@ pub(crate) async fn run_visitor_listener(
                 let tls_ca = tls_ca_file.clone();
                 let vt = visitor_type.clone();
                 let stun_server = stun_server.clone();
+                let vtx = visitor_tx.clone();
+                let fb_to = fallback_to.clone();
 
                 tokio::spawn(async move {
-                    // Connect to the server
+                    // Dial options for STCP fallback (fresh connections only).
                     let opts = DialOptions {
                         server_addr: sa.clone(),
                         server_port: sp,
@@ -123,10 +128,28 @@ pub(crate) async fn run_visitor_listener(
                     };
 
                     if vt == "xtcp" {
-                        // --- XTCP NAT hole punch path (Go frp v0.69.1 two-phase compat) ---
-                        let max_retries = if keep_tunnel_open { max_retries_an_hour.max(0) as usize } else { 0 };
-                        let retry_delay = Duration::from_secs(min_retry_interval.max(1) as u64);
+                        // --- XTCP NAT hole punch via control connection ---
+                        // Go frps v0.69.1 only handles NatHoleVisitor on the existing
+                        // control connection path, not on fresh TCP connections.
+                        // We send the message through the control loop and receive the
+                        // NatHoleResp via a oneshot channel.
+                        // When keep_tunnel_open is false, still retry once (2 total attempts).
+                        // TCP simultaneous open timing is finicky — a second attempt with fresh
+                        // STUN addresses often succeeds even when the first times out.
+                        // When keep_tunnel_open is true, use the configured retry count/delay.
+                        let max_retries = if keep_tunnel_open {
+                            max_retries_an_hour.max(0) as usize
+                        } else {
+                            1 // 2 total attempts
+                        };
+                        let retry_delay = if keep_tunnel_open {
+                            Duration::from_secs(min_retry_interval.max(1) as u64)
+                        } else {
+                            Duration::from_secs(2) // Quick retry for one-shot mode
+                        };
                         let mut hole_punch_ok = false;
+                        // Wrap in Option — P2P success arm moves it out via take().
+                        let mut user_conn = Some(user_conn);
 
                         for attempt in 0..=max_retries {
                             if attempt > 0 {
@@ -137,137 +160,112 @@ pub(crate) async fn run_visitor_listener(
                                 tokio::time::sleep(retry_delay).await;
                             }
 
-                            // --- Phase 1: PreCheck ---
-                            let mut precheck_conn = match dial_server(&opts).await {
-                                Ok(io) => io,
-                                Err(e) => {
-                                    warn!("Visitor '{}': precheck dial failed: {}", visitor_name, e);
-                                    if keep_tunnel_open && attempt < max_retries { continue; }
-                                    return;
-                                }
-                            };
-                            let precheck_txn = uuid::Uuid::new_v4().to_string();
-                            let nhv = FrpMessage::NatHoleVisitor(msg::NatHoleVisitor {
-                                transaction_id: precheck_txn,
-                                proxy_name: sn.clone(),
-                                pre_check: true,
-                                ..Default::default()
-                            });
-                            if let Err(e) = precheck_conn.write_v1_frame(&nhv).await {
-                                warn!("Visitor '{}': precheck send failed: {}", visitor_name, e);
-                                if keep_tunnel_open && attempt < max_retries { continue; }
-                                return;
-                            }
-                            debug!("Visitor '{}': sent NatHoleVisitor pre_check for '{}'", visitor_name, sn);
-
-                            match precheck_conn.read_v1_frame().await {
-                                Ok(FrpMessage::NatHoleResp(resp)) => {
-                                    if let Some(err) = resp.error {
-                                        warn!("Visitor '{}': precheck error: {}", visitor_name, err);
-                                        if keep_tunnel_open && attempt < max_retries { continue; }
-                                        return;
-                                    }
-                                    debug!("Visitor '{}': precheck OK", visitor_name);
-                                }
-                                Ok(other) => {
-                                    warn!("Visitor '{}': unexpected precheck response 0x{:02x}", visitor_name, other.v1_type_byte());
-                                    if keep_tunnel_open && attempt < max_retries { continue; }
-                                    return;
-                                }
-                                Err(e) => {
-                                    warn!("Visitor '{}': precheck read failed: {}", visitor_name, e);
-                                    if keep_tunnel_open && attempt < max_retries { continue; }
-                                    return;
-                                }
-                            }
-                            drop(precheck_conn);
-
                             // --- STUN Discovery ---
-                            let mapped_addrs = match frp_core::stun::stun_binding(&stun_server.clone()).await {
-                                Ok(addr) => {
-                                    debug!("Visitor '{}': STUN mapped address: {}", visitor_name, addr);
-                                    vec![addr]
-                                }
-                                Err(e) => {
-                                    warn!("Visitor '{}': STUN failed: {}", visitor_name, e);
-                                    vec![]
-                                }
-                            };
-
-                            // --- Phase 2: Full NatHoleVisitor ---
-                            let mut full_conn = match dial_server(&opts).await {
-                                Ok(io) => io,
-                                Err(e) => {
-                                    warn!("Visitor '{}': full phase dial failed: {}", visitor_name, e);
-                                    if keep_tunnel_open && attempt < max_retries { continue; }
-                                    return;
-                                }
-                            };
-                            let txn_id = uuid::Uuid::new_v4().to_string();
-                            let nhv2 = FrpMessage::NatHoleVisitor(msg::NatHoleVisitor {
-                                transaction_id: txn_id,
-                                proxy_name: sn.clone(),
-                                pre_check: false,
-                                protocol: Some("tcp".to_string()),
-                                mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
-                                ..Default::default()
-                            });
-                            if let Err(e) = full_conn.write_v1_frame(&nhv2).await {
-                                warn!("Visitor '{}': full NatHoleVisitor send failed: {}", visitor_name, e);
-                                if keep_tunnel_open && attempt < max_retries { continue; }
-                                return;
-                            }
-                            debug!("Visitor '{}': sent full NatHoleVisitor for '{}'", visitor_name, sn);
-
-                            // Read NatHoleResp with provider's candidate addresses
-                            match full_conn.read_v1_frame().await {
-                                Ok(FrpMessage::NatHoleResp(resp)) => {
-                                    if let Some(err) = resp.error {
-                                        warn!("Visitor '{}': NatHoleResp error: {}", visitor_name, err);
-                                        if keep_tunnel_open && attempt < max_retries { continue; }
-                                        return;
-                                    }
-                                    let candidates = resp.candidate_addrs.unwrap_or_default();
-                                    debug!("Visitor '{}': got {} candidate addresses from server", visitor_name, candidates.len());
-
-                                    // TCP simultaneous open to each candidate
-                                    for addr in &candidates {
-                                        debug!("Visitor '{}': trying simultaneous open to {}", visitor_name, addr);
-                                        match tcp_simultaneous_open(addr, fallback_timeout_ms).await {
-                                            Ok(p2p_stream) => {
-                                                info!("Visitor '{}': XTCP P2P connected to {}", visitor_name, addr);
-                                                let mut p2p = p2p_stream;
-                                                match tokio::io::copy_bidirectional(&mut user_conn, &mut p2p).await {
-                                                    Ok((to_p2p, to_user)) => {
-                                                        debug!("Visitor '{}' XTCP closed: {}B to P2P, {}B to user",
-                                                            visitor_name, to_p2p, to_user);
-                                                    }
-                                                    Err(e) => {
-                                                        debug!("Visitor '{}' XTCP bridge error: {}", visitor_name, e);
-                                                    }
-                                                }
-                                                hole_punch_ok = true;
-                                                break; // P2P succeeded
-                                            }
-                                            Err(e) => {
-                                                debug!("Visitor '{}': hole punch to {} failed: {}", visitor_name, addr, e);
-                                            }
+                            // Run STUN twice — Go frps v0.69.1 NAT classifier needs ≥2
+                            // mapped addresses to determine NAT type and behavior.
+                            let mut mapped_addrs = Vec::new();
+                            for _ in 0..2 {
+                                match frp_core::stun::stun_binding(&stun_server.clone()).await {
+                                    Ok(addr) => {
+                                        debug!("Visitor '{}': STUN mapped address: {}", visitor_name, addr);
+                                        if !mapped_addrs.contains(&addr) {
+                                            mapped_addrs.push(addr);
                                         }
                                     }
-                                    if hole_punch_ok {
-                                        break; // Exit retry loop
+                                    Err(e) => {
+                                        warn!("Visitor '{}': STUN failed: {}", visitor_name, e);
                                     }
                                 }
-                                Ok(other) => {
-                                    warn!("Visitor '{}': unexpected NatHole response 0x{:02x}", visitor_name, other.v1_type_byte());
+                            }
+                            if mapped_addrs.is_empty() {
+                                warn!("Visitor '{}': all STUN attempts failed", visitor_name);
+                            }
+
+                            // --- Send NatHoleVisitor on control connection ---
+                            let txn_id = uuid::Uuid::new_v4().to_string();
+                            // Generate auth credentials (Go frps v0.69.1 requires sign_key+timestamp)
+                            let ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64;
+                            let sign_key = if sk.is_empty() {
+                                None
+                            } else {
+                                Some(frp_core::auth::generate_token(&sk, ts))
+                            };
+                            let (reply_tx, reply_rx) = oneshot::channel();
+                            let nhv = crate::service::VisitorRequest {
+                                nhv: msg::NatHoleVisitor {
+                                    transaction_id: txn_id.clone(),
+                                    proxy_name: sn.clone(),
+                                    pre_check: false,
+                                    protocol: Some("tcp".to_string()),
+                                    sign_key,
+                                    timestamp: Some(ts),
+                                    mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
+                                    ..Default::default()
+                                },
+                                reply: reply_tx,
+                            };
+                            if let Err(_) = vtx.send(nhv) {
+                                warn!("Visitor '{}': failed to send NatHoleVisitor to control loop (channel closed)", visitor_name);
+                                return;
+                            }
+                            debug!("Visitor '{}': sent NatHoleVisitor on control connection for '{}'", visitor_name, sn);
+
+                            // --- Wait for NatHoleResp from control loop ---
+                            let resp = match reply_rx.await {
+                                Ok(Ok(resp)) => resp,
+                                Ok(Err(e)) => {
+                                    warn!("Visitor '{}': NatHoleResp error from server: {}", visitor_name, e);
                                     if keep_tunnel_open && attempt < max_retries { continue; }
                                     return;
                                 }
-                                Err(e) => {
-                                    warn!("Visitor '{}': read NatHoleResp failed: {}", visitor_name, e);
+                                Err(_) => {
+                                    warn!("Visitor '{}': NatHoleResp channel closed (control loop dropped)", visitor_name);
                                     if keep_tunnel_open && attempt < max_retries { continue; }
                                     return;
                                 }
+                            };
+                            debug!("Visitor '{}': received NatHoleResp from server", visitor_name);
+
+                            let candidates = resp.candidate_addrs.unwrap_or_default();
+                            debug!("Visitor '{}': got {} candidate addresses from server", visitor_name, candidates.len());
+
+                            // TCP simultaneous open to each candidate
+                            for addr in &candidates {
+                                debug!("Visitor '{}': trying simultaneous open to {}", visitor_name, addr);
+                                match tcp_simultaneous_open(addr, fallback_timeout_ms).await {
+                                    Ok(p2p_stream) => {
+                                        info!("Visitor '{}': XTCP P2P connected to {}", visitor_name, addr);
+                                        // Encrypt P2P channel if configured (matches Go frp wrapVisitorConn).
+                                        let use_enc = use_encryption && !sk.is_empty();
+                                        let (user_r, user_w) = user_conn.take().unwrap().into_split();
+                                        let (p2p_r, p2p_w) = p2p_stream.into_split();
+                                        if use_enc {
+                                            let key = frp_core::encryption::derive_key(&sk);
+                                            frp_core::bridge::bridge_encrypted(
+                                                user_r, user_w, p2p_r, p2p_w,
+                                                &key, use_compression, vec![], None, None, None,
+                                            ).await;
+                                            debug!("Visitor '{}' XTCP encrypted P2P closed", visitor_name);
+                                        } else {
+                                            frp_core::bridge::bridge_plain(
+                                                user_r, user_w, p2p_r, p2p_w,
+                                                use_compression, vec![], None,
+                                            ).await;
+                                            debug!("Visitor '{}' XTCP closed", visitor_name);
+                                        }
+                                        hole_punch_ok = true;
+                                        break; // P2P succeeded
+                                    }
+                                    Err(e) => {
+                                        debug!("Visitor '{}': hole punch to {} failed: {}", visitor_name, addr, e);
+                                    }
+                                }
+                            }
+                            if hole_punch_ok {
+                                break; // Exit retry loop
                             }
                         }
 
@@ -275,7 +273,16 @@ pub(crate) async fn run_visitor_listener(
                             return; // XTCP P2P succeeded
                         }
 
+                        // Unwrap user_conn for STCP fallback (hole punch failed, so not moved).
+                        let user_conn = user_conn.expect("user_conn not consumed when hole_punch_ok=false");
+
                         // --- STCP fallback (hole punch failed) ---
+                        // STCP relay via NewVisitorConn on a fresh connection works against
+                        // Rust frps (which looks up the proxy in proxy_manager regardless of type).
+                        // Against Go frps v0.69.1, XTCP proxies do NOT create a custom listener
+                        // (only NatHoleController listener), so NewVisitorConn fails with
+                        // "custom listener for [X] doesn't exist". This is expected — Go frp's
+                        // XTCP fallback uses a separate STCP proxy+visitor, not the same proxy.
                         // Open a NEW connection for STCP relay
                         let mut server_conn = match dial_server(&opts).await {
                             Ok(io) => io,
@@ -285,13 +292,19 @@ pub(crate) async fn run_visitor_listener(
                             }
                         };
 
-                        let nvc = crate::proxy::create_visitor_conn_msg(&sn, &sk, use_encryption, use_compression);
+                        let stcp_proxy_name = if fb_to.is_empty() { sn.clone() } else { fb_to.clone() };
+                        // STCP fallback is always plain relay through server.
+                        // P2P encryption uses derive_key(sk) on the direct P2P channel.
+                        // Sending use_encryption=true in NewVisitorConn would cause
+                        // Go frps to encrypt the server↔provider work conn bridge,
+                        // but the visitor side uses plain copy_bidirectional → mismatch.
+                        let nvc = crate::proxy::create_visitor_conn_msg(&stcp_proxy_name, &sk, false, false);
                         debug!("Visitor '{}': NewVisitorConn JSON: {}", visitor_name, serde_json::to_string(&nvc).unwrap_or_default());
                         if let Err(e) = server_conn.write_v1_frame(&nvc).await {
                             warn!("Visitor '{}': STCP fallback send NewVisitorConn failed: {}", visitor_name, e);
                             return;
                         }
-                        info!("Visitor '{}': fell back to STCP relay for '{}'", visitor_name, sn);
+                        info!("Visitor '{}': fell back to STCP relay for '{}'", visitor_name, stcp_proxy_name);
 
                         // Read NewVisitorConnResp before bridging
                         match server_conn.read_v1_frame().await {

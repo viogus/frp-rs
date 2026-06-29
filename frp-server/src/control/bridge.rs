@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 use tracing::{debug, info, warn};
@@ -134,6 +135,8 @@ pub(crate) async fn assign_udp_work_conn(
         error: None,
         use_encryption: None,
         use_compression: None,
+        nat_hole_sid: None,
+        nat_hole_visitor_addr: None,
     });
     if v2 {
         if let Err(e) = work_conn.write_v2_frame(&swc).await {
@@ -255,8 +258,20 @@ pub(crate) async fn assign_work_to_proxy(
         dst_addr: if !proxy_protocol_version.is_empty() && !dst_addr.is_empty() { Some(dst_addr) } else { None },
         dst_port: if !proxy_protocol_version.is_empty() && dst_port != 0 { Some(dst_port) } else { None },
         error: None,
+        // use_encryption/use_compression: propagate proxy config settings.
+        // Go frpc v0.69.1 ignores these fields (not in its StartWorkConn struct)
+        // and uses its own proxy config. The server must match whatever the
+        // provider does, so the bridge type (plain vs encrypted) is determined
+        // below based on req.use_encryption/compression, NOT forced to false.
+        // Rust frpc (work_conn.rs) respects swc.use_encryption over its own config.
+        // CipherWriter now eagerly flushes IV on first poll_flush, preventing the
+        // dual-CipherWriter deadlock that previously forced plain bridge for XTCP.
         use_encryption: if req.use_encryption { Some(true) } else { None },
         use_compression: if req.use_compression { Some(true) } else { None },
+        // For XTCP STCP fallback: set empty nat_hole_sid marker so Rust frpc
+        // knows this work conn is for STCP bridging, not XTCP notification.
+        nat_hole_sid: if req.proxy_type == "xtcp" { Some(String::new()) } else { None },
+        nat_hole_visitor_addr: None,
     });
 
     let write_result = if v2 {
@@ -270,7 +285,24 @@ pub(crate) async fn assign_work_to_proxy(
         return;
     }
 
-    info!("Bridging user conn to work conn for proxy '{}'", req.proxy_name);
+    // For XTCP STCP fallback: send a dummy NatHoleSid V1 frame with
+    // empty sid after StartWorkConn for Go frpc compatibility.
+    // Go frpc's InWorkConn expects either an embedded nat_hole_sid in
+    // StartWorkConn JSON (newer frp) or a separate NatHoleSid V1 frame
+    // immediately after StartWorkConn (Go frp v0.69.1). Our Rust frpc
+    // provider's byte-peek handles both formats.
+    // The copy_bidirectional bridge (used for XTCP STCP fallback below)
+    // doesn't send a premature FIN, so the provider can safely consume
+    // this frame without the old ECONNRESET race.
+    if req.proxy_type == "xtcp" {
+        let dummy = FrpMessage::NatHoleSid(msg::NatHoleSid {
+            sid: None,
+            provider_addr: None,
+        });
+        let _ = work_conn.write_v1_frame(&dummy).await;
+    }
+
+    info!("Bridging user conn to work conn for proxy '{}' (type={})", req.proxy_name, req.proxy_type);
 
     let proxy_name = req.proxy_name.clone();
     let metrics = state.proxy_metrics.get_or_create(&proxy_name).await;
@@ -279,12 +311,20 @@ pub(crate) async fn assign_work_to_proxy(
     let pre_read = req.pre_read;
     let enc_key = req.use_encryption;
     let comp_key = req.use_compression;
+    let proxy_type = req.proxy_type.clone();
 
     tokio::spawn(async move {
         let _guard = guard;
+        // Use encryption if the proxy config requests it (req.use_encryption
+        // comes from proxy_manager). For XTCP STCP fallback, we previously
+        // forced plain bridge to avoid a dual-CipherWriter deadlock — that
+        // deadlock is now fixed by eager IV flush in CipherWriter::poll_flush.
+        // Go frpc v0.69.1 ignores swc.use_encryption (not in its struct) and
+        // uses its own proxy config, so the server MUST match.
+        let use_enc = enc_key;
         // For encrypted bridges, pre_read bytes are passed into bridge_encrypted
         // which writes them through the CipherWriter (matching Go frp streaming CFB).
-        if enc_key {
+        if use_enc {
             let key = encryption_key;
             match work_conn {
                 IoStream::Tcp(work) => {
@@ -350,14 +390,39 @@ pub(crate) async fn assign_work_to_proxy(
             // can coordinate: write pre_read first, then skip work_w shutdown
             // to let the backend response flow back to the user.
             let bridge_pre_read = pre_read;
-            // Plain bridge with optional compression.
-            let (u_r, u_w) = req.user_conn.into_split();
-            let (w_r, w_w) = work_conn.into_split();
-            if !req.response_headers.is_empty() && req.proxy_type.starts_with("http") {
-                let injector = ResponseHeaderInjector::new(w_r, req.response_headers);
-                frp_core::bridge::bridge_plain(u_r, u_w, injector, w_w, comp_key, bridge_pre_read, Some(metrics.clone())).await;
+
+            // XTCP STCP fallback (plain, no encryption): use copy_bidirectional
+            // directly instead of bridge_plain. bridge_plain's join! pattern
+            // drops the work writer (sending FIN) as soon as the user reader
+            // reaches EOF. For STCP fallback the visitor's test client
+            // half-closes after sending data, so the server sees EOF on the
+            // user side ~60ms before the provider starts its bridge. The
+            // premature FIN on the work connection races with the provider's
+            // copy_bidirectional startup and produces ECONNRESET on VPS.
+            // copy_bidirectional avoids this: both directions run to completion
+            // within the same function, and the work side is only shut down
+            // after the full bidirectional copy finishes.
+            if proxy_type == "xtcp" {
+                let mut user_conn = req.user_conn;
+                match tokio::io::copy_bidirectional(&mut user_conn, &mut work_conn).await {
+                    Ok((a, b)) => {
+                        metrics.bytes_in.fetch_add(a, Ordering::Relaxed);
+                        metrics.bytes_out.fetch_add(b, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        debug!("XTCP STCP fallback bridge closed: {}", e);
+                    }
+                }
             } else {
-                frp_core::bridge::bridge_plain(u_r, u_w, w_r, w_w, comp_key, bridge_pre_read, Some(metrics.clone())).await;
+                // Plain bridge with optional compression.
+                let (u_r, u_w) = req.user_conn.into_split();
+                let (w_r, w_w) = work_conn.into_split();
+                if !req.response_headers.is_empty() && req.proxy_type.starts_with("http") {
+                    let injector = ResponseHeaderInjector::new(w_r, req.response_headers);
+                    frp_core::bridge::bridge_plain(u_r, u_w, injector, w_w, comp_key, bridge_pre_read, Some(metrics.clone())).await;
+                } else {
+                    frp_core::bridge::bridge_plain(u_r, u_w, w_r, w_w, comp_key, bridge_pre_read, Some(metrics.clone())).await;
+                }
             }
         }
         info!("Proxy '{}' bridge completed", req.proxy_name);

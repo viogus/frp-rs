@@ -132,6 +132,8 @@ Internal message variants drive the work connection lifecycle:
 
 `derive_key` is called in `Service::new()` with `auth_cfg.token` — the encryption key derives from the auth token, not a separate secret.
 
+**XTCP P2P encryption:** Go frp encrypts hole-punched P2P connections with PBKDF2-SHA1(SecretKey, salt="frp", iter=64, keylen=16) → AES-128-CFB. Both provider and visitor P2P paths use `bridge_encrypted` with `derive_key(&sk)` when `use_encryption` is true. The `sk` (secret key) is the proxy's `sk` field from `ProxyConfig`, NOT the auth token — this is stored in `ProxyRuntimeInfo` for access in NAT hole punch handler paths.
+
 Note: Go frp v0.69.1 golib source says salt `"crypto"` but the pre-built binary uses salt `"frp"`. This codebase uses `"frp"` for binary compatibility.
 
 ### Transport Abstraction
@@ -166,7 +168,9 @@ Two paths for visitor connections:
 
 Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkConn → StartWorkConn+NatHoleSid on work conn) → Provider does STUN → Provider→Server(NatHoleClient on control) → Server NAT analysis → Server→Visitor(NatHoleResp) + Server→Provider(NatHoleResp) → both sides TCP simultaneous open → bridge p2p → Provider→Server(NatHoleReport) → session complete.
 
-**Status:** Fully implemented. Server operates as pure relay (no server-side STUN — provider and visitor each do their own STUN). Both sides use TCP simultaneous open for hole punching. Provider-side (`frp-client/src/service.rs`) reads StartWorkConn+NatHoleSid from work conn, does STUN, sends NatHoleClient on control, reads NatHoleResp, TCP simultaneous open → bridge to local. Visitor-side (`frp-client/src/service.rs`) handles `NatHoleVisitor` → PreCheck + STUN + full NatHoleVisitor → TCP simultaneous open → bridge to user. STCP fallback if hole punch fails. e2e test in `frp-server/tests/xtcp_hole_punch.rs`.
+**Status:** Fully implemented. Server operates as pure relay (no server-side STUN — provider and visitor each do their own STUN). Both sides use TCP simultaneous open for hole punching. Provider-side (`frp-client/src/service.rs`) reads StartWorkConn+NatHoleSid from work conn, does STUN, sends NatHoleClient on control, reads NatHoleResp, TCP simultaneous open → bridge to local. Visitor-side (`frp-client/src/visitor.rs`) handles `NatHoleVisitor` → PreCheck + STUN + full NatHoleVisitor → TCP simultaneous open → bridge to user. STCP fallback if hole punch fails (uses `fallback_to` config field to point at separate STCP proxy, matching Go frp architecture). e2e test in `frp-server/tests/xtcp_hole_punch.rs`.
+
+**XTCP P2P bridging:** After successful hole punch, P2P TCP connection uses conditional `bridge_encrypted` (when `use_encryption=true` + `sk` non-empty) or `bridge_plain` (otherwise). Encryption key derived from proxy's `sk` (SecretKey) via `derive_key()` — same derivation as control connection but uses SecretKey instead of auth token. `ProxyRuntimeInfo.sk` stores the SecretKey for access in NAT hole punch handler paths (`NatHoleClient` and `NatHoleResp` handlers in service.rs, visitor P2P path in visitor.rs). Both sides derive the same key from the shared SecretKey, matching Go frp's `wrapWorkConn`/`wrapVisitorConn`.
 
 ### Transport Status
 
@@ -182,6 +186,7 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 
 - `login_fail_exit` defaults to `true` in `ClientConfig::default()` but README example shows `false` — be aware the code default is `true`
 - `#[serde(untagged)]` on `FrpMessage` enum — ordering matters for serde matching, but V1 protocol dispatches by type byte first via `deserialize_v1()`, so untagged matching is not involved in wire deserialization
+- `ProxyRuntimeInfo` must include `sk: String` field — XTCP P2P encryption derives its AES-128 key from the proxy's SecretKey via `derive_key(&sk)`. Adding new fields to `ProxyRuntimeInfo` requires updating all construction sites: `Service::new()`, `do_reload()` in `reload.rs`, and any other future sites.
 
 ### Dependency Policy (mandatory)
 

@@ -742,6 +742,7 @@ mod tests {
                 proxy_name: "p".into(), src_addr: None, src_port: None,
                 dst_addr: None, dst_port: None, error: None,
                 use_encryption: None, use_compression: None,
+                nat_hole_sid: None, nat_hole_visitor_addr: None,
             }),
             FrpMessage::NewVisitorConn(msg::NewVisitorConn {
                 proxy_name: "p".into(), sign_key: None, timestamp: None,

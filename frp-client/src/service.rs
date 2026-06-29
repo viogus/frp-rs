@@ -2,7 +2,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock, oneshot};
+
+/// Internal request from a visitor task to the control loop.
+/// Visitor sends NatHoleVisitor on the control connection (Go frps compat:
+/// fresh TCP connections with NatHoleVisitor are not handled by Go frps v0.69.1).
+/// The oneshot delivers the server's NatHoleResp back to the waiting visitor.
+pub(crate) struct VisitorRequest {
+    pub nhv: msg::NatHoleVisitor,
+    pub reply: oneshot::Sender<Result<msg::NatHoleResp, String>>,
+}
 use tokio::time::{interval, Duration};
 use tracing::{info, warn, debug};
 use rand::Rng;
@@ -46,10 +55,15 @@ pub struct Service {
     reload_rx: Mutex<Option<mpsc::UnboundedReceiver<ReloadRequest>>>,
     /// STUN server address for XTCP NAT traversal.
     nat_hole_stun_server: String,
-    /// Channel from work connection tasks to the control loop for XTCP.
+    /// Channel from work connection tasks to the control loop for XTCP (provider side).
     xtcp_tx: mpsc::UnboundedSender<XtcpNotification>,
     /// Receiver side of XTCP channel — consumed by run().
     xtcp_rx: Mutex<Option<mpsc::UnboundedReceiver<XtcpNotification>>>,
+    /// Channel from visitor tasks to the control loop (Go frps compat:
+    /// NatHoleVisitor is sent on the control connection, not fresh TCP).
+    visitor_tx: mpsc::UnboundedSender<VisitorRequest>,
+    /// Receiver side of visitor channel — consumed by run().
+    visitor_rx: Mutex<Option<mpsc::UnboundedReceiver<VisitorRequest>>>,
 }
 
 impl Service {
@@ -220,6 +234,7 @@ impl Service {
                 proxy_type: p.proxy_type.clone(),
                 use_encryption: p.use_encryption,
                 use_compression: p.use_compression,
+                sk: p.sk.clone(),
                 bandwidth_limit: bw_limit,
                 bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
                 proxy_protocol_version: p.proxy_protocol_version.clone(),
@@ -233,6 +248,7 @@ impl Service {
 
         let (reload_tx, reload_rx) = mpsc::unbounded_channel::<ReloadRequest>();
         let (xtcp_tx, xtcp_rx) = mpsc::unbounded_channel::<XtcpNotification>();
+        let (visitor_tx, visitor_rx) = mpsc::unbounded_channel::<VisitorRequest>();
 
         let nat_hole_stun_server = if cfg.nat_hole_stun_server.is_empty() {
             "stun:stun.l.google.com:19302".to_string()
@@ -255,6 +271,8 @@ impl Service {
             nat_hole_stun_server,
             xtcp_tx,
             xtcp_rx: Mutex::new(Some(xtcp_rx)),
+            visitor_tx,
+            visitor_rx: Mutex::new(Some(visitor_rx)),
         })
     }
 
@@ -375,6 +393,8 @@ impl Service {
             .expect("reload_rx already taken — run() called twice?");
         let mut xtcp_rx = self.xtcp_rx.lock().await.take()
             .expect("xtcp_rx already taken — run() called twice?");
+        let mut visitor_rx = self.visitor_rx.lock().await.take()
+            .expect("visitor_rx already taken — run() called twice?");
         let xtcp_tx = self.xtcp_tx.clone();
         let nat_hole_stun_server = self.nat_hole_stun_server.clone();
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel::<()>();
@@ -508,6 +528,23 @@ impl Service {
                 }
             }
 
+            // Register STCP/XTCP visitors on the control connection.
+            // Go frps v0.69.1 requires visitor registration before NatHoleVisitor
+            // can be sent on the control connection (otherwise: "auth failed").
+            for v in &self.cfg.visitors {
+                if v.bind_port == 0 {
+                    continue;
+                }
+                match ctl.register_visitor(v, &mut control_stream).await {
+                    Ok(_) => {
+                        info!("Visitor '{}' registered for proxy '{}'", v.name, v.server_name);
+                    }
+                    Err(e) => {
+                        warn!("Failed to register visitor '{}': {}", v.name, e);
+                    }
+                }
+            }
+
             // Split control stream for reading and writing
             let (mut reader, raw_writer) = control_stream.into_split();
             let writer = Arc::new(Mutex::new(raw_writer));
@@ -615,16 +652,20 @@ impl Service {
                 let max_retries_an_hour = v.max_retries_an_hour;
                 let min_retry_interval = v.min_retry_interval;
                 let stun_server = nat_hole_stun_server.clone();
+                let fallback_to = v.fallback_to.clone();
+                let vtx = self.visitor_tx.clone();
                 tokio::spawn(async move {
                     crate::visitor::run_visitor_listener(sa, sp, pt, server_name, secret_key, bind_addr, use_enc, use_comp, name,
                         tls_enable, tls_server_name, tls_ca_file, visitor_type, fallback_timeout_ms,
-                        keep_tunnel_open, max_retries_an_hour, min_retry_interval, stun_server).await;
+                        keep_tunnel_open, max_retries_an_hour, min_retry_interval, stun_server, vtx, fallback_to).await;
                 });
             }
 
             // --- Message loop ---
-            // Map sid -> proxy_name for XTCP NatHoleResp routing.
+            // Map sid -> proxy_name for XTCP NatHoleResp routing (provider side).
             let mut pending_xtcp: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            // Map sid -> oneshot sender for visitor NatHoleResp routing (Go frps compat).
+            let mut visitor_pending: std::collections::HashMap<String, oneshot::Sender<Result<msg::NatHoleResp, String>>> = std::collections::HashMap::new();
             let ping_secs = self.cfg.heartbeat_interval.max(1) as u64;
         info!("Heartbeat interval: {}s", ping_secs);
         let mut ping_interval = interval(Duration::from_secs(ping_secs));
@@ -684,9 +725,13 @@ impl Service {
                                 let visitor_addr = nhc.visitor_addr.unwrap_or_default();
                                 let proxy_name = nhc.proxy_name.clone();
                                 let sid = nhc.transaction_id.clone();
-                                let local_addr = self.proxy_info_map.read().await
+                                let proxy_info = self.proxy_info_map.read().await
                                     .get(&proxy_name)
-                                    .map(|p| p.local_addr.clone());
+                                    .map(|p| (p.local_addr.clone(), p.use_encryption, p.use_compression, p.sk.clone()));
+                                let local_addr = proxy_info.as_ref().map(|p| p.0.clone());
+                                let xtcp_use_enc = proxy_info.as_ref().map(|p| p.1).unwrap_or(false);
+                                let xtcp_use_comp = proxy_info.as_ref().map(|p| p.2).unwrap_or(false);
+                                let xtcp_sk = proxy_info.as_ref().map(|p| p.3.clone()).unwrap_or_default();
 
                                 if visitor_addr.is_empty() {
                                     warn!("NatHoleClient without visitor_addr for '{}'", proxy_name);
@@ -714,17 +759,26 @@ impl Service {
                                         if let Some(ref local) = local_addr {
                                             match tokio::net::TcpStream::connect(local).await {
                                                 Ok(local_stream) => {
+                                                    let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
+                                                    let use_comp = xtcp_use_comp;
+                                                    let sk = xtcp_sk.clone();
+                                                    let pn = proxy_name.clone();
                                                     tokio::spawn(async move {
-                                                        let mut p2p = p2p_stream;
-                                                        let mut local = local_stream;
-                                                        match tokio::io::copy_bidirectional(&mut p2p, &mut local).await {
-                                                            Ok((to_local, to_p2p)) => {
-                                                                debug!("XTCP provider '{}' closed: {}B to local, {}B to P2P",
-                                                                    proxy_name, to_local, to_p2p);
-                                                            }
-                                                            Err(e) => {
-                                                                debug!("XTCP provider '{}' bridge error: {}", proxy_name, e);
-                                                            }
+                                                        let (p2p_r, p2p_w) = p2p_stream.into_split();
+                                                        let (local_r, local_w) = local_stream.into_split();
+                                                        if use_enc {
+                                                            let key = frp_core::encryption::derive_key(&sk);
+                                                            frp_core::bridge::bridge_encrypted(
+                                                                local_r, local_w, p2p_r, p2p_w,
+                                                                &key, use_comp, vec![], None, None, None,
+                                                            ).await;
+                                                            debug!("XTCP provider '{}' encrypted P2P closed", pn);
+                                                        } else {
+                                                            frp_core::bridge::bridge_plain(
+                                                                local_r, local_w, p2p_r, p2p_w,
+                                                                use_comp, vec![], None,
+                                                            ).await;
+                                                            debug!("XTCP provider '{}' P2P closed", pn);
                                                         }
                                                     });
                                                     // Don't send NatHoleReport — Go frp uses implicit success.
@@ -757,6 +811,21 @@ impl Service {
                                 }
                             }
                             Ok(FrpMessage::NatHoleResp(resp)) => {
+                                // Route to waiting visitor first (Go frps compat path).
+                                // CRITICAL: Go frps generates its own sid for the NAT session,
+                                // different from the visitor's transaction_id. The NatHoleResp
+                                // contains BOTH: transaction_id (from visitor) and sid (from server).
+                                // Route by transaction_id (what the visitor set).
+                                let txn_id = resp.transaction_id.clone();
+                                if !txn_id.is_empty() {
+                                    if let Some(tx) = visitor_pending.remove(&txn_id) {
+                                        info!("XTCP visitor: received NatHoleResp for txn '{}'", txn_id);
+                                        let _ = tx.send(Ok(resp));
+                                        continue;
+                                    }
+                                }
+                                // Fall through: route to provider by server sid
+                                let sid = resp.sid.clone().unwrap_or_default();
                                 // Provider receives server's analysis with visitor's candidate addresses.
                                 if let Some(err) = resp.error {
                                     warn!("XTCP NatHoleResp error: {}", err);
@@ -766,7 +835,6 @@ impl Service {
                                     }
                                     continue;
                                 }
-                                let sid = resp.sid.clone().unwrap_or_default();
                                 let proxy_name = pending_xtcp.remove(&sid).unwrap_or_default();
                                 if proxy_name.is_empty() {
                                     warn!("XTCP NatHoleResp: unknown sid '{}'", sid);
@@ -777,27 +845,39 @@ impl Service {
                                     proxy_name, candidate_addrs.len());
 
                                 // Spawn hole punch task (don't block control loop)
-                                let local_addr = self.proxy_info_map.read().await
+                                let proxy_info = self.proxy_info_map.read().await
                                     .get(&proxy_name)
-                                    .map(|p| p.local_addr.clone());
+                                    .map(|p| (p.local_addr.clone(), p.use_encryption, p.use_compression, p.sk.clone()));
+                                let local_addr = proxy_info.as_ref().map(|p| p.0.clone());
+                                let xtcp_use_enc = proxy_info.as_ref().map(|p| p.1).unwrap_or(false);
+                                let xtcp_use_comp = proxy_info.as_ref().map(|p| p.2).unwrap_or(false);
+                                let xtcp_sk = proxy_info.as_ref().map(|p| p.3.clone()).unwrap_or_default();
                                 let proxy_name_clone = proxy_name.clone();
                                 tokio::spawn(async move {
                                     for addr in &candidate_addrs {
                                         debug!("XTCP provider '{}': trying simultaneous open to {}", proxy_name_clone, addr);
                                         match crate::visitor::tcp_simultaneous_open(addr, 5000).await {
-                                            Ok(mut p2p) => {
+                                            Ok(p2p) => {
                                                 info!("XTCP provider '{}': P2P connected to {}", proxy_name_clone, addr);
                                                 if let Some(ref local) = local_addr {
                                                     match tokio::net::TcpStream::connect(local).await {
-                                                        Ok(mut local_conn) => {
-                                                            match tokio::io::copy_bidirectional(&mut p2p, &mut local_conn).await {
-                                                                Ok((to_local, to_p2p)) => {
-                                                                    debug!("XTCP provider '{}' closed: {}B to local, {}B to P2P",
-                                                                        proxy_name_clone, to_local, to_p2p);
-                                                                }
-                                                                Err(e) => {
-                                                                    debug!("XTCP provider '{}' bridge error: {}", proxy_name_clone, e);
-                                                                }
+                                                        Ok(local_conn) => {
+                                                            let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
+                                                            let (p2p_r, p2p_w) = p2p.into_split();
+                                                            let (local_r, local_w) = local_conn.into_split();
+                                                            if use_enc {
+                                                                let key = frp_core::encryption::derive_key(&xtcp_sk);
+                                                                frp_core::bridge::bridge_encrypted(
+                                                                    local_r, local_w, p2p_r, p2p_w,
+                                                                    &key, xtcp_use_comp, vec![], None, None, None,
+                                                                ).await;
+                                                                debug!("XTCP provider '{}' encrypted P2P closed", proxy_name_clone);
+                                                            } else {
+                                                                frp_core::bridge::bridge_plain(
+                                                                    local_r, local_w, p2p_r, p2p_w,
+                                                                    xtcp_use_comp, vec![], None,
+                                                                ).await;
+                                                                debug!("XTCP provider '{}' P2P closed", proxy_name_clone);
                                                             }
                                                         }
                                                         Err(e) => {
@@ -898,17 +978,22 @@ impl Service {
                     Some(xtcp_notif) = xtcp_rx.recv() => {
                         let XtcpNotification { sid, proxy_name } = xtcp_notif;
                         info!("XTCP provider: received NatHoleSid for '{}'", proxy_name);
-                        // 1. Do STUN discovery
-                        let mapped_addrs = match frp_core::stun::stun_binding(&nat_hole_stun_server).await {
-                            Ok(addr) => {
-                                debug!("XTCP STUN result: {}", addr);
-                                vec![addr]
+                        // 1. Do STUN discovery — run twice. Go frps v0.69.1 NAT classifier
+                        //    needs ≥2 mapped addresses to determine NAT type and behavior.
+                        let mut mapped_addrs = Vec::new();
+                        for _ in 0..2 {
+                            match frp_core::stun::stun_binding(&nat_hole_stun_server).await {
+                                Ok(addr) => {
+                                    debug!("XTCP STUN result: {}", addr);
+                                    if !mapped_addrs.contains(&addr) {
+                                        mapped_addrs.push(addr);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("XTCP STUN failed: {}", e);
+                                }
                             }
-                            Err(e) => {
-                                warn!("XTCP STUN failed: {}", e);
-                                vec![]
-                            }
-                        };
+                        }
                         // 2. Send NatHoleClient on control
                         let client_msg = FrpMessage::NatHoleClient(msg::NatHoleClient {
                             transaction_id: sid.clone(),
@@ -924,6 +1009,24 @@ impl Service {
                         } else {
                             // Track sid→proxy_name for NatHoleResp routing
                             pending_xtcp.insert(sid, proxy_name);
+                        }
+                    }
+
+                    // Visitor requests: send NatHoleVisitor on control connection.
+                    // Go frps v0.69.1 only handles NatHoleVisitor on the control
+                    // connection path, not on fresh TCP connections.
+                    Some(vreq) = visitor_rx.recv() => {
+                        let txn_id = vreq.nhv.transaction_id.clone();
+                        let nhv = FrpMessage::NatHoleVisitor(vreq.nhv);
+                        match write_msg(&mut *writer.lock().await, &nhv, v2).await {
+                            Ok(()) => {
+                                debug!("Visitor: sent NatHoleVisitor on control, sid={}", txn_id);
+                                visitor_pending.insert(txn_id, vreq.reply);
+                            }
+                            Err(e) => {
+                                warn!("Visitor: failed to send NatHoleVisitor on control: {}", e);
+                                let _ = vreq.reply.send(Err(format!("send failed: {e}")));
+                            }
                         }
                     }
 

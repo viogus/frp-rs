@@ -238,6 +238,17 @@ pub struct StartWorkConn {
     /// Whether compression is enabled for the data bridge (Go frp compat).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub use_compression: Option<bool>,
+    /// XTCP visitor session ID for hole-punch notification (Rust frp extension).
+    /// When set, this work connection is for XTCP notification delivery —
+    /// the provider should initiate NAT hole punching with the visitor.
+    /// When absent and proxy_type is "xtcp", this is an STCP fallback bridge.
+    /// Go frp silently ignores unknown JSON fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nat_hole_sid: Option<String>,
+    /// XTCP visitor address for hole-punch notification (Rust frp extension).
+    /// Go frp silently ignores unknown JSON fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nat_hole_visitor_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,9 +358,13 @@ pub struct PortsRange {
 
 /// Server-recommended hole-punch behavior for a peer.
 /// Go frp v0.69.1 compat: DetectBehavior in NatHoleResp.
+/// CRITICAL: Go frps uses `json:"...,omitempty"` on ALL fields.
+/// When an integer field is 0, Go omits it from the JSON.
+/// All i32 fields below MUST have #[serde(default)] to handle this.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NatHoleDetectBehavior {
     /// Behavior mode (0-4). Determines role assignment.
+    #[serde(default)]
     pub mode: i32,
     /// Role: "sender" or "receiver".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -571,6 +586,7 @@ impl FrpMessage {
                 proxy_name: String::new(), src_addr: None, src_port: None,
                 dst_addr: None, dst_port: None, error: None,
                 use_encryption: None, use_compression: None,
+                nat_hole_sid: None, nat_hole_visitor_addr: None,
             })),
             TYPE_PING          => Some(FrpMessage::Ping(Ping { privilege_key: None, timestamp: None })),
             TYPE_PONG          => Some(FrpMessage::Pong(Pong { error: None })),
@@ -783,6 +799,8 @@ mod tests {
             error: None,
             use_encryption: None,
             use_compression: None,
+            nat_hole_sid: None,
+            nat_hole_visitor_addr: None,
         };
         roundtrip(&swc, r#"{"proxy_name":"p1","src_addr":"1.2.3.4","src_port":12345}"#);
     }

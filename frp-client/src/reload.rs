@@ -166,6 +166,7 @@ pub(crate) async fn do_reload(
                     proxy_type: p.proxy_type.clone(),
                     use_encryption: p.use_encryption,
                     use_compression: p.use_compression,
+                    sk: p.sk.clone(),
                     bandwidth_limit: bw_limit,
                     bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
                     proxy_protocol_version: p.proxy_protocol_version.clone(),

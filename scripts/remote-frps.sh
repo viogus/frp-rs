@@ -18,6 +18,12 @@
 # =============================================================================
 set -euo pipefail
 
+# Debug trap: log script exit point and reason (helps diagnose set -e failures)
+trap 'echo "TRACE: exit=$? line=$LINENO cmd=${BASH_COMMAND:-}" >&2' EXIT
+if [[ "${BASH_VERSINFO[0]:-0}" -ge 4 ]]; then
+    trap 'echo "TRACE: ERR at line=$LINENO cmd=$BASH_COMMAND" >&2' ERR
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 VPS_USER="${XTCP_VPS_USER:-frp-test}"
@@ -65,7 +71,7 @@ find_available_port() {
     for p in $(seq "$port" "$max"); do
         local in_use
         in_use=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-            "ss -tlnp 2>/dev/null | grep ':${p}\b' || true" 2>/dev/null)
+            "ss -tlnp 2>/dev/null | grep ':${p}\b' || true" 2>/dev/null) || true
         if [[ -z "$in_use" ]]; then
             echo "$p"
             return 0
@@ -76,20 +82,32 @@ find_available_port() {
 
 # Wait for frps to be listening on the given port
 wait_remote_port() {
-    local host="$1" port="$2" ssh_key="$3"
+    local host="$1" port="$2" ssh_key="$3" remote_dir="${4:-}"
     local max_attempts=30
 
     local i
+    echo "DBG: wait_remote_port host=$host port=$port max_attempts=$max_attempts remote_dir=$remote_dir" >&2
     for i in $(seq 1 "$max_attempts"); do
-        local listening
+        local listening ssh_rc
         listening=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-            "ss -tlnp 2>/dev/null | grep ':${port}\b' || true" 2>/dev/null)
+            "ss -tlnp 2>/dev/null | grep ':${port}\b' || true" 2>/dev/null) || true
+        ssh_rc=$?
+        if [[ $ssh_rc -ne 0 ]]; then
+            echo "WARNING: SSH to $host failed (exit=$ssh_rc) during port check $i/$max_attempts" >&2
+        fi
         if [[ -n "$listening" ]]; then
             return 0
         fi
         sleep 1
     done
-    die "frps on $host:$port did not become ready within ${max_attempts}s"
+
+    # Fetch frps log to help diagnose why it didn't start
+    local frps_log="(unavailable)"
+    if [[ -n "$remote_dir" ]]; then
+        frps_log=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+            "cat '$remote_dir/frps.log' 2>/dev/null || echo '(no log)'" 2>/dev/null) || true
+    fi
+    die "frps on $host:$port did not become ready within ${max_attempts}s. frps.log: $frps_log"
 }
 
 # =============================================================================
@@ -159,6 +177,10 @@ cmd_start() {
                  kill -0 \"\$pid\" 2>/dev/null && kill -9 \"\$pid\" 2>/dev/null || true; \
                fi; \
              fi; \
+                          for p in \$(seq $((17000 + shard * 100)) $((17000 + shard * 100 + 99))); do \
+                            fpid=\$(ss -tlnp 2>/dev/null | grep \":\${p}\b\" | grep -o 'pid=[0-9]*' | cut -d= -f2); \
+                            if [ -n "\$fpid" ]; then kill "\$fpid" 2>/dev/null || true; fi; \
+                          done; \
              rm -rf '$remote_dir'; \
              mkdir -p '$remote_dir'" 2>/dev/null || true
     else
@@ -173,7 +195,13 @@ cmd_start() {
 
     # --- Find available port (dies if none in range) ---
     local actual_port
-    actual_port=$(find_available_port "$host" "$port" "$ssh_key")
+    echo "DBG: find_available_port host=$host port=$port" >&2
+    # ||true prevents errexit on bash <4.4 if subshell exits non-zero
+    actual_port=$(find_available_port "$host" "$port" "$ssh_key") || true
+    echo "DBG: found port=$actual_port" >&2
+    if [[ -z "$actual_port" ]]; then
+        die "find_available_port failed — no port returned (all busy or SSH error)"
+    fi
 
     # --- Determine binary path ---
     local binary_path
@@ -208,29 +236,59 @@ cmd_start() {
 
     # --- Upload binary and config ---
     local scp_opts="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ControlPath=/tmp/frp-ssh-ctl-%h-%r"
-    local scp_err
-    scp_err=$(scp $scp_opts -i "$ssh_key" "$binary_path" "${VPS_USER}@${host}:${remote_dir}/frps" 2>&1 1>/dev/null) || {
+    local scp_err scp_rc=0
+    echo "DBG: uploading frps binary (${binary_path##*/}) to $host" >&2
+    scp_err=$(scp $scp_opts -i "$ssh_key" "$binary_path" "${VPS_USER}@${host}:${remote_dir}/frps" 2>&1 1>/dev/null) || scp_rc=$?
+    echo "DBG: binary upload done rc=$scp_rc" >&2
+    if [[ $scp_rc -ne 0 ]]; then
         rm -f "$config_path"
         die "failed to upload frps binary to $host: $scp_err"
-    }
-    scp_err=$(scp $scp_opts -i "$ssh_key" "$config_path" "${VPS_USER}@${host}:${remote_dir}/frps.toml" 2>&1 1>/dev/null) || {
+    fi
+    scp_rc=0
+    echo "DBG: uploading frps config to $host" >&2
+    scp_err=$(scp $scp_opts -i "$ssh_key" "$config_path" "${VPS_USER}@${host}:${remote_dir}/frps.toml" 2>&1 1>/dev/null) || scp_rc=$?
+    echo "DBG: config upload done rc=$scp_rc" >&2
+    if [[ $scp_rc -ne 0 ]]; then
         rm -f "$config_path"
         die "failed to upload frps config to $host: $scp_err"
-    }
+    fi
 
     # Clean up local config
     rm -f "$config_path"
 
     # --- Start frps on VPS ---
-    # Redirect all fds to detach from SSH session; nohup ensures survival
-    local start_err
-    start_err=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-        "cd $remote_dir && chmod +x frps && nohup ./frps -c frps.toml > frps.log 2>&1 < /dev/null & echo \$! > frps.pid" 2>&1 1>/dev/null) || {
-        die "failed to start frps on $host: $start_err"
-    }
+    # Background SSH locally: frps may inherit file descriptors from sshd
+    # session, keeping SSH connection open. We fire-and-forget the SSH
+    # process and verify frps startup via port check instead of SSH exit code.
+    echo "DBG: starting frps via background SSH on $host:$actual_port dir=$remote_dir" >&2
+    ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
+        "cd $remote_dir && chmod +x frps && nohup ./frps -c frps.toml > frps.log 2>&1 < /dev/null &" \
+        >/dev/null 2>&1 &
+    echo "DBG: frps start command sent (SSH backgrounded)" >&2
+
+    # Quick liveness check: if frps exits immediately (config parse error, etc.),
+    # we can fail fast with the log instead of waiting 30s for wait_remote_port.
+    sleep 2
+    echo "DBG: checking liveness of frps on $host:$actual_port dir=$remote_dir" >&2
+    local alive_check
+    alive_check=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+        "ss -tlnp 2>/dev/null | grep ':${actual_port}\b' || true" 2>/dev/null) || true
+    if [[ -z "$alive_check" ]]; then
+        # frps might still be starting — give it 3 more seconds
+        sleep 3
+        alive_check=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+            "ss -tlnp 2>/dev/null | grep ':${actual_port}\b' || true" 2>/dev/null) || true
+        if [[ -z "$alive_check" ]]; then
+            local early_log
+            early_log=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+                "cat '$remote_dir/frps.log' 2>/dev/null || echo '(no log)'" 2>/dev/null) || true
+            die "frps on $host:$actual_port did not start listening. frps.log: $early_log"
+        fi
+    fi
+    echo "DBG: liveness check passed (port $actual_port is listening)" >&2
 
     # --- Wait for frps to be ready ---
-    wait_remote_port "$host" "$actual_port" "$ssh_key"
+    wait_remote_port "$host" "$actual_port" "$ssh_key" "$remote_dir"
 
     # Echo actual port (MUST be last line of stdout for compat-test.sh integration)
     echo "$actual_port"
@@ -246,6 +304,7 @@ cmd_stop() {
     local result
     if [[ -n "$shard" ]]; then
         # CI matrix isolation: only kill this shard's frps, only clean its dir
+        local base_port=$((17000 + shard * 100))
         local remote_dir="/tmp/frp-xtcp-shard-${shard}"
         result=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
             "if [ -f '$remote_dir/frps.pid' ]; then \
@@ -256,6 +315,12 @@ cmd_stop() {
                  kill -0 \"\$pid\" 2>/dev/null && kill -9 \"\$pid\" 2>/dev/null || true; \
                fi; \
              fi; \
+                          for p in \$(seq ${base_port} $((base_port + 99))); do \
+                            fpid=\$(ss -tlnp 2>/dev/null | grep \":\${p}\b\" | grep -o 'pid=[0-9]*' | cut -d= -f2); \
+                            if [ -n "\$fpid" ]; then \
+                              kill "\$fpid" 2>/dev/null || true; \
+                            fi; \
+                          done; \
              rm -rf '$remote_dir'; \
              echo ok" 2>&1) || {
             echo "WARNING: remote stop on $host failed: $result" >&2

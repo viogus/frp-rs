@@ -200,27 +200,16 @@ async fn test_xtcp_concurrent_3_sessions() {
                         "[{}] StartWorkConn proxy_name mismatch",
                         i
                     );
-                    // Read NatHoleSid
-                    match read_msg_v1(&mut work_conn)
-                        .await
-                        .expect(&format!("[{}] read NatHoleSid from work conn", i))
-                    {
-                        FrpMessage::NatHoleSid(sid_msg) => {
-                            let sid = sid_msg
-                                .sid
-                                .expect(&format!("[{}] NatHoleSid should have sid", i));
-                            assert!(
-                                !sid.is_empty(),
-                                "[{}] sid should be non-empty",
-                                i
-                            );
-                        }
-                        other => panic!(
-                            "[{}] expected NatHoleSid after StartWorkConn, got: {:?}",
-                            i,
-                            other.v1_type_byte()
-                        ),
-                    }
+                    // NatHoleSid embedded in StartWorkConn (Rust frp extension).
+                    let sid = swc
+                        .nat_hole_sid
+                        .clone()
+                        .expect(&format!("[{}] StartWorkConn should have nat_hole_sid", i));
+                    assert!(
+                        !sid.is_empty(),
+                        "[{}] sid should be non-empty",
+                        i
+                    );
                 }
                 other => panic!(
                     "[{}] expected StartWorkConn on work conn, got: {:?}",
@@ -395,23 +384,13 @@ async fn test_xtcp_multiple_providers_same_server() {
     {
         FrpMessage::StartWorkConn(swc) => {
             assert_eq!(swc.proxy_name, "xtcp-prov-a");
-            match read_msg_v1(&mut work_conn_a)
-                .await
-                .expect("read NatHoleSid from work_conn_a")
-            {
-                FrpMessage::NatHoleSid(sid_msg) => {
-                    let s = sid_msg
-                        .sid
-                        .clone()
-                        .expect("NatHoleSid should have sid on A");
-                    assert!(!s.is_empty());
-                    s
-                }
-                other => panic!(
-                    "expected NatHoleSid on work_conn_a, got: {:?}",
-                    other.v1_type_byte()
-                ),
-            }
+            // NatHoleSid embedded in StartWorkConn (Rust frp extension).
+            let s = swc
+                .nat_hole_sid
+                .clone()
+                .expect("StartWorkConn should have nat_hole_sid on A");
+            assert!(!s.is_empty());
+            s
         }
         other => panic!(
             "expected StartWorkConn on work_conn_a, got: {:?}",
@@ -680,22 +659,12 @@ async fn test_xtcp_encrypted_proxy_registration() {
                 swc.use_compression
             );
 
-            // Also verify NatHoleSid follows
-            match read_msg_v1(&mut work_conn)
-                .await
-                .expect("read NatHoleSid from work conn")
-            {
-                FrpMessage::NatHoleSid(sid_msg) => {
-                    let sid = sid_msg
-                        .sid
-                        .expect("NatHoleSid should have sid");
-                    assert!(!sid.is_empty(), "sid should be non-empty");
-                }
-                other => panic!(
-                    "expected NatHoleSid after StartWorkConn, got: {:?}",
-                    other.v1_type_byte()
-                ),
-            }
+            // NatHoleSid embedded in StartWorkConn (Rust frp extension).
+            let sid = swc
+                .nat_hole_sid
+                .clone()
+                .expect("StartWorkConn should have nat_hole_sid");
+            assert!(!sid.is_empty(), "sid should be non-empty");
         }
         other => panic!(
             "expected StartWorkConn on work conn, got: {:?}",
