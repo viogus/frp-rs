@@ -181,7 +181,46 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        // SAFETY: W: Unpin guarantees we can project through Pin to access
+        // `state` and `inner` fields. No moves occur — only field mutation.
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+
+        // If still in initial Writing state with no buffered data, generate
+        // and flush the IV eagerly. This prevents a deadlock when both sides
+        // of a connection create CipherWriter/CipherReader pairs: each side's
+        // CipherReader blocks waiting for the other side's IV, but neither
+        // CipherWriter sends its IV until user data arrives.
+        if let WriteState::Writing { buf: wbuf, pos, cfb: saved_cfb, buf_consumed } = &mut this.state {
+            if wbuf.is_empty() {
+                use rand::RngCore;
+                let mut iv = [0u8; 16];
+                rand::rngs::OsRng.fill_bytes(&mut iv);
+                let cfb_state = CfbState::new(&this.key, &iv);
+                *wbuf = iv.to_vec();
+                *pos = 0;
+                *buf_consumed = 0;
+                *saved_cfb = Some(cfb_state);
+            }
+            // Write the IV buffer to the inner writer
+            match Pin::new(&mut this.inner).poll_write(cx, &wbuf[*pos..]) {
+                Poll::Ready(Ok(n)) => {
+                    *pos += n;
+                    if *pos >= wbuf.len() {
+                        let cfb = saved_cfb.take().expect("cfb must be set after IV generation");
+                        this.state = WriteState::Encrypting { cfb, pending: Vec::new(), pos: 0 };
+                        // IV fully flushed — now flush inner writer
+                        return Pin::new(&mut this.inner).poll_flush(cx);
+                    }
+                    // IV partially written, wake and retry
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            Pin::new(&mut this.inner).poll_flush(cx)
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

@@ -53,6 +53,16 @@ pub async fn bridge_encrypted(
     let mut enc_work_r = CipherReader::new(work_r, *key);
     let mut enc_work_w = CipherWriter::new(work_w, *key);
 
+    // Eagerly flush the IV to unblock the peer's CipherReader.
+    // Without this, when both sides use CipherWriter/CipherReader pairs,
+    // each side's work_to_user task blocks on CipherReader::read() waiting
+    // for the other side's IV, while the other side's user_to_work task
+    // blocks waiting for user data — deadlock. Flushing here sends our
+    // random IV immediately so the peer's CipherReader can make progress.
+    if enc_work_w.flush().await.is_err() {
+        return;
+    }
+
     // User → Work: write pre_read first (through CipherWriter), then bridge
     let user_to_work = async {
         if !pre_read.is_empty()

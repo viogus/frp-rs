@@ -258,17 +258,18 @@ pub(crate) async fn assign_work_to_proxy(
         dst_addr: if !proxy_protocol_version.is_empty() && !dst_addr.is_empty() { Some(dst_addr) } else { None },
         dst_port: if !proxy_protocol_version.is_empty() && dst_port != 0 { Some(dst_port) } else { None },
         error: None,
-        // For XTCP STCP fallback: force plain bridge to avoid dual-CipherWriter
-        // deadlock. When both server and provider use bridge_encrypted on the
-        // same work connection, the CipherReaders deadlock waiting for each
-        // other's IV. The StartWorkConn fields are set to Some(false) so the
-        // Rust frpc provider also uses plain bridging (work_conn.rs respects
-        // swc.use_encryption over info.use_encryption).
-        use_encryption: if req.proxy_type == "xtcp" { Some(false) } else if req.use_encryption { Some(true) } else { None },
-        use_compression: if req.proxy_type == "xtcp" { Some(false) } else if req.use_compression { Some(true) } else { None },
+        // use_encryption/use_compression: propagate proxy config settings.
+        // Go frpc v0.69.1 ignores these fields (not in its StartWorkConn struct)
+        // and uses its own proxy config. The server must match whatever the
+        // provider does, so the bridge type (plain vs encrypted) is determined
+        // below based on req.use_encryption/compression, NOT forced to false.
+        // Rust frpc (work_conn.rs) respects swc.use_encryption over its own config.
+        // CipherWriter now eagerly flushes IV on first poll_flush, preventing the
+        // dual-CipherWriter deadlock that previously forced plain bridge for XTCP.
+        use_encryption: if req.use_encryption { Some(true) } else { None },
+        use_compression: if req.use_compression { Some(true) } else { None },
         // For XTCP STCP fallback: set empty nat_hole_sid marker so Rust frpc
-        // knows to consume the dummy NatHoleSid frame (sent for Go frpc compat)
-        // before entering bridge mode.
+        // knows this work conn is for STCP bridging, not XTCP notification.
         nat_hole_sid: if req.proxy_type == "xtcp" { Some(String::new()) } else { None },
         nat_hole_visitor_addr: None,
     });
@@ -314,12 +315,13 @@ pub(crate) async fn assign_work_to_proxy(
 
     tokio::spawn(async move {
         let _guard = guard;
-        // For XTCP STCP fallback, always use plain bridge.
-        // Using bridge_encrypted on both server and provider side of the
-        // same work connection causes a deadlock: each side's CipherReader
-        // blocks waiting for the other side's CipherWriter to send an IV,
-        // but neither CipherWriter writes until user data arrives.
-        let use_enc = enc_key && proxy_type != "xtcp";
+        // Use encryption if the proxy config requests it (req.use_encryption
+        // comes from proxy_manager). For XTCP STCP fallback, we previously
+        // forced plain bridge to avoid a dual-CipherWriter deadlock — that
+        // deadlock is now fixed by eager IV flush in CipherWriter::poll_flush.
+        // Go frpc v0.69.1 ignores swc.use_encryption (not in its struct) and
+        // uses its own proxy config, so the server MUST match.
+        let use_enc = enc_key;
         // For encrypted bridges, pre_read bytes are passed into bridge_encrypted
         // which writes them through the CipherWriter (matching Go frp streaming CFB).
         if use_enc {
@@ -389,14 +391,14 @@ pub(crate) async fn assign_work_to_proxy(
             // to let the backend response flow back to the user.
             let bridge_pre_read = pre_read;
 
-            // XTCP STCP fallback: use copy_bidirectional directly instead of
-            // bridge_plain. bridge_plain's join! pattern drops the work writer
-            // (sending FIN) as soon as the user reader reaches EOF. For STCP
-            // fallback the visitor's test client half-closes after sending data,
-            // so the server sees EOF on the user side ~60ms before the provider
-            // starts its bridge. The premature FIN on the work connection races
-            // with the provider's copy_bidirectional startup and produces
-            // ECONNRESET on VPS (Linux TCP stack behavior differs from macOS).
+            // XTCP STCP fallback (plain, no encryption): use copy_bidirectional
+            // directly instead of bridge_plain. bridge_plain's join! pattern
+            // drops the work writer (sending FIN) as soon as the user reader
+            // reaches EOF. For STCP fallback the visitor's test client
+            // half-closes after sending data, so the server sees EOF on the
+            // user side ~60ms before the provider starts its bridge. The
+            // premature FIN on the work connection races with the provider's
+            // copy_bidirectional startup and produces ECONNRESET on VPS.
             // copy_bidirectional avoids this: both directions run to completion
             // within the same function, and the work side is only shut down
             // after the full bidirectional copy finishes.
