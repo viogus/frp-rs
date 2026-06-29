@@ -439,8 +439,57 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                             }
                         }
                     }
-                    // V2: byte-peek not implemented (V2 is stubs-only). Fall through
-                    // to STCP bridging. Go frp doesn't support V2 XTCP.
+                    // V2: read one frame and check for NatHoleSid.
+                    // Rust frps sends a V2 NatHoleSid frame after StartWorkConn
+                    // for XTCP notification (separate frame for Go frp compat).
+                    // Go frp v0.69.1 doesn't support V2 XTCP, so this is
+                    // Rust↔Rust only.
+                    {
+                        use frp_core::protocol::{read_v2_frame_raw, V2_FRAME_TYPE_MESSAGE};
+                        let mut peek_buf = Vec::new();
+                        match read_v2_frame_raw(&mut work).await {
+                            Ok((V2_FRAME_TYPE_MESSAGE, flags, payload)) => {
+                                peek_buf.extend_from_slice(&V2_FRAME_TYPE_MESSAGE.to_be_bytes());
+                                peek_buf.extend_from_slice(&flags.to_be_bytes());
+                                peek_buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                                peek_buf.extend_from_slice(&payload);
+                                if payload.len() >= 2 {
+                                    let type_id = u16::from_be_bytes([payload[0], payload[1]]);
+                                    if type_id == msg::V2_TYPE_NAT_HOLE_SID {
+                                        if let Ok(sid_msg) = serde_json::from_slice::<msg::NatHoleSid>(&payload[2..]) {
+                                            if let Some(sid) = sid_msg.sid {
+                                                if !sid.is_empty() {
+                                                    debug!("XTCP work conn {}: NatHoleSid (V2) for '{}'", label, proxy_name);
+                                                    let _ = xtcp_tx.send(XtcpNotification {
+                                                        sid,
+                                                        proxy_name: proxy_name.clone(),
+                                                    });
+                                                    return;
+                                                }
+                                            }
+                                            // sid=None or empty: STCP fallback — replay frame
+                                        }
+                                    }
+                                }
+                                // Not a NatHoleSid with non-empty sid — replay for STCP bridging
+                                work = IoStream::BufferedRead(peek_buf, 0, Box::new(work));
+                            }
+                            Ok((frame_type, flags, payload)) => {
+                                // Non-Message frame type — replay for STCP bridging
+                                peek_buf.extend_from_slice(&frame_type.to_be_bytes());
+                                peek_buf.extend_from_slice(&flags.to_be_bytes());
+                                peek_buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                                peek_buf.extend_from_slice(&payload);
+                                work = IoStream::BufferedRead(peek_buf, 0, Box::new(work));
+                            }
+                            Err(_) => {
+                                // Not a V2 frame — raw bridge data for STCP fallback.
+                                // read_v2_frame_raw already consumed some bytes; the
+                                // stream is in an indeterminate state. Fall through to
+                                // bridging — the bridge will get an error or partial data.
+                            }
+                        }
+                    }
 
                     // Fall through to normal bridging for STCP fallback
                 }

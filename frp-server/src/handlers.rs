@@ -5,7 +5,7 @@ use tokio::sync::oneshot;
 use tracing::{info, warn, debug};
 
 use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::write_msg_v1;
+use frp_core::protocol::write_msg;
 use frp_core::transport::IoStream;
 
 use crate::state::{AppState, InternalMsg};
@@ -27,6 +27,7 @@ pub(crate) async fn handle_visitor_conn_inner(
     mut stream: IoStream,
     msg: msg::NewVisitorConn,
     state: Arc<AppState>,
+    v2: bool,
 ) {
     let sign_key = msg.sign_key.unwrap_or_default();
     let timestamp = msg.timestamp.unwrap_or(0);
@@ -81,7 +82,7 @@ pub(crate) async fn handle_visitor_conn_inner(
                         proxy_name: msg.proxy_name.clone(),
                         error: Some("proxy not found".into()),
                     });
-                    let _ = write_msg_v1(&mut stream, &resp).await;
+                    let _ = write_msg(&mut stream, &resp, v2).await;
                     return;
                 }
             }
@@ -99,7 +100,7 @@ pub(crate) async fn handle_visitor_conn_inner(
          proxy_name: proxy_name.clone(),
          error: Some("provider not found".into()),
      });
-     let _ = write_msg_v1(&mut stream, &resp).await;
+     let _ = write_msg(&mut stream, &resp, v2).await;
      return;
         }
     };
@@ -114,7 +115,7 @@ pub(crate) async fn handle_visitor_conn_inner(
                     proxy_name: proxy_name.clone(),
                     error: Some("visitor not allowed".into()),
                 });
-                let _ = write_msg_v1(&mut stream, &resp).await;
+                let _ = write_msg(&mut stream, &resp, v2).await;
                 return;
             }
         }
@@ -134,7 +135,7 @@ pub(crate) async fn handle_visitor_conn_inner(
            proxy_name: proxy_name.clone(),
            error: None,
        });
-       if let Err(e) = write_msg_v1(&mut stream, &resp).await {
+       if let Err(e) = write_msg(&mut stream, &resp, v2).await {
            warn!("Failed to send NewVisitorConnResp for proxy '{}': {}", proxy_name, e);
            return;
        }
@@ -152,7 +153,7 @@ pub(crate) async fn handle_visitor_conn_inner(
            proxy_name: proxy_name.clone(),
            error: Some("provider disconnected".into()),
        });
-       let _ = write_msg_v1(&mut stream, &resp).await;
+       let _ = write_msg(&mut stream, &resp, v2).await;
         }
     }
 }
@@ -173,6 +174,7 @@ pub(crate) async fn handle_nat_hole_visitor(
     msg: msg::NatHoleVisitor,
     state: Arc<AppState>,
     _visitor_addr: Option<String>, // not used in Go compat path; kept for callers
+    v2: bool,
 ) {
     let transaction_id = msg.transaction_id.clone();
     let proxy_name = msg.proxy_name.clone();
@@ -191,7 +193,7 @@ pub(crate) async fn handle_nat_hole_visitor(
             error: Some("proxy not found".into()),
             ..Default::default()
         });
-        let _ = write_msg_v1(&mut writer, &resp).await;
+        let _ = write_msg(&mut writer, &resp, v2).await;
         return;
     }
 
@@ -207,7 +209,7 @@ pub(crate) async fn handle_nat_hole_visitor(
                 error: Some("provider offline".into()),
                 ..Default::default()
             });
-            let _ = write_msg_v1(&mut writer, &resp).await;
+            let _ = write_msg(&mut writer, &resp, v2).await;
             return;
         }
     };
@@ -227,7 +229,7 @@ pub(crate) async fn handle_nat_hole_visitor(
                 error: Some("provider disconnected".into()),
                 ..Default::default()
             });
-            let _ = write_msg_v1(&mut writer, &resp).await;
+            let _ = write_msg(&mut writer, &resp, v2).await;
             return;
         }
     };
@@ -247,7 +249,7 @@ pub(crate) async fn handle_nat_hole_visitor(
             error: None,
             ..Default::default()
         });
-        let _ = write_msg_v1(&mut writer, &resp).await;
+        let _ = write_msg(&mut writer, &resp, v2).await;
         return;
     }
 
@@ -329,7 +331,7 @@ pub(crate) async fn handle_nat_hole_visitor(
                 error: Some("provider NAT detection timeout".into()),
                 ..Default::default()
             });
-            let _ = write_msg_v1(w, &resp).await;
+            let _ = write_msg(w, &resp, v2).await;
         }
         state.nat_hole.remove(&sid).await;
         drop(reader);
@@ -433,7 +435,7 @@ pub(crate) async fn handle_nat_hole_visitor(
     {
         let mut writer_guard = session.visitor_writer.lock().await;
         if let Some(ref mut w) = *writer_guard {
-            let _ = write_msg_v1(w, &FrpMessage::NatHoleResp(v_resp)).await;
+            let _ = write_msg(w, &FrpMessage::NatHoleResp(v_resp), v2).await;
         }
     }
 
@@ -504,10 +506,10 @@ pub(crate) async fn dispatch_v2_message(
             handle_work_conn_inner(io, nwc, state).await;
         }
         FrpMessage::NewVisitorConn(vc) => {
-            handle_visitor_conn_inner(io, vc, state).await;
+            handle_visitor_conn_inner(io, vc, state, true).await;
         }
         FrpMessage::NatHoleVisitor(nhv) => {
-            handle_nat_hole_visitor(io, nhv, state, visitor_addr).await;
+            handle_nat_hole_visitor(io, nhv, state, visitor_addr, true).await;
         }
         other => {
             warn!("Unexpected V2 first message from {}: {:?}", addr, other.v2_type_id());
