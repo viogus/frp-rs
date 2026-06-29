@@ -18,9 +18,17 @@ const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 /// Returns the mapped address as "ip:port".
 pub async fn stun_binding(stun_addr: &str) -> Result<String, String> {
     let addr_str = stun_addr.strip_prefix("stun:").unwrap_or(stun_addr);
-    let addr: SocketAddr = addr_str
-        .parse()
-        .map_err(|e| format!("invalid STUN address '{}': {}", stun_addr, e))?;
+    // Resolve hostname to SocketAddr (Go frp compat: net.ResolveUDPAddr)
+    let addr: SocketAddr = if let Ok(sa) = addr_str.parse::<SocketAddr>() {
+        sa
+    } else {
+        // Try DNS resolution
+        let addrs = tokio::net::lookup_host(format!("{}", addr_str))
+            .await
+            .map_err(|e| format!("STUN DNS lookup failed for '{}': {}", addr_str, e))?;
+        addrs.into_iter().next()
+            .ok_or_else(|| format!("STUN DNS: no addresses found for '{}'", addr_str))?
+    };
 
     let socket = UdpSocket::bind("0.0.0.0:0")
         .await

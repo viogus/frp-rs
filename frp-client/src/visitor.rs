@@ -158,6 +158,16 @@ pub(crate) async fn run_visitor_listener(
 
                             // --- Send NatHoleVisitor on control connection ---
                             let txn_id = uuid::Uuid::new_v4().to_string();
+                            // Generate auth credentials (Go frps v0.69.1 requires sign_key+timestamp)
+                            let ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64;
+                            let sign_key = if sk.is_empty() {
+                                None
+                            } else {
+                                Some(frp_core::auth::generate_token(&sk, ts))
+                            };
                             let (reply_tx, reply_rx) = oneshot::channel();
                             let nhv = crate::service::VisitorRequest {
                                 nhv: msg::NatHoleVisitor {
@@ -165,6 +175,8 @@ pub(crate) async fn run_visitor_listener(
                                     proxy_name: sn.clone(),
                                     pre_check: false,
                                     protocol: Some("tcp".to_string()),
+                                    sign_key,
+                                    timestamp: Some(ts),
                                     mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
                                     ..Default::default()
                                 },
