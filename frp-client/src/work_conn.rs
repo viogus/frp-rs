@@ -621,8 +621,15 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                     }
                                 }
                             }
-                            let enc = if info.use_encryption { Some(&enc_key) } else { None };
-                            proxy::bridge_streams(local, work, proxy_name, info.use_encryption, info.use_compression, enc, info.bandwidth_limit, &info.bandwidth_limit_mode, proxy_metrics).await;
+                            // Respect StartWorkConn's use_encryption/use_compression
+                            // if explicitly set (Some), otherwise fall back to
+                            // proxy info. This allows the server to disable
+                            // encryption for XTCP STCP fallback work connections
+                            // to avoid the dual-CipherWriter deadlock.
+                            let use_enc = swc.use_encryption.unwrap_or(info.use_encryption);
+                            let use_comp = swc.use_compression.unwrap_or(info.use_compression);
+                            let enc = if use_enc { Some(&enc_key) } else { None };
+                            proxy::bridge_streams(local, work, proxy_name, use_enc, use_comp, enc, info.bandwidth_limit, &info.bandwidth_limit_mode, proxy_metrics).await;
                         }
                         Err(e) => {
                             warn!("Work conn {}: failed to connect to local {}: {}", label, info.local_addr, e);

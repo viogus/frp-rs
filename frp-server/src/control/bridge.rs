@@ -257,8 +257,14 @@ pub(crate) async fn assign_work_to_proxy(
         dst_addr: if !proxy_protocol_version.is_empty() && !dst_addr.is_empty() { Some(dst_addr) } else { None },
         dst_port: if !proxy_protocol_version.is_empty() && dst_port != 0 { Some(dst_port) } else { None },
         error: None,
-        use_encryption: if req.use_encryption { Some(true) } else { None },
-        use_compression: if req.use_compression { Some(true) } else { None },
+        // For XTCP STCP fallback: force plain bridge to avoid dual-CipherWriter
+        // deadlock. When both server and provider use bridge_encrypted on the
+        // same work connection, the CipherReaders deadlock waiting for each
+        // other's IV. The StartWorkConn fields are set to Some(false) so the
+        // Rust frpc provider also uses plain bridging (work_conn.rs respects
+        // swc.use_encryption over info.use_encryption).
+        use_encryption: if req.proxy_type == "xtcp" { Some(false) } else if req.use_encryption { Some(true) } else { None },
+        use_compression: if req.proxy_type == "xtcp" { Some(false) } else if req.use_compression { Some(true) } else { None },
         // For XTCP STCP fallback: set empty nat_hole_sid marker so Rust frpc
         // knows to consume the dummy NatHoleSid frame (sent for Go frpc compat)
         // before entering bridge mode.
@@ -305,12 +311,19 @@ pub(crate) async fn assign_work_to_proxy(
     let pre_read = req.pre_read;
     let enc_key = req.use_encryption;
     let comp_key = req.use_compression;
+    let proxy_type = req.proxy_type.clone();
 
     tokio::spawn(async move {
         let _guard = guard;
+        // For XTCP STCP fallback, always use plain bridge.
+        // Using bridge_encrypted on both server and provider side of the
+        // same work connection causes a deadlock: each side's CipherReader
+        // blocks waiting for the other side's CipherWriter to send an IV,
+        // but neither CipherWriter writes until user data arrives.
+        let use_enc = enc_key && proxy_type != "xtcp";
         // For encrypted bridges, pre_read bytes are passed into bridge_encrypted
         // which writes them through the CipherWriter (matching Go frp streaming CFB).
-        if enc_key {
+        if use_enc {
             let key = encryption_key;
             match work_conn {
                 IoStream::Tcp(work) => {
