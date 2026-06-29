@@ -65,9 +65,12 @@ jobs:
 
       - name: Build frp-rs (release)
         if: steps.check.outputs.configured == 'true'
+        run: |
+          mkdir -p .cargo
+          printf '[profile.release]\nlto = false\n' >> .cargo/config.toml
+          cargo build --release --bin frps --bin frpc
         env:
           RUSTFLAGS: ""   # override setup-rust-toolchain's -D warnings
-        run: cargo build --release --config 'profile.release.lto=false' --bin frps --bin frpc
 
       - name: Download Go frp
         if: steps.check.outputs.configured == 'true'
