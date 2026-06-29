@@ -874,7 +874,7 @@ write_frpc_config_xtcp_visitor() {
             printf '\n[[visitors]]\nname = "%s-stcp-visitor"\ntype = "stcp"\n' "$server_name"
             printf 'serverName = "%s-stcp"\n' "$server_name"
             printf 'secretKey = "%s"\n' "$sk"
-            printf 'bindAddr = "127.0.0.1"\nbindPort = 0\n'
+            printf 'bindAddr = "127.0.0.1"\nbindPort = -1\n'
             if $has_enc; then printf 'transport.useEncryption = true\n'; fi
             if $has_comp; then printf 'transport.useCompression = true\n'; fi
         } > "$out"
