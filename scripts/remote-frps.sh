@@ -63,15 +63,21 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 # =============================================================================
 
 # Scan port..port+100 on VPS, return first available port number
+# NOTE: do NOT silence SSH errors (2>/dev/null) — if SSH fails we must
+# not incorrectly mark ports as free. The function will die on SSH failure.
 find_available_port() {
     local host="$1" port="$2" ssh_key="$3"
     local max=$((port + 100))
 
     local p
     for p in $(seq "$port" "$max"); do
-        local in_use
+        local in_use ssh_rc
         in_use=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-            "ss -tlnp 2>/dev/null | grep ':${p}\b' || true" 2>/dev/null) || true
+            "ss -tlnp 2>/dev/null | grep ':${p}\b' || true" 2>/dev/null)
+        ssh_rc=$?
+        if [[ $ssh_rc -ne 0 ]]; then
+            die "SSH to $host failed while scanning port $p (exit=$ssh_rc)"
+        fi
         if [[ -z "$in_use" ]]; then
             echo "$p"
             return 0
@@ -289,6 +295,7 @@ cmd_start() {
 
     # --- Wait for frps to be ready ---
     wait_remote_port "$host" "$actual_port" "$ssh_key" "$remote_dir"
+    echo "WAIT_OK: frps ready on port $actual_port" >&2
 
     # Echo actual port (MUST be last line of stdout for compat-test.sh integration)
     echo "$actual_port"
