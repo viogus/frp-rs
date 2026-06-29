@@ -797,12 +797,20 @@ impl Service {
                             }
                             Ok(FrpMessage::NatHoleResp(resp)) => {
                                 // Route to waiting visitor first (Go frps compat path).
-                                let sid = resp.sid.clone().unwrap_or_default();
-                                if let Some(tx) = visitor_pending.remove(&sid) {
-                                    info!("XTCP visitor: received NatHoleResp for sid '{}'", sid);
-                                    let _ = tx.send(Ok(resp));
-                                    continue;
+                                // CRITICAL: Go frps generates its own sid for the NAT session,
+                                // different from the visitor's transaction_id. The NatHoleResp
+                                // contains BOTH: transaction_id (from visitor) and sid (from server).
+                                // Route by transaction_id (what the visitor set).
+                                let txn_id = resp.transaction_id.clone();
+                                if !txn_id.is_empty() {
+                                    if let Some(tx) = visitor_pending.remove(&txn_id) {
+                                        info!("XTCP visitor: received NatHoleResp for txn '{}'", txn_id);
+                                        let _ = tx.send(Ok(resp));
+                                        continue;
+                                    }
                                 }
+                                // Fall through: route to provider by server sid
+                                let sid = resp.sid.clone().unwrap_or_default();
                                 // Provider receives server's analysis with visitor's candidate addresses.
                                 if let Some(err) = resp.error {
                                     warn!("XTCP NatHoleResp error: {}", err);
