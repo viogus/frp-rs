@@ -135,6 +135,14 @@ cmd_start() {
         die "SSH key not found (check XTCP_VPS_SSH_KEY)"
     fi
 
+    # --- Kill stale frps from previous runs (defense against failed cleanup) ---
+    ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
+        "pkill -f 'frps -c frps.toml' 2>/dev/null; \
+         for d in /tmp/frp-xtcp-?????? /tmp/frp-xtcp-test; do \
+             if [ -d \"\$d\" ]; then rm -rf \"\$d\" 2>/dev/null; fi; \
+         done; \
+         rm -f /tmp/.frp-xtcp-dir 2>/dev/null" 2>/dev/null || true
+
     # --- Find available port (dies if none in range) ---
     local actual_port
     actual_port=$(find_available_port "$host" "$port" "$ssh_key")
@@ -204,47 +212,19 @@ cmd_stop() {
         die "SSH key not found (check XTCP_VPS_SSH_KEY)"
     fi
 
-    # Run cleanup script on VPS. Suppress stderr (SSH warnings, kill output).
-    # || true ensures we don't fail if the remote dir is already gone.
-    # Read stored directory from /tmp/.frp-xtcp-dir if available
-    ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" "bash -s" 2>/dev/null <<'REMOTE_SCRIPT' || true
-set -euo pipefail
-# Find all frp-xtcp temp dirs
-for d in /tmp/frp-xtcp-??????; do
-    if [[ -d "$d" ]]; then
-        PID_FILE="$d/frps.pid"
-        if [[ -f "$PID_FILE" ]]; then
-            pid=$(cat "$PID_FILE")
-            if kill -0 "$pid" 2>/dev/null; then
-                kill "$pid" 2>/dev/null || true
-                # Graceful shutdown: wait up to 10s
-                for i in $(seq 1 10); do
-                    kill -0 "$pid" 2>/dev/null || break
-                    sleep 1
-                done
-                # Force kill if still alive
-                kill -9 "$pid" 2>/dev/null || true
-            fi
-        fi
-        # Remove this temp directory
-        rm -rf "$d" 2>/dev/null || true
-    fi
-done
-# Also try legacy dir
-if [[ -d "/tmp/frp-xtcp-test" ]]; then
-    PID_FILE="/tmp/frp-xtcp-test/frps.pid"
-    if [[ -f "$PID_FILE" ]]; then
-        pid=$(cat "$PID_FILE")
-        kill "$pid" 2>/dev/null || true
-        sleep 1
-        kill -9 "$pid" 2>/dev/null || true
-    fi
-    rm -rf "/tmp/frp-xtcp-test" 2>/dev/null || true
-fi
-# Clean up any straggler frps processes
-pkill -f "frps -c frps.toml" 2>/dev/null || true
-rm -f /tmp/.frp-xtcp-dir 2>/dev/null || true
-REMOTE_SCRIPT
+    # Inline command — heredoc delivery can fail across OpenSSH versions.
+    # Kill all frps processes first, then clean up temp dirs.
+    local result
+    result=$(ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
+        "pkill -f 'frps -c frps.toml' 2>/dev/null; \
+         for d in /tmp/frp-xtcp-?????? /tmp/frp-xtcp-test; do \
+             if [ -d \"\$d\" ]; then rm -rf \"\$d\" 2>/dev/null; fi; \
+         done; \
+         rm -f /tmp/.frp-xtcp-dir 2>/dev/null; \
+         echo ok" 2>&1) || {
+        echo "WARNING: remote stop on $host failed: $result" >&2
+        return 1
+    }
     echo "stopped"
 }
 

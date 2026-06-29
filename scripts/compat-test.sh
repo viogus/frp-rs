@@ -2183,7 +2183,7 @@ run_xtcp_test() {
     if ! wait_for_port_safe 127.0.0.1 "$visitor_port" 30; then
         fail_test "$name" "visitor port $visitor_port not reachable"
         if [[ -n "${XTCP_FRPS_REMOTE:-}" ]]; then
-            bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "$ssh_key_path" 2>/dev/null || true
+            bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "$ssh_key_path" || true
         fi
         return
     fi
@@ -2199,7 +2199,7 @@ run_xtcp_test() {
 
     # Cleanup remote frps
     if [[ -n "${XTCP_FRPS_REMOTE:-}" ]]; then
-        bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "$ssh_key_path" 2>/dev/null || true
+        bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "$ssh_key_path" || true
     fi
 }
 
