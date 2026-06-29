@@ -270,6 +270,24 @@ pub(crate) async fn assign_work_to_proxy(
         return;
     }
 
+    // For XTCP proxies in STCP fallback mode: send NatHoleSid with no sid
+    // so the frpc work_conn handler knows this is a bridging work connection,
+    // not a NatHoleSid delivery. The frpc reads NatHoleSid after StartWorkConn
+    // for XTCP proxies; without this marker it would read bridge data as a V1
+    // frame (cause: invalid V1 msg length, hex decodes to bridged TCP stream).
+    let proxy_type = req.proxy_type.clone();
+    if proxy_type == "xtcp" {
+        let stcp_marker = FrpMessage::NatHoleSid(msg::NatHoleSid {
+            sid: None, // None = STCP fallback, Some = XTCP notification
+            provider_addr: None,
+        });
+        let _ = if v2 {
+            work_conn.write_v2_frame(&stcp_marker).await
+        } else {
+            work_conn.write_v1_frame(&stcp_marker).await
+        };
+    }
+
     info!("Bridging user conn to work conn for proxy '{}'", req.proxy_name);
 
     let proxy_name = req.proxy_name.clone();

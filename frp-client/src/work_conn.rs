@@ -346,8 +346,9 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                 };
 
                 if info.proxy_type == "xtcp" {
-                    // XTCP proxy: read NatHoleSid from work conn, notify control loop.
-                    // The control loop handles STUN, NatHoleClient, and hole punch.
+                    // XTCP proxy: read NatHoleSid from work conn.
+                    // - sid=Some: XTCP notification delivery → notify control loop, return
+                    // - sid=None: STCP fallback → fall through to normal bridging below
                     let sid_result = if v2 {
                         work.read_v2_frame().await
                     } else {
@@ -361,18 +362,21 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                     sid,
                                     proxy_name: proxy_name.clone(),
                                 });
-                            } else {
-                                warn!("XTCP work conn {}: NatHoleSid without sid", label);
+                                return; // XTCP notification: work conn consumed, don't bridge
                             }
+                            // sid=None: STCP fallback — continue to bridging below
+                            debug!("XTCP work conn {}: NatHoleSid without sid (STCP fallback), bridging", label);
                         }
                         Ok(other) => {
                             warn!("XTCP work conn {}: expected NatHoleSid, got type 0x{:02x}", label, other.v1_type_byte());
+                            return;
                         }
                         Err(e) => {
                             warn!("XTCP work conn {}: failed to read NatHoleSid: {}", label, e);
+                            return;
                         }
                     }
-                    return;
+                    // Fall through to normal bridging for STCP fallback
                 }
 
                 if info.proxy_type == "udp" {
