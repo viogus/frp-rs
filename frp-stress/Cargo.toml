@@ -1,0 +1,13 @@
+[package]
+name = "frp-stress"
+version = "0.1.0"
+edition = "2021"
+description = "CI stress testing framework for frp-rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros", "rt-multi-thread", "signal"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures-util = { workspace = true }

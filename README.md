@@ -495,6 +495,14 @@ Each encrypted frame contains a random 16-byte IV followed by the CFB-encrypted
 - Supported for TCP proxies (both client and server bridge paths) and control connections.
 - Note: Go frp v0.69.1 golib source says salt `"crypto"` but the pre-built binary uses `"frp"`. This codebase uses `"frp"` for binary compatibility.
 
+## Documentation
+
+- **[Configuration Reference](docs/config.md)** — Every config field with types, defaults, and Go frp equivalents
+- **[Proxy Type Guide](docs/proxies.md)** — When and how to use each proxy type (TCP, UDP, HTTP, STCP, XTCP, etc.)
+- **[Client Plugins](docs/client-plugins.md)** — HTTP proxy, SOCKS5, static file, TLS termination, and more
+- **[Deployment Guide](docs/deployment.md)** — Systemd, Docker, TLS, monitoring, performance tuning
+- **[Developer Guide](docs/developing.md)** — Architecture deep-dive, debugging, testing, release process
+
 ## Project Structure
 
 
