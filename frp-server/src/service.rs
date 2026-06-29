@@ -1127,7 +1127,7 @@ impl Service {
             Some(p) => p.clone(),
             None => return Err("No config file path stored".into()),
         };
-        let new_cfg: ServerConfig = frp_core::config::load_server_config(&config_path)
+        let new_cfg: ServerConfig = frp_core::config::load_server_config(&config_path, false)
             .map_err(|e| format!("Failed to reload config: {e}"))?;
 
         let mut changes: Vec<String> = Vec::new();

@@ -11,7 +11,7 @@ pub mod bandwidth;
 pub mod metrics;
 #[cfg(feature = "tls")]
 pub mod admin_auth;
-pub mod args;
+pub mod cli;
 #[cfg(feature = "kcp")]
 pub mod kcp;
 #[cfg(feature = "quic")]

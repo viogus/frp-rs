@@ -1045,25 +1045,41 @@ fn normalize_client_config(value: &mut toml::Value) {
     }
 }
 
-/// Load a TOML server configuration from a file path, processing includes.
-pub fn load_server_config(path: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+/// Load a server configuration from a file path, auto-detecting format by extension.
+/// When `strict_config` is true, unknown fields cause an error (Go frp default).
+pub fn load_server_config(
+    path: &str,
+    strict_config: bool,
+) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)?;
-    let mut value: toml::Value = toml::from_str(&content)?;
+    let format = detect_format(path);
+    let mut value: toml::Value = parse_to_toml_value(&content, format)?;
     let base_dir = Path::new(path).parent().unwrap_or(Path::new("."));
     process_includes(&mut value, base_dir)?;
     normalize_server_config(&mut value);
+    if strict_config {
+        run_strict_check(&value, &known_server_keys(), path)?;
+    }
     let json_value = toml_to_json(value);
     let cfg: ServerConfig = serde_json::from_value(json_value)?;
     Ok(cfg)
 }
 
-/// Load a TOML client configuration from a file path, processing includes.
-pub fn load_client_config(path: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
+/// Load a client configuration from a file path, auto-detecting format by extension.
+/// When `strict_config` is true, unknown fields cause an error (Go frp default).
+pub fn load_client_config(
+    path: &str,
+    strict_config: bool,
+) -> Result<ClientConfig, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)?;
-    let mut value: toml::Value = toml::from_str(&content)?;
+    let format = detect_format(path);
+    let mut value: toml::Value = parse_to_toml_value(&content, format)?;
     let base_dir = Path::new(path).parent().unwrap_or(Path::new("."));
     process_includes(&mut value, base_dir)?;
     normalize_client_config(&mut value);
+    if strict_config {
+        run_strict_check(&value, &known_client_keys(), path)?;
+    }
     let cfg: ClientConfig = serde_json::from_value(toml_to_json(value))?;
     Ok(cfg)
 }
@@ -1244,11 +1260,254 @@ fn collect_config_files_inner(dir: &Path, files: &mut Vec<std::path::PathBuf>) -
         let path = entry.path();
         if path.is_dir() {
             collect_config_files_inner(&path, files)?;
-        } else if path.extension().is_some_and(|ext| ext == "toml" || ext == "ini") {
+        } else if path.extension().is_some_and(|ext| ext == "toml" || ext == "ini" || ext == "json") {
             files.push(path);
         }
     }
     Ok(())
+}
+
+// ─── Format detection ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ConfigFormat {
+    Toml,
+    Ini,
+    Json,
+}
+
+fn detect_format(path: &str) -> ConfigFormat {
+    let path_lower = path.to_lowercase();
+    if path_lower.ends_with(".ini") {
+        ConfigFormat::Ini
+    } else if path_lower.ends_with(".json") {
+        ConfigFormat::Json
+    } else {
+        ConfigFormat::Toml
+    }
+}
+
+fn parse_to_toml_value(content: &str, format: ConfigFormat) -> Result<toml::Value, Box<dyn std::error::Error>> {
+    match format {
+        ConfigFormat::Toml => Ok(toml::from_str(content)?),
+        ConfigFormat::Ini => ini_to_toml(content),
+        ConfigFormat::Json => {
+            let json_val: serde_json::Value = serde_json::from_str(content)?;
+            Ok(json_to_toml(json_val))
+        }
+    }
+}
+
+/// Convert serde_json::Value to toml::Value for normalization pipeline.
+fn json_to_toml(v: serde_json::Value) -> toml::Value {
+    match v {
+        serde_json::Value::Null => toml::Value::String(String::new()),
+        serde_json::Value::Bool(b) => toml::Value::Boolean(b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                toml::Value::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                toml::Value::Float(f)
+            } else {
+                toml::Value::String(n.to_string())
+            }
+        }
+        serde_json::Value::String(s) => toml::Value::String(s),
+        serde_json::Value::Array(arr) => {
+            toml::Value::Array(arr.into_iter().map(json_to_toml).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let table: toml::Table = map.into_iter()
+                .map(|(k, v)| (k, json_to_toml(v)))
+                .collect();
+            toml::Value::Table(table)
+        }
+    }
+}
+
+// ─── INI parser (Go Viper-compatible type inference) ─────────────────
+
+/// Parse INI content into a toml::Value.
+/// Type inference rules match Go Viper behavior.
+fn ini_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
+    let mut root = toml::Table::new();
+    let mut current_section: Option<String> = None;
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+
+        // Skip empty lines and comments
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+
+        // Section header: [section]
+        if line.starts_with('[') && line.ends_with(']') {
+            let section = &line[1..line.len() - 1].trim();
+            current_section = Some(section.to_string());
+            root.entry(section.to_string())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            continue;
+        }
+
+        // Key = value
+        if let Some(eq_pos) = line.find('=') {
+            let key = line[..eq_pos].trim().to_string();
+            let value_str = line[eq_pos + 1..].trim();
+
+            if key.is_empty() {
+                continue;
+            }
+
+            let parsed_value = infer_ini_value(value_str);
+
+            if let Some(ref section) = current_section {
+                if let Some(toml::Value::Table(ref mut table)) = root.get_mut(section) {
+                    table.insert(key, parsed_value);
+                }
+            } else {
+                root.insert(key, parsed_value);
+            }
+        }
+    }
+
+    Ok(toml::Value::Table(root))
+}
+
+/// Infer INI value type matching Go Viper behavior.
+fn infer_ini_value(s: &str) -> toml::Value {
+    let s = s.trim();
+
+    if s.is_empty() {
+        return toml::Value::String(String::new());
+    }
+
+    // Quoted string → strip quotes
+    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+        return toml::Value::String(s[1..s.len() - 1].to_string());
+    }
+
+    // Boolean
+    match s.to_lowercase().as_str() {
+        "true" | "yes" => return toml::Value::Boolean(true),
+        "false" | "no" => return toml::Value::Boolean(false),
+        _ => {}
+    }
+
+    // Comma-separated → Array (type-infer each element)
+    if s.contains(',') {
+        let parts: Vec<toml::Value> = s.split(',')
+            .map(|p| infer_ini_value(p.trim()))
+            .collect();
+        return toml::Value::Array(parts);
+    }
+
+    // Integer
+    if let Ok(i) = s.parse::<i64>() {
+        return toml::Value::Integer(i);
+    }
+
+    // Float
+    if let Ok(f) = s.parse::<f64>() {
+        return toml::Value::Float(f);
+    }
+
+    // Default: string
+    toml::Value::String(s.to_string())
+}
+
+// ─── Strict config mode ──────────────────────────────────────────────
+
+fn known_server_keys() -> std::collections::HashSet<&'static str> {
+    use std::collections::HashSet;
+    let mut keys = HashSet::new();
+    keys.extend([
+        "bind_addr", "bind_port", "proxy_bind_addr", "vhost_http_port",
+        "vhost_https_port", "kcp_bind_port", "quic_bind_port", "sudp_port",
+        "tcpmux_httpconnect_port", "sub_domain_host", "websocket_port",
+        "tls_enable", "tls_cert_file", "tls_key_file", "tls_ca_file",
+        "tls_only", "auth", "log", "web_server", "transport",
+        "allow_port_start", "allow_port_end", "allow_ports",
+        "max_ports_per_client", "vhost_http_timeout", "user_conn_timeout",
+        "detailed_errors_to_client", "tcp_mux_passthrough", "udp_packet_size",
+        "http_plugins", "feature", "includes", "ssh_tunnel_gateway",
+        "nat_hole_analysis_data_reserve_hours",
+    ]);
+    // Go compat normalization aliases
+    keys.extend([
+        "common", "auth_method", "auth_token", "token", "oidc_issuer",
+        "oidc_audience", "oidc_token_endpoint", "log_file", "log_level",
+        "log_max_days", "web_server_addr", "web_server_port",
+        "web_server_user", "web_server_password", "web_server_enable_prometheus",
+        "enable_prometheus", "tcp_mux", "tcp_mux_keepalive_interval",
+        "sshTunnelGateway", "bindPort", "bindAddr",
+    ]);
+    keys
+}
+
+fn known_client_keys() -> std::collections::HashSet<&'static str> {
+    use std::collections::HashSet;
+    let mut keys = HashSet::new();
+    keys.extend([
+        "server_addr", "server_port", "transport_protocol", "token",
+        "auth", "user", "client_id", "metas", "metadatas",
+        "proxy_url", "proxyURL", "nat_hole_stun_server", "natHoleStunServer",
+        "start", "includes", "include",
+        "tls_enable", "tls_cert_file", "tls_key_file", "tls_ca_file",
+        "tls_server_name", "disable_custom_tls_first_byte",
+        "disableCustomTLSFirstByte", "log", "login_fail_exit",
+        "pool_count", "heartbeat_interval", "heartbeatInterval",
+        "dns_server", "dial_server_keepalive", "dialServerKeepalive",
+        "connect_server_local_ip", "connectServerLocalIP",
+        "tcp_mux", "v2", "proxies", "visitors", "web_server",
+        "feature", "common", "protocol", "tls_trusted_ca_file",
+        "serverAddr", "serverPort", "transport",
+        "log_file", "log_level", "log_max_days",
+    ]);
+    keys
+}
+
+fn run_strict_check(
+    value: &toml::Value,
+    known: &std::collections::HashSet<&str>,
+    config_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let toml::Value::Table(ref table) = value {
+        let errors = check_strict(table, known, "", config_path);
+        if !errors.is_empty() {
+            return Err(errors.join("\n").into());
+        }
+    }
+    Ok(())
+}
+
+fn check_strict(
+    table: &toml::Table,
+    known: &std::collections::HashSet<&str>,
+    path: &str,
+    config_path: &str,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    // Sections whose keys are wildcards (HashMap via #[serde(flatten)])
+    let wildcard_sections: &[&str] = &["feature"];
+
+    for key in table.keys() {
+        let full_key = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{}.{}", path, key)
+        };
+
+        if !known.contains(key.as_str()) {
+            let parent_section = path.rsplit('.').next().unwrap_or("");
+            if !wildcard_sections.contains(&parent_section) {
+                errors.push(format!(
+                    "unknown field \"{}\" in config file {}", full_key, config_path
+                ));
+            }
+        }
+    }
+    errors
 }
 
 /// Load server configs from a directory, merging all `.toml` files.
