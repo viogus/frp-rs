@@ -557,7 +557,8 @@ fail_test() {
     FAILURES+=("$name: $reason")
     if $VERBOSE; then
         echo "--- logs for $name ---"
-        for f in "$TEST_DIR"/*.log; do
+        # Collect logs from both top-level (Go frpc) and subdirectories (Rust frpc)
+        for f in "$TEST_DIR"/*.log "$TEST_DIR"/*/*.log; do
             if [[ -f "$f" ]]; then
                 echo "=== $(basename "$f") ==="
                 tail -30 "$f"
@@ -2093,6 +2094,25 @@ run_xtcp_test() {
         shard_index="${XTCP_SHARD%%/*}"
     fi
     should_run_test "$name" || return 0
+
+    # Kill any frpc/frps processes leaked from previous tests.
+    # Old Go frpc processes keep trying to reconnect with stale tokens,
+    # causing noise ("token doesn't match") and potential port conflicts.
+    pkill -f "frpc -c" 2>/dev/null || true
+    pkill -f "frps -c" 2>/dev/null || true
+    sleep 0.5
+    # Also kill local processes bound to our shard's base port
+    local _sp
+    if [[ -n "${shard_index:-}" ]]; then
+        _sp=$((17000 + shard_index * 100))
+        # fuser is available on all Linux distros (psmisc), no root needed
+        local _pid
+        _pid=$(fuser "${_sp}/tcp" 2>/dev/null || true)
+        if [[ -n "$_pid" ]]; then
+            kill $_pid 2>/dev/null || true
+            sleep 0.3
+        fi
+    fi
 
     log "=== $name ==="
     local frps_port
