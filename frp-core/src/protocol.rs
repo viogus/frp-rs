@@ -315,16 +315,6 @@ pub const V2_FRAME_TYPE_CLIENT_HELLO: u16 = 1;
 pub const V2_FRAME_TYPE_SERVER_HELLO: u16 = 2;
 // V2_FRAME_TYPE_MESSAGE = 16 already exists above.
 
-pub async fn detect_v2_magic<R: AsyncReadExt + Unpin>(
-    reader: &mut R,
-) -> Result<bool, crate::Error> {
-    let mut buf = [0u8; V2_MAGIC_LEN];
-    match reader.read_exact(&mut buf).await {
-        Ok(_) => Ok(buf == V2_MAGIC_BYTES),
-        Err(e) => Err(crate::Error::Protocol(format!("detect V2 magic: {e}"))),
-    }
-}
-
 pub async fn write_v2_magic<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
 ) -> Result<(), crate::Error> {
@@ -335,7 +325,7 @@ pub async fn write_v2_magic<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// Read and verify V2 magic bytes from a stream.
+/// Read and check V2 magic bytes from a stream.
 /// Returns `Ok(None)` if magic matches (consumed).
 /// Returns `Ok(Some(bytes))` if magic doesn't match — caller should replay these bytes.
 /// Returns `Err` if the read itself fails.
