@@ -145,16 +145,25 @@ pub(crate) async fn run_visitor_listener(
                             }
 
                             // --- STUN Discovery ---
-                            let mapped_addrs = match frp_core::stun::stun_binding(&stun_server.clone()).await {
-                                Ok(addr) => {
-                                    debug!("Visitor '{}': STUN mapped address: {}", visitor_name, addr);
-                                    vec![addr]
+                            // Run STUN twice — Go frps v0.69.1 NAT classifier needs ≥2
+                            // mapped addresses to determine NAT type and behavior.
+                            let mut mapped_addrs = Vec::new();
+                            for _ in 0..2 {
+                                match frp_core::stun::stun_binding(&stun_server.clone()).await {
+                                    Ok(addr) => {
+                                        debug!("Visitor '{}': STUN mapped address: {}", visitor_name, addr);
+                                        if !mapped_addrs.contains(&addr) {
+                                            mapped_addrs.push(addr);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Visitor '{}': STUN failed: {}", visitor_name, e);
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!("Visitor '{}': STUN failed: {}", visitor_name, e);
-                                    vec![]
-                                }
-                            };
+                            }
+                            if mapped_addrs.is_empty() {
+                                warn!("Visitor '{}': all STUN attempts failed", visitor_name);
+                            }
 
                             // --- Send NatHoleVisitor on control connection ---
                             let txn_id = uuid::Uuid::new_v4().to_string();
