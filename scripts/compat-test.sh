@@ -2219,7 +2219,7 @@ run_xtcp_test() {
             > "$TEST_DIR/$name/frpc-visitor.log" 2>&1 &
         local _rpid=$!
         track_pid $_rpid
-        # Quick health check: if frpc exits immediately, the log will show the error
+        # Quick health checks: verify process alive and producing log output
         sleep 1
         if ! kill -0 $_rpid 2>/dev/null; then
             wait $_rpid 2>/dev/null || true
@@ -2230,6 +2230,19 @@ run_xtcp_test() {
             fi
             return
         fi
+        # Check if log is being written
+        sleep 2
+        local _logsize
+        _logsize=$(wc -c < "$TEST_DIR/$name/frpc-visitor.log" 2>/dev/null || echo 0)
+        if [[ $_logsize -eq 0 ]]; then
+            fail_test "$name" "Rust frpc visitor log empty after 3s (pid $_rpid alive but no output)"
+            kill $_rpid 2>/dev/null || true
+            if [[ -n "${XTCP_FRPS_REMOTE:-}" ]]; then
+                bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "$ssh_key_path" "$shard_index" || true
+            fi
+            return
+        fi
+        echo "DBG: Rust frpc visitor log has ${_logsize}B after 3s" >&2
     fi
 
     # XTCP NAT hole punch coordination time
