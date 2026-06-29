@@ -48,8 +48,11 @@ jobs:
           key: ${{ runner.os }}-compat-${{ hashFiles('Cargo.lock') }}-v2
           restore-keys: ${{ runner.os }}-compat-
 
-      - name: Build frp-rs (release)
-        run: cargo build --release --bin frps --bin frpc
+      - name: Build frp-rs (release, LTO disabled for CI speed)
+        run: |
+          mkdir -p .cargo
+          printf '[profile.release]\nlto = false\nopt-level = 2\n' >> .cargo/config.toml
+          cargo build --release --bin frps --bin frpc
 
       - name: Download Go frp
         run: bash scripts/download-go-frp.sh "$GO_FRP_VERSION"
