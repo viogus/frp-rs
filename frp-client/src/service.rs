@@ -951,17 +951,22 @@ impl Service {
                     Some(xtcp_notif) = xtcp_rx.recv() => {
                         let XtcpNotification { sid, proxy_name } = xtcp_notif;
                         info!("XTCP provider: received NatHoleSid for '{}'", proxy_name);
-                        // 1. Do STUN discovery
-                        let mapped_addrs = match frp_core::stun::stun_binding(&nat_hole_stun_server).await {
-                            Ok(addr) => {
-                                debug!("XTCP STUN result: {}", addr);
-                                vec![addr]
+                        // 1. Do STUN discovery — run twice. Go frps v0.69.1 NAT classifier
+                        //    needs ≥2 mapped addresses to determine NAT type and behavior.
+                        let mut mapped_addrs = Vec::new();
+                        for _ in 0..2 {
+                            match frp_core::stun::stun_binding(&nat_hole_stun_server).await {
+                                Ok(addr) => {
+                                    debug!("XTCP STUN result: {}", addr);
+                                    if !mapped_addrs.contains(&addr) {
+                                        mapped_addrs.push(addr);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("XTCP STUN failed: {}", e);
+                                }
                             }
-                            Err(e) => {
-                                warn!("XTCP STUN failed: {}", e);
-                                vec![]
-                            }
-                        };
+                        }
                         // 2. Send NatHoleClient on control
                         let client_msg = FrpMessage::NatHoleClient(msg::NatHoleClient {
                             transaction_id: sid.clone(),

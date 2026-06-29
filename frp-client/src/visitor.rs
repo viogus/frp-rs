@@ -131,8 +131,20 @@ pub(crate) async fn run_visitor_listener(
                         // control connection path, not on fresh TCP connections.
                         // We send the message through the control loop and receive the
                         // NatHoleResp via a oneshot channel.
-                        let max_retries = if keep_tunnel_open { max_retries_an_hour.max(0) as usize } else { 0 };
-                        let retry_delay = Duration::from_secs(min_retry_interval.max(1) as u64);
+                        // When keep_tunnel_open is false, still retry once (2 total attempts).
+                        // TCP simultaneous open timing is finicky — a second attempt with fresh
+                        // STUN addresses often succeeds even when the first times out.
+                        // When keep_tunnel_open is true, use the configured retry count/delay.
+                        let max_retries = if keep_tunnel_open {
+                            max_retries_an_hour.max(0) as usize
+                        } else {
+                            1 // 2 total attempts
+                        };
+                        let retry_delay = if keep_tunnel_open {
+                            Duration::from_secs(min_retry_interval.max(1) as u64)
+                        } else {
+                            Duration::from_secs(2) // Quick retry for one-shot mode
+                        };
                         let mut hole_punch_ok = false;
 
                         for attempt in 0..=max_retries {
@@ -250,6 +262,12 @@ pub(crate) async fn run_visitor_listener(
                         }
 
                         // --- STCP fallback (hole punch failed) ---
+                        // STCP relay via NewVisitorConn on a fresh connection works against
+                        // Rust frps (which looks up the proxy in proxy_manager regardless of type).
+                        // Against Go frps v0.69.1, XTCP proxies do NOT create a custom listener
+                        // (only NatHoleController listener), so NewVisitorConn fails with
+                        // "custom listener for [X] doesn't exist". This is expected — Go frp's
+                        // XTCP fallback uses a separate STCP proxy+visitor, not the same proxy.
                         // Open a NEW connection for STCP relay
                         let mut server_conn = match dial_server(&opts).await {
                             Ok(io) => io,
