@@ -223,11 +223,13 @@ cmd_start() {
 
     # --- Start frps on VPS ---
     # Redirect all fds to detach from SSH session; nohup ensures survival
-    local start_err
-    start_err=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-        "cd $remote_dir && chmod +x frps && nohup ./frps -c frps.toml > frps.log 2>&1 < /dev/null & echo \$! > frps.pid" 2>&1 1>/dev/null) || {
-        die "failed to start frps on $host: $start_err"
-    }
+    local start_output start_rc
+    start_output=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+        "cd $remote_dir && chmod +x frps && nohup ./frps -c frps.toml > frps.log 2>&1 < /dev/null & echo \$! > frps.pid" 2>&1)
+    start_rc=$?
+    if [[ $start_rc -ne 0 ]]; then
+        die "failed to start frps on $host (exit=$start_rc): $start_output"
+    fi
 
     # --- Wait for frps to be ready ---
     wait_remote_port "$host" "$actual_port" "$ssh_key"

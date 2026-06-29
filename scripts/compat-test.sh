@@ -2095,7 +2095,14 @@ run_xtcp_test() {
     should_run_test "$name" || return 0
 
     log "=== $name ==="
-    local frps_port=$(random_port)
+    local frps_port
+    if [[ -n "$shard_index" ]]; then
+        # Per-shard port range prevents TOCTOU race on shared VPS.
+        # Shard 0: 17000-17099, Shard 1: 17100-17199, etc.
+        frps_port=$((17000 + shard_index * 100))
+    else
+        frps_port=$(random_port)
+    fi
     local echo_port=$(random_port)
     local visitor_port=$(random_port)
     local token="${name}-token-$(date +%s)"
@@ -2134,6 +2141,7 @@ run_xtcp_test() {
         actual_port=$(bash "$SCRIPT_DIR/remote-frps.sh" start "$frps_impl" "$XTCP_FRPS_REMOTE" \
             "$frps_port" "$token" "$ssh_key_path" "$shard_index" | tail -1) || {
             fail_test "$name" "remote frps ($frps_impl) did not start"
+            bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "$ssh_key_path" "$shard_index" || true
             return
         }
         frps_port="$actual_port"
