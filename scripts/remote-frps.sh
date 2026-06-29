@@ -96,10 +96,10 @@ wait_remote_port() {
     for i in $(seq 1 "$max_attempts"); do
         local listening ssh_rc
         listening=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-            "ss -tlnp 2>/dev/null | grep ':${port}\b' || true" 2>/dev/null) || true
+            "ss -tlnp 2>/dev/null | grep ':${port}\b' || true" 2>/dev/null)
         ssh_rc=$?
         if [[ $ssh_rc -ne 0 ]]; then
-            echo "WARNING: SSH to $host failed (exit=$ssh_rc) during port check $i/$max_attempts" >&2
+            die "SSH to $host failed while waiting for port $port (exit=$ssh_rc)"
         fi
         if [[ -n "$listening" ]]; then
             return 0
