@@ -23,7 +23,13 @@ GO_FRP_VERSION="${GO_FRP_VERSION:-0.69.1}"
 # VPS target is always linux/amd64
 GO_FRP_ARCH="linux_amd64"
 REMOTE_DIR="/tmp/frp-xtcp-test"
-SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ControlMaster=auto -o ControlPath=/tmp/frp-ssh-ctl-%h-%r -o ControlPersist=120"
+SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o ConnectionAttempts=1 -o ControlMaster=auto -o ControlPath=/tmp/frp-ssh-ctl-%h-%r -o ControlPersist=120"
+SSH_TIMEOUT=30  # hard timeout per SSH invocation (prevents ControlMaster hang)
+
+# Wrap SSH with timeout to prevent hangs from broken ControlMaster
+ssh_t() {
+    timeout "$SSH_TIMEOUT" ssh $SSH_OPTS "$@"
+}
 
 usage() {
     cat >&2 <<EOF
@@ -55,7 +61,7 @@ find_available_port() {
     local p
     for p in $(seq "$port" "$max"); do
         local in_use
-        in_use=$(ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
+        in_use=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
             "ss -tlnp 2>/dev/null | grep ':${p}\b' || true" 2>/dev/null)
         if [[ -z "$in_use" ]]; then
             echo "$p"
@@ -73,7 +79,7 @@ wait_remote_port() {
     local i
     for i in $(seq 1 "$max_attempts"); do
         local listening
-        listening=$(ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
+        listening=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
             "ss -tlnp 2>/dev/null | grep ':${port}\b' || true" 2>/dev/null)
         if [[ -n "$listening" ]]; then
             return 0
@@ -136,7 +142,7 @@ cmd_start() {
     fi
 
     # --- Kill stale frps from previous runs (defense against failed cleanup) ---
-    ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
+    ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
         "pkill -f 'frps -c frps.toml' 2>/dev/null; \
          for d in /tmp/frp-xtcp-?????? /tmp/frp-xtcp-test; do \
              if [ -d \"\$d\" ]; then rm -rf \"\$d\" 2>/dev/null; fi; \
@@ -167,13 +173,13 @@ cmd_start() {
     local remote_dir
     local ssh_err
     # mktemp creates a directory owned by frp-test, avoiding root-owned /tmp/frp-xtcp-test
-    remote_dir=$(ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
+    remote_dir=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
         "mktemp -d /tmp/frp-xtcp-XXXXXX" 2>&1) || {
         rm -f "$config_path"
         die "failed to create remote directory on $host: $remote_dir"
     }
     # Store path for stop/status to find later
-    ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
+    ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
         "echo '$remote_dir' > /tmp/.frp-xtcp-dir" 2>/dev/null || true
 
     # --- Upload binary and config ---
@@ -193,7 +199,7 @@ cmd_start() {
 
     # --- Start frps on VPS ---
     # Redirect all fds to detach from SSH session; nohup ensures survival
-    ssh_err=$(ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
+    ssh_err=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
         "cd $remote_dir && chmod +x frps && nohup ./frps -c frps.toml > frps.log 2>&1 < /dev/null & echo \$! > frps.pid" 2>&1 1>/dev/null) || {
         die "failed to start frps on $host: $ssh_err"
     }
@@ -215,7 +221,7 @@ cmd_stop() {
     # Inline command — heredoc delivery can fail across OpenSSH versions.
     # Kill all frps processes first, then clean up temp dirs.
     local result
-    result=$(ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
+    result=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
         "pkill -f 'frps -c frps.toml' 2>/dev/null; \
          for d in /tmp/frp-xtcp-?????? /tmp/frp-xtcp-test; do \
              if [ -d \"\$d\" ]; then rm -rf \"\$d\" 2>/dev/null; fi; \
@@ -236,7 +242,7 @@ cmd_status() {
     fi
 
     local running
-    running=$(ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" "bash -s" 2>/dev/null <<'REMOTE_SCRIPT'
+    running=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" "bash -s" 2>/dev/null <<'REMOTE_SCRIPT'
 # Check all frp-xtcp temp dirs
 found=0
 for d in /tmp/frp-xtcp-??????; do
