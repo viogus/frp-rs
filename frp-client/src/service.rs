@@ -651,11 +651,12 @@ impl Service {
                 let max_retries_an_hour = v.max_retries_an_hour;
                 let min_retry_interval = v.min_retry_interval;
                 let stun_server = nat_hole_stun_server.clone();
+                let fallback_to = v.fallback_to.clone();
                 let vtx = self.visitor_tx.clone();
                 tokio::spawn(async move {
                     crate::visitor::run_visitor_listener(sa, sp, pt, server_name, secret_key, bind_addr, use_enc, use_comp, name,
                         tls_enable, tls_server_name, tls_ca_file, visitor_type, fallback_timeout_ms,
-                        keep_tunnel_open, max_retries_an_hour, min_retry_interval, stun_server, vtx).await;
+                        keep_tunnel_open, max_retries_an_hour, min_retry_interval, stun_server, vtx, fallback_to).await;
                 });
             }
 

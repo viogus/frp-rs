@@ -86,6 +86,7 @@ pub(crate) async fn run_visitor_listener(
     min_retry_interval: i64,
     stun_server: String,
     visitor_tx: mpsc::UnboundedSender<crate::service::VisitorRequest>,
+    fallback_to: String,
 ) {
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
@@ -112,6 +113,7 @@ pub(crate) async fn run_visitor_listener(
                 let vt = visitor_type.clone();
                 let stun_server = stun_server.clone();
                 let vtx = visitor_tx.clone();
+                let fb_to = fallback_to.clone();
 
                 tokio::spawn(async move {
                     // Dial options for STCP fallback (fresh connections only).
@@ -277,13 +279,14 @@ pub(crate) async fn run_visitor_listener(
                             }
                         };
 
-                        let nvc = crate::proxy::create_visitor_conn_msg(&sn, &sk, use_encryption, use_compression);
+                        let stcp_proxy_name = if fb_to.is_empty() { sn.clone() } else { fb_to.clone() };
+                        let nvc = crate::proxy::create_visitor_conn_msg(&stcp_proxy_name, &sk, use_encryption, use_compression);
                         debug!("Visitor '{}': NewVisitorConn JSON: {}", visitor_name, serde_json::to_string(&nvc).unwrap_or_default());
                         if let Err(e) = server_conn.write_v1_frame(&nvc).await {
                             warn!("Visitor '{}': STCP fallback send NewVisitorConn failed: {}", visitor_name, e);
                             return;
                         }
-                        info!("Visitor '{}': fell back to STCP relay for '{}'", visitor_name, sn);
+                        info!("Visitor '{}': fell back to STCP relay for '{}'", visitor_name, stcp_proxy_name);
 
                         // Read NewVisitorConnResp before bridging
                         match server_conn.read_v1_frame().await {

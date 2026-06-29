@@ -823,6 +823,11 @@ write_frpc_config_xtcp_provider() {
             printf 'localIP = "127.0.0.1"\nlocalPort = %s\n' "$echo_port"
             if $has_enc; then printf 'transport.useEncryption = true\n'; fi
             if $has_comp; then printf 'transport.useCompression = true\n'; fi
+            printf '\n[[proxies]]\nname = "%s-stcp"\ntype = "stcp"\n' "$name"
+            printf 'secretKey = "%s"\n' "$sk"
+            printf 'localIP = "127.0.0.1"\nlocalPort = %s\n' "$echo_port"
+            if $has_enc; then printf 'transport.useEncryption = true\n'; fi
+            if $has_comp; then printf 'transport.useCompression = true\n'; fi
         } > "$out"
     else
         {
@@ -831,6 +836,11 @@ write_frpc_config_xtcp_provider() {
             printf 'tcp_mux = false\n'
             printf 'login_fail_exit = true\npool_count = 1\n'
             printf '\n[[proxies]]\nname = "%s"\ntype = "xtcp"\n' "$name"
+            printf 'sk = "%s"\n' "$sk"
+            printf 'local_ip = "127.0.0.1"\nlocal_port = %s\n' "$echo_port"
+            if $has_enc; then printf 'use_encryption = true\n'; fi
+            if $has_comp; then printf 'use_compression = true\n'; fi
+            printf '\n[[proxies]]\nname = "%s-stcp"\ntype = "stcp"\n' "$name"
             printf 'sk = "%s"\n' "$sk"
             printf 'local_ip = "127.0.0.1"\nlocal_port = %s\n' "$echo_port"
             if $has_enc; then printf 'use_encryption = true\n'; fi
@@ -857,6 +867,14 @@ write_frpc_config_xtcp_visitor() {
             printf 'serverName = "%s"\n' "$server_name"
             printf 'secretKey = "%s"\n' "$sk"
             printf 'bindAddr = "127.0.0.1"\nbindPort = %s\n' "$visitor_port"
+            printf 'fallbackTo = "%s-stcp-visitor"\n' "$server_name"
+            printf 'fallbackTimeoutMs = 2000\n'
+            if $has_enc; then printf 'transport.useEncryption = true\n'; fi
+            if $has_comp; then printf 'transport.useCompression = true\n'; fi
+            printf '\n[[visitors]]\nname = "%s-stcp-visitor"\ntype = "stcp"\n' "$server_name"
+            printf 'serverName = "%s-stcp"\n' "$server_name"
+            printf 'secretKey = "%s"\n' "$sk"
+            printf 'bindAddr = "127.0.0.1"\nbindPort = 0\n'
             if $has_enc; then printf 'transport.useEncryption = true\n'; fi
             if $has_comp; then printf 'transport.useCompression = true\n'; fi
         } > "$out"
@@ -870,6 +888,8 @@ write_frpc_config_xtcp_visitor() {
             printf 'server_name = "%s"\n' "$server_name"
             printf 'sk = "%s"\n' "$sk"
             printf 'bind_addr = "127.0.0.1"\nbind_port = %s\n' "$visitor_port"
+            printf 'fallback_to = "%s-stcp"\n' "$server_name"
+            printf 'fallback_timeout_ms = 2000\n'
             if $has_enc; then printf 'use_encryption = true\n'; fi
             if $has_comp; then printf 'use_compression = true\n'; fi
         } > "$out"
