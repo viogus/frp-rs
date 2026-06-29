@@ -527,6 +527,23 @@ impl Service {
                 }
             }
 
+            // Register STCP/XTCP visitors on the control connection.
+            // Go frps v0.69.1 requires visitor registration before NatHoleVisitor
+            // can be sent on the control connection (otherwise: "auth failed").
+            for v in &self.cfg.visitors {
+                if v.bind_port == 0 {
+                    continue;
+                }
+                match ctl.register_visitor(v, &mut control_stream).await {
+                    Ok(_) => {
+                        info!("Visitor '{}' registered for proxy '{}'", v.name, v.server_name);
+                    }
+                    Err(e) => {
+                        warn!("Failed to register visitor '{}': {}", v.name, e);
+                    }
+                }
+            }
+
             // Split control stream for reading and writing
             let (mut reader, raw_writer) = control_stream.into_split();
             let writer = Arc::new(Mutex::new(raw_writer));

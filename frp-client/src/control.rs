@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
-use frp_core::config::ProxyConfig;
+use frp_core::config::{ProxyConfig, VisitorConfig};
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::write_msg_v1;
 use frp_core::auth::{AuthConfig, OidcClient};
@@ -373,6 +373,55 @@ impl ControlConnection {
                 }
                 other => {
                     warn!("Unexpected message during NewProxy registration for '{}': {:?}", p.name, other);
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Register an XTCP/STCP visitor on the control connection.
+    /// Go frps v0.69.1 requires visitor registration before the visitor can
+    /// send NatHoleVisitor on the control connection. Without this, the
+    /// server responds with "auth failed".
+    pub async fn register_visitor(
+        &self,
+        v: &VisitorConfig,
+        stream: &mut IoStream,
+    ) -> Result<msg::NewVisitorConnResp, frp_core::Error> {
+        let nvc = crate::proxy::create_visitor_conn_msg(
+            &v.server_name, &v.secret_key,
+            v.use_encryption, v.use_compression,
+        );
+        debug!("NewVisitorConn for '{}': {}", v.server_name,
+            serde_json::to_string(&nvc).unwrap_or_default());
+        info!("Registering visitor '{}' for proxy '{}'", v.name, v.server_name);
+        if self.v2 {
+            stream.write_v2_frame(&nvc).await?;
+        } else {
+            stream.write_v1_frame(&nvc).await?;
+        }
+        loop {
+            let resp_msg = if self.v2 {
+                stream.read_v2_frame().await?
+            } else {
+                stream.read_v1_frame().await?
+            };
+            match resp_msg {
+                FrpMessage::NewVisitorConnResp(resp) => {
+                    if let Some(err) = resp.error {
+                        return Err(frp_core::Error::Other(format!(
+                            "Visitor '{}' registration failed: {err}", v.name
+                        )));
+                    }
+                    info!("Visitor '{}' registered for proxy '{}'", v.name, v.server_name);
+                    return Ok(resp);
+                }
+                FrpMessage::ReqWorkConn(_) => {
+                    debug!("Skipping ReqWorkConn during visitor registration");
+                    continue;
+                }
+                other => {
+                    warn!("Unexpected message during NewVisitorConn registration for '{}': {:?}", v.name, other);
                     continue;
                 }
             }
