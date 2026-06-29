@@ -546,6 +546,20 @@ pub async fn handle_control<S>(
             } => {
                 if let Some(stream) = incoming_msg {
                     let mut io = IoStream::Yamux(stream);
+                    if v2 {
+                        match frp_core::protocol::read_v2_magic_or_replay(&mut io).await {
+                            Ok(None) => {} // magic consumed
+                            Ok(Some(bytes)) => {
+                                // Older V2 client without per-stream magic —
+                                // replay bytes as start of next frame.
+                                io = IoStream::BufferedRead(bytes, 0, Box::new(io));
+                            }
+                            Err(e) => {
+                                warn!("Failed to read V2 magic from yamux stream for {run_id}: {e}");
+                                continue;
+                            }
+                        }
+                    }
                     match read_ctl_msg(&mut io, v2).await {
                         Ok(FrpMessage::NewWorkConn(nwc)) => {
                             let stream_run_id = nwc.run_id.as_deref().unwrap_or("");

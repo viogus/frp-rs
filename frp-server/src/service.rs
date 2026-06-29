@@ -906,24 +906,16 @@ impl Service {
                                             let mut io = IoStream::Yamux(control_stream);
                                             info!("Yamux over V2 session established for {:?}", addr);
 
-                                            // Consume V2 magic on yamux stream if present.
-                                            // Go frp writes magic on the yamux stream (after yamux wrap).
-                                            // If magic is absent (backward compat), replay the bytes
-                                            // before the handshake.
-                                            {
-                                                let mut magic_buf = [0u8; 7];
-                                                match tokio::io::AsyncReadExt::read_exact(&mut io, &mut magic_buf).await {
-                                                    Ok(_) => {
-                                                        if magic_buf != frp_core::protocol::V2_MAGIC_BYTES {
-                                                            // Replay non-magic bytes before handshake
-                                                            io = IoStream::BufferedRead(magic_buf.to_vec(), 0, Box::new(io));
-                                                        }
-                                                        // Magic consumed — continue
-                                                    }
-                                                    Err(e) => {
-                                                        warn!("Failed to read V2 magic from yamux stream: {}", e);
-                                                        return;
-                                                    }
+                                            match frp_core::protocol::read_v2_magic_or_replay(&mut io).await {
+                                                Ok(None) => {} // magic consumed
+                                                Ok(Some(bytes)) => {
+                                                    // Older V2 client without per-stream magic —
+                                                    // replay bytes as start of next frame.
+                                                    io = IoStream::BufferedRead(bytes, 0, Box::new(io));
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to read V2 magic from yamux stream: {}", e);
+                                                    return;
                                                 }
                                             }
 
