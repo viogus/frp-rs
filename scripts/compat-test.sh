@@ -3837,10 +3837,10 @@ run_test test_r2g_socks5
 # Phase 8: KCP + QUIC transport cross-compat
 # Rust↔Rust KCP: both sides use raw kcp crate, wire-compatible.
 run_test test_kcp_rust_to_rust
-# KCP Go↔Rust guarded: Go frp uses kcp-go session layer (FEC + XOR encryption),
-# Rust uses raw kcp crate. Different wire formats -- incompatible.
-# test_g2r_kcp
-# test_r2g_kcp
+# KCP Go↔Rust: compat layer (kcp_compat module) handles FEC + XOR encryption
+# to match Go frp's kcp-go session layer wire format.
+run_test test_g2r_kcp
+run_test test_r2g_kcp
 
 # QUIC Rust↔Rust: both sides use quinn crate, wire-compatible.
 run_test test_quic_rust_to_rust
