@@ -257,22 +257,14 @@ cmd_start() {
     rm -f "$config_path"
 
     # --- Start frps on VPS ---
-    # Use timeout 15: sshd may keep connection open because background frps
-    # shares the session even with nohup (nohup only blocks SIGHUP, doesn't
-    # create new session). timeout kills SSH client after 15s while frps
-    # keeps running. We verify via liveness check instead.
-    local start_output start_rc=0
-    echo "DBG: starting frps via SSH on $host:$actual_port dir=$remote_dir" >&2
-    start_output=$(timeout 15 ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
-        "cd $remote_dir && chmod +x frps && nohup ./frps -c frps.toml > frps.log 2>&1 < /dev/null & echo \$! > frps.pid" 2>&1) || start_rc=$?
-    echo "DBG: SSH start complete rc=$start_rc output_len=${#start_output}" >&2
-    if [[ $start_rc -eq 124 ]]; then
-        # timeout is expected: sshd may hold connection open for background
-        # frps process. Verify via liveness check below instead.
-        echo "DBG: SSH start timed out (expected — verifying via liveness check)" >&2
-    elif [[ $start_rc -ne 0 ]]; then
-        die "failed to start frps on $host (exit=$start_rc): $start_output"
-    fi
+    # Background SSH locally: frps may inherit file descriptors from sshd
+    # session, keeping SSH connection open. We fire-and-forget the SSH
+    # process and verify frps startup via port check instead of SSH exit code.
+    echo "DBG: starting frps via background SSH on $host:$actual_port dir=$remote_dir" >&2
+    ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
+        "cd $remote_dir && chmod +x frps && nohup ./frps -c frps.toml > frps.log 2>&1 < /dev/null &" \
+        >/dev/null 2>&1 &
+    echo "DBG: frps start command sent (SSH backgrounded)" >&2
 
     # Quick liveness check: if frps exits immediately (config parse error, etc.),
     # we can fail fast with the log instead of waiting 30s for wait_remote_port.
@@ -280,14 +272,20 @@ cmd_start() {
     echo "DBG: checking liveness of frps on $host:$actual_port dir=$remote_dir" >&2
     local alive_check
     alive_check=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-        "pid=\$(cat '$remote_dir/frps.pid' 2>/dev/null); if [ -n \"\$pid\" ] && kill -0 \"\$pid\" 2>/dev/null; then echo alive; else echo dead; fi" 2>/dev/null) || true
-    if [[ "$alive_check" == "dead" ]]; then
-        local early_log
-        early_log=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-            "cat '$remote_dir/frps.log' 2>/dev/null || echo '(no log)'" 2>/dev/null) || true
-        die "frps on $host exited immediately after start. frps.log: $early_log"
+        "ss -tlnp 2>/dev/null | grep ':${actual_port}\b' || true" 2>/dev/null) || true
+    if [[ -z "$alive_check" ]]; then
+        # frps might still be starting — give it 3 more seconds
+        sleep 3
+        alive_check=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+            "ss -tlnp 2>/dev/null | grep ':${actual_port}\b' || true" 2>/dev/null) || true
+        if [[ -z "$alive_check" ]]; then
+            local early_log
+            early_log=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+                "cat '$remote_dir/frps.log' 2>/dev/null || echo '(no log)'" 2>/dev/null) || true
+            die "frps on $host:$actual_port did not start listening. frps.log: $early_log"
+        fi
     fi
-    echo "DBG: alive check passed (result='$alive_check'), entering wait_remote_port" >&2
+    echo "DBG: liveness check passed (port $actual_port is listening)" >&2
 
     # --- Wait for frps to be ready ---
     wait_remote_port "$host" "$actual_port" "$ssh_key" "$remote_dir"
