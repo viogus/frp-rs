@@ -24,7 +24,11 @@ env:
 jobs:
   xtcp:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
 
     steps:
       - uses: actions/checkout@v4
@@ -84,6 +88,7 @@ jobs:
           bash scripts/compat-test.sh \
             --frps-remote "$XTCP_VPS_HOST" \
             --xtcp-only \
+            --shard ${{ matrix.shard }}/4 \
             --ci \
             --verbose
         env:

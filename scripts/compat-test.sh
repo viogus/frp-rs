@@ -42,6 +42,7 @@ DEBUG=false
 PIDS=""
 XTCP_FRPS_REMOTE=""
 XTCP_ONLY=false
+XTCP_SHARD=""   # "INDEX/TOTAL" e.g. "1/4"
 
 # --- Colors (empty in CI mode) ---
 if $CI; then
@@ -64,6 +65,7 @@ while [[ $# -gt 0 ]]; do
         --debug|-x) DEBUG=true; shift ;;
         --frps-remote) XTCP_FRPS_REMOTE="$2"; shift 2 ;;
         --xtcp-only) XTCP_ONLY=true; shift ;;
+        --shard) XTCP_SHARD="$2"; shift 2 ;;
         --list)
             awk '/^[[:space:]]*run_test test_[a-z]/ {print $2}' "$0" | sort
             exit 0
@@ -78,6 +80,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --list            List all test names and exit"
             echo "  --frps-remote HOST  Remote VPS address for XTCP tests"
             echo "  --xtcp-only       Run only XTCP tests (skip all other phases)"
+            echo "  --shard INDEX/TOTAL  Shard XTCP tests across N jobs (e.g. 0/4)"
             echo "  --go-version VER  Go frp version (default: 0.69.1)"
             exit 0
             ;;
@@ -2872,32 +2875,55 @@ fi
 
 # ── XTCP tests (Phase 1: VPS CI or RUN_XTCP=1) ──
 if [[ -n "${XTCP_FRPS_REMOTE:-}" ]]; then
-    log "XTCP: remote frps mode — running all 12 pairwise tests"
+    log "XTCP: remote frps mode — running pairwise tests"
     RUN_XTCP=1
 fi
 
 if ${XTCP_ONLY:-false} || [[ "${RUN_XTCP:-0}" == "1" ]]; then
-    # Baselines first
-    run_test test_xtcp_g2g_basic
-    run_test test_xtcp_r2r_basic
+    # ── 16 tests, shardable across CI matrix jobs ──
+    # Use --shard INDEX/TOTAL to split across N parallel jobs
+    XTCP_TESTS=(
+        # Unencrypted
+        "test_xtcp_g2g_basic"
+        "test_xtcp_r2r_basic"
+        "test_xtcp_g2r_basic"
+        "test_xtcp_r2g_basic"
+        "test_xtcp_go_frps_go_prov_rust_vis"
+        "test_xtcp_go_frps_rust_prov_go_vis"
+        "test_xtcp_rust_frps_go_prov_rust_vis"
+        "test_xtcp_rust_frps_rust_prov_go_vis"
+        # Encrypted
+        "test_xtcp_g2g_enc"
+        "test_xtcp_r2r_enc"
+        "test_xtcp_g2r_enc"
+        "test_xtcp_r2g_enc"
+        "test_xtcp_go_frps_go_prov_rust_vis_enc"
+        "test_xtcp_go_frps_rust_prov_go_vis_enc"
+        "test_xtcp_rust_frps_go_prov_rust_vis_enc"
+        "test_xtcp_rust_frps_rust_prov_go_vis_enc"
+    )
 
-    # Cross-implementation
-    run_test test_xtcp_g2r_basic
-    run_test test_xtcp_r2g_basic
-    run_test test_xtcp_go_frps_go_prov_rust_vis
-    run_test test_xtcp_go_frps_rust_prov_go_vis
-    run_test test_xtcp_rust_frps_go_prov_rust_vis
-    run_test test_xtcp_rust_frps_rust_prov_go_vis
-
-    # Encrypted variants
-    run_test test_xtcp_g2g_enc
-    run_test test_xtcp_r2r_enc
-    run_test test_xtcp_g2r_enc
-    run_test test_xtcp_r2g_enc
-    run_test test_xtcp_go_frps_go_prov_rust_vis_enc
-    run_test test_xtcp_go_frps_rust_prov_go_vis_enc
-    run_test test_xtcp_rust_frps_go_prov_rust_vis_enc
-    run_test test_xtcp_rust_frps_rust_prov_go_vis_enc
+    if [[ -n "${XTCP_SHARD:-}" ]]; then
+        # Sharded: run subset of tests for this CI matrix job
+        # XTCP_SHARD format: "INDEX/TOTAL" e.g. "1/4"
+        _xtcp_idx="${XTCP_SHARD%%/*}"
+        _xtcp_total="${XTCP_SHARD##*/}"
+        _xtcp_count=0
+        log "XTCP shard ${_xtcp_idx}/${_xtcp_total}:"
+        for ((_i=0; _i<${#XTCP_TESTS[@]}; _i++)); do
+            if (( _i % _xtcp_total == _xtcp_idx )); then
+                log "  [$((++_xtcp_count))] ${XTCP_TESTS[$_i]}"
+                run_test "${XTCP_TESTS[$_i]}"
+            fi
+        done
+        log "XTCP shard ${_xtcp_idx}/${_xtcp_total}: $_xtcp_count test(s) completed"
+    else
+        # Sequential: run all tests (local mode)
+        log "XTCP: running all ${#XTCP_TESTS[@]} tests sequentially"
+        for t in "${XTCP_TESTS[@]}"; do
+            run_test "$t"
+        done
+    fi
 else
     log "SKIP XTCP tests: requires public internet (STUN + NAT probes). Set RUN_XTCP=1 to enable."
 fi
