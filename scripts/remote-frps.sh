@@ -4,11 +4,13 @@
 # Manages frps (Rust or Go) on a VPS with a public IP.
 #
 # Usage:
-#   bash scripts/remote-frps.sh start  <impl> <host> <port> <token> <ssh-key>
-#   bash scripts/remote-frps.sh stop   <host> <ssh-key>
-#   bash scripts/remote-frps.sh status <host> <ssh-key>
+#   bash scripts/remote-frps.sh start  <impl> <host> <port> <token> <ssh-key> [shard]
+#   bash scripts/remote-frps.sh stop   <host> <ssh-key> [shard]
+#   bash scripts/remote-frps.sh status <host> <ssh-key> [shard]
 #
 # <impl>: "rust" or "go"
+# <shard>: optional numeric shard index for CI matrix isolation.
+#          When set, uses /tmp/frp-xtcp-shard-{shard}/ instead of mktemp -d.
 # VPS user from XTCP_VPS_USER env var (default: frp-test)
 #
 # Port conflict handling: start tries requested port, falls back to
@@ -34,11 +36,12 @@ ssh_t() {
 usage() {
     cat >&2 <<EOF
 Usage:
-  $0 start  <impl> <host> <port> <token> <ssh-key>
-  $0 stop   <host> <ssh-key>
-  $0 status <host> <ssh-key>
+  $0 start  <impl> <host> <port> <token> <ssh-key> [shard]
+  $0 stop   <host> <ssh-key> [shard]
+  $0 status <host> <ssh-key> [shard]
 
 <impl>: "rust" or "go"
+<shard>: optional numeric shard index (0-3) for CI matrix isolation
 VPS user: \$XTCP_VPS_USER (default: $VPS_USER)
 
 Start echoes the actual port used as its final stdout line.
@@ -131,7 +134,7 @@ TOML
 # =============================================================================
 
 cmd_start() {
-    local impl="$1" host="$2" port="$3" token="$4" ssh_key="$5"
+    local impl="$1" host="$2" port="$3" token="$4" ssh_key="$5" shard="${6:-}"
 
     # --- Validation ---
     if [[ "$impl" != "rust" && "$impl" != "go" ]]; then
@@ -141,13 +144,32 @@ cmd_start() {
         die "SSH key not found (check XTCP_VPS_SSH_KEY)"
     fi
 
-    # --- Kill stale frps from previous runs (defense against failed cleanup) ---
-    ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-        "pkill -f 'frps -c frps.toml' 2>/dev/null; \
-         for d in /tmp/frp-xtcp-?????? /tmp/frp-xtcp-test; do \
-             if [ -d \"\$d\" ]; then rm -rf \"\$d\" 2>/dev/null; fi; \
-         done; \
-         rm -f /tmp/.frp-xtcp-dir 2>/dev/null" 2>/dev/null || true
+    # --- Determine remote directory and clean up stale state ---
+    local remote_dir
+    if [[ -n "$shard" ]]; then
+        # CI matrix isolation: deterministic per-shard directory.
+        # Only touches THIS shard's process and directory.
+        remote_dir="/tmp/frp-xtcp-shard-${shard}"
+        ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+            "if [ -f '$remote_dir/frps.pid' ]; then \
+               pid=\$(cat '$remote_dir/frps.pid' 2>/dev/null); \
+               if [ -n \"\$pid\" ]; then \
+                 kill -0 \"\$pid\" 2>/dev/null && kill \"\$pid\" 2>/dev/null || true; \
+                 sleep 0.3; \
+                 kill -0 \"\$pid\" 2>/dev/null && kill -9 \"\$pid\" 2>/dev/null || true; \
+               fi; \
+             fi; \
+             rm -rf '$remote_dir'; \
+             mkdir -p '$remote_dir'" 2>/dev/null || true
+    else
+        # Backward compat (single runner): global pkill + mktemp
+        ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+            "pkill -f 'frps -c frps.toml' 2>/dev/null; \
+             for d in /tmp/frp-xtcp-?????? /tmp/frp-xtcp-test; do \
+                 if [ -d \"\$d\" ]; then rm -rf \"\$d\" 2>/dev/null; fi; \
+             done; \
+             rm -f /tmp/.frp-xtcp-dir 2>/dev/null" 2>/dev/null || true
+    fi
 
     # --- Find available port (dies if none in range) ---
     local actual_port
@@ -169,18 +191,20 @@ cmd_start() {
     local config_path
     config_path=$(write_frps_config "$impl" "$actual_port" "$token")
 
-    # --- Ensure remote directory exists (create unique writable dir) ---
-    local remote_dir
-    local ssh_err
-    # mktemp creates a directory owned by frp-test, avoiding root-owned /tmp/frp-xtcp-test
-    remote_dir=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-        "mktemp -d /tmp/frp-xtcp-XXXXXX" 2>&1) || {
-        rm -f "$config_path"
-        die "failed to create remote directory on $host: $remote_dir"
-    }
-    # Store path for stop/status to find later
-    ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-        "echo '$remote_dir' > /tmp/.frp-xtcp-dir" 2>/dev/null || true
+    # --- Ensure remote directory exists ---
+    if [[ -z "$shard" ]]; then
+        # Backward compat: mktemp creates unique writable dir owned by frp-test
+        local mkdir_err
+        remote_dir=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+            "mktemp -d /tmp/frp-xtcp-XXXXXX" 2>&1) || {
+            rm -f "$config_path"
+            die "failed to create remote directory on $host: $remote_dir"
+        }
+        # Store path for stop/status to find later
+        ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+            "echo '$remote_dir' > /tmp/.frp-xtcp-dir" 2>/dev/null || true
+    fi
+    # (if shard is set, remote_dir was already set and dir was created in pre-flight)
 
     # --- Upload binary and config ---
     local scp_opts="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ControlPath=/tmp/frp-ssh-ctl-%h-%r"
@@ -199,9 +223,10 @@ cmd_start() {
 
     # --- Start frps on VPS ---
     # Redirect all fds to detach from SSH session; nohup ensures survival
-    ssh_err=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+    local start_err
+    start_err=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
         "cd $remote_dir && chmod +x frps && nohup ./frps -c frps.toml > frps.log 2>&1 < /dev/null & echo \$! > frps.pid" 2>&1 1>/dev/null) || {
-        die "failed to start frps on $host: $ssh_err"
+        die "failed to start frps on $host: $start_err"
     }
 
     # --- Wait for frps to be ready ---
@@ -212,35 +237,73 @@ cmd_start() {
 }
 
 cmd_stop() {
-    local host="$1" ssh_key="$2"
+    local host="$1" ssh_key="$2" shard="${3:-}"
 
     if [[ ! -f "$ssh_key" ]]; then
         die "SSH key not found (check XTCP_VPS_SSH_KEY)"
     fi
 
-    # Inline command — heredoc delivery can fail across OpenSSH versions.
-    # Kill all frps processes first, then clean up temp dirs.
     local result
-    result=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
-        "pkill -f 'frps -c frps.toml' 2>/dev/null; \
-         for d in /tmp/frp-xtcp-?????? /tmp/frp-xtcp-test; do \
-             if [ -d \"\$d\" ]; then rm -rf \"\$d\" 2>/dev/null; fi; \
-         done; \
-         rm -f /tmp/.frp-xtcp-dir 2>/dev/null; \
-         echo ok" 2>&1) || {
-        echo "WARNING: remote stop on $host failed: $result" >&2
-        return 1
-    }
+    if [[ -n "$shard" ]]; then
+        # CI matrix isolation: only kill this shard's frps, only clean its dir
+        local remote_dir="/tmp/frp-xtcp-shard-${shard}"
+        result=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+            "if [ -f '$remote_dir/frps.pid' ]; then \
+               pid=\$(cat '$remote_dir/frps.pid' 2>/dev/null); \
+               if [ -n \"\$pid\" ]; then \
+                 kill -0 \"\$pid\" 2>/dev/null && kill \"\$pid\" 2>/dev/null || true; \
+                 sleep 0.3; \
+                 kill -0 \"\$pid\" 2>/dev/null && kill -9 \"\$pid\" 2>/dev/null || true; \
+               fi; \
+             fi; \
+             rm -rf '$remote_dir'; \
+             echo ok" 2>&1) || {
+            echo "WARNING: remote stop on $host failed: $result" >&2
+            return 1
+        }
+    else
+        # Backward compat: kill all frps, clean all mktemp dirs
+        result=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+            "pkill -f 'frps -c frps.toml' 2>/dev/null; \
+             for d in /tmp/frp-xtcp-?????? /tmp/frp-xtcp-test; do \
+                 if [ -d \"\$d\" ]; then rm -rf \"\$d\" 2>/dev/null; fi; \
+             done; \
+             rm -f /tmp/.frp-xtcp-dir 2>/dev/null; \
+             echo ok" 2>&1) || {
+            echo "WARNING: remote stop on $host failed: $result" >&2
+            return 1
+        }
+    fi
     echo "stopped"
 }
 
 cmd_status() {
-    local host="$1" ssh_key="$2"
+    local host="$1" ssh_key="$2" shard="${3:-}"
 
     if [[ ! -f "$ssh_key" ]]; then
         die "SSH key not found (check XTCP_VPS_SSH_KEY)"
     fi
 
+    if [[ -n "$shard" ]]; then
+        # CI matrix isolation: only check this shard's directory
+        local remote_dir="/tmp/frp-xtcp-shard-${shard}"
+        local running
+        running=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+            "if [ -f '$remote_dir/frps.pid' ]; then \
+               pid=\$(cat '$remote_dir/frps.pid'); \
+               if kill -0 \"\$pid\" 2>/dev/null; then \
+                 echo 'running (pid='\$pid', dir=$remote_dir)'; \
+               else \
+                 echo 'stopped (stale pid='\$pid', dir=$remote_dir)'; \
+               fi; \
+             else \
+               echo 'stopped (no pid file in $remote_dir)'; \
+             fi" 2>/dev/null) || running="unknown (ssh failed)"
+        echo "$running"
+        return
+    fi
+
+    # Backward compat: check all frp-xtcp temp dirs
     local running
     running=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" "bash -s" 2>/dev/null <<'REMOTE_SCRIPT'
 # Check all frp-xtcp temp dirs
@@ -289,25 +352,25 @@ REMOTE_SCRIPT
 
 case "${1:-}" in
     start)
-        [[ $# -eq 6 ]] || {
-            echo "ERROR: start requires 5 args: impl host port token ssh-key" >&2
+        if [[ $# -lt 6 || $# -gt 7 ]]; then
+            echo "ERROR: start requires 5-6 args: impl host port token ssh-key [shard]" >&2
             usage
-        }
-        cmd_start "$2" "$3" "$4" "$5" "$6"
+        fi
+        cmd_start "$2" "$3" "$4" "$5" "$6" "${7:-}"
         ;;
     stop)
-        [[ $# -eq 3 ]] || {
-            echo "ERROR: stop requires 2 args: host ssh-key" >&2
+        if [[ $# -lt 3 || $# -gt 4 ]]; then
+            echo "ERROR: stop requires 2-3 args: host ssh-key [shard]" >&2
             usage
-        }
-        cmd_stop "$2" "$3"
+        fi
+        cmd_stop "$2" "$3" "${4:-}"
         ;;
     status)
-        [[ $# -eq 3 ]] || {
-            echo "ERROR: status requires 2 args: host ssh-key" >&2
+        if [[ $# -lt 3 || $# -gt 4 ]]; then
+            echo "ERROR: status requires 2-3 args: host ssh-key [shard]" >&2
             usage
-        }
-        cmd_status "$2" "$3"
+        fi
+        cmd_status "$2" "$3" "${4:-}"
         ;;
     *)
         usage

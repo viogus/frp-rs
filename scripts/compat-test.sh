@@ -2087,6 +2087,11 @@ TOML
 #   features: space-separated list, e.g. "enc compression"
 run_xtcp_test() {
     local name="$1" frps_impl="$2" prov_impl="$3" vis_impl="$4" features="${5:-}"
+    # Extract numeric shard index from XTCP_SHARD (format "N/TOTAL")
+    local shard_index=""
+    if [[ -n "${XTCP_SHARD:-}" ]]; then
+        shard_index="${XTCP_SHARD%%/*}"
+    fi
     should_run_test "$name" || return 0
 
     log "=== $name ==="
@@ -2127,7 +2132,7 @@ run_xtcp_test() {
         # Start frps on remote VPS — capture actual port (handles port conflicts)
         local actual_port
         actual_port=$(bash "$SCRIPT_DIR/remote-frps.sh" start "$frps_impl" "$XTCP_FRPS_REMOTE" \
-            "$frps_port" "$token" "$ssh_key_path" | tail -1) || {
+            "$frps_port" "$token" "$ssh_key_path" "$shard_index" | tail -1) || {
             fail_test "$name" "remote frps ($frps_impl) did not start"
             return
         }
@@ -2186,7 +2191,7 @@ run_xtcp_test() {
     if ! wait_for_port_safe 127.0.0.1 "$visitor_port" 30; then
         fail_test "$name" "visitor port $visitor_port not reachable"
         if [[ -n "${XTCP_FRPS_REMOTE:-}" ]]; then
-            bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "$ssh_key_path" || true
+            bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "$ssh_key_path" "$shard_index" || true
         fi
         return
     fi
@@ -2202,7 +2207,7 @@ run_xtcp_test() {
 
     # Cleanup remote frps
     if [[ -n "${XTCP_FRPS_REMOTE:-}" ]]; then
-        bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "$ssh_key_path" || true
+        bash "$SCRIPT_DIR/remote-frps.sh" stop "$XTCP_FRPS_REMOTE" "$ssh_key_path" "$shard_index" || true
     fi
 }
 
