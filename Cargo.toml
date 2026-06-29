@@ -6,6 +6,7 @@ members = [
     "frp-client",
     "frps",
     "frpc",
+    "frp-stress",
 ]
 
 [workspace.dependencies]
