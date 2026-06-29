@@ -347,9 +347,13 @@ pub struct PortsRange {
 
 /// Server-recommended hole-punch behavior for a peer.
 /// Go frp v0.69.1 compat: DetectBehavior in NatHoleResp.
+/// CRITICAL: Go frps uses `json:"...,omitempty"` on ALL fields.
+/// When an integer field is 0, Go omits it from the JSON.
+/// All i32 fields below MUST have #[serde(default)] to handle this.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NatHoleDetectBehavior {
     /// Behavior mode (0-4). Determines role assignment.
+    #[serde(default)]
     pub mode: i32,
     /// Role: "sender" or "receiver".
     #[serde(default, skip_serializing_if = "Option::is_none")]
