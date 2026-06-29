@@ -257,15 +257,20 @@ cmd_start() {
     rm -f "$config_path"
 
     # --- Start frps on VPS ---
-    # Redirect all fds to detach from SSH session; nohup ensures survival
-    # Use ||rc=$? pattern (not ||true) so we capture exit code while preventing
-    # errexit from killing the script on bash <4.4 where var=$(failing_cmd) triggers it.
+    # Use timeout 15: sshd may keep connection open because background frps
+    # shares the session even with nohup (nohup only blocks SIGHUP, doesn't
+    # create new session). timeout kills SSH client after 15s while frps
+    # keeps running. We verify via liveness check instead.
     local start_output start_rc=0
     echo "DBG: starting frps via SSH on $host:$actual_port dir=$remote_dir" >&2
-    start_output=$(ssh_t -i "$ssh_key" "${VPS_USER}@${host}" \
+    start_output=$(timeout 15 ssh $SSH_OPTS -i "$ssh_key" "${VPS_USER}@${host}" \
         "cd $remote_dir && chmod +x frps && nohup ./frps -c frps.toml > frps.log 2>&1 < /dev/null & echo \$! > frps.pid" 2>&1) || start_rc=$?
     echo "DBG: SSH start complete rc=$start_rc output_len=${#start_output}" >&2
-    if [[ $start_rc -ne 0 ]]; then
+    if [[ $start_rc -eq 124 ]]; then
+        # timeout is expected: sshd may hold connection open for background
+        # frps process. Verify via liveness check below instead.
+        echo "DBG: SSH start timed out (expected — verifying via liveness check)" >&2
+    elif [[ $start_rc -ne 0 ]]; then
         die "failed to start frps on $host (exit=$start_rc): $start_output"
     fi
 
