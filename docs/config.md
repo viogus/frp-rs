@@ -108,7 +108,7 @@ Server-side HTTP plugins. Each entry is an external HTTP service called on lifec
 |-------|------|---------|-------------------|-------------|
 | `name` | `string` | `""` | `name` | Plugin name for logging. |
 | `url` | `string` | **required** | `url` | URL of the plugin server (e.g. `"http://127.0.0.1:4000/handler"`). |
-| `ops` | `string[]` | `[]` | `ops` | Operations this plugin handles: `"Login"`, `"NewProxy"`, `"CloseProxy"`. Empty = all operations. |
+| `ops` | `string[]` | `[]` | `ops` | Operations this plugin handles: `"login"`, `"new_proxy"`, `"close_proxy"`. Empty = all operations. |
 | `timeout` | `u64` | `5` | `timeout` | Timeout in seconds for HTTP calls to the plugin. |
 | `enable_control` | `bool` | `false` | `enableControl` | When true, the plugin response determines approve/reject. When false, the plugin is notify-only. |
 
@@ -172,7 +172,7 @@ detailed_errors_to_client = false
 tcp_mux_passthrough = false
 udp_packet_size = 65535
 nat_hole_analysis_data_reserve_hours = 1
-includes = []
+includes = ["conf.d/*.toml"]
 
 [auth]
 method = "token"
@@ -690,22 +690,31 @@ All `.toml` and `.ini` files in the directory (recursive) are loaded and merged 
 
 ## Feature Flags (Build-Time)
 
-Configuration fields gated behind Cargo features:
+Configuration fields and behavior gated behind Cargo features.
 
-| Feature | Fields Gated |
-|---------|-------------|
-| `kcp` | `kcp_bind_port` (server) |
-| `quic` | `quic_bind_port` (server) |
-| `websocket` | `websocket_port` (server) |
-| `ssh` | `[ssh_tunnel_gateway]` section |
-| `dashboard` | `[web_server]` dashboard endpoints |
-| `oidc` | All `oidc_*` auth fields |
-| `tls` | All `tls_*` fields |
-| `compression` | `use_compression` (proxy/visitor) |
-| `chacha20` | V2 XChaCha20-Poly1305 cipher |
-| `http-proxy` | HTTP proxy plugin (`type = "http_proxy"`) |
+### Compile-Time Gated Fields
 
-With `--no-default-features --features tiny` or `--features micro`, gated fields are silently ignored at deserialization time (serde `#[cfg(feature = "...")]`).
+Only three config fields have `#[cfg(feature)]` on the struct definition. When the feature is off, the field does not exist on the config struct and is rejected at deserialization time.
+
+| Feature | Field | Description |
+|---------|-------|-------------|
+| `kcp` | `kcp_bind_port` | KCP listener port (server) |
+| `quic` | `quic_bind_port` | QUIC listener port (server) |
+| `websocket` | `websocket_port` | WebSocket listener port (server) |
+
+### Runtime-Gated Features
+
+All other features gate only the runtime behavior. Their config fields are always present on the struct and always deserialized, but the corresponding protocol handler, plugin, or code path is not compiled and the field value is ignored at runtime.
+
+| Feature | Config Fields Always Present | Runtime Effect When Disabled |
+|---------|------------------------------|------------------------------|
+| `tls` | `tls_enable`, `tls_cert_file`, `tls_key_file`, `tls_ca_file`, `tls_server_name`, `tls_only`, `disable_custom_tls_first_byte` | TLS accept/dial not compiled |
+| `oidc` | `oidc_issuer`, `oidc_audience`, `oidc_token_endpoint`, `oidc_skip_expiry`, `oidc_skip_issuer`, `oidc_proxy_url` | OIDC token verification not compiled |
+| `compression` | `use_compression` (proxy/visitor) | Snappy bridge compression not compiled |
+| `chacha20` | V2 cipher fields | XChaCha20-Poly1305 V2 cipher not compiled |
+| `ssh` | `[ssh_tunnel_gateway]` section | SSH gateway not compiled |
+| `dashboard` | `[web_server]` section | Dashboard HTTP endpoints not compiled |
+| `http-proxy` | `type = "http_proxy"` plugin config | HTTP proxy plugin not compiled |
 
 ---
 
@@ -718,4 +727,4 @@ RUST_LOG=debug ./frps -c frps.toml
 RUST_LOG=frp_core=trace,frp_server=debug ./frps -c frps.toml
 ```
 
-The config file `log.level` takes precedence over `RUST_LOG` when both are set.
+Both the config file `log.level` and the `RUST_LOG` environment variable control log verbosity. See the `tracing-subscriber` documentation for precedence rules.
