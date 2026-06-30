@@ -29,7 +29,7 @@ futures-util.workspace = true
 tokio-rustls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
-webpki-roots = { workspace = true, optional = true }
+rustls-platform-verifier = { workspace = true, optional = true }
 ring = { workspace = true }
 yamux.workspace = true
 tokio-util.workspace = true
@@ -43,7 +43,7 @@ chacha20poly1305 = { workspace = true, optional = true }
 
 [features]
 default = ["quic", "kcp", "websocket", "oidc", "tls", "compression", "chacha20"]
-tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:webpki-roots", "dep:axum"]
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:rustls-platform-verifier", "dep:axum"]
 compression = ["dep:snap"]
 chacha20 = ["dep:chacha20poly1305"]
 quic = ["dep:quinn", "tls"]

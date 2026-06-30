@@ -1889,15 +1889,14 @@ pub fn build_tls_acceptor(
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-/// Build a `RootCertStore` from an optional CA file path.
-/// If `ca_file` is Some and non-empty, loads CA certs from that file.
-/// If None or empty, uses the system's webpki roots.
+/// Build a `RootCertStore` from a custom CA file path.
+/// Returns `None` when no custom CA is specified (caller should use
+/// the platform verifier instead).
 #[cfg(feature = "tls")]
-pub fn build_root_store(ca_file: Option<&str>) -> Result<rustls::RootCertStore, crate::Error> {
-    let mut root_store = rustls::RootCertStore::empty();
-
-    if let Some(ca_path) = ca_file {
-        if !ca_path.is_empty() {
+pub fn build_root_store(ca_file: Option<&str>) -> Result<Option<rustls::RootCertStore>, crate::Error> {
+    match ca_file {
+        Some(ca_path) if !ca_path.is_empty() => {
+            let mut root_store = rustls::RootCertStore::empty();
             let file = std::fs::File::open(ca_path)
                 .map_err(|e| crate::Error::Other(format!("open CA file: {e}")))?;
             let mut reader = std::io::BufReader::new(file);
@@ -1905,18 +1904,16 @@ pub fn build_root_store(ca_file: Option<&str>) -> Result<rustls::RootCertStore, 
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| crate::Error::Other(format!("read CA certs: {e}")))?;
             root_store.add_parsable_certificates(certs);
-        } else {
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            Ok(Some(root_store))
         }
-    } else {
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        _ => Ok(None),
     }
-
-    Ok(root_store)
 }
 
 /// Create a TLS connector for client-side TLS.
-/// If ca_file is provided, use it as a custom root CA; otherwise use webpki roots.
+/// If ca_file is provided, use it as a custom root CA; otherwise use
+/// the OS platform verifier (macOS Security.framework, Windows Schannel,
+/// Linux system CA bundle).
 /// If cert_file/key_file are provided, present client certificate to server (mTLS).
 #[cfg(feature = "tls")]
 pub fn build_tls_connector(
@@ -1924,39 +1921,70 @@ pub fn build_tls_connector(
     cert_file: Option<&str>,
     key_file: Option<&str>,
 ) -> Result<TlsConnector, crate::Error> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+    use rustls_platform_verifier::ConfigVerifierExt;
+
     let root_store = build_root_store(ca_file)?;
 
-    let config = if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
+    let config = if let Some(store) = root_store {
+        // Custom CA: use RootCertStore
+        if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
+            if !cert_path.is_empty() && !key_path.is_empty() {
+                let cert_file = std::fs::File::open(cert_path)
+                    .map_err(|e| crate::Error::Other(format!("open client cert file: {e}")))?;
+                let mut cert_reader = std::io::BufReader::new(cert_file);
+                let client_certs = rustls_pemfile::certs(&mut cert_reader)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| crate::Error::Other(format!("read client certs: {e}")))?;
+                let key_file = std::fs::File::open(key_path)
+                    .map_err(|e| crate::Error::Other(format!("open client key file: {e}")))?;
+                let mut key_reader = std::io::BufReader::new(key_file);
+                let client_key = rustls_pemfile::private_key(&mut key_reader)
+                    .map_err(|e| crate::Error::Other(format!("read client key: {e}")))?
+                    .ok_or_else(|| crate::Error::Other("no client private key found".into()))?;
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(Arc::new(store))
+                    .with_client_auth_cert(client_certs, client_key)
+                    .map_err(|e| crate::Error::Other(format!("build mTLS client config: {e}")))?
+            } else {
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(Arc::new(store))
+                    .with_no_client_auth()
+            }
+        } else {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(Arc::new(store))
+                .with_no_client_auth()
+        }
+    } else if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
+        // Platform verifier with client certificate (mTLS)
         if !cert_path.is_empty() && !key_path.is_empty() {
-            // Load client certificate chain
             let cert_file = std::fs::File::open(cert_path)
                 .map_err(|e| crate::Error::Other(format!("open client cert file: {e}")))?;
             let mut cert_reader = std::io::BufReader::new(cert_file);
             let client_certs = rustls_pemfile::certs(&mut cert_reader)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| crate::Error::Other(format!("read client certs: {e}")))?;
-
-            // Load client private key
             let key_file = std::fs::File::open(key_path)
                 .map_err(|e| crate::Error::Other(format!("open client key file: {e}")))?;
             let mut key_reader = std::io::BufReader::new(key_file);
             let client_key = rustls_pemfile::private_key(&mut key_reader)
                 .map_err(|e| crate::Error::Other(format!("read client key: {e}")))?
                 .ok_or_else(|| crate::Error::Other("no client private key found".into()))?;
-
             rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
+                .with_platform_verifier()
+                .map_err(|e| crate::Error::Other(format!("platform verifier: {e}")))?
                 .with_client_auth_cert(client_certs, client_key)
                 .map_err(|e| crate::Error::Other(format!("build mTLS client config: {e}")))?
         } else {
-            rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
+            // Platform verifier, no client certificate
+            <rustls::ClientConfig as ConfigVerifierExt>::with_platform_verifier()
+                .map_err(|e| crate::Error::Other(format!("platform verifier: {e}")))?
         }
     } else {
-        rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth()
+        // Platform verifier, no client certificate
+        <rustls::ClientConfig as ConfigVerifierExt>::with_platform_verifier()
+            .map_err(|e| crate::Error::Other(format!("platform verifier: {e}")))?
     };
 
     Ok(TlsConnector::from(Arc::new(config)))
