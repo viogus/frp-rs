@@ -1,9 +1,11 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use frp_core::auth::{AuthConfig, OidcVerifier};
 use frp_core::transport::IoStream;
@@ -133,6 +135,13 @@ pub struct AppState {
     /// this acceptor atomically. SIGUSR1 reload also swaps when cert paths change.
     #[cfg(feature = "tls")]
     pub tls_acceptor: Arc<std::sync::RwLock<Option<tokio_rustls::TlsAcceptor>>>,
+    /// CancellationToken for graceful shutdown. Cancelled on SIGTERM/SIGINT.
+    /// Main accept loop and control handlers watch this to stop accepting new
+    /// connections while letting existing bridge tasks drain.
+    pub shutdown_token: CancellationToken,
+    /// Active bridge connection counter. Incremented when a bridge task starts,
+    /// decremented when it completes. The drain phase polls this counter.
+    pub active_connections: AtomicU64,
 }
 
 impl AppState {
@@ -175,6 +184,8 @@ impl AppState {
             detailed_errors_to_client,
             #[cfg(feature = "tls")]
             tls_acceptor: Arc::new(std::sync::RwLock::new(None)),
+            shutdown_token: CancellationToken::new(),
+            active_connections: AtomicU64::new(0),
         }
     }
 }
