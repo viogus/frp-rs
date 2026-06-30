@@ -79,6 +79,14 @@ pub fn create_new_proxy_msg(
         multiplexer: if p.multiplexer.is_empty() { None } else { Some(p.multiplexer.clone()) },
         virtual_net: if p.virtual_net.is_empty() { None } else { Some(p.virtual_net.clone()) },
         proxy_protocol_version: if p.proxy_protocol_version.is_empty() { None } else { Some(p.proxy_protocol_version.clone()) },
+        #[cfg(feature = "vnet")]
+        advertise_subnet: None,
+        #[cfg(feature = "vnet")]
+        vnet_ip: None,
+        #[cfg(feature = "vnet")]
+        vnet_netmask: None,
+        #[cfg(feature = "vnet")]
+        vnet_mtu: None,
     });
 
     // Strip local_str for Go frps compatibility — Go frps v0.69.1

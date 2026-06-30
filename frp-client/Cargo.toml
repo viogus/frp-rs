@@ -24,9 +24,10 @@ tokio-rustls = { workspace = true, optional = true }
 rand.workspace = true
 
 [features]
-default = ["tls", "quic", "kcp", "websocket", "oidc"]
+default = ["tls", "quic", "kcp", "websocket", "oidc", "vnet"]
 tls = ["frp-core/tls", "dep:rustls", "dep:tokio-rustls"]
 quic = ["frp-core/quic"]
 kcp = ["frp-core/kcp"]
 websocket = ["frp-core/websocket"]
 oidc = ["frp-core/oidc"]
+vnet = ["frp-core/vnet"]

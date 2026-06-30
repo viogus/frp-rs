@@ -403,6 +403,14 @@ fn build_v1_frame_from_args(args: &ParsedProxyArgs, allocated_port: u16) -> Resu
         multiplexer: none_if_empty(&args.multiplexer),
         virtual_net: None,
         proxy_protocol_version: None,
+        #[cfg(feature = "vnet")]
+        advertise_subnet: None,
+        #[cfg(feature = "vnet")]
+        vnet_ip: None,
+        #[cfg(feature = "vnet")]
+        vnet_netmask: None,
+        #[cfg(feature = "vnet")]
+        vnet_mtu: None,
     });
 
     let type_byte = msg.v1_type_byte();

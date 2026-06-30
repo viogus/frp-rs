@@ -755,6 +755,14 @@ mod tests {
                 allow_users: None, bandwidth_limit: None, bandwidth_limit_mode: None,
                 annotations: None, metas: None, multiplexer: None, virtual_net: None,
                 proxy_protocol_version: None,
+                #[cfg(feature = "vnet")]
+                advertise_subnet: None,
+                #[cfg(feature = "vnet")]
+                vnet_ip: None,
+                #[cfg(feature = "vnet")]
+                vnet_netmask: None,
+                #[cfg(feature = "vnet")]
+                vnet_mtu: None,
             }),
             FrpMessage::NewProxyResp(msg::NewProxyResp {
                 proxy_name: "p".into(), remote_addr: None, error: None,
