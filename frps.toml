@@ -46,6 +46,9 @@ web_server_addr = ""             # "" = disabled
 web_server_port = 0
 web_server_user = "admin"
 web_server_password = "admin"
+## Dashboard TLS (flat format) — HTTPS when both are non-empty
+web_server_tls_cert_file = ""
+web_server_tls_key_file = ""
 
 ## Transport
 tcp_mux = true                   # Flat format (also settable as transport.tcp_mux)
@@ -72,6 +75,8 @@ tcp_mux = true                   # Flat format (also settable as transport.tcp_m
 # port = 0
 # user = "admin"
 # password = "admin"
+# tls_cert_file = ""
+# tls_key_file = ""
 # 
 # [transport]
 # tcp_mux = true
