@@ -39,3 +39,8 @@ reqwest = { workspace = true, features = ["json"] }
 serde_json = { workspace = true }
 axum = { workspace = true }
 jsonwebtoken = { workspace = true }
+criterion.workspace = true
+
+[[bench]]
+name = "nathole"
+harness = false

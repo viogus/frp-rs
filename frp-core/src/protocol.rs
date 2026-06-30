@@ -202,7 +202,7 @@ pub fn deserialize_v2(type_id: u16, json_bytes: &[u8]) -> Result<FrpMessage, cra
     Ok(msg)
 }
 
-fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate::Error> {
+pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate::Error> {
     let msg = match type_byte {
         msg::TYPE_LOGIN => {
             let v: msg::Login = serde_json::from_slice(payload)
