@@ -629,9 +629,9 @@ mod tests {
             FrpMessage::Ping(msg::Ping { privilege_key: None, timestamp: Some(42) }),
             FrpMessage::Pong(msg::Pong { error: None }),
             FrpMessage::CloseProxy(msg::CloseProxy { proxy_name: "test".into() }),
+            FrpMessage::CloseProxyResp(msg::CloseProxyResp { proxy_name: "test".into() }),
+            FrpMessage::Error(msg::Error { error: "test error".into() }),
             FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
-            // Note: CloseProxyResp and Error are V1-only (v2_type_id() == 0),
-            // so they are excluded from this V2 roundtrip test.
         ];
 
         for msg in &messages {
@@ -689,9 +689,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_v2_msg_18_types_roundtrip() {
-        // Test all 18 V2 message types survive encode -> decode roundtrip.
-        // Skip CloseProxyResp and Error (V1-only, v2_type_id returns 0).
+    async fn test_v2_msg_20_types_roundtrip() {
+        // Test all 20 V2 message types survive encode -> decode roundtrip.
         // Construct each message with minimal valid fields (no Default on most).
         fn test_addr() -> msg::UdpAddr {
             msg::UdpAddr { ip: "0.0.0.0".into(), port: 0, zone: String::new() }
@@ -752,6 +751,8 @@ mod tests {
             FrpMessage::NatHoleResp(msg::NatHoleResp::default()),
             FrpMessage::NatHoleSid(msg::NatHoleSid { sid: None, provider_addr: None }),
             FrpMessage::NatHoleReport(msg::NatHoleReport { sid: None }),
+            FrpMessage::CloseProxyResp(msg::CloseProxyResp { proxy_name: "p".into() }),
+            FrpMessage::Error(msg::Error { error: "test error".into() }),
         ];
 
         for msg in &messages {
