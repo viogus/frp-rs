@@ -30,6 +30,8 @@ jobs:
         run: rustup default stable
       - name: Clippy
         run: cargo clippy --workspace
+      - name: Build binaries (needed for integration tests)
+        run: cargo build --bin frps --bin frpc
       - name: Run tests
         run: cargo test --workspace
 
