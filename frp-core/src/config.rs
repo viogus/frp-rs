@@ -1808,4 +1808,304 @@ bindPort = 2200
         let cfg: ServerConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.ssh_tunnel_gateway.bind_port, 0);
     }
+
+    // ─── Property-based tests (proptest) ───────────────────────────────
+
+    /// Helper: normalize a TOML string through the full server config pipeline
+    /// and return the re-serialized TOML (post-normalization).
+    fn normalize_server_toml(toml_str: &str) -> String {
+        let mut val: toml::Value = toml::from_str(toml_str).unwrap();
+        normalize_server_config(&mut val);
+        toml::to_string(&val).unwrap()
+    }
+
+    /// Helper: normalize a TOML string through the full client config pipeline.
+    fn normalize_client_toml(toml_str: &str) -> String {
+        let mut val: toml::Value = toml::from_str(toml_str).unwrap();
+        normalize_client_config(&mut val);
+        toml::to_string(&val).unwrap()
+    }
+
+    mod proptest_tests {
+        use proptest::prelude::*;
+
+        // ── Strategies ────────────────────────────────────────────────
+
+        /// Generate a valid server TOML config with [common] section.
+        fn arb_server_common_config() -> impl Strategy<Value = String> {
+            (any::<u16>(), any::<u16>(), any::<u16>(), any::<u16>()).prop_map(
+                |(bind_port, vhost_http, vhost_https, dash_port)| {
+                    format!(
+                        "[common]\n\
+                         bind_port = {bind_port}\n\
+                         vhost_http_port = {vhost_http}\n\
+                         vhost_https_port = {vhost_https}\n\
+                         web_server_port = {dash_port}\n"
+                    )
+                },
+            )
+        }
+
+        /// Generate a valid client TOML config with [common] section.
+        fn arb_client_common_config() -> impl Strategy<Value = String> {
+            (any::<u16>(), "[a-zA-Z0-9._-]{1,16}").prop_map(|(port, addr)| {
+                format!(
+                    "[common]\n\
+                     server_addr = \"{addr}\"\n\
+                     server_port = {port}\n\
+                     token = \"test-token\"\n"
+                )
+            })
+        }
+
+        // ── Server config properties ──────────────────────────────────
+
+        proptest! {
+            /// Server config normalization is idempotent: applying it twice
+            /// produces the same result as applying it once.
+            #[test]
+            fn server_normalization_idempotent(toml_str in arb_server_common_config()) {
+                let first = super::normalize_server_toml(&toml_str);
+                let second = super::normalize_server_toml(&first);
+                prop_assert_eq!(first, second,
+                    "normalize(normalize(x)) != normalize(x)");
+            }
+        }
+
+        proptest! {
+            /// Server config: flat auth fields produce same result as nested [auth].
+            #[test]
+            fn server_auth_flat_vs_nested_equivalent(
+                bind_port in any::<u16>(),
+                token in "[a-zA-Z0-9]{4,32}",
+            ) {
+                let flat = format!(
+                    "bind_port = {bind_port}\n\
+                     auth_method = \"token\"\n\
+                     auth_token = \"{token}\"\n"
+                );
+                let nested = format!(
+                    "bind_port = {bind_port}\n\
+                     [auth]\n\
+                     method = \"token\"\n\
+                     token = \"{token}\"\n"
+                );
+                let flat_norm = super::normalize_server_toml(&flat);
+                let nested_norm = super::normalize_server_toml(&nested);
+                prop_assert_eq!(flat_norm, nested_norm,
+                    "flat auth fields did not normalize to same result as nested [auth]");
+            }
+        }
+
+        proptest! {
+            /// Server config: flat log fields produce same result as nested [log].
+            #[test]
+            fn server_log_flat_vs_nested_equivalent(
+                bind_port in any::<u16>(),
+                level in "trace|debug|info|warn|error",
+                file in "[a-z/.]{0,32}",
+            ) {
+                let flat = format!(
+                    "bind_port = {bind_port}\n\
+                     log_level = \"{level}\"\n\
+                     log_file = \"{file}\"\n"
+                );
+                let nested = format!(
+                    "bind_port = {bind_port}\n\
+                     [log]\n\
+                     level = \"{level}\"\n\
+                     file = \"{file}\"\n"
+                );
+                let flat_norm = super::normalize_server_toml(&flat);
+                let nested_norm = super::normalize_server_toml(&nested);
+                prop_assert_eq!(flat_norm, nested_norm,
+                    "flat log fields did not normalize to same result as nested [log]");
+            }
+        }
+
+        proptest! {
+            /// Server config: flat web_server fields produce same result as nested [web_server].
+            #[test]
+            fn server_web_server_flat_vs_nested_equivalent(
+                bind_port in any::<u16>(),
+                ws_port in any::<u16>(),
+                ws_user in "[a-zA-Z0-9]{2,16}",
+                ws_pwd in "[a-zA-Z0-9]{2,16}",
+            ) {
+                let flat = format!(
+                    "bind_port = {bind_port}\n\
+                     web_server_port = {ws_port}\n\
+                     web_server_user = \"{ws_user}\"\n\
+                     web_server_password = \"{ws_pwd}\"\n"
+                );
+                let nested = format!(
+                    "bind_port = {bind_port}\n\
+                     [web_server]\n\
+                     port = {ws_port}\n\
+                     user = \"{ws_user}\"\n\
+                     password = \"{ws_pwd}\"\n"
+                );
+                let flat_norm = super::normalize_server_toml(&flat);
+                let nested_norm = super::normalize_server_toml(&nested);
+                prop_assert_eq!(flat_norm, nested_norm,
+                    "flat web_server fields did not normalize to same as nested [web_server]");
+            }
+        }
+
+        // ── Client config properties ─────────────────────────────────
+
+        proptest! {
+            /// Client config normalization is idempotent.
+            #[test]
+            fn client_normalization_idempotent(toml_str in arb_client_common_config()) {
+                let first = super::normalize_client_toml(&toml_str);
+                let second = super::normalize_client_toml(&first);
+                prop_assert_eq!(first, second,
+                    "normalize(normalize(x)) != normalize(x)");
+            }
+        }
+
+        proptest! {
+            /// Client config: protocol field maps to transport_protocol.
+            #[test]
+            fn client_protocol_to_transport_protocol(
+                port in any::<u16>(),
+                proto in "tcp|kcp|quic|websocket",
+                token in "[a-zA-Z0-9]{4,16}",
+            ) {
+                let input = format!(
+                    "[common]\n\
+                     server_addr = \"127.0.0.1\"\n\
+                     server_port = {port}\n\
+                     token = \"{token}\"\n\
+                     protocol = \"{proto}\"\n"
+                );
+                let norm = super::normalize_client_toml(&input);
+                // After normalization, "protocol" should become "transport_protocol"
+                prop_assert!(norm.contains("transport_protocol"),
+                    "protocol was not normalized to transport_protocol: {norm}");
+                prop_assert!(!norm.contains("\nprotocol ="),
+                    "old protocol key still present after normalization: {norm}");
+            }
+        }
+
+        proptest! {
+            /// Client config: Go camelCase fields normalized to snake_case.
+            #[test]
+            fn client_camelcase_to_snakecase(
+                port in any::<u16>(),
+                addr in "[a-z.]{4,16}",
+                token in "[a-zA-Z0-9]{4,16}",
+            ) {
+                let input = format!(
+                    "[common]\n\
+                     serverAddr = \"{addr}\"\n\
+                     serverPort = {port}\n\
+                     token = \"{token}\"\n"
+                );
+                let norm = super::normalize_client_toml(&input);
+                prop_assert!(norm.contains("server_addr"),
+                    "serverAddr not normalized to server_addr: {norm}");
+                prop_assert!(norm.contains("server_port"),
+                    "serverPort not normalized to server_port: {norm}");
+            }
+        }
+
+        proptest! {
+            /// Client config: [transport] section flattened to top-level keys.
+            #[test]
+            fn client_transport_flatten(
+                port in any::<u16>(),
+                token in "[a-zA-Z0-9]{4,16}",
+            ) {
+                let input = format!(
+                    "server_addr = \"127.0.0.1\"\n\
+                     server_port = {port}\n\
+                     token = \"{token}\"\n\
+                     [transport]\n\
+                     tcp_mux = false\n"
+                );
+                let norm = super::normalize_client_toml(&input);
+                // After normalization, [transport] should be gone and tcp_mux at top level
+                prop_assert!(norm.contains("tcp_mux"),
+                    "transport.tcp_mux not flattened to top-level: {norm}");
+                // The [transport] section itself should be gone
+                prop_assert!(!norm.contains("[transport]"),
+                    "[transport] section still present after flatten: {norm}");
+            }
+        }
+
+        proptest! {
+            /// Server config: [common] section flattened to root, then normalization
+            /// is idempotent.
+            #[test]
+            fn server_common_flatten_idempotent(
+                bind_port in any::<u16>(),
+                token in "[a-zA-Z0-9]{4,16}",
+            ) {
+                let input = format!(
+                    "[common]\n\
+                     bind_port = {bind_port}\n\
+                     auth_method = \"token\"\n\
+                     auth_token = \"{token}\"\n\
+                     log_level = \"info\"\n"
+                );
+                let first = super::normalize_server_toml(&input);
+                let second = super::normalize_server_toml(&first);
+                prop_assert_eq!(first.clone(), second,
+                    "[common] flatten + normalize not idempotent");
+                // [common] should be gone
+                prop_assert!(!first.contains("[common]"),
+                    "[common] section still present after normalization: {first}");
+            }
+        }
+
+        // ── Non-proptest edge case tests ─────────────────────────────
+
+        #[test]
+        fn server_token_promoted_to_auth() {
+            let input = "bind_port = 7000\ntoken = \"my-secret\"\n";
+            let norm = super::normalize_server_toml(input);
+            assert!(norm.contains("[auth]"), "token should be promoted into [auth]: {norm}");
+            assert!(norm.contains("token = \"my-secret\""), "token value missing: {norm}");
+        }
+
+        #[test]
+        fn server_ssh_tunnel_gateway_rename() {
+            let input = "bind_port = 7000\n[sshTunnelGateway]\nbindPort = 2200\n";
+            let norm = super::normalize_server_toml(input);
+            assert!(norm.contains("ssh_tunnel_gateway"),
+                "sshTunnelGateway not renamed: {norm}");
+            assert!(!norm.contains("sshTunnelGateway"),
+                "old sshTunnelGateway key still present: {norm}");
+        }
+
+        #[test]
+        fn client_tls_trusted_ca_rename() {
+            let input = "server_addr = \"x\"\nserver_port = 7000\ntls_trusted_ca_file = \"/certs/ca.pem\"\n";
+            let norm = super::normalize_client_toml(input);
+            assert!(norm.contains("tls_ca_file"),
+                "tls_trusted_ca_file not renamed to tls_ca_file: {norm}");
+            assert!(!norm.contains("tls_trusted_ca_file"),
+                "old tls_trusted_ca_file key still present: {norm}");
+        }
+
+        #[test]
+        fn server_enable_prometheus_to_web_server() {
+            let input = "bind_port = 7000\nenable_prometheus = true\n";
+            let norm = super::normalize_server_toml(input);
+            assert!(norm.contains("[web_server]"),
+                "enable_prometheus should create [web_server]: {norm}");
+            assert!(norm.contains("enable_prometheus"),
+                "enable_prometheus value missing: {norm}");
+        }
+
+        #[test]
+        fn client_transport_wire_protocol_v2() {
+            let input = "server_addr = \"x\"\nserver_port = 7000\n[transport]\nwireProtocol = \"v2\"\n";
+            let norm = super::normalize_client_toml(input);
+            assert!(norm.contains("v2 = true"),
+                "wireProtocol=v2 not converted to v2=true: {norm}");
+        }
+    }
 }
