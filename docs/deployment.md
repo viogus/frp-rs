@@ -44,7 +44,7 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 ```
 
-**Note on `ProtectSystem=strict`:** If you use TLS certificates, add `ReadWritePaths=/etc/frp` (or wherever your certs live). If you write logs to a file, add `ReadWritePaths=/var/log/frp`.
+**Note on `ProtectSystem=strict`:** If you use TLS certificates, add `ReadOnlyPaths=/etc/frp` (frps only needs to read certs, not write them). If you write logs to a file, add `ReadWritePaths=/var/log/frp`.
 
 ### Client Unit (`/etc/systemd/system/frpc.service`)
 
@@ -473,13 +473,28 @@ scrape_configs:
 ### Dashboard Web UI
 
 ```toml
-# frps.toml
+# frps.toml — plain HTTP (put nginx in front for HTTPS)
 [web_server]
 addr = "127.0.0.1"        # bind to localhost; put a reverse proxy in front
 port = 7500
 user = "admin"
 password = "secure-password"
 ```
+
+For direct HTTPS without a reverse proxy, add TLS fields:
+
+```toml
+# frps.toml — direct HTTPS
+[web_server]
+addr = "0.0.0.0"
+port = 7500
+user = "admin"
+password = "secure-password"
+tls_cert_file = "/etc/frp/dashboard.crt"
+tls_key_file = "/etc/frp/dashboard.key"
+```
+
+Both cert and key must be non-empty for TLS to activate (implicit detection, matching Go frp behavior). CLI flags `--dashboard-tls-cert-file` and `--dashboard-tls-key-file` also work.
 
 The dashboard provides:
 
@@ -660,12 +675,14 @@ Keep `tcp_mux = true` unless you have a specific reason to disable it. Benefits:
 
 **`pool_count` (client-side):**
 
-Pre-establishes work connections so the server can assign them immediately
-when a user connects, without waiting for `ReqWorkConn` + `NewWorkConn`:
+Caps the number of pre-established (idle) work connections. The pool is
+filled **lazily** — connections are created on-demand when the server requests
+them via `ReqWorkConn`, and surplus connections are kept in the pool up to
+`pool_count`. The pool is NOT pre-warmed at startup.
 
 ```toml
 # frpc.toml
-pool_count = 5    # keep 5 idle work connections ready
+pool_count = 5    # keep up to 5 idle work connections ready
 ```
 
 Start with `pool_count = 1` and increase if you observe latency spikes on

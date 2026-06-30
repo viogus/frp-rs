@@ -74,7 +74,7 @@ The README gives a solid overview. The sections below cover details that reading
 
 **V1** (fully implemented): 9-byte header — 1 byte type + 8 bytes big-endian payload length (max 64 KiB) — followed by UTF-8 JSON payload. Defined in `frp-core/src/protocol.rs`.
 
-**V2** (stubs only): 7-byte magic `FRP\0\x02\r\n` + different framing. `detect_v2_magic` and `write_v2_magic` exist but no V2 frame read/write is implemented.
+**V2** (fully implemented): 7-byte magic `FRP\0\x02\r\n` + different framing. V2 frame read/write (`write_v2_frame_raw`/`read_v2_frame_raw`), message dispatch (`write_msg_v2`/`read_msg_v2`), AEAD encryption (`v2_handshake.rs`: ClientHello/ServerHello, HKDF key derivation, `crypto.rs`: AeadAlgorithm trait for AES-256-GCM/ChaCha20-Poly1305), and capability negotiation all implemented. V2 compat tests guard behind `GO_FRP_V2=1` (require source-built Go frp; auto-detect locally, skip in CI).
 
 Message type bytes and structs live in `frp-core/src/msg.rs`. The `FrpMessage` enum is `#[serde(untagged)]` — serde matches the first variant whose fields intersect the JSON, which means ordering of the enum variants matters.
 
@@ -188,6 +188,13 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 - `#[serde(untagged)]` on `FrpMessage` enum — ordering matters for serde matching, but V1 protocol dispatches by type byte first via `deserialize_v1()`, so untagged matching is not involved in wire deserialization
 - `ProxyRuntimeInfo` must include `sk: String` field — XTCP P2P encryption derives its AES-128 key from the proxy's SecretKey via `derive_key(&sk)`. Adding new fields to `ProxyRuntimeInfo` requires updating all construction sites: `Service::new()`, `do_reload()` in `reload.rs`, and any other future sites.
 
+### Testing & Tooling
+
+- **Benchmarks**: `cargo bench -p frp-core` (9 groups: key derivation, compression, cipher stream, STUN, V1+V2 protocol all-types, bridge plain/encrypted/compressed, bandwidth limiter) + `cargo bench -p frp-server` (nathole classify + analysis). CI: `cargo bench --workspace --no-run` build-check in `ci.yml`.
+- **Property/fuzz tests**: proptest-based config normalization (`frp-core/src/config.rs`, 14 tests) and V1/V2 protocol frame fuzzing (`frp-core/src/protocol.rs`, 13 tests, 0 panics found).
+- **Stress tests**: `scripts/stress-test.sh` runs frps + frpc under load with connection churn, monitored via `scripts/frp-stress/`. Weekly CI run in `stress-test.yml`.
+- **Cross-compat tests**: `scripts/compat-test.sh` — 40 default + 2 guarded (XTCP 16-test pairwise matrix, V2 `GO_FRP_V2=1`). Runs on every push via `compat.yml`. XTCP compat runs daily on VPS via `xtcp-compat.yml`.
+
 ### Dependency Policy (mandatory)
 
 **No new dependencies without explicit justification.** Every new crate added to the workspace must have a documented reason covering:
@@ -206,7 +213,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 | Crypto (general) | `ring` | 0.17 — SHA256, AES-256-GCM, HKDF, HMAC |
 | Crypto (Go compat) | `aes` + `cfb-mode`, `pbkdf2` + `sha1`, `md-5` | AES-128-CFB, PBKDF2-SHA1, MD5 — ring lacks these |
 | Crypto (V2 XChaCha20) | `chacha20poly1305` | ring only has ChaCha20 (96-bit nonce), V2 needs XChaCha20 (192-bit) |
-| TLS | `rustls` + `tokio-rustls` + `rustls-pemfile` + `webpki-roots` | ring backend, tls12 |
+| TLS | `rustls` + `tokio-rustls` + `rustls-pemfile` + `rustls-platform-verifier` | ring backend, tls12, native cert verifier |
 | SSH | `russh` | ring backend (NOT aws-lc-rs), features: ring+rsa only |
 | HTTP client | `reqwest` | rustls-tls only (no json, no socks features) |
 | HTTP server | `axum` | dashboard, admin auth |

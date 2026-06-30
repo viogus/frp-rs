@@ -89,3 +89,8 @@ frp-client = { path = "../frp-client" }
 |---------|---------|
 | `oidc` | OIDC token acquisition |
 | `websocket` | WebSocket transport (dial) |
+| `quic` | QUIC transport (dial) |
+| `kcp` | KCP transport (dial) |
+| `tls` | TLS transport (rustls, tokio-rustls) |
+| `compression` | Snappy bridge compression |
+| `chacha20` | XChaCha20-Poly1305 V2 cipher |

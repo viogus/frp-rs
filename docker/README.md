@@ -8,9 +8,12 @@
 |------|------|
 | `ghcr.io/viogus/frps-rs:latest` | linux/amd64, arm64 |
 | `ghcr.io/viogus/frpc-rs:latest` | linux/amd64, arm64 |
+| `ghcr.io/viogus/frps-tiny-rs:latest` | linux/amd64, arm64 |
+| `ghcr.io/viogus/frpc-tiny-rs:latest` | linux/amd64, arm64 |
+| `ghcr.io/viogus/frps-micro-rs:latest` | linux/amd64, arm64 |
+| `ghcr.io/viogus/frpc-micro-rs:latest` | linux/amd64, arm64 |
 
-| `ghcr.io/viogus/frps-rs:test` | linux/amd64, arm64 (源码构建) |
-| `ghcr.io/viogus/frpc-rs:test` | linux/amd64, arm64 (源码构建) |
+`:test` 标签 (源码构建) 和 `:vX.Y.Z` 版本标签也适用于所有 6 个变体。
 
 ## 构建方式
 
@@ -79,6 +82,10 @@ services:
 | `FRP_SUBDOMAIN_HOST` | — | 子域名后缀 |
 | `FRP_TLS_CERT_FILE` | — | TLS 证书文件 |
 | `FRP_TLS_KEY_FILE` | — | TLS 私钥文件 |
+| `FRP_DASHBOARD_PORT` | `0` | Dashboard 端口 (0 = 禁用) |
+| `FRP_DASHBOARD_ADDR` | `""` | Dashboard 绑定地址 |
+| `FRP_DASHBOARD_USER` | `""` | Dashboard 用户名 |
+| `FRP_DASHBOARD_PWD` | `""` | Dashboard 密码 |
 
 ### frpc-rs
 

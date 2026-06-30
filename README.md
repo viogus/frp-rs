@@ -43,6 +43,8 @@ suitable as a drop-in replacement for either the client or server side.
 | TLS transport        | ✅     | ✅     |
 | QUIC transport       | ✅     | ✅     |
 | KCP transport        | ✅     | ✅     |
+| V2 wire protocol     | ✅     | ✅     |
+| V1 wire protocol     | ✅     | ✅     |
 | TCP health checks    | ✅     | —      |
 | HTTP VHost routing   | —      | ✅     |
 | HTTPS VHost routing  | —      | ✅     |
@@ -59,8 +61,8 @@ Client plugins: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `ht
 ### Go frp Compatibility Notes
 
 frp-rs targets protocol compatibility with Go frp v0.69.1. **100% feature parity.**
-39/39 cross-compatibility tests pass on every commit, with 5 additional guarded tests
-for specific environments (XTCP requires public internet, V2 requires source-built Go frp).
+40/40 cross-compatibility tests pass on every commit, with 2 additional guarded tests
+for specific environments (XTCP 16-test pairwise matrix on VPS, V2 auto-detected locally).
 
 - **V1 wire protocol**: Fully compatible. All message types, authentication, encryption (AES-128-CFB),
   compression (Snappy) — wire-compatible with Go frp v0.69.1.
@@ -206,6 +208,8 @@ tcp_mux_keepalive_interval = 30
 | `web_server.user` | `""` | Dashboard Basic Auth username |
 | `web_server.password` | `""` | Dashboard Basic Auth password |
 | `web_server.enable_prometheus` | `false` | Expose /metrics for Prometheus scraping |
+| `web_server.tls_cert_file` | `""` | Dashboard TLS certificate path |
+| `web_server.tls_key_file` | `""` | Dashboard TLS private key path |
 | `transport.tcp_mux` | `true` | Enable TCP multiplexing |
 | `transport.tcp_mux_keepalive_interval` | `30` | Keepalive interval (seconds) for mux |
 | `transport.heartbeat_timeout` | `90` | Heartbeat timeout in seconds (server disconnects if no ping) |
