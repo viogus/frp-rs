@@ -1,4 +1,5 @@
 pub mod state;
+pub mod store;
 pub mod service;
 pub mod control;
 pub mod proxy;

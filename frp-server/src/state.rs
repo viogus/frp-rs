@@ -122,6 +122,8 @@ pub struct AppState {
     pub plugin_manager: Arc<crate::plugin::HttpPluginManager>,
     /// In-memory store for proxy configs submitted via dashboard Store API.
     pub proxy_config_store: Arc<RwLock<HashMap<String, frp_core::config::ProxyConfig>>>,
+    /// Path to the JSON store file for proxy_config_store persistence.
+    pub store_path: Option<std::path::PathBuf>,
     /// TCPMux HTTP CONNECT route table (domain → proxy mapping).
     pub tcpmux_manager: Arc<TcpMuxManager>,
     /// Per-proxy traffic metrics for dashboard API.
@@ -181,6 +183,7 @@ impl AppState {
             custom_404_page,
             plugin_manager,
             proxy_config_store: Arc::new(RwLock::new(HashMap::new())),
+            store_path: None,
             detailed_errors_to_client,
             #[cfg(feature = "tls")]
             tls_acceptor: Arc::new(std::sync::RwLock::new(None)),
