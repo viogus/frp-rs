@@ -966,29 +966,64 @@ impl Service {
                                         }
                                     }
                                 } else {
-                                    let mut tls = tls_stream;
-                                    match read_msg_v1(&mut tls).await {
-                                        Ok(FrpMessage::Login(login)) => {
-                                            control::handle_control(tls, login, state, Some(addr), None, false, None).await;
-                                        }
-                                        Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                            let io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls)));
-                                            crate::handlers::handle_work_conn_inner(io, nwc, state).await;
-                                        }
-                                        Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                            let io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls)));
-                                            crate::handlers::handle_visitor_conn_inner(io, nvc, state, false).await;
-                                        }
-                                        Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                            let io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls)));
-                                            let visitor_addr = Some(addr.to_string());
-                                            crate::handlers::handle_nat_hole_visitor(io, nhv, state, visitor_addr, false).await;
-                                        }
-                                        Ok(other) => {
-                                            debug!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected TLS first message from {}: {:?}", addr, other.v1_type_byte());
-                                        }
-                                        Err(e) => {
-                                            debug!(addr = %addr, error = %e, "TLS read error from {}: {}", addr, e);
+                                    // Wrap in IoStream::Tls for V2 frame I/O support.
+                                    // read_msg_v1 works on raw TlsStream but V2 frames need IoStream.
+                                    let mut io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls_stream)));
+
+                                    // Try V2 magic detection
+                                    let mut magic = [0u8; 7];
+                                    let is_v2 = match io.read_exact(&mut magic).await {
+                                        Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                        Err(_) => false,
+                                    };
+
+                                    if is_v2 {
+                                        // V2 path: ClientHello/ServerHello handshake
+                                        let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                            Ok((Some(p), crypto)) => (p, crypto),
+                                            Ok((None, crypto)) => {
+                                                match io.read_raw_v2_frame().await {
+                                                    Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                    Ok((ft, _, _)) => {
+                                                        tracing::warn!(frame_type = ?ft, addr = %addr, "TLS V2: unexpected frame type {} after handshake from {}", ft, addr);
+                                                        return;
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(addr = %addr, error = %e, "TLS V2: failed to read message after handshake from {}: {}", addr, e);
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(addr = %addr, error = %e, "TLS V2 handshake error from {}: {}", addr, e);
+                                                return;
+                                            }
+                                        };
+                                        // Pass visitor_addr to match V1 TLS plain behavior for NatHoleVisitor
+                                        crate::handlers::dispatch_v2_message(io, msg_payload, state, addr, None, Some(addr.to_string()), crypto_ctx).await;
+                                    } else {
+                                        // V1 fallback: replay consumed 7 bytes
+                                        let mut io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
+                                        match read_msg_v1(&mut io).await {
+                                            Ok(FrpMessage::Login(login)) => {
+                                                control::handle_control(io, login, state, Some(addr), None, false, None).await;
+                                            }
+                                            Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                crate::handlers::handle_work_conn_inner(io, nwc, state).await;
+                                            }
+                                            Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                crate::handlers::handle_visitor_conn_inner(io, nvc, state, false).await;
+                                            }
+                                            Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                let visitor_addr = Some(addr.to_string());
+                                                crate::handlers::handle_nat_hole_visitor(io, nhv, state, visitor_addr, false).await;
+                                            }
+                                            Ok(other) => {
+                                                debug!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected TLS first message from {}: {:?}", addr, other.v1_type_byte());
+                                            }
+                                            Err(e) => {
+                                                debug!(addr = %addr, error = %e, "TLS read error from {}: {}", addr, e);
+                                            }
                                         }
                                     }
                                 }
