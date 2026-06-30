@@ -37,6 +37,14 @@ fn tcpmux_proxy(name: &str, domains: Vec<String>, local: &str) -> NewProxy {
         multiplexer: Some("httpconnect".into()),
         virtual_net: None,
                     proxy_protocol_version: None,
+                    #[cfg(feature = "vnet")]
+                    advertise_subnet: None,
+                    #[cfg(feature = "vnet")]
+                    vnet_ip: None,
+                    #[cfg(feature = "vnet")]
+                    vnet_netmask: None,
+                    #[cfg(feature = "vnet")]
+                    vnet_mtu: None,
     }
 }
 
