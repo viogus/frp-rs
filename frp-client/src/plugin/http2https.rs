@@ -52,12 +52,12 @@ pub async fn start_http2https_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
         let tls_connector = match build_tls_connector(None, None, None) {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!("http2https plugin: failed to build TLS connector: {}", e);
+                tracing::error!(error = %e, "http2https plugin: failed to build TLS connector: {}", e);
                 return;
             }
         };
 
-        debug!("http2https plugin listening on {}", local_addr);
+        debug!(local_addr = %local_addr, "http2https plugin listening on {}", local_addr);
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -68,12 +68,12 @@ pub async fn start_http2https_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
                             let connector = tls_connector.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = handle_conn(client, &target, &rewrite, &connector).await {
-                                    debug!("http2https: {peer} error: {e}");
+                                    debug!(peer = %peer, error = %e, "http2https: {peer} error: {e}");
                                 }
                             });
                         }
                         Err(e) => {
-                            warn!("http2https plugin accept error: {e}");
+                            warn!(error = %e, "http2https plugin accept error: {e}");
                             break;
                         }
                     }

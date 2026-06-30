@@ -20,7 +20,7 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
         ));
     };
 
-    debug!("unix_domain_socket plugin: connecting to {}", path);
+    debug!(path = %path, "unix_domain_socket plugin: connecting to {}", path);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
         frp_core::Error::Transport(format!("unix_domain_socket plugin: bind: {e}"))
@@ -33,7 +33,7 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
     let path_clone = path.clone();
 
     let task = tokio::spawn(async move {
-        debug!("unix_domain_socket plugin listening on {}", local_addr);
+        debug!(local_addr = %local_addr, "unix_domain_socket plugin listening on {}", local_addr);
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
@@ -43,7 +43,7 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
                 result = listener.accept() => {
                     match result {
                         Ok((mut tcp_stream, peer)) => {
-                            debug!("unix_domain_socket plugin: new connection from {}", peer);
+                            debug!(peer = %peer, "unix_domain_socket plugin: new connection from {}", peer);
                             let path = path_clone.clone();
                             tokio::spawn(async move {
                                 match UnixStream::connect(&path).await {
@@ -55,6 +55,7 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
                                     }
                                     Err(e) => {
                                         tracing::warn!(
+                                            path = %path, error = %e,
                                             "unix_domain_socket plugin: connect to {} failed: {}",
                                             path, e
                                         );
@@ -63,7 +64,7 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
                             });
                         }
                         Err(e) => {
-                            tracing::warn!("unix_domain_socket plugin: accept error: {}", e);
+                            tracing::warn!(error = %e, "unix_domain_socket plugin: accept error: {}", e);
                             break;
                         }
                     }

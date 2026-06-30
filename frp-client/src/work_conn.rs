@@ -183,27 +183,27 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
         let mut work = if let Some(ref quic) = quic_conn {
             match quic.open_bi().await {
                 Ok(stream) => {
-                    debug!("Work conn {} opened QUIC stream", label);
+                    debug!(label = %label, "Work conn {} opened QUIC stream", label);
                     IoStream::Quic(stream)
                 }
                 Err(e) => {
-                    warn!("Work conn {}: QUIC open_bi failed: {}", label, e);
+                    warn!(label = %label, error = %e, "Work conn {}: QUIC open_bi failed: {}", label, e);
                     return;
                 }
             }
         } else if let Some(ref yamux) = yamux {
             match yamux.open_stream().await {
                 Some(stream) => {
-                    debug!("Work conn {} opened yamux stream", label);
+                    debug!(label = %label, "Work conn {} opened yamux stream", label);
                     IoStream::Yamux(stream)
                 }
                 None => {
-                    warn!("Work conn {}: yamux open stream failed, session closed?", label);
+                    warn!(label = %label, "Work conn {}: yamux open stream failed, session closed?", label);
                     return;
                 }
             }
         } else {
-            debug!("Work conn {} dialing server", label);
+            debug!(label = %label, "Work conn {} dialing server", label);
             let opts = DialOptions {
                 server_addr: server_addr.clone(),
                 server_port,
@@ -220,7 +220,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             match dial_server(&opts).await {
                 Ok(io) => io,
                 Err(e) => {
-                    debug!("Work conn {} dial failed: {}", label, e);
+                    debug!(label = %label, error = %e, "Work conn {} dial failed: {}", label, e);
                     return;
                 }
             }
@@ -230,16 +230,16 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
         let mut work = if let Some(ref yamux) = yamux {
             match yamux.open_stream().await {
                 Some(stream) => {
-                    debug!("Work conn {} opened yamux stream", label);
+                    debug!(label = %label, "Work conn {} opened yamux stream", label);
                     IoStream::Yamux(stream)
                 }
                 None => {
-                    warn!("Work conn {}: yamux open stream failed, session closed?", label);
+                    warn!(label = %label, "Work conn {}: yamux open stream failed, session closed?", label);
                     return;
                 }
             }
         } else {
-            debug!("Work conn {} dialing server", label);
+            debug!(label = %label, "Work conn {} dialing server", label);
             let opts = DialOptions {
                 server_addr: server_addr.clone(),
                 server_port,
@@ -256,7 +256,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             match dial_server(&opts).await {
                 Ok(io) => io,
                 Err(e) => {
-                    debug!("Work conn {} dial failed: {}", label, e);
+                    debug!(label = %label, error = %e, "Work conn {} dial failed: {}", label, e);
                     return;
                 }
             }
@@ -275,7 +275,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             if requires_auth {
                 if let Some(ref oidc) = oidc_client {
                     if let Err(e) = oidc.set_new_work_conn(&mut nwc_msg).await {
-                        warn!("Work conn {} OIDC NewWorkConn auth failed: {}", label, e);
+                        warn!(label = %label, error = %e, "Work conn {} OIDC NewWorkConn auth failed: {}", label, e);
                         return;
                     }
                 } else {
@@ -304,7 +304,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             // calls WriteMagicIfV2 before returning the stream.
             if v2 {
                 if let Err(e) = frp_core::protocol::write_v2_magic(&mut work).await {
-                    warn!("Work conn {} failed to write V2 magic: {}", label, e);
+                    warn!(label = %label, error = %e, "Work conn {} failed to write V2 magic: {}", label, e);
                     return;
                 }
             }
@@ -315,10 +315,10 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                 work.write_v1_frame(&nwc).await
             };
             if let Err(e) = write_result {
-                warn!("Work conn {} failed to send NewWorkConn: {}", label, e);
+                warn!(label = %label, error = %e, "Work conn {} failed to send NewWorkConn: {}", label, e);
                 return;
             }
-            debug!("Work conn {} sent NewWorkConn, waiting for StartWorkConn", label);
+            debug!(label = %label, "Work conn {} sent NewWorkConn, waiting for StartWorkConn", label);
         }
 
         // Read StartWorkConn
@@ -330,7 +330,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
         match swc_result {
             Ok(FrpMessage::StartWorkConn(swc)) => {
                 let proxy_name = &swc.proxy_name;
-                debug!("Work conn {} assigned to proxy '{}'", label, proxy_name);
+                debug!(label = %label, proxy_name = %proxy_name, "Work conn {} assigned to proxy '{}'", label, proxy_name);
 
                 // Look up the proxy runtime info
                 let info = {
@@ -340,7 +340,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                 let info = match info {
                     Some(info) => info,
                     None => {
-                        warn!("Work conn {}: unknown proxy '{}'", label, proxy_name);
+                        warn!(label = %label, proxy_name = %proxy_name, "Work conn {}: unknown proxy '{}'", label, proxy_name);
                         return;
                     }
                 };
@@ -361,10 +361,10 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                             // XTCP notification. No dummy frame follows —
                             // the StartWorkConn payload is immediately
                             // followed by bridge data.
-                            debug!("XTCP work conn {}: STCP fallback for '{}'", label, proxy_name);
+                            debug!(label = %label, proxy_name = %proxy_name, "XTCP work conn {}: STCP fallback for '{}'", label, proxy_name);
                             // Fall through to bridging
                         } else {
-                            debug!("XTCP work conn {}: NatHoleSid in StartWorkConn for '{}'", label, proxy_name);
+                            debug!(label = %label, proxy_name = %proxy_name, "XTCP work conn {}: NatHoleSid in StartWorkConn for '{}'", label, proxy_name);
                             let _ = xtcp_tx.send(XtcpNotification {
                                 sid,
                                 proxy_name: proxy_name.clone(),
@@ -397,7 +397,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                                 match serde_json::from_slice::<msg::NatHoleSid>(&payload) {
                                                     Ok(sid_msg) => {
                                                         if let Some(sid) = sid_msg.sid {
-                                                            debug!("XTCP work conn {}: NatHoleSid (Go frps) for '{}'", label, proxy_name);
+                                                            debug!(label = %label, proxy_name = %proxy_name, "XTCP work conn {}: NatHoleSid (Go frps) for '{}'", label, proxy_name);
                                                             let _ = xtcp_tx.send(XtcpNotification {
                                                                 sid,
                                                                 proxy_name: proxy_name.clone(),
@@ -405,7 +405,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                                             return;
                                                         }
                                                         // sid=None: STCP fallback (Go frps — unlikely)
-                                                        debug!("XTCP work conn {}: NatHoleSid without sid (Go frps STCP fallback)", label);
+                                                        debug!(label = %label, "XTCP work conn {}: NatHoleSid without sid (Go frps STCP fallback)", label);
                                                         // Fall through to bridging — no pre-read needed (NatHoleSid consumed).
                                                     }
                                                     _ => {
@@ -459,7 +459,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                         if let Ok(sid_msg) = serde_json::from_slice::<msg::NatHoleSid>(&payload[2..]) {
                                             if let Some(sid) = sid_msg.sid {
                                                 if !sid.is_empty() {
-                                                    debug!("XTCP work conn {}: NatHoleSid (V2) for '{}'", label, proxy_name);
+                                                    debug!(label = %label, proxy_name = %proxy_name, "XTCP work conn {}: NatHoleSid (V2) for '{}'", label, proxy_name);
                                                     let _ = xtcp_tx.send(XtcpNotification {
                                                         sid,
                                                         proxy_name: proxy_name.clone(),
@@ -503,7 +503,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     let sock = match sock {
                         Some(s) => s,
                         None => {
-                            warn!("Work conn {}: no UDP socket for proxy '{}'", label, proxy_name);
+                            warn!(label = %label, proxy_name = %proxy_name, "Work conn {}: no UDP socket for proxy '{}'", label, proxy_name);
                             return;
                         }
                     };
@@ -513,7 +513,8 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     };
                     let (use_enc, use_comp) = enc_cfg;
 
-                    info!("Work conn {} bridging UDP for '{}' (enc={}, comp={})",
+                    info!(label = %label, proxy_name = %proxy_name, use_enc = %use_enc, use_comp = %use_comp,
+                        "Work conn {} bridging UDP for '{}' (enc={}, comp={})",
                         label, proxy_name, use_enc, use_comp);
 
                     let (mut w_r, mut w_w) = work.into_split();
@@ -531,7 +532,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     let enc_key_r = enc_key;
                     let last_remote_r = last_remote.clone();
                     tokio::spawn(async move {
-                        debug!("UDP reader '{}' started", pn_r);
+                        debug!(proxy_name = %pn_r, "UDP reader '{}' started", pn_r);
                         loop {
                             let result = if v2 {
                                 read_msg_v2(&mut w_r).await
@@ -556,18 +557,18 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                             payload = d;
                                         }
                                     }
-                                    debug!("UDP reader '{}': forwarding {} bytes to local", pn_r, n);
+                                    debug!(proxy_name = %pn_r, byte_count = n, "UDP reader '{}': forwarding {} bytes to local", pn_r, n);
                                     if let Err(e) = sock_r.send(&payload).await {
-                                        debug!("UDP '{}' send to local failed: {}", pn_r, e);
+                                        debug!(proxy_name = %pn_r, error = %e, "UDP '{}' send to local failed: {}", pn_r, e);
                                         break;
                                     }
                                 }
                                 Ok(FrpMessage::Ping(_)) | Ok(FrpMessage::Pong(_)) => continue,
                                 Ok(other) => {
-                                    debug!("UDP work conn '{}': unexpected msg 0x{:02x}", pn_r, other.v1_type_byte());
+                                    debug!(proxy_name = %pn_r, v1_type = ?other.v1_type_byte(), "UDP work conn '{}': unexpected msg 0x{:02x}", pn_r, other.v1_type_byte());
                                 }
                                 Err(e) => {
-                                    debug!("UDP work conn '{}' read closed: {}", pn_r, e);
+                                    debug!(proxy_name = %pn_r, error = %e, "UDP work conn '{}' read closed: {}", pn_r, e);
                                     break;
                                 }
                             }
@@ -580,12 +581,12 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     let local_addr_str = info.local_addr.clone();
                     let last_remote_w = last_remote.clone();
                     tokio::spawn(async move {
-                        debug!("UDP writer '{}' started", pn_w);
+                        debug!(proxy_name = %pn_w, "UDP writer '{}' started", pn_w);
                         let mut buf = vec![0u8; 65535];
                         loop {
                             match sock.recv_from(&mut buf).await {
                                 Ok((n, src)) => {
-                                    debug!("UDP writer '{}': recv'd {} bytes from local {}", pn_w, n, src);
+                                    debug!(proxy_name = %pn_w, byte_count = n, src_addr = %src, "UDP writer '{}': recv'd {} bytes from local {}", pn_w, n, src);
                                     let mut payload = buf[..n].to_vec();
                                     if use_comp {
                                         if let Ok(c) = encryption::compress(&payload) { payload = c; }
@@ -606,13 +607,13 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                         write_msg_v1(&mut w_w, &pkt).await
                                     };
                                     if let Err(e) = write_result {
-                                        debug!("UDP '{}' send to work conn failed: {}", pn_w, e);
+                                        debug!(proxy_name = %pn_w, error = %e, "UDP '{}' send to work conn failed: {}", pn_w, e);
                                         break;
                                     }
-                                    debug!("UDP writer '{}': sent {} bytes to work conn", pn_w, n);
+                                    debug!(proxy_name = %pn_w, byte_count = n, "UDP writer '{}': sent {} bytes to work conn", pn_w, n);
                                 }
                                 Err(e) => {
-                                    debug!("UDP '{}' recv from local failed: {}", pn_w, e);
+                                    debug!(proxy_name = %pn_w, error = %e, "UDP '{}' recv from local failed: {}", pn_w, e);
                                     break;
                                 }
                             }
@@ -634,7 +635,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                             swc.dst_port.unwrap_or(0),
                                         );
                                         if let Err(e) = local.write_all(header.as_bytes()).await {
-                                            warn!("Failed to write PROXY v1 header: {}", e);
+                                            warn!(error = %e, "Failed to write PROXY v1 header: {}", e);
                                         }
                                     } else if info.proxy_protocol_version == "v2" {
                                         if let Err(e) = write_proxy_protocol_v2(
@@ -643,7 +644,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                             swc.src_port.unwrap_or(0) as u16,
                                             swc.dst_port.unwrap_or(0) as u16,
                                         ).await {
-                                            warn!("Failed to write PROXY v2 header: {}", e);
+                                            warn!(error = %e, "Failed to write PROXY v2 header: {}", e);
                                         }
                                     }
                                 }
@@ -659,20 +660,20 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                             proxy::bridge_streams(local, work, proxy_name, use_enc, use_comp, enc, info.bandwidth_limit, &info.bandwidth_limit_mode, proxy_metrics).await;
                         }
                         Err(e) => {
-                            warn!("Work conn {}: failed to connect to local {}: {}", label, info.local_addr, e);
+                            warn!(label = %label, local_addr = %info.local_addr, error = %e, "Work conn {}: failed to connect to local {}: {}", label, info.local_addr, e);
                         }
                     }
                 }
             }
             Ok(other) => {
-                warn!("Work conn {}: unexpected message: {:?}", label, other.v1_type_byte());
+                warn!(label = %label, v1_type = ?other.v1_type_byte(), "Work conn {}: unexpected message: {:?}", label, other.v1_type_byte());
             }
             Err(e) => {
-                debug!("Work conn {}: read error: {}", label, e);
+                debug!(label = %label, error = %e, "Work conn {}: read error: {}", label, e);
             }
         }
 
-        debug!("Work conn {} completed", label);
+        debug!(label = %label, "Work conn {} completed", label);
 
         // Replenish pool: spawn replacement to maintain pool_count
         // (Go frp v0.69.1 compat — idle work conns refilled after use)

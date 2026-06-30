@@ -25,7 +25,7 @@ pub async fn start_http_proxy(cfg: &PluginConfig) -> Result<PluginHandle, frp_co
     let auth = HttpProxyAuth::from_config(cfg);
 
     let task = tokio::spawn(async move {
-        debug!("http_proxy plugin listening on {}", local_addr);
+        debug!(local_addr = %local_addr, "http_proxy plugin listening on {}", local_addr);
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -34,12 +34,12 @@ pub async fn start_http_proxy(cfg: &PluginConfig) -> Result<PluginHandle, frp_co
                             let auth = auth.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = handle_http_proxy_conn(stream, auth).await {
-                                    debug!("http_proxy: {peer} error: {e}");
+                                    debug!(peer = %peer, error = %e, "http_proxy: {peer} error: {e}");
                                 }
                             });
                         }
                         Err(e) => {
-                            warn!("http_proxy plugin accept error: {e}");
+                            warn!(error = %e, "http_proxy plugin accept error: {e}");
                             break;
                         }
                     }

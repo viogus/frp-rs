@@ -30,7 +30,7 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
         ));
     };
 
-    debug!("tls2raw plugin: target TLS service at {}", target_addr);
+    debug!(target_addr = %target_addr, "tls2raw plugin: target TLS service at {}", target_addr);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
         frp_core::Error::Transport(format!("tls2raw plugin: bind: {e}"))
@@ -47,12 +47,12 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
         let tls_connector = match build_tls_connector(None, None, None) {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!("tls2raw plugin: failed to build TLS connector: {}", e);
+                tracing::error!(error = %e, "tls2raw plugin: failed to build TLS connector: {}", e);
                 return;
             }
         };
 
-        debug!("tls2raw plugin listening on {}", local_addr);
+        debug!(local_addr = %local_addr, "tls2raw plugin listening on {}", local_addr);
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
@@ -62,7 +62,7 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
                 result = listener.accept() => {
                     match result {
                         Ok((tunnel_stream, peer)) => {
-                            debug!("tls2raw plugin: new tunnel connection from {}", peer);
+                            debug!(peer = %peer, "tls2raw plugin: new tunnel connection from {}", peer);
                             let target = target_addr_clone.clone();
                             let connector = tls_connector.clone();
                             tokio::spawn(async move {
@@ -76,6 +76,7 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
                                     Ok(n) => n,
                                     Err(e) => {
                                         tracing::warn!(
+                                            target = %target, error = ?e,
                                             "tls2raw plugin: invalid hostname '{}': {:?}",
                                             target, e
                                         );
@@ -97,6 +98,7 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
                                             }
                                             Err(e) => {
                                                 tracing::warn!(
+                                                    target = %target, error = %e,
                                                     "tls2raw plugin: TLS connect to {} failed: {}",
                                                     target, e
                                                 );
@@ -105,6 +107,7 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
                                     }
                                     Err(e) => {
                                         tracing::warn!(
+                                            target = %target, error = %e,
                                             "tls2raw plugin: TCP connect to {} failed: {}",
                                             target, e
                                         );
@@ -113,7 +116,7 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
                             });
                         }
                         Err(e) => {
-                            tracing::warn!("tls2raw plugin: accept error: {}", e);
+                            tracing::warn!(error = %e, "tls2raw plugin: accept error: {}", e);
                             break;
                         }
                     }

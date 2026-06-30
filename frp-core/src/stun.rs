@@ -42,7 +42,7 @@ pub async fn stun_binding(stun_addr: &str) -> Result<String, String> {
         .send_to(&request, addr)
         .await
         .map_err(|e| format!("STUN send: {e}"))?;
-    debug!("STUN Binding Request sent to {}", addr);
+    debug!(addr = %addr, "STUN Binding Request sent to {}", addr);
 
     let mut buf = [0u8; 256];
     let (n, _src) = tokio::time::timeout(
@@ -105,7 +105,7 @@ pub fn parse_binding_response(data: &[u8], expected_tx_id: &[u8; 12]) -> Result<
         match attr_type {
             ATTR_XOR_MAPPED_ADDRESS => {
                 if let Some(addr) = parse_xor_mapped_address(value, MAGIC_COOKIE) {
-                    debug!("STUN XOR-MAPPED-ADDRESS: {}", addr);
+                    debug!(addr = %addr, "STUN XOR-MAPPED-ADDRESS: {}", addr);
                     return Ok(addr);
                 }
             }

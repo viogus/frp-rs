@@ -25,7 +25,7 @@ async fn write_resp(
     v2: bool,
 ) {
     if let Err(e) = write_msg(writer, msg, v2).await {
-        warn!("Failed to write response: {e}");
+        warn!(error = %e, "Failed to write response: {e}");
     }
 }
 
@@ -94,7 +94,7 @@ pub(crate) async fn handle_new_proxy(
     // When sudp_port is configured, force all SUDP proxies to use that port
     let remote_port = if is_sudp && state.sudp_port > 0 {
         if remote_port > 0 && remote_port != state.sudp_port {
-            info!("SUDP proxy '{}': overriding remote_port {} → {} (sudp_port config)",
+            info!(proxy_name = %np.proxy_name, remote_port = %remote_port, sudp_port = %state.sudp_port, "SUDP proxy '{}': overriding remote_port {} → {} (sudp_port config)",
                 np.proxy_name, remote_port, state.sudp_port);
         }
         state.sudp_port
@@ -160,7 +160,7 @@ pub(crate) async fn handle_new_proxy(
                             format!("{}:{}", vn, sk)
                         };
                         state.sk_index.write().await.insert(sk_key, np.proxy_name.clone());
-                        info!("STCP/XTCP proxy '{}' registered with sk{}",
+                        info!(proxy_name = %np.proxy_name, vn = %vn, "STCP/XTCP proxy '{}' registered with sk{}",
                             np.proxy_name,
                             if vn.is_empty() { String::new() } else { format!(" (virtual_net: {vn})") });
                     }
@@ -177,7 +177,7 @@ pub(crate) async fn handle_new_proxy(
                         let sub_host = &state.sub_domain_host;
                         if !sub_host.is_empty() {
                             let full_domain = format!("{}.{}", subdomain, sub_host);
-                            info!("Subdomain route: {} → {}", full_domain, np.proxy_name);
+                            info!(full_domain = %full_domain, proxy_name = %np.proxy_name, "Subdomain route: {} → {}", full_domain, np.proxy_name);
                             if !domains.contains(&full_domain) {
                                 domains.push(full_domain);
                             }
@@ -207,7 +207,7 @@ pub(crate) async fn handle_new_proxy(
                     http_user,
                     http_pwd,
                 ).await;
-                info!("VHost routes registered for '{}': domains={:?}, locations={:?}, rewrite={:?}",
+                info!(proxy_name = %np.proxy_name, domains = ?domains, locations = ?locations, hhr = ?hhr, "VHost routes registered for '{}': domains={:?}, locations={:?}, rewrite={:?}",
                     np.proxy_name, domains, locations, hhr);
             }
 
@@ -231,7 +231,7 @@ pub(crate) async fn handle_new_proxy(
                 }
 
                 if domains.is_empty() {
-                    warn!("HTTPS proxy '{}' has no custom_domains — SNI routing won't work", np.proxy_name);
+                    warn!(proxy_name = %np.proxy_name, "HTTPS proxy '{}' has no custom_domains — SNI routing won't work", np.proxy_name);
                 }
 
                 let hhr = np.host_header_rewrite.as_deref().unwrap_or("");
@@ -247,7 +247,7 @@ pub(crate) async fn handle_new_proxy(
                     http_pwd,
                 ).await;
                 info!(
-                    "VHost SNI routes registered for HTTPS proxy '{}': domains={:?}",
+                    proxy_name = %np.proxy_name, domains = ?domains, "VHost SNI routes registered for HTTPS proxy '{}': domains={:?}",
                     np.proxy_name, domains
                 );
             }
@@ -277,7 +277,7 @@ pub(crate) async fn handle_new_proxy(
                     http_pwd,
                 ).await;
                 info!(
-                    "TCPMux routes registered for '{}': domains={:?}",
+                    proxy_name = %np.proxy_name, domains = ?domains, "TCPMux routes registered for '{}': domains={:?}",
                     np.proxy_name, domains
                 );
             }
@@ -312,11 +312,11 @@ pub(crate) async fn handle_new_proxy(
                         });
                         match found {
                             Some(sock) => {
-                                info!("SUDP proxy '{}' sharing port {} (reusing existing socket)", np.proxy_name, port);
+                                info!(proxy_name = %np.proxy_name, port = %port, "SUDP proxy '{}' sharing port {} (reusing existing socket)", np.proxy_name, port);
                                 sock
                             }
                             None => {
-                                tracing::error!("SUDP port {} bind failed (no existing socket to share): {}", port, e);
+                                tracing::error!(port = %port, error = %e, "SUDP port {} bind failed (no existing socket to share): {}", port, e);
                                 state.proxy_manager.remove(&np.proxy_name).await;
                                 let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
                                     proxy_name: np.proxy_name.clone(),
@@ -329,7 +329,7 @@ pub(crate) async fn handle_new_proxy(
                         }
                     }
                     Err(e) => {
-                        tracing::error!("Failed to bind UDP port {}: {}", port, e);
+                        tracing::error!(port = %port, error = %e, "Failed to bind UDP port {}: {}", port, e);
                         state.used_ports.write().await.remove(&port);
                         state.proxy_manager.remove(&np.proxy_name).await;
                         let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
@@ -367,9 +367,9 @@ pub(crate) async fn handle_new_proxy(
                         let _ = itx_clone.send(InternalMsg::UdpNeedsWorkConn { proxy_name: pn_clone });
                     });
                 }
-                info!("{} proxy '{}' listening on port {}", if is_sudp { "SUDP" } else { "UDP" }, np.proxy_name, port);
+                info!(is_sudp = %is_sudp, proxy_name = %np.proxy_name, port = %port, "{} proxy '{}' listening on port {}", if is_sudp { "SUDP" } else { "UDP" }, np.proxy_name, port);
             } else if is_nat_hole {
-                info!("{} proxy '{}' registered (no listener, NAT hole punch)", np.proxy_type, np.proxy_name);
+                info!(proxy_type = %np.proxy_type, proxy_name = %np.proxy_name, "{} proxy '{}' registered (no listener, NAT hole punch)", np.proxy_type, np.proxy_name);
             } else {
                 let handle = tokio::spawn(async move {
                     listen_and_proxy(bind_addr, port, pn, itx).await;
@@ -377,7 +377,7 @@ pub(crate) async fn handle_new_proxy(
                 listener_handles.insert(np.proxy_name.clone(), handle);
             }
 
-            info!("Proxy '{}' registered on port {} (run_id: {})", np.proxy_name, port, run_id);
+            info!(proxy_name = %np.proxy_name, port = %port, run_id = %run_id, "Proxy '{}' registered on port {} (run_id: {})", np.proxy_name, port, run_id);
 
             let remote_addr_str = format!(":{}", port);
             let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
@@ -396,7 +396,7 @@ pub(crate) async fn handle_new_proxy(
             }
         }
         None => {
-            warn!("No available port for proxy '{}'", np.proxy_name);
+            warn!(proxy_name = %np.proxy_name, "No available port for proxy '{}'", np.proxy_name);
             let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
                 proxy_name: np.proxy_name.clone(),
                 remote_addr: None,
@@ -417,11 +417,11 @@ pub(crate) async fn listen_and_proxy(
     let addr = format_socket_addr(&bind_addr, port);
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => {
-            info!("Proxy listener started on {} for '{}'", addr, proxy_name);
+            info!(addr = %addr, proxy_name = %proxy_name, "Proxy listener started on {} for '{}'", addr, proxy_name);
             l
         }
         Err(e) => {
-            tracing::error!("Failed to bind proxy port {}: {}", port, e);
+            tracing::error!(port = %port, error = %e, "Failed to bind proxy port {}: {}", port, e);
             return;
         }
     };
@@ -434,12 +434,12 @@ pub(crate) async fn listen_and_proxy(
                     user_conn: IoStream::Tcp(user_conn),
                     pre_read: vec![],
                 }).is_err() {
-                    warn!("Control handler gone, stopping proxy listener for '{}'", proxy_name);
+                    warn!(proxy_name = %proxy_name, "Control handler gone, stopping proxy listener for '{}'", proxy_name);
                     break;
                 }
             }
             Err(e) => {
-                tracing::error!("Accept error on proxy port {}: {}", port, e);
+                tracing::error!(port = %port, error = %e, "Accept error on proxy port {}: {}", port, e);
                 break;
             }
         }

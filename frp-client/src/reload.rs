@@ -102,7 +102,7 @@ pub(crate) async fn do_reload(
         write_msg(&mut *w, &close, v2).await
             .map_err(|e| format!("send CloseProxy for '{name}': {e}"))?;
         changes.push(format!("proxy '{name}' removed"));
-        tracing::info!("Reload: sent CloseProxy for '{name}'");
+        tracing::info!(name = %name, "Reload: sent CloseProxy for '{name}'");
     }
 
     // Send CloseProxy + NewProxy for changed proxies
@@ -110,6 +110,7 @@ pub(crate) async fn do_reload(
         if let Some(p) = new_cfg.proxies.iter().find(|p| &p.name == name) {
             if p.plugin.is_some() {
                 tracing::warn!(
+                    name = %name,
                     "Reload: proxy '{name}' has a plugin — plugin restart requires full frpc restart"
                 );
             }
@@ -123,7 +124,7 @@ pub(crate) async fn do_reload(
             write_msg(&mut *w, &np, v2).await
                 .map_err(|e| format!("send NewProxy for changed '{name}': {e}"))?;
             changes.push(format!("proxy '{name}' updated"));
-            tracing::info!("Reload: sent CloseProxy+NewProxy for changed '{name}'");
+            tracing::info!(name = %name, "Reload: sent CloseProxy+NewProxy for changed '{name}'");
         }
     }
 
@@ -133,6 +134,7 @@ pub(crate) async fn do_reload(
         if let Some(p) = new_cfg.proxies.iter().find(|p| &p.name == name) {
             if p.plugin.is_some() {
                 tracing::warn!(
+                    name = %name,
                     "Reload: proxy '{name}' has a plugin — plugin restart requires full frpc restart"
                 );
             }
@@ -141,7 +143,7 @@ pub(crate) async fn do_reload(
             write_msg(&mut *w, &np, v2).await
                 .map_err(|e| format!("send NewProxy for '{name}': {e}"))?;
             changes.push(format!("proxy '{name}' added"));
-            tracing::info!("Reload: sent NewProxy for '{name}'");
+            tracing::info!(name = %name, "Reload: sent NewProxy for '{name}'");
         }
     }
     drop(w);
@@ -180,6 +182,6 @@ pub(crate) async fn do_reload(
     }
 
     let summary = changes.join("; ");
-    tracing::info!("Config reload summary: {}", summary);
+    tracing::info!(summary = %summary, "Config reload summary: {}", summary);
     Ok(format!("reload success: {summary}"))
 }

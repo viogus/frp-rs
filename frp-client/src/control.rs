@@ -167,6 +167,7 @@ impl ControlConnection {
                         }
                         other => {
                             warn!(
+                                transport = ?std::mem::discriminant(&other),
                                 "Unexpected transport {:?} for mux proposal — yamux not applied",
                                 std::mem::discriminant(&other)
                             );
@@ -202,6 +203,7 @@ impl ControlConnection {
                     }
                     other => {
                         warn!(
+                            transport = ?std::mem::discriminant(&other),
                             "Unexpected transport {:?} for mux proposal — yamux not applied",
                             std::mem::discriminant(&other)
                         );
@@ -320,7 +322,7 @@ impl ControlConnection {
                 }
                 self.run_id = resp.run_id.clone().unwrap_or_default();
                 self.server_auth_scopes = resp.server_additional_auth_scopes.unwrap_or_default();
-                info!("Logged in. run_id: {}", self.run_id);
+                info!(run_id = %self.run_id, "Logged in. run_id: {}", self.run_id);
                 #[cfg(feature = "quic")]
                 {
                     Ok((io_stream, self.run_id.clone(), yamux_session, quic_conn))
@@ -342,15 +344,16 @@ impl ControlConnection {
         stream: &mut IoStream,
     ) -> Result<msg::NewProxyResp, frp_core::Error> {
         let np = proxy::create_new_proxy_msg(p, local_addr);
-        debug!("NewProxy JSON: {}", serde_json::to_string(&np).unwrap_or_default());
-        info!("Registering proxy '{}' type={} remote_port={} local={}",
+        debug!(json = %serde_json::to_string(&np).unwrap_or_default(), "NewProxy JSON: {}", serde_json::to_string(&np).unwrap_or_default());
+        info!(name = %p.name, proxy_type = %p.proxy_type, remote_port = %p.remote_port, local_addr = %local_addr,
+            "Registering proxy '{}' type={} remote_port={} local={}",
             p.name, p.proxy_type, p.remote_port, local_addr);
         if self.v2 {
             stream.write_v2_frame(&np).await?;
         } else {
             stream.write_v1_frame(&np).await?;
         }
-        info!("NewProxy sent for '{}', waiting for response...", p.name);
+        info!(name = %p.name, "NewProxy sent for '{}', waiting for response...", p.name);
         loop {
             let resp_msg = if self.v2 {
                 stream.read_v2_frame().await?
@@ -364,7 +367,7 @@ impl ControlConnection {
                             "Proxy '{}' registration failed: {err}", p.name
                         )));
                     }
-                    info!("Proxy '{}' registered on remote port {:?}", p.name, resp.remote_addr);
+                    info!(name = %p.name, remote_addr = ?resp.remote_addr, "Proxy '{}' registered on remote port {:?}", p.name, resp.remote_addr);
                     return Ok(resp);
                 }
                 FrpMessage::ReqWorkConn(_) => {
@@ -372,7 +375,7 @@ impl ControlConnection {
                     continue;
                 }
                 other => {
-                    warn!("Unexpected message during NewProxy registration for '{}': {:?}", p.name, other);
+                    warn!(proxy_name = %p.name, message = ?other, "Unexpected message during NewProxy registration for '{}': {:?}", p.name, other);
                     continue;
                 }
             }
@@ -392,9 +395,9 @@ impl ControlConnection {
             &v.server_name, &v.secret_key,
             v.use_encryption, v.use_compression,
         );
-        debug!("NewVisitorConn for '{}': {}", v.server_name,
+        debug!(server_name = %v.server_name, json = %serde_json::to_string(&nvc).unwrap_or_default(), "NewVisitorConn for '{}': {}", v.server_name,
             serde_json::to_string(&nvc).unwrap_or_default());
-        info!("Registering visitor '{}' for proxy '{}'", v.name, v.server_name);
+        info!(visitor_name = %v.name, proxy_name = %v.server_name, "Registering visitor '{}' for proxy '{}'", v.name, v.server_name);
         if self.v2 {
             stream.write_v2_frame(&nvc).await?;
         } else {
@@ -413,20 +416,20 @@ impl ControlConnection {
                             "Visitor '{}' registration failed: {err}", v.name
                         )));
                     }
-                    info!("Visitor '{}' registered for proxy '{}'", v.name, v.server_name);
+                    info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}'", v.name, v.server_name);
                     return Ok(resp);
                 }
                 FrpMessage::ReqWorkConn(_) => {
                     // Go frps v0.69.1 responds to NewVisitorConn with ReqWorkConn
                     // instead of NewVisitorConnResp. Treat as success.
-                    info!("Visitor '{}' registered (Go frps compat: ReqWorkConn after NewVisitorConn)", v.name);
+                    info!(visitor_name = %v.name, "Visitor '{}' registered (Go frps compat: ReqWorkConn after NewVisitorConn)", v.name);
                     return Ok(msg::NewVisitorConnResp {
                         proxy_name: v.server_name.clone(),
                         error: None,
                     });
                 }
                 other => {
-                    warn!("Unexpected message during NewVisitorConn registration for '{}': {:?}", v.name, other);
+                    warn!(visitor_name = %v.name, message = ?other, "Unexpected message during NewVisitorConn registration for '{}': {:?}", v.name, other);
                     continue;
                 }
             }

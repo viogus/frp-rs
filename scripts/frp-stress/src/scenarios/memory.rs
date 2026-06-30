@@ -12,18 +12,20 @@ pub async fn run(cli: &Cli) -> Result<()> {
     );
     let mut streams = Vec::new();
 
-    tracing::info!("Phase 1: Ramping up to {} connections", cli.concurrency);
+    tracing::info!(concurrency = %cli.concurrency, "Phase 1: Ramping up to {} connections", cli.concurrency);
     for i in 0..cli.concurrency {
         let stream = TcpStream::connect(&target)
             .await
             .with_context(|| format!("connect {} failed at conn {}", target, i))?;
         streams.push(stream);
         if i > 0 && i % 100 == 0 {
-            tracing::info!("  {} connections established", i);
+            tracing::info!(count = %i, "  {} connections established", i);
         }
     }
 
     tracing::info!(
+        concurrency = %cli.concurrency,
+        duration = %cli.duration,
         "Phase 2: Holding {} connections for {}s",
         cli.concurrency,
         cli.duration
@@ -35,7 +37,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
         tokio::select! {
             _ = tick.tick() => {
                 let elapsed = (tokio::time::Instant::now() - deadline + Duration::from_secs(cli.duration)).as_secs();
-                tracing::info!("  memory scenario: {} connections alive, elapsed {}s",
+                tracing::info!(connections = %streams.len(), elapsed = %elapsed, "  memory scenario: {} connections alive, elapsed {}s",
                     streams.len(), elapsed);
             }
             _ = tokio::time::sleep_until(deadline) => break,

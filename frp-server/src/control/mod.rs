@@ -76,18 +76,18 @@ pub async fn handle_control<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    info!("New control connection from {:?}", peer);
+    info!(peer = ?peer, "New control connection from {:?}", peer);
 
     // --- Authenticate ---
     let oidc_subject: Option<String> = if let Some(ref verifier) = state.oidc_verifier {
         let token = login.privilege_key.as_deref().unwrap_or("");
         match verifier.verify_login(token).await {
             Ok(oidc_token) => {
-                info!("OIDC login verified: subject={}", oidc_token.subject);
+                info!(subject = %oidc_token.subject, "OIDC login verified: subject={}", oidc_token.subject);
                 Some(oidc_token.subject)
             }
             Err(e) => {
-                warn!("OIDC auth failed for {:?}: {}", peer, e);
+                warn!(peer = ?peer, error = %e, "OIDC auth failed for {:?}: {}", peer, e);
                 let (_, mut writer) = tokio::io::split(stream);
                 let resp = FrpMessage::LoginResp(msg::LoginResp {
                     version: Some(frp_core::VERSION.into()),
@@ -105,7 +105,7 @@ pub async fn handle_control<S>(
             login.privilege_key.as_deref(),
             login.timestamp,
         ) {
-            warn!("Authentication failed for {:?}: {}", peer, e);
+            warn!(peer = ?peer, error = %e, "Authentication failed for {:?}: {}", peer, e);
             let (_, mut writer) = tokio::io::split(stream);
             let resp = FrpMessage::LoginResp(msg::LoginResp {
                 version: Some(frp_core::VERSION.into()),
@@ -121,7 +121,7 @@ pub async fn handle_control<S>(
 
     let run_id = login.run_id.clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    info!("Client {:?} logged in with run_id: {}", peer, run_id);
+    info!(peer = ?peer, run_id = %run_id, "Client {:?} logged in with run_id: {}", peer, run_id);
 
     // Store OIDC subject for ping/NWC verification
     if let Some(ref sub) = oidc_subject {
@@ -139,7 +139,7 @@ pub async fn handle_control<S>(
         "metas": login.metas,
     });
     if let Err(reason) = state.plugin_manager.notify("login", login_content).await {
-        warn!("Login for run_id {} rejected by server plugin: {}", run_id, reason);
+        warn!(run_id = %run_id, reason = %reason, "Login for run_id {} rejected by server plugin: {}", run_id, reason);
         let (_, mut writer) = tokio::io::split(stream);
         let resp = FrpMessage::LoginResp(msg::LoginResp {
             version: Some(frp_core::VERSION.into()),
@@ -159,7 +159,7 @@ pub async fn handle_control<S>(
     {
         let mut map = state.run_id_to_ctl_tx.write().await;
         if let Some(old_ctl) = map.get(&run_id) {
-            warn!("Duplicate run_id {}: shutting down old control handler", run_id);
+            warn!(run_id = %run_id, "Duplicate run_id {}: shutting down old control handler", run_id);
             let _ = old_ctl.tx.send(InternalMsg::Shutdown);
         }
         map.insert(run_id.clone(), ControlTx {
@@ -179,7 +179,7 @@ pub async fn handle_control<S>(
             server_additional_auth_scopes: if additional_auth_scopes.is_empty() { None } else { Some(additional_auth_scopes) },
         });
         if let Err(e) = write_ctl_msg(&mut stream, &resp, v2).await {
-            warn!("Failed to send login response to {:?}: {}", peer, e);
+            warn!(peer = ?peer, error = %e, "Failed to send login response to {:?}: {}", peer, e);
             proxy_ops::unregister_control(&state, &run_id).await;
             return;
         }
@@ -210,14 +210,14 @@ pub async fn handle_control<S>(
                         (Box::new(r), Box::new(w))
                     }
                     Err(e) => {
-                        warn!("Failed to create AEAD stream for {:?}: {}", peer, e);
+                        warn!(peer = ?peer, error = %e, "Failed to create AEAD stream for {:?}: {}", peer, e);
                         proxy_ops::unregister_control(&state, &run_id).await;
                         return;
                     }
                 }
             }
             Err(e) => {
-                warn!("Failed to derive AEAD keys for {:?}: {}", peer, e);
+                warn!(peer = ?peer, error = %e, "Failed to derive AEAD keys for {:?}: {}", peer, e);
                 proxy_ops::unregister_control(&state, &run_id).await;
                 return;
             }
@@ -250,7 +250,7 @@ pub async fn handle_control<S>(
         while let Some(req) = pending_requests.front() {
             if req.created_at.elapsed() > PENDING_REQUEST_TIMEOUT {
                 let expired = pending_requests.pop_front().unwrap();
-                debug!("Pending request for proxy '{}' timed out after {:?}", expired.proxy_name, PENDING_REQUEST_TIMEOUT);
+                debug!(proxy_name = %expired.proxy_name, timeout = ?PENDING_REQUEST_TIMEOUT, "Pending request for proxy '{}' timed out after {:?}", expired.proxy_name, PENDING_REQUEST_TIMEOUT);
             } else {
                 break;
             }
@@ -259,7 +259,7 @@ pub async fn handle_control<S>(
         // Heartbeat check: if no ping in heartbeat_timeout, disconnect
         let hb_timeout = Duration::from_secs(state.heartbeat_timeout.max(1) as u64);
         if last_ping.elapsed() > hb_timeout {
-            warn!("Heartbeat timeout for {:?} (no ping in {:?}), disconnecting", peer, hb_timeout);
+            warn!(peer = ?peer, hb_timeout = ?hb_timeout, "Heartbeat timeout for {:?} (no ping in {:?}), disconnecting", peer, hb_timeout);
             break;
         }
 
@@ -270,12 +270,12 @@ pub async fn handle_control<S>(
             internal = internal_rx.recv() => {
                 match internal {
                     Some(InternalMsg::NewWorkConn(mut stream)) => {
-                        debug!("Got work conn for run_id {}", run_id);
+                        debug!(run_id = %run_id, "Got work conn for run_id {}", run_id);
                         // Expire stale pending NatHoleSid entries first.
                         while let Some((_, _, ts)) = pending_nat_hole_sids.front() {
                             if ts.elapsed() > PENDING_REQUEST_TIMEOUT {
                                 let (sid, _pn, _) = pending_nat_hole_sids.pop_front().unwrap();
-                                debug!("Pending NatHoleSid {} timed out", sid);
+                                debug!(sid = %sid, "Pending NatHoleSid {} timed out", sid);
                             } else {
                                 break;
                             }
@@ -283,7 +283,7 @@ pub async fn handle_control<S>(
                         // Check NatHoleSid delivery first (Go frp XTCP compat).
                         // Pending sids take priority — they unblock waiting visitors.
                         if let Some((sid, proxy_name, _ts)) = pending_nat_hole_sids.pop_front() {
-                            debug!("Delivering pending NatHoleSid {} for {} to provider", sid, proxy_name);
+                            debug!(sid = %sid, proxy_name = %proxy_name, "Delivering pending NatHoleSid {} for {} to provider", sid, proxy_name);
                             // Look up proxy flags for StartWorkConn (encryption/compression propagation)
                             let (use_enc, use_comp) = state.proxy_manager.get(&proxy_name).await
                                 .map(|p| (p.use_encryption, p.use_compression))
@@ -301,7 +301,7 @@ pub async fn handle_control<S>(
                                 nat_hole_visitor_addr: None,
                             });
                             if let Err(e) = write_ctl_msg(&mut stream, &swc, v2).await {
-                                warn!("Failed to send pending StartWorkConn with NatHoleSid: {}", e);
+                                warn!(error = %e, "Failed to send pending StartWorkConn with NatHoleSid: {}", e);
                             } else {
                                 // Also send a separate NatHoleSid V1 frame for Go frpc compat.
                                 // Go frp ignores unknown JSON fields (embedded nat_hole_sid),
@@ -311,7 +311,7 @@ pub async fn handle_control<S>(
                                     provider_addr: None,
                                 });
                                 if let Err(e) = write_ctl_msg(&mut stream, &nhs, v2).await {
-                                    debug!("Failed to send separate NatHoleSid frame (non-fatal): {}", e);
+                                    debug!(error = %e, "Failed to send separate NatHoleSid frame (non-fatal): {}", e);
                                 }
                             }
                             // Work conn consumed for XTCP notification — drop it.
@@ -320,14 +320,14 @@ pub async fn handle_control<S>(
                             while let Some((_, ts)) = pending_udp.front() {
                                 if ts.elapsed() > PENDING_REQUEST_TIMEOUT {
                                     let (pn, _) = pending_udp.pop_front().unwrap();
-                                    debug!("Pending UDP work conn for '{}' timed out", pn);
+                                    debug!(proxy_name = %pn, "Pending UDP work conn for '{}' timed out", pn);
                                 } else {
                                     break;
                                 }
                             }
                             // Check if a UDP proxy needs this work connection
                             if let Some((proxy_name, _)) = pending_udp.pop_front() {
-                                info!("Assigning work conn to UDP proxy '{}'", proxy_name);
+                                info!(proxy_name = %proxy_name, "Assigning work conn to UDP proxy '{}'", proxy_name);
                                 let local_addr = state.proxy_manager.get(&proxy_name).await
                                     .and_then(|info| info.local_addr)
                                     .and_then(|s| msg::UdpAddr::from_string(&s));
@@ -346,15 +346,15 @@ pub async fn handle_control<S>(
                                     bridge::assign_work_to_proxy(stream, req, enc_key, state.clone(), v2).await;
                                 } else if work_pool.len() < pool_cap {
                                     work_pool.push_back(stream);
-                                    debug!("Work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
+                                    debug!(run_id = %run_id, pool_size = %work_pool.len(), pool_cap = %pool_cap, "Work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
                                 } else {
-                                    debug!("Work pool full for {} ({}/{}), dropping work conn", run_id, work_pool.len(), pool_cap);
+                                    debug!(run_id = %run_id, pool_size = %work_pool.len(), pool_cap = %pool_cap, "Work pool full for {} ({}/{}), dropping work conn", run_id, work_pool.len(), pool_cap);
                                 }
                             }
                         }
                     }
                     Some(InternalMsg::VisitorConn { proxy_name, visitor_conn }) => {
-                        debug!("STCP visitor conn for proxy {} on run_id {}", proxy_name, run_id);
+                        debug!(proxy_name = %proxy_name, run_id = %run_id, "STCP visitor conn for proxy {} on run_id {}", proxy_name, run_id);
                         let (enc, comp, response_headers, proxy_type) = {
                             let p = state.proxy_manager.get(&proxy_name).await;
                             let e = p.as_ref().map(|p| p.use_encryption).unwrap_or(false);
@@ -369,14 +369,14 @@ pub async fn handle_control<S>(
                         } else {
                             debug!("No pooled work conn for STCP, sending ReqWorkConn");
                             if let Err(e) = write_ctl_msg(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
-                                warn!("Failed to send ReqWorkConn: {}", e);
+                                warn!(error = %e, "Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
                             pending_requests.push_back(PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type });
                         }
                     }
                     Some(InternalMsg::ProxyUserConn { proxy_name, user_conn, pre_read }) => {
-                        debug!("User conn for proxy {} on run_id {}", proxy_name, run_id);
+                        debug!(proxy_name = %proxy_name, run_id = %run_id, "User conn for proxy {} on run_id {}", proxy_name, run_id);
                         // Group load balancing: if proxy belongs to a group,
                         // select a backend (possibly on a different run_id).
                         let (target_proxy, target_run_id) = {
@@ -386,7 +386,7 @@ pub async fn handle_control<S>(
                             if let Some(ref group_name) = group {
                                 if let Some(backend) = state.proxy_manager.select_group_backend(group_name, &group_key).await {
                                     let backend_run_id = state.proxy_manager.get_run_id(&backend).await.unwrap_or_default();
-                                    info!("Group LB: {} -> backend {} (run_id {})", proxy_name, backend, backend_run_id);
+                                    info!(proxy_name = %proxy_name, backend = %backend, backend_run_id = %backend_run_id, "Group LB: {} -> backend {} (run_id {})", proxy_name, backend, backend_run_id);
                                     (backend, backend_run_id)
                                 } else {
                                     (proxy_name.clone(), run_id.clone())
@@ -409,7 +409,7 @@ pub async fn handle_control<S>(
                                 });
                                 continue;
                             }
-                            warn!("Group backend run_id {} not found for proxy {}", target_run_id, target_proxy);
+                            warn!(target_run_id = %target_run_id, target_proxy = %target_proxy, "Group backend run_id {} not found for proxy {}", target_run_id, target_proxy);
                             continue;
                         }
                         let (enc, comp, response_headers, proxy_type) = {
@@ -424,34 +424,34 @@ pub async fn handle_control<S>(
                             let enc_key = state.reloadable.read().unwrap().encryption_key;
                             bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type }, enc_key, state.clone(), v2).await;
                         } else {
-                            debug!("No pooled work conn, sending ReqWorkConn for {}", target_proxy);
+                            debug!(target_proxy = %target_proxy, "No pooled work conn, sending ReqWorkConn for {}", target_proxy);
                             if let Err(e) = write_ctl_msg(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
-                                warn!("Failed to send ReqWorkConn: {}", e);
+                                warn!(error = %e, "Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
                             pending_requests.push_back(PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type });
                         }
                     }
                     Some(InternalMsg::UdpNeedsWorkConn { proxy_name }) => {
-                        debug!("UDP proxy '{}' needs work connection", proxy_name);
+                        debug!(proxy_name = %proxy_name, "UDP proxy '{}' needs work connection", proxy_name);
                         if let Err(e) = write_ctl_msg(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
-                            warn!("Failed to send ReqWorkConn for UDP: {}", e);
+                            warn!(error = %e, "Failed to send ReqWorkConn for UDP: {}", e);
                             break;
                         }
                         pending_udp.push_back((proxy_name, Instant::now()));
                     }
                     Some(InternalMsg::WriteNatHoleSid { sid, provider_addr }) => {
-                        debug!("Writing NatHoleSid to visitor via control channel for {}", sid);
+                        debug!(sid = %sid, "Writing NatHoleSid to visitor via control channel for {}", sid);
                         let forward = FrpMessage::NatHoleSid(msg::NatHoleSid {
                             sid: Some(sid),
                             provider_addr,
                         });
                         if let Err(e) = write_ctl_msg(&mut writer, &forward, v2).await {
-                            warn!("Failed to write NatHoleSid to visitor: {}", e);
+                            warn!(error = %e, "Failed to write NatHoleSid to visitor: {}", e);
                         }
                     }
                     Some(InternalMsg::WriteNatHoleResp { transaction_id, error, sid, protocol, candidate_addrs, assisted_addrs }) => {
-                        debug!("Writing NatHoleResp to visitor via control channel for {}", transaction_id);
+                        debug!(transaction_id = %transaction_id, "Writing NatHoleResp to visitor via control channel for {}", transaction_id);
                         let forward = FrpMessage::NatHoleResp(msg::NatHoleResp {
                             transaction_id,
                             error,
@@ -462,20 +462,20 @@ pub async fn handle_control<S>(
                             ..Default::default()
                         });
                         if let Err(e) = write_ctl_msg(&mut writer, &forward, v2).await {
-                            warn!("Failed to write NatHoleResp to visitor: {}", e);
+                            warn!(error = %e, "Failed to write NatHoleResp to visitor: {}", e);
                         }
                     }
                     Some(InternalMsg::WriteNatHoleReport { sid }) => {
-                        debug!("Writing NatHoleReport to visitor via control channel for {}", sid);
+                        debug!(sid = %sid, "Writing NatHoleReport to visitor via control channel for {}", sid);
                         let forward = FrpMessage::NatHoleReport(msg::NatHoleReport {
                             sid: Some(sid),
                         });
                         if let Err(e) = write_ctl_msg(&mut writer, &forward, v2).await {
-                            warn!("Failed to write NatHoleReport to visitor: {}", e);
+                            warn!(error = %e, "Failed to write NatHoleReport to visitor: {}", e);
                         }
                     }
                     Some(InternalMsg::NatHoleSidOnWorkConn { sid, proxy_name }) => {
-                        debug!("Sending NatHoleSid {} for proxy {} to provider on work conn", sid, proxy_name);
+                        debug!(sid = %sid, proxy_name = %proxy_name, "Sending NatHoleSid {} for proxy {} to provider on work conn", sid, proxy_name);
                         if let Some(mut work_conn) = work_pool.pop_front() {
                             // Look up proxy flags for StartWorkConn (encryption/compression propagation)
                             let (use_enc, use_comp) = state.proxy_manager.get(&proxy_name).await
@@ -496,9 +496,9 @@ pub async fn handle_control<S>(
                                 nat_hole_visitor_addr: None,
                             });
                             if let Err(e) = write_ctl_msg(&mut work_conn, &swc, v2).await {
-                                warn!("Failed to send StartWorkConn with NatHoleSid on work conn: {}", e);
+                                warn!(error = %e, "Failed to send StartWorkConn with NatHoleSid on work conn: {}", e);
                             } else {
-                                debug!("Sent StartWorkConn with embedded NatHoleSid {} to provider on work conn", sid);
+                                debug!(sid = %sid, "Sent StartWorkConn with embedded NatHoleSid {} to provider on work conn", sid);
                                 // Also send a separate NatHoleSid V1 frame for Go frpc compat.
                                 // Go frp ignores unknown JSON fields (embedded nat_hole_sid),
                                 // so it needs the standalone frame to recognize the XTCP notification.
@@ -509,27 +509,27 @@ pub async fn handle_control<S>(
                                     provider_addr: None,
                                 });
                                 if let Err(e) = write_ctl_msg(&mut work_conn, &nhs, v2).await {
-                                    debug!("Failed to send separate NatHoleSid frame (non-fatal): {}", e);
+                                    debug!(error = %e, "Failed to send separate NatHoleSid frame (non-fatal): {}", e);
                                 }
                             }
                             // Connection consumed — Go frp doesn't reuse after NatHoleSid.
                             drop(work_conn);
                         } else {
                             // No pooled work conn — request one, queue sid.
-                            debug!("No pooled work conn for NatHoleSid {}, requesting via ReqWorkConn", sid);
+                            debug!(sid = %sid, "No pooled work conn for NatHoleSid {}, requesting via ReqWorkConn", sid);
                             if let Err(e) = write_ctl_msg(&mut writer,
                                 &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
-                                warn!("Failed to send ReqWorkConn for NatHoleSid: {}", e);
+                                warn!(error = %e, "Failed to send ReqWorkConn for NatHoleSid: {}", e);
                             }
                             pending_nat_hole_sids.push_back((sid, proxy_name, Instant::now()));
                         }
                     }
                     Some(InternalMsg::Shutdown) => {
-                        warn!("Shutdown received for run_id {} (replaced by new control connection)", run_id);
+                        warn!(run_id = %run_id, "Shutdown received for run_id {} (replaced by new control connection)", run_id);
                         break;
                     }
                     None => {
-                        info!("Control channel closed for {:?}", peer);
+                        info!(peer = ?peer, "Control channel closed for {:?}", peer);
                         break;
                     }
                 }
@@ -555,7 +555,7 @@ pub async fn handle_control<S>(
                                 io = IoStream::BufferedRead(bytes, 0, Box::new(io));
                             }
                             Err(e) => {
-                                warn!("Failed to read V2 magic from yamux stream for {run_id}: {e}");
+                                warn!(run_id = %run_id, error = %e, "Failed to read V2 magic from yamux stream for {run_id}: {e}");
                                 continue;
                             }
                         }
@@ -564,20 +564,20 @@ pub async fn handle_control<S>(
                         Ok(FrpMessage::NewWorkConn(nwc)) => {
                             let stream_run_id = nwc.run_id.as_deref().unwrap_or("");
                             if stream_run_id != run_id {
-                                debug!("Yamux work conn run_id mismatch: expected {run_id}, got {stream_run_id}");
+                                debug!(expected_run_id = %run_id, got_run_id = %stream_run_id, "Yamux work conn run_id mismatch: expected {run_id}, got {stream_run_id}");
                                 continue;
                             }
                         }
                         Ok(other) => {
-                            debug!("Unexpected yamux stream message for {run_id}: {:?}", other.v1_type_byte());
+                            debug!(run_id = %run_id, msg_type = ?other.v1_type_byte(), "Unexpected yamux stream message for {run_id}: {:?}", other.v1_type_byte());
                             continue;
                         }
                         Err(e) => {
-                            warn!("Failed to read from yamux stream for {run_id}: {e}");
+                            warn!(run_id = %run_id, error = %e, "Failed to read from yamux stream for {run_id}: {e}");
                             continue;
                         }
                     }
-                    debug!("Yamux work conn for run_id {}", run_id);
+                    debug!(run_id = %run_id, "Yamux work conn for run_id {}", run_id);
                     while let Some(req) = pending_requests.front() {
                         if req.created_at.elapsed() > PENDING_REQUEST_TIMEOUT {
                             pending_requests.pop_front();
@@ -590,9 +590,9 @@ pub async fn handle_control<S>(
                         bridge::assign_work_to_proxy(io, req, enc_key, state.clone(), v2).await;
                     } else if work_pool.len() < pool_cap {
                         work_pool.push_back(io);
-                        debug!("Yamux work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
+                        debug!(run_id = %run_id, pool_size = %work_pool.len(), pool_cap = %pool_cap, "Yamux work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
                     } else {
-                        debug!("Work pool full for {} ({}/{}), dropping yamux work conn", run_id, work_pool.len(), pool_cap);
+                        debug!(run_id = %run_id, pool_size = %work_pool.len(), pool_cap = %pool_cap, "Work pool full for {} ({}/{}), dropping yamux work conn", run_id, work_pool.len(), pool_cap);
                     }
                 }
             }
@@ -600,7 +600,7 @@ pub async fn handle_control<S>(
             msg = read_ctl_msg(&mut reader, v2) => {
                 match msg {
                     Ok(FrpMessage::UDPPacket(up)) => {
-                        debug!("UDPPacket from client: {} bytes to {:?}", up.content.len(), up.remote_addr);
+                        debug!(byte_count = %up.content.len(), remote_addr = ?up.remote_addr, "UDPPacket from client: {} bytes to {:?}", up.content.len(), up.remote_addr);
                         // Forward via the proxy's UDP socket (bidirectional NAT, Go frp compat).
                         let local_addr_str = up.local_addr.as_ref().map(|a| a.to_string()).unwrap_or_default();
                         let proxy_name = udp_local_to_proxy.get(&local_addr_str).cloned();
@@ -643,7 +643,7 @@ pub async fn handle_control<S>(
                                 });
                             }
                         } else {
-                            warn!("No UDP socket for proxy, dropping {} bytes", up.content.len());
+                            warn!(byte_count = %up.content.len(), "No UDP socket for proxy, dropping {} bytes", up.content.len());
                         }
                     }
                     Ok(FrpMessage::NewProxy(np)) => {
@@ -669,7 +669,7 @@ pub async fn handle_control<S>(
                             handle.abort();
                         }
                         state.proxy_manager.remove(&cp.proxy_name).await;
-                        info!("Proxy closed: {}", cp.proxy_name);
+                        info!(proxy_name = %cp.proxy_name, "Proxy closed: {}", cp.proxy_name);
                         // Server plugin: close_proxy hook (fire-and-forget)
                         let plugin_state = state.clone();
                         let pn = cp.proxy_name.clone();
@@ -688,18 +688,20 @@ pub async fn handle_control<S>(
                     }
                     Ok(FrpMessage::NatHoleClient(ref client_msg)) => {
                         debug!(
+                            transaction_id = %client_msg.transaction_id,
+                            mapped_addrs = ?client_msg.mapped_addrs,
                             "Received NatHoleClient from provider: txn={}, addrs={:?}",
                             client_msg.transaction_id, client_msg.mapped_addrs
                         );
                         state.nat_hole.handle_client(client_msg.clone()).await;
                     }
                     Ok(FrpMessage::NatHoleSid(ref sid_msg)) => {
-                        debug!("Received NatHoleSid from provider: {:?}", sid_msg.sid);
+                        debug!(sid = ?sid_msg.sid, "Received NatHoleSid from provider: {:?}", sid_msg.sid);
                         if let Some(ref sid) = sid_msg.sid {
                             let provider_addr = peer.as_ref().map(|a| a.to_string());
                             // Try control-channel path first (Go frp compat).
                             if state.nat_hole.forward_sid_via_ctl(sid, provider_addr.clone()).await {
-                                debug!("Forwarded NatHoleSid via control channel for {}", sid);
+                                debug!(sid = %sid, "Forwarded NatHoleSid via control channel for {}", sid);
                             } else if let Some(mut writer) = state.nat_hole.take_writer(sid).await {
                                 // Fallback: accept-loop writer path
                                 let forward = FrpMessage::NatHoleSid(msg::NatHoleSid {
@@ -707,18 +709,18 @@ pub async fn handle_control<S>(
                                     provider_addr,
                                 });
                                 if write_ctl_msg(&mut writer, &forward, v2).await.is_ok() {
-                                    debug!("Forwarded NatHoleSid to visitor for session {}", sid);
+                                    debug!(sid = %sid, "Forwarded NatHoleSid to visitor for session {}", sid);
                                 } else {
-                                    warn!("Failed to write NatHoleSid to visitor for session {}", sid);
+                                    warn!(sid = %sid, "Failed to write NatHoleSid to visitor for session {}", sid);
                                 }
                                 state.nat_hole.return_writer(sid, writer).await;
                             } else {
-                                warn!("NatHoleSid for unknown session {}", sid);
+                                warn!(sid = %sid, "NatHoleSid for unknown session {}", sid);
                             }
                         }
                     }
                     Ok(FrpMessage::NatHoleResp(ref resp_msg)) => {
-                        debug!("Received NatHoleResp from provider: txn={}, error={:?}, candidates={:?}",
+                        debug!(transaction_id = %resp_msg.transaction_id, error = ?resp_msg.error, candidate_addrs = ?resp_msg.candidate_addrs, "Received NatHoleResp from provider: txn={}, error={:?}, candidates={:?}",
                             resp_msg.transaction_id, resp_msg.error, resp_msg.candidate_addrs);
                         // Relay provider's NAT hole response to visitor.
                         // Go frp XTCP compat: visitor needs provider's candidate addresses
@@ -733,7 +735,7 @@ pub async fn handle_control<S>(
                             resp_msg.candidate_addrs.clone(),
                             resp_msg.assisted_addrs.clone(),
                         ).await {
-                            debug!("Forwarded NatHoleResp via control channel for {}", tid);
+                            debug!(tid = %tid, "Forwarded NatHoleResp via control channel for {}", tid);
                         } else if let Some(mut writer) = state.nat_hole.take_writer(tid).await {
                             let forward = FrpMessage::NatHoleResp(msg::NatHoleResp {
                                 transaction_id: tid.clone(),
@@ -747,7 +749,7 @@ pub async fn handle_control<S>(
                             let _ = write_ctl_msg(&mut writer, &forward, v2).await;
                             state.nat_hole.return_writer(tid, writer).await;
                         } else {
-                            warn!("NatHoleResp for unknown session {}", tid);
+                            warn!(tid = %tid, "NatHoleResp for unknown session {}", tid);
                         }
                         // Signal the session so handle_nat_hole_visitor wakes up.
                         // Go frp v0.69.1 sends NatHoleResp (type 'm') from provider
@@ -765,7 +767,7 @@ pub async fn handle_control<S>(
                         }).await;
                     }
                     Ok(FrpMessage::NatHoleReport(ref report_msg)) => {
-                        debug!("Received NatHoleReport from provider: {:?}", report_msg.sid);
+                        debug!(sid = ?report_msg.sid, "Received NatHoleReport from provider: {:?}", report_msg.sid);
                         if let Some(ref sid) = report_msg.sid {
                             // Try control-channel path first (Go frp compat).
                             if !state.nat_hole.forward_report_via_ctl(sid).await {
@@ -801,7 +803,7 @@ pub async fn handle_control<S>(
                             ).map(|_| ())
                         };
                         if let Err(e) = ping_auth_result {
-                            warn!("Ping auth failed from {:?}: {}", peer, e);
+                            warn!(peer = ?peer, error = %e, "Ping auth failed from {:?}: {}", peer, e);
                             let pong = FrpMessage::Pong(msg::Pong { error: Some(err_msg(state.detailed_errors_to_client, e, "ping authentication failed")) });
                             let _ = write_ctl_msg(&mut writer, &pong, v2).await;
                             break;
@@ -809,13 +811,13 @@ pub async fn handle_control<S>(
                         last_ping = Instant::now();
                         let pong = FrpMessage::Pong(msg::Pong { error: None });
                         if let Err(e) = write_ctl_msg(&mut writer, &pong, v2).await {
-                            warn!("Failed to send pong: {}", e);
+                            warn!(error = %e, "Failed to send pong: {}", e);
                             break;
                         }
-                        debug!("Ping from {:?}", peer);
+                        debug!(peer = ?peer, "Ping from {:?}", peer);
                     }
                     Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                        debug!("NewVisitorConn on control channel: proxy='{}'", nvc.proxy_name);
+                        debug!(proxy_name = %nvc.proxy_name, "NewVisitorConn on control channel: proxy='{}'", nvc.proxy_name);
                         // Visitor registration on the control connection.
                         // Rust frpc sends NewVisitorConn on control before sending
                         // NatHoleVisitor for XTCP hole punching. Go frps v0.69.1
@@ -841,7 +843,7 @@ pub async fn handle_control<S>(
                         };
 
                         if ok {
-                            info!("Visitor '{}' registered on control channel for proxy '{}'",
+                            info!(proxy_name = %nvc.proxy_name, "Visitor '{}' registered on control channel for proxy '{}'",
                                 nvc.proxy_name, nvc.proxy_name);
                             // Go frps v0.69.1 compat: respond with ReqWorkConn.
                             // Rust frpc control.rs register_visitor() treats
@@ -849,7 +851,7 @@ pub async fn handle_control<S>(
                             let rwc = FrpMessage::ReqWorkConn(msg::ReqWorkConn {});
                             let _ = write_ctl_msg(&mut writer, &rwc, v2).await;
                         } else {
-                            warn!("NewVisitorConn auth failed on control channel for proxy '{}'",
+                            warn!(proxy_name = %nvc.proxy_name, "NewVisitorConn auth failed on control channel for proxy '{}'",
                                 nvc.proxy_name);
                             let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
                                 proxy_name: nvc.proxy_name.clone(),
@@ -859,7 +861,7 @@ pub async fn handle_control<S>(
                         }
                     }
                     Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                        debug!("NatHoleVisitor on control channel: proxy='{}', txn='{}'",
+                        debug!(proxy_name = %nhv.proxy_name, transaction_id = %nhv.transaction_id, "NatHoleVisitor on control channel: proxy='{}', txn='{}'",
                             nhv.proxy_name, nhv.transaction_id);
                         let transaction_id = nhv.transaction_id.clone();
                         let proxy_name = nhv.proxy_name.clone();
@@ -892,7 +894,7 @@ pub async fn handle_control<S>(
                         // Go frp v0.69.1 pre_check compat: validate and return OK,
                         // no session created, no provider notified.
                         if nhv.pre_check && nhv.mapped_addrs.is_none() {
-                            debug!("NatHoleVisitor pre_check on ctl channel: proxy='{}' OK", proxy_name);
+                            debug!(proxy_name = %proxy_name, "NatHoleVisitor pre_check on ctl channel: proxy='{}' OK", proxy_name);
                             let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
                                 transaction_id: transaction_id.clone(),
                                 error: None,
@@ -930,7 +932,7 @@ pub async fn handle_control<S>(
                         {
                             Ok(s) => s,
                             Err(e) => {
-                                warn!("NatHole session creation failed: {}", e);
+                                warn!(error = %e, "NatHole session creation failed: {}", e);
                                 continue;
                             }
                         };
@@ -948,7 +950,7 @@ pub async fn handle_control<S>(
                             sid: transaction_id.clone(),
                             proxy_name: proxy_name.clone(),
                         }).is_err() {
-                            warn!("Provider for run_id {} has gone away", provider_run_id);
+                            warn!(provider_run_id = %provider_run_id, "Provider for run_id {} has gone away", provider_run_id);
                             state.nat_hole.remove(&transaction_id).await;
                             continue;
                         }
@@ -970,7 +972,7 @@ pub async fn handle_control<S>(
                             ).await;
 
                             if client_received.is_err() {
-                                warn!("NatHole ctl session {}: timeout waiting for provider", tid);
+                                warn!(tid = %tid, "NatHole ctl session {}: timeout waiting for provider", tid);
                                 nat_hole.remove(&tid).await;
                                 return;
                             }
@@ -986,7 +988,7 @@ pub async fn handle_control<S>(
                             let client_msg = match client_msg_opt {
                                 Some(m) => m,
                                 None => {
-                                    warn!("NatHole ctl session {}: no client msg", tid);
+                                    warn!(tid = %tid, "NatHole ctl session {}: no client msg", tid);
                                     nat_hole.remove(&tid).await;
                                     return;
                                 }
@@ -1070,19 +1072,19 @@ pub async fn handle_control<S>(
 
                             // Wait for report
                             match tokio::time::timeout(Duration::from_secs(30), report_rx).await {
-                                Ok(Ok(_)) => debug!("NatHole ctl session {}: completed", tid),
+                                Ok(Ok(_)) => debug!(tid = %tid, "NatHole ctl session {}: completed", tid),
                                 Ok(Err(_)) | Err(_) => {
-                                    debug!("NatHole ctl session {}: cleanup", tid);
+                                    debug!(tid = %tid, "NatHole ctl session {}: cleanup", tid);
                                     nat_hole.remove(&tid).await;
                                 }
                             }
                         });
                     }
                     Ok(_) => {
-                        debug!("Unhandled message from {:?}", peer);
+                        debug!(peer = ?peer, "Unhandled message from {:?}", peer);
                     }
                     Err(e) => {
-                        info!("Control connection {:?} closed: {}", peer, e);
+                        info!(peer = ?peer, error = %e, "Control connection {:?} closed: {}", peer, e);
                         break;
                     }
                 }
@@ -1096,5 +1098,5 @@ pub async fn handle_control<S>(
     }
     proxy_ops::unregister_control(&state, &run_id).await;
     state.proxy_manager.remove_client(&run_id).await;
-    info!("Control connection {} removed", run_id);
+    info!(run_id = %run_id, "Control connection {} removed", run_id);
 }

@@ -38,7 +38,7 @@ pub async fn start_http2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle, 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let task = tokio::spawn(async move {
-        debug!("http2http plugin listening on {}", local_addr);
+        debug!(local_addr = %local_addr, "http2http plugin listening on {}", local_addr);
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -48,12 +48,12 @@ pub async fn start_http2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle, 
                             let rewrite = host_rewrite.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = handle_conn(client, &target, &rewrite).await {
-                                    debug!("http2http: {peer} error: {e}");
+                                    debug!(peer = %peer, error = %e, "http2http: {peer} error: {e}");
                                 }
                             });
                         }
                         Err(e) => {
-                            warn!("http2http plugin accept error: {e}");
+                            warn!(error = %e, "http2http plugin accept error: {e}");
                             break;
                         }
                     }

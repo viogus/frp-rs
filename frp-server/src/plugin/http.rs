@@ -73,7 +73,7 @@ impl HttpPluginManager {
             let body = match serde_json::to_string(&event) {
                 Ok(b) => b,
                 Err(e) => {
-                    tracing::warn!("Server plugin '{}' JSON serialize error: {}", plugin.cfg.name, e);
+                    tracing::warn!(plugin_name = %plugin.cfg.name, error = %e, "Server plugin '{}' JSON serialize error: {}", plugin.cfg.name, e);
                     continue;
                 }
             };
@@ -88,7 +88,7 @@ impl HttpPluginManager {
                         let resp_text = match resp.text().await {
                             Ok(t) => t,
                             Err(e) => {
-                                tracing::warn!("Server plugin '{}' read response error: {}", plugin.cfg.name, e);
+                                tracing::warn!(plugin_name = %plugin.cfg.name, error = %e, "Server plugin '{}' read response error: {}", plugin.cfg.name, e);
                                 continue;
                             }
                         };
@@ -100,6 +100,7 @@ impl HttpPluginManager {
                                     pr.reject_reason.clone()
                                 };
                                 tracing::warn!(
+                                    plugin_name = %plugin.cfg.name, op = %op, reason = %reason,
                                     "Server plugin '{}' rejected op '{}': {}",
                                     plugin.cfg.name, op, reason
                                 );
@@ -110,12 +111,14 @@ impl HttpPluginManager {
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(
+                        plugin_name = %plugin.cfg.name, op = %op, error = %e,
                         "Server plugin '{}' HTTP error for op '{}': {}",
                         plugin.cfg.name, op, e
                     );
                 }
                 Err(_) => {
                     tracing::warn!(
+                        plugin_name = %plugin.cfg.name, op = %op,
                         "Server plugin '{}' timeout for op '{}'",
                         plugin.cfg.name, op
                     );

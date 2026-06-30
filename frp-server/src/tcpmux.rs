@@ -100,7 +100,7 @@ pub async fn run_tcpmux_listener(
     state: Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&addr).await?;
-    info!("TCPMux HTTP CONNECT listener started on {}", addr);
+    info!(addr = %addr, "TCPMux HTTP CONNECT listener started on {}", addr);
 
     loop {
         let (mut stream, peer) = listener.accept().await?;
@@ -138,6 +138,7 @@ pub async fn run_tcpmux_listener(
 
             if !method.eq_ignore_ascii_case("CONNECT") {
                 warn!(
+                    method = %method, peer = %peer,
                     "TCPMux: expected CONNECT, got {} from {}",
                     method, peer
                 );
@@ -151,7 +152,7 @@ pub async fn run_tcpmux_listener(
             let host = match extract_host_header(&request_text) {
                 Some(h) => h.to_string(),
                 None => {
-                    warn!("TCPMux: no Host header from {}", peer);
+                    warn!(peer = %peer, "TCPMux: no Host header from {}", peer);
                     let _ = stream
                         .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
                         .await;
@@ -160,6 +161,7 @@ pub async fn run_tcpmux_listener(
             };
 
             debug!(
+                target = %target, host = %host, peer = %peer,
                 "TCPMux CONNECT target='{}' host='{}' from {}",
                 target, host, peer
             );
@@ -169,6 +171,7 @@ pub async fn run_tcpmux_listener(
                 Some(r) => r,
                 None => {
                     warn!(
+                        host = %host, peer = %peer,
                         "TCPMux: no route for host '{}' from {}",
                         host, peer
                     );
@@ -200,7 +203,7 @@ pub async fn run_tcpmux_listener(
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await
             {
-                debug!("TCPMux: failed to write 200 to {}: {}", peer, e);
+                debug!(peer = %peer, error = %e, "TCPMux: failed to write 200 to {}: {}", peer, e);
                 return;
             }
 
@@ -222,6 +225,7 @@ pub async fn run_tcpmux_listener(
                     .ok();
             } else {
                 warn!(
+                    host = %host,
                     "TCPMux: route for '{}' found but control handler gone",
                     host
                 );

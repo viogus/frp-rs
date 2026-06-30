@@ -41,7 +41,7 @@ pub async fn start_static_file_proxy(cfg: &PluginConfig) -> Result<PluginHandle,
     };
 
     let task = tokio::spawn(async move {
-        debug!("static_file plugin listening on {}", local_addr);
+        debug!(local_addr = %local_addr, "static_file plugin listening on {}", local_addr);
         loop {
             tokio::select! {
                 result = listener.accept() => {

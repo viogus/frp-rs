@@ -119,7 +119,7 @@ pub(crate) async fn assign_udp_work_conn(
     let sock = match udp_sockets.get(proxy_name) {
         Some(s) => s.clone(),
         None => {
-            warn!("UDP socket not found for proxy '{}'", proxy_name);
+            warn!(proxy_name = %proxy_name, "UDP socket not found for proxy '{}'", proxy_name);
             return;
         }
     };
@@ -140,14 +140,14 @@ pub(crate) async fn assign_udp_work_conn(
     });
     if v2 {
         if let Err(e) = work_conn.write_v2_frame(&swc).await {
-            warn!("Failed to send StartWorkConn (V2) for UDP '{}': {}", proxy_name, e);
+            warn!(proxy_name = %proxy_name, error = %e, "Failed to send StartWorkConn (V2) for UDP '{}': {}", proxy_name, e);
             return;
         }
     } else if let Err(e) = work_conn.write_v1_frame(&swc).await {
-        warn!("Failed to send StartWorkConn for UDP '{}': {}", proxy_name, e);
+        warn!(proxy_name = %proxy_name, error = %e, "Failed to send StartWorkConn for UDP '{}': {}", proxy_name, e);
         return;
     }
-    debug!("UDP work conn assigned to '{}', starting bridge tasks", proxy_name);
+    debug!(proxy_name = %proxy_name, "UDP work conn assigned to '{}', starting bridge tasks", proxy_name);
 
     let (mut w_r, mut w_w) = work_conn.into_split();
 
@@ -155,7 +155,7 @@ pub(crate) async fn assign_udp_work_conn(
     let sock_w = sock.clone();
     let pn_w = proxy_name.clone();
     tokio::spawn(async move {
-        debug!("UDP work conn reader task started for '{}'", pn_w);
+        debug!(proxy_name = %pn_w, "UDP work conn reader task started for '{}'", pn_w);
         loop {
             let result = if v2 {
                 read_msg_v2(&mut w_r).await
@@ -167,7 +167,7 @@ pub(crate) async fn assign_udp_work_conn(
                     if let Some(ref remote) = up.remote_addr {
                         let remote_str = remote.to_string();
                         if let Err(e) = sock_w.send_to(&up.content, &remote_str).await {
-                            debug!("UDP send_to failed for '{}': {}", pn_w, e);
+                            debug!(proxy_name = %pn_w, error = %e, "UDP send_to failed for '{}': {}", pn_w, e);
                         }
                     }
                 }
@@ -176,10 +176,10 @@ pub(crate) async fn assign_udp_work_conn(
                     continue;
                 }
                 Ok(other) => {
-                    debug!("UDP work conn for '{}': unexpected msg 0x{:02x}", pn_w, other.v1_type_byte());
+                    debug!(proxy_name = %pn_w, msg_type = %other.v1_type_byte(), "UDP work conn for '{}': unexpected msg 0x{:02x}", pn_w, other.v1_type_byte());
                 }
                 Err(e) => {
-                    debug!("UDP work conn for '{}' read closed: {}", pn_w, e);
+                    debug!(proxy_name = %pn_w, error = %e, "UDP work conn for '{}' read closed: {}", pn_w, e);
                     break;
                 }
             }
@@ -189,12 +189,12 @@ pub(crate) async fn assign_udp_work_conn(
     // Task: read from UDP socket → write UDPPacket to work conn
     let pn_w2 = proxy_name.clone();
     tokio::spawn(async move {
-        debug!("UDP work conn writer task started for '{}'", pn_w2);
+        debug!(proxy_name = %pn_w2, "UDP work conn writer task started for '{}'", pn_w2);
         let mut buf = vec![0u8; udp_packet_size];
         loop {
             match sock.recv_from(&mut buf).await {
                 Ok((n, src)) => {
-                    debug!("UDP writer '{}' recv'd {} bytes from {}", pn_w2, n, src);
+                    debug!(proxy_name = %pn_w2, bytes = %n, source = %src, "UDP writer '{}' recv'd {} bytes from {}", pn_w2, n, src);
                     let remote = msg::UdpAddr {
                         ip: src.ip().to_string(),
                         port: src.port(),
@@ -205,25 +205,25 @@ pub(crate) async fn assign_udp_work_conn(
                         local_addr: local_addr.clone(),
                         remote_addr: Some(remote),
                     });
-                    debug!("UDP writer '{}' sending UDPPacket to work conn...", pn_w2);
+                    debug!(proxy_name = %pn_w2, "UDP writer '{}' sending UDPPacket to work conn...", pn_w2);
                     let write_result = if v2 {
                         write_msg_v2(&mut w_w, &pkt).await
                     } else {
                         write_msg_v1(&mut w_w, &pkt).await
                     };
                     if let Err(e) = write_result {
-                        debug!("UDP work conn write failed for '{}': {}", pn_w2, e);
+                        debug!(proxy_name = %pn_w2, error = %e, "UDP work conn write failed for '{}': {}", pn_w2, e);
                         break;
                     }
-                    debug!("UDP work conn wrote {} bytes for '{}'", n, pn_w2);
+                    debug!(bytes = %n, proxy_name = %pn_w2, "UDP work conn wrote {} bytes for '{}'", n, pn_w2);
                 }
                 Err(e) => {
-                    debug!("UDP recv_from error for '{}': {}", pn_w2, e);
+                    debug!(proxy_name = %pn_w2, error = %e, "UDP recv_from error for '{}': {}", pn_w2, e);
                     break;
                 }
             }
         }
-        debug!("UDP writer '{}' task exiting", pn_w2);
+        debug!(proxy_name = %pn_w2, "UDP writer '{}' task exiting", pn_w2);
     });
 }
 
@@ -281,7 +281,7 @@ pub(crate) async fn assign_work_to_proxy(
     };
 
     if let Err(e) = write_result {
-        warn!("Failed to send StartWorkConn: {}", e);
+        warn!(error = %e, "Failed to send StartWorkConn: {}", e);
         return;
     }
 
@@ -307,7 +307,7 @@ pub(crate) async fn assign_work_to_proxy(
         }
     }
 
-    info!("Bridging user conn to work conn for proxy '{}' (type={})", req.proxy_name, req.proxy_type);
+    info!(proxy_name = %req.proxy_name, proxy_type = %req.proxy_type, "Bridging user conn to work conn for proxy '{}' (type={})", req.proxy_name, req.proxy_type);
 
     let proxy_name = req.proxy_name.clone();
     let metrics = state.proxy_metrics.get_or_create(&proxy_name).await;
@@ -415,7 +415,7 @@ pub(crate) async fn assign_work_to_proxy(
                         metrics.bytes_out.fetch_add(b, Ordering::Relaxed);
                     }
                     Err(e) => {
-                        debug!("XTCP STCP fallback bridge closed: {}", e);
+                        debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
                     }
                 }
             } else {
@@ -430,6 +430,6 @@ pub(crate) async fn assign_work_to_proxy(
                 }
             }
         }
-        info!("Proxy '{}' bridge completed", req.proxy_name);
+        info!(proxy_name = %req.proxy_name, "Proxy '{}' bridge completed", req.proxy_name);
     });
 }

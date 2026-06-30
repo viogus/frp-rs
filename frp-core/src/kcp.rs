@@ -56,13 +56,13 @@ impl Write for UdpOutput {
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // UDP send buffer full — return Ok to avoid breaking KCP,
                 // the packet will be retransmitted by KCP later.
-                tracing::warn!("KCP UDP send would block ({} bytes)", data.len());
+                tracing::warn!(byte_count = data.len(), "KCP UDP send would block ({} bytes)", data.len());
                 Ok(data.len())
             }
             Err(e) => {
                 // Hard error (not WouldBlock) — return Err so KCP's
                 // internal state marks the segment for retransmission.
-                tracing::error!("KCP UDP send error: {}", e);
+                tracing::error!(error = %e, "KCP UDP send error: {}", e);
                 Err(e)
             }
         }

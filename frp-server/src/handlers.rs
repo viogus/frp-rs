@@ -43,20 +43,20 @@ pub(crate) async fn handle_visitor_conn_inner(
             if !sk.is_empty() {
                 let expected = frp_core::auth::generate_token(sk, timestamp);
                 if expected == sign_key {
-                    debug!("STCP visitor auth OK (Go-compat MD5) for proxy '{}'", msg.proxy_name);
+                    debug!(proxy_name = %msg.proxy_name, "STCP visitor auth OK (Go-compat MD5) for proxy '{}'", msg.proxy_name);
                     Some(msg.proxy_name.clone())
                 } else {
-                    warn!("STCP visitor MD5 auth mismatch for proxy '{}'", msg.proxy_name);
+                    warn!(proxy_name = %msg.proxy_name, "STCP visitor MD5 auth mismatch for proxy '{}'", msg.proxy_name);
                     None
                 }
             } else {
                 // Proxy has no sk — no auth required (allow)
-                debug!("STCP visitor: proxy '{}' has no sk, allowing", msg.proxy_name);
+                debug!(proxy_name = %msg.proxy_name, "STCP visitor: proxy '{}' has no sk, allowing", msg.proxy_name);
                 Some(msg.proxy_name.clone())
             }
         } else {
             // Proxy has no sk — no auth required (allow)
-            debug!("STCP visitor: proxy '{}' has no sk, allowing", msg.proxy_name);
+            debug!(proxy_name = %msg.proxy_name, "STCP visitor: proxy '{}' has no sk, allowing", msg.proxy_name);
             Some(msg.proxy_name.clone())
         }
     } else {
@@ -71,11 +71,11 @@ pub(crate) async fn handle_visitor_conn_inner(
             let pn = state.sk_index.read().await.get(&sign_key).cloned();
             match pn {
                 Some(pn) => {
-                    debug!("STCP visitor auth OK (raw sk_index lookup) for proxy '{}'", pn);
+                    debug!(proxy_name = %pn, "STCP visitor auth OK (raw sk_index lookup) for proxy '{}'", pn);
                     pn
                 }
                 None => {
-                    warn!("NewVisitorConn: no STCP proxy found for proxy_name='{}', sign_key='{}...'",
+                    warn!(proxy_name = %msg.proxy_name, sign_key_prefix = %&sign_key[..sign_key.len().min(8)], "NewVisitorConn: no STCP proxy found for proxy_name='{}', sign_key='{}...'",
                         msg.proxy_name, &sign_key[..sign_key.len().min(8)]);
                     // Send error response to visitor (Go frp expects NewVisitorConnResp)
                     let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
@@ -94,7 +94,7 @@ pub(crate) async fn handle_visitor_conn_inner(
     let run_id = match run_id {
         Some(id) => id,
         None => {
-            warn!("NewVisitorConn: no run_id found for proxy '{}'", proxy_name);
+            warn!(proxy_name = %proxy_name, "NewVisitorConn: no run_id found for proxy '{}'", proxy_name);
      // Send error response to visitor
      let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
          proxy_name: proxy_name.clone(),
@@ -110,7 +110,7 @@ pub(crate) async fn handle_visitor_conn_inner(
         if !proxy_info.allow_users.is_empty() {
             let visitor_run_id = msg.run_id.as_deref().unwrap_or("");
             if !proxy_info.allow_users.iter().any(|u| u == visitor_run_id) {
-                warn!("STCP visitor '{}' not in allow_users for proxy '{}'", visitor_run_id, proxy_name);
+                warn!(visitor_run_id = %visitor_run_id, proxy_name = %proxy_name, "STCP visitor '{}' not in allow_users for proxy '{}'", visitor_run_id, proxy_name);
                 let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
                     proxy_name: proxy_name.clone(),
                     error: Some("visitor not allowed".into()),
@@ -128,7 +128,7 @@ pub(crate) async fn handle_visitor_conn_inner(
 
     match ctl_tx {
         Some(ctl) => {
-            info!("STCP visitor for proxy '{}' routed to provider {}", proxy_name, run_id);
+            info!(proxy_name = %proxy_name, run_id = %run_id, "STCP visitor for proxy '{}' routed to provider {}", proxy_name, run_id);
        // Send success response to visitor BEFORE forwarding the stream
        // (Go frp visitor expects NewVisitorConnResp on the same connection)
        let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
@@ -136,18 +136,18 @@ pub(crate) async fn handle_visitor_conn_inner(
            error: None,
        });
        if let Err(e) = write_msg(&mut stream, &resp, v2).await {
-           warn!("Failed to send NewVisitorConnResp for proxy '{}': {}", proxy_name, e);
+           warn!(proxy_name = %proxy_name, error = %e, "Failed to send NewVisitorConnResp for proxy '{}': {}", proxy_name, e);
            return;
        }
             if ctl.tx.send(InternalMsg::VisitorConn {
                 proxy_name,
                 visitor_conn: stream,
             }).is_err() {
-                warn!("Provider for run_id {} has gone away", run_id);
+                warn!(run_id = %run_id, "Provider for run_id {} has gone away", run_id);
             }
         }
         None => {
-            warn!("No provider found for run_id {}", run_id);
+            warn!(run_id = %run_id, "No provider found for run_id {}", run_id);
        // Send error response to visitor
        let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
            proxy_name: proxy_name.clone(),
@@ -186,7 +186,7 @@ pub(crate) async fn handle_nat_hole_visitor(
 
     // Validate proxy exists
     if state.proxy_manager.get(&proxy_name).await.is_none() {
-        warn!("NatHoleVisitor: proxy '{}' not found", proxy_name);
+        warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy '{}' not found", proxy_name);
         let mut writer = stream.into_split().1;
         let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
             transaction_id: transaction_id.clone(),
@@ -202,7 +202,7 @@ pub(crate) async fn handle_nat_hole_visitor(
     let run_id = match run_id {
         Some(id) => id,
         None => {
-            warn!("NatHoleVisitor: no run_id found for proxy '{}'", proxy_name);
+            warn!(proxy_name = %proxy_name, "NatHoleVisitor: no run_id found for proxy '{}'", proxy_name);
             let mut writer = stream.into_split().1;
             let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
@@ -222,7 +222,7 @@ pub(crate) async fn handle_nat_hole_visitor(
     let ctl_tx = match ctl_tx {
         Some(ctl) => ctl,
         None => {
-            warn!("No provider control handler for run_id {}", run_id);
+            warn!(run_id = %run_id, "No provider control handler for run_id {}", run_id);
             let mut writer = stream.into_split().1;
             let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
@@ -240,6 +240,7 @@ pub(crate) async fn handle_nat_hole_visitor(
     // pre_check=true with full data (treating it as a full request).
     if msg.pre_check && msg.mapped_addrs.is_none() {
         debug!(
+            proxy_name = %proxy_name,
             "NatHoleVisitor pre_check for proxy '{}': OK",
             proxy_name
         );
@@ -269,7 +270,7 @@ pub(crate) async fn handle_nat_hole_visitor(
     {
         Ok(s) => s,
         Err(e) => {
-            warn!("NatHole session creation failed: {}", e);
+            warn!(error = %e, "NatHole session creation failed: {}", e);
             return;
         }
     };
@@ -297,12 +298,13 @@ pub(crate) async fn handle_nat_hole_visitor(
         })
         .is_err()
     {
-        warn!("Provider for run_id {} has gone away", run_id);
+        warn!(run_id = %run_id, "Provider for run_id {} has gone away", run_id);
         state.nat_hole.remove(&transaction_id).await;
         return;
     }
 
     info!(
+        proxy_name = %proxy_name, sid = %sid,
         "NatHoleVisitor for proxy '{}': created session {}, waiting for provider",
         proxy_name, sid
     );
@@ -321,6 +323,7 @@ pub(crate) async fn handle_nat_hole_visitor(
 
     if client_msg_received.is_err() {
         warn!(
+            sid = %sid,
             "NatHole session {}: timeout waiting for provider NatHoleClient",
             sid
         );
@@ -343,7 +346,7 @@ pub(crate) async fn handle_nat_hole_visitor(
     let client_msg = match client_msg_opt {
         Some(m) => m,
         None => {
-            warn!("NatHole session {}: no client message after notify", sid);
+            warn!(sid = %sid, "NatHole session {}: no client message after notify", sid);
             state.nat_hole.remove(&sid).await;
             drop(reader);
             return;
@@ -451,19 +454,19 @@ pub(crate) async fn handle_nat_hole_visitor(
         });
     }
 
-    info!("NatHole session {}: NatHoleResp sent to both sides", sid);
+    info!(sid = %sid, "NatHole session {}: NatHoleResp sent to both sides", sid);
 
     // --- Step 7: Wait for report ---
     match tokio::time::timeout(Duration::from_secs(30), report_rx).await {
         Ok(Ok(_report)) => {
-            debug!("NatHole session {}: provider completed", sid);
+            debug!(sid = %sid, "NatHole session {}: provider completed", sid);
         }
         Ok(Err(_)) => {
-            debug!("NatHole session {}: provider dropped without report", sid);
+            debug!(sid = %sid, "NatHole session {}: provider dropped without report", sid);
             state.nat_hole.remove(&sid).await;
         }
         Err(_) => {
-            warn!("NatHole session {}: timed out waiting for provider report", sid);
+            warn!(sid = %sid, "NatHole session {}: timed out waiting for provider report", sid);
             state.nat_hole.remove(&sid).await;
             drop(reader);
         }
@@ -487,14 +490,14 @@ pub(crate) async fn dispatch_v2_message(
     crypto_ctx: Option<frp_core::v2_handshake::CryptoContext>,
 ) {
     if payload.len() < 2 {
-        warn!("V2 message payload too short from {}", addr);
+        warn!(addr = %addr, "V2 message payload too short from {}", addr);
         return;
     }
     let type_id = u16::from_be_bytes([payload[0], payload[1]]);
     let msg = match frp_core::protocol::deserialize_v2(type_id, &payload[2..]) {
         Ok(m) => m,
         Err(e) => {
-            warn!("Failed to decode V2 message from {}: {}", addr, e);
+            warn!(addr = %addr, error = %e, "Failed to decode V2 message from {}: {}", addr, e);
             return;
         }
     };
@@ -512,7 +515,7 @@ pub(crate) async fn dispatch_v2_message(
             handle_nat_hole_visitor(io, nhv, state, visitor_addr, true).await;
         }
         other => {
-            warn!("Unexpected V2 first message from {}: {:?}", addr, other.v2_type_id());
+            warn!(addr = %addr, type_id = ?other.v2_type_id(), "Unexpected V2 first message from {}: {:?}", addr, other.v2_type_id());
         }
     }
 }
@@ -556,7 +559,7 @@ pub(crate) async fn handle_work_conn_inner(
         ).map(|_| ())
     };
     if let Err(e) = nwc_auth_result {
-        warn!("Work conn auth failed for run_id {}: {}", run_id, e);
+        warn!(run_id = %run_id, error = %e, "Work conn auth failed for run_id {}: {}", run_id, e);
         return;
     }
 
@@ -568,11 +571,11 @@ pub(crate) async fn handle_work_conn_inner(
     match ctl_tx {
         Some(ctl) => {
             if ctl.tx.send(InternalMsg::NewWorkConn(stream)).is_err() {
-                warn!("Control handler for {} has gone away", run_id);
+                warn!(run_id = %run_id, "Control handler for {} has gone away", run_id);
             }
         }
         None => {
-            warn!("No control handler found for run_id {}", run_id);
+            warn!(run_id = %run_id, "No control handler found for run_id {}", run_id);
         }
     }
 }

@@ -1133,21 +1133,21 @@ fn process_includes(
             let content = match std::fs::read_to_string(path) {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::warn!("Include file {}: read error: {}", path.display(), e);
+                    tracing::warn!(path = %path.display(), error = %e, "Include file {}: read error: {}", path.display(), e);
                     continue;
                 }
             };
             let inc_value: Value = match toml::from_str(&content) {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!("Include file {}: parse error: {}", path.display(), e);
+                    tracing::warn!(path = %path.display(), error = %e, "Include file {}: parse error: {}", path.display(), e);
                     continue;
                 }
             };
 
             // Deep-merge included config into main config
             deep_merge_toml(value, &inc_value);
-            tracing::debug!("Merged include file: {}", path.display());
+            tracing::debug!(path = %path.display(), "Merged include file: {}", path.display());
         }
     }
 

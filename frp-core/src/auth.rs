@@ -191,7 +191,7 @@ mod oidc_impl {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                     if let Err(e) = verifier.refresh_jwks().await {
-                        tracing::warn!("OIDC background JWKS refresh failed: {}", e);
+                        tracing::warn!(error = %e, "OIDC background JWKS refresh failed: {}", e);
                     } else {
                         tracing::debug!("OIDC JWKS refreshed in background");
                     }
@@ -629,7 +629,7 @@ pub fn resolve_dynamic_token(token: &str) -> String {
         match std::fs::read_to_string(path) {
             Ok(content) => content.lines().next().unwrap_or("").trim().to_string(),
             Err(e) => {
-                tracing::warn!("Failed to read dynamic token file {}: {}", path, e);
+                tracing::warn!(path = %path, error = %e, "Failed to read dynamic token file {}: {}", path, e);
                 String::new()
             }
         }
@@ -646,6 +646,7 @@ pub fn resolve_dynamic_token(token: &str) -> String {
             Ok(o) => {
                 if !o.status.success() {
                     tracing::warn!(
+                        cmd = %cmd, status = %o.status,
                         "Dynamic token exec command '{}' exited with {}",
                         cmd, o.status
                     );
@@ -658,7 +659,7 @@ pub fn resolve_dynamic_token(token: &str) -> String {
                     .to_string()
             }
             Err(e) => {
-                tracing::warn!("Failed to exec dynamic token command '{}': {}", cmd, e);
+                tracing::warn!(cmd = %cmd, error = %e, "Failed to exec dynamic token command '{}': {}", cmd, e);
                 String::new()
             }
         }

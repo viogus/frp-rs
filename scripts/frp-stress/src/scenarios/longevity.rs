@@ -14,6 +14,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(cli.duration);
 
     tracing::info!(
+        duration = %cli.duration,
         "Longevity test: {}s with connect/transfer/close cycles",
         cli.duration
     );
@@ -25,7 +26,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
         match run_cycle(&target).await {
             Ok(()) => cycles += 1,
             Err(e) => {
-                tracing::error!("Cycle {} failed: {:#}", cycles, e);
+                tracing::error!(cycles = %cycles, error = ?e, "Cycle {} failed: {:#}", cycles, e);
                 failures += 1;
                 if failures > 10 {
                     anyhow::bail!("Too many failures ({})", failures);
@@ -36,6 +37,9 @@ pub async fn run(cli: &Cli) -> Result<()> {
     }
 
     tracing::info!(
+        cycles = %cycles,
+        failures = %failures,
+        duration = %cli.duration,
         "Longevity: {} cycles, {} failures over {}s",
         cycles,
         failures,

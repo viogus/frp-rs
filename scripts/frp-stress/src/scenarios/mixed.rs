@@ -10,7 +10,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
         cli.frps_addr.split(':').next().unwrap_or("127.0.0.1"),
         cli.port
     );
-    tracing::info!("Mixed load test: {}s", cli.duration);
+    tracing::info!(duration = %cli.duration, "Mixed load test: {}s", cli.duration);
 
     let target1 = target.clone();
     let target2 = target.clone();
@@ -37,7 +37,7 @@ async fn steady_load(target: String, dur: u64) -> Result<()> {
     while tokio::time::Instant::now() < deadline {
         match TcpStream::connect(&target).await {
             Ok(s) => streams.push(s),
-            Err(e) => tracing::warn!("steady connect: {}", e),
+            Err(e) => tracing::warn!(error = %e, "steady connect: {}", e),
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
         if streams.len() > 100 {

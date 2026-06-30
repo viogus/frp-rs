@@ -13,6 +13,8 @@ pub async fn run(cli: &Cli) -> Result<()> {
     let batch_size = cli.concurrency.min(50);
 
     tracing::info!(
+        batch_size = %batch_size,
+        duration = %cli.duration,
         "Burst test: batches of {} connect/disconnect for {}s",
         batch_size,
         cli.duration
@@ -31,7 +33,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
             match result {
                 Ok(_) => total_connects += 1,
                 Err(e) => {
-                    tracing::warn!("Burst connect failed: {}", e);
+                    tracing::warn!(error = %e, "Burst connect failed: {}", e);
                     total_failures += 1;
                 }
             }
@@ -47,6 +49,9 @@ pub async fn run(cli: &Cli) -> Result<()> {
     };
 
     tracing::info!(
+        total_connects = %total_connects,
+        total_failures = %total_failures,
+        fail_rate_pct = %(fail_rate * 100.0),
         "Burst: {} connects, {} failures ({:.1}% fail rate)",
         total_connects,
         total_failures,

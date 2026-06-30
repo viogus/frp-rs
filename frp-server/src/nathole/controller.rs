@@ -116,7 +116,7 @@ impl Controller {
     ) -> Result<(Arc<Session>, oneshot::Receiver<msg::NatHoleReport>), String> {
         // Session cap: prevent unbounded memory growth under load.
         if self.sessions.read().await.len() >= MAX_SESSIONS {
-            warn!("NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session");
+            warn!(max_sessions = MAX_SESSIONS, "NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session");
             return Err(format!("NAT hole session limit reached ({MAX_SESSIONS})"));
         }
         let (report_tx, report_rx) = oneshot::channel();
@@ -153,7 +153,7 @@ impl Controller {
     ) -> Result<(Arc<Session>, oneshot::Receiver<msg::NatHoleReport>), String> {
         // Session cap: prevent unbounded memory growth under load.
         if self.sessions.read().await.len() >= MAX_SESSIONS {
-            warn!("NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session");
+            warn!(max_sessions = MAX_SESSIONS, "NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session");
             return Err(format!("NAT hole session limit reached ({MAX_SESSIONS})"));
         }
         let (report_tx, report_rx) = oneshot::channel();
@@ -187,6 +187,8 @@ impl Controller {
             let sessions = self.sessions.read().await;
             if let Some(session) = sessions.get(sid) {
                 trace!(
+                    sid = %sid,
+                    proxy_name = %msg.proxy_name,
                     "handle client message, sid [{}], proxy: {}",
                     sid,
                     msg.proxy_name

@@ -23,6 +23,9 @@ pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
    buf.extend_from_slice(&payload);
 
     tracing::trace!(
+        type_byte = %type_byte,
+        payload_len = payload.len(),
+        payload_text = %String::from_utf8_lossy(&payload),
         "V1 frame: type=0x{:02x} len={} payload={}",
         type_byte,
         payload.len(),
@@ -51,7 +54,15 @@ pub async fn read_v1_frame<R: AsyncReadExt + Unpin>(
         header[5], header[6], header[7], header[8],
     ]);
 
-    tracing::debug!("V1 header: type={:#04x} len={} raw={}", type_byte, length, hex::encode(header));
+    tracing::debug!(
+        type_byte = %type_byte,
+        length = %length,
+        raw = %hex::encode(header),
+        "V1 header: type={:#04x} len={} raw={}",
+        type_byte,
+        length,
+        hex::encode(header)
+    );
 
     if !(0..=V1_MAX_MSG_LENGTH).contains(&length) {
         return Err(crate::Error::Protocol(format!("invalid V1 msg length: {length}")));
@@ -269,11 +280,22 @@ fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate::Er
             FrpMessage::UDPPacket(v)
         }
         msg::TYPE_NAT_HOLE_VISITOR => {
-            tracing::debug!("NatHoleVisitor raw payload: {}", String::from_utf8_lossy(payload));
+            tracing::debug!(
+                payload_text = %String::from_utf8_lossy(payload),
+                "NatHoleVisitor raw payload: {}",
+                String::from_utf8_lossy(payload)
+            );
             let v: msg::NatHoleVisitor = serde_json::from_slice(payload)
                 .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleVisitor: {e}")))?;
-            tracing::debug!("NatHoleVisitor deserialized: transaction_id={:?}, proxy_name={}, pre_check={}",
-                v.transaction_id, v.proxy_name, v.pre_check);
+            tracing::debug!(
+                transaction_id = ?v.transaction_id,
+                proxy_name = %v.proxy_name,
+                pre_check = %v.pre_check,
+                "NatHoleVisitor deserialized: transaction_id={:?}, proxy_name={}, pre_check={}",
+                v.transaction_id,
+                v.proxy_name,
+                v.pre_check
+            );
             FrpMessage::NatHoleVisitor(v)
         }
         msg::TYPE_NAT_HOLE_CLIENT => {
@@ -362,7 +384,15 @@ pub async fn write_v2_frame_raw<W: AsyncWriteExt + Unpin>(
     header[2..4].copy_from_slice(&flags.to_be_bytes());
     header[4..8].copy_from_slice(&(payload.len() as u32).to_be_bytes());
 
-    tracing::trace!("write V2 frame: type={}, flags={}, len={}", frame_type, flags, payload.len());
+    tracing::trace!(
+        frame_type = %frame_type,
+        flags = %flags,
+        payload_len = payload.len(),
+        "write V2 frame: type={}, flags={}, len={}",
+        frame_type,
+        flags,
+        payload.len()
+    );
 
     let mut out = Vec::with_capacity(V2_FRAME_HEADER_LEN + payload.len());
     out.extend_from_slice(&header);
@@ -385,10 +415,18 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
     let flags = u16::from_be_bytes([header[2], header[3]]);
     let payload_len = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
 
-    tracing::debug!("read V2 frame: type={}, flags={}, len={}", frame_type, flags, payload_len);
+    tracing::debug!(
+        frame_type = %frame_type,
+        flags = %flags,
+        payload_len = %payload_len,
+        "read V2 frame: type={}, flags={}, len={}",
+        frame_type,
+        flags,
+        payload_len
+    );
 
     if flags != 0 {
-        tracing::trace!("V2 frame with non-zero flags: {flags}");
+        tracing::trace!(flags = %flags, "V2 frame with non-zero flags: {flags}");
     }
     if payload_len > V2_MAX_FRAME_PAYLOAD as usize {
         return Err(crate::Error::Protocol(format!(

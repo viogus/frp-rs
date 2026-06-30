@@ -44,7 +44,7 @@ pub async fn start_socks5_proxy(cfg: &PluginConfig) -> Result<PluginHandle, frp_
     let pass = if cfg.password.is_empty() { None } else { Some(cfg.password.clone()) };
 
     let task = tokio::spawn(async move {
-        debug!("socks5 plugin listening on {}", local_addr);
+        debug!(local_addr = %local_addr, "socks5 plugin listening on {}", local_addr);
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -54,12 +54,12 @@ pub async fn start_socks5_proxy(cfg: &PluginConfig) -> Result<PluginHandle, frp_
                             let p = pass.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = handle_socks5_conn(stream, u, p).await {
-                                    debug!("socks5: {peer} error: {e}");
+                                    debug!(peer = %peer, error = %e, "socks5: {peer} error: {e}");
                                 }
                             });
                         }
                         Err(e) => {
-                            warn!("socks5 plugin accept error: {e}");
+                            warn!(error = %e, "socks5 plugin accept error: {e}");
                             break;
                         }
                     }

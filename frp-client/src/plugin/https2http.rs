@@ -58,7 +58,7 @@ pub async fn start_https2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let task = tokio::spawn(async move {
-        debug!("https2http plugin listening on {} (TLS)", local_addr);
+        debug!(local_addr = %local_addr, "https2http plugin listening on {} (TLS)", local_addr);
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -72,17 +72,17 @@ pub async fn start_https2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
                                 match acceptor.accept(tcp).await {
                                     Ok(tls) => {
                                         if let Err(e) = handle_conn(tls, &target, &rewrite).await {
-                                            debug!("https2http: {peer} error: {e}");
+                                            debug!(peer = %peer, error = %e, "https2http: {peer} error: {e}");
                                         }
                                     }
                                     Err(e) => {
-                                        debug!("https2http: {peer} TLS error: {e}");
+                                        debug!(peer = %peer, error = %e, "https2http: {peer} TLS error: {e}");
                                     }
                                 }
                             });
                         }
                         Err(e) => {
-                            warn!("https2http plugin accept error: {e}");
+                            warn!(error = %e, "https2http plugin accept error: {e}");
                             break;
                         }
                     }

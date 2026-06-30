@@ -228,6 +228,7 @@ impl VirtualControl {
             // CipherStream — no other data is interleaved. Warn + discard.
             if !accumulated.is_empty() {
                 tracing::warn!(
+                    extra_bytes = %accumulated.len(),
                     "bridge: {} extra bytes after LoginResp, discarding",
                     accumulated.len()
                 );
@@ -259,7 +260,7 @@ impl VirtualControl {
                             }
                         }
                         Err(e) => {
-                            tracing::debug!("bridge: read task exiting: {e}");
+                            tracing::debug!(error = %e, "bridge: read task exiting: {e}");
                             break;
                         }
                     }
@@ -330,7 +331,7 @@ pub struct SshSession {
 
 impl Drop for SshSession {
     fn drop(&mut self) {
-        tracing::debug!("SshSession {} dropped (has handle: {})", self.run_id, self.ssh_handle.is_some());
+        tracing::debug!(run_id = %self.run_id, has_handle = %self.ssh_handle.is_some(), "SshSession {} dropped (has handle: {})", self.run_id, self.ssh_handle.is_some());
     }
 }
 
@@ -484,7 +485,7 @@ impl Handler for SshSession {
     ) -> Result<(), Self::Error> {
         self.ssh_handle = Some(session.handle());
         self.authenticated = true;
-        tracing::info!("SSH session {} authenticated", self.run_id);
+        tracing::info!(run_id = %self.run_id, "SSH session {} authenticated", self.run_id);
 
         // Spawn a background task that handles work connection requests.
         // When the control handler needs a work connection, it writes
@@ -528,12 +529,12 @@ impl Handler for SshSession {
 
         self.pending_command = Some(cmd.clone());
 
-        tracing::info!("SSH session {}: exec_request '{}'", self.run_id, cmd);
+        tracing::info!(run_id = %self.run_id, cmd = %cmd, "SSH session {}: exec_request '{}'", self.run_id, cmd);
 
         let args = match parse_ssh_args(&cmd) {
             Ok(args) => args,
             Err(e) => {
-                tracing::warn!("SSH session {}: parse error: {}", self.run_id, e);
+                tracing::warn!(run_id = %self.run_id, error = %e, "SSH session {}: parse error: {}", self.run_id, e);
                 return Err(anyhow!("{}", e));
             }
         };
@@ -543,6 +544,7 @@ impl Handler for SshSession {
             Some(bind) => bind,
             None => {
                 tracing::debug!(
+                    run_id = %self.run_id,
                     "SSH session {}: exec before -R, storing pending proxy",
                     self.run_id
                 );
@@ -589,6 +591,11 @@ impl Handler for SshSession {
         }
 
         tracing::info!(
+            proxy_name = %proxy_name,
+            proxy_type = %args.proxy_type,
+            remote_port = %allocated,
+            ssh_listen_port = %ssh_listen_port,
+            run_id = %self.run_id,
             "SSH gateway: registered proxy '{}' type={} remote_port={} ssh_listen_port={} (run_id={})",
             proxy_name,
             args.proxy_type,
@@ -623,6 +630,8 @@ impl Handler for SshSession {
         *port = allocated as u32;
 
         tracing::debug!(
+            address = %_address,
+            allocated_port = %allocated,
             "SSH -R bind: {}:{} (SSH listen port {})",
             _address, allocated, allocated
         );
@@ -715,6 +724,7 @@ async fn handle_work_conn_requests(
             Some(p) => p,
             None => {
                 tracing::warn!(
+                    run_id = %run_id,
                     "SSH session {}: WorkConnRequest but no listen ports available",
                     run_id
                 );
@@ -729,6 +739,9 @@ async fn handle_work_conn_requests(
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(
+                    run_id = %run_id,
+                    listen_port = %port,
+                    error = %e,
                     "SSH session {}: failed to connect to SSH listen port {}: {}",
                     run_id, port, e
                 );
@@ -748,6 +761,7 @@ async fn handle_work_conn_requests(
                 let io_stream = frp_core::transport::IoStream::Tcp(stream);
                 if tx.tx.send(InternalMsg::NewWorkConn(io_stream)).is_err() {
                     tracing::error!(
+                        run_id = %run_id,
                         "SSH session {}: control handler channel closed",
                         run_id
                     );
@@ -755,6 +769,7 @@ async fn handle_work_conn_requests(
             }
             None => {
                 tracing::error!(
+                    run_id = %run_id,
                     "SSH session {}: no control handler found for work connection",
                     run_id
                 );
@@ -762,13 +777,13 @@ async fn handle_work_conn_requests(
         }
     }
 
-    tracing::debug!("SSH session {} work-connection handler exiting", run_id);
+    tracing::debug!(run_id = %run_id, "SSH session {} work-connection handler exiting", run_id);
 }
 
 /// Clean up a disconnected SSH session: remove all registered proxies.
 pub async fn cleanup_session(run_id: &str, state: &Arc<AppState>) {
     state.proxy_manager.remove_client(run_id).await;
-    tracing::info!("SSH session {} cleaned up", run_id);
+    tracing::info!(run_id = %run_id, "SSH session {} cleaned up", run_id);
 }
 
 #[cfg(test)]
@@ -909,7 +924,7 @@ impl SshListener {
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
         let addr = format!("{}:{}", self.bind_addr, self.bind_port);
         let listener = TcpListener::bind(&addr).await?;
-        tracing::info!("SSH tunnel gateway listening on {}", addr);
+        tracing::info!(address = %addr, "SSH tunnel gateway listening on {}", addr);
 
         // Build russh server config, wrap in Arc (required by run_stream)
         let mut russh_config = Config::default();
@@ -925,12 +940,12 @@ impl SshListener {
             let (stream, peer_addr) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    tracing::error!("SSH accept error: {}", e);
+                    tracing::error!(error = %e, "SSH accept error: {}", e);
                     continue;
                 }
             };
 
-            tracing::info!("SSH connection from {}", peer_addr);
+            tracing::info!(peer_address = %peer_addr, "SSH connection from {}", peer_addr);
 
             let run_id = uuid::Uuid::new_v4().to_string();
             let state = self.state.clone();
@@ -1006,6 +1021,8 @@ impl SshListener {
                     Ok(running) => running,
                     Err(e) => {
                         tracing::error!(
+                            run_id = %ctrl_run_id,
+                            error = ?e,
                             "SSH session {} failed to start: {:?}",
                             ctrl_run_id,
                             e
@@ -1016,8 +1033,8 @@ impl SshListener {
                 };
 
                 match running.await {
-                    Ok(()) => tracing::info!("SSH session {} ended normally", ctrl_run_id),
-                    Err(e) => tracing::error!("SSH session {} error: {:#}", ctrl_run_id, e),
+                    Ok(()) => tracing::info!(run_id = %ctrl_run_id, "SSH session {} ended normally", ctrl_run_id),
+                    Err(e) => tracing::error!(run_id = %ctrl_run_id, error = ?e, "SSH session {} error: {:#}", ctrl_run_id, e),
                 }
 
                 // Cleanup all proxies registered by this session
