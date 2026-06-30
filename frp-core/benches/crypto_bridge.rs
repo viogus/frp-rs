@@ -198,18 +198,121 @@ fn bench_protocol(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Protocol: V2 roundtrip + per-type V1/V2 serialize/deserialize ────────────
+
+fn bench_protocol_all_types(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let all_types: &[(u8, u16, &str)] = &[
+        (frp_core::msg::TYPE_LOGIN, frp_core::msg::V2_TYPE_LOGIN, "login"),
+        (frp_core::msg::TYPE_LOGIN_RESP, frp_core::msg::V2_TYPE_LOGIN_RESP, "login_resp"),
+        (frp_core::msg::TYPE_NEW_PROXY, frp_core::msg::V2_TYPE_NEW_PROXY, "new_proxy"),
+        (frp_core::msg::TYPE_NEW_PROXY_RESP, frp_core::msg::V2_TYPE_NEW_PROXY_RESP, "new_proxy_resp"),
+        (frp_core::msg::TYPE_CLOSE_PROXY, frp_core::msg::V2_TYPE_CLOSE_PROXY, "close_proxy"),
+        (frp_core::msg::TYPE_NEW_WORK_CONN, frp_core::msg::V2_TYPE_NEW_WORK_CONN, "new_work_conn"),
+        (frp_core::msg::TYPE_REQ_WORK_CONN, frp_core::msg::V2_TYPE_REQ_WORK_CONN, "req_work_conn"),
+        (frp_core::msg::TYPE_START_WORK_CONN, frp_core::msg::V2_TYPE_START_WORK_CONN, "start_work_conn"),
+        (frp_core::msg::TYPE_PING, frp_core::msg::V2_TYPE_PING, "ping"),
+        (frp_core::msg::TYPE_PONG, frp_core::msg::V2_TYPE_PONG, "pong"),
+        (frp_core::msg::TYPE_NEW_VISITOR_CONN, frp_core::msg::V2_TYPE_NEW_VISITOR_CONN, "new_visitor_conn"),
+        (frp_core::msg::TYPE_NEW_VISITOR_CONN_RESP, frp_core::msg::V2_TYPE_NEW_VISITOR_CONN_RESP, "new_visitor_conn_resp"),
+        (frp_core::msg::TYPE_UDP_PACKET, frp_core::msg::V2_TYPE_UDP_PACKET, "udp_packet"),
+        (frp_core::msg::TYPE_NAT_HOLE_VISITOR, frp_core::msg::V2_TYPE_NAT_HOLE_VISITOR, "nat_hole_visitor"),
+        (frp_core::msg::TYPE_NAT_HOLE_CLIENT, frp_core::msg::V2_TYPE_NAT_HOLE_CLIENT, "nat_hole_client"),
+        (frp_core::msg::TYPE_NAT_HOLE_RESP, frp_core::msg::V2_TYPE_NAT_HOLE_RESP, "nat_hole_resp"),
+        (frp_core::msg::TYPE_NAT_HOLE_SID, frp_core::msg::V2_TYPE_NAT_HOLE_SID, "nat_hole_sid"),
+        (frp_core::msg::TYPE_NAT_HOLE_REPORT, frp_core::msg::V2_TYPE_NAT_HOLE_REPORT, "nat_hole_report"),
+        (frp_core::msg::TYPE_CLOSE_PROXY_RESP, frp_core::msg::V2_TYPE_CLOSE_PROXY_RESP, "close_proxy_resp"),
+        (frp_core::msg::TYPE_ERROR, frp_core::msg::V2_TYPE_ERROR, "error"),
+    ];
+
+    let mut group = c.benchmark_group("protocol_all_types");
+    group.throughput(Throughput::Elements(1));
+
+    for &(v1_byte, v2_id, name) in all_types {
+        let msg = frp_core::msg::FrpMessage::from_v1_type_byte(v1_byte).unwrap();
+
+        group.bench_function(format!("v1_serialize_{name}"), |b| {
+            b.iter(|| {
+                let _ = serde_json::to_vec(black_box(&msg)).unwrap();
+            });
+        });
+
+        let json = serde_json::to_vec(&msg).unwrap();
+        group.bench_function(format!("v1_deserialize_{name}"), |b| {
+            b.iter(|| {
+                let _ = frp_core::protocol::deserialize_v1(black_box(v1_byte), black_box(&json));
+            });
+        });
+
+        group.bench_function(format!("v2_roundtrip_{name}"), |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let (mut a_tx, mut a_rx) = tokio::io::duplex(65536);
+                    frp_core::protocol::write_msg_v2(black_box(&mut a_tx), black_box(&msg))
+                        .await
+                        .unwrap();
+                    let _ = frp_core::protocol::read_msg_v2(black_box(&mut a_rx))
+                        .await
+                        .unwrap();
+                });
+            });
+        });
+
+        group.bench_function(format!("v2_serialize_{name}"), |b| {
+            b.iter(|| {
+                let _ = serde_json::to_vec(black_box(&msg)).unwrap();
+                let _ = black_box(v2_id);
+            });
+        });
+
+        group.bench_function(format!("v2_deserialize_{name}"), |b| {
+            b.iter(|| {
+                let _ = frp_core::protocol::deserialize_v2(black_box(v2_id), black_box(&json));
+            });
+        });
+    }
+
+    group.finish();
+}
+
 // ── Encrypted bridge data pipeline ─────────────────────────────────────────
 
 fn bench_bridge_pipeline(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let key = bench_key();
-    let sizes = [1024, 65536, 262144]; // 1KB, 64KB, 256KB
+    let sizes = [1024, 65536, 262144, 1048576]; // 1KB, 64KB, 256KB, 1MB
 
     let mut group = c.benchmark_group("bridge");
     for size in sizes {
         let data = bench_data(size);
         group.throughput(Throughput::Bytes(size as u64));
 
+        // Plain bridge: no encryption, no compression
+        group.bench_function(format!("plain_bridge_{}_bytes", size), |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let (mut u_w_test, u_r_bridge) = tokio::io::duplex(size * 2);
+                    let (w_w_bridge, _w_r_test) = tokio::io::duplex(size * 2);
+                    let (w_w_test, w_r_bridge) = tokio::io::duplex(size * 2);
+                    let (u_w_bridge, _u_r_test) = tokio::io::duplex(size * 2);
+
+                    let h = tokio::spawn(async move {
+                        frp_core::bridge::bridge_plain(
+                            u_r_bridge, u_w_bridge, w_r_bridge, w_w_bridge,
+                            false, vec![], None,
+                        ).await;
+                    });
+
+                    AsyncWriteExt::write_all(&mut u_w_test, &data).await.unwrap();
+                    drop(u_w_test);
+                    drop(w_w_test);
+
+                    h.await.unwrap();
+                });
+            });
+        });
+
+        // Encrypted only: no compression
         group.bench_function(format!("encrypted_bridge_{}_bytes", size), |b| {
             b.iter(|| {
                 rt.block_on(async {
@@ -233,7 +336,71 @@ fn bench_bridge_pipeline(c: &mut Criterion) {
                 });
             });
         });
+
+        // Encrypted + compressed
+        group.bench_function(format!("encrypted_compressed_bridge_{}_bytes", size), |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let (mut u_w_test, u_r_bridge) = tokio::io::duplex(size * 2);
+                    let (w_w_bridge, _w_r_test) = tokio::io::duplex(size * 2);
+                    let (w_w_test, w_r_bridge) = tokio::io::duplex(size * 2);
+                    let (u_w_bridge, _u_r_test) = tokio::io::duplex(size * 2);
+
+                    let h = tokio::spawn(async move {
+                        frp_core::bridge::bridge_encrypted(
+                            u_r_bridge, u_w_bridge, w_r_bridge, w_w_bridge,
+                            &key, true, vec![], None, None, None,
+                        ).await;
+                    });
+
+                    AsyncWriteExt::write_all(&mut u_w_test, &data).await.unwrap();
+                    drop(u_w_test);
+                    drop(w_w_test);
+
+                    h.await.unwrap();
+                });
+            });
+        });
     }
+    group.finish();
+}
+
+// ── Bandwidth limiter accuracy ──────────────────────────────────────────────
+
+fn bench_bandwidth_limiter(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let mut group = c.benchmark_group("bandwidth");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("limiter_consume_within_burst", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let mut lim = frp_core::bandwidth::BandwidthLimiter::new(1_000_000_000); // 1 GB/s — huge burst
+                lim.consume(black_box(1024)).await;
+            });
+        });
+    });
+
+    group.bench_function("limiter_consume_exceeds_burst", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                // 1 KB/s rate, burst = 1KB. Consuming 2KB forces sleep.
+                let mut lim = frp_core::bandwidth::BandwidthLimiter::new(1024);
+                lim.consume(black_box(2048)).await;
+            });
+        });
+    });
+
+    group.bench_function("limiter_consume_zero", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let mut lim = frp_core::bandwidth::BandwidthLimiter::new(1024);
+                lim.consume(black_box(0)).await;
+            });
+        });
+    });
+
     group.finish();
 }
 
@@ -244,6 +411,8 @@ criterion_group!(
     bench_cipher_stream,
     bench_stun_parse,
     bench_protocol,
+    bench_protocol_all_types,
     bench_bridge_pipeline,
+    bench_bandwidth_limiter,
 );
 criterion_main!(benches);
