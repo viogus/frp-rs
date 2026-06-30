@@ -39,8 +39,8 @@ pub struct Service {
     encryption_key: [u8; 16],
     /// Map proxy_name -> runtime info for looking up where to connect
     proxy_info_map: Arc<RwLock<HashMap<String, ProxyRuntimeInfo>>>,
-    /// Plugin handles kept alive for the lifetime of the service.
-    _plugin_handles: Vec<PluginHandle>,
+    /// Plugin handles keyed by proxy name. Drop removes the plugin task.
+    plugin_handles: Arc<std::sync::Mutex<HashMap<String, PluginHandle>>>,
     /// OIDC client for fetching access tokens (None when auth method is Token).
     oidc_client: Option<Arc<OidcClient>>,
     /// Server-side auth scopes from LoginResp, used for Ping/NewWorkConn gating.
@@ -117,7 +117,7 @@ impl Service {
         let oidc_client: Option<Arc<OidcClient>> = None;
 
         // Start plugins for proxies that have them configured.
-        let mut plugin_handles = Vec::new();
+        let mut plugin_handles_map: HashMap<String, PluginHandle> = HashMap::new();
         let mut plugin_addrs: HashMap<String, String> = HashMap::new();
 
         // Register a successfully started plugin.
@@ -126,14 +126,14 @@ impl Service {
             proxy_name: &str,
             result: Result<PluginHandle, frp_core::Error>,
             addrs: &mut HashMap<String, String>,
-            handles: &mut Vec<PluginHandle>,
+            handles: &mut HashMap<String, PluginHandle>,
         ) {
             match result {
                 Ok(handle) => {
                     let addr = handle.local_addr.to_string();
                     info!(plugin_type = %plugin_type, proxy_name = %proxy_name, addr = %addr, "{plugin_type} plugin for '{proxy_name}' started on {addr}");
                     addrs.insert(proxy_name.to_string(), addr);
-                    handles.push(handle);
+                    handles.insert(proxy_name.to_string(), handle);
                 }
                 Err(e) => {
                     warn!(plugin_type = %plugin_type, proxy_name = %proxy_name, error = %e, "Failed to start {plugin_type} plugin for '{proxy_name}': {e}");
@@ -147,47 +147,47 @@ impl Service {
                     "http_proxy" => {
                         record_plugin("http_proxy", &p.name,
                             plugin::start_http_proxy(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles);
+                            &mut plugin_addrs, &mut plugin_handles_map);
                     }
                     "socks5" => {
                         record_plugin("socks5", &p.name,
                             plugin::start_socks5_proxy(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles);
+                            &mut plugin_addrs, &mut plugin_handles_map);
                     }
                     "static_file" => {
                         record_plugin("static_file", &p.name,
                             plugin::start_static_file_proxy(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles);
+                            &mut plugin_addrs, &mut plugin_handles_map);
                     }
                     "unix_domain_socket" => {
                         record_plugin("unix_domain_socket", &p.name,
                             plugin::start_unix_socket_plugin(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles);
+                            &mut plugin_addrs, &mut plugin_handles_map);
                     }
                     "tls2raw" => {
                         record_plugin("tls2raw", &p.name,
                             plugin::start_tls2raw_plugin(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles);
+                            &mut plugin_addrs, &mut plugin_handles_map);
                     }
                     "http2http" => {
                         record_plugin("http2http", &p.name,
                             plugin::start_http2http_plugin(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles);
+                            &mut plugin_addrs, &mut plugin_handles_map);
                     }
                     "http2https" => {
                         record_plugin("http2https", &p.name,
                             plugin::start_http2https_plugin(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles);
+                            &mut plugin_addrs, &mut plugin_handles_map);
                     }
                     "https2http" => {
                         record_plugin("https2http", &p.name,
                             plugin::start_https2http_plugin(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles);
+                            &mut plugin_addrs, &mut plugin_handles_map);
                     }
                     "https2https" => {
                         record_plugin("https2https", &p.name,
                             plugin::start_https2https_plugin(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles);
+                            &mut plugin_addrs, &mut plugin_handles_map);
                     }
                     "visitor_plugin" => {
                         let plugin_ctx = PluginContext {
@@ -204,7 +204,7 @@ impl Service {
                         };
                         record_plugin("visitor", &p.name,
                             plugin::start_visitor_plugin(plugin_cfg, plugin_ctx).await,
-                            &mut plugin_addrs, &mut plugin_handles);
+                            &mut plugin_addrs, &mut plugin_handles_map);
                     }
                     other => {
                         warn!(plugin_type = %other, proxy_name = %p.name, "Unknown plugin type '{other}' for proxy '{}'", p.name);
@@ -261,7 +261,7 @@ impl Service {
             auth_cfg: Arc::new(auth_cfg),
             encryption_key: enc_key,
             proxy_info_map,
-            _plugin_handles: plugin_handles,
+            plugin_handles: Arc::new(std::sync::Mutex::new(plugin_handles_map)),
             oidc_client,
             server_auth_scopes: tokio::sync::RwLock::new(Vec::new()),
             proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
@@ -1055,25 +1055,217 @@ impl Service {
         }
     }
 
-    /// Reload configuration from file. Used by admin API.
+    /// Start a single plugin and return its handle with resolved bound address.
+    /// Used during reload to restart plugins with updated config.
+    /// Returns None if plugin_type is unknown or start fails (logged internally).
+    async fn start_plugin(
+        &self,
+        proxy_name: &str,
+        plugin_cfg: &frp_core::config::PluginConfig,
+    ) -> Option<PluginHandle> {
+        let result = match plugin_cfg.plugin_type.as_str() {
+            "http_proxy" => plugin::start_http_proxy(plugin_cfg).await,
+            "socks5" => plugin::start_socks5_proxy(plugin_cfg).await,
+            "static_file" => plugin::start_static_file_proxy(plugin_cfg).await,
+            "unix_domain_socket" => plugin::start_unix_socket_plugin(plugin_cfg).await,
+            "tls2raw" => plugin::start_tls2raw_plugin(plugin_cfg).await,
+            "http2http" => plugin::start_http2http_plugin(plugin_cfg).await,
+            "http2https" => plugin::start_http2https_plugin(plugin_cfg).await,
+            "https2http" => plugin::start_https2http_plugin(plugin_cfg).await,
+            "https2https" => plugin::start_https2https_plugin(plugin_cfg).await,
+            "visitor_plugin" => {
+                let ctx = PluginContext {
+                    server_addr: self.cfg.server_addr.clone(),
+                    server_port: self.cfg.server_port,
+                    transport_protocol: self.cfg.transport_protocol.clone(),
+                    tls_enable: self.cfg.tls_enable,
+                    tls_server_name: self.cfg.tls_server_name.clone(),
+                    tls_ca_file: if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
+                    use_encryption: true,
+                    use_compression: false,
+                    token: self.auth_cfg.token.clone(),
+                    oidc_client: self.oidc_client.clone(),
+                };
+                plugin::start_visitor_plugin(plugin_cfg, ctx).await
+            }
+            other => {
+                warn!(plugin_type = %other, proxy_name = %proxy_name, "Unknown plugin type '{}' for '{}'", other, proxy_name);
+                return None;
+            }
+        };
+
+        match result {
+            Ok(handle) => {
+                info!(
+                    plugin_type = %plugin_cfg.plugin_type,
+                    proxy_name = %proxy_name,
+                    addr = %handle.local_addr,
+                    "{} plugin for '{}' restarted on {}",
+                    plugin_cfg.plugin_type, proxy_name, handle.local_addr
+                );
+                Some(handle)
+            }
+            Err(e) => {
+                warn!(
+                    plugin_type = %plugin_cfg.plugin_type,
+                    proxy_name = %proxy_name,
+                    error = %e,
+                    "Failed to restart {} plugin for '{}': {}",
+                    plugin_cfg.plugin_type, proxy_name, e
+                );
+                None
+            }
+        }
+    }
+
+    /// Reload configuration from file. Used by admin API and SIGUSR1.
     ///
-    /// Sends NewProxy for added proxies and CloseProxy for removed proxies
-    /// over the control connection. Responses are handled asynchronously by
-    /// the message loop. Plugin-based proxies log a warning (plugin restart
-    /// requires a full frpc restart).
+    /// Diffs old vs new proxy configs, restarts affected plugins, sends
+    /// CloseProxy/NewProxy messages with correct plugin bound addresses,
+    /// and updates the shared proxy_info_map.
     pub async fn try_reload(
         &self,
         config_path: &str,
         strict: bool,
         writer: &Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>,
     ) -> Result<String, String> {
-        crate::reload::do_reload(
+        let delta = crate::reload::do_reload(
             &self.proxy_info_map,
-            self.cfg.v2,
             config_path,
             strict,
-            writer,
-        ).await
+        ).await?;
+
+        if delta.removed.is_empty() && delta.added.is_empty() && delta.changed.is_empty() {
+            return Ok(delta.summary);
+        }
+
+        let v2 = self.cfg.v2;
+
+        // Step 1: Drop old PluginHandles for removed and changed proxies.
+        // PluginHandle::Drop sends a oneshot shutdown signal to the plugin task.
+        {
+            let mut handles = self.plugin_handles.lock().unwrap();
+            for name in delta.removed.iter().chain(delta.changed.iter()) {
+                if handles.remove(name).is_some() {
+                    debug!(proxy_name = %name, "Dropped old plugin handle for '{}'", name);
+                }
+            }
+        }
+
+        // Step 2: Start new plugins for added and changed proxies that have plugin config.
+        // Collect actual bound addresses for use in NewProxy messages and map updates.
+        let mut plugin_addrs: HashMap<String, String> = HashMap::new();
+        for name in delta.added.iter().chain(delta.changed.iter()) {
+            if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
+                if let Some(ref plugin_cfg) = p.plugin {
+                    if let Some(handle) = self.start_plugin(name, plugin_cfg).await {
+                        let addr = handle.local_addr.to_string();
+                        plugin_addrs.insert(name.clone(), addr);
+                        self.plugin_handles.lock().unwrap().insert(name.clone(), handle);
+                    }
+                    // If plugin start fails, plugin_addrs won't have an entry;
+                    // the proxy uses configured local_ip:local_port as fallback.
+                }
+            }
+        }
+
+        // Step 3: Send CloseProxy/NewProxy with correct local addresses.
+        let mut changes: Vec<String> = Vec::new();
+        let mut w = writer.lock().await;
+
+        // Send CloseProxy for removed proxies (fire-and-forget)
+        for name in &delta.removed {
+            let close = FrpMessage::CloseProxy(msg::CloseProxy {
+                proxy_name: name.clone(),
+            });
+            write_msg(&mut *w, &close, v2).await
+                .map_err(|e| format!("send CloseProxy for '{name}': {e}"))?;
+            changes.push(format!("proxy '{name}' removed"));
+            tracing::info!(name = %name, "Reload: sent CloseProxy for removed '{}'", name);
+        }
+
+        // Send CloseProxy + NewProxy for changed proxies
+        for name in &delta.changed {
+            if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
+                let close = FrpMessage::CloseProxy(msg::CloseProxy {
+                    proxy_name: name.clone(),
+                });
+                write_msg(&mut *w, &close, v2).await
+                    .map_err(|e| format!("send CloseProxy for changed '{name}': {e}"))?;
+
+                let local_addr = plugin_addrs
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
+                let np = crate::proxy::create_new_proxy_msg(p, &local_addr);
+                write_msg(&mut *w, &np, v2).await
+                    .map_err(|e| format!("send NewProxy for changed '{name}': {e}"))?;
+                changes.push(format!("proxy '{name}' updated"));
+                tracing::info!(name = %name, local_addr = %local_addr, "Reload: sent CloseProxy+NewProxy for changed '{}'", name);
+            }
+        }
+
+        // Send NewProxy for added proxies
+        for name in &delta.added {
+            if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
+                let local_addr = plugin_addrs
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
+                let np = crate::proxy::create_new_proxy_msg(p, &local_addr);
+                write_msg(&mut *w, &np, v2).await
+                    .map_err(|e| format!("send NewProxy for added '{name}': {e}"))?;
+                changes.push(format!("proxy '{name}' added"));
+                tracing::info!(name = %name, local_addr = %local_addr, "Reload: sent NewProxy for added '{}'", name);
+            }
+        }
+        drop(w);
+
+        // Step 4: Update proxy_info_map so admin API and work conn lookups
+        // reflect the new proxy set with correct plugin bound addresses.
+        {
+            let mut map = self.proxy_info_map.write().await;
+            for name in &delta.removed {
+                map.remove(name);
+            }
+            for name in delta.changed.iter().chain(delta.added.iter()) {
+                if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
+                    let bw_limit = frp_core::config::parse_bandwidth_limit(&p.bandwidth_limit).unwrap_or(0);
+                    let local_addr = plugin_addrs
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
+                    let plugin_type = p.plugin.as_ref()
+                        .map(|pl| pl.plugin_type.clone())
+                        .unwrap_or_default();
+                    let snapshot = crate::reload::config_snapshot(p);
+                    let mut err = String::new();
+                    // If this proxy has a plugin but plugin_addrs doesn't have it,
+                    // the plugin failed to start — record the error
+                    if p.plugin.is_some() && !plugin_addrs.contains_key(name) {
+                        err = format!("plugin '{}' failed to start", plugin_type);
+                    }
+                    map.insert(name.clone(), ProxyRuntimeInfo {
+                        local_addr,
+                        proxy_type: p.proxy_type.clone(),
+                        use_encryption: p.use_encryption,
+                        use_compression: p.use_compression,
+                        sk: p.sk.clone(),
+                        bandwidth_limit: bw_limit,
+                        bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
+                        proxy_protocol_version: p.proxy_protocol_version.clone(),
+                        plugin: plugin_type,
+                        remote_addr: String::new(),
+                        err,
+                        config_snapshot: snapshot,
+                    });
+                }
+            }
+        }
+
+        let summary = changes.join("; ");
+        tracing::info!(summary = %summary, "Config reload summary: {}", summary);
+        Ok(format!("reload success: {summary}"))
     }
 }
 

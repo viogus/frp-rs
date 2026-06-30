@@ -1,16 +1,14 @@
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tracing;
 
 use frp_core::config::{ClientConfig, ProxyConfig};
-use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::write_msg;
 
 use crate::admin::ProxyRuntimeInfo;
 
 /// Build a config snapshot string for reload change detection.
-/// Includes all fields that matter for proxy registration.
+/// Includes all fields that matter for proxy registration and plugin config.
 pub(crate) fn config_snapshot(p: &ProxyConfig) -> String {
     // Sort and serialize key fields deterministically
     let mut fields: Vec<(&str, String)> = Vec::new();
@@ -33,24 +31,55 @@ pub(crate) fn config_snapshot(p: &ProxyConfig) -> String {
     fields.push(("group_key", p.group_key.clone()));
     fields.push(("multiplexer", p.multiplexer.clone()));
     fields.push(("proxy_protocol_version", p.proxy_protocol_version.clone()));
+
+    // Plugin fields — needed for detecting plugin config changes during reload
+    if let Some(ref pl) = p.plugin {
+        fields.push(("plugin.type", pl.plugin_type.clone()));
+        fields.push(("plugin.http_user", pl.http_user.clone()));
+        fields.push(("plugin.http_password", pl.http_password.clone()));
+        fields.push(("plugin.local_addr", pl.local_addr.clone()));
+        fields.push(("plugin.local_path", pl.local_path.clone()));
+        fields.push(("plugin.strip_prefix", pl.strip_prefix.clone()));
+        fields.push(("plugin.host_header_rewrite", pl.host_header_rewrite.clone()));
+        fields.push(("plugin.username", pl.username.clone()));
+        fields.push(("plugin.password", pl.password.clone()));
+        fields.push(("plugin.crt_file", pl.crt_file.clone()));
+        fields.push(("plugin.key_file", pl.key_file.clone()));
+        fields.push(("plugin.server_name", pl.server_name.clone()));
+        fields.push(("plugin.secret_key", pl.secret_key.clone()));
+        fields.push(("plugin.bind_addr", pl.bind_addr.clone()));
+        fields.push(("plugin.bind_port", pl.bind_port.to_string()));
+    } else {
+        fields.push(("plugin.type", "(none)".to_string()));
+    }
+
     fields.sort_by(|a, b| a.0.cmp(b.0));
     let parts: Vec<String> = fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
     parts.join("|")
 }
 
-/// Reload configuration from file. Used by admin API.
+/// Result of diffing old vs new proxy configurations.
+/// The caller (try_reload) uses this to restart plugins,
+/// send protocol messages, and update proxy_info_map.
+#[derive(Debug)]
+pub(crate) struct ReloadDelta {
+    pub summary: String,
+    pub removed: Vec<String>,
+    pub added: Vec<String>,
+    pub changed: Vec<String>,
+    pub new_config: ClientConfig,
+}
+
+/// Compute the diff between the current proxy set and a freshly loaded config.
 ///
-/// Sends NewProxy for added proxies and CloseProxy for removed proxies
-/// over the control connection. Responses are handled asynchronously by
-/// the message loop. Plugin-based proxies log a warning (plugin restart
-/// requires a full frpc restart).
+/// Does NOT send protocol messages or update proxy_info_map — the caller
+/// (`Service::try_reload`) handles plugin restarts, message sending, and
+/// state updates so it can use the correct plugin bound addresses.
 pub(crate) async fn do_reload(
     proxy_info_map: &Arc<RwLock<HashMap<String, ProxyRuntimeInfo>>>,
-    v2: bool,
     config_path: &str,
     strict: bool,
-    writer: &Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>,
-) -> Result<String, String> {
+) -> Result<ReloadDelta, String> {
     let new_cfg: ClientConfig = frp_core::config::load_client_config(config_path, strict)
         .map_err(|e| format!("failed to load config: {e}"))?;
 
@@ -87,101 +116,24 @@ pub(crate) async fn do_reload(
     }
 
     if removed.is_empty() && added.is_empty() && changed.is_empty() {
-        return Ok("reload success: no changes detected".into());
-    }
-
-    let mut changes: Vec<String> = Vec::new();
-    let mut w = writer.lock().await;
-
-    // Send CloseProxy for removed proxies (fire-and-forget; CloseProxyResp
-    // is handled by the message loop)
-    for name in &removed {
-        let close = FrpMessage::CloseProxy(msg::CloseProxy {
-            proxy_name: name.clone(),
+        return Ok(ReloadDelta {
+            summary: "reload success: no changes detected".into(),
+            removed,
+            added,
+            changed,
+            new_config: new_cfg,
         });
-        write_msg(&mut *w, &close, v2).await
-            .map_err(|e| format!("send CloseProxy for '{name}': {e}"))?;
-        changes.push(format!("proxy '{name}' removed"));
-        tracing::info!(name = %name, "Reload: sent CloseProxy for '{name}'");
     }
 
-    // Send CloseProxy + NewProxy for changed proxies
-    for name in &changed {
-        if let Some(p) = new_cfg.proxies.iter().find(|p| &p.name == name) {
-            if p.plugin.is_some() {
-                tracing::warn!(
-                    name = %name,
-                    "Reload: proxy '{name}' has a plugin — plugin restart requires full frpc restart"
-                );
-            }
-            let close = FrpMessage::CloseProxy(msg::CloseProxy {
-                proxy_name: name.clone(),
-            });
-            write_msg(&mut *w, &close, v2).await
-                .map_err(|e| format!("send CloseProxy for changed '{name}': {e}"))?;
-            let local_addr = format!("{}:{}", p.local_ip, p.local_port);
-            let np = crate::proxy::create_new_proxy_msg(p, &local_addr);
-            write_msg(&mut *w, &np, v2).await
-                .map_err(|e| format!("send NewProxy for changed '{name}': {e}"))?;
-            changes.push(format!("proxy '{name}' updated"));
-            tracing::info!(name = %name, "Reload: sent CloseProxy+NewProxy for changed '{name}'");
-        }
-    }
+    let summary = format!(
+        "reload: +{} added, ~{} changed, -{} removed",
+        added.len(),
+        changed.len(),
+        removed.len()
+    );
+    tracing::info!(added = %added.len(), changed = %changed.len(), removed = %removed.len(),
+        "Config diff: +{} added, ~{} changed, -{} removed",
+        added.len(), changed.len(), removed.len());
 
-    // Send NewProxy for added proxies (fire-and-forget; NewProxyResp
-    // is handled by the message loop)
-    for name in &added {
-        if let Some(p) = new_cfg.proxies.iter().find(|p| &p.name == name) {
-            if p.plugin.is_some() {
-                tracing::warn!(
-                    name = %name,
-                    "Reload: proxy '{name}' has a plugin — plugin restart requires full frpc restart"
-                );
-            }
-            let local_addr = format!("{}:{}", p.local_ip, p.local_port);
-            let np = crate::proxy::create_new_proxy_msg(p, &local_addr);
-            write_msg(&mut *w, &np, v2).await
-                .map_err(|e| format!("send NewProxy for '{name}': {e}"))?;
-            changes.push(format!("proxy '{name}' added"));
-            tracing::info!(name = %name, "Reload: sent NewProxy for '{name}'");
-        }
-    }
-    drop(w);
-
-    // Update the shared proxy_info_map so admin API and work conn lookups
-    // reflect the new proxy set.
-    {
-        let mut map = proxy_info_map.write().await;
-        for name in &removed {
-            map.remove(name);
-        }
-        for name in changed.iter().chain(added.iter()) {
-            if let Some(p) = new_cfg.proxies.iter().find(|p| &p.name == name) {
-                let bw_limit = frp_core::config::parse_bandwidth_limit(&p.bandwidth_limit).unwrap_or(0);
-                let local_addr = format!("{}:{}", p.local_ip, p.local_port);
-                let plugin_type = p.plugin.as_ref()
-                    .map(|pl| pl.plugin_type.clone())
-                    .unwrap_or_default();
-                let snapshot = config_snapshot(p);
-                map.insert(name.clone(), ProxyRuntimeInfo {
-                    local_addr,
-                    proxy_type: p.proxy_type.clone(),
-                    use_encryption: p.use_encryption,
-                    use_compression: p.use_compression,
-                    sk: p.sk.clone(),
-                    bandwidth_limit: bw_limit,
-                    bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
-                    proxy_protocol_version: p.proxy_protocol_version.clone(),
-                    plugin: plugin_type,
-                    remote_addr: String::new(),
-                    err: String::new(),
-                    config_snapshot: snapshot,
-                });
-            }
-        }
-    }
-
-    let summary = changes.join("; ");
-    tracing::info!(summary = %summary, "Config reload summary: {}", summary);
-    Ok(format!("reload success: {summary}"))
+    Ok(ReloadDelta { summary, removed, added, changed, new_config: new_cfg })
 }
