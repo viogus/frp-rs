@@ -563,6 +563,15 @@ pub(crate) async fn handle_work_conn_inner(
         return;
     }
 
+    // NewWorkConn plugin hook — control-enabled plugins can reject
+    let nwc_content = serde_json::json!({
+        "run_id": run_id,
+    });
+    if let Err(reason) = state.plugin_manager.notify("new_work_conn", nwc_content).await {
+        warn!(run_id = %run_id, reason = %reason, "NewWorkConn plugin hook rejected: {}", reason);
+        return;
+    }
+
     let ctl_tx = {
         let map = state.run_id_to_ctl_tx.read().await;
         map.get(&run_id).cloned()
