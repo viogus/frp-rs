@@ -61,7 +61,9 @@ COPY frp-vnet/ frp-vnet/
 COPY frps/ frps/
 COPY frpc/ frpc/
 
-RUN cargo zigbuild --target $(cat /tmp/rust_target) --release ${FRP_FEATURES} && \
+# Use -p <package> to avoid building frp-vnet workspace member on tiny/micro,
+# which would force-enable frp-core/vnet via feature unification.
+RUN cargo zigbuild -p ${FRP_COMPONENT%-*} --target $(cat /tmp/rust_target) --release ${FRP_FEATURES} && \
     cp target/$(cat /tmp/rust_target)/release/${FRP_COMPONENT} /usr/bin/frp && \
     strip /usr/bin/frp || true
 
