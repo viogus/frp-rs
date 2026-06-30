@@ -20,7 +20,6 @@ unsafe impl Sync for LinuxTun {}
 
 impl LinuxTun {
     pub async fn open(requested_name: &str) -> anyhow::Result<Box<dyn TunDevice>> {
-        use std::os::unix::ffi::OsStrExt;
         use std::ffi::CStr;
 
         let dev = std::fs::OpenOptions::new()
@@ -39,7 +38,12 @@ impl LinuxTun {
             bytes
         };
         let copy_len = name_bytes.len().min(libc::IFNAMSIZ);
-        ifr.ifr_name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+        for (dst, src) in ifr.ifr_name[..copy_len]
+            .iter_mut()
+            .zip(&name_bytes[..copy_len])
+        {
+            *dst = *src as libc::c_char;
+        }
 
         ifr.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
 
@@ -119,7 +123,12 @@ impl TunDevice for LinuxTun {
         let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
         let name_bytes = self.name.as_bytes();
         let copy_len = name_bytes.len().min(libc::IFNAMSIZ - 1);
-        ifr.ifr_name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+        for (dst, src) in ifr.ifr_name[..copy_len]
+            .iter_mut()
+            .zip(&name_bytes[..copy_len])
+        {
+            *dst = *src as libc::c_char;
+        }
 
         set_sockaddr(
             &mut ifr,
