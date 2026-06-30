@@ -97,7 +97,7 @@ impl TunDevice for LinuxTun {
         unsafe fn set_sockaddr(
             ifr: &mut libc::ifreq,
             sock: libc::c_int,
-            ioctl: libc::c_ulong,
+            ioctl: libc::c_int,
             addr: u32,
         ) -> anyhow::Result<()> {
             let sin = libc::sockaddr_in {
@@ -134,7 +134,7 @@ impl TunDevice for LinuxTun {
             set_sockaddr(
                 &mut ifr,
                 sock,
-                libc::SIOCSIFADDR,
+                libc::SIOCSIFADDR as libc::c_int,
                 u32::from(addr).to_be(),
             )
         }
@@ -146,7 +146,7 @@ impl TunDevice for LinuxTun {
             set_sockaddr(
                 &mut ifr,
                 sock,
-                libc::SIOCSIFNETMASK,
+                libc::SIOCSIFNETMASK as libc::c_int,
                 u32::from(netmask).to_be(),
             )
         }
@@ -156,7 +156,7 @@ impl TunDevice for LinuxTun {
         })?;
 
         ifr.ifr_ifru.ifru_mtu = mtu as libc::c_int;
-        let ret = unsafe { libc::ioctl(sock, libc::SIOCSIFMTU, &ifr) };
+        let ret = unsafe { libc::ioctl(sock, libc::SIOCSIFMTU as _, &ifr) };
         if ret < 0 {
             unsafe { libc::close(sock) };
             return Err(anyhow::anyhow!(
@@ -167,7 +167,7 @@ impl TunDevice for LinuxTun {
         self.mtu.set(mtu);
 
         // Bring up
-        let ret = unsafe { libc::ioctl(sock, libc::SIOCGIFFLAGS, &ifr) };
+        let ret = unsafe { libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &ifr) };
         if ret < 0 {
             unsafe { libc::close(sock) };
             return Err(anyhow::anyhow!(
@@ -178,7 +178,7 @@ impl TunDevice for LinuxTun {
         unsafe {
             ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
         }
-        let ret = unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS, &ifr) };
+        let ret = unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr) };
         if ret < 0 {
             unsafe { libc::close(sock) };
             return Err(anyhow::anyhow!(
