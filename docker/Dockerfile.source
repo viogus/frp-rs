@@ -57,6 +57,7 @@ COPY Cargo.toml Cargo.lock* ./
 COPY frp-core/ frp-core/
 COPY frp-server/ frp-server/
 COPY frp-client/ frp-client/
+COPY frp-vnet/ frp-vnet/
 COPY frps/ frps/
 COPY frpc/ frpc/
 
