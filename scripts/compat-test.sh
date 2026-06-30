@@ -2690,6 +2690,9 @@ test_quic_rust_to_rust() {
         return
     fi
 
+    # Idle resilience: verify QUIC survives idle period
+    sleep 5
+
     local result
     result=$(send_and_expect "$proxy_port" "quic-r2r-data" "quic-r2r-data" 10)
     if [[ "$result" == OK:* ]]; then
@@ -3635,6 +3638,9 @@ test_g2r_quic() {
         return
     fi
 
+    # Idle resilience: verify QUIC survives idle period
+    sleep 5
+
     local result
     result=$(send_and_expect "$proxy_port" "quic-test-data" "quic-test-data" 15)
     if [[ "$result" == OK:* ]]; then
@@ -3686,12 +3692,116 @@ test_r2g_quic() {
         return
     fi
 
+    # Idle resilience: verify QUIC survives idle period
+    sleep 5
+
     local result
     result=$(send_and_expect "$proxy_port" "quic-r2g-test" "quic-r2g-test" 10)
     if [[ "$result" == OK:* ]]; then
         pass_test "$name"
     else
         fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Go frpc -> Rust frps, QUIC multi-proxy (2 proxies over 1 QUIC connection)
+# =============================================================================
+test_g2r_quic_multi_proxy() {
+    local name="go-to-rust-quic-multi-proxy"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local quic_port=$(random_port)
+    local proxy1_port=$(random_port)
+    local proxy2_port=$(random_port)
+    local echo1_port=$(random_port)
+    local echo2_port=$(random_port)
+    local token="test-token-g2r-quic-multi"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo1_port"
+    wait_for_port 127.0.0.1 "$echo1_port" 3 || {
+        fail_test "$name" "echo1 server did not start"
+        return
+    }
+    start_echo_server "$echo2_port"
+    wait_for_port 127.0.0.1 "$echo2_port" 3 || {
+        fail_test "$name" "echo2 server did not start"
+        return
+    }
+
+    # Start Rust frps with QUIC
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "quic=$quic_port"
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 10 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Custom Go frpc config with 2 proxies over QUIC
+    cat > "$TEST_DIR/$name/frpc.toml" << GOFPC_EOF
+serverAddr = "127.0.0.1"
+serverPort = $quic_port
+
+auth.token = "$token"
+
+transport.protocol = "quic"
+transport.tls.enable = true
+transport.tls.disableCustomTLSFirstByte = true
+transport.tls.trustedCaFile = "$CERT_DIR/ca.crt"
+transport.tls.serverName = "localhost"
+transport.tcpMux = false
+
+log.to = "$TEST_DIR/go-frpc-$name.log"
+log.level = "debug"
+
+[[proxies]]
+name = "quic-multi-1"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = $echo1_port
+remotePort = $proxy1_port
+
+[[proxies]]
+name = "quic-multi-2"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = $echo2_port
+remotePort = $proxy2_port
+GOFPC_EOF
+
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    # QUIC transport needs extra time for multi-stream setup
+    sleep 2
+
+    # Verify proxy 1
+    if ! wait_for_port_safe 127.0.0.1 "$proxy1_port" 25; then
+        fail_test "$name" "proxy1 port $proxy1_port not reachable"
+        return
+    fi
+    local result1
+    result1=$(send_and_expect "$proxy1_port" "quic-multi-1-data" "quic-multi-1-data" 5)
+
+    # Verify proxy 2
+    if ! wait_for_port_safe 127.0.0.1 "$proxy2_port" 15; then
+        fail_test "$name" "proxy2 port $proxy2_port not reachable"
+        return
+    fi
+    local result2
+    result2=$(send_and_expect "$proxy2_port" "quic-multi-2-data" "quic-multi-2-data" 5)
+
+    if [[ "$result1" == OK:* ]] && [[ "$result2" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "proxy1=$result1 proxy2=$result2"
     fi
 }
 
@@ -3849,6 +3959,7 @@ run_test test_quic_rust_to_rust
 # Both pre-built and source-built Go frp binaries work with release Rust build.
 run_test test_g2r_quic
 run_test test_r2g_quic
+run_test test_g2r_quic_multi_proxy
 
 # Phase 9: V2 wire protocol
 # g2r: Go frpc needs source build for transport.wireProtocol config support.
