@@ -290,8 +290,38 @@ async fn handle_root() -> Html<String> {
     Html(include_str!("dashboard.html").replace("{version}", frp_core::VERSION))
 }
 
-async fn handle_healthz() -> &'static str {
-    "ok"
+#[derive(Deserialize)]
+struct HealthzQuery {
+    /// Probe type: "liveness" (default) or "readiness".
+    #[serde(default)]
+    probe: Option<String>,
+}
+
+async fn handle_healthz(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HealthzQuery>,
+) -> (StatusCode, &'static str) {
+    match query.probe.as_deref() {
+        Some("readiness") => {
+            // Verify internal state structures are accessible (not deadlocked).
+            let used_ok = state.used_ports.try_read().is_ok();
+            let ctl_ok = state.run_id_to_ctl_tx.try_read().is_ok();
+            if used_ok && ctl_ok {
+                (StatusCode::OK, "ok")
+            } else {
+                tracing::warn!(
+                    "Readiness check failed: used_ports={} ctl_map={}",
+                    used_ok,
+                    ctl_ok
+                );
+                (StatusCode::SERVICE_UNAVAILABLE, "not ready")
+            }
+        }
+        _ => {
+            // Liveness: process is alive, always ok.
+            (StatusCode::OK, "ok")
+        }
+    }
 }
 
 // --- Store API ---
