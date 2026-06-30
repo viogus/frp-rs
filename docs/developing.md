@@ -393,13 +393,13 @@ cargo clippy                 # Lint
 Three size tiers via feature flags:
 
 ```bash
-# Full (all features, ~4.6MB frps, ~3.4MB frpc)
+# Full (all features, ~4.8MB frps, ~3.7MB frpc)
 cargo build --release -p frps -p frpc
 
-# Tiny (no QUIC/KCP/WS/SSH/OIDC/dashboard; keeps TLS, ~2.8MB/~2.6MB)
+# Tiny (no QUIC/KCP/WS/SSH/OIDC/dashboard; keeps TLS, ~2.7MB/~2.3MB)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
 
-# Micro (core only: no TLS, compression, chacha20, HTTP proxy, ~1.5MB/~1.9MB)
+# Micro (core only: no TLS, compression, chacha20, HTTP proxy, tcp-mux, ~1.6MB/~1.7MB)
 cargo build --release -p frps -p frpc --no-default-features --features micro
 ```
 
@@ -413,14 +413,15 @@ The binaries are named `frps`/`frpc` (full), `frps-tiny`/`frpc-tiny`, and `frps-
 | `kcp` | frp-core | KCP transport (kcp) |
 | `websocket` | frp-core/server | WebSocket transport (tokio-tungstenite) |
 | `oidc` | frp-core | OIDC auth (jsonwebtoken, reqwest) |
-| `ssh` | frp-server | SSH gateway (russh) |
+| `ssh` | frp-server | SSH gateway (russh, rand 0.10) |
 | `dashboard` | frp-server | Metrics/status API (prometheus, axum) |
-| `tls` | frp-core/server/client | TLS encryption (rustls, rustls-platform-verifier, axum TlsListener) |
+| `tls` | frp-core/server/client | TLS encryption (rustls, webpki-roots) |
 | `compression` | frp-core | Snappy bridge compression (snap) |
 | `chacha20` | frp-core | XChaCha20-Poly1305 V2 cipher (AES-256-GCM stays) |
 | `http-proxy` | frp-server | HTTP proxy plugin (reqwest) |
+| `tcp-mux` | frp-core/server/client | yamux stream multiplexing (~80KB) |
 
-All features default ON. `quic` implies `tls`. `oidc` implies `reqwest`.
+All features default ON. `quic` implies `tls`. `oidc` implies `reqwest`. `ssh` implies `rand`.
 
 ### Release Profile
 

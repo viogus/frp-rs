@@ -192,7 +192,6 @@ QuicConnection, dial_quic() calls, TransportProtocol match arms — each gated.
 |-----------|--------|
 | TCP (TcpStream) | Core transport |
 | TLS (rustls) | Essential security |
-| TcpMux (yamux) | Multi-stream multiplexing |
 | AES-128-CFB encryption | Go frp compat |
 | Snappy compression | Data plane compression |
 | STCP / XTCP | Core NAT traversal |
@@ -201,12 +200,18 @@ QuicConnection, dial_quic() calls, TransportProtocol match arms — each gated.
 | PBKDF2-SHA1 key derivation | Go frp compat |
 | MD5 auth token | Go frp compat |
 
+## What's gated (post-v0.3.2)
+
+| Component | Feature | When gated |
+|-----------|---------|------------|
+| TcpMux (yamux) | `tcp-mux` | PR #98 — ~80KB, default ON, micro OFF |
+
 ## Estimated Size Impact
 
-| Binary | Full (macOS ARM64) | Tiny (est.) | Tiny + UPX Linux (est.) |
-|--------|--------------------|-------------|--------------------------|
-| frps | 4.6 MB | 2.8-3.2 MB | 1.0-1.2 MB |
-| frpc | 3.5 MB | 2.0-2.5 MB | 0.8-1.0 MB |
+| Binary | Full (macOS ARM64) | Tiny | Micro |
+|--------|---------------------|------|-------|
+| frps | 4.8 MB | 2.7 MB | 1.6 MB |
+| frpc | 3.7 MB | 2.3 MB | 1.7 MB |
 
 ## Risk Assessment
 

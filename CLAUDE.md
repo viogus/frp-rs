@@ -21,15 +21,15 @@ Three size tiers via feature flags:
 ```bash
 # Full (all features)
 cargo build --release -p frps -p frpc
-# → frps (~4.6MB), frpc (~3.4MB)
+# → frps (~4.8MB), frpc (~3.7MB)
 
 # Tiny (no heavy protocols: QUIC/KCP/WS/SSH/OIDC/dashboard; keeps TLS)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
-# → frps-tiny (~2.8MB), frpc-tiny (~2.6MB)
+# → frps-tiny (~2.7MB), frpc-tiny (~2.3MB)
 
-# Micro (core only: no TLS, compression, chacha20, HTTP proxy)
+# Micro (core only: no TLS, compression, chacha20, HTTP proxy, tcp-mux)
 cargo build --release -p frps -p frpc --no-default-features --features micro
-# → frps-micro (~1.5MB), frpc-micro (~1.9MB)
+# → frps-micro (~1.6MB), frpc-micro (~1.7MB)
 ```
 
 Feature flags across crates:
@@ -39,14 +39,15 @@ Feature flags across crates:
 | `kcp` | frp-core | KCP transport (kcp) |
 | `websocket` | frp-core/server | WebSocket transport (tokio-tungstenite) |
 | `oidc` | frp-core | OIDC auth (jsonwebtoken, reqwest) |
-| `ssh` | frp-server | SSH gateway (russh) |
+| `ssh` | frp-server | SSH gateway (russh, rand 0.10) |
 | `dashboard` | frp-server | Metrics/status API (prometheus, axum) |
-| `tls` | frp-core/server/client | TLS encryption (rustls, webpki-roots, axum TlsListener) |
+| `tls` | frp-core/server/client | TLS encryption (rustls, webpki-roots) |
 | `compression` | frp-core | Snappy bridge compression (snap) |
 | `chacha20` | frp-core | XChaCha20-Poly1305 V2 cipher (AES-256-GCM stays) |
 | `http-proxy` | frp-server | HTTP proxy plugin (reqwest) |
+| `tcp-mux` | frp-core/server/client | yamux stream multiplexing (~80KB) |
 
-All features default ON. `quic` implies `tls`. `oidc` implies `reqwest`.
+All features default ON. `quic` implies `tls`. `oidc` implies `reqwest`. `ssh` implies `rand`.
 
 - No `cargo check` variation needed — use `cargo build` for the full workspace.
 - Tests live inline (`#[cfg(test)] mod tests`), no separate test crates.
