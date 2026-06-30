@@ -21,7 +21,65 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tracing::{debug, warn};
 
+#[cfg(feature = "tcp-mux")]
 use yamux::{Config, Connection, Mode, Stream};
+
+/// Wrapper type for a yamux stream compatible with tokio's AsyncRead/AsyncWrite.
+#[cfg(feature = "tcp-mux")]
+pub type YamuxStream = Compat<Stream>;
+
+/// Stub type when tcp-mux is disabled. Never constructed at runtime;
+/// only exists so IoStream::Yamux variant compiles.
+#[cfg(not(feature = "tcp-mux"))]
+#[derive(Debug)]
+pub struct YamuxStream {
+    _priv: (),
+}
+
+#[cfg(not(feature = "tcp-mux"))]
+impl tokio::io::AsyncRead for YamuxStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "tcp-mux disabled at compile time",
+        )))
+    }
+}
+
+#[cfg(not(feature = "tcp-mux"))]
+impl tokio::io::AsyncWrite for YamuxStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "tcp-mux disabled at compile time",
+        )))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "tcp-mux disabled at compile time",
+        )))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
 
 /// Configuration for the yamux session.
 #[derive(Debug, Clone)]
@@ -38,6 +96,7 @@ impl Default for TcpMuxConfig {
     }
 }
 
+#[cfg(feature = "tcp-mux")]
 fn yamux_config(_cfg: &TcpMuxConfig) -> Config {
     let mut cfg = Config::default();
     // Match Go frp's hashicorp/yamux settings for compatibility.
@@ -49,10 +108,6 @@ fn yamux_config(_cfg: &TcpMuxConfig) -> Config {
     cfg.set_max_num_streams(256);
     cfg
 }
-
-/// Wrapper type for a yamux stream compatible with tokio's AsyncRead/AsyncWrite.
-/// yamux::Stream impls futures-io traits; Compat wraps them into tokio traits.
-pub type YamuxStream = Compat<Stream>;
 
 /// Receiver for incoming yamux streams (work connections) accepted by the server.
 pub struct IncomingStreams {
@@ -95,6 +150,7 @@ struct OpenRequest {
 /// - `incoming`: channel receiver for subsequent accepted streams (work connections)
 ///
 /// Spawns a background task to manage the yamux Connection.
+#[cfg(feature = "tcp-mux")]
 pub async fn server_mux<S>(
     stream: S,
     mux_cfg: &TcpMuxConfig,
@@ -158,6 +214,19 @@ where
     Ok((control_compat, IncomingStreams { rx }))
 }
 
+#[cfg(not(feature = "tcp-mux"))]
+pub async fn server_mux<S>(
+    _stream: S,
+    _mux_cfg: &TcpMuxConfig,
+) -> Result<(YamuxStream, IncomingStreams), crate::Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    Err(crate::Error::Protocol(
+        "tcp_mux is disabled (compile-time feature 'tcp-mux' not enabled)".into(),
+    ))
+}
+
 /// Create a client-side yamux session from an already-established stream.
 ///
 /// The stream can be a raw TCP connection or a TLS-wrapped connection.
@@ -168,6 +237,7 @@ where
 /// - `session`: handle for opening additional streams (work connections)
 ///
 /// Spawns a background task to manage the yamux Connection.
+#[cfg(feature = "tcp-mux")]
 pub async fn client_mux<S>(
     stream: S,
     mux_cfg: &TcpMuxConfig,
@@ -266,4 +336,17 @@ where
     });
 
     Ok((control_compat, YamuxSession { tx }))
+}
+
+#[cfg(not(feature = "tcp-mux"))]
+pub async fn client_mux<S>(
+    _stream: S,
+    _mux_cfg: &TcpMuxConfig,
+) -> Result<(YamuxStream, YamuxSession), crate::Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    Err(crate::Error::Protocol(
+        "tcp_mux is disabled (compile-time feature 'tcp-mux' not enabled)".into(),
+    ))
 }
