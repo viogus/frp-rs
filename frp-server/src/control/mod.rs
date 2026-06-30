@@ -547,9 +547,14 @@ pub async fn handle_control<S>(
                         break;
                     }
                     #[cfg(feature = "vnet")]
-                    Some(InternalMsg::VnetPacketForward { proxy_name, data: _data }) => {
-                        debug!(%proxy_name, "vnet packet forward to {} (work conn integration pending)", proxy_name);
-                        // TODO: Forward to work connection — will be completed in Task 11
+                    Some(InternalMsg::VnetPacketForward { proxy_name, data }) => {
+                        let pkt = FrpMessage::VnetPacket(msg::VnetPacket {
+                            proxy_name,
+                            data,
+                        });
+                        if let Err(e) = write_ctl_msg(&mut writer, &pkt, v2).await {
+                            warn!(error = %e, "Failed to forward VnetPacket: {}", e);
+                        }
                     }
                     None => {
                         info!(peer = ?peer, "Control channel closed for {:?}", peer);

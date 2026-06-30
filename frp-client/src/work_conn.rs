@@ -511,31 +511,11 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
 
                 #[cfg(feature = "vnet")]
                 if info.proxy_type == "vnet" {
-                    use frp_vnet::controller::VnetController;
-                    // Take TUN device from shared map. The TUN device is created
-                    // during proxy registration in the service layer.
-                    let tun = {
-                        let mut map = vnet_tuns.lock().await;
-                        map.get_mut(proxy_name).and_then(|opt| opt.take())
-                    };
-                    let tun = match tun {
-                        Some(t) => t,
-                        None => {
-                            warn!(label = %label, proxy_name = %proxy_name, "vnet work conn: no TUN device for '{}'", proxy_name);
-                            return;
-                        }
-                    };
-                    let pn = proxy_name.clone();
-                    info!(label = %label, proxy_name = %pn, "vnet work conn established, spawning controller");
-                    let (w_r, w_w) = work.into_split();
-                    let routes = vnet_routes.clone();
-                    tokio::spawn(async move {
-                        let ctrl = VnetController::new(pn.clone(), routes, v2);
-                        if let Err(e) = ctrl.run(tun, w_r, w_w).await {
-                            tracing::error!(proxy_name = %pn, error = %e, "vnet controller exited with error");
-                        }
-                        tracing::info!(proxy_name = %pn, "vnet controller stopped");
-                    });
+                    // VnetController is spawned in the service layer after TUN
+                    // creation. The work connection for vnet proxies carries
+                    // StartWorkConn for connection lifecycle signaling;
+                    // VnetPackets flow on the control connection.
+                    info!(label = %label, proxy_name = %proxy_name, "vnet work conn established (controller in service layer)");
                     return;
                 }
 

@@ -76,6 +76,13 @@ pub struct Service {
     /// read by VnetController during packet forwarding.
     #[cfg(feature = "vnet")]
     vnet_routes: Arc<tokio::sync::RwLock<frp_vnet::router::RouteTable>>,
+    /// Per-proxy TX channels for forwarding received VnetPackets to TUN devices.
+    /// Keyed by proxy name.
+    #[cfg(feature = "vnet")]
+    vnet_tun_tx: Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>,
+    /// Per-proxy TUN device names for OS route injection.
+    #[cfg(feature = "vnet")]
+    vnet_tun_names: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Service {
@@ -274,6 +281,10 @@ impl Service {
         let vnet_routes = Arc::new(tokio::sync::RwLock::new(
             frp_vnet::router::RouteTable::new(),
         ));
+        #[cfg(feature = "vnet")]
+        let vnet_tun_tx = Arc::new(Mutex::new(HashMap::new()));
+        #[cfg(feature = "vnet")]
+        let vnet_tun_names = Arc::new(Mutex::new(HashMap::new()));
 
         Ok(Self {
             cfg,
@@ -296,6 +307,10 @@ impl Service {
             vnet_tuns,
             #[cfg(feature = "vnet")]
             vnet_routes,
+            #[cfg(feature = "vnet")]
+            vnet_tun_tx,
+            #[cfg(feature = "vnet")]
+            vnet_tun_names,
         })
     }
 
@@ -564,13 +579,20 @@ impl Service {
 
                             match frp_vnet::tun::open_tun("").await {
                                 Ok(tun) => {
+                                    let tun_name = tun.name().to_string();
                                     if let Err(e) = tun.configure(ip, netmask, mtu) {
                                         warn!(proxy_name = %p.name, error = %e, "TUN configure failed");
                                     } else {
-                                        info!(proxy_name = %p.name, name = tun.name(), "TUN device ready");
+                                        info!(proxy_name = %p.name, name = %tun_name, "TUN device ready");
                                     }
-                                    // Store TUN device even if configure failed, so work_conn
-                                    // can pick it up. Partial functionality is better than none.
+                                    // Store TUN name for OS route injection
+                                    {
+                                        let mut names = self.vnet_tun_names.lock().await;
+                                        names.insert(p.name.clone(), tun_name);
+                                    }
+                                    // Store TUN device for later controller spawning.
+                                    // The controller is spawned after the control
+                                    // connection writer is created.
                                     {
                                         let mut tuns = self.vnet_tuns.lock().await;
                                         tuns.insert(p.name.clone(), Some(tun));
@@ -634,6 +656,35 @@ impl Service {
             // Split control stream for reading and writing
             let (mut reader, raw_writer) = control_stream.into_split();
             let writer = Arc::new(Mutex::new(raw_writer));
+
+            // Spawn VnetControllers for all vnet proxies now that the
+            // control connection writer is available.
+            #[cfg(feature = "vnet")]
+            {
+                let mut tuns = self.vnet_tuns.lock().await;
+                for (proxy_name, tun_opt) in tuns.iter_mut() {
+                    if let Some(tun) = tun_opt.take() {
+                        let (tun_tx, tun_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                        {
+                            let mut txs = self.vnet_tun_tx.lock().await;
+                            txs.insert(proxy_name.clone(), tun_tx);
+                        }
+                        let ctl_writer = writer.clone();
+                        let routes = self.vnet_routes.clone();
+                        let pn = proxy_name.clone();
+                        tokio::spawn(async move {
+                            let ctrl = frp_vnet::controller::VnetController::new(
+                                pn.clone(), routes, v2,
+                            );
+                            if let Err(e) = ctrl.run(tun, ctl_writer, tun_rx).await {
+                                tracing::error!(proxy_name = %pn, error = %e, "vnet controller exited with error");
+                            }
+                            tracing::info!(proxy_name = %pn, "vnet controller stopped");
+                        });
+                    }
+                }
+                tuns.clear();
+            }
 
             // Bind local UDP sockets for UDP proxies.
             // UDP data flows over work connections (Go frp v0.69.1 compat).
@@ -1010,7 +1061,26 @@ impl Service {
                                 // through the TUN device instead of the default gateway.
                                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                                 {
-                                    add_os_route(&adv.subnet, "tun0");
+                                    let names = self.vnet_tun_names.lock().await;
+                                    if let Some(tun_name) = names.values().next() {
+                                        add_os_route(&adv.subnet, tun_name);
+                                    }
+                                }
+                            }
+                            #[cfg(feature = "vnet")]
+                            Ok(FrpMessage::VnetPacket(vpkt)) => {
+                                match data_encoding::BASE64.decode(vpkt.data.as_bytes()) {
+                                    Ok(packet) => {
+                                        let txs = self.vnet_tun_tx.lock().await;
+                                        if let Some(tx) = txs.get(&vpkt.proxy_name) {
+                                            if tx.send(packet).is_err() {
+                                                warn!(proxy_name = %vpkt.proxy_name, "vnet TUN channel closed");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(%e, "VnetPacket base64 decode error");
+                                    }
                                 }
                             }
                             #[cfg(feature = "vnet")]

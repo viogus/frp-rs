@@ -23,6 +23,7 @@ toml.workspace = true
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 rand.workspace = true
+data-encoding.workspace = true
 
 [features]
 default = ["tls", "quic", "kcp", "websocket", "oidc", "vnet"]

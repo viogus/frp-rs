@@ -205,12 +205,14 @@ impl AsyncRead for MacOSTun {
             }) {
                 Ok(Ok(n)) => {
                     // macOS utun prepends a 4-byte AF header (AF_INET=2).
-                    // Strip it and advance the buffer by the actual IP packet length.
-                    if n > 4 {
-                        let actual = n - 4;
-                        dst.copy_within(4..n, 0);
-                        buf.advance(actual);
+                    // Short read (n <= 4 means no packet data after AF header).
+                    // Continue the read loop instead of returning 0 (which signals EOF).
+                    if n <= 4 {
+                        continue;
                     }
+                    let actual = n - 4;
+                    dst.copy_within(4..n, 0);
+                    buf.advance(actual);
                     return Poll::Ready(Ok(()));
                 }
                 Ok(Err(e)) => return Poll::Ready(Err(e)),

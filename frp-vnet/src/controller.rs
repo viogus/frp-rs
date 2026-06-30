@@ -1,11 +1,14 @@
-//! VNet controller — bidirectional TUN↔work_conn packet forwarding loop.
+//! VNet controller — bidirectional TUN↔control_conn packet forwarding loop.
 //! Uses frp-core protocol framing (V1/V2) with VnetPacket messages.
+//!
+//! TX: TUN read → route lookup → VnetPacket → write_msg on ctl_writer (control conn)
+//! RX: tun_packet_rx → TUN write
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::RwLock;
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 use data_encoding::BASE64;
 
@@ -50,22 +53,22 @@ impl VnetController {
         &self.proxy_name
     }
 
-    /// Run the bidirectional packet loop.
+    /// Run the bidirectional packet loop via the control connection.
     ///
-    /// Takes ownership of the TUN device and the work connection halves.
-    /// This function runs until either side closes or errors.
+    /// TX: TUN read → route lookup → VnetPacket → write_msg on ctl_writer
+    /// RX: tun_packet_rx → TUN write
     pub async fn run(
         &self,
         mut tun: Box<dyn TunDevice>,
-        mut work_conn_r: Box<dyn AsyncRead + Unpin + Send>,
-        mut work_conn_w: Box<dyn AsyncWrite + Unpin + Send>,
+        ctl_writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
+        mut tun_packet_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     ) -> anyhow::Result<()> {
         let mtu = tun.mtu() as usize;
         let mut tun_buf = vec![0u8; mtu];
 
         loop {
             tokio::select! {
-                // TUN → work_conn: read IP packet, lookup route, send VnetPacket
+                // TUN → control connection: read IP packet, lookup route, send VnetPacket
                 result = tun.read(&mut tun_buf) => {
                     match result {
                         Ok(0) => {
@@ -95,13 +98,15 @@ impl VnetController {
                                     data: BASE64.encode(packet),
                                 };
                                 let msg = frp_core::msg::FrpMessage::VnetPacket(vnet_pkt);
+                                let mut writer = ctl_writer.lock().await;
                                 let write_result = if self.v2 {
-                                    frp_core::protocol::write_msg_v2(&mut work_conn_w, &msg).await
+                                    frp_core::protocol::write_msg_v2(&mut *writer, &msg).await
                                 } else {
-                                    frp_core::protocol::write_msg_v1(&mut work_conn_w, &msg).await
+                                    frp_core::protocol::write_msg_v1(&mut *writer, &msg).await
                                 };
+                                drop(writer);
                                 if let Err(e) = write_result {
-                                    tracing::error!(%self.proxy_name, %e, "work_conn write error");
+                                    tracing::error!(%self.proxy_name, %e, "control write error");
                                     break;
                                 }
                             }
@@ -113,35 +118,17 @@ impl VnetController {
                         }
                     }
                 }
-                // work_conn → TUN: read VnetPacket, write raw IP packet to TUN.
-                // Inline the read to avoid Sized issues with dyn trait objects.
-                result = async {
-                    if self.v2 {
-                        frp_core::protocol::read_msg_v2(&mut work_conn_r).await
-                    } else {
-                        frp_core::protocol::read_msg_v1(&mut work_conn_r).await
-                    }
-                } => {
-                    match result {
-                        Ok(frp_core::msg::FrpMessage::VnetPacket(vpkt)) => {
-                            match BASE64.decode(vpkt.data.as_bytes()) {
-                                Ok(packet) => {
-                                    if let Err(e) = tun.write_all(&packet).await {
-                                        tracing::error!(%self.proxy_name, %e, "TUN write error");
-                                        return Err(anyhow::anyhow!("TUN write error: {e}"));
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(%self.proxy_name, %e, "VnetPacket base64 decode error");
-                                }
+                // control connection → TUN: receive decoded packets from service
+                packet = tun_packet_rx.recv() => {
+                    match packet {
+                        Some(pkt) => {
+                            if let Err(e) = tun.write_all(&pkt).await {
+                                tracing::error!(%self.proxy_name, %e, "TUN write error");
+                                return Err(anyhow::anyhow!("TUN write error: {e}"));
                             }
                         }
-                        Ok(other) => {
-                            let type_byte = other.v1_type_byte();
-                            tracing::debug!(%self.proxy_name, %type_byte, "unexpected msg type 0x{type_byte:02x} on vnet work conn");
-                        }
-                        Err(e) => {
-                            tracing::error!(%self.proxy_name, %e, "work_conn read error");
+                        None => {
+                            tracing::info!(%self.proxy_name, "tun_packet channel closed");
                             break;
                         }
                     }
