@@ -10,6 +10,7 @@ md-5.workspace = true
 
 [dependencies]
 frp-core = { path = "../frp-core", default-features = false }
+frp-vnet = { workspace = true, optional = true }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -30,4 +31,4 @@ quic = ["frp-core/quic"]
 kcp = ["frp-core/kcp"]
 websocket = ["frp-core/websocket"]
 oidc = ["frp-core/oidc"]
-vnet = ["frp-core/vnet"]
+vnet = ["frp-core/vnet", "dep:frp-vnet"]
