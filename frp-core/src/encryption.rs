@@ -109,6 +109,10 @@ impl SnappyDecompressor {
     /// Returns an error only for truly corrupt input (bad magic, bad CRC);
     /// partial frames are silently buffered, not treated as errors.
     pub fn feed(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        const MAX_SNAPPY_BUFFER: usize = 16 * 1024 * 1024; // 16 MB
+        if self.buf.len() + data.len() > MAX_SNAPPY_BUFFER {
+            return Err("snappy decompression buffer exhausted".into());
+        }
         self.buf.extend_from_slice(data);
 
         let mut output = Vec::new();

@@ -128,6 +128,8 @@ pub async fn handle_control<S>(
         None
     };
 
+    let reloadable = state.reloadable.read().unwrap().clone();
+
     let run_id = login.run_id.clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     info!(peer = ?peer, run_id = %run_id, "Client {:?} logged in with run_id: {}", peer, run_id);
@@ -180,7 +182,7 @@ pub async fn handle_control<S>(
 
     // --- Send login response (plain, before encryption) ---
     {
-        let additional_auth_scopes = state.reloadable.read().unwrap().additional_auth_scopes.clone();
+        let additional_auth_scopes = reloadable.additional_auth_scopes.clone();
         let resp = FrpMessage::LoginResp(msg::LoginResp {
             version: Some(frp_core::VERSION.into()),
             run_id: Some(run_id.clone()),
@@ -211,7 +213,7 @@ pub async fn handle_control<S>(
         Box<dyn AsyncRead + Unpin + Send>,
         Box<dyn AsyncWrite + Unpin + Send>,
     ) = if let (true, Some(ctx)) = (v2, crypto_ctx.as_ref()) {
-        let token = state.reloadable.read().unwrap().auth_cfg.token.clone();
+        let token = reloadable.auth_cfg.token.clone();
         match frp_core::crypto::derive_aead_control_keys(
             token.as_bytes(), ctx.algorithm, &ctx.transcript_hash,
         ) {
@@ -241,7 +243,7 @@ pub async fn handle_control<S>(
         }
     } else {
         // V1 or plain V2: wrap in AES-128-CFB
-        let enc_key = encryption::derive_key(&state.reloadable.read().unwrap().auth_cfg.token);
+        let enc_key = encryption::derive_key(&reloadable.auth_cfg.token);
         let cipher = frp_core::cipher_stream::CipherStream::new(Box::new(stream), enc_key);
         let (r, w) = tokio::io::split(cipher);
         (Box::new(r), Box::new(w))
@@ -359,7 +361,7 @@ pub async fn handle_control<S>(
                                     }
                                 }
                                 if let Some(req) = pending_requests.pop_front() {
-                                    let enc_key = state.reloadable.read().unwrap().encryption_key;
+                                    let enc_key = reloadable.encryption_key;
                                     bridge::assign_work_to_proxy(stream, req, enc_key, state.clone(), v2).await;
                                 } else if work_pool.len() < pool_cap {
                                     work_pool.push_back(stream);
@@ -390,7 +392,7 @@ pub async fn handle_control<S>(
                             (e, c, rh, pt)
                         };
                         if let Some(work_conn) = work_pool.pop_front() {
-                            let enc_key = state.reloadable.read().unwrap().encryption_key;
+                            let enc_key = reloadable.encryption_key;
                             bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type }, enc_key, state.clone(), v2).await;
                         } else {
                             debug!("No pooled work conn for STCP, sending ReqWorkConn");
@@ -456,7 +458,7 @@ pub async fn handle_control<S>(
                             (e, c, rh, pt)
                         };
                         if let Some(work_conn) = work_pool.pop_front() {
-                            let enc_key = state.reloadable.read().unwrap().encryption_key;
+                            let enc_key = reloadable.encryption_key;
                             bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type }, enc_key, state.clone(), v2).await;
                         } else {
                             debug!(target_proxy = %target_proxy, "No pooled work conn, sending ReqWorkConn for {}", target_proxy);
@@ -631,7 +633,7 @@ pub async fn handle_control<S>(
                         }
                     }
                     if let Some(req) = pending_requests.pop_front() {
-                        let enc_key = state.reloadable.read().unwrap().encryption_key;
+                        let enc_key = reloadable.encryption_key;
                         bridge::assign_work_to_proxy(io, req, enc_key, state.clone(), v2).await;
                     } else if work_pool.len() < pool_cap {
                         work_pool.push_back(io);
@@ -663,7 +665,7 @@ pub async fn handle_control<S>(
                         if let Some(ref pn) = proxy_name {
                             if let Some(proxy_info) = state.proxy_manager.get(pn.as_str()).await {
                                 if proxy_info.use_encryption {
-                                    if let Ok(decrypted) = encryption::decrypt(&payload, &state.reloadable.read().unwrap().encryption_key) {
+                                    if let Ok(decrypted) = encryption::decrypt(&payload, &reloadable.encryption_key) {
                                         payload = decrypted;
                                     }
                                 }
@@ -881,7 +883,7 @@ pub async fn handle_control<S>(
                     Ok(FrpMessage::Ping(ref ping_msg)) => {
                         // Validate ping auth (Go frp v0.69.1 compat).
                         // Only validate when "HeartBeats" is in additional_auth_scopes.
-                        let requires_ping_auth = state.reloadable.read().unwrap()
+                        let requires_ping_auth = reloadable
                             .additional_auth_scopes.iter().any(|s| s == "HeartBeats");
                         let ping_auth_result = if !requires_ping_auth {
                             Ok(())
@@ -893,7 +895,7 @@ pub async fn handle_control<S>(
                                 &expected_sub,
                             ).await
                         } else {
-                            state.reloadable.read().unwrap().auth_cfg.validate_login(
+                            reloadable.auth_cfg.validate_login(
                                 ping_msg.privilege_key.as_deref(),
                                 ping_msg.timestamp,
                             ).map(|_| ())

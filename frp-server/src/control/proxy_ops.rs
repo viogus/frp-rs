@@ -113,12 +113,11 @@ pub(crate) async fn handle_new_proxy(
     let allocated_port = if is_sudp && remote_port > 0 {
         // SUDP proxies can share ports. If the requested port is already
         // in use, reuse it without adding to used_ports.
-        let ports = state.used_ports.read().await;
+        // Check-and-allocate atomically under write lock (fixes TOCTOU).
+        let mut ports = state.used_ports.write().await;
         if ports.contains(&remote_port) {
             Some(remote_port)
         } else {
-            drop(ports);
-            let mut ports = state.used_ports.write().await;
             allocate_port_multi(&mut ports, remote_port, &state.reloadable.read().unwrap().allow_ports)
         }
     } else {

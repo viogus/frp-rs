@@ -524,7 +524,7 @@ pub fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
             let list_len = u16::from_be_bytes([ch[pos], ch[pos + 1]]) as usize;
             pos += 2;
             let list_end = pos + list_len;
-            if list_end > ch.len() {
+            if list_end > ext_end {
                 return None;
             }
 
@@ -533,7 +533,7 @@ pub fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
                 let name_len = u16::from_be_bytes([ch[pos + 1], ch[pos + 2]]) as usize;
                 pos += 3;
 
-                if name_type == 0x00 && pos + name_len <= ch.len() {
+                if name_type == 0x00 && pos + name_len <= list_end {
                     return String::from_utf8(ch[pos..pos + name_len].to_vec()).ok();
                 }
                 pos += name_len;

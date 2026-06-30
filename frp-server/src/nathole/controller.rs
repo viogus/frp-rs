@@ -89,9 +89,12 @@ impl Controller {
         Ok(rx)
     }
 
-    /// Unregister a provider.
+    /// Unregister a provider and cleanup orphaned sessions.
     pub async fn close_client(&self, name: &str) {
         self.client_cfgs.write().await.remove(name);
+        // Remove any sessions belonging to this provider.
+        let mut sessions = self.sessions.write().await;
+        sessions.retain(|_sid, session| session.proxy_name != name);
     }
 
     /// Notify a provider about a new visitor (send sid to provider).
@@ -114,11 +117,6 @@ impl Controller {
         visitor_msg: msg::NatHoleVisitor,
         writer: Box<dyn AsyncWrite + Send + Unpin>,
     ) -> Result<(Arc<Session>, oneshot::Receiver<msg::NatHoleReport>), String> {
-        // Session cap: prevent unbounded memory growth under load.
-        if self.sessions.read().await.len() >= MAX_SESSIONS {
-            warn!(max_sessions = MAX_SESSIONS, "NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session");
-            return Err(format!("NAT hole session limit reached ({MAX_SESSIONS})"));
-        }
         let (report_tx, report_rx) = oneshot::channel();
         let session = Arc::new(Session {
             sid: sid.clone(),
@@ -135,10 +133,15 @@ impl Controller {
             report_tx: Mutex::new(Some(report_tx)),
             created_at: Instant::now(),
         });
-        self.sessions
-            .write()
-            .await
-            .insert(sid.clone(), session.clone());
+        // Check-and-insert atomically under write lock (fixes TOCTOU).
+        {
+            let mut sessions = self.sessions.write().await;
+            if sessions.len() >= MAX_SESSIONS {
+                warn!(max_sessions = MAX_SESSIONS, "NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session");
+                return Err(format!("NAT hole session limit reached ({MAX_SESSIONS})"));
+            }
+            sessions.insert(sid.clone(), session.clone());
+        }
         Ok((session, report_rx))
     }
 
@@ -151,11 +154,6 @@ impl Controller {
         visitor_msg: msg::NatHoleVisitor,
         visitor_ctl_tx: mpsc::UnboundedSender<InternalMsg>,
     ) -> Result<(Arc<Session>, oneshot::Receiver<msg::NatHoleReport>), String> {
-        // Session cap: prevent unbounded memory growth under load.
-        if self.sessions.read().await.len() >= MAX_SESSIONS {
-            warn!(max_sessions = MAX_SESSIONS, "NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session");
-            return Err(format!("NAT hole session limit reached ({MAX_SESSIONS})"));
-        }
         let (report_tx, report_rx) = oneshot::channel();
         let (notify_tx, _notify_rx) = oneshot::channel();
         let session = Arc::new(Session {
@@ -173,10 +171,15 @@ impl Controller {
             report_tx: Mutex::new(Some(report_tx)),
             created_at: Instant::now(),
         });
-        self.sessions
-            .write()
-            .await
-            .insert(sid.clone(), session.clone());
+        // Check-and-insert atomically under write lock (fixes TOCTOU).
+        {
+            let mut sessions = self.sessions.write().await;
+            if sessions.len() >= MAX_SESSIONS {
+                warn!(max_sessions = MAX_SESSIONS, "NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session");
+                return Err(format!("NAT hole session limit reached ({MAX_SESSIONS})"));
+            }
+            sessions.insert(sid.clone(), session.clone());
+        }
         Ok((session, report_rx))
     }
 

@@ -1334,6 +1334,7 @@ impl Service {
                 }
                 Err(e) => {
                     error!(error = %e, "Failed to accept connection: {}", e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
                 }

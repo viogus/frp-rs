@@ -62,14 +62,25 @@ impl AuthConfig {
     /// auth, populated from JWT 'sub' claim for OIDC). Returns Err if invalid.
     pub fn validate_login(&self, privilege_key: Option<&str>, timestamp: Option<i64>) -> Result<String, String> {
         if self.token.is_empty() && self.method == AuthMethod::Token {
+            tracing::warn!("Authentication token is empty — server accepts ALL connections. Set [auth].token in config.");
             return Ok(String::new());
         }
 
         let key = privilege_key.unwrap_or("");
-        let ts = timestamp.unwrap_or(0);
 
         match self.method {
             AuthMethod::Token => {
+                let ts = match timestamp {
+                    Some(t) => t,
+                    None => return Err("timestamp required for authentication".into()),
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                if (ts - now).abs() > 15 {
+                    return Err("timestamp outside acceptable window".into());
+                }
                 let expected = generate_token(&self.token, ts);
                 if key != expected {
                     return Err("invalid authentication token".into());
@@ -694,7 +705,10 @@ mod tests {
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
         };
-        let ts = 100i64;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
         let key = generate_token("secret", ts);
         assert!(cfg.validate_login(Some(&key), Some(ts)).is_ok());
         assert!(cfg.validate_login(Some(&key), Some(ts + 1)).is_err());

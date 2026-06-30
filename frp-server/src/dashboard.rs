@@ -51,12 +51,18 @@ impl axum::serve::Listener for TlsListener {
                     continue;
                 }
             };
-            let tls_acceptor = self
+            let tls_acceptor = match self
                 .acceptor
                 .read()
                 .unwrap()
                 .clone()
-                .expect("TLS acceptor not initialized");
+            {
+                Some(acceptor) => acceptor,
+                None => {
+                    tracing::warn!("TLS acceptor not initialized, skipping connection");
+                    continue;
+                }
+            };
             match tls_acceptor.accept(stream).await {
                 Ok(tls_stream) => return (tls_stream, addr),
                 Err(e) => {
