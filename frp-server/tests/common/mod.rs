@@ -1,4 +1,6 @@
 use std::net::SocketAddr;
+use std::process::{Child, Command};
+use std::time::Duration;
 use tokio::net::TcpSocket;
 use tokio::task::JoinHandle;
 
@@ -91,4 +93,125 @@ pub async fn raw_login_resp(
 ) -> Result<LoginResp, frp_core::Error> {
     let (_, resp) = raw_login(addr, privilege_key, timestamp, token).await?;
     Ok(resp)
+}
+
+/// Handle to a running frps child process with dashboard.
+/// Kills the process on drop.
+pub struct FrpsHandle {
+    child: Child,
+    pub bind_port: u16,
+    pub dashboard_port: u16,
+    _config_dir: tempfile::TempDir,
+}
+
+impl FrpsHandle {
+    /// Start frps with the given TOML config content.
+    /// Returns handle after both bind_port and dashboard_port are accepting connections.
+    pub async fn start(config_content: &str) -> Self {
+        let config_dir = tempfile::TempDir::new().unwrap();
+        let config_path = config_dir.path().join("frps.toml");
+        std::fs::write(&config_path, config_content).unwrap();
+
+        // Extract ports from config
+        let bind_port = config_content
+            .lines()
+            .find(|l| l.trim().starts_with("bind_port"))
+            .and_then(|l| l.split('=').nth(1))
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        let dashboard_port = config_content
+            .lines()
+            .find(|l| l.trim().starts_with("port") && l.contains("web_server"))
+            .or_else(|| {
+                // port might be in [web_server] section, scan after web_server header
+                let mut in_web = false;
+                config_content.lines().find(|l| {
+                    if l.trim() == "[web_server]" {
+                        in_web = true;
+                        return false;
+                    }
+                    if in_web && l.trim().starts_with("port") {
+                        return true;
+                    }
+                    false
+                })
+            })
+            .and_then(|l| l.split('=').nth(1))
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+
+        // Try to find the frps binary
+        let frps_bin = std::env::var("CARGO_BIN_EXE_frps").unwrap_or_else(|_| {
+            // Fallback: look in target directory.
+            // Tests run from the crate root (frp-server/), so target/ is one level up.
+            let profile = if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            };
+            for candidate in &[
+                format!("target/{}/frps", profile),
+                format!("../target/{}/frps", profile),
+            ] {
+                if std::path::Path::new(candidate).exists() {
+                    return candidate.clone();
+                }
+            }
+            // Return workspace-relative path as last resort
+            format!("../target/{}/frps", profile)
+        });
+
+        let child = Command::new(&frps_bin)
+            .arg("-c")
+            .arg(&config_path)
+            .env("RUST_LOG", "error")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to start frps");
+
+        // Wait for ports
+        if bind_port > 0 {
+            wait_tcp_port(bind_port, Duration::from_secs(15))
+                .await
+                .expect("frps bind_port not ready");
+        }
+        if dashboard_port > 0 {
+            wait_tcp_port(dashboard_port, Duration::from_secs(15))
+                .await
+                .expect("frps dashboard_port not ready");
+        }
+        // Extra time for dashboard routes to register
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        Self {
+            child,
+            bind_port,
+            dashboard_port,
+            _config_dir: config_dir,
+        }
+    }
+
+    pub fn dashboard_url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{}", self.dashboard_port, path)
+    }
+}
+
+impl Drop for FrpsHandle {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Wait for a TCP port to accept connections.
+pub async fn wait_tcp_port(port: u16, timeout: Duration) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(format!("port {} not ready after {:?}", port, timeout))
 }

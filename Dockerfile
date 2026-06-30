@@ -22,15 +22,17 @@ COPY frp-server/Cargo.toml  frp-server/
 COPY frp-client/Cargo.toml  frp-client/
 COPY frps/Cargo.toml        frps/
 COPY frpc/Cargo.toml        frpc/
+COPY frp-stress/Cargo.toml  frp-stress/
 
-RUN mkdir -p frp-core/src frp-server/src frp-client/src frps/src frpc/src && \
+RUN mkdir -p frp-core/src frp-server/src frp-client/src frps/src frpc/src frp-stress/src && \
     echo 'pub fn main() {}' > frp-core/src/lib.rs && \
     echo 'fn main() {}'     > frp-server/src/main.rs && \
     echo 'fn main() {}'     > frp-client/src/main.rs && \
     echo 'fn main() {}'     > frps/src/main.rs && \
     echo 'fn main() {}'     > frpc/src/main.rs && \
+    echo 'fn main() {}'     > frp-stress/src/main.rs && \
     cargo build --release --bin frps --bin frpc && \
-    rm -rf frp-core/src frp-server/src frp-client/src frps/src frpc/src
+    rm -rf frp-core/src frp-server/src frp-client/src frps/src frpc/src frp-stress/src
 
 # Build real source (rust:1-alpine defaults to x86_64-unknown-linux-musl)
 COPY frp-core/src   frp-core/src/

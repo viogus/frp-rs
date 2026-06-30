@@ -35,3 +35,7 @@ http-proxy = ["dep:reqwest"]
 
 [dev-dependencies]
 tempfile = "3"
+reqwest = { workspace = true, features = ["json"] }
+serde_json = { workspace = true }
+axum = { workspace = true }
+jsonwebtoken = { workspace = true }

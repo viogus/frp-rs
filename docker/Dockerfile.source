@@ -59,6 +59,10 @@ COPY frp-server/ frp-server/
 COPY frp-client/ frp-client/
 COPY frps/ frps/
 COPY frpc/ frpc/
+# frp-stress is a dev-only stress testing tool. Only copy Cargo.toml to
+# satisfy workspace resolution; a dummy main.rs keeps cargo happy.
+COPY frp-stress/Cargo.toml frp-stress/
+RUN mkdir -p frp-stress/src && echo 'fn main() {}' > frp-stress/src/main.rs
 
 RUN cargo zigbuild --target $(cat /tmp/rust_target) --release ${FRP_FEATURES} && \
     cp target/$(cat /tmp/rust_target)/release/${FRP_COMPONENT} /usr/bin/frp && \
