@@ -97,7 +97,7 @@ impl TunDevice for LinuxTun {
         unsafe fn set_sockaddr(
             ifr: &mut libc::ifreq,
             sock: libc::c_int,
-            ioctl: libc::c_int,
+            ioctl: libc::c_ulong,
             addr: u32,
         ) -> anyhow::Result<()> {
             let sin = libc::sockaddr_in {
@@ -110,7 +110,7 @@ impl TunDevice for LinuxTun {
                 &mut ifr.ifr_ifru.ifru_addr as *mut _ as *mut libc::sockaddr_in,
                 sin,
             );
-            let ret = unsafe { libc::ioctl(sock, ioctl, ifr as *const _) };
+            let ret = unsafe { libc::ioctl(sock, ioctl as _, ifr as *const _) };
             if ret < 0 {
                 return Err(anyhow::anyhow!(
                     "ioctl failed: {}",
@@ -134,7 +134,7 @@ impl TunDevice for LinuxTun {
             set_sockaddr(
                 &mut ifr,
                 sock,
-                libc::SIOCSIFADDR as libc::c_int,
+                libc::SIOCSIFADDR,
                 u32::from(addr).to_be(),
             )
         }
@@ -146,7 +146,7 @@ impl TunDevice for LinuxTun {
             set_sockaddr(
                 &mut ifr,
                 sock,
-                libc::SIOCSIFNETMASK as libc::c_int,
+                libc::SIOCSIFNETMASK,
                 u32::from(netmask).to_be(),
             )
         }
