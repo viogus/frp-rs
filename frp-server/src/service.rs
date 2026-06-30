@@ -1010,24 +1010,59 @@ impl Service {
                                 match accept_websocket(stream_io).await {
                                     Ok(mut ws) => {
                                         info!(addr = %addr, "WebSocket upgrade on main port for {}", addr);
-                                        match read_msg_v1(&mut ws).await {
-                                            Ok(FrpMessage::Login(login)) => {
-                                                control::handle_control(ws, login, state.clone(), Some(addr), None, false, None).await;
-                                            }
-                                            Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                crate::handlers::handle_work_conn_inner(ws, nwc, state.clone()).await;
-                                            }
-                                            Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                crate::handlers::handle_visitor_conn_inner(ws, nvc, state.clone(), false).await;
-                                            }
-                                            Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                crate::handlers::handle_nat_hole_visitor(ws, nhv, state.clone(), None, false).await;
-                                            }
-                                            Ok(other) => {
-                                                warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
-                                            }
-                                            Err(e) => {
-                                                debug!(addr = %addr, error = %e, "WS read error from {}: {}", addr, e);
+
+                                        // Try V2 magic detection
+                                        let mut magic = [0u8; 7];
+                                        let is_v2 = match ws.read_exact(&mut magic).await {
+                                            Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                            Err(_) => false,
+                                        };
+
+                                        if is_v2 {
+                                            // V2 path: ClientHello/ServerHello handshake
+                                            let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ws).await {
+                                                Ok((Some(p), crypto)) => (p, crypto),
+                                                Ok((None, crypto)) => {
+                                                    match ws.read_raw_v2_frame().await {
+                                                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                        Ok((ft, _, _)) => {
+                                                            warn!(frame_type = ?ft, addr = %addr, "WS V2 (main): unexpected frame type {} after handshake from {}", ft, addr);
+                                                            return;
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(addr = %addr, error = %e, "WS V2 (main): failed to read message after handshake from {}: {}", addr, e);
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(addr = %addr, error = %e, "WS V2 (main) handshake error from {}: {}", addr, e);
+                                                    return;
+                                                }
+                                            };
+                                            crate::handlers::dispatch_v2_message(ws, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
+                                        } else {
+                                            // V1 fallback: replay consumed 7 bytes
+                                            let mut ws = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
+                                            match read_msg_v1(&mut ws).await {
+                                                Ok(FrpMessage::Login(login)) => {
+                                                    control::handle_control(ws, login, state.clone(), Some(addr), None, false, None).await;
+                                                }
+                                                Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                    crate::handlers::handle_work_conn_inner(ws, nwc, state.clone()).await;
+                                                }
+                                                Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                    crate::handlers::handle_visitor_conn_inner(ws, nvc, state.clone(), false).await;
+                                                }
+                                                Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                    crate::handlers::handle_nat_hole_visitor(ws, nhv, state.clone(), None, false).await;
+                                                }
+                                                Ok(other) => {
+                                                    warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
+                                                }
+                                                Err(e) => {
+                                                    debug!(addr = %addr, error = %e, "WS read error from {}: {}", addr, e);
+                                                }
                                             }
                                         }
                                     }
