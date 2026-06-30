@@ -55,6 +55,7 @@ oidc = ["dep:jsonwebtoken", "dep:reqwest"]
 [dev-dependencies]
 tower = "0.5"
 criterion.workspace = true
+proptest = "1.6"
 
 [[bench]]
 name = "crypto_bridge"
