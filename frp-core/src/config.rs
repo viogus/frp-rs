@@ -944,7 +944,7 @@ fn normalize_server_config(value: &mut toml::Value) {
 
         // Flatten web_server_* fields into web_server table
         let mut ws_items: Vec<(String, Value)> = Vec::new();
-        for key in ["web_server_addr", "web_server_port", "web_server_user", "web_server_password", "web_server_enable_prometheus", "enable_prometheus"] {
+        for key in ["web_server_addr", "web_server_port", "web_server_user", "web_server_password", "web_server_enable_prometheus", "enable_prometheus", "web_server_tls_cert_file", "web_server_tls_key_file"] {
             if let Some(v) = table.remove(key) {
                 let sub_key = key.strip_prefix("web_server_").unwrap_or(key);
                 ws_items.push((sub_key.to_string(), v));
@@ -1446,6 +1446,7 @@ fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "oidc_audience", "oidc_token_endpoint", "log_file", "log_level",
         "log_max_days", "web_server_addr", "web_server_port",
         "web_server_user", "web_server_password", "web_server_enable_prometheus",
+        "web_server_tls_cert_file", "web_server_tls_key_file",
         "enable_prometheus", "tcp_mux", "tcp_mux_keepalive_interval",
         "sshTunnelGateway", "bindPort", "bindAddr",
     ]);

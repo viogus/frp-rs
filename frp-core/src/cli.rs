@@ -678,6 +678,10 @@ impl FrpsArgs {
         if let Some(ref v) = self.dashboard_user { cfg.web_server.user = v.clone(); }
         if let Some(ref v) = self.dashboard_pwd { cfg.web_server.password = v.clone(); }
         if self.enable_prometheus { cfg.web_server.enable_prometheus = true; }
+        if let Some(ref v) = self.dashboard_tls_cert_file { cfg.web_server.tls_cert_file = v.clone(); }
+        if let Some(ref v) = self.dashboard_tls_key_file { cfg.web_server.tls_key_file = v.clone(); }
+        // dashboard_tls_mode: no config field needed — TLS activates when both
+        // cert_file and key_file are non-empty (implicit detection, matching Go frp).
     }
 }
 
