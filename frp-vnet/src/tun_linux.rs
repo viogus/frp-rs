@@ -45,7 +45,9 @@ impl LinuxTun {
             *dst = *src as libc::c_char;
         }
 
-        ifr.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
+        unsafe {
+            ifr.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
+        }
 
         let ret = unsafe { libc::ioctl(raw_fd, libc::TUNSETIFF, &ifr) };
         if ret < 0 {
@@ -130,28 +132,34 @@ impl TunDevice for LinuxTun {
             *dst = *src as libc::c_char;
         }
 
-        set_sockaddr(
-            &mut ifr,
-            sock,
-            libc::SIOCSIFADDR,
-            u32::from(addr).to_be(),
-        )
+        unsafe {
+            set_sockaddr(
+                &mut ifr,
+                sock,
+                libc::SIOCSIFADDR,
+                u32::from(addr).to_be(),
+            )
+        }
         .map_err(|e| {
             unsafe { libc::close(sock) };
             e
         })?;
-        set_sockaddr(
-            &mut ifr,
-            sock,
-            libc::SIOCSIFNETMASK,
-            u32::from(netmask).to_be(),
-        )
+        unsafe {
+            set_sockaddr(
+                &mut ifr,
+                sock,
+                libc::SIOCSIFNETMASK,
+                u32::from(netmask).to_be(),
+            )
+        }
         .map_err(|e| {
             unsafe { libc::close(sock) };
             e
         })?;
 
-        ifr.ifr_ifru.ifru_mtu = mtu as libc::c_int;
+        unsafe {
+            ifr.ifr_ifru.ifru_mtu = mtu as libc::c_int;
+        }
         let ret = unsafe { libc::ioctl(sock, libc::SIOCSIFMTU, &ifr) };
         if ret < 0 {
             unsafe { libc::close(sock) };
@@ -171,7 +179,9 @@ impl TunDevice for LinuxTun {
                 io::Error::last_os_error()
             ));
         }
-        ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+        unsafe {
+            ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+        }
         let ret = unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS, &ifr) };
         if ret < 0 {
             unsafe { libc::close(sock) };
