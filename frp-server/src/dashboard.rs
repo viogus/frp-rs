@@ -377,30 +377,40 @@ async fn handle_store_proxy_create(
             error: "proxy already exists".into()
         })));
     }
-    let mut store = state.proxy_config_store.write().await;
-    if store.contains_key(&config.name) {
-        return Err((StatusCode::CONFLICT, Json(ErrorResponse {
-            error: "proxy config already in store".into()
-        })));
+    let name = config.name.clone();
+    {
+        let mut store = state.proxy_config_store.write().await;
+        if store.contains_key(&config.name) {
+            return Err((StatusCode::CONFLICT, Json(ErrorResponse {
+                error: "proxy config already in store".into()
+            })));
+        }
+        let (local_ip, local_port) = if config.local_addr.is_empty() {
+            (String::new(), 0u16)
+        } else if let Some((ip, port_str)) = config.local_addr.rsplit_once(':') {
+            (ip.to_string(), port_str.parse::<u16>().unwrap_or(0))
+        } else {
+            (config.local_addr.clone(), 0u16)
+        };
+        store.insert(config.name.clone(), frp_core::config::ProxyConfig {
+            name: config.name.clone(),
+            proxy_type: config.proxy_type.clone(),
+            remote_port: config.remote_port.unwrap_or(0),
+            local_ip,
+            local_port,
+            custom_domains: config.custom_domains.clone(),
+            group: config.group.clone(),
+            ..Default::default()
+        });
+    } // write lock released before persist
+
+    // Persist to disk
+    if let Some(ref p) = state.store_path {
+        let snapshot = state.proxy_config_store.read().await.clone();
+        crate::store::save_store(p, &snapshot);
     }
-    let (local_ip, local_port) = if config.local_addr.is_empty() {
-        (String::new(), 0u16)
-    } else if let Some((ip, port_str)) = config.local_addr.rsplit_once(':') {
-        (ip.to_string(), port_str.parse::<u16>().unwrap_or(0))
-    } else {
-        (config.local_addr.clone(), 0u16)
-    };
-    store.insert(config.name.clone(), frp_core::config::ProxyConfig {
-        name: config.name.clone(),
-        proxy_type: config.proxy_type.clone(),
-        remote_port: config.remote_port.unwrap_or(0),
-        local_ip,
-        local_port,
-        custom_domains: config.custom_domains.clone(),
-        group: config.group.clone(),
-        ..Default::default()
-    });
-    Ok(Json(serde_json::json!({"status": "created", "name": config.name})))
+
+    Ok(Json(serde_json::json!({"status": "created", "name": name})))
 }
 
 /// DELETE /api/store/proxy/:name — remove a proxy (cleans up server-side state).
@@ -431,6 +441,12 @@ async fn handle_store_proxy_delete(
     // Remove from store if present
     state.proxy_config_store.write().await.remove(&name);
 
+    // Persist to disk
+    if let Some(ref p) = state.store_path {
+        let snapshot = state.proxy_config_store.read().await.clone();
+        crate::store::save_store(p, &snapshot);
+    }
+
     Ok(Json(serde_json::json!({"status": "deleted", "name": name})))
 }
 
@@ -458,6 +474,11 @@ async fn handle_proxies_delete(
             state.proxy_config_store.write().await.remove(name);
             deleted.push(name.clone());
         }
+    }
+    // Persist to disk
+    if let Some(ref p) = state.store_path {
+        let snapshot = state.proxy_config_store.read().await.clone();
+        crate::store::save_store(p, &snapshot);
     }
     Json(serde_json::json!({
         "deleted": deleted.len(),

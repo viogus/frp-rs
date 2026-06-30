@@ -90,7 +90,7 @@ impl Service {
             vec![(cfg.allow_port_start, cfg.allow_port_end)]
         };
         let sub_host = cfg.sub_domain_host.clone();
-        let state = AppState::new(
+        let mut state = AppState::new(
             auth_cfg,
             if cfg.proxy_bind_addr.is_empty() {
                 cfg.bind_addr.clone()
@@ -122,6 +122,19 @@ impl Service {
         if cfg.web_server.port > 0 && cfg.web_server.enable_prometheus {
             crate::metrics::prom::register_all();
         }
+
+        // Load persisted proxy configs from the store file
+        let store_path = crate::store::resolve_store_path(&config_file);
+        let loaded = crate::store::load_store(&store_path);
+        if !loaded.is_empty() {
+            let mut store = state.proxy_config_store.write().await;
+            for (name, config) in loaded {
+                store.entry(name).or_insert(config);
+            }
+            info!(count = store.len(), path = %store_path.display(),
+                "loaded {} stored proxy configs", store.len());
+        }
+        state.store_path = Some(store_path);
 
         Ok(Self {
             state: Arc::new(state),
