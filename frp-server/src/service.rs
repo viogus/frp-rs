@@ -318,18 +318,56 @@ impl Service {
                             let state = kcp_state.clone();
                             tokio::spawn(async move {
                                 let mut ctl = frp_core::transport::IoStream::Kcp(stream);
-                                match frp_core::protocol::read_msg_v1(&mut ctl).await {
-                                    Ok(frp_core::msg::FrpMessage::Login(login)) => {
-                                        control::handle_control(ctl, login, state, None, None, false, None).await;
-                                    }
-                                    Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
-                                        crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
-                                    }
-                                    Ok(other) => {
-                                        tracing::warn!(other = ?other.v1_type_byte(), "Unexpected KCP message: {:?}", other.v1_type_byte());
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "KCP read error: {}", e);
+
+                                // Try V2 magic detection
+                                let mut magic = [0u8; 7];
+                                let is_v2 = match ctl.read_exact(&mut magic).await {
+                                    Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                    Err(_) => false,
+                                };
+
+                                if is_v2 {
+                                    // V2 path: ClientHello/ServerHello handshake
+                                    let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ctl).await {
+                                        Ok((Some(p), crypto)) => (p, crypto),
+                                        Ok((None, crypto)) => {
+                                            match ctl.read_raw_v2_frame().await {
+                                                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                Ok((ft, _, _)) => {
+                                                    tracing::warn!(frame_type = ?ft, "KCP V2: unexpected frame type {} after handshake", ft);
+                                                    return;
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(error = %e, "KCP V2: failed to read message after handshake: {}", e);
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "KCP V2 handshake error: {}", e);
+                                            return;
+                                        }
+                                    };
+                                    // KCP listener doesn't capture peer addr (matching V1 behavior).
+                                    // Use unspecified addr for dispatch_v2_message logging.
+                                    let peer_addr = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
+                                    crate::handlers::dispatch_v2_message(ctl, msg_payload, state, peer_addr, None, None, crypto_ctx).await;
+                                } else {
+                                    // V1 fallback: replay consumed 7 bytes
+                                    let mut ctl = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ctl));
+                                    match frp_core::protocol::read_msg_v1(&mut ctl).await {
+                                        Ok(frp_core::msg::FrpMessage::Login(login)) => {
+                                            control::handle_control(ctl, login, state, None, None, false, None).await;
+                                        }
+                                        Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                                            crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
+                                        }
+                                        Ok(other) => {
+                                            tracing::warn!(other = ?other.v1_type_byte(), "Unexpected KCP message: {:?}", other.v1_type_byte());
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "KCP read error: {}", e);
+                                        }
                                     }
                                 }
                             });
