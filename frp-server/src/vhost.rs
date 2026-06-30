@@ -269,20 +269,22 @@ pub async fn run_vhost_http_listener(
 #[cfg(feature = "tls")]
 pub async fn run_vhost_https_listener(
     addr: String,
-    tls_cert_file: String,
-    tls_key_file: String,
     state: std::sync::Arc<crate::service::AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(feature = "tls")]
-    use frp_core::transport::build_tls_acceptor;
-    let acceptor = build_tls_acceptor(&tls_cert_file, &tls_key_file, None)?;
     let listener = TcpListener::bind(&addr).await?;
     info!(addr = %addr, "HTTPS VHost listener started on {}", addr);
 
     loop {
         let (stream, peer) = listener.accept().await?;
         let state = state.clone();
-        let acceptor = acceptor.clone();
+        // Read the current TLS acceptor from shared state. Hot-reload
+        // swaps a new acceptor under write lock; read-lock is cheap.
+        let acceptor = state
+            .tls_acceptor
+            .read()
+            .unwrap()
+            .clone()
+            .expect("TLS acceptor not initialized");
 
         tokio::spawn(async move {
             let mut tls_stream = match acceptor.accept(stream).await {
@@ -361,8 +363,6 @@ pub async fn run_vhost_https_listener(
 #[cfg(not(feature = "tls"))]
 pub async fn run_vhost_https_listener(
     _addr: String,
-    _tls_cert_file: String,
-    _tls_key_file: String,
     _state: std::sync::Arc<crate::service::AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err("TLS feature not enabled".into())

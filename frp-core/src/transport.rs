@@ -1992,15 +1992,34 @@ pub fn build_tls_connector(
 
 /// TLS listener wrapper implementing axum's Listener trait.
 /// Used by dashboard and admin API servers to accept TLS connections.
+///
+/// The acceptor is stored behind `Arc<RwLock<>>` to support hot-reload:
+/// certificate renewal swaps the acceptor atomically without restarting
+/// axum's serve loop.
 #[cfg(feature = "tls")]
 pub struct TlsListener {
     inner: TcpListener,
-    acceptor: TlsAcceptor,
+    acceptor: Arc<std::sync::RwLock<Option<TlsAcceptor>>>,
 }
 
 #[cfg(feature = "tls")]
 impl TlsListener {
+    /// Create a new TLS listener from an owned acceptor. Wraps it in a
+    /// shared lock for potential future hot-reload (e.g., admin server).
     pub fn new(inner: TcpListener, acceptor: TlsAcceptor) -> Self {
+        Self {
+            inner,
+            acceptor: Arc::new(std::sync::RwLock::new(Some(acceptor))),
+        }
+    }
+
+    /// Create a TLS listener that shares its acceptor with the main server's
+    /// hot-reload mechanism. When the server reloads its TLS certificate,
+    /// the dashboard picks up the new cert on the next accept().
+    pub fn from_shared(
+        inner: TcpListener,
+        acceptor: Arc<std::sync::RwLock<Option<TlsAcceptor>>>,
+    ) -> Self {
         Self { inner, acceptor }
     }
 }
@@ -2019,7 +2038,15 @@ impl axum::serve::Listener for TlsListener {
                     continue;
                 }
             };
-            match self.acceptor.accept(stream).await {
+            // Read-lock to get the current acceptor. Hot-reload swaps a new
+            // acceptor under write lock; cloning here is just an Arc refcount.
+            let tls_acceptor = self
+                .acceptor
+                .read()
+                .unwrap()
+                .clone()
+                .expect("TLS acceptor not initialized");
+            match tls_acceptor.accept(stream).await {
                 Ok(tls_stream) => return (tls_stream, addr),
                 Err(e) => {
                     tracing::warn!(addr = %addr, error = %e, "TLS handshake error from {}: {}", addr, e);

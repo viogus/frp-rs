@@ -128,6 +128,11 @@ pub struct AppState {
     pub max_ports_per_client: u64,
     /// When false (default), internal error details are not sent to clients.
     pub detailed_errors_to_client: bool,
+    /// Shared TLS acceptor for hot-reload. Cert renewal tools (certbot, cert-manager)
+    /// replace cert files in-place — periodic poll detects mtime changes and swaps
+    /// this acceptor atomically. SIGUSR1 reload also swaps when cert paths change.
+    #[cfg(feature = "tls")]
+    pub tls_acceptor: Arc<std::sync::RwLock<Option<tokio_rustls::TlsAcceptor>>>,
 }
 
 impl AppState {
@@ -168,6 +173,8 @@ impl AppState {
             plugin_manager,
             proxy_config_store: Arc::new(RwLock::new(HashMap::new())),
             detailed_errors_to_client,
+            #[cfg(feature = "tls")]
+            tls_acceptor: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 }

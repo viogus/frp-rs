@@ -141,21 +141,21 @@ impl Service {
         info!(bind_addr = %bind_addr, "frps starting on {}", bind_addr);
 
         #[cfg(feature = "tls")]
-        let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = if self.cfg.tls_enable {
+        if self.cfg.tls_enable {
             let ca_file = if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.as_str()) };
-            match build_tls_acceptor(&self.cfg.tls_cert_file, &self.cfg.tls_key_file, ca_file) {
+            let acceptor = match build_tls_acceptor(&self.cfg.tls_cert_file, &self.cfg.tls_key_file, ca_file) {
                 Ok(acc) => {
                     info!(cert_file = %self.cfg.tls_cert_file, "TLS enabled with cert: {}", self.cfg.tls_cert_file);
-                    Some(acc)
+                    acc
                 }
                 Err(e) => {
                     error!(error = %e, "Failed to initialize TLS: {}", e);
                     return Err(e.into());
                 }
-            }
-        } else {
-            None
-        };
+            };
+            // Store in shared state for hot-reload access.
+            *self.state.tls_acceptor.write().unwrap() = Some(acceptor);
+        }
         #[cfg(not(feature = "tls"))]
         let _tls_acceptor: Option<()> = None;
 
@@ -230,10 +230,8 @@ impl Service {
             let https_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.vhost_https_port);
             let https_addr2 = https_addr.clone();
             let https_state = self.state.clone();
-            let cert = self.cfg.tls_cert_file.clone();
-            let key = self.cfg.tls_key_file.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::vhost::run_vhost_https_listener(https_addr, cert, key, https_state).await {
+                if let Err(e) = crate::vhost::run_vhost_https_listener(https_addr, https_state).await {
                     error!(error = %e, "HTTPS VHost listener failed: {}", e);
                 }
             });
@@ -630,6 +628,67 @@ impl Service {
             }
         });
 
+        // Periodic TLS certificate hot-reload: stat cert/key files every 60 seconds.
+        // When mtimes change (e.g., certbot/cert-manager renews in-place), rebuild
+        // the acceptor and atomically swap so new connections use the new cert
+        // without a restart.
+        #[cfg(feature = "tls")]
+        if self.cfg.tls_enable {
+            let poll_state = self.state.clone();
+            let cert_file = self.cfg.tls_cert_file.clone();
+            let key_file = self.cfg.tls_key_file.clone();
+            let ca_file = if self.cfg.tls_ca_file.is_empty() {
+                None
+            } else {
+                Some(self.cfg.tls_ca_file.clone())
+            };
+            tokio::spawn(async move {
+                let mut last_cert_mtime: Option<std::time::SystemTime> = None;
+                let mut last_key_mtime: Option<std::time::SystemTime> = None;
+                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                // Skip the first tick (fires immediately).
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    // Stat cert and key files. If either mtime changed, rebuild.
+                    let cert_meta = match std::fs::metadata(&cert_file) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    let key_meta = match std::fs::metadata(&key_file) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    let cert_mtime = cert_meta.modified().ok();
+                    let key_mtime = key_meta.modified().ok();
+                    let cert_changed = cert_mtime != last_cert_mtime;
+                    let key_changed = key_mtime != last_key_mtime;
+                    if cert_changed || key_changed {
+                        last_cert_mtime = cert_mtime;
+                        last_key_mtime = key_mtime;
+                        let ca = ca_file.as_deref();
+                        match build_tls_acceptor(&cert_file, &key_file, ca) {
+                            Ok(new_acceptor) => {
+                                let mut guard = poll_state.tls_acceptor.write().unwrap();
+                                *guard = Some(new_acceptor);
+                                tracing::info!(
+                                    "TLS certificate hot-reloaded (cert: {}, key: {})",
+                                    cert_file,
+                                    key_file
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to reload TLS certificate: {} (keeping old config)",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         // Main accept loop — mixed-mode: TLS, WebSocket, and V1 on same port.
         // Uses MSG_PEEK to detect connection type without consuming bytes,
         // matching Go frp v0.69.1 behavior.
@@ -638,7 +697,7 @@ impl Service {
                 Ok((stream, addr)) => {
                     let state = self.state.clone();
                     #[cfg(feature = "tls")]
-                    let acceptor = tls_acceptor.clone();
+                    let acceptor = state.tls_acceptor.read().unwrap().clone();
 
                     tokio::spawn(async move {
                         let (ct, mut stream_io) = match detect_and_strip_magic(stream).await {
@@ -1114,8 +1173,8 @@ impl Service {
 
     /// Reload configuration from the config file (SIGUSR1 handler).
     /// Re-reads the TOML config and applies safe-to-reload settings
-    /// (allow_ports, auth token, encryption key). Returns a summary
-    /// of changes, or an error if the config cannot be read.
+    /// (allow_ports, auth token, encryption key, TLS certificates).
+    /// Returns a summary of changes, or an error if the config cannot be read.
     pub async fn reload(&self) -> Result<String, String> {
         let config_path = match &self.config_file {
             Some(p) => p.clone(),
@@ -1191,6 +1250,36 @@ impl Service {
                 "tls_enable: {} -> {} (restart required)",
                 self.cfg.tls_enable, new_cfg.tls_enable
             ));
+        }
+        // TLS certificate hot-reload: if cert/key/ca paths changed, rebuild
+        // acceptor and swap atomically. Existing connections keep old config;
+        // new connections pick up the new cert immediately.
+        #[cfg(feature = "tls")]
+        if self.cfg.tls_enable
+            && (self.cfg.tls_cert_file != new_cfg.tls_cert_file
+                || self.cfg.tls_key_file != new_cfg.tls_key_file
+                || self.cfg.tls_ca_file != new_cfg.tls_ca_file)
+        {
+            let ca = if new_cfg.tls_ca_file.is_empty() {
+                None
+            } else {
+                Some(new_cfg.tls_ca_file.as_str())
+            };
+            match build_tls_acceptor(&new_cfg.tls_cert_file, &new_cfg.tls_key_file, ca) {
+                Ok(acceptor) => {
+                    *self.state.tls_acceptor.write().unwrap() = Some(acceptor);
+                    changes.push(format!(
+                        "TLS certificate reloaded (cert: {}, key: {})",
+                        new_cfg.tls_cert_file, new_cfg.tls_key_file
+                    ));
+                }
+                Err(e) => {
+                    changes.push(format!(
+                        "TLS certificate reload FAILED: {} (keeping old config)",
+                        e
+                    ));
+                }
+            }
         }
         // OIDC verifier is created once at startup (async, fetches JWKS).
         // Changes to OIDC settings require a full restart.
