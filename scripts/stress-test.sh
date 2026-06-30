@@ -70,7 +70,9 @@ echo "=== Building ==="
 cd "$PROJECT_DIR"
 mkdir -p .cargo
 printf '[profile.release]\nlto = false\nopt-level = 2\n' >> .cargo/config.toml
-cargo build --release --bin frps --bin frpc --bin frp-stress 2>&1
+cargo build --release --bin frps --bin frpc 2>&1
+cd "$PROJECT_DIR/scripts/frp-stress" && cargo build --release 2>&1
+cd "$PROJECT_DIR"
 
 # Start frps
 echo "=== Starting frps ==="
@@ -98,7 +100,7 @@ fi
 
 # Run stress tests
 echo "=== Running scenario: $SCENARIO ==="
-./target/release/frp-stress \
+./scripts/frp-stress/target/release/frp-stress \
     --scenario "$SCENARIO" \
     --duration "$DURATION" \
     --concurrency "$CONCURRENCY" \

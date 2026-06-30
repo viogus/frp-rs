@@ -37,7 +37,8 @@ jobs:
         run: |
           mkdir -p .cargo
           printf '[profile.release]\nlto = false\nopt-level = 2\n' >> .cargo/config.toml
-          cargo build --release --bin frps --bin frpc --bin frp-stress
+          cargo build --release --bin frps --bin frpc
+          cd scripts/frp-stress && cargo build --release
 
       - name: Run stress tests (all scenarios)
         run: bash scripts/stress-test.sh all 120 100
