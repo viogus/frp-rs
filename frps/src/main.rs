@@ -3,39 +3,41 @@ use std::process;
 
 use tracing_subscriber::EnvFilter;
 
-use frp_core::args::{parse_args, CliArgs};
+use frp_core::cli::{parse_frps_args, FrpsArgs};
 use frp_core::config::{load_server_config, collect_config_files, ServerConfig};
 use frp_server::service::Service;
 
 #[tokio::main]
 async fn main() {
-    let cli = parse_args("frps.toml", "frps");
+    let cli = parse_frps_args();
     run(cli).await;
 }
 
-fn init_logging(cli: &CliArgs, cfg: Option<&ServerConfig>) {
+fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     // Merge log settings: CLI > config [log] > defaults
-    let level = cli.log_level.as_deref().unwrap_or_else(|| {
+    let level = cli.log_level.clone().unwrap_or_else(|| {
         cfg.map(|c| c.log.level.as_str()).unwrap_or(
             #[cfg(feature = "debug-logs")]
             "debug",
             #[cfg(not(feature = "debug-logs"))]
             "info",
-        )
+        ).to_string()
     });
-    let file = cli.log_file.as_deref().or_else(|| {
-        cfg.and_then(|c| if c.log.file.is_empty() { None } else { Some(c.log.file.as_str()) })
+    let file = cli.log_file.clone().or_else(|| {
+        cfg.and_then(|c| if c.log.file.is_empty() { None } else { Some(c.log.file.clone()) })
     });
 
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
+        .unwrap_or_else(|_| EnvFilter::new(&level));
 
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(!cli.disable_log_color);
 
     if let Some(path) = file {
         let file_appender = tracing_appender::rolling::daily(
-            Path::new(path).parent().unwrap_or(Path::new(".")),
-            Path::new(path).file_name().unwrap_or(std::ffi::OsStr::new("frps.log")),
+            Path::new(&path).parent().unwrap_or(Path::new(".")),
+            Path::new(&path).file_name().unwrap_or(std::ffi::OsStr::new("frps.log")),
         );
         builder.with_writer(file_appender).init();
     } else {
@@ -43,7 +45,7 @@ fn init_logging(cli: &CliArgs, cfg: Option<&ServerConfig>) {
     }
 }
 
-async fn run(cli: CliArgs) {
+async fn run(cli: FrpsArgs) {
     if cli.show_version {
         println!("frps {}", frp_core::VERSION);
         process::exit(0);
@@ -72,8 +74,9 @@ async fn run(cli: CliArgs) {
         let mut handles = Vec::new();
         for path in &files {
             let path_str = path.display().to_string();
-            match load_server_config(&path_str) {
-                Ok(cfg) => {
+            match load_server_config(&path_str, cli.strict_config) {
+                Ok(mut cfg) => {
+                    cli.override_server_config(&mut cfg);
                     handles.push(tokio::spawn(async move {
                         let service = match Service::new(cfg, Some(path_str.clone())).await {
                             Ok(s) => s,
@@ -105,16 +108,16 @@ async fn run(cli: CliArgs) {
     }
 
     // Single config mode: load config first, then init logging with [log] fallback
-    let cfg = match load_server_config(&cli.config) {
+    let mut cfg = match load_server_config(&cli.config, cli.strict_config) {
         Ok(cfg) => cfg,
         Err(e) => {
-            // Init logging with CLI defaults so we can log the error
             init_logging(&cli, None);
             tracing::error!("Failed to load config: {}", e);
             process::exit(1);
         }
     };
 
+    cli.override_server_config(&mut cfg);
     init_logging(&cli, Some(&cfg));
 
     tracing::info!("frps (Rust) v{} starting...", frp_core::VERSION);

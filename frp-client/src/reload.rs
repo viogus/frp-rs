@@ -51,7 +51,7 @@ pub(crate) async fn do_reload(
     strict: bool,
     writer: &Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>,
 ) -> Result<String, String> {
-    let new_cfg: ClientConfig = frp_core::config::load_client_config(config_path)
+    let new_cfg: ClientConfig = frp_core::config::load_client_config(config_path, strict)
         .map_err(|e| format!("failed to load config: {e}"))?;
 
     // Diff old vs new proxy names
