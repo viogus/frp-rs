@@ -195,6 +195,24 @@ pub fn deserialize_v2(type_id: u16, json_bytes: &[u8]) -> Result<FrpMessage, cra
                 .map_err(|e| crate::Error::Protocol(format!("deserialize Error (v2): {e}")))?;
             FrpMessage::Error(v)
         }
+        #[cfg(feature = "vnet")]
+        msg::V2_TYPE_VNET_ROUTE_ADVERTISE => {
+            let v: msg::VnetRouteAdvertise = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetRouteAdvertise (v2): {e}")))?;
+            FrpMessage::VnetRouteAdvertise(v)
+        }
+        #[cfg(feature = "vnet")]
+        msg::V2_TYPE_VNET_PACKET => {
+            let v: msg::VnetPacket = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetPacket (v2): {e}")))?;
+            FrpMessage::VnetPacket(v)
+        }
+        #[cfg(feature = "vnet")]
+        msg::V2_TYPE_VNET_ROUTE_REMOVE => {
+            let v: msg::VnetRouteRemove = serde_json::from_slice(json_bytes)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetRouteRemove (v2): {e}")))?;
+            FrpMessage::VnetRouteRemove(v)
+        }
         _ => return Err(crate::Error::Protocol(format!(
             "unknown V2 message type ID: {type_id}"
         ))),
@@ -317,6 +335,24 @@ pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate
             let v: msg::NatHoleReport = serde_json::from_slice(payload)
                 .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleReport: {e}")))?;
             FrpMessage::NatHoleReport(v)
+        }
+        #[cfg(feature = "vnet")]
+        msg::TYPE_VNET_ROUTE_ADVERTISE => {
+            let v: msg::VnetRouteAdvertise = serde_json::from_slice(payload)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetRouteAdvertise: {e}")))?;
+            FrpMessage::VnetRouteAdvertise(v)
+        }
+        #[cfg(feature = "vnet")]
+        msg::TYPE_VNET_PACKET => {
+            let v: msg::VnetPacket = serde_json::from_slice(payload)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetPacket: {e}")))?;
+            FrpMessage::VnetPacket(v)
+        }
+        #[cfg(feature = "vnet")]
+        msg::TYPE_VNET_ROUTE_REMOVE => {
+            let v: msg::VnetRouteRemove = serde_json::from_slice(payload)
+                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetRouteRemove: {e}")))?;
+            FrpMessage::VnetRouteRemove(v)
         }
         _ => return Err(crate::Error::Protocol(format!("unknown V1 type byte: 0x{type_byte:02x}"))),
     };
