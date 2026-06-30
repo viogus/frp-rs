@@ -6,6 +6,8 @@ pub mod proxy;
 pub mod vhost;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
+#[cfg(feature = "dashboard")]
+pub mod event;
 pub mod nathole;
 pub mod tcpmux;
 pub mod metrics;

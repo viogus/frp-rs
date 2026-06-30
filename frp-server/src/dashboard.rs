@@ -1,5 +1,7 @@
 use std::sync::Arc;
-use axum::{Router, Json, extract::{State, Path, Query}, response::Html, routing::{get, delete}};
+use std::time::Duration;
+use std::collections::HashMap;
+use axum::{Router, Json, extract::{State, Path, Query, ws::{WebSocketUpgrade, WebSocket, Message}}, response::Html, routing::{get, delete}};
 use axum::http::StatusCode;
 use serde::{Serialize, Deserialize};
 use crate::service::AppState;
@@ -486,6 +488,100 @@ async fn handle_proxies_delete(
     }))
 }
 
+// --- WebSocket event stream ---
+
+/// Upgrade handler for GET /api/events.
+/// Auth is handled by the `apply_admin_auth` middleware on the router —
+/// this handler only runs when the Authorization header is valid.
+async fn handle_events(
+    State(state): State<Arc<AppState>>,
+    ws: WebSocketUpgrade,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws(socket, state))
+}
+
+async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
+    let mut rx = state.event_tx.subscribe();
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Ok(ev) => {
+                        let json = serde_json::to_string(&ev).unwrap_or_default();
+                        if socket.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!(
+                            skipped = n,
+                            "WebSocket event stream lagged, skipped {} events",
+                            n
+                        );
+                        // Continue — rx.recv() recovers after lagged
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(e)) => {
+                        tracing::debug!(error = %e, "WebSocket recv error");
+                        break;
+                    }
+                    _ => {} // Ignore text/binary/ping/pong — axum auto-pongs
+                }
+            }
+        }
+    }
+}
+
+/// Background task that periodically emits traffic snapshots to
+/// WebSocket subscribers. Runs every 1 second, skips when no
+/// subscribers are connected, and only emits when metrics change.
+async fn run_traffic_events(state: Arc<AppState>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Track last-emitted values per proxy to avoid redundant events
+    let mut last_values: HashMap<String, MetricsSnapshot> = HashMap::new();
+
+    loop {
+        interval.tick().await;
+
+        // Skip work entirely when no WebSocket clients are listening
+        if state.event_tx.receiver_count() == 0 {
+            continue;
+        }
+
+        let proxies = state.proxy_manager.list().await;
+        for proxy in &proxies {
+            if let Some(metrics) = state.proxy_metrics.get(&proxy.name).await {
+                let snap = metrics.snapshot();
+                let changed = last_values
+                    .get(&proxy.name)
+                    .map(|prev| {
+                        prev.bytes_in != snap.bytes_in
+                            || prev.bytes_out != snap.bytes_out
+                            || prev.current_conns != snap.current_conns
+                    })
+                    .unwrap_or(true);
+
+                if changed {
+                    last_values.insert(proxy.name.clone(), snap.clone());
+                    let _ = state.event_tx.send(crate::event::ServerEvent::Traffic {
+                        proxy_name: proxy.name.clone(),
+                        bytes_in: snap.bytes_in,
+                        bytes_out: snap.bytes_out,
+                        current_conns: snap.current_conns,
+                    });
+                }
+            }
+        }
+    }
+}
+
 // --- Dashboard runner ---
 
 pub async fn run_dashboard(
@@ -508,7 +604,8 @@ pub async fn run_dashboard(
         .route("/api/clients", get(handle_clients))
         .route("/api/clients/{run_id}", get(handle_client_detail))
         .route("/api/store/proxies", get(handle_store_proxies).post(handle_store_proxy_create))
-        .route("/api/store/proxy/{name}", delete(handle_store_proxy_delete));
+        .route("/api/store/proxy/{name}", delete(handle_store_proxy_delete))
+        .route("/api/events", get(handle_events));
 
     let api_routes = apply_admin_auth(api_routes, &auth_user, &auth_password);
 
@@ -533,6 +630,13 @@ pub async fn run_dashboard(
     if enable_prometheus {
         app = app.merge(metrics_route);
     }
+    // Spawn periodic traffic event broadcaster for WebSocket subscribers.
+    // Clone state before it's moved into .with_state().
+    let traffic_state = state.clone();
+    tokio::spawn(async move {
+        run_traffic_events(traffic_state).await;
+    });
+
     let app = app.with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

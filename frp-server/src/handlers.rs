@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::oneshot;
-use tracing::{info, warn, debug};
+use tracing::{info, instrument, warn, debug};
 
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::write_msg;
@@ -169,6 +169,7 @@ pub(crate) async fn handle_visitor_conn_inner(
 /// forwards NatHoleClient to the provider via InternalMsg,
 /// writes NatHoleResp (OK or error) to the visitor via the accept-loop writer,
 /// and waits for the provider's report signal.
+#[instrument(skip(stream, state), fields(proxy_name = %msg.proxy_name, transaction_id = %msg.transaction_id))]
 pub(crate) async fn handle_nat_hole_visitor(
     stream: IoStream,
     msg: msg::NatHoleVisitor,
@@ -526,6 +527,7 @@ pub(crate) async fn dispatch_v2_message(
 
 /// Handle an incoming work connection. Verifies auth, then routes the
 /// IoStream to the appropriate control handler via InternalMsg.
+#[instrument(skip(stream, state), fields(run_id = %msg.run_id.clone().unwrap_or_default()))]
 pub(crate) async fn handle_work_conn_inner(
     stream: IoStream,
     msg: msg::NewWorkConn,

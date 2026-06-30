@@ -5,7 +5,7 @@ use tokio::io::AsyncReadExt;
 
 use tokio_util::sync::CancellationToken;
 
-use tracing::{info, error, warn, debug};
+use tracing::{info, error, warn, debug, instrument};
 
 use frp_core::config::ServerConfig;
 use frp_core::auth::{AuthConfig, AuthMethod};
@@ -148,6 +148,7 @@ impl Service {
         self.state.clone()
     }
 
+    #[instrument(skip(self), fields(bind_addr = %self.cfg.bind_addr, bind_port = %self.cfg.bind_port))]
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let bind_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.bind_port);
         info!(bind_addr = %bind_addr, "frps starting on {}", bind_addr);

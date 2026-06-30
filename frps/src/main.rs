@@ -13,8 +13,9 @@ async fn main() {
     run(cli).await;
 }
 
-fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
-    // Merge log settings: CLI > config [log] > defaults
+// ── Logging / tracing init ────────────────────────────────────────────────────
+
+fn resolve_log_settings(cli: &FrpsArgs, cfg: Option<&ServerConfig>) -> (String, Option<String>) {
     let level = cli.log_level.clone().unwrap_or_else(|| {
         cfg.map(|c| c.log.level.as_str()).unwrap_or(
             #[cfg(feature = "debug-logs")]
@@ -26,7 +27,14 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     let file = cli.log_file.clone().or_else(|| {
         cfg.and_then(|c| if c.log.file.is_empty() { None } else { Some(c.log.file.clone()) })
     });
+    (level, file)
+}
 
+// ── Without `otel` feature: exact current behavior ────────────────────────────
+
+#[cfg(not(feature = "otel"))]
+fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
+    let (level, file) = resolve_log_settings(cli, cfg);
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(&level));
 
@@ -43,6 +51,131 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     } else {
         builder.init();
     }
+}
+
+// ── With `otel` feature: Registry + Layer composition + optional OTLP export ──
+
+#[cfg(feature = "otel")]
+fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let (level, file) = resolve_log_settings(cli, cfg);
+
+    // OTel endpoint resolution: env var → config field → disabled
+    let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .ok()
+        .or_else(|| cfg.and_then(|c| {
+            if c.observability.otlp_endpoint.is_empty() { None }
+            else { Some(c.observability.otlp_endpoint.clone()) }
+        }));
+
+    let svc_name = cfg
+        .and_then(|c| if c.observability.service_name.is_empty() { None } else { Some(c.observability.service_name.clone()) })
+        .unwrap_or_else(|| "frps".to_string());
+
+    let (otel_layer, _provider) = if let Some(ref ep) = otlp_endpoint {
+        match build_otel_layer(ep, &svc_name) {
+            Ok((layer, provider)) => (Some(layer), Some(provider)),
+            Err(e) => {
+                eprintln!("WARNING: OTel init failed (endpoint={ep}): {e}. Tracing without OTLP export.");
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+
+    let ansi = !cli.disable_log_color;
+
+    // Layer objects (filter, console_fmt, file_fmt) are created inside
+    // each branch to avoid S-type unification between otel vs non-otel paths.
+    if let Some(path) = file {
+        let file_appender = tracing_appender::rolling::daily(
+            Path::new(&path).parent().unwrap_or(Path::new(".")),
+            Path::new(&path).file_name().unwrap_or(std::ffi::OsStr::new("frps.log")),
+        );
+        if let Some(layer) = otel_layer {
+            if let Some(p) = _provider {
+                let _ = Box::leak(Box::new(p));
+            }
+            tracing_subscriber::registry()
+                .with(layer)
+                .with(EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new(&level)))
+                .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(file_appender),
+                )
+                .init();
+        } else {
+            tracing_subscriber::registry()
+                .with(EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new(&level)))
+                .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(file_appender),
+                )
+                .init();
+        }
+    } else {
+        if let Some(layer) = otel_layer {
+            if let Some(p) = _provider {
+                let _ = Box::leak(Box::new(p));
+            }
+            tracing_subscriber::registry()
+                .with(layer)
+                .with(EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new(&level)))
+                .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
+                .init();
+        } else {
+            tracing_subscriber::registry()
+                .with(EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new(&level)))
+                .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
+                .init();
+        }
+    }
+}
+
+// NOTE: if modifying this function, apply the same changes to frpc/src/main.rs
+#[cfg(feature = "otel")]
+fn build_otel_layer(
+    endpoint: &str,
+    service_name: &str,
+) -> Result<(
+    tracing_opentelemetry::OpenTelemetryLayer<
+        tracing_subscriber::Registry,
+        opentelemetry_sdk::trace::Tracer,
+    >,
+    opentelemetry_sdk::trace::TracerProvider,
+), Box<dyn std::error::Error>> {
+    use opentelemetry::KeyValue;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::Resource;
+    use opentelemetry_otlp::WithExportConfig as _;
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_endpoint(endpoint.to_string())
+        .build()?;
+
+    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+        .with_resource(Resource::new(vec![
+            KeyValue::new("service.name", service_name.to_string()),
+        ]))
+        .build();
+
+    let tracer = provider.tracer("frp-rs");
+    let layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+    Ok((layer, provider))
 }
 
 async fn run(cli: FrpsArgs) {

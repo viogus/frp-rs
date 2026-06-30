@@ -54,12 +54,12 @@ pub async fn start_static_file_proxy(cfg: &PluginConfig) -> Result<PluginHandle,
                                 if let Err(e) =
                                     handle_static_file_conn(stream, a, &lp, sp.as_deref()).await
                                 {
-                                    debug!("static_file: {peer} error: {e}");
+                                    debug!(peer = %peer, error = %e, "static_file: {peer} error: {e}");
                                 }
                             });
                         }
                         Err(e) => {
-                            warn!("static_file plugin accept error: {e}");
+                            warn!(error = %e, "static_file plugin accept error: {e}");
                             break;
                         }
                     }

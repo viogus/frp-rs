@@ -121,6 +121,9 @@ pub struct ServerConfig {
     /// Go frp compat: natholeAnalysisDataReserveHours. Default: 1 (hour).
     #[serde(default = "default_nathole_analysis_data_reserve_hours")]
     pub nat_hole_analysis_data_reserve_hours: u64,
+    /// OpenTelemetry / observability settings.
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 fn default_allow_port_start() -> u16 { 10000 }
@@ -238,6 +241,7 @@ impl Default for ServerConfig {
             includes: Vec::new(),
             ssh_tunnel_gateway: SshTunnelGatewayConfig::default(),
             nat_hole_analysis_data_reserve_hours: default_nathole_analysis_data_reserve_hours(),
+            observability: ObservabilityConfig::default(),
             graceful_shutdown_timeout: default_graceful_timeout(),
         }
     }
@@ -357,6 +361,27 @@ impl Default for LogConfig {
 fn default_log_level() -> String { "info".into() }
 fn default_health_check_url() -> String { "/".into() }
 fn default_max_days() -> i32 { 3 }
+
+/// OpenTelemetry / observability configuration.
+/// When `otlp_endpoint` is empty (default), OTel export is disabled even when
+/// the `otel` feature is compiled in. The `OTEL_EXPORTER_OTLP_ENDPOINT`
+/// environment variable takes precedence over this config field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservabilityConfig {
+    #[serde(default)]
+    pub otlp_endpoint: String,
+    #[serde(default)]
+    pub service_name: String,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: String::new(),
+            service_name: String::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[derive(Default)]
@@ -648,6 +673,9 @@ pub struct ClientConfig {
     /// Experimental feature gates. Go frp compat: [feature] section.
     #[serde(default)]
     pub feature: FeatureConfig,
+    /// OpenTelemetry / observability settings.
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 impl Default for ClientConfig {
@@ -684,6 +712,7 @@ impl Default for ClientConfig {
             visitors: vec![],
             web_server: WebServerConfig::default(),
             feature: FeatureConfig::default(),
+            observability: ObservabilityConfig::default(),
         }
     }
 }
@@ -1457,7 +1486,7 @@ fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "max_ports_per_client", "vhost_http_timeout", "user_conn_timeout",
         "detailed_errors_to_client", "tcp_mux_passthrough", "udp_packet_size",
         "http_plugins", "feature", "includes", "ssh_tunnel_gateway",
-        "nat_hole_analysis_data_reserve_hours",
+        "nat_hole_analysis_data_reserve_hours", "observability",
     ]);
     // Go compat normalization aliases
     keys.extend([
@@ -1489,7 +1518,7 @@ fn known_client_keys() -> std::collections::HashSet<&'static str> {
         "tcp_mux", "v2", "proxies", "visitors", "web_server",
         "feature", "common", "protocol", "tls_trusted_ca_file",
         "serverAddr", "serverPort", "transport",
-        "log_file", "log_level", "log_max_days",
+        "log_file", "log_level", "log_max_days", "observability",
     ]);
     keys
 }

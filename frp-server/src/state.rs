@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicU64;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -157,6 +157,10 @@ pub struct AppState {
     /// Populated by VnetRouteAdvertise messages, used to forward VnetPacket.
     #[cfg(feature = "vnet")]
     pub vnet_routes: VnetRouteMap,
+    /// Broadcast channel for admin WebSocket event stream.
+    /// Capacity 256 — slow clients get Lagged and skip events.
+    #[cfg(feature = "dashboard")]
+    pub event_tx: broadcast::Sender<crate::event::ServerEvent>,
 }
 
 impl AppState {
@@ -204,6 +208,8 @@ impl AppState {
             active_connections: AtomicU64::new(0),
             #[cfg(feature = "vnet")]
             vnet_routes: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "dashboard")]
+            event_tx: broadcast::channel(256).0,
         }
     }
 }

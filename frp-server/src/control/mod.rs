@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::collections::VecDeque;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant};
-use tracing::{info, warn, debug};
+use tracing::{info, warn, debug, instrument};
 use crate::nathole::NAT_HOLE_TIMEOUT;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 
@@ -65,6 +65,7 @@ pub(super) struct PendingRequest {
 /// Handle a control connection from a frpc client.
 /// The login message has already been consumed from the stream.
 /// `peer` is passed separately because generic stream types don't have peer_addr().
+#[instrument(skip(stream, state, incoming, crypto_ctx), fields(run_id = %login.run_id.clone().unwrap_or_default(), peer = ?peer))]
 pub async fn handle_control<S>(
     mut stream: S,
     login: msg::Login,
@@ -106,6 +107,14 @@ pub async fn handle_control<S>(
             login.timestamp,
         ) {
             warn!(peer = ?peer, error = %e, "Authentication failed for {:?}: {}", peer, e);
+            // Emit WebSocket event for dashboard subscribers
+            #[cfg(feature = "dashboard")]
+            {
+                let _ = state.event_tx.send(crate::event::ServerEvent::Error {
+                    message: format!("Authentication failed for {:?}", peer),
+                    context: Some("login".into()),
+                });
+            }
             let (_, mut writer) = tokio::io::split(stream);
             let resp = FrpMessage::LoginResp(msg::LoginResp {
                 version: Some(frp_core::VERSION.into()),
@@ -182,6 +191,14 @@ pub async fn handle_control<S>(
             warn!(peer = ?peer, error = %e, "Failed to send login response to {:?}: {}", peer, e);
             proxy_ops::unregister_control(&state, &run_id).await;
             return;
+        }
+        // Emit WebSocket event for dashboard subscribers
+        #[cfg(feature = "dashboard")]
+        {
+            let _ = state.event_tx.send(crate::event::ServerEvent::ClientConnected {
+                run_id: run_id.clone(),
+                client_addr: peer.map(|a| a.to_string()),
+            });
         }
     }
 
@@ -741,6 +758,14 @@ pub async fn handle_control<S>(
                         }
                         state.proxy_manager.remove(&cp.proxy_name).await;
                         info!(proxy_name = %cp.proxy_name, "Proxy closed: {}", cp.proxy_name);
+                        // Emit WebSocket event for dashboard subscribers
+                        #[cfg(feature = "dashboard")]
+                        {
+                            let _ = state.event_tx.send(crate::event::ServerEvent::ProxyDown {
+                                proxy_name: cp.proxy_name.clone(),
+                                run_id: run_id.clone(),
+                            });
+                        }
                         // Server plugin: close_proxy hook (fire-and-forget)
                         let plugin_state = state.clone();
                         let pn = cp.proxy_name.clone();
@@ -1182,6 +1207,24 @@ pub async fn handle_control<S>(
     // Cleanup
     for (_, handle) in listener_handles.drain() {
         handle.abort();
+    }
+    // Emit ProxyDown for all proxies owned by this client (before removing them)
+    #[cfg(feature = "dashboard")]
+    {
+        let proxies = state.proxy_manager.list_client(&run_id).await;
+        for p in &proxies {
+            let _ = state.event_tx.send(crate::event::ServerEvent::ProxyDown {
+                proxy_name: p.name.clone(),
+                run_id: run_id.clone(),
+            });
+        }
+    }
+    // Emit ClientDisconnected
+    #[cfg(feature = "dashboard")]
+    {
+        let _ = state.event_tx.send(crate::event::ServerEvent::ClientDisconnected {
+            run_id: run_id.clone(),
+        });
     }
     proxy_ops::unregister_control(&state, &run_id).await;
     state.proxy_manager.remove_client(&run_id).await;
