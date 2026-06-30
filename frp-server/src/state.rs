@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicU64;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -144,6 +144,10 @@ pub struct AppState {
     /// Active bridge connection counter. Incremented when a bridge task starts,
     /// decremented when it completes. The drain phase polls this counter.
     pub active_connections: AtomicU64,
+    /// Broadcast channel for admin WebSocket event stream.
+    /// Capacity 256 — slow clients get Lagged and skip events.
+    #[cfg(feature = "dashboard")]
+    pub event_tx: broadcast::Sender<crate::event::ServerEvent>,
 }
 
 impl AppState {
@@ -189,6 +193,8 @@ impl AppState {
             tls_acceptor: Arc::new(std::sync::RwLock::new(None)),
             shutdown_token: CancellationToken::new(),
             active_connections: AtomicU64::new(0),
+            #[cfg(feature = "dashboard")]
+            event_tx: broadcast::channel(256).0,
         }
     }
 }

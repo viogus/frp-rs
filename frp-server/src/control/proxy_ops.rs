@@ -65,6 +65,14 @@ pub(crate) async fn handle_new_proxy(
         "run_id": run_id,
     });
     if let Err(reason) = state.plugin_manager.notify("new_proxy", np_content).await {
+        // Emit WebSocket event for dashboard subscribers
+        #[cfg(feature = "dashboard")]
+        {
+            let _ = state.event_tx.send(crate::event::ServerEvent::Error {
+                message: format!("Plugin 'new_proxy' rejected proxy '{}': {}", np.proxy_name, reason),
+                context: Some("new_proxy".into()),
+            });
+        }
         let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
             proxy_name: np.proxy_name.clone(),
             remote_addr: None,
@@ -379,6 +387,17 @@ pub(crate) async fn handle_new_proxy(
             }
 
             info!(proxy_name = %np.proxy_name, port = %port, run_id = %run_id, "Proxy '{}' registered on port {} (run_id: {})", np.proxy_name, port, run_id);
+
+            // Emit WebSocket event for dashboard subscribers
+            #[cfg(feature = "dashboard")]
+            {
+                let _ = state.event_tx.send(crate::event::ServerEvent::ProxyUp {
+                    proxy_name: np.proxy_name.clone(),
+                    proxy_type: np.proxy_type.clone(),
+                    run_id: run_id.to_string(),
+                    remote_port: Some(port),
+                });
+            }
 
             let remote_addr_str = format!(":{}", port);
             let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {

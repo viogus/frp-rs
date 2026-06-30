@@ -17,7 +17,7 @@ data-encoding.workspace = true
 tokio-tungstenite = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 tokio-util.workspace = true
-axum = { workspace = true, optional = true }
+axum = { workspace = true, optional = true, features = ["ws"] }
 prometheus = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 rand = "0.10"
