@@ -49,6 +49,8 @@ erasing the concrete type for the bridge layer.
 **Feature flags**: `tls`, `kcp`, `quic`, `websocket`, `compression`, `chacha20`,
 `oidc`. All default ON. Disable to shrink binary size.
 
+**TLS verification**: Uses `rustls-platform-verifier` for native OS trust store (macOS Security.framework, Windows Schannel, Linux openssl dir) instead of bundled `webpki-roots`. Saves ~300KB binary size.
+
 ## Usage
 
 ```rust

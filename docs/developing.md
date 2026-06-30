@@ -272,9 +272,9 @@ Message type bytes (from `frp-core/src/msg.rs`):
 
 The `FrpMessage` enum is `#[serde(untagged)]` -- serde matches the first variant whose fields intersect the JSON. In wire deserialization this is not an issue because the type byte is matched first via `deserialize_v1()`, which dispatches to the correct struct before deserialization.
 
-**V2** (stubs and AEAD, partially implemented in `frp-core/src/protocol.rs`):
+**V2** (fully implemented in `frp-core/src/protocol.rs`):
 
-V2 uses 7-byte magic `FRP\0\x02\r\n` + different framing with numeric type IDs (u16). `detect_v2_magic` and `write_v2_magic` exist. Full AEAD encryption with capability negotiation via `frp-core/src/v2_handshake.rs` and `frp-core/src/crypto.rs`. V2 messages use `deserialize_v2()` which dispatches by numeric type ID.
+V2 uses 7-byte magic `FRP\0\x02\r\n` + different framing with numeric type IDs (u16). Full AEAD encryption with capability negotiation via `frp-core/src/v2_handshake.rs` and `frp-core/src/crypto.rs` (AES-256-GCM or ChaCha20-Poly1305, HKDF-SHA256 key derivation). V2 frame read/write (`read_v2_frame_raw`/`write_v2_frame_raw`), message dispatch (`read_msg_v2`/`write_msg_v2`), and `deserialize_v2()` all fully operational. V2 compat tests auto-detect locally (require source-built Go frp), skipped in CI by default. Set `GO_FRP_V2=1` to enable in CI.
 
 Encryption in the control handler is protocol-aware: V1 uses AES-128-CFB (`CipherStream`), V2 with AEAD keys wraps the stream in `AeadStream` after LoginResp.
 
@@ -415,7 +415,7 @@ The binaries are named `frps`/`frpc` (full), `frps-tiny`/`frpc-tiny`, and `frps-
 | `oidc` | frp-core | OIDC auth (jsonwebtoken, reqwest) |
 | `ssh` | frp-server | SSH gateway (russh) |
 | `dashboard` | frp-server | Metrics/status API (prometheus, axum) |
-| `tls` | frp-core/server/client | TLS encryption (rustls, webpki-roots, axum TlsListener) |
+| `tls` | frp-core/server/client | TLS encryption (rustls, rustls-platform-verifier, axum TlsListener) |
 | `compression` | frp-core | Snappy bridge compression (snap) |
 | `chacha20` | frp-core | XChaCha20-Poly1305 V2 cipher (AES-256-GCM stays) |
 | `http-proxy` | frp-server | HTTP proxy plugin (reqwest) |
@@ -544,7 +544,7 @@ cargo test -- --ignored
 The compat test suite verifies Go frp <-> Rust frp interop across all proxy types and transport protocols:
 
 ```bash
-# Full suite (all 39 tests)
+# Full suite (40 default + 2 guarded)
 bash scripts/compat-test.sh --verbose
 
 # Filter by proxy type and direction
@@ -588,6 +588,42 @@ Follow these conventions:
 3. **Use `test_utils`**: each crate may provide test helpers for spawning servers/clients
 4. **Avoid port conflicts**: use port `0` for auto-allocation or pick unique ports
 5. **Clean up**: ensure spawned tasks/processes are killed on test completion
+
+### Benchmarks
+
+Criterion micro-benchmarks in `frp-core/benches/crypto_bridge.rs` (9 groups) and `frp-server/benches/nathole.rs` (2 groups):
+
+```bash
+# Run all benchmarks (slow — runs each bench many times)
+cargo bench -p frp-core
+cargo bench -p frp-server
+
+# Quick compile-time check (used in CI)
+cargo bench --workspace --no-run
+
+# Run specific groups
+cargo bench -p frp-core -- protocol_all_types
+cargo bench -p frp-core -- bridge
+cargo bench -p frp-server -- nat_analysis
+```
+
+CI gate: `cargo bench --workspace --no-run` in `.github/workflows/ci.yml` ensures benchmarks don't bit-rot.
+
+### Stress Tests
+
+Long-running load test (`scripts/stress-test.sh`) that runs frps + frpc under connection churn:
+
+```bash
+bash scripts/stress-test.sh
+```
+
+Monitors memory, connection counts, and throughput. Runs weekly in CI via `.github/workflows/stress-test.yml`. The `scripts/frp-stress/` crate contains the load generator (not part of the main workspace).
+
+### Property & Fuzz Tests
+
+Proptest-based tests verify correctness under adversarial inputs:
+- **Config normalization** (`frp-core/src/config.rs`): 14 tests — idempotency, flat↔nested equivalence, camelCase→snake_case
+- **Protocol fuzzing** (`frp-core/src/protocol.rs`): 13 tests — all 256 V1 type bytes × arbitrary payloads, V2 arbitrary type IDs, truncated frames, magic detection
 
 ## 7. Release Process
 
@@ -641,17 +677,17 @@ UPX is not required -- the release profile already produces compact binaries via
 
 ### Docker Image Publication
 
-The Docker image is built from source in a multi-stage build (`Dockerfile`):
+The Docker image is built from source in a multi-stage build (`docker/Dockerfile.source`):
 
 ```bash
-# Build for frps
-docker build --build-arg FRP_COMPONENT=frps -t frps:latest .
+# Build for frps (from repo root)
+docker build --build-arg FRP_COMPONENT=frps -t frps:latest -f docker/Dockerfile.source .
 
 # Build for frpc
-docker build --build-arg FRP_COMPONENT=frpc -t frpc:latest .
+docker build --build-arg FRP_COMPONENT=frpc -t frpc:latest -f docker/Dockerfile.source .
 ```
 
-The release workflow (`.github/workflows/docker.yml`) builds and pushes multi-arch images. The image uses a `scratch` base (~2 MB total) with a musl-static binary.
+Also available: `frps-tiny`, `frpc-tiny`, `frps-micro`, `frpc-micro` variants. The release workflow (`.github/workflows/docker.yml`) builds and pushes multi-arch images for all 6 variants. The image uses a `scratch` base (~2 MB total) with a musl-static binary.
 
 ### Triggering a Release
 
@@ -659,8 +695,8 @@ Releases are triggered by pushing a version tag or manually via workflow dispatc
 
 ```bash
 # Tag and push (triggers .github/workflows/release.yml)
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.2
+git push origin v0.3.2
 ```
 
 The release workflow:
@@ -689,7 +725,7 @@ The Docker workflow runs separately (`.github/workflows/docker.yml`) and can be 
 | Crypto (general) | `ring` 0.17 |
 | Crypto (Go compat) | `aes` + `cfb-mode`, `pbkdf2` + `sha1`, `md-5` |
 | Crypto (V2 XChaCha20) | `chacha20poly1305` |
-| TLS | `rustls` + `tokio-rustls` + `rustls-pemfile` + `webpki-roots` |
+| TLS | `rustls` + `tokio-rustls` + `rustls-pemfile` + `rustls-platform-verifier` |
 | SSH | `russh` (ring backend, NOT aws-lc-rs) |
 | HTTP client | `reqwest` (rustls-tls only) |
 | HTTP server | `axum` |

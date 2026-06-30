@@ -6,7 +6,7 @@
 
 frp-rs achieves **100% feature parity** with Go frp v0.69.1. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 9 client plugins, config coverage, SSH tunnel gateway, V2 AEAD protocol, and XTCP Go↔Rust cross-compat all match Go frp behavior. No remaining gaps.
 
-**39/39 cross-compatibility tests pass (5 additional guarded tests for specific environments).**
+**40/40 cross-compatibility tests pass (2 additional guarded tests: XTCP 16-test pairwise matrix on VPS, V2 auto-detected locally).**
 
 ---
 
@@ -120,7 +120,7 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 
 2. **XTCP Go frp cross-compat** — ✅ Full implementation: server coordinates NAT analysis with address exchange. Compat tests guarded behind `RUN_XTCP=1` (requires public internet for STUN/NAT probes).
 
-3. **QUIC Go↔Rust cross-compat** — ✅ Multi-stream QuicConnection wrapper accepts Go frp quic-go additional streams. Full cross-compat verified. Go→Rust guarded behind `RUN_QUIC_G2R=1` (Go frpc v0.69.1 pre-built binary QUIC work-connection limitation).
+3. **QUIC Go↔Rust cross-compat** — ✅ Multi-stream QuicConnection wrapper accepts Go frp quic-go additional streams. Full cross-compat verified. Enabled by default since 0.3.1 (root cause was stale debug build, release build works).
 
 ## Out of Scope
 

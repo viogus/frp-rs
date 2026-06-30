@@ -149,10 +149,10 @@ Sites: `bridge.rs:73,108,193,226,308,336,446,470`
 
 `frp-core/Cargo.toml` `tls` feature pulls `axum` (for `TlsListener`). This means `axum` (~500KB+ HTTP framework) is compiled into frpc even though frpc never serves HTTP. Move axum dependency to `frp-server` only.
 
-### 5.3 `webpki-roots` → `rustls-platform-verifier`
-**Priority**: Medium | **Effort**: Low | **Status**: Gap | **Issue**: [#54](https://github.com/viogus/frp-rs/issues/54)
+### 5.3 `webpki-roots` → `rustls-platform-verifier` ✅
+**Priority**: Medium | **Effort**: Low | **Status**: Done | **Issue**: [#54](https://github.com/viogus/frp-rs/issues/54)
 
-`webpki-roots` bundles ~300KB of CA certificates. `rustls-platform-verifier` uses native OS trust store (macOS Security.framework, Windows Schannel, Linux openssl dir). Saves ~300KB binary size. Also benefits mobile targets.
+Replaced in workspace. `rustls-platform-verifier` uses native OS trust store (macOS Security.framework, Windows Schannel, Linux openssl dir). Saves ~300KB binary size. Also benefits mobile targets.
 
 ### 5.4 `snap` → `lz4_flex` evaluation
 **Priority**: Low | **Effort**: Low | **Status**: Evaluation | **Issue**: [#66](https://github.com/viogus/frp-rs/issues/66)
@@ -172,7 +172,7 @@ Encrypted bridge path: buf → decrypt → buf → write. Could use `Bytes` to s
 ### 5.7 `quinn` → lightweight QUIC (long-term)
 **Priority**: Low | **Effort**: High | **Status**: None
 
-`quinn` pulls `rustls`, `webpki-roots`, `quinn-proto`, `quinn-udp`. ~800KB+. Long-term: thin wrapper over `quinn-proto` only, reuse existing TLS config.
+`quinn` pulls `rustls`, `rustls-platform-verifier`, `quinn-proto`, `quinn-udp`. ~800KB+. Long-term: thin wrapper over `quinn-proto` only, reuse existing TLS config.
 
 ---
 
@@ -218,7 +218,7 @@ Dashboard/admin API serves plain HTTP only. Go frp `WebServer` config has TLS fi
 | 1.4 | Work connection warm-start pool | [#45](https://github.com/viogus/frp-rs/issues/45) | 2h |
 | 3.3 | `/metrics` auth gate | [#65](https://github.com/viogus/frp-rs/issues/65) | 1h |
 | 6.4 | TLS cert hot-reload | [#58](https://github.com/viogus/frp-rs/issues/58) | 2h |
-| 5.3 | `webpki-roots` → platform verifier | [#54](https://github.com/viogus/frp-rs/issues/54) | 2h |
+| 5.3 | `webpki-roots` → platform verifier ✅ | [#54](https://github.com/viogus/frp-rs/issues/54) | 2h |
 | 6.6 | Admin API TLS | [#61](https://github.com/viogus/frp-rs/issues/61) | 2h |
 | 2.3 | CloseProxyResp + Error V2 IDs | [#64](https://github.com/viogus/frp-rs/issues/64) | 1h |
 

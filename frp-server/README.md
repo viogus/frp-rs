@@ -78,3 +78,8 @@ frp-server = { path = "../frp-server" }
 | `dashboard` | Prometheus metrics, axum status API |
 | `ssh` | SSH gateway (russh) |
 | `oidc` | OIDC token verification |
+| `http-proxy` | HTTP proxy plugin (reqwest) |
+| `websocket` | WebSocket transport listener |
+| `quic` | QUIC transport listener |
+| `kcp` | KCP transport listener |
+| `tls` | TLS encryption (rustls, tokio-rustls) |
