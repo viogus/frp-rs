@@ -84,7 +84,16 @@ impl TcpMuxManager {
     /// Look up by hostname (exact match, port-stripped).
     pub async fn lookup(&self, host: &str) -> Option<TcpMuxRoute> {
         // Strip port if present: example.com:443 → example.com
-        let hostname = host.rsplitn(2, ':').last().unwrap_or(host);
+        // Handle bracketed IPv6: [::1]:443 → ::1
+        let hostname = if host.starts_with('[') {
+            if let Some(end) = host.find(']') {
+                &host[1..end]
+            } else {
+                host
+            }
+        } else {
+            host.rsplitn(2, ':').last().unwrap_or(host)
+        };
         self.routes.read().await.get(hostname).cloned()
     }
 }
@@ -296,7 +305,11 @@ fn extract_proxy_auth(request: &str) -> Option<(String, String)> {
         line.len() >= 20 && line[..20].eq_ignore_ascii_case("proxy-authorization:")
     })?;
     let value = auth_line[20..].trim();
-    let encoded = value.strip_prefix("Basic ")?.trim();
+    let encoded = if value.len() > 6 && value[..6].eq_ignore_ascii_case("Basic ") {
+        value[6..].trim()
+    } else {
+        return None;
+    };
     let decoded = data_encoding::BASE64.decode(encoded.as_bytes()).ok()?;
     let creds = String::from_utf8(decoded).ok()?;
     let (user, pwd) = creds.split_once(':')?;

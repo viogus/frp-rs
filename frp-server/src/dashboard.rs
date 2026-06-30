@@ -188,11 +188,12 @@ async fn handle_proxies(
     let proxies = state.proxy_manager.list().await;
     let filter_type = query.proxy_type;
     let mut entries = Vec::new();
+    let ctl_map = state.run_id_to_ctl_tx.read().await;
     for p in &proxies {
         if !filter_type.is_empty() && p.proxy_type != filter_type {
             continue;
         }
-        let online = state.run_id_to_ctl_tx.read().await.contains_key(&p.run_id);
+        let online = ctl_map.contains_key(&p.run_id);
         let traffic = state.proxy_metrics.get(&p.name).await
             .map(|m| m.snapshot())
             .unwrap_or_else(|| MetricsSnapshot {
@@ -238,8 +239,8 @@ async fn handle_proxy_detail(
         local_addr: proxy.local_addr.clone(),
         use_encryption: proxy.use_encryption,
         use_compression: proxy.use_compression,
-        custom_domains: Vec::new(),
-        multiplexer: String::new(),
+        custom_domains: proxy.custom_domains.clone(),
+        multiplexer: proxy.multiplexer.clone(),
         group: proxy.group.unwrap_or_default(),
         traffic,
     }))
@@ -292,8 +293,8 @@ async fn handle_proxy_by_name(
         local_addr: proxy.local_addr.clone(),
         use_encryption: proxy.use_encryption,
         use_compression: proxy.use_compression,
-        custom_domains: Vec::new(),
-        multiplexer: String::new(),
+        custom_domains: proxy.custom_domains.clone(),
+        multiplexer: proxy.multiplexer.clone(),
         group: proxy.group.unwrap_or_default(),
         traffic,
     }))

@@ -1119,7 +1119,7 @@ pub async fn handle_control<S>(
                             let (v_resp, c_resp) = if let (Some(ref vf), Some(ref cf)) = (&v_feature, &c_feature) {
                                 let key = nathole_ctrl::gen_analysis_key(cf, vf);
                                 let (mode, _index, c_behavior, v_behavior) =
-                                    nat_hole.analyzer.get_recommand_behaviors(&key, cf, vf);
+                                    nat_hole.analyzer.get_recommend_behaviors(&key, cf, vf);
 
                                 let timeout_ms = c_behavior.send_delay_ms.max(v_behavior.send_delay_ms) + 5000;
                                 let v_read_timeout = timeout_ms - v_behavior.send_delay_ms;

@@ -143,17 +143,17 @@ pub fn parse_bandwidth_limit(s: &str) -> Option<u64> {
     }
     let s = s.trim().to_uppercase();
     let (num_str, mult) = if let Some(rest) = s.strip_suffix("GB") {
-        (rest.trim(), 1_000_000_000u64)
+        (rest.trim(), 1_073_741_824u64)
     } else if let Some(rest) = s.strip_suffix('G') {
-        (rest.trim(), 1_000_000_000u64)
+        (rest.trim(), 1_073_741_824u64)
     } else if let Some(rest) = s.strip_suffix("MB") {
-        (rest.trim(), 1_000_000u64)
+        (rest.trim(), 1_048_576u64)
     } else if let Some(rest) = s.strip_suffix('M') {
-        (rest.trim(), 1_000_000u64)
+        (rest.trim(), 1_048_576u64)
     } else if let Some(rest) = s.strip_suffix("KB") {
-        (rest.trim(), 1000u64)
+        (rest.trim(), 1024u64)
     } else if let Some(rest) = s.strip_suffix('K') {
-        (rest.trim(), 1000u64)
+        (rest.trim(), 1024u64)
     } else {
         (&s[..], 1u64)
     };
@@ -1731,23 +1731,23 @@ remote_port = 7001
         assert_eq!(parse_bandwidth_limit(""), None);
         assert_eq!(parse_bandwidth_limit("0"), None);
 
-        // KB variants (decimal: 1KB = 1000)
-        assert_eq!(parse_bandwidth_limit("1KB"), Some(1000));
-        assert_eq!(parse_bandwidth_limit("1K"), Some(1000));
+        // KB variants (binary: 1KB = 1024)
+        assert_eq!(parse_bandwidth_limit("1KB"), Some(1024));
+        assert_eq!(parse_bandwidth_limit("1K"), Some(1024));
 
         // MB variants
-        assert_eq!(parse_bandwidth_limit("1MB"), Some(1_000_000));
-        assert_eq!(parse_bandwidth_limit("1M"), Some(1_000_000));
+        assert_eq!(parse_bandwidth_limit("1MB"), Some(1_048_576));
+        assert_eq!(parse_bandwidth_limit("1M"), Some(1_048_576));
 
         // GB variant
-        assert_eq!(parse_bandwidth_limit("1GB"), Some(1_000_000_000));
+        assert_eq!(parse_bandwidth_limit("1GB"), Some(1_073_741_824));
 
         // Plain bytes
         assert_eq!(parse_bandwidth_limit("500"), Some(500));
 
         // Case insensitive (input uppercased internally)
-        assert_eq!(parse_bandwidth_limit("1mb"), Some(1_000_000));
-        assert_eq!(parse_bandwidth_limit("1kb"), Some(1000));
+        assert_eq!(parse_bandwidth_limit("1mb"), Some(1_048_576));
+        assert_eq!(parse_bandwidth_limit("1kb"), Some(1024));
 
         // Garbage → None
         assert_eq!(parse_bandwidth_limit("not-a-number"), None);

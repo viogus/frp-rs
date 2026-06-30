@@ -36,6 +36,13 @@ pub struct YamuxStream {
     _priv: (),
 }
 
+// SAFETY: When tcp-mux is disabled, YamuxStream is never constructed at
+// runtime — it exists only as a type-level stub so IoStream::Yamux variant
+// compiles. All trait impls return errors. Marking Send is sound because
+// no instance of this type can exist.
+#[cfg(not(feature = "tcp-mux"))]
+unsafe impl Send for YamuxStream {}
+
 #[cfg(not(feature = "tcp-mux"))]
 impl tokio::io::AsyncRead for YamuxStream {
     fn poll_read(

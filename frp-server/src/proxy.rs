@@ -24,6 +24,10 @@ pub struct ProxyInfo {
     pub proxy_protocol_version: String,
     /// Response headers to inject into HTTP responses.
     pub response_headers: std::collections::HashMap<String, String>,
+    /// Custom domains for HTTP vhost routing.
+    pub custom_domains: Vec<String>,
+    /// Multiplexer type (e.g., "yamux").
+    pub multiplexer: String,
 }
 
 /// Manages all proxy registrations on the server.

@@ -10,7 +10,7 @@ use tokio::io::AsyncWrite;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tracing::{instrument, trace, warn};
 
-use frp_core::msg::{self, NatHoleDetectBehavior, PortsRange};
+use frp_core::msg::{self, FrpMessage, NatHoleDetectBehavior, PortsRange};
 
 use crate::service::InternalMsg;
 use super::analysis::{Analyzer, RecommendBehavior};
@@ -49,6 +49,8 @@ pub struct Session {
     pub notify_ch: Mutex<Option<oneshot::Sender<()>>>,
     pub report_tx: Mutex<Option<oneshot::Sender<msg::NatHoleReport>>>,
     pub created_at: Instant,
+    /// Last activity timestamp for expiry (updated on handle_client and handle_report).
+    pub last_activity: std::sync::Mutex<Instant>,
 }
 
 /// Central XTCP NAT hole punch controller.
@@ -132,12 +134,27 @@ impl Controller {
             notify_ch: Mutex::new(None),  // caller sets up before notifying provider
             report_tx: Mutex::new(Some(report_tx)),
             created_at: Instant::now(),
+            last_activity: std::sync::Mutex::new(Instant::now()),
         });
         // Check-and-insert atomically under write lock (fixes TOCTOU).
         {
             let mut sessions = self.sessions.write().await;
             if sessions.len() >= MAX_SESSIONS {
                 warn!(max_sessions = MAX_SESSIONS, "NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session");
+                // Send error response to visitor so it doesn't hang.
+                let mut guard = session.visitor_writer.lock().await;
+                if let Some(ref mut w) = *guard {
+                    let _ = frp_core::protocol::write_v1_frame(
+                        w,
+                        &FrpMessage::NatHoleResp(msg::NatHoleResp {
+                            transaction_id: session.visitor_msg.transaction_id.clone(),
+                            sid: Some(sid.clone()),
+                            error: Some("NAT hole session limit reached".into()),
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                }
                 return Err(format!("NAT hole session limit reached ({MAX_SESSIONS})"));
             }
             sessions.insert(sid.clone(), session.clone());
@@ -170,12 +187,24 @@ impl Controller {
             notify_ch: Mutex::new(Some(notify_tx)),
             report_tx: Mutex::new(Some(report_tx)),
             created_at: Instant::now(),
+            last_activity: std::sync::Mutex::new(Instant::now()),
         });
         // Check-and-insert atomically under write lock (fixes TOCTOU).
         {
             let mut sessions = self.sessions.write().await;
             if sessions.len() >= MAX_SESSIONS {
                 warn!(max_sessions = MAX_SESSIONS, "NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session");
+                // Send error response via control channel so visitor doesn't hang.
+                if let Some(ref tx) = session.visitor_ctl_tx {
+                    let _ = tx.send(InternalMsg::WriteNatHoleResp {
+                        transaction_id: session.visitor_msg.transaction_id.clone(),
+                        error: Some("NAT hole session limit reached".into()),
+                        sid: Some(sid.clone()),
+                        protocol: None,
+                        candidate_addrs: None,
+                        assisted_addrs: None,
+                    });
+                }
                 return Err(format!("NAT hole session limit reached ({MAX_SESSIONS})"));
             }
             sessions.insert(sid.clone(), session.clone());
@@ -198,6 +227,7 @@ impl Controller {
                     msg.proxy_name
                 );
                 *session.client_msg.lock().await = Some(msg);
+                *session.last_activity.lock().unwrap() = Instant::now();
                 // Signal the waiting HandleVisitor
                 if let Some(notify) = session.notify_ch.lock().await.take() {
                     let _ = notify.send(());
@@ -211,6 +241,7 @@ impl Controller {
         if let Some(sid) = msg.sid.as_deref() {
             let sessions = self.sessions.read().await;
             if let Some(session) = sessions.get(sid) {
+                *session.last_activity.lock().unwrap() = Instant::now();
                 // Report success to analyzer
                 let v_resp = session.v_resp.lock().await;
                 if let Some(ref resp) = *v_resp {
@@ -256,7 +287,10 @@ impl Controller {
     pub async fn expire_sessions(&self, timeout: Duration) {
         let now = Instant::now();
         let mut sessions = self.sessions.write().await;
-        sessions.retain(|_sid, s| now.duration_since(s.created_at) < timeout);
+        sessions.retain(|_sid, s| {
+            let last = *s.last_activity.lock().unwrap();
+            now.duration_since(last) < timeout
+        });
     }
 
     // --- Backward-compat methods matching old NatHoleCoordinator API ---

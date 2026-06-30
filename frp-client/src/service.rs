@@ -544,6 +544,8 @@ impl Service {
             let v2 = self.cfg.v2;
             info!(run_id = %run_id, "Logged in. run_id: {}", run_id);
 
+            let session_alive = Arc::new(AtomicBool::new(true));
+
             // Register proxies using IoStream directly (supports TCP and TLS)
             for p in &proxies {
                 let local_addr = self.proxy_info_map.read().await
@@ -767,6 +769,7 @@ impl Service {
                     bind_addr: if self.cfg.connect_server_local_ip.is_empty() { None } else { Some(self.cfg.connect_server_local_ip.clone()) },
                     proxy_url: self.cfg.proxy_url.clone(),
                     xtcp_tx: xtcp_tx.clone(),
+                    session_alive: session_alive.clone(),
                     #[cfg(feature = "vnet")]
                     vnet_tuns: self.vnet_tuns.clone(),
                     #[cfg(feature = "vnet")]
@@ -851,6 +854,7 @@ impl Service {
                                     bind_addr: if self.cfg.connect_server_local_ip.is_empty() { None } else { Some(self.cfg.connect_server_local_ip.clone()) },
                                     proxy_url: self.cfg.proxy_url.clone(),
                                     xtcp_tx: xtcp_tx.clone(),
+                                    session_alive: session_alive.clone(),
                                     #[cfg(feature = "vnet")]
                                     vnet_tuns: self.vnet_tuns.clone(),
                                     #[cfg(feature = "vnet")]
@@ -1228,6 +1232,9 @@ impl Service {
                     }
                 }
             }
+
+            // Signal session end to stop pool replenishment cascade
+            session_alive.store(false, Ordering::Release);
 
             // Check if admin stop was requested
             if shutdown_flag.load(Ordering::SeqCst) {

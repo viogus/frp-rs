@@ -437,7 +437,7 @@ impl AsyncRead for WsByteStream {
                                     } else if raw_len == 127 {
                                         *raw_read_state = RawReadState::ReadingExtendedLen8 { ext: [0u8; 8], filled: 0 };
                                     } else {
-                                        if raw_len > 16 * 1024 * 1024 {
+                                        if raw_len > crate::protocol::V1_MAX_MSG_LENGTH as u64 + 4096 {
                                             *raw_read_state = RawReadState::Idle;
                                             return Poll::Ready(Err(io::Error::new(
                                                 io::ErrorKind::InvalidData,
@@ -477,7 +477,7 @@ impl AsyncRead for WsByteStream {
                                         return Poll::Pending;
                                     }
                                     let payload_len = u16::from_be_bytes(*ext) as u64;
-                                    if payload_len > 16 * 1024 * 1024 {
+                                    if payload_len > crate::protocol::V1_MAX_MSG_LENGTH as u64 + 4096 {
                                         *raw_read_state = RawReadState::Idle;
                                         return Poll::Ready(Err(io::Error::new(
                                             io::ErrorKind::InvalidData,
@@ -516,7 +516,7 @@ impl AsyncRead for WsByteStream {
                                         return Poll::Pending;
                                     }
                                     let payload_len = u64::from_be_bytes(*ext);
-                                    if payload_len > 16 * 1024 * 1024 {
+                                    if payload_len > crate::protocol::V1_MAX_MSG_LENGTH as u64 + 4096 {
                                         *raw_read_state = RawReadState::Idle;
                                         return Poll::Ready(Err(io::Error::new(
                                             io::ErrorKind::InvalidData,

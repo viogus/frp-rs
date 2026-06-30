@@ -82,10 +82,10 @@ fn bench_nat_analysis(c: &mut Criterion) {
         public_network: false,
     };
 
-    group.bench_function("get_recommand_easy_easy", |b| {
+    group.bench_function("get_recommend_easy_easy", |b| {
         let analyzer = frp_server::nathole::analysis::Analyzer::new(Duration::from_secs(3600));
         b.iter(|| {
-            let _ = analyzer.get_recommand_behaviors(
+            let _ = analyzer.get_recommend_behaviors(
                 black_box("easy-key"),
                 black_box(&easy_feature),
                 black_box(&easy_feature),
@@ -93,10 +93,10 @@ fn bench_nat_analysis(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("get_recommand_hard_hard", |b| {
+    group.bench_function("get_recommend_hard_hard", |b| {
         let analyzer = frp_server::nathole::analysis::Analyzer::new(Duration::from_secs(3600));
         b.iter(|| {
-            let _ = analyzer.get_recommand_behaviors(
+            let _ = analyzer.get_recommend_behaviors(
                 black_box("hard-key"),
                 black_box(&hard_regular),
                 black_box(&hard_regular),
@@ -104,17 +104,17 @@ fn bench_nat_analysis(c: &mut Criterion) {
         });
     });
 
-    // Cycle through all mode-0 entries (exercises recommand + score rotation)
-    group.bench_function("recommand_cycle_mode0", |b| {
+    // Cycle through all mode-0 entries (exercises recommend + score rotation)
+    group.bench_function("recommend_cycle_mode0", |b| {
         let analyzer = frp_server::nathole::analysis::Analyzer::new(Duration::from_secs(3600));
         // First warm-up to populate records
-        analyzer.get_recommand_behaviors("cycle-key", &easy_feature, &easy_feature);
+        analyzer.get_recommend_behaviors("cycle-key", &easy_feature, &easy_feature);
 
         let mut counter = 0u64;
         b.iter(|| {
             // Rotate key so each iteration gets a fresh entry to avoid score exhaustion
             let key = format!("cycle-{}", counter % 100);
-            let _ = analyzer.get_recommand_behaviors(
+            let _ = analyzer.get_recommend_behaviors(
                 black_box(&key),
                 black_box(&easy_feature),
                 black_box(&easy_feature),

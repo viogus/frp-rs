@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
@@ -68,6 +69,7 @@ pub(crate) struct WorkConnConfig {
     pub bind_addr: Option<String>,
     pub proxy_url: String,
     pub xtcp_tx: mpsc::UnboundedSender<XtcpNotification>,
+    pub session_alive: Arc<AtomicBool>,
     #[cfg(feature = "vnet")]
     pub vnet_tuns: VnetTunMap,
     #[cfg(feature = "vnet")]
@@ -167,6 +169,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             bind_addr,
             proxy_url,
             xtcp_tx,
+            session_alive,
             #[cfg(feature = "vnet")]
             vnet_tuns,
             #[cfg(feature = "vnet")]
@@ -179,6 +182,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
         let repl_proxy_metrics = proxy_metrics.clone();
         let repl_proxy_url = proxy_url.clone();
         let repl_xtcp_tx = xtcp_tx.clone();
+        let repl_session_alive = session_alive.clone();
         #[cfg(feature = "vnet")]
         let repl_vnet_tuns = vnet_tuns.clone();
         #[cfg(feature = "vnet")]
@@ -702,7 +706,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
 
         // Replenish pool: spawn replacement to maintain pool_count
         // (Go frp v0.69.1 compat — idle work conns refilled after use)
-        if pool_id >= 0 {
+        if pool_id >= 0 && repl_session_alive.load(Ordering::Acquire) {
             spawn_work_conn(WorkConnConfig {
                 server_addr: server_addr.clone(),
                 server_port,
@@ -729,6 +733,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                 bind_addr,
                 proxy_url: repl_proxy_url,
                 xtcp_tx: repl_xtcp_tx,
+                session_alive: repl_session_alive,
                 #[cfg(feature = "vnet")]
                 vnet_tuns: repl_vnet_tuns,
                 #[cfg(feature = "vnet")]

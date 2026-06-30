@@ -144,6 +144,8 @@ pub(crate) async fn handle_new_proxy(
                 allow_users: np.allow_users.clone().unwrap_or_default(),
                 proxy_protocol_version: np.proxy_protocol_version.clone().unwrap_or_default(),
                 response_headers: np.response_headers.clone().unwrap_or_default(),
+                custom_domains: np.custom_domains.clone().unwrap_or_default(),
+                multiplexer: np.multiplexer.clone().unwrap_or_default(),
             };
 
             if let Err(e) = state.proxy_manager.register(run_id.to_string(), info.clone()).await {
