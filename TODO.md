@@ -1,6 +1,8 @@
 # TODO — frp-rs Feature Backlog
 
 > Auto-generated from codebase scan (frp-rs vs Go frp v0.69.1). 2026-06-30.
+> **Milestone**: [v0.69.1 — Go frp parity + innovation](https://github.com/viogus/frp-rs/milestone/1)
+> **Issues**: [#43–#67](https://github.com/viogus/frp-rs/issues?q=milestone%3A%22v0.69.1+%E2%80%94+Go+frp+parity+%2B+innovation%22)
 
 ---
 
