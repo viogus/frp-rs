@@ -14,6 +14,8 @@ pub mod admin_auth;
 pub mod cli;
 #[cfg(feature = "kcp")]
 pub mod kcp;
+#[cfg(feature = "kcp")]
+pub mod kcp_compat;
 #[cfg(feature = "quic")]
 pub mod quic;
 pub mod v2_handshake;
