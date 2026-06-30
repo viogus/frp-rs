@@ -21,11 +21,11 @@ tokio-util.workspace = true
 axum = { workspace = true, optional = true, features = ["ws"] }
 prometheus = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
-rand = "0.10"
+rand = { version = "0.10", optional = true }
 
 [features]
-default = ["ssh", "dashboard", "websocket", "quic", "kcp", "oidc", "tls", "http-proxy", "vnet"]
-ssh = ["dep:russh"]
+default = ["ssh", "dashboard", "websocket", "quic", "kcp", "oidc", "tls", "http-proxy", "vnet", "compression", "chacha20", "tcp-mux"]
+ssh = ["dep:russh", "dep:rand"]
 dashboard = ["dep:prometheus", "dep:axum", "frp-core/admin-auth"]
 websocket = ["dep:tokio-tungstenite", "frp-core/websocket"]
 quic = ["frp-core/quic"]
@@ -34,6 +34,9 @@ oidc = ["frp-core/oidc"]
 tls = ["frp-core/tls", "dep:tokio-rustls"]
 http-proxy = ["dep:reqwest"]
 vnet = ["frp-core/vnet", "dep:frp-vnet"]
+compression = ["frp-core/compression"]
+chacha20 = ["frp-core/chacha20"]
+tcp-mux = ["frp-core/tcp-mux"]
 
 [dev-dependencies]
 tempfile = "3"

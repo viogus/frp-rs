@@ -26,7 +26,7 @@ rand.workspace = true
 data-encoding.workspace = true
 
 [features]
-default = ["tls", "quic", "kcp", "websocket", "oidc", "vnet", "admin"]
+default = ["tls", "quic", "kcp", "websocket", "oidc", "vnet", "admin", "compression", "chacha20", "tcp-mux"]
 admin = ["dep:axum", "frp-core/admin-auth"]
 tls = ["frp-core/tls", "dep:rustls", "dep:tokio-rustls"]
 quic = ["frp-core/quic"]
@@ -34,3 +34,6 @@ kcp = ["frp-core/kcp"]
 websocket = ["frp-core/websocket"]
 oidc = ["frp-core/oidc"]
 vnet = ["frp-core/vnet", "dep:frp-vnet"]
+compression = ["frp-core/compression"]
+chacha20 = ["frp-core/chacha20"]
+tcp-mux = ["frp-core/tcp-mux"]
