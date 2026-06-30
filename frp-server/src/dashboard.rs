@@ -470,6 +470,7 @@ pub async fn run_dashboard(
     state: Arc<AppState>,
     auth_user: String,
     auth_password: String,
+    enable_prometheus: bool,
     tls_cert_file: Option<String>,
     tls_key_file: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -488,8 +489,9 @@ pub async fn run_dashboard(
 
     let api_routes = apply_admin_auth(api_routes, &auth_user, &auth_password);
 
-    // /metrics is public (Prometheus scrapers don't use Basic Auth).
-    // Syncs gauge values from the live ProxyMetricsRegistry on each scrape.
+    // /metrics: gated behind enable_prometheus (Go frp compat).
+    // Returns 404 when disabled. When dashboard auth is configured,
+    // /metrics also requires Basic auth.
     let state_for_metrics = state.clone();
     let metrics_route = Router::new()
         .route("/metrics", get(move || {
@@ -499,13 +501,16 @@ pub async fn run_dashboard(
                 crate::metrics::prom::render_metrics_text()
             }
         }));
+    let metrics_route = apply_admin_auth(metrics_route, &auth_user, &auth_password);
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/", get(handle_root))
         .route("/healthz", get(handle_healthz))
-        .merge(api_routes)
-        .merge(metrics_route)
-        .with_state(state);
+        .merge(api_routes);
+    if enable_prometheus {
+        app = app.merge(metrics_route);
+    }
+    let app = app.with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
