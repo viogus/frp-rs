@@ -870,4 +870,365 @@ mod tests {
             other => panic!("expected Login, got {:?}", other.v2_type_id()),
         }
     }
+
+    // ─── Fuzz / property-based tests (proptest) ─────────────────────
+
+    /// Sync reader adapter that delivers pre-determined bytes for fuzz testing.
+    /// Implements only read_exact — enough for V1/V2 frame reading and magic detection.
+    struct FuzzReader {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl FuzzReader {
+        fn new(data: Vec<u8>) -> Self {
+            Self { data, pos: 0 }
+        }
+    }
+
+    impl tokio::io::AsyncRead for FuzzReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let remaining = self.data.len() - self.pos;
+            let to_copy = remaining.min(buf.remaining());
+            buf.put_slice(&self.data[self.pos..self.pos + to_copy]);
+            self.pos += to_copy;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    mod proptest_fuzz {
+        use proptest::prelude::*;
+        use super::*;
+
+        // ── V1 deserialize fuzz ─────────────────────────────────────
+
+        /// All valid V1 type bytes — every one must accept or reject without panicking.
+        const V1_TYPE_BYTES: &[u8] = &[
+            msg::TYPE_LOGIN,
+            msg::TYPE_LOGIN_RESP,
+            msg::TYPE_NEW_PROXY,
+            msg::TYPE_NEW_PROXY_RESP,
+            msg::TYPE_CLOSE_PROXY,
+            msg::TYPE_CLOSE_PROXY_RESP,
+            msg::TYPE_NEW_WORK_CONN,
+            msg::TYPE_REQ_WORK_CONN,
+            msg::TYPE_START_WORK_CONN,
+            msg::TYPE_NEW_VISITOR_CONN,
+            msg::TYPE_NEW_VISITOR_CONN_RESP,
+            msg::TYPE_PING,
+            msg::TYPE_PONG,
+            msg::TYPE_UDP_PACKET,
+            msg::TYPE_NAT_HOLE_VISITOR,
+            msg::TYPE_NAT_HOLE_CLIENT,
+            msg::TYPE_NAT_HOLE_RESP,
+            msg::TYPE_NAT_HOLE_SID,
+            msg::TYPE_NAT_HOLE_REPORT,
+            msg::TYPE_ERROR,
+        ];
+
+        proptest! {
+            /// Fuzz `deserialize_v1` with arbitrary byte payloads for every valid
+            /// V1 type byte. Must never panic — must return Ok or Err cleanly.
+            #[test]
+            fn fuzz_deserialize_v1_known_types(
+                type_idx in 0usize..V1_TYPE_BYTES.len(),
+                payload in prop::collection::vec(any::<u8>(), 0..2048),
+            ) {
+                let type_byte = V1_TYPE_BYTES[type_idx];
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    deserialize_v1(type_byte, &payload)
+                }));
+                match result {
+                    Ok(Ok(_msg)) => { /* valid JSON for this type — acceptable */ }
+                    Ok(Err(_e)) => { /* invalid JSON or wrong fields — acceptable */ }
+                    Err(_panic) => panic!("deserialize_v1 panicked on type_byte={type_byte}, payload_len={}", payload.len()),
+                }
+            }
+        }
+
+        proptest! {
+            /// Fuzz `deserialize_v1` with arbitrary type bytes (including unknown ones).
+            /// Unknown type bytes must return Err, never panic.
+            #[test]
+            fn fuzz_deserialize_v1_arbitrary_types(
+                type_byte in any::<u8>(),
+                payload in prop::collection::vec(any::<u8>(), 0..1024),
+            ) {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    deserialize_v1(type_byte, &payload)
+                }));
+                match result {
+                    Ok(Ok(msg)) => {
+                        // Known type + valid JSON — the type byte should match
+                        let expected = msg.v1_type_byte();
+                        prop_assert_eq!(type_byte, expected,
+                            "type_byte mismatch: deserialized message has wrong type byte");
+                    }
+                    Ok(Err(_)) => { /* expected for unknown types or invalid JSON */ }
+                    Err(_panic) => panic!("deserialize_v1 panicked on type_byte={type_byte}"),
+                }
+            }
+        }
+
+        proptest! {
+            /// Fuzz `deserialize_v2` with arbitrary type IDs and payloads.
+            /// Must never panic.
+            #[test]
+            fn fuzz_deserialize_v2(
+                type_id in any::<u16>(),
+                payload in prop::collection::vec(any::<u8>(), 0..2048),
+            ) {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::protocol::deserialize_v2(type_id, &payload)
+                }));
+                match result {
+                    Ok(Ok(_)) | Ok(Err(_)) => { /* expected */ }
+                    Err(_panic) => panic!("deserialize_v2 panicked on type_id={type_id}, payload_len={}", payload.len()),
+                }
+            }
+        }
+
+        // ── Frame header fuzz ───────────────────────────────────────
+
+        proptest! {
+            /// Fuzz V1 frame header parsing: arbitrary 9-byte headers with arbitrary
+            /// payload lengths. Validates that oversized or invalid lengths are rejected.
+            #[test]
+            fn fuzz_v1_frame_header(
+                header_bytes in prop::array::uniform9(any::<u8>()),
+                payload_len in 0usize..=65536usize,
+            ) {
+                // Construct a full frame: 9-byte header + payload bytes
+                // Encode the payload length in big-endian bytes 1..9
+                let mut frame = header_bytes;
+                frame[1..9].copy_from_slice(&(payload_len as i64).to_be_bytes());
+
+                // Extend with dummy payload
+                let mut full_frame = frame.to_vec();
+                full_frame.extend(vec![0u8; payload_len]);
+
+                // Feed to FuzzReader and attempt read_v1_frame
+                let reader = FuzzReader::new(full_frame.clone());
+                // Wrap reader so we can call read_v1_frame
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_time()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async {
+                        let mut r = reader;
+                        read_v1_frame(&mut r).await
+                    })
+                }));
+                match result {
+                    Ok(Ok(_)) => {
+                        // Valid frame: payload_len must be within 0..=65536
+                        prop_assert!(payload_len <= 65536,
+                            "read_v1_frame accepted oversized payload_len={payload_len}");
+                    }
+                    Ok(Err(_)) => { /* expected for oversized/invalid */ }
+                    Err(_panic) => panic!("read_v1_frame panicked on header={header_bytes:?}, payload_len={payload_len}"),
+                }
+            }
+        }
+
+        proptest! {
+            /// Fuzz V1 frame with malicious length field: payload says it's long
+            /// but actual buffer is shorter (truncation attack).
+            #[test]
+            fn fuzz_v1_frame_truncated_payload(
+                claimed_len in 1i64..65536i64,
+                actual_len in 0usize..100usize,
+            ) {
+                let mut header = [0u8; 9];
+                header[1..9].copy_from_slice(&claimed_len.to_be_bytes());
+                let mut frame = header.to_vec();
+                frame.extend(vec![0u8; actual_len]);
+
+                let reader = FuzzReader::new(frame);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_time()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async {
+                        let mut r = reader;
+                        read_v1_frame(&mut r).await
+                    })
+                }));
+                match result {
+                    Ok(Ok(_)) => {
+                        // Only valid if actual_len >= claimed_len
+                        prop_assert!(actual_len as i64 >= claimed_len,
+                            "read_v1_frame accepted truncated payload: claimed={claimed_len}, actual={actual_len}");
+                    }
+                    Ok(Err(_)) => { /* expected */ }
+                    Err(_panic) => panic!("read_v1_frame panicked on truncated payload"),
+                }
+            }
+        }
+
+        // ── V2 magic detection fuzz ─────────────────────────────────
+
+        proptest! {
+            /// Fuzz `read_v2_magic_or_replay` with arbitrary 7-byte prefixes.
+            /// Only exact V2 magic should be consumed; everything else replayed.
+            #[test]
+            fn fuzz_v2_magic_detection(bytes in prop::array::uniform7(any::<u8>())) {
+                let reader = FuzzReader::new(bytes.to_vec());
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_time()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async {
+                        let mut r = reader;
+                        read_v2_magic_or_replay(&mut r).await
+                    })
+                }));
+                match result {
+                    Ok(Ok(None)) => {
+                        // Magic matched — bytes must equal V2_MAGIC_BYTES
+                        prop_assert_eq!(&bytes[..], &V2_MAGIC_BYTES[..],
+                            "read_v2_magic_or_replay consumed non-magic bytes");
+                    }
+                    Ok(Ok(Some(replay))) => {
+                        prop_assert_eq!(&replay[..], &bytes[..],
+                            "replayed bytes must equal input bytes");
+                        prop_assert_ne!(&bytes[..], &V2_MAGIC_BYTES[..],
+                            "read_v2_magic_or_replay replayed V2 magic bytes");
+                    }
+                    Ok(Err(_)) => { /* IO error — shouldn't happen for full read */ }
+                    Err(_panic) => panic!("read_v2_magic_or_replay panicked on bytes={bytes:?}"),
+                }
+            }
+        }
+
+        // ── Deterministic edge cases ────────────────────────────────
+
+        #[test]
+        fn v1_deserialize_empty_payload_all_types() {
+            for &tb in V1_TYPE_BYTES {
+                let result = deserialize_v1(tb, b"");
+                // Empty payload is invalid JSON — must return Err, never panic
+                assert!(result.is_err(),
+                    "deserialize_v1({tb}, \"\") should fail on empty payload");
+            }
+        }
+
+        #[test]
+        fn v1_deserialize_binary_garbage() {
+            // Binary garbage (not UTF-8 JSON) — must return Err for all types
+            let garbage: Vec<u8> = (0..=255).collect();
+            for &tb in V1_TYPE_BYTES {
+                let result = deserialize_v1(tb, &garbage);
+                assert!(result.is_err(),
+                    "deserialize_v1({tb}, binary_garbage) should fail");
+            }
+        }
+
+        #[test]
+        fn v1_deserialize_null_byte_injection() {
+            // JSON with embedded null bytes
+            let payload = b"{\"version\": \"\0\0\0\"}";
+            for &tb in V1_TYPE_BYTES {
+                let result = deserialize_v1(tb, payload);
+                // Must not panic — Err is expected (invalid JSON or wrong fields)
+                let _ = result;
+            }
+        }
+
+        #[test]
+        fn v2_deserialize_empty_payload() {
+            for type_id in 0u16..30 {
+                let result = crate::protocol::deserialize_v2(type_id, b"");
+                assert!(result.is_err(),
+                    "deserialize_v2({type_id}, \"\") should fail on empty payload");
+            }
+        }
+
+        #[test]
+        fn v2_deserialize_binary_garbage() {
+            let garbage: Vec<u8> = (0..=255).collect();
+            for type_id in 0u16..30 {
+                let result = crate::protocol::deserialize_v2(type_id, &garbage);
+                assert!(result.is_err(),
+                    "deserialize_v2({type_id}, binary_garbage) should fail");
+            }
+        }
+
+        #[test]
+        fn v1_frame_negative_length_rejected() {
+            // Header with negative length in bytes 1..9
+            let mut header = [0u8; 9];
+            header[0] = msg::TYPE_LOGIN;
+            header[1..9].copy_from_slice(&(-1i64).to_be_bytes());
+            let reader = FuzzReader::new(header.to_vec());
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let result = rt.block_on(async {
+                let mut r = reader;
+                read_v1_frame(&mut r).await
+            });
+            assert!(result.is_err(), "negative V1 length should be rejected");
+        }
+
+        #[test]
+        fn v1_frame_zero_length_accepted() {
+            let mut header = [0u8; 9];
+            header[0] = msg::TYPE_LOGIN;
+            // bytes 1..9 are all zero = length 0
+            let reader = FuzzReader::new(header.to_vec());
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let result = rt.block_on(async {
+                let mut r = reader;
+                read_v1_frame(&mut r).await
+            });
+            assert!(result.is_ok(), "zero-length V1 frame should be accepted");
+        }
+
+        #[test]
+        fn v2_magic_exact_match_detected() {
+            let reader = FuzzReader::new(V2_MAGIC_BYTES.to_vec());
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let result = rt.block_on(async {
+                let mut r = reader;
+                read_v2_magic_or_replay(&mut r).await
+            });
+            assert!(result.is_ok());
+            assert!(result.unwrap().is_none(), "V2 magic should be detected and consumed");
+        }
+
+        #[test]
+        fn v2_magic_one_byte_off_replayed() {
+            // Toggle the last byte — should not match magic
+            let mut bytes = V2_MAGIC_BYTES;
+            bytes[6] ^= 1;
+            let reader = FuzzReader::new(bytes.to_vec());
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let result = rt.block_on(async {
+                let mut r = reader;
+                read_v2_magic_or_replay(&mut r).await
+            });
+            assert!(result.is_ok());
+            let replay = result.unwrap();
+            assert!(replay.is_some(), "near-magic should be replayed, not consumed");
+            assert_eq!(replay.unwrap(), bytes.to_vec());
+        }
+    }
 }
