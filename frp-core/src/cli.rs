@@ -253,14 +253,20 @@ fn svr_log() -> impl Parser<SvrLog> {
 }
 
 fn svr_transport() -> impl Parser<SvrTransport> {
+    #[cfg(feature = "kcp")]
     let kcp_bind_port = long("kcp-bind-port")
         .long("kcp_bind_port")
         .argument::<u16>("PORT")
         .optional();
+    #[cfg(not(feature = "kcp"))]
+    let kcp_bind_port = bpaf::pure(None);
+    #[cfg(feature = "quic")]
     let quic_bind_port = long("quic-bind-port")
         .long("quic_bind_port")
         .argument::<u16>("PORT")
         .optional();
+    #[cfg(not(feature = "quic"))]
+    let quic_bind_port = bpaf::pure(None);
     let vhost_http_port = long("vhost-http-port")
         .long("vhost_http_port")
         .argument::<u16>("PORT")
@@ -657,7 +663,9 @@ impl FrpsArgs {
         if let Some(v) = self.log_max_days { cfg.log.max_days = v; }
 
         // Transport / ports
+        #[cfg(feature = "kcp")]
         if let Some(v) = self.kcp_bind_port { cfg.kcp_bind_port = v; }
+        #[cfg(feature = "quic")]
         if let Some(v) = self.quic_bind_port { cfg.quic_bind_port = v; }
         if let Some(v) = self.vhost_http_port { cfg.vhost_http_port = v; }
         if let Some(v) = self.vhost_https_port { cfg.vhost_https_port = v; }
