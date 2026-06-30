@@ -23,7 +23,7 @@ pub async fn stun_binding(stun_addr: &str) -> Result<String, String> {
         sa
     } else {
         // Try DNS resolution
-        let addrs = tokio::net::lookup_host(format!("{}", addr_str))
+        let addrs = tokio::net::lookup_host(addr_str.to_string())
             .await
             .map_err(|e| format!("STUN DNS lookup failed for '{}': {}", addr_str, e))?;
         addrs.into_iter().next()

@@ -16,6 +16,9 @@ use crate::nathole::controller::Controller;
 use crate::vhost::VhostManager;
 use crate::tcpmux::TcpMuxManager;
 
+#[cfg(feature = "vnet")]
+type VnetRouteMap = Arc<RwLock<HashMap<(String, String), (String, String)>>>;
+
 // ---------------------------------------------------------------
 // Shared state for cross-task communication
 // ---------------------------------------------------------------
@@ -153,7 +156,7 @@ pub struct AppState {
     /// Virtual network routing table: (virtual_net, subnet) → (run_id, proxy_name).
     /// Populated by VnetRouteAdvertise messages, used to forward VnetPacket.
     #[cfg(feature = "vnet")]
-    pub vnet_routes: Arc<RwLock<HashMap<(String, String), (String, String)>>>,
+    pub vnet_routes: VnetRouteMap,
 }
 
 impl AppState {

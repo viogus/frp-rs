@@ -2,6 +2,16 @@
 
 All notable changes to frp-rs.
 
+## v0.4.0 (unreleased)
+
+### Added
+- Virtual Net L3 VPN: new `type = "vnet"` proxy with TUN device routing (#48)
+- New `frp-vnet` crate: cross-platform TUN (Linux/macOS), CIDR routing table, VnetController
+- Server-side vnet route management with subnet conflict detection
+- Client-side VnetController: TUN<->work_conn bidirectional packet loop
+- OS route injection for peer subnet reachability (Linux, macOS)
+- Feature-gated behind `vnet` flag (full=on, tiny/micro=off)
+
 ## [0.3.2] - 2026-06-30
 
 ### Added

@@ -80,7 +80,7 @@ impl RouteTable {
         self.by_name.insert(name.to_string(), (net.clone(), name.to_string()));
         self.routes.push((net, name.to_string()));
         // Sort by prefix length descending for longest-prefix match
-        self.routes.sort_by(|a, b| b.0.prefix_len.cmp(&a.0.prefix_len));
+        self.routes.sort_by_key(|item| std::cmp::Reverse(item.0.prefix_len));
 
         Ok(())
     }

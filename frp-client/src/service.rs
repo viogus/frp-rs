@@ -18,6 +18,9 @@ use rand::Rng;
 
 use frp_core::auth::{AuthConfig, AuthMethod, OidcClient};
 use frp_core::config::ClientConfig;
+
+#[cfg(feature = "vnet")]
+type VnetTunMap = Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>;
 use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg, write_msg};
@@ -67,7 +70,7 @@ pub struct Service {
     /// Shared TUN devices for vnet proxies, keyed by proxy name.
     /// Work connection tasks take ownership of the TUN device via Option::take().
     #[cfg(feature = "vnet")]
-    vnet_tuns: Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>,
+    vnet_tuns: VnetTunMap,
     /// Shared routing table for vnet packet forwarding (TX direction).
     /// Updated by the service when peer route advertisements arrive,
     /// read by VnetController during packet forwarding.

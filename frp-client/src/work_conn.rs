@@ -18,6 +18,9 @@ use frp_core::metrics::ProxyMetricsRegistry;
 use crate::proxy;
 use crate::admin::ProxyRuntimeInfo;
 
+#[cfg(feature = "vnet")]
+type VnetTunMap = Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>;
+
 /// Conditional type for the QUIC connection parameter.
 /// When the `quic` feature is disabled, the parameter is `()` (ZST, no-op).
 #[cfg(feature = "quic")]
@@ -66,7 +69,7 @@ pub(crate) struct WorkConnConfig {
     pub proxy_url: String,
     pub xtcp_tx: mpsc::UnboundedSender<XtcpNotification>,
     #[cfg(feature = "vnet")]
-    pub vnet_tuns: Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>,
+    pub vnet_tuns: VnetTunMap,
     #[cfg(feature = "vnet")]
     pub vnet_routes: Arc<RwLock<frp_vnet::router::RouteTable>>,
 }
