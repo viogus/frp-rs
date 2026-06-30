@@ -354,6 +354,15 @@ pub async fn handle_control<S>(
                         }
                     }
                     Some(InternalMsg::VisitorConn { proxy_name, visitor_conn }) => {
+                        // NewUserConn plugin hook — control-enabled plugins can reject
+                        let user_content = serde_json::json!({
+                            "proxy_name": proxy_name,
+                            "run_id": run_id,
+                        });
+                        if let Err(reason) = state.plugin_manager.notify("new_user_conn", user_content).await {
+                            debug!(proxy_name = %proxy_name, reason = %reason, "NewUserConn plugin hook rejected (VisitorConn): {}", reason);
+                            continue;
+                        }
                         debug!(proxy_name = %proxy_name, run_id = %run_id, "STCP visitor conn for proxy {} on run_id {}", proxy_name, run_id);
                         let (enc, comp, response_headers, proxy_type) = {
                             let p = state.proxy_manager.get(&proxy_name).await;
@@ -376,6 +385,15 @@ pub async fn handle_control<S>(
                         }
                     }
                     Some(InternalMsg::ProxyUserConn { proxy_name, user_conn, pre_read }) => {
+                        // NewUserConn plugin hook — control-enabled plugins can reject
+                        let user_content = serde_json::json!({
+                            "proxy_name": proxy_name,
+                            "run_id": run_id,
+                        });
+                        if let Err(reason) = state.plugin_manager.notify("new_user_conn", user_content).await {
+                            debug!(proxy_name = %proxy_name, reason = %reason, "NewUserConn plugin hook rejected (ProxyUserConn): {}", reason);
+                            continue;
+                        }
                         debug!(proxy_name = %proxy_name, run_id = %run_id, "User conn for proxy {} on run_id {}", proxy_name, run_id);
                         // Group load balancing: if proxy belongs to a group,
                         // select a backend (possibly on a different run_id).
@@ -809,6 +827,18 @@ pub async fn handle_control<S>(
                             break;
                         }
                         last_ping = Instant::now();
+                        // Fire ping plugin hook (fire-and-forget — don't block control loop)
+                        let ping_content = serde_json::json!({
+                            "run_id": run_id,
+                            "remote_addr": peer.map(|a| a.to_string()).unwrap_or_default(),
+                            "timestamp": ping_msg.timestamp,
+                        });
+                        let plugin_mgr = state.plugin_manager.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = plugin_mgr.notify("ping", ping_content).await {
+                                debug!("Ping plugin hook: {}", e);
+                            }
+                        });
                         let pong = FrpMessage::Pong(msg::Pong { error: None });
                         if let Err(e) = write_ctl_msg(&mut writer, &pong, v2).await {
                             warn!(error = %e, "Failed to send pong: {}", e);
