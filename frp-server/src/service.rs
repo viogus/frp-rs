@@ -600,10 +600,11 @@ impl Service {
             } else {
                 Some(self.cfg.web_server.tls_key_file.clone())
             };
+            let enable_prom = self.cfg.web_server.enable_prometheus;
             tokio::spawn(async move {
                 if let Err(e) = crate::dashboard::run_dashboard(
                     dash_addr, dash_state, dash_user, dash_pwd,
-                    dash_tls_cert, dash_tls_key,
+                    enable_prom, dash_tls_cert, dash_tls_key,
                 ).await {
                     tracing::error!("Dashboard server failed: {}", e);
                 }
