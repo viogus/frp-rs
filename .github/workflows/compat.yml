@@ -51,6 +51,9 @@ jobs:
       - name: Build frp-rs (release)
         run: cargo build --release --bin frps --bin frpc
 
+      - name: Run Rust unit tests
+        run: cargo test --workspace --release --lib
+
       - name: Download Go frp
         run: bash scripts/download-go-frp.sh "$GO_FRP_VERSION"
 
