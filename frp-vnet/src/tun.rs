@@ -18,7 +18,15 @@ pub async fn open_tun(name: &str) -> anyhow::Result<Box<dyn TunDevice>> {
     {
         crate::tun_linux::LinuxTun::open(name).await
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        crate::tun_macos::MacOSTun::open(name).await
+    }
+    #[cfg(target_os = "windows")]
+    {
+        crate::tun_windows::WindowsTun::open(name).await
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = name;
         anyhow::bail!("TUN devices not yet implemented on this platform")
