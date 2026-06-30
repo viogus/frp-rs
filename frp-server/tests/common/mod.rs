@@ -148,7 +148,7 @@ impl FrpsHandle {
             } else {
                 "release"
             };
-            format!("target/{}/frps", profile)
+            format!("../target/{}/frps", profile)
         });
 
         let child = Command::new(&frps_bin)
