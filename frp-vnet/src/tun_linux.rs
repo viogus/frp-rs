@@ -45,9 +45,7 @@ impl LinuxTun {
             *dst = *src as libc::c_char;
         }
 
-        unsafe {
-            ifr.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
-        }
+        ifr.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
 
         let ret = unsafe { libc::ioctl(raw_fd, libc::TUNSETIFF, &ifr) };
         if ret < 0 {
@@ -157,9 +155,7 @@ impl TunDevice for LinuxTun {
             e
         })?;
 
-        unsafe {
-            ifr.ifr_ifru.ifru_mtu = mtu as libc::c_int;
-        }
+        ifr.ifr_ifru.ifru_mtu = mtu as libc::c_int;
         let ret = unsafe { libc::ioctl(sock, libc::SIOCSIFMTU, &ifr) };
         if ret < 0 {
             unsafe { libc::close(sock) };
