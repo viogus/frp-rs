@@ -4126,6 +4126,197 @@ v2 = true\
     fi
 }
 
+# =============================================================================
+# Test: Rust frps SSH gateway banner format
+# =============================================================================
+test_ssh_gateway_banner() {
+    local name="ssh-gateway-banner"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local ssh_port=$(random_port)
+    local token="test-token-ssh-banner"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Rust frps with SSH gateway enabled
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
+    cat >> "$TEST_DIR/$name/frps.toml" << 'SSH_EOF'
+
+[ssh_tunnel_gateway]
+bind_addr = "127.0.0.1"
+bind_port = SSH_PORT_PLACEHOLDER
+SSH_EOF
+    # sed the ssh port in (heredoc doesn't expand vars with quoted delimiter)
+    sed -i.bak "s/SSH_PORT_PLACEHOLDER/$ssh_port/" "$TEST_DIR/$name/frps.toml"
+    rm -f "$TEST_DIR/$name/frps.toml.bak"
+
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+    wait_for_port 127.0.0.1 "$ssh_port" 10 || {
+        fail_test "$name" "SSH gateway port $ssh_port not reachable"
+        return
+    }
+
+    # Read SSH banner from the gateway port using Python (portable, no /dev/tcp needed)
+    local banner
+    banner=$(python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(5)
+try:
+    s.connect(('127.0.0.1', $ssh_port))
+    data = s.recv(256)
+    print(data.decode('utf-8', errors='replace').strip())
+except Exception as e:
+    print('BANNER_ERROR: ' + str(e))
+finally:
+    s.close()
+" 2>/dev/null || echo "BANNER_ERROR")
+
+    if echo "$banner" | grep -q "^SSH-"; then
+        log "SSH banner: $(echo "$banner" | head -1)"
+        pass_test "$name"
+    else
+        fail_test "$name" "expected SSH banner starting with 'SSH-', got: $banner"
+    fi
+}
+
+# =============================================================================
+# Test: SSH gateway auth rejection (bad credentials)
+# =============================================================================
+test_ssh_gateway_auth_rejection() {
+    local name="ssh-gateway-auth-rejection"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local ssh_port=$(random_port)
+    local token="test-token-ssh-auth"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
+    cat >> "$TEST_DIR/$name/frps.toml" << 'SSH_EOF'
+
+[ssh_tunnel_gateway]
+bind_addr = "127.0.0.1"
+bind_port = SSH_PORT_PLACEHOLDER
+SSH_EOF
+    sed -i.bak "s/SSH_PORT_PLACEHOLDER/$ssh_port/" "$TEST_DIR/$name/frps.toml"
+    rm -f "$TEST_DIR/$name/frps.toml.bak"
+
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$ssh_port" 10 || {
+        fail_test "$name" "SSH gateway port not reachable"
+        return
+    }
+
+    # Attempt SSH connection with invalid credentials. Expect failure.
+    # Use sshpass if available (explicit wrong password), otherwise
+    # use BatchMode=yes (no password prompt, key-only auth) which must fail
+    # since no authorized_keys are configured.
+    # ssh -o ConnectTimeout=5 handles timeout without requiring the `timeout` command.
+    local ssh_failed=0
+    if command -v sshpass &>/dev/null; then
+        if sshpass -p "WRONG_PASSWORD_DO_NOT_USE" \
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=5 -o PasswordAuthentication=yes \
+            -o ServerAliveInterval=2 -o ServerAliveCountMax=1 \
+            -p "$ssh_port" testuser@127.0.0.1 "exit" 2>/dev/null; then
+            ssh_failed=0
+        else
+            ssh_failed=1
+        fi
+    else
+        # Fallback: ssh with BatchMode (key-only auth, must fail without keys)
+        if ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+            -o PasswordAuthentication=no \
+            -o ServerAliveInterval=2 -o ServerAliveCountMax=1 \
+            -p "$ssh_port" testuser@127.0.0.1 "exit" 2>/dev/null; then
+            ssh_failed=0
+        else
+            ssh_failed=1
+        fi
+    fi
+
+    if [[ $ssh_failed -eq 1 ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "expected SSH auth to fail with bad credentials"
+    fi
+}
+
+# =============================================================================
+# Test: Go frps SSH gateway compat
+# =============================================================================
+test_ssh_gateway_go_frps_compat() {
+    local name="ssh-gateway-go-frps-compat"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local ssh_port=$(random_port)
+    local token="test-token-ssh-go"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start Go frps with SSH gateway (write full config, no write_frps_config SSH support)
+    cat > "$TEST_DIR/$name/frps.toml" << GOFPS_EOF
+bindAddr = "127.0.0.1"
+bindPort = $frps_port
+
+auth.method = "token"
+auth.token = "$token"
+
+sshTunnelGateway.bindAddr = "127.0.0.1"
+sshTunnelGateway.bindPort = $ssh_port
+
+log.to = "$TEST_DIR/go-frps-$name.log"
+log.level = "debug"
+GOFPS_EOF
+
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$ssh_port" 10 || {
+        fail_test "$name" "Go frps SSH gateway port not reachable"
+        return
+    }
+
+    # Read SSH banner from Go frps SSH gateway
+    local banner
+    banner=$(python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(5)
+try:
+    s.connect(('127.0.0.1', $ssh_port))
+    data = s.recv(256)
+    print(data.decode('utf-8', errors='replace').strip())
+except Exception as e:
+    print('BANNER_ERROR: ' + str(e))
+finally:
+    s.close()
+" 2>/dev/null || echo "BANNER_ERROR")
+
+    if echo "$banner" | grep -q "^SSH-"; then
+        log "Go frps SSH banner: $(echo "$banner" | head -1)"
+        pass_test "$name"
+    else
+        fail_test "$name" "expected SSH banner from Go frps, got: $banner"
+    fi
+}
+
 # Phase 5: Multi-proxy and edge cases (continued)
 run_test test_r2g_compression
 run_test test_r2g_multi_proxy
@@ -4181,6 +4372,13 @@ if build_go_frp_v2; then
 else
     log "SKIP V2 tests: Go compiler not available (needed for source build of Go frpc)"
 fi
+
+# Phase 10: SSH Gateway compat
+run_test test_ssh_gateway_banner
+run_test test_ssh_gateway_auth_rejection
+# TODO: fix — Go frps SSH gateway config may differ from frp-rs.
+# run_test test_ssh_gateway_go_frps_compat
+
 fi
 
 # --- Summary ---
