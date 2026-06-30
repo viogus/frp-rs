@@ -2,6 +2,20 @@
 
 All notable changes to frp-rs.
 
+## [0.3.2] - 2026-06-30
+
+### Added
+- File-backed persistence for proxy config store (#46) — dashboard CRUD survives restarts via atomic JSON file (`frps_store.json`)
+- Dashboard TLS CLI flags and config normalization (#61) — `--dashboard-tls-cert-file`, `--dashboard-tls-key-file` wired to WebServerConfig
+- Property-based tests for config TOML→JSON normalization (#56) — proptest idempotency, flat↔nested equivalence, camelCase→snake_case
+- Fuzz/property-based tests for V1/V2 protocol frame parsing (#55) — all 256 type bytes, arbitrary payloads, truncated frames
+- Benchmark suite (#60) — expanded from 6 to 10 groups: V2 protocol roundtrip (20 types × 5 benches), bridge plain/encrypted/compressed (1K–1MB), bandwidth limiter accuracy, NAT hole-punch classify+analysis
+- CI: benchmark compile check — `cargo bench --workspace --no-run` in CI to catch bench rot
+
+### Changed
+- frp-server: criterion dev-dep + `[[bench]]` harness for nathole benchmarks
+- frp-core: `deserialize_v1` made public for bench access
+
 ## [0.3.1] - 2026-06-28
 
 ### Added
