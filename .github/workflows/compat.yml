@@ -54,6 +54,9 @@ jobs:
           printf '[profile.release]\nlto = false\nopt-level = 2\n' >> .cargo/config.toml
           cargo build --release --bin frps --bin frpc
 
+      - name: Run Rust unit tests
+        run: cargo test --workspace --release --lib
+
       - name: Download Go frp
         run: bash scripts/download-go-frp.sh "$GO_FRP_VERSION"
 
