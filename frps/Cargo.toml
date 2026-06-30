@@ -12,10 +12,23 @@ tiny = ["frp-server/tls", "frp-server/http-proxy"]
 micro = []
 # Enable debug/trace logging for development. Default: info only.
 debug-logs = []
+# OpenTelemetry: structured tracing + OTLP export
+# Dep justification (CLAUDE.md policy):
+# - opentelemetry: OTel API (traces) — std, no alternative for OTLP export
+# - opentelemetry_sdk: span processor + batch exporter — no alternative
+# - opentelemetry-otlp: OTLP/HTTP exporter — no alternative
+# - tracing-opentelemetry: bridge from tracing spans to OTel — no alternative
+# All optional; zero binary size impact when `otel` feature disabled.
+# Estimated binary size impact with otel: +2-3 MB (http-proto only, no tonic).
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
 [dependencies]
 frp-core = { path = "../frp-core", default-features = false }
 frp-server = { path = "../frp-server", default-features = false }
+opentelemetry = { version = "0.27", optional = true, default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.27", optional = true, features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", optional = true, features = ["http-proto"] }
+tracing-opentelemetry = { version = "0.28", optional = true }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

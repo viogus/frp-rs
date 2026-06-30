@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::collections::VecDeque;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant};
-use tracing::{info, warn, debug};
+use tracing::{info, warn, debug, instrument};
 use crate::nathole::NAT_HOLE_TIMEOUT;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 
@@ -65,6 +65,7 @@ pub(super) struct PendingRequest {
 /// Handle a control connection from a frpc client.
 /// The login message has already been consumed from the stream.
 /// `peer` is passed separately because generic stream types don't have peer_addr().
+#[instrument(skip(stream, state, incoming, crypto_ctx), fields(run_id = %login.run_id.clone().unwrap_or_default(), peer = ?peer))]
 pub async fn handle_control<S>(
     mut stream: S,
     login: msg::Login,

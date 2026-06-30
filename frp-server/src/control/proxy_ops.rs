@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{info, instrument, warn};
 
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::write_msg;
@@ -31,6 +31,7 @@ async fn write_resp(
 
 /// Register a new proxy and start listening on its assigned port.
 #[allow(clippy::too_many_arguments)]
+#[instrument(skip(state, writer, internal_tx, listener_handles, udp_sockets, udp_local_to_proxy), fields(proxy_name = %np.proxy_name, proxy_type = %np.proxy_type, run_id = %run_id))]
 pub(crate) async fn handle_new_proxy(
     np: msg::NewProxy,
     run_id: &str,
@@ -408,6 +409,7 @@ pub(crate) async fn handle_new_proxy(
 }
 
 /// Listen on a proxy port and forward incoming connections to the control handler.
+#[instrument(skip(internal_tx), fields(proxy_name = %proxy_name, port = %port))]
 pub(crate) async fn listen_and_proxy(
     bind_addr: String,
     port: u16,

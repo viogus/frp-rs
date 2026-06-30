@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, warn, debug};
+use tracing::{info, instrument, warn, debug};
 
 use crate::service::{AppState, InternalMsg};
 
@@ -187,6 +187,7 @@ pub(crate) async fn write_http_error(
 
 /// Run an HTTP VHost listener on the given address.
 /// Accepts connections, reads the Host header, and routes via InternalMsg.
+#[instrument(skip(state), fields(addr = %addr))]
 pub async fn run_vhost_http_listener(
     addr: String,
     state: Arc<AppState>,
@@ -267,6 +268,7 @@ pub async fn run_vhost_http_listener(
 /// Run an HTTPS VHost listener on the given address.
 /// Performs TLS handshake, then extracts Host header and routes via InternalMsg.
 #[cfg(feature = "tls")]
+#[instrument(skip(state), fields(addr = %addr))]
 pub async fn run_vhost_https_listener(
     addr: String,
     state: std::sync::Arc<crate::service::AppState>,

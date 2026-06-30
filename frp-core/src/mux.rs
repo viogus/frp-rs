@@ -144,7 +144,7 @@ where
                     }
                 }
                 Some(Err(e)) => {
-                    debug!("yamux server accept error: {e}");
+                    debug!(error = %e, "yamux server accept error: {e}");
                     break;
                 }
                 None => {
@@ -206,7 +206,7 @@ where
                             let stream = match result {
                                 Ok(s) => Some(s.compat()),
                                 Err(e) => {
-                                    warn!("yamux client: open stream failed: {e}");
+                                    warn!(error = %e, "yamux client: open stream failed: {e}");
                                     None
                                 }
                             };
@@ -251,7 +251,7 @@ where
                             debug!("yamux client: unexpected inbound stream, ignoring");
                         }
                         Some(Err(e)) => {
-                            warn!("yamux client: connection error: {e}");
+                            warn!(error = %e, "yamux client: connection error: {e}");
                             break;
                         }
                         None => {

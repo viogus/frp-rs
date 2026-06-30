@@ -6,9 +6,11 @@ use crate::bandwidth::BandwidthLimiter;
 use crate::cipher_stream::{CipherReader, CipherWriter};
 use crate::encryption;
 use crate::transport::IoStream;
+use tracing::instrument;
 
 /// Bridge encrypted data between two IoStreams, splitting them internally.
 #[allow(clippy::too_many_arguments)]
+#[instrument(skip(user, work, key, pre_read, read_limiter, write_limiter, metrics), fields(use_compression))]
 pub async fn bridge_encrypted_io(
     user: IoStream,
     work: IoStream,
@@ -38,6 +40,7 @@ pub async fn bridge_encrypted_io(
 ///
 /// `read_limiter` limits work→user (download). `write_limiter` limits user→work (upload).
 #[allow(clippy::too_many_arguments)]
+#[instrument(skip(user_r, user_w, work_r, work_w, key, pre_read, read_limiter, write_limiter, metrics), fields(use_compression))]
 pub async fn bridge_encrypted(
     mut user_r: impl AsyncReadExt + Unpin,
     mut user_w: impl AsyncWriteExt + Unpin,
@@ -175,6 +178,7 @@ pub async fn bridge_encrypted(
 }
 
 /// Plain (unencrypted) bidirectional bridge with optional compression.
+#[instrument(skip(user_r, user_w, work_r, work_w, pre_read, metrics), fields(use_compression))]
 pub async fn bridge_plain(
     mut user_r: impl AsyncReadExt + Unpin,
     mut user_w: impl AsyncWriteExt + Unpin,
