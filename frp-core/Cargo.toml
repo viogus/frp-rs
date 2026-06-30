@@ -43,7 +43,8 @@ chacha20poly1305 = { workspace = true, optional = true }
 
 [features]
 default = ["quic", "kcp", "websocket", "oidc", "tls", "compression", "chacha20", "vnet"]
-tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:rustls-platform-verifier", "dep:axum"]
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:rustls-platform-verifier"]
+admin-auth = ["dep:axum"]
 compression = ["dep:snap"]
 chacha20 = ["dep:chacha20poly1305"]
 quic = ["dep:quinn", "tls"]

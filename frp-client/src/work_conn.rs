@@ -16,7 +16,7 @@ use frp_core::transport::{DialOptions, dial_server, IoStream};
 use frp_core::metrics::ProxyMetricsRegistry;
 
 use crate::proxy;
-use crate::admin::ProxyRuntimeInfo;
+use crate::proxy_runtime::ProxyRuntimeInfo;
 
 #[cfg(feature = "vnet")]
 type VnetTunMap = Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>;

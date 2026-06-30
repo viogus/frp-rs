@@ -9,7 +9,7 @@ pub mod mux;
 pub mod bridge;
 pub mod bandwidth;
 pub mod metrics;
-#[cfg(feature = "tls")]
+#[cfg(feature = "admin-auth")]
 pub mod admin_auth;
 pub mod cli;
 #[cfg(feature = "kcp")]

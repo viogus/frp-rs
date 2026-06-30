@@ -2,6 +2,8 @@ pub mod service;
 pub mod control;
 pub mod proxy;
 pub mod plugin;
+pub mod proxy_runtime;
+#[cfg(feature = "admin")]
 pub mod admin;
 pub mod health;
 pub mod visitor;

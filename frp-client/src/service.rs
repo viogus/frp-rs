@@ -32,7 +32,9 @@ use frp_core::metrics::ProxyMetricsRegistry;
 
 use crate::plugin::{self, PluginHandle, PluginContext};
 use crate::control::ControlConnection;
-use crate::admin::{AdminState, ReloadRequest, ProxyRuntimeInfo};
+use crate::proxy_runtime::{ProxyRuntimeInfo, ReloadRequest};
+#[cfg(feature = "admin")]
+use crate::admin::AdminState;
 use crate::work_conn::XtcpNotification;
 
 /// The main frpc service.
@@ -441,6 +443,7 @@ impl Service {
         let (stop_tx, mut stop_rx) = mpsc::unbounded_channel::<()>();
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
+        #[cfg(feature = "admin")]
         if self.cfg.web_server.port > 0 {
             let admin_addr = frp_core::format_socket_addr(
                 &self.cfg.web_server.addr,
