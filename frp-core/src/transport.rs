@@ -2015,14 +2015,14 @@ impl axum::serve::Listener for TlsListener {
             let (stream, addr) = match self.inner.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    tracing::warn!("TLS listener accept error: {}", e);
+                    tracing::warn!(error = %e, "TLS listener accept error: {}", e);
                     continue;
                 }
             };
             match self.acceptor.accept(stream).await {
                 Ok(tls_stream) => return (tls_stream, addr),
                 Err(e) => {
-                    tracing::warn!("TLS handshake error from {}: {}", addr, e);
+                    tracing::warn!(addr = %addr, error = %e, "TLS handshake error from {}: {}", addr, e);
                     continue;
                 }
             }

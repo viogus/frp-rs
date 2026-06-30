@@ -310,6 +310,8 @@ async fn handle_healthz(
                 (StatusCode::OK, "ok")
             } else {
                 tracing::warn!(
+                    used_ports = %used_ok,
+                    ctl_map = %ctl_ok,
                     "Readiness check failed: used_ports={} ctl_map={}",
                     used_ok,
                     ctl_ok
@@ -519,7 +521,7 @@ pub async fn run_dashboard(
             #[cfg(feature = "tls")]
             {
                 let acceptor = frp_core::transport::build_tls_acceptor(&cert, &key, None)?;
-                tracing::info!("Dashboard listening on {} (TLS)", addr);
+                tracing::info!(addr = %addr, "Dashboard listening on {} (TLS)", addr);
                 let tls_listener = frp_core::transport::TlsListener::new(listener, acceptor);
                 axum::serve(tls_listener, app).await?;
             }
@@ -530,7 +532,7 @@ pub async fn run_dashboard(
             }
         }
         _ => {
-            tracing::info!("Dashboard listening on {}", addr);
+            tracing::info!(addr = %addr, "Dashboard listening on {}", addr);
             axum::serve(listener, app).await?;
         }
     }

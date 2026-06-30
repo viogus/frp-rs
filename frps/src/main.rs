@@ -58,15 +58,17 @@ async fn run(cli: FrpsArgs) {
         let files = match collect_config_files(Path::new(dir)) {
             Ok(files) => files,
             Err(e) => {
-                tracing::error!("Failed to read config directory: {}", e);
+                tracing::error!(error = %e, "Failed to read config directory: {}", e);
                 process::exit(1);
             }
         };
         if files.is_empty() {
-            tracing::error!("No config files found in directory: {dir}");
+            tracing::error!(dir = %dir, "No config files found in directory: {dir}");
             process::exit(1);
         }
         tracing::info!(
+            version = %frp_core::VERSION,
+            count = %files.len(),
             "frps (Rust) v{} starting {} services from config directory",
             frp_core::VERSION,
             files.len()
@@ -81,17 +83,17 @@ async fn run(cli: FrpsArgs) {
                         let service = match Service::new(cfg, Some(path_str.clone())).await {
                             Ok(s) => s,
                             Err(e) => {
-                                tracing::error!("frps service init failed for [{}]: {}", path_str, e);
+                                tracing::error!(path = %path_str, error = %e, "frps service init failed for [{}]: {}", path_str, e);
                                 return;
                             }
                         };
                         if let Err(e) = service.run().await {
-                            tracing::error!("frps service error for config file [{}]: {}", path_str, e);
+                            tracing::error!(path = %path_str, error = %e, "frps service error for config file [{}]: {}", path_str, e);
                         }
                     }));
                 }
                 Err(e) => {
-                    tracing::error!("Failed to load config from [{}]: {}", path_str, e);
+                    tracing::error!(path = %path_str, error = %e, "Failed to load config from [{}]: {}", path_str, e);
                 }
             }
         }
@@ -101,7 +103,7 @@ async fn run(cli: FrpsArgs) {
         }
         for handle in handles {
             if let Err(e) = handle.await {
-                tracing::error!("frps service task panicked: {}", e);
+                tracing::error!(error = %e, "frps service task panicked: {}", e);
             }
         }
         return;
@@ -112,7 +114,7 @@ async fn run(cli: FrpsArgs) {
         Ok(cfg) => cfg,
         Err(e) => {
             init_logging(&cli, None);
-            tracing::error!("Failed to load config: {}", e);
+            tracing::error!(error = %e, "Failed to load config: {}", e);
             process::exit(1);
         }
     };
@@ -120,11 +122,11 @@ async fn run(cli: FrpsArgs) {
     cli.override_server_config(&mut cfg);
     init_logging(&cli, Some(&cfg));
 
-    tracing::info!("frps (Rust) v{} starting...", frp_core::VERSION);
+    tracing::info!(version = %frp_core::VERSION, "frps (Rust) v{} starting...", frp_core::VERSION);
     let config_path = Some(cli.config.clone());
     let service = std::sync::Arc::new(
         Service::new(cfg, config_path).await.unwrap_or_else(|e| {
-            tracing::error!("frps init error: {}", e);
+            tracing::error!(error = %e, "frps init error: {}", e);
             process::exit(1);
         })
     );
@@ -136,22 +138,22 @@ async fn run(cli: FrpsArgs) {
         tokio::spawn(async move {
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
                 Ok(mut sig) => {
-                    tracing::info!("SIGUSR1 reload ready (pid={})", std::process::id());
+                    tracing::info!(pid = %std::process::id(), "SIGUSR1 reload ready (pid={})", std::process::id());
                     loop {
                         sig.recv().await;
                         match svc.reload().await {
-                            Ok(summary) => tracing::info!("SIGUSR1: {}", summary),
-                            Err(e) => tracing::error!("SIGUSR1 reload: {}", e),
+                            Ok(summary) => tracing::info!(summary = %summary, "SIGUSR1: {}", summary),
+                            Err(e) => tracing::error!(error = %e, "SIGUSR1 reload: {}", e),
                         }
                     }
                 }
-                Err(e) => tracing::warn!("SIGUSR1 unavailable: {}", e),
+                Err(e) => tracing::warn!(error = %e, "SIGUSR1 unavailable: {}", e),
             }
         })
     };
 
     if let Err(e) = service.run().await {
-        tracing::error!("frps error: {}", e);
+        tracing::error!(error = %e, "frps error: {}", e);
         process::exit(1);
     }
 

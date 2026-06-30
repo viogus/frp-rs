@@ -192,7 +192,7 @@ pub async fn run_vhost_http_listener(
     state: Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&addr).await?;
-    info!("HTTP VHost listener started on {}", addr);
+    info!(addr = %addr, "HTTP VHost listener started on {}", addr);
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -218,7 +218,7 @@ pub async fn run_vhost_http_listener(
             };
             let path = extract_path(&request_text).unwrap_or("/");
 
-            debug!("HTTP VHost request for '{}' path '{}' from {}", host, path, peer);
+            debug!(host = %host, path = %path, peer = %peer, "HTTP VHost request for '{}' path '{}' from {}", host, path, peer);
 
             if let Some(route) = state.vhost_manager.lookup_combined(&host, path).await {
                 // HTTP Basic Auth check (Go frp compat)
@@ -253,11 +253,11 @@ pub async fn run_vhost_http_listener(
                         pre_read,
                     }).ok();
                 } else {
-                    warn!("VHost route for '{}' path '{}' found but control handler gone", host, path);
+                    warn!(host = %host, path = %path, "VHost route for '{}' path '{}' found but control handler gone", host, path);
                     write_http_error(&mut stream, "HTTP/1.1 502 Bad Gateway", "").await;
                 }
             } else {
-                warn!("No VHost route for '{}' path '{}' from {}", host, path, peer);
+                warn!(host = %host, path = %path, peer = %peer, "No VHost route for '{}' path '{}' from {}", host, path, peer);
                 write_http_error(&mut stream, "HTTP/1.1 404 Not Found", &state.custom_404_page).await;
             }
         });
@@ -277,7 +277,7 @@ pub async fn run_vhost_https_listener(
     use frp_core::transport::build_tls_acceptor;
     let acceptor = build_tls_acceptor(&tls_cert_file, &tls_key_file, None)?;
     let listener = TcpListener::bind(&addr).await?;
-    info!("HTTPS VHost listener started on {}", addr);
+    info!(addr = %addr, "HTTPS VHost listener started on {}", addr);
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -288,7 +288,7 @@ pub async fn run_vhost_https_listener(
             let mut tls_stream = match acceptor.accept(stream).await {
                 Ok(s) => s,
                 Err(e) => {
-                    warn!("TLS handshake failed from {}: {}", peer, e);
+                    warn!(peer = %peer, error = %e, "TLS handshake failed from {}: {}", peer, e);
                     return;
                 }
             };
@@ -310,7 +310,7 @@ pub async fn run_vhost_https_listener(
             };
             let path = extract_path(&request_text).unwrap_or("/");
 
-            debug!("HTTPS VHost request for '{}' path '{}' from {}", host, path, peer);
+            debug!(host = %host, path = %path, peer = %peer, "HTTPS VHost request for '{}' path '{}' from {}", host, path, peer);
 
             if let Some(route) = state.vhost_manager.lookup_combined(&host, path).await {
                 // HTTP Basic Auth check (Go frp compat)
@@ -347,11 +347,11 @@ pub async fn run_vhost_https_listener(
                         pre_read,
                     }).ok();
                 } else {
-                    warn!("HTTPS VHost route for '{}' path '{}' found but control handler gone", host, path);
+                    warn!(host = %host, path = %path, "HTTPS VHost route for '{}' path '{}' found but control handler gone", host, path);
                     write_http_error(&mut tls_stream, "HTTP/1.1 502 Bad Gateway", "").await;
                 }
             } else {
-                warn!("No VHost route for '{}' path '{}' from {}", host, path, peer);
+                warn!(host = %host, path = %path, peer = %peer, "No VHost route for '{}' path '{}' from {}", host, path, peer);
                 write_http_error(&mut tls_stream, "HTTP/1.1 404 Not Found", &state.custom_404_page).await;
             }
         });

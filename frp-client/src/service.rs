@@ -108,7 +108,7 @@ impl Service {
                 ac.oidc_tls_insecure_skip_verify,
                 Some(ac.oidc_proxy_url.clone()).filter(|s| !s.is_empty()),
             ).await.map_err(|e| format!("OIDC client init failed: {e}"))?;
-            info!("OIDC client initialized, token endpoint: {}", client.token_endpoint());
+            info!(endpoint = %client.token_endpoint(), "OIDC client initialized, token endpoint: {}", client.token_endpoint());
             Some(Arc::new(client))
         } else {
             None
@@ -131,12 +131,12 @@ impl Service {
             match result {
                 Ok(handle) => {
                     let addr = handle.local_addr.to_string();
-                    info!("{plugin_type} plugin for '{proxy_name}' started on {addr}");
+                    info!(plugin_type = %plugin_type, proxy_name = %proxy_name, addr = %addr, "{plugin_type} plugin for '{proxy_name}' started on {addr}");
                     addrs.insert(proxy_name.to_string(), addr);
                     handles.push(handle);
                 }
                 Err(e) => {
-                    warn!("Failed to start {plugin_type} plugin for '{proxy_name}': {e}");
+                    warn!(plugin_type = %plugin_type, proxy_name = %proxy_name, error = %e, "Failed to start {plugin_type} plugin for '{proxy_name}': {e}");
                 }
             }
         }
@@ -207,7 +207,7 @@ impl Service {
                             &mut plugin_addrs, &mut plugin_handles);
                     }
                     other => {
-                        warn!("Unknown plugin type '{other}' for proxy '{}'", p.name);
+                        warn!(plugin_type = %other, proxy_name = %p.name, "Unknown plugin type '{other}' for proxy '{}'", p.name);
                     }
                 }
             }
@@ -216,7 +216,7 @@ impl Service {
         let mut map: HashMap<String, ProxyRuntimeInfo> = HashMap::new();
         for p in &cfg.proxies {
             if map.contains_key(&p.name) {
-                warn!("Duplicate proxy name '{}' — only the first entry will be used", p.name);
+                warn!(proxy_name = %p.name, "Duplicate proxy name '{}' — only the first entry will be used", p.name);
                 continue;
             }
             let bw_limit = frp_core::config::parse_bandwidth_limit(&p.bandwidth_limit).unwrap_or(0);
@@ -306,6 +306,7 @@ impl Service {
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         info!(
+            version = %frp_core::VERSION, server_addr = %self.cfg.server_addr, server_port = %self.cfg.server_port,
             "frpc (Rust) v{} connecting to {}:{}",
             frp_core::VERSION, self.cfg.server_addr, self.cfg.server_port
         );
@@ -313,7 +314,7 @@ impl Service {
         let protocol: TransportProtocol = match self.cfg.transport_protocol.parse() {
             Ok(p) => p,
             Err(_) => {
-                warn!("Unknown transport protocol '{}', falling back to tcp", self.cfg.transport_protocol);
+                warn!(protocol = %self.cfg.transport_protocol, "Unknown transport protocol '{}', falling back to tcp", self.cfg.transport_protocol);
                 TransportProtocol::Tcp
             }
         };
@@ -328,6 +329,7 @@ impl Service {
             let start_set: std::collections::HashSet<&str> = self.cfg.start.iter().map(|s| s.as_str()).collect();
             let filtered: Vec<_> = proxies.into_iter().filter(|p| start_set.contains(p.name.as_str())).collect();
             info!(
+                active = %filtered.len(), total = %self.cfg.proxies.len(), start = ?self.cfg.start,
                 "Selective proxy start: {} of {} proxies active (start={:?})",
                 filtered.len(),
                 self.cfg.proxies.len(),
@@ -346,7 +348,7 @@ impl Service {
                 .filter(|p| !p.enabled)
                 .map(|p| p.name.as_str())
                 .collect();
-            info!("Disabled proxies (skipped): {:?}", disabled);
+            info!(disabled = ?disabled, "Disabled proxies (skipped): {:?}", disabled);
         }
 
         if proxies.is_empty() {
@@ -364,7 +366,7 @@ impl Service {
                 continue;
             }
             if hc_type != "tcp" && hc_type != "http" {
-                warn!("Health check type '{}' not yet supported for '{}'", hc_type, p.name);
+                warn!(health_check_type = %hc_type, proxy_name = %p.name, "Health check type '{}' not yet supported for '{}'", hc_type, p.name);
                 continue;
             }
             let la = self.proxy_info_map.read().await
@@ -429,10 +431,10 @@ impl Service {
                     admin_addr, admin_state, admin_auth_user, admin_auth_pwd,
                     admin_tls_cert, admin_tls_key,
                 ).await {
-                    tracing::error!("frpc admin server failed: {}", e);
+                    tracing::error!(error = %e, "frpc admin server failed: {}", e);
                 }
             });
-            info!("frpc admin server starting on {}:{}", self.cfg.web_server.addr, self.cfg.web_server.port);
+            info!(addr = %self.cfg.web_server.addr, port = %self.cfg.web_server.port, "frpc admin server starting on {}:{}", self.cfg.web_server.addr, self.cfg.web_server.port);
         }
 
         // Main session loop with reconnection.
@@ -486,7 +488,7 @@ impl Service {
                 }
                 Err(e) => {
                     failed_count += 1;
-                    warn!("Login failed (attempt {}): {}", failed_count, e);
+                    warn!(attempt = %failed_count, error = %e, "Login failed (attempt {}): {}", failed_count, e);
                     if self.cfg.login_fail_exit && !did_login_once {
                         return Err(e.into());
                     }
@@ -498,7 +500,7 @@ impl Service {
             #[cfg(feature = "quic")]
             let quic_conn = quic_conn.map(std::sync::Arc::new);
             let v2 = self.cfg.v2;
-            info!("Logged in. run_id: {}", run_id);
+            info!(run_id = %run_id, "Logged in. run_id: {}", run_id);
 
             // Register proxies using IoStream directly (supports TCP and TLS)
             for p in &proxies {
@@ -510,7 +512,7 @@ impl Service {
                     Ok(resp) => {
                         let remote = resp.remote_addr
                             .unwrap_or_else(|| format!("0.0.0.0:{}", p.remote_port));
-                        info!("Proxy '{}' registered on remote port {}", p.name, remote);
+                        info!(proxy_name = %p.name, remote = %remote, "Proxy '{}' registered on remote port {}", p.name, remote);
                         // Update runtime info for admin API
                         let mut map = self.proxy_info_map.write().await;
                         if let Some(info) = map.get_mut(&p.name) {
@@ -519,7 +521,7 @@ impl Service {
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to register proxy '{}': {}", p.name, e);
+                        warn!(proxy_name = %p.name, error = %e, "Failed to register proxy '{}': {}", p.name, e);
                         let mut map = self.proxy_info_map.write().await;
                         if let Some(info) = map.get_mut(&p.name) {
                             info.err = e.to_string();
@@ -537,10 +539,10 @@ impl Service {
                 }
                 match ctl.register_visitor(v, &mut control_stream).await {
                     Ok(_) => {
-                        info!("Visitor '{}' registered for proxy '{}'", v.name, v.server_name);
+                        info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}'", v.name, v.server_name);
                     }
                     Err(e) => {
-                        warn!("Failed to register visitor '{}': {}", v.name, e);
+                        warn!(visitor_name = %v.name, error = %e, "Failed to register visitor '{}': {}", v.name, e);
                     }
                 }
             }
@@ -563,13 +565,13 @@ impl Service {
                     let socket = match UdpSocket::bind(&bind_addr).await {
                         Ok(s) => Arc::new(s),
                         Err(e) => {
-                            warn!("UDP proxy '{}': bind failed: {}", p.name, e);
+                            warn!(proxy_name = %p.name, error = %e, "UDP proxy '{}': bind failed: {}", p.name, e);
                             continue;
                         }
                     };
                     // Connect to local UDP service for send/recv
                     if let Err(e) = socket.connect(&local_addr).await {
-                        warn!("UDP proxy '{}': connect to local {} failed: {}", p.name, local_addr, e);
+                        warn!(proxy_name = %p.name, local_addr = %local_addr, error = %e, "UDP proxy '{}': connect to local {} failed: {}", p.name, local_addr, e);
                         continue;
                     }
                     {
@@ -584,7 +586,7 @@ impl Service {
                         cfg.insert(p.name.clone(), enc);
                     }
                     let enc_label = if p.use_encryption { "encrypted" } else { "plain" };
-                    info!("UDP proxy '{}' ready, bridging to {} ({})", p.name, local_addr, enc_label);
+                    info!(proxy_name = %p.name, local_addr = %local_addr, enc_label = %enc_label, "UDP proxy '{}' ready, bridging to {} ({})", p.name, local_addr, enc_label);
                 }
             }
 
@@ -667,7 +669,7 @@ impl Service {
             // Map sid -> oneshot sender for visitor NatHoleResp routing (Go frps compat).
             let mut visitor_pending: std::collections::HashMap<String, oneshot::Sender<Result<msg::NatHoleResp, String>>> = std::collections::HashMap::new();
             let ping_secs = self.cfg.heartbeat_interval.max(1) as u64;
-        info!("Heartbeat interval: {}s", ping_secs);
+        info!(interval = %ping_secs, "Heartbeat interval: {}s", ping_secs);
         let mut ping_interval = interval(Duration::from_secs(ping_secs));
 
             loop {
@@ -712,16 +714,16 @@ impl Service {
                                 debug!("Pong received");
                             }
                             Ok(FrpMessage::CloseProxy(cp)) => {
-                                info!("Server closed proxy: {}", cp.proxy_name);
+                                info!(proxy_name = %cp.proxy_name, "Server closed proxy: {}", cp.proxy_name);
                             }
                             Ok(FrpMessage::CloseProxyResp(cpr)) => {
-                                info!("Server confirmed proxy close: {}", cpr.proxy_name);
+                                info!(proxy_name = %cpr.proxy_name, "Server confirmed proxy close: {}", cpr.proxy_name);
                             }
                             Ok(FrpMessage::Error(err)) => {
-                                warn!("Server error: {}", err.error);
+                                warn!(error = %err.error, "Server error: {}", err.error);
                             }
                             Ok(FrpMessage::NatHoleClient(nhc)) => {
-                                debug!("Received NatHoleClient for proxy '{}'", nhc.proxy_name);
+                                debug!(proxy_name = %nhc.proxy_name, "Received NatHoleClient for proxy '{}'", nhc.proxy_name);
                                 let visitor_addr = nhc.visitor_addr.unwrap_or_default();
                                 let proxy_name = nhc.proxy_name.clone();
                                 let sid = nhc.transaction_id.clone();
@@ -734,7 +736,7 @@ impl Service {
                                 let xtcp_sk = proxy_info.as_ref().map(|p| p.3.clone()).unwrap_or_default();
 
                                 if visitor_addr.is_empty() {
-                                    warn!("NatHoleClient without visitor_addr for '{}'", proxy_name);
+                                    warn!(proxy_name = %proxy_name, "NatHoleClient without visitor_addr for '{}'", proxy_name);
                                     let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
                                         sid: Some(sid.clone()),
                                     });
@@ -748,7 +750,7 @@ impl Service {
                                     provider_addr: None, // server fills from control connection peer addr
                                 });
                                 if let Err(e) = write_msg(&mut *writer.lock().await, &sid_msg, v2).await {
-                                    warn!("Failed to send NatHoleSid: {}", e);
+                                    warn!(error = %e, "Failed to send NatHoleSid: {}", e);
                                     continue;
                                 }
 
@@ -772,20 +774,20 @@ impl Service {
                                                                 local_r, local_w, p2p_r, p2p_w,
                                                                 &key, use_comp, vec![], None, None, None,
                                                             ).await;
-                                                            debug!("XTCP provider '{}' encrypted P2P closed", pn);
+                                                            debug!(proxy_name = %pn, "XTCP provider '{}' encrypted P2P closed", pn);
                                                         } else {
                                                             frp_core::bridge::bridge_plain(
                                                                 local_r, local_w, p2p_r, p2p_w,
                                                                 use_comp, vec![], None,
                                                             ).await;
-                                                            debug!("XTCP provider '{}' P2P closed", pn);
+                                                            debug!(proxy_name = %pn, "XTCP provider '{}' P2P closed", pn);
                                                         }
                                                     });
                                                     // Don't send NatHoleReport — Go frp uses implicit success.
                                                     // If bridge fails, the TCP close propagates naturally.
                                                 }
                                                 Err(e) => {
-                                                    warn!("XTCP provider '{}': connect local failed: {}", proxy_name, e);
+                                                    warn!(proxy_name = %proxy_name, error = %e, "XTCP provider '{}': connect local failed: {}", proxy_name, e);
                                                     let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
                                                         sid: Some(sid),
                                                     });
@@ -793,7 +795,7 @@ impl Service {
                                                 }
                                             }
                                         } else {
-                                            warn!("XTCP provider '{}': no local address", proxy_name);
+                                            warn!(proxy_name = %proxy_name, "XTCP provider '{}': no local address", proxy_name);
                                             let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
                                                 sid: Some(sid),
                                             });
@@ -801,7 +803,7 @@ impl Service {
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("XTCP hole punch for '{}' failed: {}", proxy_name, e);
+                                        warn!(proxy_name = %proxy_name, error = %e, "XTCP hole punch for '{}' failed: {}", proxy_name, e);
                                         // Report failure — triggers STCP fallback on visitor side
                                         let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
                                             sid: Some(sid),
@@ -819,7 +821,7 @@ impl Service {
                                 let txn_id = resp.transaction_id.clone();
                                 if !txn_id.is_empty() {
                                     if let Some(tx) = visitor_pending.remove(&txn_id) {
-                                        info!("XTCP visitor: received NatHoleResp for txn '{}'", txn_id);
+                                        info!(transaction_id = %txn_id, "XTCP visitor: received NatHoleResp for txn '{}'", txn_id);
                                         let _ = tx.send(Ok(resp));
                                         continue;
                                     }
@@ -828,7 +830,7 @@ impl Service {
                                 let sid = resp.sid.clone().unwrap_or_default();
                                 // Provider receives server's analysis with visitor's candidate addresses.
                                 if let Some(err) = resp.error {
-                                    warn!("XTCP NatHoleResp error: {}", err);
+                                    warn!(error = %err, "XTCP NatHoleResp error: {}", err);
                                     // Clean up pending tracking
                                     if let Some(ref sid) = resp.sid {
                                         pending_xtcp.remove(sid);
@@ -837,11 +839,11 @@ impl Service {
                                 }
                                 let proxy_name = pending_xtcp.remove(&sid).unwrap_or_default();
                                 if proxy_name.is_empty() {
-                                    warn!("XTCP NatHoleResp: unknown sid '{}'", sid);
+                                    warn!(sid = %sid, "XTCP NatHoleResp: unknown sid '{}'", sid);
                                     continue;
                                 }
                                 let candidate_addrs = resp.candidate_addrs.unwrap_or_default();
-                                info!("XTCP provider '{}': received {} candidate addresses from server",
+                                info!(proxy_name = %proxy_name, candidate_count = %candidate_addrs.len(), "XTCP provider '{}': received {} candidate addresses from server",
                                     proxy_name, candidate_addrs.len());
 
                                 // Spawn hole punch task (don't block control loop)
@@ -855,10 +857,10 @@ impl Service {
                                 let proxy_name_clone = proxy_name.clone();
                                 tokio::spawn(async move {
                                     for addr in &candidate_addrs {
-                                        debug!("XTCP provider '{}': trying simultaneous open to {}", proxy_name_clone, addr);
+                                        debug!(proxy_name = %proxy_name_clone, addr = %addr, "XTCP provider '{}': trying simultaneous open to {}", proxy_name_clone, addr);
                                         match crate::visitor::tcp_simultaneous_open(addr, 5000).await {
                                             Ok(p2p) => {
-                                                info!("XTCP provider '{}': P2P connected to {}", proxy_name_clone, addr);
+                                                info!(proxy_name = %proxy_name_clone, addr = %addr, "XTCP provider '{}': P2P connected to {}", proxy_name_clone, addr);
                                                 if let Some(ref local) = local_addr {
                                                     match tokio::net::TcpStream::connect(local).await {
                                                         Ok(local_conn) => {
@@ -871,42 +873,42 @@ impl Service {
                                                                     local_r, local_w, p2p_r, p2p_w,
                                                                     &key, xtcp_use_comp, vec![], None, None, None,
                                                                 ).await;
-                                                                debug!("XTCP provider '{}' encrypted P2P closed", proxy_name_clone);
+                                                                debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' encrypted P2P closed", proxy_name_clone);
                                                             } else {
                                                                 frp_core::bridge::bridge_plain(
                                                                     local_r, local_w, p2p_r, p2p_w,
                                                                     xtcp_use_comp, vec![], None,
                                                                 ).await;
-                                                                debug!("XTCP provider '{}' P2P closed", proxy_name_clone);
+                                                                debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' P2P closed", proxy_name_clone);
                                                             }
                                                         }
                                                         Err(e) => {
-                                                            warn!("XTCP provider '{}': connect local failed: {}", proxy_name_clone, e);
+                                                            warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': connect local failed: {}", proxy_name_clone, e);
                                                         }
                                                     }
                                                 } else {
-                                                    warn!("XTCP provider '{}': no local address", proxy_name_clone);
+                                                    warn!(proxy_name = %proxy_name_clone, "XTCP provider '{}': no local address", proxy_name_clone);
                                                 }
                                                 return;
                                             }
                                             Err(e) => {
-                                                debug!("XTCP provider '{}': hole punch to {} failed: {}", proxy_name_clone, addr, e);
+                                                debug!(proxy_name = %proxy_name_clone, addr = %addr, error = %e, "XTCP provider '{}': hole punch to {} failed: {}", proxy_name_clone, addr, e);
                                             }
                                         }
                                     }
-                                    warn!("XTCP provider '{}': all hole punch attempts failed", proxy_name_clone);
+                                    warn!(proxy_name = %proxy_name_clone, "XTCP provider '{}': all hole punch attempts failed", proxy_name_clone);
                                 });
                             }
                             Ok(FrpMessage::NewProxyResp(resp)) => {
                                 if let Some(err) = resp.error {
-                                    warn!("Proxy registration error: {}", err);
+                                    warn!(error = %err, "Proxy registration error: {}", err);
                                 }
                             }
                             Ok(_) => {
                                 // Other messages are ignored
                             }
                             Err(e) => {
-                                warn!("Control read error: {}. Reconnecting...", e);
+                                warn!(error = %e, "Control read error: {}. Reconnecting...", e);
                                 break;
                             }
                         }
@@ -926,7 +928,7 @@ impl Service {
                         if requires_auth {
                             if let Some(ref oidc) = self.oidc_client {
                                 if let Err(e) = oidc.set_ping(&mut ping_msg).await {
-                                    warn!("OIDC ping token failed: {}. Reconnecting...", e);
+                                    warn!(error = %e, "OIDC ping token failed: {}. Reconnecting...", e);
                                     break;
                                 }
                             } else {
@@ -951,19 +953,19 @@ impl Service {
                         }
                         let ping = FrpMessage::Ping(ping_msg);
                         if let Err(e) = write_msg(&mut *writer.lock().await, &ping, v2).await {
-                            warn!("Ping failed: {}. Reconnecting...", e);
+                            warn!(error = %e, "Ping failed: {}. Reconnecting...", e);
                             break;
                         }
                         debug!("Ping sent");
                     }
 
                     Some(proxy_name) = health_rx.recv() => {
-                        info!("Health check sending CloseProxy for unhealthy proxy: {}", proxy_name);
+                        info!(proxy_name = %proxy_name, "Health check sending CloseProxy for unhealthy proxy: {}", proxy_name);
                         let close = FrpMessage::CloseProxy(msg::CloseProxy {
                             proxy_name: proxy_name.clone(),
                         });
                         if let Err(e) = write_msg(&mut *writer.lock().await, &close, v2).await {
-                            warn!("Failed to send CloseProxy for {}: {}", proxy_name, e);
+                            warn!(proxy_name = %proxy_name, error = %e, "Failed to send CloseProxy for {}: {}", proxy_name, e);
                         }
                     }
 
@@ -977,20 +979,20 @@ impl Service {
 
                     Some(xtcp_notif) = xtcp_rx.recv() => {
                         let XtcpNotification { sid, proxy_name } = xtcp_notif;
-                        info!("XTCP provider: received NatHoleSid for '{}'", proxy_name);
+                        info!(proxy_name = %proxy_name, "XTCP provider: received NatHoleSid for '{}'", proxy_name);
                         // 1. Do STUN discovery — run twice. Go frps v0.69.1 NAT classifier
                         //    needs ≥2 mapped addresses to determine NAT type and behavior.
                         let mut mapped_addrs = Vec::new();
                         for _ in 0..2 {
                             match frp_core::stun::stun_binding(&nat_hole_stun_server).await {
                                 Ok(addr) => {
-                                    debug!("XTCP STUN result: {}", addr);
+                                    debug!(addr = %addr, "XTCP STUN result: {}", addr);
                                     if !mapped_addrs.contains(&addr) {
                                         mapped_addrs.push(addr);
                                     }
                                 }
                                 Err(e) => {
-                                    warn!("XTCP STUN failed: {}", e);
+                                    warn!(error = %e, "XTCP STUN failed: {}", e);
                                 }
                             }
                         }
@@ -1005,7 +1007,7 @@ impl Service {
                             visitor_addr: None,
                         });
                         if let Err(e) = write_msg(&mut *writer.lock().await, &client_msg, v2).await {
-                            warn!("XTCP: failed to send NatHoleClient: {}", e);
+                            warn!(error = %e, "XTCP: failed to send NatHoleClient: {}", e);
                         } else {
                             // Track sid→proxy_name for NatHoleResp routing
                             pending_xtcp.insert(sid, proxy_name);
@@ -1020,11 +1022,11 @@ impl Service {
                         let nhv = FrpMessage::NatHoleVisitor(vreq.nhv);
                         match write_msg(&mut *writer.lock().await, &nhv, v2).await {
                             Ok(()) => {
-                                debug!("Visitor: sent NatHoleVisitor on control, sid={}", txn_id);
+                                debug!(sid = %txn_id, "Visitor: sent NatHoleVisitor on control, sid={}", txn_id);
                                 visitor_pending.insert(txn_id, vreq.reply);
                             }
                             Err(e) => {
-                                warn!("Visitor: failed to send NatHoleVisitor on control: {}", e);
+                                warn!(error = %e, "Visitor: failed to send NatHoleVisitor on control: {}", e);
                                 let _ = vreq.reply.send(Err(format!("send failed: {e}")));
                             }
                         }
@@ -1047,7 +1049,7 @@ impl Service {
             // Session dropped — reconnect with exponential backoff.
             // login_fail_exit only applies to initial login, not session drops.
             failed_count += 1;
-            warn!("Session ended, reconnecting in {}s (attempt {})...",
+            warn!(delay = %Self::reconnect_delay_secs(failed_count), attempt = %failed_count, "Session ended, reconnecting in {}s (attempt {})...",
                 Self::reconnect_delay_secs(failed_count), failed_count);
             Self::reconnect_delay(failed_count).await;
         }

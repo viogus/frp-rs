@@ -432,11 +432,11 @@ pub async fn v2_handshake_server(
 
             // Try to negotiate AEAD crypto
             let client_algorithms = &client_hello.capabilities.crypto.algorithms;
-            tracing::debug!("[V2-HS] ClientHello algorithms: {:?}, client_random: {:?}",
+            tracing::debug!(client_algorithms = ?client_algorithms, client_random_present = ?client_hello.capabilities.crypto.client_random.as_ref().map(|_| "present"), "[V2-HS] ClientHello algorithms: {:?}, client_random: {:?}",
                 client_algorithms,
                 client_hello.capabilities.crypto.client_random.as_ref().map(|_| "present"));
             if let Some(algorithm) = select_aead_algorithm(client_algorithms) {
-                tracing::debug!("[V2-HS] Selected algorithm: {:?}", algorithm);
+                tracing::debug!(algorithm = ?algorithm, "[V2-HS] Selected algorithm: {:?}", algorithm);
                 // Validate client_random
                 let client_random = client_hello.capabilities.crypto.client_random.as_ref()
                     .ok_or_else(|| crate::Error::Protocol(
@@ -460,7 +460,7 @@ pub async fn v2_handshake_server(
                 Ok((None, Some(CryptoContext { algorithm, transcript_hash })))
             } else {
                 // No crypto: send plain ServerHello
-                tracing::debug!("[V2-HS] No crypto negotiated (client offered {:?})", client_algorithms);
+                tracing::debug!(client_algorithms = ?client_algorithms, "[V2-HS] No crypto negotiated (client offered {:?})", client_algorithms);
                 let server_hello = ServerHello::default_ok();
                 let json = serde_json::to_vec(&server_hello)
                     .map_err(|e| crate::Error::Protocol(format!("serialize ServerHello: {e}")))?;

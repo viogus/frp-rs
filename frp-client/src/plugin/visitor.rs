@@ -76,7 +76,7 @@ pub async fn start_visitor_plugin(
     let oidc_client = ctx.oidc_client.clone();
 
     let task = tokio::spawn(async move {
-        debug!("visitor plugin listening on {}", local_addr);
+        debug!(local_addr = %local_addr, "visitor plugin listening on {}", local_addr);
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
@@ -86,7 +86,7 @@ pub async fn start_visitor_plugin(
                 result = listener.accept() => {
                     match result {
                         Ok((user_conn, peer)) => {
-                            debug!("visitor plugin: new connection from {}", peer);
+                            debug!(peer = %peer, "visitor plugin: new connection from {}", peer);
                             let sn = server_name.clone();
                             let sk = secret_key.clone();
                             let at = auth_token.clone();
@@ -105,12 +105,12 @@ pub async fn start_visitor_plugin(
                                     user_conn, &sn, &sk, &at, &sa, sp, te, &tsn,
                                     tcf.as_deref(), ue, uc, &tp, oidc,
                                 ).await {
-                                    debug!("visitor plugin handler: {}", e);
+                                    debug!(error = %e, "visitor plugin handler: {}", e);
                                 }
                             });
                         }
                         Err(e) => {
-                            warn!("visitor plugin: accept error: {}", e);
+                            warn!(error = %e, "visitor plugin: accept error: {}", e);
                             break;
                         }
                     }
@@ -239,8 +239,8 @@ async fn handle_visitor_conn(
     });
 
     match tokio::join!(a, b) {
-        (Ok(n1), Ok(n2)) => debug!("visitor plugin: bridge done ({:?}B→server, {:?}B→user)", n1, n2),
-        (Err(e), _) | (_, Err(e)) => debug!("visitor plugin: bridge closed: {}", e),
+        (Ok(n1), Ok(n2)) => debug!(n1 = ?n1, n2 = ?n2, "visitor plugin: bridge done ({:?}B→server, {:?}B→user)", n1, n2),
+        (Err(e), _) | (_, Err(e)) => debug!(error = %e, "visitor plugin: bridge closed: {}", e),
     }
 
     Ok(())

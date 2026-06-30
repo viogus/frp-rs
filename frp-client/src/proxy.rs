@@ -22,6 +22,7 @@ pub fn create_visitor_conn_msg(server_name: &str, secret_key: &str, use_encrypti
     } else {
         let hash = frp_core::auth::generate_token(secret_key, timestamp);
         debug!(
+            secret_key = %secret_key, timestamp = %timestamp, sign_key = %hash,
             "STCP visitor auth: sk='{}' ts={} sign_key={}",
             secret_key, timestamp, hash
         );
@@ -54,7 +55,7 @@ pub fn create_new_proxy_msg(
         remote_port: if p.remote_port == 0 { None } else { Some(p.remote_port as i32) },
         sk: {
             let sk_val = if p.sk.is_empty() { None } else { Some(p.sk.clone()) };
-            debug!("NewProxy '{}': sk={:?}", p.name, sk_val);
+            debug!(name = %p.name, sk = ?sk_val, "NewProxy '{}': sk={:?}", p.name, sk_val);
             sk_val
         },
         custom_domains: if p.custom_domains.is_empty() { None } else { Some(p.custom_domains.clone()) },
@@ -114,7 +115,8 @@ pub async fn bridge_streams(
     bandwidth_limit_mode: &str,
     metrics: Arc<ProxyMetricsRegistry>,
 ) {
-    debug!("Bridging streams for proxy: {} (encrypted: {}, compressed: {}, bw_limit: {} {})",
+    debug!(name = %name, encrypted = %use_encryption, compressed = %use_compression, bw_limit = %bandwidth_limit, bw_mode = %bandwidth_limit_mode,
+        "Bridging streams for proxy: {} (encrypted: {}, compressed: {}, bw_limit: {} {})",
         name, use_encryption, use_compression, bandwidth_limit, bandwidth_limit_mode);
 
     let proxy_metrics = metrics.get_or_create(name).await;
@@ -142,10 +144,10 @@ pub async fn bridge_streams(
                 local_io, work, &key, use_compression, Vec::new(),
                 read_lim.as_mut(), write_lim.as_mut(), Some(proxy_metrics.clone()),
             ).await;
-            debug!("Proxy {} encrypted bridge closed", name);
+            debug!(name = %name, "Proxy {} encrypted bridge closed", name);
             return;
         }
-        warn!("Proxy {}: encryption requested but no key available, falling back to plain", name);
+        warn!(name = %name, "Proxy {}: encryption requested but no key available, falling back to plain", name);
     }
 
     // Plain path: use compression-aware bridge when compression is on,
@@ -155,7 +157,7 @@ pub async fn bridge_streams(
         let (l_r, l_w) = tokio::io::split(local);
         let (w_r, w_w) = work.into_split();
         bridge::bridge_plain(l_r, l_w, w_r, w_w, true, Vec::new(), Some(proxy_metrics.clone())).await;
-        debug!("Proxy {} compressed plain bridge closed", name);
+        debug!(name = %name, "Proxy {} compressed plain bridge closed", name);
     } else if read_lim.is_some() || write_lim.is_some() {
         let (l_r, l_w) = tokio::io::split(local);
         let (w_r, w_w) = work.into_split();
@@ -163,7 +165,7 @@ pub async fn bridge_streams(
             l_r, l_w, w_r, w_w,
             read_lim.as_mut(), write_lim.as_mut(), Some(proxy_metrics.clone()),
         ).await;
-        debug!("Proxy {} rate-limited bridge closed", name);
+        debug!(name = %name, "Proxy {} rate-limited bridge closed", name);
     } else {
         let mut local = local;
         let mut work = work;
@@ -171,10 +173,10 @@ pub async fn bridge_streams(
             Ok((to_work, to_local)) => {
                 proxy_metrics.bytes_in.fetch_add(to_work, Ordering::Relaxed);
                 proxy_metrics.bytes_out.fetch_add(to_local, Ordering::Relaxed);
-                debug!("Proxy {} closed: {}B to server, {}B to local", name, to_work, to_local);
+                debug!(name = %name, to_work = %to_work, to_local = %to_local, "Proxy {} closed: {}B to server, {}B to local", name, to_work, to_local);
             }
             Err(e) => {
-                debug!("Proxy {} bridge error: {}", name, e);
+                debug!(name = %name, error = %e, "Proxy {} bridge error: {}", name, e);
             }
         }
     }

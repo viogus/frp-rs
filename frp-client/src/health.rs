@@ -22,7 +22,7 @@ pub(crate) async fn run_health_check(
     max_failed: u32,
     health_tx: mpsc::UnboundedSender<String>,
 ) {
-    info!("Health check ({}) started for '{}' -> {} (interval: {:?}, timeout: {:?})",
+    info!(check_type = %check_type, proxy_name = %proxy_name, local_addr = %local_addr, interval = ?interval, timeout = ?timeout, "Health check ({}) started for '{}' -> {} (interval: {:?}, timeout: {:?})",
         check_type, proxy_name, local_addr, interval, timeout);
 
     let mut failures: u32 = 0;
@@ -39,16 +39,16 @@ pub(crate) async fn run_health_check(
         match result {
             Ok(()) => {
                 failures = 0;
-                debug!("Health check OK for '{}'", proxy_name);
+                debug!(proxy_name = %proxy_name, "Health check OK for '{}'", proxy_name);
             }
             Err(e) => {
                 failures += 1;
-                warn!("Health check FAIL for '{}' ({}): {}", proxy_name, failures, e);
+                warn!(proxy_name = %proxy_name, failures = %failures, error = %e, "Health check FAIL for '{}' ({}): {}", proxy_name, failures, e);
             }
         }
 
         if failures >= max_failed {
-            warn!("Health check: proxy '{}' exceeded max failures ({}), sending CloseProxy",
+            warn!(proxy_name = %proxy_name, max_failed = %max_failed, "Health check: proxy '{}' exceeded max failures ({}), sending CloseProxy",
                 proxy_name, max_failed);
             let _ = health_tx.send(proxy_name.clone());
             failures = 0; // Reset to avoid repeated warnings

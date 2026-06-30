@@ -9,7 +9,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
         cli.frps_addr.split(':').next().unwrap_or("127.0.0.1"),
         cli.port
     );
-    tracing::info!("Opening {} connections to {}", cli.concurrency, target);
+    tracing::info!(concurrency = %cli.concurrency, target = %target, "Opening {} connections to {}", cli.concurrency, target);
 
     let mut handles = Vec::with_capacity(cli.concurrency);
 
@@ -34,11 +34,11 @@ pub async fn run(cli: &Cli) -> Result<()> {
         match h.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                tracing::error!("Connection {} failed: {:#}", i, e);
+                tracing::error!(i = %i, error = ?e, "Connection {} failed: {:#}", i, e);
                 failures += 1;
             }
             Err(e) => {
-                tracing::error!("Task {} panicked: {}", i, e);
+                tracing::error!(i = %i, error = %e, "Task {} panicked: {}", i, e);
                 failures += 1;
             }
         }
@@ -49,6 +49,8 @@ pub async fn run(cli: &Cli) -> Result<()> {
     }
 
     tracing::info!(
+        concurrency = %cli.concurrency,
+        duration = %cli.duration,
         "All {} connections stable for {}s",
         cli.concurrency,
         cli.duration

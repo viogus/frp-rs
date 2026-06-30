@@ -127,7 +127,7 @@ pub async fn bridge_encrypted(
                     Ok(p) => p,
                     #[cfg(feature = "compression")]
                     Err(e) => {
-                        tracing::warn!("snappy decompress error in encrypted bridge: {}", e);
+                        tracing::warn!(error = %e, "snappy decompress error in encrypted bridge: {}", e);
                         break;
                     }
                     #[cfg(not(feature = "compression"))]
@@ -163,7 +163,7 @@ pub async fn bridge_encrypted(
                 }
                 #[cfg(feature = "compression")]
                 Err(e) => {
-                    tracing::warn!("snappy flush error in encrypted bridge: {}", e);
+                    tracing::warn!(error = %e, "snappy flush error in encrypted bridge: {}", e);
                 }
                 _ => {}
             }
@@ -243,7 +243,7 @@ pub async fn bridge_plain(
                     Ok(p) => p,
                     #[cfg(feature = "compression")]
                     Err(e) => {
-                        tracing::warn!("snappy decompress error in bridge: {}", e);
+                        tracing::warn!(error = %e, "snappy decompress error in bridge: {}", e);
                         break;
                     }
                     #[cfg(not(feature = "compression"))]
@@ -272,7 +272,7 @@ pub async fn bridge_plain(
                 }
                 #[cfg(feature = "compression")]
                 Err(e) => {
-                    tracing::warn!("snappy flush error in bridge: {}", e);
+                    tracing::warn!(error = %e, "snappy flush error in bridge: {}", e);
                 }
                 _ => {}
             }

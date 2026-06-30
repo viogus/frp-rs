@@ -68,13 +68,13 @@ impl Service {
                 Some(auth_cfg.oidc_proxy_url.clone()).filter(|s| !s.is_empty()),
             ).await {
                 Ok(v) => {
-                    info!("OIDC verifier initialized (issuer: {})", auth_cfg.oidc_issuer);
+                    info!(issuer = %auth_cfg.oidc_issuer, "OIDC verifier initialized (issuer: {})", auth_cfg.oidc_issuer);
                     let v = Arc::new(v);
                     v.start_background_refresh();
                     Some(v)
                 }
                 Err(e) => {
-                    error!("OIDC verifier initialization failed: {e}");
+                    error!(error = %e, "OIDC verifier initialization failed: {e}");
                     return Err(format!("Cannot start frps with OIDC auth: {e}"));
                 }
             }
@@ -138,18 +138,18 @@ impl Service {
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let bind_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.bind_port);
-        info!("frps starting on {}", bind_addr);
+        info!(bind_addr = %bind_addr, "frps starting on {}", bind_addr);
 
         #[cfg(feature = "tls")]
         let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = if self.cfg.tls_enable {
             let ca_file = if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.as_str()) };
             match build_tls_acceptor(&self.cfg.tls_cert_file, &self.cfg.tls_key_file, ca_file) {
                 Ok(acc) => {
-                    info!("TLS enabled with cert: {}", self.cfg.tls_cert_file);
+                    info!(cert_file = %self.cfg.tls_cert_file, "TLS enabled with cert: {}", self.cfg.tls_cert_file);
                     Some(acc)
                 }
                 Err(e) => {
-                    error!("Failed to initialize TLS: {}", e);
+                    error!(error = %e, "Failed to initialize TLS: {}", e);
                     return Err(e.into());
                 }
             }
@@ -160,7 +160,7 @@ impl Service {
         let _tls_acceptor: Option<()> = None;
 
         let listener = TcpListener::bind(&bind_addr).await?;
-        info!("frps listener started on {}", bind_addr);
+        info!(bind_addr = %bind_addr, "frps listener started on {}", bind_addr);
 
         // Optional WebSocket listener
         #[cfg(feature = "websocket")]
@@ -170,15 +170,15 @@ impl Service {
             let ws_state = self.state.clone();
             tokio::spawn(async move {
                 if let Ok(listener) = TcpListener::bind(&ws_addr2).await {
-                    info!("WebSocket listener ready on {}", ws_addr2);
+                    info!(addr = %ws_addr2, "WebSocket listener ready on {}", ws_addr2);
                     loop {
                         if let Ok((stream, addr)) = listener.accept().await {
-                            info!("New WebSocket connection from {}", addr);
+                            info!(addr = %addr, "New WebSocket connection from {}", addr);
                             let state = ws_state.clone();
                             tokio::spawn(async move {
                                 match frp_core::transport::accept_websocket(IoStream::Tcp(stream)).await {
                                     Ok(mut ws) => {
-                                        info!("WebSocket upgrade completed for {}", addr);
+                                        info!(addr = %addr, "WebSocket upgrade completed for {}", addr);
                                         match read_msg_v1(&mut ws).await {
                                             Ok(FrpMessage::Login(login)) => {
                                                 control::handle_control(ws, login, state.clone(), Some(addr), None, false, None).await;
@@ -193,15 +193,15 @@ impl Service {
                                                 crate::handlers::handle_nat_hole_visitor(ws, nhv, state.clone(), None, false).await;
                                             }
                                             Ok(other) => {
-                                                warn!("Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
+                                                warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
                                             }
                                             Err(e) => {
-                                                debug!("WS read error from {}: {}", addr, e);
+                                                debug!(addr = %addr, error = %e, "WS read error from {}: {}", addr, e);
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("WebSocket upgrade failed for {}: {}", addr, e);
+                                        warn!(addr = %addr, error = %e, "WebSocket upgrade failed for {}: {}", addr, e);
                                     }
                                 }
                             });
@@ -209,7 +209,7 @@ impl Service {
                     }
                 }
             });
-            info!("WebSocket listener started on {}", ws_addr);
+            info!(addr = %ws_addr, "WebSocket listener started on {}", ws_addr);
         }
 
 
@@ -219,10 +219,10 @@ impl Service {
             let http_state = self.state.clone();
             tokio::spawn(async move {
                 if let Err(e) = crate::vhost::run_vhost_http_listener(http_addr, http_state).await {
-                    error!("HTTP VHost listener failed: {}", e);
+                    error!(error = %e, "HTTP VHost listener failed: {}", e);
                 }
             });
-            info!("HTTP VHost listener starting on port {}", self.cfg.vhost_http_port);
+            info!(port = %self.cfg.vhost_http_port, "HTTP VHost listener starting on port {}", self.cfg.vhost_http_port);
         }
 
         // Start HTTPS VHost listener if configured
@@ -234,10 +234,10 @@ impl Service {
             let key = self.cfg.tls_key_file.clone();
             tokio::spawn(async move {
                 if let Err(e) = crate::vhost::run_vhost_https_listener(https_addr, cert, key, https_state).await {
-                    error!("HTTPS VHost listener failed: {}", e);
+                    error!(error = %e, "HTTPS VHost listener failed: {}", e);
                 }
             });
-            info!("HTTPS VHost listener starting on {}", https_addr2);
+            info!(addr = %https_addr2, "HTTPS VHost listener starting on {}", https_addr2);
         }
 
         // Start TCPMux HTTP CONNECT listener if configured
@@ -251,10 +251,10 @@ impl Service {
                 if let Err(e) =
                     crate::tcpmux::run_tcpmux_listener(tcpmux_addr, tcpmux_state).await
                 {
-                    error!("TCPMux HTTP CONNECT listener failed: {}", e);
+                    error!(error = %e, "TCPMux HTTP CONNECT listener failed: {}", e);
                 }
             });
-            info!(
+            info!(port = %self.cfg.tcpmux_httpconnect_port,
                 "TCPMux HTTP CONNECT listener starting on port {}",
                 self.cfg.tcpmux_httpconnect_port
             );
@@ -273,18 +273,18 @@ impl Service {
                 match crate::ssh_gateway::SshListener::new(&ssh_cfg, ssh_state, token).await {
                     Ok(Some(listener)) => {
                         if let Err(e) = listener.run().await {
-                            tracing::error!("SSH tunnel gateway failed: {}", e);
+                            tracing::error!(error = %e, "SSH tunnel gateway failed: {}", e);
                         }
                     }
                     Ok(None) => {
                         tracing::debug!("SSH tunnel gateway disabled (bind_port=0)");
                     }
                     Err(e) => {
-                        tracing::error!("SSH tunnel gateway init failed: {}", e);
+                        tracing::error!(error = %e, "SSH tunnel gateway init failed: {}", e);
                     }
                 }
             });
-            tracing::info!("SSH tunnel gateway starting on port {}", self.cfg.ssh_tunnel_gateway.bind_port);
+            tracing::info!(port = %self.cfg.ssh_tunnel_gateway.bind_port, "SSH tunnel gateway starting on port {}", self.cfg.ssh_tunnel_gateway.bind_port);
         }
 
         // Start KCP listener if configured
@@ -297,11 +297,11 @@ impl Service {
                 let mut listener = match frp_core::kcp::KcpListener::bind(&kcp_addr2, Default::default()).await {
                     Ok(l) => l,
                     Err(e) => {
-                        tracing::error!("KCP listener bind failed: {}", e);
+                        tracing::error!(error = %e, "KCP listener bind failed: {}", e);
                         return;
                     }
                 };
-                tracing::info!("KCP listener started on {}", kcp_addr2);
+                tracing::info!(addr = %kcp_addr2, "KCP listener started on {}", kcp_addr2);
                 loop {
                     match listener.accept().await {
                         Ok(stream) => {
@@ -316,22 +316,22 @@ impl Service {
                                         crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
                                     }
                                     Ok(other) => {
-                                        tracing::warn!("Unexpected KCP message: {:?}", other.v1_type_byte());
+                                        tracing::warn!(other = ?other.v1_type_byte(), "Unexpected KCP message: {:?}", other.v1_type_byte());
                                     }
                                     Err(e) => {
-                                        tracing::warn!("KCP read error: {}", e);
+                                        tracing::warn!(error = %e, "KCP read error: {}", e);
                                     }
                                 }
                             });
                         }
                         Err(e) => {
-                            tracing::error!("KCP accept error: {}", e);
+                            tracing::error!(error = %e, "KCP accept error: {}", e);
                             break;
                         }
                     }
                 }
             });
-            tracing::info!("KCP listener starting on {}", kcp_addr);
+            tracing::info!(addr = %kcp_addr, "KCP listener starting on {}", kcp_addr);
         }
 
         // Start QUIC listener if configured (requires TLS cert/key)
@@ -346,32 +346,32 @@ impl Service {
                 let cert_pem = match std::fs::read_to_string(&cert_path) {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::error!("QUIC: failed to read cert file {}: {}", cert_path, e);
+                        tracing::error!(cert_path = %cert_path, error = %e, "QUIC: failed to read cert file {}: {}", cert_path, e);
                         return;
                     }
                 };
                 let key_pem = match std::fs::read_to_string(&key_path) {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::error!("QUIC: failed to read key file {}: {}", key_path, e);
+                        tracing::error!(key_path = %key_path, error = %e, "QUIC: failed to read key file {}: {}", key_path, e);
                         return;
                     }
                 };
                 let sockaddr: std::net::SocketAddr = match quic_addr.parse() {
                     Ok(a) => a,
                     Err(e) => {
-                        tracing::error!("QUIC: invalid bind address {}: {}", quic_addr, e);
+                        tracing::error!(addr = %quic_addr, error = %e, "QUIC: invalid bind address {}: {}", quic_addr, e);
                         return;
                     }
                 };
                 let listener = match frp_core::quic::QuicListener::new(sockaddr, &cert_pem, &key_pem) {
                     Ok(l) => l,
                     Err(e) => {
-                        tracing::error!("QUIC listener bind failed: {}", e);
+                        tracing::error!(error = %e, "QUIC listener bind failed: {}", e);
                         return;
                     }
                 };
-                tracing::info!("QUIC listener started on {}", quic_addr);
+                tracing::info!(addr = %quic_addr, "QUIC listener started on {}", quic_addr);
                 loop {
                     match listener.accept().await {
                         Ok((stream, conn)) => {
@@ -399,17 +399,17 @@ impl Service {
                                             match ctl.read_raw_v2_frame().await {
                                                 Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                 Ok((ft, _, _)) => {
-                                                    tracing::warn!("QUIC V2: unexpected frame type {} after handshake", ft);
+                                                    tracing::warn!(frame_type = ?ft, "QUIC V2: unexpected frame type {} after handshake", ft);
                                                     return;
                                                 }
                                                 Err(e) => {
-                                                    tracing::warn!("QUIC V2: failed to read message after handshake: {}", e);
+                                                    tracing::warn!(error = %e, "QUIC V2: failed to read message after handshake: {}", e);
                                                     return;
                                                 }
                                             }
                                         }
                                         Err(e) => {
-                                            tracing::warn!("QUIC V2 handshake error: {}", e);
+                                            tracing::warn!(error = %e, "QUIC V2 handshake error: {}", e);
                                             return;
                                         }
                                     };
@@ -450,10 +450,10 @@ impl Service {
                                                                             crate::handlers::handle_work_conn_inner(wc, nwc, s).await;
                                                                         }
                                                                         Ok(other) => {
-                                                                            tracing::warn!("QUIC V2 drain: unexpected msg type_id={:?}", other.v2_type_id());
+                                                                            tracing::warn!(msg_type_id = ?other.v2_type_id(), "QUIC V2 drain: unexpected msg type_id={:?}", other.v2_type_id());
                                                                         }
                                                                         Err(e) => {
-                                                                            tracing::warn!("QUIC V2 drain: read error: {}", e);
+                                                                            tracing::warn!(error = %e, "QUIC V2 drain: read error: {}", e);
                                                                         }
                                                                     }
                                                                 } else {
@@ -463,17 +463,17 @@ impl Service {
                                                                             crate::handlers::handle_work_conn_inner(wc, nwc, s).await;
                                                                         }
                                                                         Ok(other) => {
-                                                                            tracing::warn!("QUIC V1 drain: unexpected msg type_byte={:?}", other.v1_type_byte());
+                                                                            tracing::warn!(msg_type_byte = ?other.v1_type_byte(), "QUIC V1 drain: unexpected msg type_byte={:?}", other.v1_type_byte());
                                                                         }
                                                                         Err(e) => {
-                                                                            tracing::warn!("QUIC V1 drain: read error: {}", e);
+                                                                            tracing::warn!(error = %e, "QUIC V1 drain: read error: {}", e);
                                                                         }
                                                                     }
                                                                 }
                                                             });
                                                         }
                                                         Err(e) => {
-                                                            tracing::debug!("QUIC drain (V2 ctl) done: {e}");
+                                                            tracing::debug!(error = %e, "QUIC drain (V2 ctl) done: {e}");
                                                             break;
                                                         }
                                                     }
@@ -524,10 +524,10 @@ impl Service {
                                                                                     crate::handlers::handle_work_conn_inner(wc, nwc, s).await;
                                                                                 }
                                                                                 Ok(other) => {
-                                                                                    tracing::warn!("QUIC V2 drain: unexpected msg type_id={:?}", other.v2_type_id());
+                                                                                    tracing::warn!(msg_type_id = ?other.v2_type_id(), "QUIC V2 drain: unexpected msg type_id={:?}", other.v2_type_id());
                                                                                 }
                                                                                 Err(e) => {
-                                                                                    tracing::warn!("QUIC V2 drain: read error: {}", e);
+                                                                                    tracing::warn!(error = %e, "QUIC V2 drain: read error: {}", e);
                                                                                 }
                                                                             }
                                                                         } else {
@@ -537,17 +537,17 @@ impl Service {
                                                                                     crate::handlers::handle_work_conn_inner(wc, nwc, s).await;
                                                                                 }
                                                                                 Ok(other) => {
-                                                                                    tracing::warn!("QUIC V1 drain: unexpected msg type_byte={:?}", other.v1_type_byte());
+                                                                                    tracing::warn!(msg_type_byte = ?other.v1_type_byte(), "QUIC V1 drain: unexpected msg type_byte={:?}", other.v1_type_byte());
                                                                                 }
                                                                                 Err(e) => {
-                                                                                    tracing::warn!("QUIC V1 drain: read error: {}", e);
+                                                                                    tracing::warn!(error = %e, "QUIC V1 drain: read error: {}", e);
                                                                                 }
                                                                             }
                                                                         }
                                                                     });
                                                                 }
                                                                 Err(e) => {
-                                                                    tracing::debug!("QUIC drain (V1 ctl) done: {e}");
+                                                                    tracing::debug!(error = %e, "QUIC drain (V1 ctl) done: {e}");
                                                                     break;
                                                                 }
                                                             }
@@ -563,23 +563,23 @@ impl Service {
                                             crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
                                         }
                                         Ok(other) => {
-                                            tracing::warn!("Unexpected QUIC message: {:?}", other.v1_type_byte());
+                                            tracing::warn!(other = ?other.v1_type_byte(), "Unexpected QUIC message: {:?}", other.v1_type_byte());
                                         }
                                         Err(e) => {
-                                            tracing::warn!("QUIC read error: {}", e);
+                                            tracing::warn!(error = %e, "QUIC read error: {}", e);
                                         }
                                     }
                                 }
                             });
                         }
                         Err(e) => {
-                            tracing::error!("QUIC accept error: {}", e);
+                            tracing::error!(error = %e, "QUIC accept error: {}", e);
                             break;
                         }
                     }
                 }
             });
-            tracing::info!("QUIC listener starting on {}", quic_addr2);
+            tracing::info!(addr = %quic_addr2, "QUIC listener starting on {}", quic_addr2);
         }
 
         // Start dashboard server if configured
@@ -606,10 +606,10 @@ impl Service {
                     dash_addr, dash_state, dash_user, dash_pwd,
                     enable_prom, dash_tls_cert, dash_tls_key,
                 ).await {
-                    tracing::error!("Dashboard server failed: {}", e);
+                    tracing::error!(error = %e, "Dashboard server failed: {}", e);
                 }
             });
-            tracing::info!("Dashboard web UI starting on {}", dash_addr2);
+            tracing::info!(addr = %dash_addr2, "Dashboard web UI starting on {}", dash_addr2);
         }
 
         // Background cleanup for stale NAT hole punch sessions.
@@ -625,7 +625,7 @@ impl Service {
                 // Clean expired analyzer entries to prevent unbounded memory growth.
                 let (removed, total) = nat_hole.analyzer.clean();
                 if removed > 0 {
-                    tracing::debug!("Analyzer cleanup: removed {}/{} expired entries", removed, total);
+                    tracing::debug!(removed = %removed, total = %total, "Analyzer cleanup: removed {}/{} expired entries", removed, total);
                 }
             }
         });
@@ -644,7 +644,7 @@ impl Service {
                         let (ct, mut stream_io) = match detect_and_strip_magic(stream).await {
                             Ok((c, s)) => (c, s),
                             Err(e) => {
-                                warn!("Failed to detect connection type from {}: {}", addr, e);
+                                warn!(addr = %addr, error = %e, "Failed to detect connection type from {}: {}", addr, e);
                                 return;
                             }
                         };
@@ -658,7 +658,7 @@ impl Service {
                                 let (mut pre_read_bytes, mut inner_stream) = match stream_io {
                                     IoStream::PreRead(buf, s) => (buf, s),
                                     _ => {
-                                        warn!("Expected PreRead for TLS connection from {}", addr);
+                                        warn!(addr = %addr, "Expected PreRead for TLS connection from {}", addr);
                                         return;
                                     }
                                 };
@@ -681,7 +681,7 @@ impl Service {
                                     Ok(Ok(n)) if n >= 43 => n,
                                     Ok(Ok(_)) => 0,
                                     _ => {
-                                        warn!("TLS read timeout from {} during SNI check", addr);
+                                        warn!(addr = %addr, "TLS read timeout from {} during SNI check", addr);
                                         return;
                                     }
                                 };
@@ -695,14 +695,15 @@ impl Service {
                                 // Try SNI-based routing for HTTPS proxies
                                 if !sni_data.is_empty() {
                                     if let Some(sni_host) = crate::vhost::extract_sni_from_client_hello(&sni_data) {
-                                        debug!("SNI from {}: {}", addr, sni_host);
+                                        debug!(addr = %addr, sni_host = %sni_host, "SNI from {}: {}", addr, sni_host);
                                         if let Some(route) = state.vhost_manager.lookup(&sni_host).await {
                                             let ctl_tx = {
                                                 let map = state.run_id_to_ctl_tx.read().await;
                                                 map.get(&route.run_id).cloned()
                                             };
                                             if let Some(ctl) = ctl_tx {
-                                                info!("SNI route '{}' → HTTPS proxy '{}' from {}",
+                                                info!(sni_host = %sni_host, proxy_name = %route.proxy_name, addr = %addr,
+                                                    "SNI route '{}' → HTTPS proxy '{}' from {}",
                                                     sni_host, route.proxy_name, addr);
                                                 let _ = ctl.tx.send(InternalMsg::ProxyUserConn {
                                                     proxy_name: route.proxy_name.clone(),
@@ -722,18 +723,18 @@ impl Service {
                                 let acceptor = match acceptor {
                                     Some(a) => a,
                                     None => {
-                                        warn!("TLS connection from {} but TLS not configured", addr);
+                                        warn!(addr = %addr, "TLS connection from {} but TLS not configured", addr);
                                         return;
                                     }
                                 };
                                 let tls_stream = match acceptor.accept(stream).await {
                                     Ok(s) => s,
                                     Err(e) => {
-                                        warn!("TLS handshake failed from {}: {}", addr, e);
+                                        warn!(addr = %addr, error = %e, "TLS handshake failed from {}: {}", addr, e);
                                         return;
                                     }
                                 };
-                                info!("TLS connection from {}", addr);
+                                info!(addr = %addr, "TLS connection from {}", addr);
 
                                 // When tcp_mux is enabled, wrap TLS stream in yamux
                                 // before reading the first message (matches Go frp).
@@ -746,7 +747,7 @@ impl Service {
                                     match mux::server_mux(tls_stream, &mux_cfg).await {
                                         Ok((control_stream, incoming)) => {
                                             let mut io = IoStream::Yamux(control_stream);
-                                            info!("Yamux over TLS session established for {:?}", addr);
+                                            info!(addr = ?addr, "Yamux over TLS session established for {:?}", addr);
 
                                             // Try V2 detection on yamux stream (Go frp: magic on stream)
                                             let mut magic = [0u8; 7];
@@ -764,17 +765,17 @@ impl Service {
                                                         match io.read_raw_v2_frame().await {
                                                             Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                             Ok((ft, _, _)) => {
-                                                                warn!("Unexpected frame type {} after V2 TLS+yamux handshake from {}", ft, addr);
+                                                                warn!(frame_type = ?ft, addr = %addr, "Unexpected frame type {} after V2 TLS+yamux handshake from {}", ft, addr);
                                                                 return;
                                                             }
                                                             Err(e) => {
-                                                            warn!("Failed to read V2 message after TLS+yamux handshake from {}: {}", addr, e);
+                                                            warn!(addr = %addr, error = %e, "Failed to read V2 message after TLS+yamux handshake from {}: {}", addr, e);
                                                             return;
                                                         }
                                                     }
                                                     }
                                                     Err(e) => {
-                                                        warn!("V2 TLS+yamux handshake error from {}: {}", addr, e);
+                                                        warn!(addr = %addr, error = %e, "V2 TLS+yamux handshake error from {}: {}", addr, e);
                                                         return;
                                                     }
                                                 };
@@ -796,16 +797,16 @@ impl Service {
                                                         crate::handlers::handle_nat_hole_visitor(io, nhv, state, None, false).await;
                                                     }
                                                     Ok(other) => {
-                                                        warn!("Unexpected TLS+yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
+                                                        warn!(addr = ?addr, other = ?other.v1_type_byte(), "Unexpected TLS+yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
                                                     }
                                                     Err(e) => {
-                                                        warn!("TLS+yamux read error from {}: {}", addr, e);
+                                                        warn!(addr = %addr, error = %e, "TLS+yamux read error from {}: {}", addr, e);
                                                     }
                                                 }
                                             }
                                         }
                                         Err(e) => {
-                                            warn!("Failed to start yamux over TLS for {:?}: {}", addr, e);
+                                            warn!(addr = ?addr, error = %e, "Failed to start yamux over TLS for {:?}: {}", addr, e);
                                         }
                                     }
                                 } else {
@@ -828,10 +829,10 @@ impl Service {
                                             crate::handlers::handle_nat_hole_visitor(io, nhv, state, visitor_addr, false).await;
                                         }
                                         Ok(other) => {
-                                            debug!("Unexpected TLS first message from {}: {:?}", addr, other.v1_type_byte());
+                                            debug!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected TLS first message from {}: {:?}", addr, other.v1_type_byte());
                                         }
                                         Err(e) => {
-                                            debug!("TLS read error from {}: {}", addr, e);
+                                            debug!(addr = %addr, error = %e, "TLS read error from {}: {}", addr, e);
                                         }
                                     }
                                 }
@@ -839,20 +840,20 @@ impl Service {
 
                             #[cfg(not(feature = "tls"))]
                             ConnectionType::Tls(_) => {
-                                warn!("TLS connection from {} but TLS feature not enabled", addr);
+                                warn!(addr = %addr, "TLS connection from {} but TLS feature not enabled", addr);
                             }
 
                             #[cfg(feature = "websocket")]
                             ConnectionType::WebSocket => {
                                 if state.tls_only {
-                                    warn!("TLS-only mode: rejected WebSocket from {}", addr);
+                                    warn!(addr = %addr, "TLS-only mode: rejected WebSocket from {}", addr);
                                     return;
                                 }
                                 // stream_io is IoStream::PreRead — its AsyncRead replays
                                 // the 7 consumed bytes (starting with 'G' for GET).
                                 match accept_websocket(stream_io).await {
                                     Ok(mut ws) => {
-                                        info!("WebSocket upgrade on main port for {}", addr);
+                                        info!(addr = %addr, "WebSocket upgrade on main port for {}", addr);
                                         match read_msg_v1(&mut ws).await {
                                             Ok(FrpMessage::Login(login)) => {
                                                 control::handle_control(ws, login, state.clone(), Some(addr), None, false, None).await;
@@ -867,15 +868,15 @@ impl Service {
                                                 crate::handlers::handle_nat_hole_visitor(ws, nhv, state.clone(), None, false).await;
                                             }
                                             Ok(other) => {
-                                                warn!("Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
+                                                warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
                                             }
                                             Err(e) => {
-                                                debug!("WS read error from {}: {}", addr, e);
+                                                debug!(addr = %addr, error = %e, "WS read error from {}: {}", addr, e);
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("WebSocket upgrade failed for {}: {}", addr, e);
+                                        warn!(addr = %addr, error = %e, "WebSocket upgrade failed for {}: {}", addr, e);
                                     }
                                 }
                             }
@@ -885,13 +886,13 @@ impl Service {
                                 let inner_stream = match stream_io {
                                     IoStream::Tcp(s) => s,
                                     _other => {
-                                        warn!("Expected TcpStream for V2 connection from {}, got unexpected stream type", addr);
+                                        warn!(addr = %addr, "Expected TcpStream for V2 connection from {}, got unexpected stream type", addr);
                                         return;
                                     }
                                 };
 
                                 if state.tls_only {
-                                    warn!("TLS-only mode: rejected V2 from {}", addr);
+                                    warn!(addr = %addr, "TLS-only mode: rejected V2 from {}", addr);
                                     return;
                                 }
 
@@ -905,7 +906,7 @@ impl Service {
                                     match mux::server_mux(inner_stream, &mux_cfg).await {
                                         Ok((control_stream, incoming)) => {
                                             let mut io = IoStream::Yamux(control_stream);
-                                            info!("Yamux over V2 session established for {:?}", addr);
+                                            info!(addr = ?addr, "Yamux over V2 session established for {:?}", addr);
 
                                             match frp_core::protocol::read_v2_magic_or_replay(&mut io).await {
                                                 Ok(None) => {} // magic consumed
@@ -915,7 +916,7 @@ impl Service {
                                                     io = IoStream::BufferedRead(bytes, 0, Box::new(io));
                                                 }
                                                 Err(e) => {
-                                                    warn!("Failed to read V2 magic from yamux stream: {}", e);
+                                                    warn!(error = %e, "Failed to read V2 magic from yamux stream: {}", e);
                                                     return;
                                                 }
                                             }
@@ -929,17 +930,17 @@ impl Service {
                                                     match io.read_raw_v2_frame().await {
                                                         Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                         Ok((ft, _, _)) => {
-                                                            warn!("Unexpected frame type {} after V2 handshake from {}", ft, addr);
+                                                            warn!(frame_type = ?ft, addr = %addr, "Unexpected frame type {} after V2 handshake from {}", ft, addr);
                                                             return;
                                                         }
                                                         Err(e) => {
-                                                            warn!("Failed to read V2 message after handshake from {}: {}", addr, e);
+                                                            warn!(addr = %addr, error = %e, "Failed to read V2 message after handshake from {}: {}", addr, e);
                                                             return;
                                                         }
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    warn!("V2 handshake error from {}: {}", addr, e);
+                                                    warn!(addr = %addr, error = %e, "V2 handshake error from {}: {}", addr, e);
                                                     return;
                                                 }
                                             };
@@ -947,7 +948,7 @@ impl Service {
                                             crate::handlers::dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None, crypto_ctx).await;
                                         }
                                         Err(e) => {
-                                            warn!("Failed to start yamux over V2 for {:?}: {}", addr, e);
+                                            warn!(addr = ?addr, error = %e, "Failed to start yamux over V2 for {:?}: {}", addr, e);
                                         }
                                     }
                                 } else {
@@ -963,17 +964,17 @@ impl Service {
                                             match io.read_raw_v2_frame().await {
                                                 Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                 Ok((ft, _, _)) => {
-                                                    warn!("Unexpected frame type {} after V2 handshake from {}", ft, addr);
+                                                    warn!(frame_type = ?ft, addr = %addr, "Unexpected frame type {} after V2 handshake from {}", ft, addr);
                                                     return;
                                                 }
                                                 Err(e) => {
-                                                    warn!("Failed to read V2 message after handshake from {}: {}", addr, e);
+                                                    warn!(addr = %addr, error = %e, "Failed to read V2 message after handshake from {}: {}", addr, e);
                                                     return;
                                                 }
                                             }
                                         }
                                         Err(e) => {
-                                            warn!("V2 handshake error from {}: {}", addr, e);
+                                            warn!(addr = %addr, error = %e, "V2 handshake error from {}: {}", addr, e);
                                             return;
                                         }
                                     };
@@ -984,7 +985,7 @@ impl Service {
 
                             ConnectionType::V1(_byte) => {
                                 if state.tls_only {
-                                    warn!("TLS-only mode: rejected plain TCP from {}", addr);
+                                    warn!(addr = %addr, "TLS-only mode: rejected plain TCP from {}", addr);
                                     return;
                                 }
                                 if state.tcp_mux {
@@ -994,7 +995,7 @@ impl Service {
                                     let (pre_read, inner_tcp) = match stream_io {
                                         IoStream::PreRead(buf, s) => (buf, s),
                                         _ => {
-                                            warn!(
+                                            warn!(addr = %addr,
                                                 "Expected PreRead stream after detect_and_strip_magic from {}, got unexpected stream type",
                                                 addr
                                             );
@@ -1011,7 +1012,7 @@ impl Service {
                                     match mux::server_mux(stream, &mux_cfg).await {
                                         Ok((control_stream, incoming)) => {
                                             let mut io = IoStream::Yamux(control_stream);
-                                            info!("Yamux session established for {:?}", addr);
+                                            info!(addr = ?addr, "Yamux session established for {:?}", addr);
 
                                             // Try V2 detection: read 7 magic bytes from yamux stream.
                                             // Go frp sends V2 magic on yamux stream (not raw TCP) when tcpMux.
@@ -1030,17 +1031,17 @@ impl Service {
                                                         match io.read_raw_v2_frame().await {
                                                             Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                             Ok((ft, _, _)) => {
-                                                                warn!("Unexpected frame type {} after V2 handshake from {}", ft, addr);
+                                                                warn!(frame_type = ?ft, addr = %addr, "Unexpected frame type {} after V2 handshake from {}", ft, addr);
                                                                 return;
                                                             }
                                                             Err(e) => {
-                                                                warn!("Failed to read V2 message after handshake from {}: {}", addr, e);
+                                                                warn!(addr = %addr, error = %e, "Failed to read V2 message after handshake from {}: {}", addr, e);
                                                                 return;
                                                             }
                                                         }
                                                     }
                                                     Err(e) => {
-                                                        warn!("V2 handshake error from {}: {}", addr, e);
+                                                        warn!(addr = %addr, error = %e, "V2 handshake error from {}: {}", addr, e);
                                                         return;
                                                     }
                                                 };
@@ -1062,16 +1063,16 @@ impl Service {
                                                         crate::handlers::handle_nat_hole_visitor(io, nhv, state, None, false).await;
                                                     }
                                                     Ok(other) => {
-                                                        warn!("Unexpected yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
+                                                        warn!(addr = ?addr, other = ?other.v1_type_byte(), "Unexpected yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
                                                     }
                                                     Err(e) => {
-                                                        warn!("Failed to read yamux first message from {}: {}", addr, e);
+                                                        warn!(addr = %addr, error = %e, "Failed to read yamux first message from {}: {}", addr, e);
                                                     }
                                                 }
                                             }
                                         }
                                         Err(e) => {
-                                            warn!("Failed to start yamux server for {:?}: {}", addr, e);
+                                            warn!(addr = ?addr, error = %e, "Failed to start yamux server for {:?}: {}", addr, e);
                                         }
                                     }
                                 } else {
@@ -1093,10 +1094,10 @@ impl Service {
                                             crate::handlers::handle_nat_hole_visitor(stream_io, nhv, state, visitor_addr, false).await;
                                         }
                                         Ok(other) => {
-                                            warn!("Unexpected first message from {}: {:?}", addr, other.v1_type_byte());
+                                            warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected first message from {}: {:?}", addr, other.v1_type_byte());
                                         }
                                         Err(e) => {
-                                            warn!("Failed to read first message from {}: {}", addr, e);
+                                            warn!(addr = %addr, error = %e, "Failed to read first message from {}: {}", addr, e);
                                         }
                                     }
                                 }
@@ -1105,7 +1106,7 @@ impl Service {
                     });
                 }
                 Err(e) => {
-                    error!("Failed to accept connection: {}", e);
+                    error!(error = %e, "Failed to accept connection: {}", e);
                 }
             }
         }
@@ -1206,7 +1207,7 @@ impl Service {
         if changes.is_empty() {
             Ok("config reloaded: no changes detected".into())
         } else {
-            info!("Config reloaded: {}", changes.join("; "));
+            info!(changes = %changes.join("; "), "Config reloaded: {}", changes.join("; "));
             Ok(changes.join("; "))
         }
     }

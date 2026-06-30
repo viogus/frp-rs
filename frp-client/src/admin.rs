@@ -233,19 +233,19 @@ pub async fn run_admin_server(
     match (tls_cert_file, tls_key_file) {
         (Some(cert), Some(key)) if !cert.is_empty() && !key.is_empty() => {
             let acceptor = frp_core::transport::build_tls_acceptor(&cert, &key, None)?;
-            tracing::info!("frpc admin server listening on {} (TLS)", addr);
+            tracing::info!(addr = %addr, "frpc admin server listening on {} (TLS)", addr);
             let tls_listener = frp_core::transport::TlsListener::new(listener, acceptor);
             axum::serve(tls_listener, app).await?;
         }
         _ => {
-            tracing::info!("frpc admin server listening on {}", addr);
+            tracing::info!(addr = %addr, "frpc admin server listening on {}", addr);
             axum::serve(listener, app).await?;
         }
     }
     #[cfg(not(feature = "tls"))]
     {
         let _ = (&auth_user, &auth_password, &tls_cert_file, &tls_key_file);
-        tracing::info!("frpc admin server listening on {}", addr);
+        tracing::info!(addr = %addr, "frpc admin server listening on {}", addr);
         axum::serve(listener, app).await?;
     }
     Ok(())

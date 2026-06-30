@@ -92,15 +92,17 @@ async fn run_normal(args: FrpcRunArgs) {
         let files = match collect_config_files(Path::new(dir)) {
             Ok(files) => files,
             Err(e) => {
-                tracing::error!("Failed to read config directory: {}", e);
+                tracing::error!(error = %e, "Failed to read config directory: {}", e);
                 process::exit(1);
             }
         };
         if files.is_empty() {
-            tracing::error!("No config files found in directory: {dir}");
+            tracing::error!(dir = %dir, "No config files found in directory: {dir}");
             process::exit(1);
         }
         tracing::info!(
+            version = %frp_core::VERSION,
+            service_count = %files.len(),
             "frpc (Rust) v{} starting {} services from config directory",
             frp_core::VERSION,
             files.len()
@@ -114,17 +116,17 @@ async fn run_normal(args: FrpcRunArgs) {
                         let service = match Service::new(cfg, Some(path_str.clone())).await {
                             Ok(svc) => svc,
                             Err(e) => {
-                                tracing::error!("frpc service init error for config file [{}]: {}", path_str, e);
+                                tracing::error!(config_file = %path_str, error = %e, "frpc service init error for config file [{}]: {}", path_str, e);
                                 return;
                             }
                         };
                         if let Err(e) = service.run().await {
-                            tracing::error!("frpc service error for config file [{}]: {}", path_str, e);
+                            tracing::error!(config_file = %path_str, error = %e, "frpc service error for config file [{}]: {}", path_str, e);
                         }
                     }));
                 }
                 Err(e) => {
-                    tracing::error!("Failed to load config from [{}]: {}", path_str, e);
+                    tracing::error!(path = %path_str, error = %e, "Failed to load config from [{}]: {}", path_str, e);
                 }
             }
         }
@@ -134,7 +136,7 @@ async fn run_normal(args: FrpcRunArgs) {
         }
         for handle in handles {
             if let Err(e) = handle.await {
-                tracing::error!("frpc service task panicked: {}", e);
+                tracing::error!(error = %e, "frpc service task panicked: {}", e);
             }
         }
         return;
@@ -145,18 +147,18 @@ async fn run_normal(args: FrpcRunArgs) {
         Ok(cfg) => cfg,
         Err(e) => {
             init_logging(&args, None);
-            tracing::error!("Failed to load config: {}", e);
+            tracing::error!(error = %e, "Failed to load config: {}", e);
             process::exit(1);
         }
     };
 
     init_logging(&args, Some(&cfg));
 
-    tracing::info!("frpc (Rust) v{} connecting...", frp_core::VERSION);
+    tracing::info!(version = %frp_core::VERSION, "frpc (Rust) v{} connecting...", frp_core::VERSION);
     let service = Arc::new(match Service::new(cfg, Some(args.config.clone())).await {
         Ok(svc) => svc,
         Err(e) => {
-            tracing::error!("frpc init error: {}", e);
+            tracing::error!(error = %e, "frpc init error: {}", e);
             process::exit(1);
         }
     });
@@ -174,7 +176,7 @@ async fn run_normal(args: FrpcRunArgs) {
             let mut sig = match signal::unix::signal(signal::unix::SignalKind::from_raw(SIGUSR1)) {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!("SIGUSR1 handler init failed: {}", e);
+                    tracing::warn!(error = %e, "SIGUSR1 handler init failed: {}", e);
                     return;
                 }
             };
@@ -186,7 +188,7 @@ async fn run_normal(args: FrpcRunArgs) {
     }
 
     if let Err(e) = service.run().await {
-        tracing::error!("frpc error: {}", e);
+        tracing::error!(error = %e, "frpc error: {}", e);
         process::exit(1);
     }
 }
@@ -197,18 +199,18 @@ async fn run_single_proxy(server_addr: &str, server_port: u16, token: Option<&st
         .init();
 
     let cfg = build_single_proxy_config(server_addr, server_port, token, proxy);
-    tracing::info!("frpc (Rust) v{} starting single proxy...", frp_core::VERSION);
+    tracing::info!(version = %frp_core::VERSION, "frpc (Rust) v{} starting single proxy...", frp_core::VERSION);
 
     let service = match Service::new(cfg, None).await {
         Ok(svc) => svc,
         Err(e) => {
-            tracing::error!("frpc init error: {}", e);
+            tracing::error!(error = %e, "frpc init error: {}", e);
             process::exit(1);
         }
     };
 
     if let Err(e) = service.run().await {
-        tracing::error!("frpc error: {}", e);
+        tracing::error!(error = %e, "frpc error: {}", e);
         process::exit(1);
     }
 }

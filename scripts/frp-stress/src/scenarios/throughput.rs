@@ -17,6 +17,8 @@ pub async fn run(cli: &Cli) -> Result<()> {
     let mut total_bytes: u64 = 0;
 
     tracing::info!(
+        duration = %cli.duration,
+        concurrency = %cli.concurrency,
         "Throughput test: {}s, {} streams",
         cli.duration,
         cli.concurrency
@@ -45,13 +47,15 @@ pub async fn run(cli: &Cli) -> Result<()> {
     for h in handles {
         match h.await {
             Ok(Ok(bytes)) => total_bytes += bytes,
-            Ok(Err(e)) => tracing::error!("Throughput stream failed: {:#}", e),
-            Err(e) => tracing::error!("Throughput task panicked: {}", e),
+            Ok(Err(e)) => tracing::error!(error = ?e, "Throughput stream failed: {:#}", e),
+            Err(e) => tracing::error!(error = %e, "Throughput task panicked: {}", e),
         }
     }
 
     let mbps = (total_bytes as f64 / (1024.0 * 1024.0)) / cli.duration as f64;
     tracing::info!(
+        total_bytes = %total_bytes,
+        mbps = %mbps,
         "Throughput: {} total bytes, {:.2} MB/s",
         total_bytes,
         mbps

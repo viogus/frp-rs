@@ -23,11 +23,11 @@ pub async fn run_all(cli: &Cli) -> Result<()> {
 
     let mut failed = 0;
     for (name, f) in scenarios {
-        tracing::info!("=== Scenario: {} ===", name);
+        tracing::info!(name = %name, "=== Scenario: {} ===", name);
         match f(cli).await {
-            Ok(()) => tracing::info!("PASS: {}", name),
+            Ok(()) => tracing::info!(name = %name, "PASS: {}", name),
             Err(e) => {
-                tracing::error!("FAIL: {}: {:#}", name, e);
+                tracing::error!(name = %name, error = %e, "FAIL: {}: {:#}", name, e);
                 failed += 1;
             }
         }

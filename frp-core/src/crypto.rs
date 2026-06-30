@@ -652,7 +652,7 @@ impl AeadStream {
     /// Read one AEAD frame. Returns `Ok(true)` when a frame was decoded,
     /// `Ok(false)` on clean EOF at frame boundary.
     fn poll_read_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        tracing::debug!("[AEAD-READ] poll_read_frame called, read_header_read={}, read_frame_count={}",
+        tracing::debug!(read_header_read = %self.read_header_read, read_frame_count = %self.read_frame_count, "[AEAD-READ] poll_read_frame called, read_header_read={}, read_frame_count={}",
             self.read_header_read, self.read_frame_count);
         // Read stream nonce on first frame
         if !self.read_header_read {
@@ -713,11 +713,11 @@ impl AeadStream {
 
         let plaintext = match self.read_cipher.decrypt(&self.read_nonce, &ciphertext, &aad) {
             Ok(p) => {
-                tracing::debug!("[AEAD-READ] frame={} decrypt OK, plaintext_len={}", self.read_frame_count, p.len());
+                tracing::debug!(frame = %self.read_frame_count, plaintext_len = %p.len(), "[AEAD-READ] frame={} decrypt OK, plaintext_len={}", self.read_frame_count, p.len());
                 p
             }
             Err(e) => {
-                tracing::warn!("[AEAD-READ] frame={} decrypt FAILED: {} (nonce={}, stream_nonce={})",
+                tracing::warn!(frame = %self.read_frame_count, error = %e, nonce = %hex::encode(&self.read_nonce), stream_nonce = %hex::encode(stream_nonce), "[AEAD-READ] frame={} decrypt FAILED: {} (nonce={}, stream_nonce={})",
                     self.read_frame_count, e,
                     hex::encode(&self.read_nonce),
                     hex::encode(stream_nonce));
@@ -805,7 +805,7 @@ impl AsyncWrite for AeadStream {
 
         // Send stream nonce first if needed
         if !this.write_header_sent {
-            tracing::debug!("[AEAD-WRITE] first write: nonce={}", hex::encode(&this.write_nonce));
+            tracing::debug!(nonce = %hex::encode(&this.write_nonce), "[AEAD-WRITE] first write: nonce={}", hex::encode(&this.write_nonce));
             // Queue the nonce write
             let mut pending = this.write_stream_nonce.clone();
             let overhead = this.algorithm.overhead();
@@ -834,7 +834,7 @@ impl AsyncWrite for AeadStream {
             }
             this.write_frame_count += 1;
             this.write_header_sent = true;
-            tracing::debug!("[AEAD-WRITE] frame={} encrypted, pending_len={}", this.write_frame_count, this.write_pending.len());
+            tracing::debug!(frame = %this.write_frame_count, pending_len = %this.write_pending.len(), "[AEAD-WRITE] frame={} encrypted, pending_len={}", this.write_frame_count, this.write_pending.len());
 
             this.write_pending = pending;
             this.write_pending_pos = 0;
