@@ -243,9 +243,11 @@ impl AsyncWrite for MacOSTun {
                 let n = unsafe { libc::write(fd, packet.as_ptr() as *const _, packet.len()) };
                 if n < 0 {
                     Err(io::Error::last_os_error())
+                } else if n < 4 {
+                    Err(io::Error::new(io::ErrorKind::WriteZero, "TUN short write"))
                 } else {
-                    // Report the original buffer length (not the full packet with header)
-                    Ok(buf.len())
+                    // Subtract 4-byte AF header; return original payload bytes written
+                    Ok(n as usize - 4)
                 }
             }) {
                 Ok(Ok(n)) => return Poll::Ready(Ok(n)),
