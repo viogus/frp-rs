@@ -70,6 +70,12 @@ pub enum InternalMsg {
         candidate_addrs: Option<Vec<String>>,
         assisted_addrs: Option<Vec<String>>,
     },
+    /// Forward a vnet IP packet to a target client's control handler.
+    #[cfg(feature = "vnet")]
+    VnetPacketForward {
+        proxy_name: String,
+        data: String, // base64-encoded IP packet
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +150,10 @@ pub struct AppState {
     /// Active bridge connection counter. Incremented when a bridge task starts,
     /// decremented when it completes. The drain phase polls this counter.
     pub active_connections: AtomicU64,
+    /// Virtual network routing table: (virtual_net, subnet) → (run_id, proxy_name).
+    /// Populated by VnetRouteAdvertise messages, used to forward VnetPacket.
+    #[cfg(feature = "vnet")]
+    pub vnet_routes: Arc<RwLock<HashMap<(String, String), (String, String)>>>,
 }
 
 impl AppState {
@@ -189,6 +199,8 @@ impl AppState {
             tls_acceptor: Arc::new(std::sync::RwLock::new(None)),
             shutdown_token: CancellationToken::new(),
             active_connections: AtomicU64::new(0),
+            #[cfg(feature = "vnet")]
+            vnet_routes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
