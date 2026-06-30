@@ -64,6 +64,15 @@ pub struct Service {
     visitor_tx: mpsc::UnboundedSender<VisitorRequest>,
     /// Receiver side of visitor channel — consumed by run().
     visitor_rx: Mutex<Option<mpsc::UnboundedReceiver<VisitorRequest>>>,
+    /// Shared TUN devices for vnet proxies, keyed by proxy name.
+    /// Work connection tasks take ownership of the TUN device via Option::take().
+    #[cfg(feature = "vnet")]
+    vnet_tuns: Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>,
+    /// Shared routing table for vnet packet forwarding (TX direction).
+    /// Updated by the service when peer route advertisements arrive,
+    /// read by VnetController during packet forwarding.
+    #[cfg(feature = "vnet")]
+    vnet_routes: Arc<tokio::sync::RwLock<frp_vnet::router::RouteTable>>,
 }
 
 impl Service {
@@ -256,6 +265,13 @@ impl Service {
             cfg.nat_hole_stun_server.clone()
         };
 
+        #[cfg(feature = "vnet")]
+        let vnet_tuns = Arc::new(Mutex::new(HashMap::new()));
+        #[cfg(feature = "vnet")]
+        let vnet_routes = Arc::new(tokio::sync::RwLock::new(
+            frp_vnet::router::RouteTable::new(),
+        ));
+
         Ok(Self {
             cfg,
             auth_cfg: Arc::new(auth_cfg),
@@ -273,6 +289,10 @@ impl Service {
             xtcp_rx: Mutex::new(Some(xtcp_rx)),
             visitor_tx,
             visitor_rx: Mutex::new(Some(visitor_rx)),
+            #[cfg(feature = "vnet")]
+            vnet_tuns,
+            #[cfg(feature = "vnet")]
+            vnet_routes,
         })
     }
 
@@ -519,6 +539,67 @@ impl Service {
                             info.remote_addr = remote;
                             info.err.clear();
                         }
+
+                        #[cfg(feature = "vnet")]
+                        if p.proxy_type == "vnet" && !p.vnet_ip.is_empty() {
+                            use std::net::Ipv4Addr;
+                            let ip: Ipv4Addr = match p.vnet_ip.parse() {
+                                Ok(ip) => ip,
+                                Err(e) => {
+                                    warn!(proxy_name = %p.name, error = %e, "invalid vnet_ip '{}'", p.vnet_ip);
+                                    continue;
+                                }
+                            };
+                            let netmask: Ipv4Addr = match p.vnet_netmask.parse() {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    warn!(proxy_name = %p.name, error = %e, "invalid vnet_netmask '{}'", p.vnet_netmask);
+                                    continue;
+                                }
+                            };
+                            let mtu = p.vnet_mtu;
+
+                            match frp_vnet::tun::open_tun("").await {
+                                Ok(tun) => {
+                                    if let Err(e) = tun.configure(ip, netmask, mtu) {
+                                        warn!(proxy_name = %p.name, error = %e, "TUN configure failed");
+                                    } else {
+                                        info!(proxy_name = %p.name, name = tun.name(), "TUN device ready");
+                                    }
+                                    // Store TUN device even if configure failed, so work_conn
+                                    // can pick it up. Partial functionality is better than none.
+                                    {
+                                        let mut tuns = self.vnet_tuns.lock().await;
+                                        tuns.insert(p.name.clone(), Some(tun));
+                                    }
+                                    // Send VnetRouteAdvertise if subnet is configured
+                                    if !p.advertise_subnet.is_empty() {
+                                        let adv = FrpMessage::VnetRouteAdvertise(msg::VnetRouteAdvertise {
+                                            proxy_name: p.name.clone(),
+                                            subnet: p.advertise_subnet.clone(),
+                                            virtual_net: if p.virtual_net.is_empty() {
+                                                None
+                                            } else {
+                                                Some(p.virtual_net.clone())
+                                            },
+                                        });
+                                        let send_result = if v2 {
+                                            control_stream.write_v2_frame(&adv).await
+                                        } else {
+                                            control_stream.write_v1_frame(&adv).await
+                                        };
+                                        if let Err(e) = send_result {
+                                            warn!(proxy_name = %p.name, error = %e, "failed to send VnetRouteAdvertise");
+                                        } else {
+                                            info!(proxy_name = %p.name, subnet = %p.advertise_subnet, "VnetRouteAdvertise sent");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(proxy_name = %p.name, error = %e, "TUN open failed (need root/CAP_NET_ADMIN?)");
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!(proxy_name = %p.name, error = %e, "Failed to register proxy '{}': {}", p.name, e);
@@ -628,6 +709,10 @@ impl Service {
                     bind_addr: if self.cfg.connect_server_local_ip.is_empty() { None } else { Some(self.cfg.connect_server_local_ip.clone()) },
                     proxy_url: self.cfg.proxy_url.clone(),
                     xtcp_tx: xtcp_tx.clone(),
+                    #[cfg(feature = "vnet")]
+                    vnet_tuns: self.vnet_tuns.clone(),
+                    #[cfg(feature = "vnet")]
+                    vnet_routes: self.vnet_routes.clone(),
                 });
             }
 
@@ -708,6 +793,10 @@ impl Service {
                                     bind_addr: if self.cfg.connect_server_local_ip.is_empty() { None } else { Some(self.cfg.connect_server_local_ip.clone()) },
                                     proxy_url: self.cfg.proxy_url.clone(),
                                     xtcp_tx: xtcp_tx.clone(),
+                                    #[cfg(feature = "vnet")]
+                                    vnet_tuns: self.vnet_tuns.clone(),
+                                    #[cfg(feature = "vnet")]
+                                    vnet_routes: self.vnet_routes.clone(),
                                 });
                             }
                             Ok(FrpMessage::Pong(_)) => {
@@ -903,6 +992,29 @@ impl Service {
                                 if let Some(err) = resp.error {
                                     warn!(error = %err, "Proxy registration error: {}", err);
                                 }
+                            }
+                            #[cfg(feature = "vnet")]
+                            Ok(FrpMessage::VnetRouteAdvertise(adv)) => {
+                                info!(subnet = %adv.subnet, proxy_name = %adv.proxy_name, "peer vnet route advertisement received");
+                                // Update the shared route table (TX direction lookup).
+                                {
+                                    let mut routes = self.vnet_routes.write().await;
+                                    if let Err(e) = routes.insert(&adv.proxy_name, &adv.subnet) {
+                                        warn!(%e, "failed to add vnet route");
+                                    }
+                                }
+                                // Inject OS route so the kernel sends matching packets
+                                // through the TUN device instead of the default gateway.
+                                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                                {
+                                    add_os_route(&adv.subnet, "tun0");
+                                }
+                            }
+                            #[cfg(feature = "vnet")]
+                            Ok(FrpMessage::VnetRouteRemove(adv)) => {
+                                info!(proxy_name = %adv.proxy_name, "peer vnet route removed");
+                                let mut routes = self.vnet_routes.write().await;
+                                routes.remove(&adv.proxy_name);
                             }
                             Ok(_) => {
                                 // Other messages are ignored
@@ -1266,6 +1378,32 @@ impl Service {
         let summary = changes.join("; ");
         tracing::info!(summary = %summary, "Config reload summary: {}", summary);
         Ok(format!("reload success: {summary}"))
+    }
+}
+
+/// Inject an OS-level route directing traffic for `subnet` through the
+/// given TUN interface. This makes the kernel send matching packets to
+/// the TUN device instead of the physical NIC / default gateway.
+#[cfg(feature = "vnet")]
+fn add_os_route(subnet: &str, tun_name: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("ip")
+            .args(["route", "add", subnet, "dev", tun_name])
+            .output();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (net, _mask) = match subnet.split_once('/') {
+            Some(s) => s,
+            None => {
+                tracing::warn!("invalid subnet format for OS route: {subnet}");
+                return;
+            }
+        };
+        let _ = std::process::Command::new("route")
+            .args(["add", "-net", net, "-interface", tun_name])
+            .output();
     }
 }
 

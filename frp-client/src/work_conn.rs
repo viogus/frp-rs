@@ -65,6 +65,10 @@ pub(crate) struct WorkConnConfig {
     pub bind_addr: Option<String>,
     pub proxy_url: String,
     pub xtcp_tx: mpsc::UnboundedSender<XtcpNotification>,
+    #[cfg(feature = "vnet")]
+    pub vnet_tuns: Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>,
+    #[cfg(feature = "vnet")]
+    pub vnet_routes: Arc<RwLock<frp_vnet::router::RouteTable>>,
 }
 
 /// Write HAProxy PROXY protocol v2 binary header to the stream.
@@ -160,6 +164,10 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             bind_addr,
             proxy_url,
             xtcp_tx,
+            #[cfg(feature = "vnet")]
+            vnet_tuns,
+            #[cfg(feature = "vnet")]
+            vnet_routes,
         } = cfg;
 
         // Clones for replenishment (before any field is consumed)
@@ -168,6 +176,10 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
         let repl_proxy_metrics = proxy_metrics.clone();
         let repl_proxy_url = proxy_url.clone();
         let repl_xtcp_tx = xtcp_tx.clone();
+        #[cfg(feature = "vnet")]
+        let repl_vnet_tuns = vnet_tuns.clone();
+        #[cfg(feature = "vnet")]
+        let repl_vnet_routes = vnet_routes.clone();
 
         let label = if pool_id >= 0 {
             format!("pool-{}", pool_id)
@@ -494,6 +506,36 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     // Fall through to normal bridging for STCP fallback
                 }
 
+                #[cfg(feature = "vnet")]
+                if info.proxy_type == "vnet" {
+                    use frp_vnet::controller::VnetController;
+                    // Take TUN device from shared map. The TUN device is created
+                    // during proxy registration in the service layer.
+                    let tun = {
+                        let mut map = vnet_tuns.lock().await;
+                        map.get_mut(proxy_name).and_then(|opt| opt.take())
+                    };
+                    let tun = match tun {
+                        Some(t) => t,
+                        None => {
+                            warn!(label = %label, proxy_name = %proxy_name, "vnet work conn: no TUN device for '{}'", proxy_name);
+                            return;
+                        }
+                    };
+                    let pn = proxy_name.clone();
+                    info!(label = %label, proxy_name = %pn, "vnet work conn established, spawning controller");
+                    let (w_r, w_w) = work.into_split();
+                    let routes = vnet_routes.clone();
+                    tokio::spawn(async move {
+                        let ctrl = VnetController::new(pn.clone(), routes, v2);
+                        if let Err(e) = ctrl.run(tun, w_r, w_w).await {
+                            tracing::error!(proxy_name = %pn, error = %e, "vnet controller exited with error");
+                        }
+                        tracing::info!(proxy_name = %pn, "vnet controller stopped");
+                    });
+                    return;
+                }
+
                 if info.proxy_type == "udp" {
                     // UDP proxy: bridge work conn ↔ local UDP socket
                     let sock = {
@@ -704,6 +746,10 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                 bind_addr,
                 proxy_url: repl_proxy_url,
                 xtcp_tx: repl_xtcp_tx,
+                #[cfg(feature = "vnet")]
+                vnet_tuns: repl_vnet_tuns,
+                #[cfg(feature = "vnet")]
+                vnet_routes: repl_vnet_routes,
             });
         }
     });

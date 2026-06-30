@@ -5,11 +5,13 @@ edition = "2021"
 description = "Virtual network (L3 VPN) TUN device and routing for frp-rs"
 
 [dependencies]
-frp-core = { path = "../frp-core", default-features = false }
+frp-core = { path = "../frp-core", default-features = false, features = ["vnet"] }
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt"] }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+data-encoding = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
