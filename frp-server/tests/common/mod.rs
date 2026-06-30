@@ -142,7 +142,8 @@ impl FrpsHandle {
 
         // Try to find the frps binary
         let frps_bin = std::env::var("CARGO_BIN_EXE_frps").unwrap_or_else(|_| {
-            // Fallback: look in target directory
+            // Fallback: look in target directory.
+            // Tests run from the crate root (frp-server/), so target/ is one level up.
             let profile = if cfg!(debug_assertions) {
                 "debug"
             } else {
