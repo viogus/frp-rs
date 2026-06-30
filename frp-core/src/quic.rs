@@ -137,9 +137,15 @@ pub async fn dial_quic(addr: &str, server_name: &str, ca_file: Option<&str>) -> 
 
     let roots = crate::transport::build_root_store(ca_file)
         .map_err(|e| io::Error::other(format!("QUIC TLS roots: {e}")))?;
-    let mut tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let mut tls_config = if let Some(store) = roots {
+        rustls::ClientConfig::builder()
+            .with_root_certificates(std::sync::Arc::new(store))
+            .with_no_client_auth()
+    } else {
+        use rustls_platform_verifier::ConfigVerifierExt;
+        <rustls::ClientConfig as ConfigVerifierExt>::with_platform_verifier()
+            .map_err(|e| io::Error::other(format!("QUIC platform verifier: {e}")))?
+    };
     tls_config.alpn_protocols = vec![b"frp".to_vec()];
 
     let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)

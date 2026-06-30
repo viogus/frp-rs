@@ -35,7 +35,7 @@ tokio-rustls = { version = "0.26", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
 rustls-pemfile = "2"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await", "sink"] }
-webpki-roots = "0.26"
+rustls-platform-verifier = "0.6"
 ring = "0.17"
 jsonwebtoken = "9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
