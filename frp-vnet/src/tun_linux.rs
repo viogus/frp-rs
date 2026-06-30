@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -11,7 +12,7 @@ use super::tun::TunDevice;
 pub struct LinuxTun {
     async_fd: AsyncFd<OwnedFd>,
     name: String,
-    mtu: u16,
+    mtu: Cell<u16>,
 }
 
 unsafe impl Send for LinuxTun {}
@@ -76,7 +77,7 @@ impl LinuxTun {
         Ok(Box::new(LinuxTun {
             async_fd,
             name,
-            mtu: 1500,
+            mtu: Cell::new(1500),
         }))
     }
 }
@@ -101,12 +102,10 @@ impl TunDevice for LinuxTun {
                 sin_addr: libc::in_addr { s_addr: addr },
                 sin_zero: [0; 8],
             };
-            unsafe {
-                std::ptr::write(
-                    &mut ifr.ifr_ifru.ifru_addr as *mut _ as *mut libc::sockaddr_in,
-                    sin,
-                );
-            }
+            std::ptr::write(
+                &mut ifr.ifr_ifru.ifru_addr as *mut _ as *mut libc::sockaddr_in,
+                sin,
+            );
             let ret = unsafe { libc::ioctl(sock, ioctl, ifr as *const _) };
             if ret < 0 {
                 return Err(anyhow::anyhow!(
@@ -152,6 +151,7 @@ impl TunDevice for LinuxTun {
                 io::Error::last_os_error()
             ));
         }
+        self.mtu.set(mtu);
 
         // Bring up
         let ret = unsafe { libc::ioctl(sock, libc::SIOCGIFFLAGS, &ifr) };
@@ -181,7 +181,7 @@ impl TunDevice for LinuxTun {
         &self.name
     }
     fn mtu(&self) -> u16 {
-        self.mtu
+        self.mtu.get()
     }
 }
 
@@ -218,9 +218,6 @@ impl AsyncRead for LinuxTun {
                     buf.advance(n);
                     return Poll::Ready(Ok(()));
                 }
-                Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {
-                    continue;
-                }
                 Ok(Err(e)) => return Poll::Ready(Err(e)),
                 Err(_would_block) => continue,
             }
@@ -251,7 +248,6 @@ impl AsyncWrite for LinuxTun {
                 }
             }) {
                 Ok(Ok(n)) => return Poll::Ready(Ok(n)),
-                Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 Ok(Err(e)) => return Poll::Ready(Err(e)),
                 Err(_would_block) => continue,
             }
