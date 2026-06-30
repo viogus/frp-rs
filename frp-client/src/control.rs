@@ -144,7 +144,6 @@ impl ControlConnection {
                 let ca_file = self.tls_ca_file.as_deref();
                 let (stream, qc) = frp_core::quic::dial_quic(&addr, server_name, ca_file).await
                     .map_err(|e| frp_core::Error::Transport(format!("QUIC dial: {e}")))?;
-                // TODO: V2 handshake over QUIC when V2+QUIC interop needed.
                 (IoStream::Quic(stream), None, Some(qc))
             } else {
                 let raw_stream = dial_server(&opts).await?;
