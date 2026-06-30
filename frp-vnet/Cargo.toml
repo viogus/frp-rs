@@ -1,0 +1,20 @@
+[package]
+name = "frp-vnet"
+version = "0.1.0"
+edition = "2021"
+description = "Virtual network (L3 VPN) TUN device and routing for frp-rs"
+
+[dependencies]
+frp-core = { path = "../frp-core", default-features = false }
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt"] }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_IO"] }
