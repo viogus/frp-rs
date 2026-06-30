@@ -5,7 +5,7 @@ use tracing;
 
 use frp_core::config::{ClientConfig, ProxyConfig};
 
-use crate::admin::ProxyRuntimeInfo;
+use crate::proxy_runtime::ProxyRuntimeInfo;
 
 /// Build a config snapshot string for reload change detection.
 /// Includes all fields that matter for proxy registration and plugin config.

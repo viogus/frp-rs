@@ -7,8 +7,6 @@ use tokio_tungstenite::tungstenite::Message;
 #[cfg(feature = "websocket")]
 use futures_util::{sink::Sink, Stream};
 use tokio::net::TcpStream;
-#[cfg(feature = "tls")]
-use tokio::net::TcpListener;
 #[cfg(feature = "websocket")]
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 #[cfg(feature = "kcp")]
@@ -1988,77 +1986,6 @@ pub fn build_tls_connector(
     };
 
     Ok(TlsConnector::from(Arc::new(config)))
-}
-
-/// TLS listener wrapper implementing axum's Listener trait.
-/// Used by dashboard and admin API servers to accept TLS connections.
-///
-/// The acceptor is stored behind `Arc<RwLock<>>` to support hot-reload:
-/// certificate renewal swaps the acceptor atomically without restarting
-/// axum's serve loop.
-#[cfg(feature = "tls")]
-pub struct TlsListener {
-    inner: TcpListener,
-    acceptor: Arc<std::sync::RwLock<Option<TlsAcceptor>>>,
-}
-
-#[cfg(feature = "tls")]
-impl TlsListener {
-    /// Create a new TLS listener from an owned acceptor. Wraps it in a
-    /// shared lock for potential future hot-reload (e.g., admin server).
-    pub fn new(inner: TcpListener, acceptor: TlsAcceptor) -> Self {
-        Self {
-            inner,
-            acceptor: Arc::new(std::sync::RwLock::new(Some(acceptor))),
-        }
-    }
-
-    /// Create a TLS listener that shares its acceptor with the main server's
-    /// hot-reload mechanism. When the server reloads its TLS certificate,
-    /// the dashboard picks up the new cert on the next accept().
-    pub fn from_shared(
-        inner: TcpListener,
-        acceptor: Arc<std::sync::RwLock<Option<TlsAcceptor>>>,
-    ) -> Self {
-        Self { inner, acceptor }
-    }
-}
-
-#[cfg(feature = "tls")]
-impl axum::serve::Listener for TlsListener {
-    type Io = tokio_rustls::server::TlsStream<TcpStream>;
-    type Addr = std::net::SocketAddr;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            let (stream, addr) = match self.inner.accept().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    tracing::warn!(error = %e, "TLS listener accept error: {}", e);
-                    continue;
-                }
-            };
-            // Read-lock to get the current acceptor. Hot-reload swaps a new
-            // acceptor under write lock; cloning here is just an Arc refcount.
-            let tls_acceptor = self
-                .acceptor
-                .read()
-                .unwrap()
-                .clone()
-                .expect("TLS acceptor not initialized");
-            match tls_acceptor.accept(stream).await {
-                Ok(tls_stream) => return (tls_stream, addr),
-                Err(e) => {
-                    tracing::warn!(addr = %addr, error = %e, "TLS handshake error from {}: {}", addr, e);
-                    continue;
-                }
-            }
-        }
-    }
-
-    fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
-        self.inner.local_addr()
-    }
 }
 
 /// A stream wrapper that yields pre-read bytes before the inner stream.

@@ -1,3 +1,5 @@
+#![cfg(feature = "admin")]
+
 use std::sync::Arc;
 use std::collections::HashMap;
 use axum::{
@@ -13,34 +15,9 @@ use frp_core::metrics::ProxyMetricsRegistry;
 #[cfg(feature = "tls")]
 use frp_core::admin_auth::apply_admin_auth;
 
-// Re-export for service.rs
-#[derive(Debug, Clone)]
-pub struct ProxyRuntimeInfo {
-    pub local_addr: String,
-    pub proxy_type: String,
-    pub use_encryption: bool,
-    pub use_compression: bool,
-    /// Secret key (sk) for XTCP/STCP proxy encryption.
-    pub sk: String,
-    pub bandwidth_limit: u64,
-    pub bandwidth_limit_mode: String,
-    pub proxy_protocol_version: String,
-    /// Plugin type (e.g. "http_proxy", "socks5"). Empty if no plugin.
-    pub plugin: String,
-    /// Remote address assigned by frps (from NewProxyResp).
-    pub remote_addr: String,
-    /// Last registration error, if any. Cleared on success.
-    pub err: String,
-    /// Snapshot of original proxy config (JSON) for reload change detection.
-    pub config_snapshot: String,
-}
+use crate::proxy_runtime::{ProxyRuntimeInfo, ReloadRequest};
 
 // --- Types ---
-
-pub struct ReloadRequest {
-    pub strict: bool,
-    pub reply: oneshot::Sender<Result<String, String>>,
-}
 
 #[derive(Serialize)]
 struct ProxyStatusEntry {
@@ -202,6 +179,67 @@ async fn handle_put_config(
     }
 }
 
+// --- Local TlsListener (moved from frp-core to avoid axum in core) ---
+
+#[cfg(feature = "tls")]
+use std::io;
+#[cfg(feature = "tls")]
+use tokio::net::{TcpListener, TcpStream};
+#[cfg(feature = "tls")]
+use tokio_rustls::server::TlsAcceptor;
+
+/// TLS listener wrapper implementing axum's Listener trait.
+#[cfg(feature = "tls")]
+struct TlsListener {
+    inner: TcpListener,
+    acceptor: Arc<std::sync::RwLock<Option<TlsAcceptor>>>,
+}
+
+#[cfg(feature = "tls")]
+impl TlsListener {
+    fn new(inner: TcpListener, acceptor: TlsAcceptor) -> Self {
+        Self {
+            inner,
+            acceptor: Arc::new(std::sync::RwLock::new(Some(acceptor))),
+        }
+    }
+}
+
+#[cfg(feature = "tls")]
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, addr) = match self.inner.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::warn!(error = %e, "TLS listener accept error: {}", e);
+                    continue;
+                }
+            };
+            let tls_acceptor = self
+                .acceptor
+                .read()
+                .unwrap()
+                .clone()
+                .expect("TLS acceptor not initialized");
+            match tls_acceptor.accept(stream).await {
+                Ok(tls_stream) => return (tls_stream, addr),
+                Err(e) => {
+                    tracing::warn!(addr = %addr, error = %e, "TLS handshake error from {}: {}", addr, e);
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
+}
+
 // --- Server ---
 
 pub async fn run_admin_server(
@@ -234,7 +272,7 @@ pub async fn run_admin_server(
         (Some(cert), Some(key)) if !cert.is_empty() && !key.is_empty() => {
             let acceptor = frp_core::transport::build_tls_acceptor(&cert, &key, None)?;
             tracing::info!(addr = %addr, "frpc admin server listening on {} (TLS)", addr);
-            let tls_listener = frp_core::transport::TlsListener::new(listener, acceptor);
+            let tls_listener = TlsListener::new(listener, acceptor);
             axum::serve(tls_listener, app).await?;
         }
         _ => {

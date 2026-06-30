@@ -8,6 +8,70 @@ use crate::service::AppState;
 use frp_core::admin_auth::apply_admin_auth;
 use frp_core::metrics::MetricsSnapshot;
 
+// --- Local TlsListener (moved from frp-core to avoid axum in core) ---
+
+#[cfg(feature = "tls")]
+use std::io;
+#[cfg(feature = "tls")]
+use tokio::net::TcpListener;
+#[cfg(feature = "tls")]
+use tokio::net::TcpStream;
+#[cfg(feature = "tls")]
+use tokio_rustls::server::TlsAcceptor;
+
+/// TLS listener wrapper implementing axum's Listener trait.
+/// Used by dashboard and admin API servers to accept TLS connections.
+#[cfg(feature = "tls")]
+struct TlsListener {
+    inner: TcpListener,
+    acceptor: Arc<std::sync::RwLock<Option<TlsAcceptor>>>,
+}
+
+#[cfg(feature = "tls")]
+impl TlsListener {
+    fn new(inner: TcpListener, acceptor: TlsAcceptor) -> Self {
+        Self {
+            inner,
+            acceptor: Arc::new(std::sync::RwLock::new(Some(acceptor))),
+        }
+    }
+}
+
+#[cfg(feature = "tls")]
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, addr) = match self.inner.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::warn!(error = %e, "TLS listener accept error: {}", e);
+                    continue;
+                }
+            };
+            let tls_acceptor = self
+                .acceptor
+                .read()
+                .unwrap()
+                .clone()
+                .expect("TLS acceptor not initialized");
+            match tls_acceptor.accept(stream).await {
+                Ok(tls_stream) => return (tls_stream, addr),
+                Err(e) => {
+                    tracing::warn!(addr = %addr, error = %e, "TLS handshake error from {}: {}", addr, e);
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
+}
+
 #[derive(Serialize)]
 struct StatusResponse {
     version: String,
@@ -647,7 +711,7 @@ pub async fn run_dashboard(
             {
                 let acceptor = frp_core::transport::build_tls_acceptor(&cert, &key, None)?;
                 tracing::info!(addr = %addr, "Dashboard listening on {} (TLS)", addr);
-                let tls_listener = frp_core::transport::TlsListener::new(listener, acceptor);
+                let tls_listener = TlsListener::new(listener, acceptor);
                 axum::serve(tls_listener, app).await?;
             }
             #[cfg(not(feature = "tls"))]

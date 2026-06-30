@@ -26,7 +26,7 @@ rand = "0.10"
 [features]
 default = ["ssh", "dashboard", "websocket", "quic", "kcp", "oidc", "tls", "http-proxy", "vnet"]
 ssh = ["dep:russh"]
-dashboard = ["dep:prometheus", "dep:axum"]
+dashboard = ["dep:prometheus", "dep:axum", "frp-core/admin-auth"]
 websocket = ["dep:tokio-tungstenite", "frp-core/websocket"]
 quic = ["frp-core/quic"]
 kcp = ["frp-core/kcp"]
