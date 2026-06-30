@@ -25,6 +25,13 @@ pub const TYPE_NAT_HOLE_SID: u8 = b'5';
 pub const TYPE_NAT_HOLE_REPORT: u8 = b'6';
 pub const TYPE_CLOSE_PROXY_RESP: u8 = b'7';
 pub const TYPE_ERROR: u8 = b'8';
+// VNet (L3 VPN) message types
+#[cfg(feature = "vnet")]
+pub const TYPE_VNET_ROUTE_ADVERTISE: u8 = 0x40;
+#[cfg(feature = "vnet")]
+pub const TYPE_VNET_PACKET: u8 = 0x41;
+#[cfg(feature = "vnet")]
+pub const TYPE_VNET_ROUTE_REMOVE: u8 = 0x42;
 
 // ---------------------------------------------------------------
 // V2 message type IDs (matching Go frp v0.69.1 wire_v2.go)
@@ -49,6 +56,13 @@ pub const V2_TYPE_NAT_HOLE_SID: u16 = 17;
 pub const V2_TYPE_NAT_HOLE_REPORT: u16 = 18;
 pub const V2_TYPE_CLOSE_PROXY_RESP: u16 = 19;
 pub const V2_TYPE_ERROR: u16 = 20;
+// VNet (L3 VPN) message types
+#[cfg(feature = "vnet")]
+pub const V2_TYPE_VNET_ROUTE_ADVERTISE: u16 = 42;
+#[cfg(feature = "vnet")]
+pub const V2_TYPE_VNET_PACKET: u16 = 43;
+#[cfg(feature = "vnet")]
+pub const V2_TYPE_VNET_ROUTE_REMOVE: u16 = 44;
 
 // ---------------------------------------------------------------
 // Base64 helpers for UDPPacket (Go frp encodes []byte as base64)
@@ -177,6 +191,18 @@ pub struct NewProxy {
     pub virtual_net: Option<String>,
     #[serde(rename = "proxyProtocolVersion", skip_serializing_if = "Option::is_none")]
     pub proxy_protocol_version: Option<String>,
+    #[cfg(feature = "vnet")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advertise_subnet: Option<String>,
+    #[cfg(feature = "vnet")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vnet_ip: Option<String>,
+    #[cfg(feature = "vnet")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vnet_netmask: Option<String>,
+    #[cfg(feature = "vnet")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vnet_mtu: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +224,31 @@ pub struct CloseProxy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloseProxyResp {
     pub proxy_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(feature = "vnet")]
+pub struct VnetRouteAdvertise {
+    pub proxy_name: String,
+    pub subnet: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub virtual_net: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(feature = "vnet")]
+pub struct VnetRouteRemove {
+    pub proxy_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub virtual_net: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(feature = "vnet")]
+pub struct VnetPacket {
+    pub proxy_name: String,
+    /// Base64-encoded raw IP packet
+    pub data: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,6 +528,12 @@ pub enum FrpMessage {
     NatHoleSid(NatHoleSid),
     NatHoleReport(NatHoleReport),
     Error(Error),
+    #[cfg(feature = "vnet")]
+    VnetRouteAdvertise(VnetRouteAdvertise),
+    #[cfg(feature = "vnet")]
+    VnetPacket(VnetPacket),
+    #[cfg(feature = "vnet")]
+    VnetRouteRemove(VnetRouteRemove),
 }
 
 impl FrpMessage {
@@ -502,6 +559,12 @@ impl FrpMessage {
             FrpMessage::NatHoleReport(_)      => TYPE_NAT_HOLE_REPORT,
             FrpMessage::CloseProxyResp(_)   => TYPE_CLOSE_PROXY_RESP,
             FrpMessage::Error(_)            => TYPE_ERROR,
+            #[cfg(feature = "vnet")]
+            FrpMessage::VnetRouteAdvertise(_) => TYPE_VNET_ROUTE_ADVERTISE,
+            #[cfg(feature = "vnet")]
+            FrpMessage::VnetPacket(_) => TYPE_VNET_PACKET,
+            #[cfg(feature = "vnet")]
+            FrpMessage::VnetRouteRemove(_) => TYPE_VNET_ROUTE_REMOVE,
         }
     }
 
@@ -527,6 +590,12 @@ impl FrpMessage {
             FrpMessage::NatHoleReport(_)      => V2_TYPE_NAT_HOLE_REPORT,
             FrpMessage::CloseProxyResp(_) => V2_TYPE_CLOSE_PROXY_RESP,
             FrpMessage::Error(_)          => V2_TYPE_ERROR,
+            #[cfg(feature = "vnet")]
+            FrpMessage::VnetRouteAdvertise(_) => V2_TYPE_VNET_ROUTE_ADVERTISE,
+            #[cfg(feature = "vnet")]
+            FrpMessage::VnetPacket(_) => V2_TYPE_VNET_PACKET,
+            #[cfg(feature = "vnet")]
+            FrpMessage::VnetRouteRemove(_) => V2_TYPE_VNET_ROUTE_REMOVE,
         }
     }
 
@@ -571,6 +640,14 @@ impl FrpMessage {
                 metas: None, multiplexer: None,
                 virtual_net: None,
                 proxy_protocol_version: None,
+                #[cfg(feature = "vnet")]
+                advertise_subnet: None,
+                #[cfg(feature = "vnet")]
+                vnet_ip: None,
+                #[cfg(feature = "vnet")]
+                vnet_netmask: None,
+                #[cfg(feature = "vnet")]
+                vnet_mtu: None,
             })),
             TYPE_NEW_PROXY_RESP => Some(FrpMessage::NewProxyResp(NewProxyResp {
                 proxy_name: String::new(), remote_addr: None, error: None,
@@ -615,6 +692,22 @@ impl FrpMessage {
             })),
             TYPE_ERROR => Some(FrpMessage::Error(Error {
                 error: String::new(),
+            })),
+            #[cfg(feature = "vnet")]
+            TYPE_VNET_ROUTE_ADVERTISE => Some(FrpMessage::VnetRouteAdvertise(VnetRouteAdvertise {
+                proxy_name: String::new(),
+                subnet: String::new(),
+                virtual_net: None,
+            })),
+            #[cfg(feature = "vnet")]
+            TYPE_VNET_PACKET => Some(FrpMessage::VnetPacket(VnetPacket {
+                proxy_name: String::new(),
+                data: String::new(),
+            })),
+            #[cfg(feature = "vnet")]
+            TYPE_VNET_ROUTE_REMOVE => Some(FrpMessage::VnetRouteRemove(VnetRouteRemove {
+                proxy_name: String::new(),
+                virtual_net: None,
             })),
             _ => None,
         }
@@ -735,6 +828,14 @@ mod tests {
             multiplexer: None,
             virtual_net: None,
             proxy_protocol_version: None,
+            #[cfg(feature = "vnet")]
+            advertise_subnet: None,
+            #[cfg(feature = "vnet")]
+            vnet_ip: None,
+            #[cfg(feature = "vnet")]
+            vnet_netmask: None,
+            #[cfg(feature = "vnet")]
+            vnet_mtu: None,
         };
         let json = serde_json::to_string(&np).expect("serialize");
         let back: NewProxy = serde_json::from_str(&json).expect("deserialize");

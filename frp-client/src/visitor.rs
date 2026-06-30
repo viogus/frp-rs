@@ -208,7 +208,7 @@ pub(crate) async fn run_visitor_listener(
                                 },
                                 reply: reply_tx,
                             };
-                            if let Err(_) = vtx.send(nhv) {
+                            if vtx.send(nhv).is_err() {
                                 warn!(visitor_name = %visitor_name, "Visitor '{}': failed to send NatHoleVisitor to control loop (channel closed)", visitor_name);
                                 return;
                             }

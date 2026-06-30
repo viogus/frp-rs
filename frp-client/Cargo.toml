@@ -10,6 +10,7 @@ md-5.workspace = true
 
 [dependencies]
 frp-core = { path = "../frp-core", default-features = false }
+frp-vnet = { workspace = true, optional = true }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,11 +23,13 @@ toml.workspace = true
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 rand.workspace = true
+data-encoding.workspace = true
 
 [features]
-default = ["tls", "quic", "kcp", "websocket", "oidc"]
+default = ["tls", "quic", "kcp", "websocket", "oidc", "vnet"]
 tls = ["frp-core/tls", "dep:rustls", "dep:tokio-rustls"]
 quic = ["frp-core/quic"]
 kcp = ["frp-core/kcp"]
 websocket = ["frp-core/websocket"]
 oidc = ["frp-core/oidc"]
+vnet = ["frp-core/vnet", "dep:frp-vnet"]

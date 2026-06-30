@@ -4,6 +4,7 @@ members = [
     "frp-core",
     "frp-server",
     "frp-client",
+    "frp-vnet",
     "frps",
     "frpc",
 ]
@@ -46,6 +47,8 @@ russh = { version = "0.61", default-features = false, features = ["ring", "rsa"]
 tokio-util = { version = "0.7", features = ["compat"] }
 kcp = "0.6"
 quinn = "0.11"
+
+frp-vnet = { path = "frp-vnet" }
 
 socket2 = "0.5"
 chacha20poly1305 = "0.10"

@@ -795,6 +795,19 @@ pub struct ProxyConfig {
     /// Empty string (default) means the default (global) network.
     #[serde(default)]
     pub virtual_net: String,
+    /// CIDR subnet this vnet client advertises to peers (e.g. "10.0.0.0/24").
+    /// Only used when type = "vnet". Go frp compat: advertiseSubnet.
+    #[serde(default, alias = "advertiseSubnet")]
+    pub advertise_subnet: String,
+    /// IP address for the local TUN device. Go frp compat: vnetIp.
+    #[serde(default, alias = "vnetIp")]
+    pub vnet_ip: String,
+    /// Netmask for the TUN device (default: 255.255.255.0). Go frp compat: vnetNetmask.
+    #[serde(default = "default_vnet_netmask", alias = "vnetNetmask")]
+    pub vnet_netmask: String,
+    /// MTU for the TUN device (default: 1420). Go frp compat: vnetMtu.
+    #[serde(default = "default_vnet_mtu", alias = "vnetMtu")]
+    pub vnet_mtu: u16,
     /// PROXY protocol version: "v1", "v2", or "" (disabled).
     /// Go frp compat: proxyProtocolVersion.
     #[serde(default, alias = "proxyProtocolVersion")]
@@ -866,6 +879,12 @@ pub struct VisitorConfig {
 
 fn default_max_retries_an_hour() -> i32 { 8 }
 fn default_min_retry_interval() -> i64 { 30 }
+fn default_vnet_netmask() -> String {
+    "255.255.255.0".to_string()
+}
+fn default_vnet_mtu() -> u16 {
+    1420
+}
 
 /// Normalize a parsed TOML value from Go frp format to frp-rs format.
 /// Handles:

@@ -563,6 +563,16 @@ pub async fn handle_control<S>(
                         warn!(run_id = %run_id, "Shutdown received for run_id {} (replaced by new control connection)", run_id);
                         break;
                     }
+                    #[cfg(feature = "vnet")]
+                    Some(InternalMsg::VnetPacketForward { proxy_name, data }) => {
+                        let pkt = FrpMessage::VnetPacket(msg::VnetPacket {
+                            proxy_name,
+                            data,
+                        });
+                        if let Err(e) = write_ctl_msg(&mut writer, &pkt, v2).await {
+                            warn!(error = %e, "Failed to forward VnetPacket: {}", e);
+                        }
+                    }
                     None => {
                         info!(peer = ?peer, "Control channel closed for {:?}", peer);
                         break;
@@ -684,6 +694,44 @@ pub async fn handle_control<S>(
                     Ok(FrpMessage::NewProxy(np)) => {
                         proxy_ops::handle_new_proxy(np, &run_id, &state, &mut writer, &internal_tx, &mut listener_handles, &mut udp_sockets, &mut udp_local_to_proxy, v2).await;
                     }
+                    #[cfg(feature = "vnet")]
+                    Ok(FrpMessage::VnetRouteAdvertise(ref adv)) => {
+                        let vn = adv.virtual_net.clone().unwrap_or_default();
+                        let key = (vn.clone(), adv.subnet.clone());
+                        state.vnet_routes.write().await.insert(
+                            key,
+                            (run_id.clone(), adv.proxy_name.clone()),
+                        );
+                        info!(
+                            proxy_name = %adv.proxy_name,
+                            subnet = %adv.subnet,
+                            "vnet route advertised: {} → {}",
+                            adv.subnet, adv.proxy_name
+                        );
+                    }
+                    #[cfg(feature = "vnet")]
+                    Ok(FrpMessage::VnetPacket(ref pkt)) => {
+                        // Look up target proxy and forward packet via internal message
+                        if let Some(target_info) = state.proxy_manager.get(&pkt.proxy_name).await {
+                            let target_run_id = target_info.run_id.clone();
+                            if target_run_id == run_id {
+                                // Same client — no forwarding needed (client handles locally)
+                                debug!(proxy_name = %pkt.proxy_name, "vnet packet target is self, skipping forward");
+                            } else if let Some(ctl_tx) = state.run_id_to_ctl_tx.read().await.get(&target_run_id) {
+                                let _ = ctl_tx.tx.send(crate::state::InternalMsg::VnetPacketForward {
+                                    proxy_name: pkt.proxy_name.clone(),
+                                    data: pkt.data.clone(),
+                                });
+                            }
+                        }
+                    }
+                    #[cfg(feature = "vnet")]
+                    Ok(FrpMessage::VnetRouteRemove(ref rem)) => {
+                        let vn = rem.virtual_net.clone().unwrap_or_default();
+                        let mut routes = state.vnet_routes.write().await;
+                        routes.retain(|(vn_k, _), (_, name)| !(vn_k == &vn && name == &rem.proxy_name));
+                        info!(proxy_name = %rem.proxy_name, "vnet route removed: {}", rem.proxy_name);
+                    }
                     Ok(FrpMessage::CloseProxy(cp)) => {
                         if let Some(info) = state.proxy_manager.get(&cp.proxy_name).await {
                             if let Some(port) = info.remote_port {
@@ -698,6 +746,11 @@ pub async fn handle_control<S>(
                             // Clean up VHost routes
                             state.vhost_manager.unregister(&cp.proxy_name).await;
                             state.proxy_metrics.remove(&cp.proxy_name).await;
+                            #[cfg(feature = "vnet")]
+                            {
+                                let mut routes = state.vnet_routes.write().await;
+                                routes.retain(|_, (_, name)| name != &cp.proxy_name);
+                            }
                         }
                         // Stop the listener task
                         if let Some(handle) = listener_handles.remove(&cp.proxy_name) {

@@ -30,11 +30,9 @@ Call sites to add:
 - NewUserConn hook: visitor connection accept path
 
 ### 1.3 Virtual Net (L3 VPN with TUN device)
-**Priority**: High | **Effort**: High | **Status**: Stub | **Issue**: [#48](https://github.com/viogus/frp-rs/issues/48)
+**Priority**: High | **Effort**: High | **Status**: Done | **Issue**: [#48](https://github.com/viogus/frp-rs/issues/48)
 
-`virtual_net: String` field exists in `ProxyConfig` (`frp-core/src/config.rs:761`) but zero TUN device implementation. Go frp has full `pkg/vnet/` (~3000 lines): TUN device creation, IP routing, IPv4/IPv6, client/server routers.
-
-Needs: TUN device creation (cross-platform), IP packet routing through frp tunnels, config wiring.
+Implemented in v0.4.0. New `frp-vnet` crate with cross-platform TUN (Linux/macOS/Win stub), CIDR routing table with longest-prefix-match, server-side route management with subnet conflict detection, client-side VnetController with bidirectional TUN<->work_conn packet loop, and OS route injection for peer subnet reachability. Feature-gated behind `vnet` flag.
 
 ### 1.4 Work connection warm-start pool
 **Priority**: Medium | **Effort**: Low | **Status**: Partial | **Issue**: [#45](https://github.com/viogus/frp-rs/issues/45)

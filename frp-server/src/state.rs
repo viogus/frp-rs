@@ -16,6 +16,9 @@ use crate::nathole::controller::Controller;
 use crate::vhost::VhostManager;
 use crate::tcpmux::TcpMuxManager;
 
+#[cfg(feature = "vnet")]
+type VnetRouteMap = Arc<RwLock<HashMap<(String, String), (String, String)>>>;
+
 // ---------------------------------------------------------------
 // Shared state for cross-task communication
 // ---------------------------------------------------------------
@@ -69,6 +72,12 @@ pub enum InternalMsg {
         protocol: Option<String>,
         candidate_addrs: Option<Vec<String>>,
         assisted_addrs: Option<Vec<String>>,
+    },
+    /// Forward a vnet IP packet to a target client's control handler.
+    #[cfg(feature = "vnet")]
+    VnetPacketForward {
+        proxy_name: String,
+        data: String, // base64-encoded IP packet
     },
 }
 
@@ -144,6 +153,10 @@ pub struct AppState {
     /// Active bridge connection counter. Incremented when a bridge task starts,
     /// decremented when it completes. The drain phase polls this counter.
     pub active_connections: AtomicU64,
+    /// Virtual network routing table: (virtual_net, subnet) → (run_id, proxy_name).
+    /// Populated by VnetRouteAdvertise messages, used to forward VnetPacket.
+    #[cfg(feature = "vnet")]
+    pub vnet_routes: VnetRouteMap,
     /// Broadcast channel for admin WebSocket event stream.
     /// Capacity 256 — slow clients get Lagged and skip events.
     #[cfg(feature = "dashboard")]
@@ -193,6 +206,8 @@ impl AppState {
             tls_acceptor: Arc::new(std::sync::RwLock::new(None)),
             shutdown_token: CancellationToken::new(),
             active_connections: AtomicU64::new(0),
+            #[cfg(feature = "vnet")]
+            vnet_routes: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "dashboard")]
             event_tx: broadcast::channel(256).0,
         }

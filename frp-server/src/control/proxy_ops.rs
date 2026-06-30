@@ -158,6 +158,24 @@ pub(crate) async fn handle_new_proxy(
                 return;
             }
 
+            #[cfg(feature = "vnet")]
+            if np.proxy_type == "vnet" {
+                if let Some(ref subnet) = np.advertise_subnet {
+                    if !subnet.is_empty() {
+                        let vn = np.virtual_net.clone().unwrap_or_default();
+                        let key = (vn, subnet.clone());
+                        let mut routes = state.vnet_routes.write().await;
+                        routes.insert(key, (run_id.to_string(), np.proxy_name.clone()));
+                        info!(
+                            proxy_name = %np.proxy_name,
+                            subnet = %subnet,
+                            "vnet route registered: {} → {}",
+                            subnet, np.proxy_name
+                        );
+                    }
+                }
+            }
+
             // Register STCP/XTCP proxies in sk_index (scoped by virtual_net)
             if np.proxy_type == "stcp" || np.proxy_type == "xtcp" {
                 if let Some(ref sk) = np.sk {
@@ -500,5 +518,10 @@ pub(crate) async fn unregister_control(state: &Arc<AppState>, run_id: &str) {
         state.vhost_manager.unregister(&p.name).await;
         state.tcpmux_manager.unregister(&p.name).await;
         state.proxy_metrics.remove(&p.name).await;
+    }
+    #[cfg(feature = "vnet")]
+    {
+        let mut routes = state.vnet_routes.write().await;
+        routes.retain(|_, (_, name)| !proxies.iter().any(|p| &p.name == name));
     }
 }

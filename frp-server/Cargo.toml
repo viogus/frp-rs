@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 frp-core = { path = "../frp-core", default-features = false }
+frp-vnet = { workspace = true, optional = true }
 russh = { workspace = true, optional = true }
 tokio.workspace = true
 serde.workspace = true
@@ -23,7 +24,7 @@ reqwest = { workspace = true, optional = true }
 rand = "0.10"
 
 [features]
-default = ["ssh", "dashboard", "websocket", "quic", "kcp", "oidc", "tls", "http-proxy"]
+default = ["ssh", "dashboard", "websocket", "quic", "kcp", "oidc", "tls", "http-proxy", "vnet"]
 ssh = ["dep:russh"]
 dashboard = ["dep:prometheus", "dep:axum"]
 websocket = ["dep:tokio-tungstenite", "frp-core/websocket"]
@@ -32,6 +33,7 @@ kcp = ["frp-core/kcp"]
 oidc = ["frp-core/oidc"]
 tls = ["frp-core/tls", "dep:tokio-rustls"]
 http-proxy = ["dep:reqwest"]
+vnet = ["frp-core/vnet", "dep:frp-vnet"]
 
 [dev-dependencies]
 tempfile = "3"
