@@ -83,6 +83,11 @@ pub struct ServerConfig {
     /// details are included. Go frp compat: detailedErrorsToClient. Default: false.
     #[serde(default)]
     pub detailed_errors_to_client: bool,
+    /// Maximum time in seconds to wait for active connections to drain
+    /// during graceful shutdown. After this timeout, remaining connections
+    /// are force-closed. Default: 30.
+    #[serde(default = "default_graceful_timeout")]
+    pub graceful_shutdown_timeout: u64,
     /// When tcp_mux is enabled and yamux init fails, forward raw bytes
     /// to the VHost handler instead of closing the connection.
     /// Go frp compat: TCPMuxPassthrough. Default: false.
@@ -124,6 +129,7 @@ fn default_vhost_http_timeout() -> u64 { 60 }
 fn default_user_conn_timeout() -> u64 { 10 }
 fn default_udp_packet_size() -> usize { 65535 }
 fn default_nathole_analysis_data_reserve_hours() -> u64 { 1 }
+fn default_graceful_timeout() -> u64 { 30 }
 
 /// Parse a bandwidth limit string like "1MB", "500KB", "100K".
 /// Returns bytes per second, or None if unparseable.
@@ -232,6 +238,7 @@ impl Default for ServerConfig {
             includes: Vec::new(),
             ssh_tunnel_gateway: SshTunnelGatewayConfig::default(),
             nat_hole_analysis_data_reserve_hours: default_nathole_analysis_data_reserve_hours(),
+            graceful_shutdown_timeout: default_graceful_timeout(),
         }
     }
 }

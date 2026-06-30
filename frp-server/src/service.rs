@@ -3,7 +3,6 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::io::AsyncReadExt;
 
-#[cfg(feature = "quic")]
 use tokio_util::sync::CancellationToken;
 
 use tracing::{info, error, warn, debug};
@@ -692,8 +691,20 @@ impl Service {
         // Main accept loop — mixed-mode: TLS, WebSocket, and V1 on same port.
         // Uses MSG_PEEK to detect connection type without consuming bytes,
         // matching Go frp v0.69.1 behavior.
+
+        // Spawn ctrl_c listener for graceful shutdown.
+        // tokio::signal::ctrl_c() catches both SIGINT and SIGTERM on Unix.
+        let shutdown_token = self.state.shutdown_token.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            info!("Received SIGINT/SIGTERM, initiating graceful shutdown...");
+            shutdown_token.cancel();
+        });
+
         loop {
-            match listener.accept().await {
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
                 Ok((stream, addr)) => {
                     let state = self.state.clone();
                     #[cfg(feature = "tls")]
@@ -1168,7 +1179,38 @@ impl Service {
                     error!(error = %e, "Failed to accept connection: {}", e);
                 }
             }
+                }
+                _ = self.state.shutdown_token.cancelled() => {
+                    info!("Accept loop stopped for graceful shutdown");
+                    break;
+                }
+            }
         }
+
+        // --- Graceful drain phase ---
+        // Accept loop has stopped. Let existing bridge connections finish.
+        let drain_timeout = Duration::from_secs(self.cfg.graceful_shutdown_timeout);
+        let drain_start = std::time::Instant::now();
+        let initial = self.state.active_connections.load(std::sync::atomic::Ordering::Relaxed);
+        info!(active = %initial, timeout_secs = %drain_timeout.as_secs(),
+            "Draining {} active connections (timeout {}s)",
+            initial, drain_timeout.as_secs());
+
+        loop {
+            let remaining = self.state.active_connections.load(std::sync::atomic::Ordering::Relaxed);
+            if remaining == 0 {
+                info!(elapsed_secs = %drain_start.elapsed().as_secs_f32(),
+                    "All connections drained in {:.1}s", drain_start.elapsed().as_secs_f32());
+                break;
+            }
+            if drain_start.elapsed() > drain_timeout {
+                warn!(remaining = %remaining, timeout_secs = %drain_timeout.as_secs(),
+                    "Drain timeout — {} connections still active, forcing shutdown", remaining);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok(())
     }
 
     /// Reload configuration from the config file (SIGUSR1 handler).

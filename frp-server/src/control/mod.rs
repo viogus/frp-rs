@@ -1089,6 +1089,10 @@ pub async fn handle_control<S>(
                     }
                 }
             }
+            _ = state.shutdown_token.cancelled() => {
+                info!(run_id = %run_id, "Graceful shutdown: draining control handler for {}", run_id);
+                break;
+            }
         }
     }
 

@@ -14,6 +14,20 @@ use crate::service::AppState;
 
 use super::PendingRequest;
 
+/// RAII guard that tracks an active bridge connection for graceful shutdown drain.
+struct ActiveGuard(std::sync::Arc<AppState>);
+impl ActiveGuard {
+    fn new(state: &std::sync::Arc<AppState>) -> Self {
+        state.active_connections.fetch_add(1, Ordering::Relaxed);
+        Self(state.clone())
+    }
+}
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Wraps an AsyncRead, buffering HTTP response headers on first read
 /// and injecting configured headers before passing through.
 struct ResponseHeaderInjector<R> {
@@ -312,6 +326,7 @@ pub(crate) async fn assign_work_to_proxy(
     let proxy_name = req.proxy_name.clone();
     let metrics = state.proxy_metrics.get_or_create(&proxy_name).await;
     let guard = ConnGuard::new(metrics.clone());
+    let drain_guard = ActiveGuard::new(&state);
 
     let pre_read = req.pre_read;
     let enc_key = req.use_encryption;
@@ -320,6 +335,7 @@ pub(crate) async fn assign_work_to_proxy(
 
     tokio::spawn(async move {
         let _guard = guard;
+        let _drain = drain_guard;
         // Use encryption if the proxy config requests it (req.use_encryption
         // comes from proxy_manager). For XTCP STCP fallback, we previously
         // forced plain bridge to avoid a dual-CipherWriter deadlock — that
