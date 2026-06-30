@@ -244,26 +244,6 @@ pub async fn handle_control<S>(
     let mut udp_local_to_proxy: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut last_ping = Instant::now();
 
-    // Warm-start: pre-allocate work connections eagerly.
-    // Go frp sends pool_count ReqWorkConn messages at startup so the client
-    // opens connections immediately, avoiding first-request latency.
-    let warm_count = login.pool_count.unwrap_or(1).max(0) as usize;
-    if warm_count > 0 {
-        debug!(count = warm_count, run_id = %run_id, "Warm-start: requesting {} work connections", warm_count);
-        for i in 0..warm_count {
-            if let Err(e) = write_ctl_msg(
-                &mut writer,
-                &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
-                v2,
-            )
-            .await
-            {
-                warn!(error = %e, sent = i, total = warm_count, "Failed to send ReqWorkConn during warm-start (sent {}/{})", i, warm_count);
-                break;
-            }
-        }
-    }
-
     // --- Main select loop ---
     loop {
         // Expire stale pending requests
