@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWrite;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
-use tracing::{trace, warn};
+use tracing::{instrument, trace, warn};
 
 use frp_core::msg::{self, NatHoleDetectBehavior, PortsRange};
 
@@ -182,6 +182,7 @@ impl Controller {
 
     /// Handle the provider's NatHoleClient response (with STUN addresses).
     /// Signals the session's notify channel so the waiting HandleVisitor can proceed.
+    #[instrument(skip(self, msg), fields(transaction_id = %msg.transaction_id, sid = ?msg.sid))]
     pub async fn handle_client(&self, msg: msg::NatHoleClient) {
         if let Some(ref sid) = msg.sid {
             let sessions = self.sessions.read().await;

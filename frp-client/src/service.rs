@@ -13,7 +13,7 @@ pub(crate) struct VisitorRequest {
     pub reply: oneshot::Sender<Result<msg::NatHoleResp, String>>,
 }
 use tokio::time::{interval, Duration};
-use tracing::{info, warn, debug};
+use tracing::{info, warn, debug, instrument};
 use rand::Rng;
 
 use frp_core::auth::{AuthConfig, AuthMethod, OidcClient};
@@ -304,6 +304,7 @@ impl Service {
         tracing::info!("Config reload requested (SIGUSR1)");
     }
 
+    #[instrument(skip(self), fields(server_addr = %self.cfg.server_addr, server_port = %self.cfg.server_port))]
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         info!(
             version = %frp_core::VERSION, server_addr = %self.cfg.server_addr, server_port = %self.cfg.server_port,
