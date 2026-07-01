@@ -18,7 +18,7 @@ use frp_core::transport::{IoStream, ConnectionType, detect_and_strip_magic, PreR
 #[cfg(feature = "tls")]
 use frp_core::transport::build_tls_acceptor_or_generate;
 #[cfg(feature = "websocket")]
-use frp_core::transport::accept_websocket;
+use frp_core::transport::{accept_websocket, accept_websocket_from_peeked};
 use frp_core::format_socket_addr;
 
 use crate::control;
@@ -1152,9 +1152,11 @@ impl Service {
 
                                 #[cfg(feature = "websocket")]
                                 if is_ws_tls {
-                                    // WebSocket upgrade over TLS (Go frpc ws transport)
-                                    let buf_read = IoStream::BufferedRead(ws_peek, 0, Box::new(io));
-                                    match accept_websocket(buf_read).await {
+                                    // WebSocket upgrade over TLS (Go frpc ws transport).
+                                    // Use accept_websocket_from_peeked to avoid nested
+                                    // BufferedRead wrapping on TLS streams — BufReader
+                                    // leftover handling corrupts the read position.
+                                    match accept_websocket_from_peeked(ws_peek, Box::new(io)).await {
                                         Ok(mut ws) => {
                                             info!(addr = %addr, "WebSocket upgrade over TLS for {}", addr);
                                             let mut magic = [0u8; 7];

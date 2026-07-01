@@ -1911,6 +1911,109 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
     Ok(IoStream::WebSocket(ws))
 }
 
+/// Accept a WebSocket upgrade from pre-peeked HTTP request bytes and a raw stream.
+///
+/// Unlike [`accept_websocket`], this function does NOT wrap the stream in BufReader
+/// or BufferedRead — it parses the HTTP request from `peeked` (already read from the
+/// stream), writes the 101 response directly to `raw`, and returns a WsByteStream
+/// backed by the original stream. This avoids the nested BufferedRead issue that
+/// corrupts reads when the inner stream is TLS.
+#[cfg(feature = "websocket")]
+pub async fn accept_websocket_from_peeked(
+    peeked: Vec<u8>,
+    mut raw: Box<dyn AsyncReadWrite>,
+) -> Result<IoStream, crate::Error> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Parse HTTP headers from peeked data. Read more from raw if the
+    // complete request (ending with \r\n\r\n) is not in peeked.
+    let mut buf = peeked;
+    let extra: Vec<u8> = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let tail = buf.split_off(pos + 4);
+            buf.truncate(pos + 4);
+            break tail;
+        }
+        // Need more data — read from raw stream
+        let mut chunk = vec![0u8; 1024];
+        let n = raw
+            .read(&mut chunk)
+            .await
+            .map_err(|e| crate::Error::Transport(format!("WS read remaining headers: {e}")))?;
+        if n == 0 {
+            return Err(crate::Error::Transport("WS: connection closed during headers".into()));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+
+    let headers_str = String::from_utf8_lossy(&buf);
+    let mut key = String::new();
+    for line in headers_str.lines() {
+        if line.len() > 1 {
+            let lower = line.to_lowercase();
+            if lower.starts_with("sec-websocket-key:") {
+                key = line.split_once(':').map(|x| x.1).unwrap_or("").trim().to_string();
+            }
+        }
+    }
+
+    if key.is_empty() {
+        return Err(crate::Error::Transport("Missing Sec-WebSocket-Key".into()));
+    }
+
+    // Compute accept key: base64(sha1(key + magic GUID))
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let hash = hasher.finalize();
+    let accept = {
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut s = String::with_capacity(28);
+        for chunk in hash.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+            let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+            let triple = (b0 << 16) | (b1 << 8) | b2;
+            s.push(CHARS[((triple >> 18) & 0x3f) as usize] as char);
+            s.push(CHARS[((triple >> 12) & 0x3f) as usize] as char);
+            if chunk.len() > 1 {
+                s.push(CHARS[((triple >> 6) & 0x3f) as usize] as char);
+            } else {
+                s.push('=');
+            }
+            if chunk.len() > 2 {
+                s.push(CHARS[(triple & 0x3f) as usize] as char);
+            } else {
+                s.push('=');
+            }
+        }
+        s
+    };
+
+    // Send 101 Switching Protocols
+    let resp = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+    );
+    raw.write_all(resp.as_bytes())
+        .await
+        .map_err(|e| crate::Error::Transport(format!("WS write response: {e}")))?;
+
+    if !extra.is_empty() {
+        tracing::debug!(
+            extra_len = extra.len(),
+            "Pipelined data after HTTP headers — Go frpc sent WS frame before 101"
+        );
+        // Go frp v0.69.1 does NOT pipeline (hybiClientHandshake blocks on
+        // ReadResponse before NewClient returns the WS conn). If a future
+        // version pipelines, the extra bytes would need to be fed into
+        // WsByteStream ahead of the raw stream.
+    }
+
+    let ws = WsByteStream::from_raw(raw, false);
+    Ok(IoStream::WebSocket(ws))
+}
+
 /// Connect via WebSocket using manual HTTP upgrade (Raw mode, client side).
 /// Returns an IoStream with a WsByteStream adapter in client mode,
 /// so callers can use read_msg_v1/write_msg_v1 directly.
