@@ -1876,7 +1876,7 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
     // Capture any bytes BufReader may have read-ahead past headers
     // (defensive: client should wait for 101 before sending frames).
     let leftover = reader.buffer().to_vec();
-    tracing::info!(
+    tracing::debug!(
         leftover_len = leftover.len(),
         leftover_first16 = %if leftover.len() > 0 {
             leftover.iter().take(16).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
@@ -1945,7 +1945,7 @@ pub async fn accept_websocket_from_peeked(
         if n == 0 {
             return Err(crate::Error::Transport("WS: connection closed during headers".into()));
         }
-        tracing::info!(
+        tracing::debug!(
             read_n = n,
             chunk_hex = %hex::encode(&chunk[..n.min(32)]),
             "accept_websocket_from_peeked: read {} more bytes from raw stream",
@@ -1954,7 +1954,7 @@ pub async fn accept_websocket_from_peeked(
         buf.extend_from_slice(&chunk[..n]);
     };
 
-    tracing::info!(
+    tracing::debug!(
         peeked_len = buf.len(),
         read_more = read_more,
         extra_len = extra.len(),
