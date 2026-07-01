@@ -251,57 +251,133 @@ impl Service {
                                                     }
                                                 };
                                                 tracing::info!(addr = %addr, "TLS-over-WebSocket connection from {}", addr);
-                                                let mut io = IoStream::Tls(Box::new(tls_stream));
 
-                                                let mut chicken = [0u8; 7];
-                                                let is_tls_v2 = match io.read_exact(&mut chicken).await {
-                                                    Ok(_) => chicken == frp_core::protocol::V2_MAGIC_BYTES,
-                                                    Err(_) => false,
-                                                };
-                                                if is_tls_v2 {
-                                                    let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                                        Ok((Some(p), crypto)) => (p, crypto),
-                                                        Ok((None, crypto)) => {
-                                                            match io.read_raw_v2_frame().await {
-                                                                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                                Ok((ft, _, _)) => {
-                                                                    tracing::warn!(frame_type = ?ft, addr = %addr, "WS+TLS+V2: unexpected frame type {} from {}", ft, addr);
-                                                                    return;
-                                                                }
-                                                                Err(e) => {
-                                                                    tracing::warn!(addr = %addr, error = %e, "WS+TLS+V2: failed to read message from {}: {}", addr, e);
-                                                                    return;
+                                                // When tcp_mux is enabled, wrap TLS stream in yamux before
+                                                // reading the first message (matches Go frp — Go frpc uses
+                                                // tcp_mux by default over all transports).
+                                                if state.tcp_mux {
+                                                    let mux_cfg = mux::TcpMuxConfig {
+                                                        keepalive_interval: std::time::Duration::from_secs(
+                                                            state.tcp_mux_keepalive.max(1) as u64
+                                                        ),
+                                                    };
+                                                    match mux::server_mux(tls_stream, &mux_cfg).await {
+                                                        Ok((control_stream, incoming)) => {
+                                                            let mut io = IoStream::Yamux(control_stream);
+                                                            tracing::info!(addr = ?addr, "Yamux over WS+TLS session established for {:?}", addr);
+
+                                                            // V2 detection on yamux stream
+                                                            let mut magic = [0u8; 7];
+                                                            let is_v2 = match io.read_exact(&mut magic).await {
+                                                                Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                                                Err(_) => false,
+                                                            };
+                                                            if is_v2 {
+                                                                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                                    Ok((Some(p), crypto)) => (p, crypto),
+                                                                    Ok((None, crypto)) => {
+                                                                        match io.read_raw_v2_frame().await {
+                                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                            Ok((ft, _, _)) => {
+                                                                                tracing::warn!(frame_type = ?ft, addr = %addr, "WS+TLS+yamux V2: unexpected frame type {} from {}", ft, addr);
+                                                                                return;
+                                                                            }
+                                                                            Err(e) => {
+                                                                                tracing::warn!(addr = %addr, error = %e, "WS+TLS+yamux V2: failed to read message from {}: {}", addr, e);
+                                                                                return;
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    Err(e) => {
+                                                                        tracing::warn!(addr = %addr, error = %e, "WS+TLS+yamux V2 handshake error from {}: {}", addr, e);
+                                                                        return;
+                                                                    }
+                                                                };
+                                                                crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, Some(incoming), None, crypto_ctx).await;
+                                                            } else {
+                                                                // V1 over WS+TLS+yamux
+                                                                let mut io = frp_core::transport::IoStream::BufferedRead(
+                                                                    magic.to_vec(), 0, Box::new(io),
+                                                                );
+                                                                match read_msg_v1(&mut io).await {
+                                                                    Ok(FrpMessage::Login(login)) => {
+                                                                        control::handle_control(io, login, state.clone(), Some(addr), Some(incoming), false, None).await;
+                                                                    }
+                                                                    Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                                        crate::handlers::handle_work_conn_inner(io, nwc, state.clone()).await;
+                                                                    }
+                                                                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                                        crate::handlers::handle_visitor_conn_inner(io, nvc, state.clone(), false).await;
+                                                                    }
+                                                                    Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                                        crate::handlers::handle_nat_hole_visitor(io, nhv, state.clone(), None, false).await;
+                                                                    }
+                                                                    Ok(other) => {
+                                                                        tracing::warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 message after WS+TLS+yamux from {}: {:?}", addr, other.v1_type_byte());
+                                                                    }
+                                                                    Err(e) => {
+                                                                        tracing::warn!(addr = %addr, error = %e, "V1 read error after WS+TLS+yamux from {}: {}", addr, e);
+                                                                    }
                                                                 }
                                                             }
                                                         }
                                                         Err(e) => {
-                                                            tracing::warn!(addr = %addr, error = %e, "WS+TLS+V2 handshake error from {}: {}", addr, e);
-                                                            return;
+                                                            tracing::warn!(addr = ?addr, error = %e, "Failed to start yamux over WS+TLS for {:?}: {}", addr, e);
                                                         }
-                                                    };
-                                                    crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
+                                                    }
                                                 } else {
-                                                    let mut io = frp_core::transport::IoStream::BufferedRead(
-                                                        chicken.to_vec(), 0, Box::new(io),
-                                                    );
-                                                    match read_msg_v1(&mut io).await {
-                                                        Ok(FrpMessage::Login(login)) => {
-                                                            control::handle_control(io, login, state.clone(), Some(addr), None, false, None).await;
-                                                        }
-                                                        Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                            crate::handlers::handle_work_conn_inner(io, nwc, state.clone()).await;
-                                                        }
-                                                        Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                            crate::handlers::handle_visitor_conn_inner(io, nvc, state.clone(), false).await;
-                                                        }
-                                                        Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                            crate::handlers::handle_nat_hole_visitor(io, nhv, state.clone(), None, false).await;
-                                                        }
-                                                        Ok(other) => {
-                                                            tracing::warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 message after WS+TLS from {}: {:?}", addr, other.v1_type_byte());
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::warn!(addr = %addr, error = %e, "V1 read error after WS+TLS from {}: {}", addr, e);
+                                                    let mut io = IoStream::Tls(Box::new(tls_stream));
+
+                                                    let mut chicken = [0u8; 7];
+                                                    let is_tls_v2 = match io.read_exact(&mut chicken).await {
+                                                        Ok(_) => chicken == frp_core::protocol::V2_MAGIC_BYTES,
+                                                        Err(_) => false,
+                                                    };
+                                                    if is_tls_v2 {
+                                                        let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                            Ok((Some(p), crypto)) => (p, crypto),
+                                                            Ok((None, crypto)) => {
+                                                                match io.read_raw_v2_frame().await {
+                                                                    Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                    Ok((ft, _, _)) => {
+                                                                        tracing::warn!(frame_type = ?ft, addr = %addr, "WS+TLS+V2: unexpected frame type {} from {}", ft, addr);
+                                                                        return;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        tracing::warn!(addr = %addr, error = %e, "WS+TLS+V2: failed to read message from {}: {}", addr, e);
+                                                                        return;
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::warn!(addr = %addr, error = %e, "WS+TLS+V2 handshake error from {}: {}", addr, e);
+                                                                return;
+                                                            }
+                                                        };
+                                                        crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
+                                                    } else {
+                                                        let mut io = frp_core::transport::IoStream::BufferedRead(
+                                                            chicken.to_vec(), 0, Box::new(io),
+                                                        );
+                                                        match read_msg_v1(&mut io).await {
+                                                            Ok(FrpMessage::Login(login)) => {
+                                                                control::handle_control(io, login, state.clone(), Some(addr), None, false, None).await;
+                                                            }
+                                                            Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                                crate::handlers::handle_work_conn_inner(io, nwc, state.clone()).await;
+                                                            }
+                                                            Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                                crate::handlers::handle_visitor_conn_inner(io, nvc, state.clone(), false).await;
+                                                            }
+                                                            Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                                crate::handlers::handle_nat_hole_visitor(io, nhv, state.clone(), None, false).await;
+                                                            }
+                                                            Ok(other) => {
+                                                                tracing::warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 message after WS+TLS from {}: {:?}", addr, other.v1_type_byte());
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::warn!(addr = %addr, error = %e, "V1 read error after WS+TLS from {}: {}", addr, e);
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -1291,59 +1367,136 @@ impl Service {
                                                     }
                                                 };
                                                 info!(addr = %addr, "TLS-over-WebSocket connection from {}", addr);
-                                                let mut io = IoStream::Tls(Box::new(tls_stream));
 
-                                                // V2 chicken check on the decrypted TLS stream
-                                                let mut chicken = [0u8; 7];
-                                                let is_tls_v2 = match io.read_exact(&mut chicken).await {
-                                                    Ok(_) => chicken == frp_core::protocol::V2_MAGIC_BYTES,
-                                                    Err(_) => false,
-                                                };
-                                                if is_tls_v2 {
-                                                    let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                                        Ok((Some(p), crypto)) => (p, crypto),
-                                                        Ok((None, crypto)) => {
-                                                            match io.read_raw_v2_frame().await {
-                                                                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                                Ok((ft, _, _)) => {
-                                                                    warn!(frame_type = ?ft, addr = %addr, "WS+TLS+V2: unexpected frame type {} from {}", ft, addr);
-                                                                    return;
-                                                                }
-                                                                Err(e) => {
-                                                                    warn!(addr = %addr, error = %e, "WS+TLS+V2: failed to read message from {}: {}", addr, e);
-                                                                    return;
+                                                // When tcp_mux is enabled, wrap TLS stream in yamux before
+                                                // reading the first message (matches Go frp — Go frpc uses
+                                                // tcp_mux by default over all transports, including
+                                                // WebSocket-tunneled TLS).
+                                                if state.tcp_mux {
+                                                    let mux_cfg = mux::TcpMuxConfig {
+                                                        keepalive_interval: std::time::Duration::from_secs(
+                                                            state.tcp_mux_keepalive.max(1) as u64
+                                                        ),
+                                                    };
+                                                    match mux::server_mux(tls_stream, &mux_cfg).await {
+                                                        Ok((control_stream, incoming)) => {
+                                                            let mut io = IoStream::Yamux(control_stream);
+                                                            info!(addr = ?addr, "Yamux over WS+TLS session established for {:?}", addr);
+
+                                                            // V2 detection on yamux stream
+                                                            let mut magic = [0u8; 7];
+                                                            let is_v2 = match io.read_exact(&mut magic).await {
+                                                                Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                                                Err(_) => false,
+                                                            };
+                                                            if is_v2 {
+                                                                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                                    Ok((Some(p), crypto)) => (p, crypto),
+                                                                    Ok((None, crypto)) => {
+                                                                        match io.read_raw_v2_frame().await {
+                                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                            Ok((ft, _, _)) => {
+                                                                                warn!(frame_type = ?ft, addr = %addr, "WS+TLS+yamux V2: unexpected frame type {} from {}", ft, addr);
+                                                                                return;
+                                                                            }
+                                                                            Err(e) => {
+                                                                                warn!(addr = %addr, error = %e, "WS+TLS+yamux V2: failed to read message from {}: {}", addr, e);
+                                                                                return;
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    Err(e) => {
+                                                                        warn!(addr = %addr, error = %e, "WS+TLS+yamux V2 handshake error from {}: {}", addr, e);
+                                                                        return;
+                                                                    }
+                                                                };
+                                                                crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, Some(incoming), None, crypto_ctx).await;
+                                                            } else {
+                                                                // V1 over WS+TLS+yamux
+                                                                let mut io = frp_core::transport::IoStream::BufferedRead(
+                                                                    magic.to_vec(), 0, Box::new(io),
+                                                                );
+                                                                match read_msg_v1(&mut io).await {
+                                                                    Ok(FrpMessage::Login(login)) => {
+                                                                        control::handle_control(io, login, state.clone(), Some(addr), Some(incoming), false, None).await;
+                                                                    }
+                                                                    Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                                        crate::handlers::handle_work_conn_inner(io, nwc, state.clone()).await;
+                                                                    }
+                                                                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                                        crate::handlers::handle_visitor_conn_inner(io, nvc, state.clone(), false).await;
+                                                                    }
+                                                                    Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                                        crate::handlers::handle_nat_hole_visitor(io, nhv, state.clone(), None, false).await;
+                                                                    }
+                                                                    Ok(other) => {
+                                                                        warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 message after WS+TLS+yamux from {}: {:?}", addr, other.v1_type_byte());
+                                                                    }
+                                                                    Err(e) => {
+                                                                        warn!(addr = %addr, error = %e, "V1 read error after WS+TLS+yamux from {}: {}", addr, e);
+                                                                    }
                                                                 }
                                                             }
                                                         }
                                                         Err(e) => {
-                                                            warn!(addr = %addr, error = %e, "WS+TLS+V2 handshake error from {}: {}", addr, e);
-                                                            return;
+                                                            warn!(addr = ?addr, error = %e, "Failed to start yamux over WS+TLS for {:?}: {}", addr, e);
                                                         }
-                                                    };
-                                                    crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
+                                                    }
                                                 } else {
-                                                    // V1 over TLS-over-WS
-                                                    let mut io = frp_core::transport::IoStream::BufferedRead(
-                                                        chicken.to_vec(), 0, Box::new(io),
-                                                    );
-                                                    match read_msg_v1(&mut io).await {
-                                                        Ok(FrpMessage::Login(login)) => {
-                                                            control::handle_control(io, login, state.clone(), Some(addr), None, false, None).await;
-                                                        }
-                                                        Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                            crate::handlers::handle_work_conn_inner(io, nwc, state.clone()).await;
-                                                        }
-                                                        Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                            crate::handlers::handle_visitor_conn_inner(io, nvc, state.clone(), false).await;
-                                                        }
-                                                        Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                            crate::handlers::handle_nat_hole_visitor(io, nhv, state.clone(), None, false).await;
-                                                        }
-                                                        Ok(other) => {
-                                                            warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 message after WS+TLS from {}: {:?}", addr, other.v1_type_byte());
-                                                        }
-                                                        Err(e) => {
-                                                            warn!(addr = %addr, error = %e, "V1 read error after WS+TLS from {}: {}", addr, e);
+                                                    let mut io = IoStream::Tls(Box::new(tls_stream));
+
+                                                    // V2 chicken check on the decrypted TLS stream
+                                                    let mut chicken = [0u8; 7];
+                                                    let is_tls_v2 = match io.read_exact(&mut chicken).await {
+                                                        Ok(_) => chicken == frp_core::protocol::V2_MAGIC_BYTES,
+                                                        Err(_) => false,
+                                                    };
+                                                    if is_tls_v2 {
+                                                        let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                            Ok((Some(p), crypto)) => (p, crypto),
+                                                            Ok((None, crypto)) => {
+                                                                match io.read_raw_v2_frame().await {
+                                                                    Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                    Ok((ft, _, _)) => {
+                                                                        warn!(frame_type = ?ft, addr = %addr, "WS+TLS+V2: unexpected frame type {} from {}", ft, addr);
+                                                                        return;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        warn!(addr = %addr, error = %e, "WS+TLS+V2: failed to read message from {}: {}", addr, e);
+                                                                        return;
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                warn!(addr = %addr, error = %e, "WS+TLS+V2 handshake error from {}: {}", addr, e);
+                                                                return;
+                                                            }
+                                                        };
+                                                        crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
+                                                    } else {
+                                                        // V1 over TLS-over-WS
+                                                        let mut io = frp_core::transport::IoStream::BufferedRead(
+                                                            chicken.to_vec(), 0, Box::new(io),
+                                                        );
+                                                        match read_msg_v1(&mut io).await {
+                                                            Ok(FrpMessage::Login(login)) => {
+                                                                control::handle_control(io, login, state.clone(), Some(addr), None, false, None).await;
+                                                            }
+                                                            Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                                crate::handlers::handle_work_conn_inner(io, nwc, state.clone()).await;
+                                                            }
+                                                            Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                                crate::handlers::handle_visitor_conn_inner(io, nvc, state.clone(), false).await;
+                                                            }
+                                                            Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                                crate::handlers::handle_nat_hole_visitor(io, nhv, state.clone(), None, false).await;
+                                                            }
+                                                            Ok(other) => {
+                                                                warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 message after WS+TLS from {}: {:?}", addr, other.v1_type_byte());
+                                                            }
+                                                            Err(e) => {
+                                                                warn!(addr = %addr, error = %e, "V1 read error after WS+TLS from {}: {}", addr, e);
+                                                            }
                                                         }
                                                     }
                                                 }
