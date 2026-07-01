@@ -1106,6 +1106,88 @@ impl Service {
                                 };
                                 info!(addr = %addr, "TLS connection from {}", addr);
 
+                                // Wrap TLS stream for unified V2/V1/WS handling.
+                                let mut io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls_stream)));
+
+                                // Peek for WebSocket upgrade inside TLS (Go frp 'ws'
+                                // transport sends TLS ClientHello first, then WebSocket
+                                // upgrade inside the TLS tunnel).
+                                let mut ws_peek = [0u8; 4];
+                                let is_ws_tls = match tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    io.read_exact(&mut ws_peek),
+                                ).await {
+                                    Ok(Ok(n)) if n >= 4 => &ws_peek == b"GET ",
+                                    _ => false,
+                                };
+
+                                if is_ws_tls {
+                                    // WebSocket upgrade over TLS (Go frpc ws transport)
+                                    let buf_read = IoStream::BufferedRead(ws_peek.to_vec(), 0, Box::new(io));
+                                    match accept_websocket(buf_read).await {
+                                        Ok(mut ws) => {
+                                            info!(addr = %addr, "WebSocket upgrade over TLS for {}", addr);
+                                            let mut magic = [0u8; 7];
+                                            let is_v2 = match ws.read_exact(&mut magic).await {
+                                                Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                                Err(_) => false,
+                                            };
+                                            if is_v2 {
+                                                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ws).await {
+                                                    Ok((Some(p), crypto)) => (p, crypto),
+                                                    Ok((None, crypto)) => {
+                                                        match ws.read_raw_v2_frame().await {
+                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                            Ok((ft, _, _)) => {
+                                                                warn!(frame_type = ?ft, addr = %addr, "WS+TLS V2: unexpected frame type {} from {}", ft, addr);
+                                                                return;
+                                                            }
+                                                            Err(e) => {
+                                                                warn!(addr = %addr, error = %e, "WS+TLS V2: failed to read message: {}", e);
+                                                                return;
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(addr = %addr, error = %e, "WS+TLS V2 handshake error: {}", e);
+                                                        return;
+                                                    }
+                                                };
+                                                crate::handlers::dispatch_v2_message(ws, msg_payload, state, addr, None, None, crypto_ctx).await;
+                                            } else {
+                                                let mut ws = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
+                                                match read_msg_v1(&mut ws).await {
+                                                    Ok(FrpMessage::Login(login)) => {
+                                                        control::handle_control(ws, login, state, Some(addr), None, false, None).await;
+                                                    }
+                                                    Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                        crate::handlers::handle_work_conn_inner(ws, nwc, state).await;
+                                                    }
+                                                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                        crate::handlers::handle_visitor_conn_inner(ws, nvc, state, false).await;
+                                                    }
+                                                    Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                        crate::handlers::handle_nat_hole_visitor(ws, nhv, state, None, false).await;
+                                                    }
+                                                    Ok(other) => {
+                                                        warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 after WS+TLS: {:?}", other.v1_type_byte());
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(addr = %addr, error = %e, "V1 read error after WS+TLS: {}", e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(addr = %addr, error = %e, "WebSocket upgrade over TLS failed: {}", e);
+                                        }
+                                    }
+                                    return;
+                                }
+
+                                // Not WebSocket — replay peeked bytes.
+                                let mut io = IoStream::BufferedRead(ws_peek.to_vec(), 0, Box::new(io));
+
                                 // When tcp_mux is enabled, wrap TLS stream in yamux
                                 // before reading the first message (matches Go frp).
                                 if state.tcp_mux {
@@ -1114,7 +1196,7 @@ impl Service {
                                             state.tcp_mux_keepalive.max(1) as u64
                                         ),
                                     };
-                                    match mux::server_mux(tls_stream, &mux_cfg).await {
+                                    match mux::server_mux(io, &mux_cfg).await {
                                         Ok((control_stream, incoming)) => {
                                             let mut io = IoStream::Yamux(control_stream);
                                             info!(addr = ?addr, "Yamux over TLS session established for {:?}", addr);
@@ -1180,10 +1262,8 @@ impl Service {
                                         }
                                     }
                                 } else {
-                                    // Wrap in IoStream::Tls for V2 frame I/O support.
-                                    // read_msg_v1 works on raw TlsStream but V2 frames need IoStream.
-                                    let mut io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls_stream)));
-
+                                    // io already includes peeked bytes via BufferedRead.
+                                    // Proceed with V2/V1 detection on the TLS stream.
                                     // Try V2 magic detection
                                     let mut magic = [0u8; 7];
                                     let is_v2 = match io.read_exact(&mut magic).await {
