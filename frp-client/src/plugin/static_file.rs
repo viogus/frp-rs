@@ -141,9 +141,9 @@ async fn handle_static_file_conn(
     // Decode URL and strip prefix to get relative filesystem path
     let rel_path = resolve_static_path(url_path, strip_prefix)?;
 
-    // Sanitize: reject path traversal (component-level check)
-    let escaped = rel_path.split('/').all(|c| c != "..");
-    if !escaped {
+    // Sanitize: reject path traversal (component-level check).
+    // Reject empty path components (//), current-dir (.), and parent-dir (..).
+    if !validate_rel_path(&rel_path) {
         let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let _ = client.write_all(resp).await;
         return Err("path traversal rejected".into());
@@ -159,6 +159,23 @@ async fn handle_static_file_conn(
     if full_path.is_dir() {
         full_path = full_path.join("index.html");
     }
+
+    // Defense-in-depth: canonicalize both the base directory and the resolved
+    // path, then verify the resolved path stays within the base. This catches
+    // symlink escapes that component checks alone cannot detect.
+    let base = std::fs::canonicalize(local_path)
+        .map_err(|e| format!("failed to resolve base directory '{}': {e}", local_path))?;
+    if let Ok(resolved) = std::fs::canonicalize(&full_path) {
+        if !resolved.starts_with(&base) {
+            let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = client.write_all(resp).await;
+            return Err("path traversal rejected".into());
+        }
+        full_path = resolved;
+    }
+    // If canonicalize fails (file doesn't exist), fall through — fs::read
+    // below will return a 404. No traversal risk: non-existent files can't
+    // be read regardless of their path.
 
     // Read and serve file
     let content = match std::fs::read(&full_path) {
@@ -274,4 +291,38 @@ mod tests {
         // Verify that .. passes through (caller's responsibility to check).
         assert_eq!(resolve_static_path("/../etc/passwd", None).unwrap(), "../etc/passwd");
     }
+
+    #[test]
+    fn test_validate_rel_path_rejects_traversal() {
+        assert!(!validate_rel_path(".."));
+        assert!(!validate_rel_path("../etc/passwd"));
+        assert!(!validate_rel_path("foo/../../bar"));
+        assert!(!validate_rel_path("."));
+        assert!(!validate_rel_path("./config"));
+        assert!(!validate_rel_path("foo/./bar"));
+        assert!(!validate_rel_path("foo//bar"));
+        assert!(!validate_rel_path("foo///bar"));
+        // urlencoding_decode would decode %2F to /, which would produce
+        // an empty component and be rejected
+        assert!(!validate_rel_path("foo//bar"));
+    }
+
+    #[test]
+    fn test_validate_rel_path_allows_normal() {
+        assert!(validate_rel_path(""));
+        assert!(validate_rel_path("index.html"));
+        assert!(validate_rel_path("css/style.css"));
+        assert!(validate_rel_path("a/b/c.html"));
+        assert!(validate_rel_path("file.with..dots"));
+        assert!(validate_rel_path("something..test"));
+    }
+}
+
+/// Validate a relative path for path traversal attempts.
+/// Returns true if the path is safe to use (no empty components, no `.`, no `..`).
+fn validate_rel_path(path: &str) -> bool {
+    if path.is_empty() {
+        return true;
+    }
+    !path.split('/').any(|c| c.is_empty() || c == "." || c == "..")
 }
