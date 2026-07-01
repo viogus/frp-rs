@@ -1876,48 +1876,27 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
     // Capture any bytes BufReader may have read-ahead past headers
     // (defensive: client should wait for 101 before sending frames).
     let leftover = reader.buffer().to_vec();
-    let stream = reader.into_inner();
-
-    // Extract TcpStream from IoStream. PreRead variant may have
-    // unconsumed pre-read bytes (if BufReader didn't need them all).
-    let (extra_pre_read, mut tcp) = match stream {
-        IoStream::PreRead(pre, t) => (pre, t),
-        IoStream::Tcp(t) => (vec![], t),
-        _ => {
-            return Err(crate::Error::Transport(
-                "WebSocket accept requires TcpStream-based IoStream".into(),
-            ));
-        }
-    };
+    let mut stream = reader.into_inner();
 
     let resp = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
     );
-    tcp.write_all(resp.as_bytes()).await
+    stream.write_all(resp.as_bytes()).await
         .map_err(|e| crate::Error::Transport(format!("WS write response: {e}")))?;
 
-    // Feed leftover raw TCP bytes back into the stream so WsByteStream
-    // parses them as WebSocket frames. Previously these bytes were placed
-    // directly into ws.read_buf (treated as already-extracted payload),
-    // which caused V1 dispatch to see raw WS frame headers instead of
-    // the Login message.
+    // Feed leftover BufReader bytes back so WsByteStream parses them
+    // as WebSocket frames. Works with any IoStream variant (Tcp, Tls,
+    // BufferedRead, etc.) — no TcpStream extraction needed.
     let raw_stream: Box<dyn AsyncReadWrite> = if !leftover.is_empty() {
         tracing::trace!(
             leftover_len = leftover.len(),
             "Replaying {} BufReader leftover bytes for WS frame parsing",
             leftover.len()
         );
-        Box::new(PreReadStream::new(leftover, tcp))
+        Box::new(IoStream::BufferedRead(leftover, 0, Box::new(stream)))
     } else {
-        Box::new(tcp)
+        Box::new(stream)
     };
-    // extra_pre_read has already been consumed by BufReader
-    // (drained via IoStream::PreRead::poll_read). No need to replay.
-    debug_assert!(
-        extra_pre_read.is_empty(),
-        "extra_pre_read should be empty after BufReader consumption, got {} bytes",
-        extra_pre_read.len()
-    );
     let ws = WsByteStream::from_raw(raw_stream, false);
     Ok(IoStream::WebSocket(ws))
 }
