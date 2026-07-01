@@ -1876,6 +1876,16 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
     // Capture any bytes BufReader may have read-ahead past headers
     // (defensive: client should wait for 101 before sending frames).
     let leftover = reader.buffer().to_vec();
+    tracing::debug!(
+        leftover_len = leftover.len(),
+        leftover_first16 = %if leftover.len() > 0 {
+            leftover.iter().take(16).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
+        } else {
+            String::from("(empty)")
+        },
+        "accept_websocket leftover: {} bytes",
+        leftover.len()
+    );
     let mut stream = reader.into_inner();
 
     let resp = format!(
@@ -1898,6 +1908,120 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
         Box::new(stream)
     };
     let ws = WsByteStream::from_raw(raw_stream, false);
+    Ok(IoStream::WebSocket(ws))
+}
+
+/// Accept a WebSocket upgrade from pre-peeked HTTP request bytes and a raw stream.
+///
+/// Unlike [`accept_websocket`], this function does NOT wrap the stream in BufReader
+/// or BufferedRead — it parses the HTTP request from `peeked` (already read from the
+/// stream), writes the 101 response directly to `raw`, and returns a WsByteStream
+/// backed by the original stream. This avoids the nested BufferedRead issue that
+/// corrupts reads when the inner stream is TLS.
+#[cfg(feature = "websocket")]
+pub async fn accept_websocket_from_peeked(
+    peeked: Vec<u8>,
+    mut raw: IoStream,
+) -> Result<IoStream, crate::Error> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Parse HTTP headers from peeked data. Read more from raw if the
+    // complete request (ending with \r\n\r\n) is not in peeked.
+    let mut buf = peeked;
+    let mut read_more = false;
+    let extra: Vec<u8> = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let tail = buf.split_off(pos + 4);
+            buf.truncate(pos + 4);
+            break tail;
+        }
+        read_more = true;
+        // Need more data — read from raw stream
+        let mut chunk = vec![0u8; 1024];
+        let n = raw
+            .read(&mut chunk)
+            .await
+            .map_err(|e| crate::Error::Transport(format!("WS read remaining headers: {e}")))?;
+        if n == 0 {
+            return Err(crate::Error::Transport("WS: connection closed during headers".into()));
+        }
+        tracing::debug!(
+            read_n = n,
+            chunk_hex = %hex::encode(&chunk[..n.min(32)]),
+            "accept_websocket_from_peeked: read {} more bytes from raw stream",
+            n
+        );
+        buf.extend_from_slice(&chunk[..n]);
+    };
+
+    tracing::debug!(
+        peeked_len = buf.len(),
+        read_more = read_more,
+        extra_len = extra.len(),
+        "accept_websocket_from_peeked: headers complete"
+    );
+
+    let headers_str = String::from_utf8_lossy(&buf);
+    let mut key = String::new();
+    for line in headers_str.lines() {
+        if line.len() > 1 {
+            let lower = line.to_lowercase();
+            if lower.starts_with("sec-websocket-key:") {
+                key = line.split_once(':').map(|x| x.1).unwrap_or("").trim().to_string();
+            }
+        }
+    }
+
+    if key.is_empty() {
+        return Err(crate::Error::Transport("Missing Sec-WebSocket-Key".into()));
+    }
+
+    // Compute accept key: base64(sha1(key + magic GUID))
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let hash = hasher.finalize();
+    let accept = {
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut s = String::with_capacity(28);
+        for chunk in hash.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+            let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+            let triple = (b0 << 16) | (b1 << 8) | b2;
+            s.push(CHARS[((triple >> 18) & 0x3f) as usize] as char);
+            s.push(CHARS[((triple >> 12) & 0x3f) as usize] as char);
+            if chunk.len() > 1 {
+                s.push(CHARS[((triple >> 6) & 0x3f) as usize] as char);
+            } else {
+                s.push('=');
+            }
+            if chunk.len() > 2 {
+                s.push(CHARS[(triple & 0x3f) as usize] as char);
+            } else {
+                s.push('=');
+            }
+        }
+        s
+    };
+
+    // Send 101 Switching Protocols
+    let resp = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+    );
+    raw.write_all(resp.as_bytes())
+        .await
+        .map_err(|e| crate::Error::Transport(format!("WS write response: {e}")))?;
+
+    if !extra.is_empty() {
+        tracing::debug!(
+            extra_len = extra.len(),
+            "Pipelined data after HTTP headers — Go frpc sent WS frame before 101"
+        );
+    }
+
+    let ws = WsByteStream::from_raw(Box::new(raw), false);
     Ok(IoStream::WebSocket(ws))
 }
 
