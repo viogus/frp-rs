@@ -7,33 +7,33 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
-    #[serde(default = "default_bind_addr")]
+    #[serde(default = "default_bind_addr", alias = "bindAddr")]
     pub bind_addr: String,
-    #[serde(default = "default_bind_port")]
+    #[serde(default = "default_bind_port", alias = "bindPort")]
     pub bind_port: u16,
-    #[serde(default)]
+    #[serde(default, alias = "proxyBindAddr")]
     pub proxy_bind_addr: String,
-    #[serde(default)]
+    #[serde(default, alias = "vhostHTTPPort")]
     pub vhost_http_port: u16,
-    #[serde(default)]
+    #[serde(default, alias = "vhostHTTPSPort")]
     pub vhost_https_port: u16,
-    #[serde(default)]
+    #[serde(default, alias = "kcpBindPort")]
     #[cfg(feature = "kcp")]
     pub kcp_bind_port: u16,
-    #[serde(default)]
+    #[serde(default, alias = "quicBindPort")]
     #[cfg(feature = "quic")]
     pub quic_bind_port: u16,
     /// Shared UDP port for SUDP proxies. When > 0, SUDP proxies
     /// share this port instead of allocating individual ports.
-    #[serde(default)]
+    #[serde(default, alias = "sudpPort")]
     pub sudp_port: u16,
     /// Port for tcpmux HTTP CONNECT multiplexing. When > 0, TCPMux
     /// proxies share this port via HTTP CONNECT Host header routing.
-    #[serde(default)]
+    #[serde(default, alias = "tcpmuxHTTPConnectPort")]
     pub tcpmux_httpconnect_port: u16,
     #[serde(default)]
     pub sub_domain_host: String,
-    #[serde(default)]
+    #[serde(default, alias = "websocketPort")]
     #[cfg(feature = "websocket")]
     pub websocket_port: u16,
     #[serde(default)]
@@ -1517,6 +1517,9 @@ fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "web_server_tls_cert_file", "web_server_tls_key_file",
         "enable_prometheus", "tcp_mux", "tcp_mux_keepalive_interval",
         "sshTunnelGateway", "bindPort", "bindAddr",
+        "vhostHTTPPort", "vhostHTTPSPort", "kcpBindPort", "quicBindPort",
+        "sudpPort", "tcpmuxHTTPConnectPort", "proxyBindAddr",
+        "websocketPort",
     ]);
     keys
 }
@@ -1626,6 +1629,35 @@ log_level = "info"
         assert_eq!(cfg.bind_port, 7000);
         assert_eq!(cfg.auth.token, "my-token");
         assert_eq!(cfg.auth.method, "token");
+    }
+
+    #[test]
+    fn test_go_camelcase_server_port_aliases() {
+        // Go frp uses camelCase: bindPort, kcpBindPort, vhostHTTPPort, etc.
+        // These must map to Rust snake_case fields via serde aliases.
+        let toml_str = r#"
+bindPort = 7000
+kcpBindPort = 7100
+vhostHTTPPort = 10080
+vhostHTTPSPort = 10443
+quicBindPort = 7200
+sudpPort = 7300
+tcpmuxHTTPConnectPort = 7400
+websocketPort = 7500
+proxyBindAddr = "10.0.0.1"
+auth.method = "token"
+auth.token = "test"
+"#;
+        let cfg: ServerConfig = load_server_config_from_str(toml_str).unwrap();
+        assert_eq!(cfg.bind_port, 7000, "bindPort");
+        assert_eq!(cfg.kcp_bind_port, 7100, "kcpBindPort");
+        assert_eq!(cfg.vhost_http_port, 10080, "vhostHTTPPort");
+        assert_eq!(cfg.vhost_https_port, 10443, "vhostHTTPSPort");
+        assert_eq!(cfg.quic_bind_port, 7200, "quicBindPort");
+        assert_eq!(cfg.sudp_port, 7300, "sudpPort");
+        assert_eq!(cfg.tcpmux_httpconnect_port, 7400, "tcpmuxHTTPConnectPort");
+        assert_eq!(cfg.websocket_port, 7500, "websocketPort");
+        assert_eq!(cfg.proxy_bind_addr, "10.0.0.1", "proxyBindAddr");
     }
 
     #[test]
