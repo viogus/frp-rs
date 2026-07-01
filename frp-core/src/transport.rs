@@ -1876,6 +1876,16 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
     // Capture any bytes BufReader may have read-ahead past headers
     // (defensive: client should wait for 101 before sending frames).
     let leftover = reader.buffer().to_vec();
+    tracing::info!(
+        leftover_len = leftover.len(),
+        leftover_first16 = %if leftover.len() > 0 {
+            leftover.iter().take(16).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
+        } else {
+            String::from("(empty)")
+        },
+        "accept_websocket leftover: {} bytes",
+        leftover.len()
+    );
     let mut stream = reader.into_inner();
 
     let resp = format!(
