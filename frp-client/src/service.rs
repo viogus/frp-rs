@@ -86,18 +86,18 @@ pub struct Service {
     /// Channel to trigger config reload from external signal (SIGUSR1).
     reload_tx: mpsc::UnboundedSender<ReloadRequest>,
     /// Receiver side of reload channel — consumed by run().
-    reload_rx: Mutex<Option<mpsc::UnboundedReceiver<ReloadRequest>>>,
+    reload_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<ReloadRequest>>>,
     /// STUN server address for XTCP NAT traversal.
     nat_hole_stun_server: String,
     /// Channel from work connection tasks to the control loop for XTCP (provider side).
     xtcp_tx: mpsc::UnboundedSender<XtcpNotification>,
     /// Receiver side of XTCP channel — consumed by run().
-    xtcp_rx: Mutex<Option<mpsc::UnboundedReceiver<XtcpNotification>>>,
+    xtcp_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<XtcpNotification>>>,
     /// Channel from visitor tasks to the control loop (Go frps compat:
     /// NatHoleVisitor is sent on the control connection, not fresh TCP).
     visitor_tx: mpsc::UnboundedSender<VisitorRequest>,
     /// Receiver side of visitor channel — consumed by run().
-    visitor_rx: Mutex<Option<mpsc::UnboundedReceiver<VisitorRequest>>>,
+    visitor_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<VisitorRequest>>>,
     /// Shared TUN devices for vnet proxies, keyed by proxy name.
     /// Work connection tasks take ownership of the TUN device via Option::take().
     #[cfg(feature = "vnet")]
@@ -280,12 +280,12 @@ impl Service {
             proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
             config_file,
             reload_tx,
-            reload_rx: Mutex::new(Some(reload_rx)),
+            reload_rx: std::sync::Mutex::new(Some(reload_rx)),
             nat_hole_stun_server,
             xtcp_tx,
-            xtcp_rx: Mutex::new(Some(xtcp_rx)),
+            xtcp_rx: std::sync::Mutex::new(Some(xtcp_rx)),
             visitor_tx,
-            visitor_rx: Mutex::new(Some(visitor_rx)),
+            visitor_rx: std::sync::Mutex::new(Some(visitor_rx)),
             #[cfg(feature = "vnet")]
             vnet_tuns,
             #[cfg(feature = "vnet")]
@@ -413,11 +413,11 @@ impl Service {
 
         // Start admin HTTP server if configured
         let reload_tx = self.reload_tx.clone();
-        let mut reload_rx = self.reload_rx.lock().await.take()
+        let mut reload_rx = self.reload_rx.lock().unwrap().take()
             .expect("reload_rx already taken — run() called twice?");
-        let mut xtcp_rx = self.xtcp_rx.lock().await.take()
+        let mut xtcp_rx = self.xtcp_rx.lock().unwrap().take()
             .expect("xtcp_rx already taken — run() called twice?");
-        let mut visitor_rx = self.visitor_rx.lock().await.take()
+        let mut visitor_rx = self.visitor_rx.lock().unwrap().take()
             .expect("visitor_rx already taken — run() called twice?");
         let xtcp_tx = self.xtcp_tx.clone();
         let nat_hole_stun_server = self.nat_hole_stun_server.clone();

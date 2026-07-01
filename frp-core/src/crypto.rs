@@ -516,9 +516,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for AeadStreamReader<R> {
 // Combined AeadStream (AsyncRead + AsyncWrite) — wraps Box<dyn AsyncReadWriteUnpin>
 // ---------------------------------------------------------------------------
 
-/// Trait alias for AsyncRead + AsyncWrite + Unpin + Send.
-pub trait AsyncReadWriteUnpin: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWriteUnpin for T {}
+use crate::cipher_stream::AsyncReadWriteUnpin;
 
 /// Combined AEAD stream wrapping a bidirectional byte transport.
 ///
