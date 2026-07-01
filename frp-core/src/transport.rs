@@ -2101,6 +2101,75 @@ pub fn build_tls_acceptor(
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Generate a self-signed TLS certificate and build a [`rustls::ServerConfig`].
+///
+/// Matches Go frp's `newRandomTLSKeyPair()` behavior: when no cert/key files
+/// are configured, frps auto-generates a self-signed cert so it can always
+/// accept TLS connections (Go frpc sends TLS ClientHello by default).
+///
+/// Uses ECDSA P-256 (ring backend) — Go frp uses RSA 2048 but the algorithm
+/// difference is irrelevant for TLS compatibility.
+#[cfg(feature = "tls")]
+pub fn generate_self_signed_tls_config() -> Result<rustls::ServerConfig, crate::Error> {
+    use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, BasicConstraints, KeyPair};
+
+    let key_pair = KeyPair::generate()
+        .map_err(|e| crate::Error::Other(format!("generate TLS key pair: {e}")))?;
+
+    let mut params = CertificateParams::new(vec!["frp".to_string()])
+        .map_err(|e| crate::Error::Other(format!("create TLS cert params: {e}")))?;
+
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "frp");
+    dn.push(DnType::OrganizationName, "frp-rs auto-generated");
+    params.distinguished_name = dn;
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::DigitalSignature,
+        rcgen::KeyUsagePurpose::KeyEncipherment,
+        rcgen::KeyUsagePurpose::KeyCertSign,
+    ];
+    // Uses rcgen's default validity (now → now + 365 days).
+    // Go frp uses 10 years but the auto-generated cert is regenerated on every
+    // frps restart, so a shorter validity is acceptable.
+
+    let cert = params.self_signed(&key_pair)
+        .map_err(|e| crate::Error::Other(format!("self-sign TLS cert: {e}")))?;
+
+    let cert_der = cert.der().clone();
+    let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into();
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .map_err(|e| crate::Error::Other(format!("build TLS config from generated cert: {e}")))?;
+
+    Ok(config)
+}
+
+/// Build a [`TlsAcceptor`] from cert/key files, or auto-generate a self-signed
+/// cert when no files are configured (matching Go frp behavior).
+///
+/// When both `cert_file` and `key_file` are non-empty, this delegates to
+/// [`build_tls_acceptor`]. Otherwise, it calls [`generate_self_signed_tls_config`]
+/// to create an ephemeral self-signed certificate.
+///
+/// Auto-generated certs never enable mTLS (CA verification) — if you need
+/// mTLS, provide explicit cert files and a CA file.
+#[cfg(feature = "tls")]
+pub fn build_tls_acceptor_or_generate(
+    cert_file: &str,
+    key_file: &str,
+    ca_file: Option<&str>,
+) -> Result<TlsAcceptor, crate::Error> {
+    if !cert_file.is_empty() && !key_file.is_empty() {
+        return build_tls_acceptor(cert_file, key_file, ca_file);
+    }
+    tracing::info!("No TLS cert files configured — auto-generating self-signed certificate");
+    let config = generate_self_signed_tls_config()?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
 /// Build a `RootCertStore` from a custom CA file path.
 /// Returns `None` when no custom CA is specified (caller should use
 /// the platform verifier instead).

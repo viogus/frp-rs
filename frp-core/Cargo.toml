@@ -40,11 +40,12 @@ socket2.workspace = true
 jsonwebtoken = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true, optional = true }
+rcgen = { version = "0.13", optional = true, default-features = false, features = ["ring"] }
 
 [features]
 default = ["quic", "kcp", "websocket", "oidc", "tls", "compression", "chacha20", "vnet", "tcp-mux"]
 tcp-mux = ["dep:yamux"]
-tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:rustls-platform-verifier"]
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:rustls-platform-verifier", "dep:rcgen"]
 admin-auth = ["dep:axum"]
 compression = ["dep:snap"]
 chacha20 = ["dep:chacha20poly1305"]

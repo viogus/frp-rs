@@ -16,7 +16,7 @@ use frp_core::protocol::read_msg_v1;
 use frp_core::mux;
 use frp_core::transport::{IoStream, ConnectionType, detect_and_strip_magic, PreReadStream};
 #[cfg(feature = "tls")]
-use frp_core::transport::build_tls_acceptor;
+use frp_core::transport::build_tls_acceptor_or_generate;
 #[cfg(feature = "websocket")]
 use frp_core::transport::accept_websocket;
 use frp_core::format_socket_addr;
@@ -155,11 +155,15 @@ impl Service {
         info!(bind_addr = %bind_addr, "frps starting on {}", bind_addr);
 
         #[cfg(feature = "tls")]
-        if self.cfg.tls_enable {
+        {
             let ca_file = if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.as_str()) };
-            let acceptor = match build_tls_acceptor(&self.cfg.tls_cert_file, &self.cfg.tls_key_file, ca_file) {
+            let acceptor = match build_tls_acceptor_or_generate(&self.cfg.tls_cert_file, &self.cfg.tls_key_file, ca_file) {
                 Ok(acc) => {
-                    info!(cert_file = %self.cfg.tls_cert_file, "TLS enabled with cert: {}", self.cfg.tls_cert_file);
+                    if self.cfg.tls_cert_file.is_empty() {
+                        info!("TLS enabled with auto-generated self-signed certificate");
+                    } else {
+                        info!(cert_file = %self.cfg.tls_cert_file, "TLS enabled with cert: {}", self.cfg.tls_cert_file);
+                    }
                     acc
                 }
                 Err(e) => {
@@ -226,6 +230,86 @@ impl Service {
                                                 }
                                             };
                                             crate::handlers::dispatch_v2_message(ws, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
+                                        } else if magic[0] == 0x16 {
+                                            #[cfg(feature = "tls")]
+                                            {
+                                                let tls_acceptor = match state.tls_acceptor.read().unwrap().clone() {
+                                                    Some(a) => a,
+                                                    None => {
+                                                        tracing::warn!(addr = %addr, "TLS ClientHello in WS frame but TLS not configured");
+                                                        return;
+                                                    }
+                                                };
+                                                let stream = frp_core::transport::IoStream::BufferedRead(
+                                                    magic.to_vec(), 0, Box::new(ws),
+                                                );
+                                                let tls_stream = match tls_acceptor.accept(stream).await {
+                                                    Ok(s) => s,
+                                                    Err(e) => {
+                                                        tracing::warn!(addr = %addr, error = %e, "TLS handshake failed on WS from {}: {}", addr, e);
+                                                        return;
+                                                    }
+                                                };
+                                                tracing::info!(addr = %addr, "TLS-over-WebSocket connection from {}", addr);
+                                                let mut io = IoStream::Tls(Box::new(tls_stream));
+
+                                                let mut chicken = [0u8; 7];
+                                                let is_tls_v2 = match io.read_exact(&mut chicken).await {
+                                                    Ok(_) => chicken == frp_core::protocol::V2_MAGIC_BYTES,
+                                                    Err(_) => false,
+                                                };
+                                                if is_tls_v2 {
+                                                    let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                        Ok((Some(p), crypto)) => (p, crypto),
+                                                        Ok((None, crypto)) => {
+                                                            match io.read_raw_v2_frame().await {
+                                                                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                Ok((ft, _, _)) => {
+                                                                    tracing::warn!(frame_type = ?ft, addr = %addr, "WS+TLS+V2: unexpected frame type {} from {}", ft, addr);
+                                                                    return;
+                                                                }
+                                                                Err(e) => {
+                                                                    tracing::warn!(addr = %addr, error = %e, "WS+TLS+V2: failed to read message from {}: {}", addr, e);
+                                                                    return;
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(addr = %addr, error = %e, "WS+TLS+V2 handshake error from {}: {}", addr, e);
+                                                            return;
+                                                        }
+                                                    };
+                                                    crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
+                                                } else {
+                                                    let mut io = frp_core::transport::IoStream::BufferedRead(
+                                                        chicken.to_vec(), 0, Box::new(io),
+                                                    );
+                                                    match read_msg_v1(&mut io).await {
+                                                        Ok(FrpMessage::Login(login)) => {
+                                                            control::handle_control(io, login, state.clone(), Some(addr), None, false, None).await;
+                                                        }
+                                                        Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                            crate::handlers::handle_work_conn_inner(io, nwc, state.clone()).await;
+                                                        }
+                                                        Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                            crate::handlers::handle_visitor_conn_inner(io, nvc, state.clone(), false).await;
+                                                        }
+                                                        Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                            crate::handlers::handle_nat_hole_visitor(io, nhv, state.clone(), None, false).await;
+                                                        }
+                                                        Ok(other) => {
+                                                            tracing::warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 message after WS+TLS from {}: {:?}", addr, other.v1_type_byte());
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(addr = %addr, error = %e, "V1 read error after WS+TLS from {}: {}", addr, e);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            #[cfg(not(feature = "tls"))]
+                                            {
+                                                tracing::warn!(addr = %addr, "TLS ClientHello in WebSocket frame but TLS feature not enabled, dropping connection from {}", addr);
+                                            }
                                         } else {
                                             // V1 fallback: replay consumed 7 bytes
                                             let mut ws = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
@@ -735,7 +819,7 @@ impl Service {
         // the acceptor and atomically swap so new connections use the new cert
         // without a restart.
         #[cfg(feature = "tls")]
-        if self.cfg.tls_enable {
+        {
             let poll_state = self.state.clone();
             let cert_file = self.cfg.tls_cert_file.clone();
             let key_file = self.cfg.tls_key_file.clone();
@@ -769,7 +853,7 @@ impl Service {
                         last_cert_mtime = cert_mtime;
                         last_key_mtime = key_mtime;
                         let ca = ca_file.as_deref();
-                        match build_tls_acceptor(&cert_file, &key_file, ca) {
+                        match build_tls_acceptor_or_generate(&cert_file, &key_file, ca) {
                             Ok(new_acceptor) => {
                                 let mut guard = poll_state.tls_acceptor.write().unwrap();
                                 *guard = Some(new_acceptor);
@@ -1177,6 +1261,97 @@ impl Service {
                                                 }
                                             };
                                             crate::handlers::dispatch_v2_message(ws, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
+                                        } else if magic[0] == 0x16 {
+                                            // TLS-over-WebSocket: Go frpc (Docker default) sends
+                                            // TLS ClientHello as first WebSocket frame payload.
+                                            // Replay consumed bytes and wrap in TLS, matching
+                                            // Go frps auto-generated cert behavior.
+                                            #[cfg(feature = "tls")]
+                                            {
+                                                let tls_acceptor = match state.tls_acceptor.read().unwrap().clone() {
+                                                    Some(a) => a,
+                                                    None => {
+                                                        warn!(addr = %addr, "TLS ClientHello in WS frame but TLS not configured");
+                                                        return;
+                                                    }
+                                                };
+                                                // Replay the 7 consumed payload bytes (TLS ClientHello
+                                                // prefix), then delegate to WsByteStream for subsequent
+                                                // WebSocket frames. The TLS handshake runs INSIDE the
+                                                // WebSocket framing — ServerHello/Certificate/etc. are
+                                                // wrapped in WS frames by WsByteStream.
+                                                let stream = frp_core::transport::IoStream::BufferedRead(
+                                                    magic.to_vec(), 0, Box::new(ws),
+                                                );
+                                                let tls_stream = match tls_acceptor.accept(stream).await {
+                                                    Ok(s) => s,
+                                                    Err(e) => {
+                                                        warn!(addr = %addr, error = %e, "TLS handshake failed on WS from {}: {}", addr, e);
+                                                        return;
+                                                    }
+                                                };
+                                                info!(addr = %addr, "TLS-over-WebSocket connection from {}", addr);
+                                                let mut io = IoStream::Tls(Box::new(tls_stream));
+
+                                                // V2 chicken check on the decrypted TLS stream
+                                                let mut chicken = [0u8; 7];
+                                                let is_tls_v2 = match io.read_exact(&mut chicken).await {
+                                                    Ok(_) => chicken == frp_core::protocol::V2_MAGIC_BYTES,
+                                                    Err(_) => false,
+                                                };
+                                                if is_tls_v2 {
+                                                    let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                        Ok((Some(p), crypto)) => (p, crypto),
+                                                        Ok((None, crypto)) => {
+                                                            match io.read_raw_v2_frame().await {
+                                                                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                Ok((ft, _, _)) => {
+                                                                    warn!(frame_type = ?ft, addr = %addr, "WS+TLS+V2: unexpected frame type {} from {}", ft, addr);
+                                                                    return;
+                                                                }
+                                                                Err(e) => {
+                                                                    warn!(addr = %addr, error = %e, "WS+TLS+V2: failed to read message from {}: {}", addr, e);
+                                                                    return;
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(addr = %addr, error = %e, "WS+TLS+V2 handshake error from {}: {}", addr, e);
+                                                            return;
+                                                        }
+                                                    };
+                                                    crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
+                                                } else {
+                                                    // V1 over TLS-over-WS
+                                                    let mut io = frp_core::transport::IoStream::BufferedRead(
+                                                        chicken.to_vec(), 0, Box::new(io),
+                                                    );
+                                                    match read_msg_v1(&mut io).await {
+                                                        Ok(FrpMessage::Login(login)) => {
+                                                            control::handle_control(io, login, state.clone(), Some(addr), None, false, None).await;
+                                                        }
+                                                        Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                            crate::handlers::handle_work_conn_inner(io, nwc, state.clone()).await;
+                                                        }
+                                                        Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                            crate::handlers::handle_visitor_conn_inner(io, nvc, state.clone(), false).await;
+                                                        }
+                                                        Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                            crate::handlers::handle_nat_hole_visitor(io, nhv, state.clone(), None, false).await;
+                                                        }
+                                                        Ok(other) => {
+                                                            warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 message after WS+TLS from {}: {:?}", addr, other.v1_type_byte());
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(addr = %addr, error = %e, "V1 read error after WS+TLS from {}: {}", addr, e);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            #[cfg(not(feature = "tls"))]
+                                            {
+                                                warn!(addr = %addr, "TLS ClientHello in WebSocket frame but TLS feature not enabled, dropping connection from {}", addr);
+                                            }
                                         } else {
                                             // V1 fallback: replay consumed 7 bytes
                                             let mut ws = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
@@ -1556,17 +1731,16 @@ impl Service {
         // acceptor and swap atomically. Existing connections keep old config;
         // new connections pick up the new cert immediately.
         #[cfg(feature = "tls")]
-        if self.cfg.tls_enable
-            && (self.cfg.tls_cert_file != new_cfg.tls_cert_file
-                || self.cfg.tls_key_file != new_cfg.tls_key_file
-                || self.cfg.tls_ca_file != new_cfg.tls_ca_file)
+        if self.cfg.tls_cert_file != new_cfg.tls_cert_file
+            || self.cfg.tls_key_file != new_cfg.tls_key_file
+            || self.cfg.tls_ca_file != new_cfg.tls_ca_file
         {
             let ca = if new_cfg.tls_ca_file.is_empty() {
                 None
             } else {
                 Some(new_cfg.tls_ca_file.as_str())
             };
-            match build_tls_acceptor(&new_cfg.tls_cert_file, &new_cfg.tls_key_file, ca) {
+            match build_tls_acceptor_or_generate(&new_cfg.tls_cert_file, &new_cfg.tls_key_file, ca) {
                 Ok(acceptor) => {
                     *self.state.tls_acceptor.write().unwrap() = Some(acceptor);
                     changes.push(format!(
