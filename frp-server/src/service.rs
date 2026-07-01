@@ -246,7 +246,7 @@ impl Service {
                                                     warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
                                                 }
                                                 Err(e) => {
-                                                    debug!(addr = %addr, error = %e, "WS read error from {}: {}", addr, e);
+                                                    warn!(addr = %addr, error = %e, "WS read error from {}: {}", addr, e);
                                                 }
                                             }
                                         }
@@ -1113,7 +1113,7 @@ impl Service {
                                                     warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
                                                 }
                                                 Err(e) => {
-                                                    debug!(addr = %addr, error = %e, "WS read error from {}: {}", addr, e);
+                                                    warn!(addr = %addr, error = %e, "WS read error from {}: {}", addr, e);
                                                 }
                                             }
                                         }
