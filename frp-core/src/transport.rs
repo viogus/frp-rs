@@ -430,11 +430,6 @@ impl AsyncRead for WsByteStream {
                                     if *filled < 2 {
                                         return Poll::Pending;
                                     }
-                                    // Log first few frames to diagnose parsing issues
-                                    tracing::debug!(
-                                        head_hex = %hex::encode(&head[..2]),
-                                        "WS Raw frame header"
-                                    );
                                     let opcode = head[0] & 0x0f;
                                     let masked = (head[1] & 0x80) != 0;
                                     let raw_len = (head[1] & 0x7f) as u64;
@@ -2024,112 +2019,6 @@ pub async fn accept_websocket_from_peeked(
             extra_len = extra.len(),
             "Pipelined data after HTTP headers — Go frpc sent WS frame before 101"
         );
-    }
-
-    // Diagnostic: manually read first WS frame from TLS to check if
-    // WsByteStream::Raw or the TLS stream is the root cause.
-    {
-        use tokio::io::AsyncReadExt;
-        // Temporarily take raw for diagnostic, put it back after
-        let mut diag_raw = raw; // take ownership for diagnostic
-
-        let mut header = [0u8; 2];
-        let diag_result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            diag_raw.read_exact(&mut header),
-        ).await;
-
-        match diag_result {
-            Ok(Ok(_)) => {
-                let opcode = header[0] & 0x0f;
-                let masked = (header[1] & 0x80) != 0;
-                let raw_len = (header[1] & 0x7f) as u64;
-                tracing::info!(
-                    header_hex = %hex::encode(&header),
-                    opcode,
-                    masked,
-                    raw_len,
-                    "Direct TLS read: WS frame header"
-                );
-
-                let payload_len = if raw_len == 126 {
-                    let mut ext = [0u8; 2];
-                    (&mut diag_raw).read_exact(&mut ext).await.map_err(|e| {
-                        crate::Error::Transport(format!("ext len: {e}"))
-                    })?;
-                    u16::from_be_bytes(ext) as u64
-                } else if raw_len == 127 {
-                    let mut ext = [0u8; 8];
-                    (&mut diag_raw).read_exact(&mut ext).await.map_err(|e| {
-                        crate::Error::Transport(format!("ext len: {e}"))
-                    })?;
-                    u64::from_be_bytes(ext)
-                } else {
-                    raw_len
-                };
-
-                let mut mask_key = [0u8; 4];
-                if masked {
-                    (&mut diag_raw).read_exact(&mut mask_key).await.map_err(|e| {
-                        crate::Error::Transport(format!("mask key: {e}"))
-                    })?;
-                }
-
-                let mut payload = vec![0u8; payload_len as usize];
-                if payload_len > 0 {
-                    (&mut diag_raw).read_exact(&mut payload).await.map_err(|e| {
-                        crate::Error::Transport(format!("payload: {e}"))
-                    })?;
-                    if masked {
-                        for i in 0..payload.len() {
-                            payload[i] ^= mask_key[i % 4];
-                        }
-                    }
-                }
-
-                let payload_first32 = if payload.len() > 32 {
-                    hex::encode(&payload[..32])
-                } else {
-                    hex::encode(&payload)
-                };
-                tracing::info!(
-                    payload_len = payload_len,
-                    payload_first32 = %payload_first32,
-                    "Direct TLS read: WS frame payload (unmasked)"
-                );
-
-                // Replay the consumed bytes via BufferedRead wrapping diag_raw.
-                let mut replayed = Vec::new();
-                replayed.extend_from_slice(&header);
-                if raw_len == 126 {
-                    replayed.extend_from_slice(&u16::to_be_bytes(payload_len as u16));
-                } else if raw_len == 127 {
-                    replayed.extend_from_slice(&u64::to_be_bytes(payload_len));
-                }
-                if masked {
-                    replayed.extend_from_slice(&mask_key);
-                    // Re-mask payload
-                    for i in 0..payload.len() {
-                        payload[i] ^= mask_key[i % 4];
-                    }
-                }
-                replayed.extend_from_slice(&payload);
-
-                let ws = WsByteStream::from_raw(
-                    Box::new(IoStream::BufferedRead(replayed, 0, Box::new(diag_raw))),
-                    false,
-                );
-                return Ok(IoStream::WebSocket(ws));
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "Direct TLS read error");
-                raw = diag_raw; // put back
-            }
-            Err(_) => {
-                tracing::info!("Direct TLS read timeout — Go frpc hasn't sent frame yet");
-                raw = diag_raw; // put back
-            }
-        }
     }
 
     let ws = WsByteStream::from_raw(Box::new(raw), false);
