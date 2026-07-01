@@ -1156,7 +1156,7 @@ impl Service {
                                     // Use accept_websocket_from_peeked to avoid nested
                                     // BufferedRead wrapping on TLS streams — BufReader
                                     // leftover handling corrupts the read position.
-                                    match accept_websocket_from_peeked(ws_peek, Box::new(io)).await {
+                                    match accept_websocket_from_peeked(ws_peek, io).await {
                                         Ok(mut ws) => {
                                             info!(addr = %addr, "WebSocket upgrade over TLS for {}", addr);
                                             let mut magic = [0u8; 7];
