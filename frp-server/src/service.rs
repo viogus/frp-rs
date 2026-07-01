@@ -55,6 +55,7 @@ impl Service {
             additional_data: None,
             oidc_proxy_url: cfg.auth.oidc_proxy_url.clone(),
             additional_auth_scopes: cfg.auth.additional_auth_scopes.clone(),
+            authentication_timeout: cfg.auth.authentication_timeout,
         };
 
         #[cfg(feature = "oidc")]
@@ -1415,6 +1416,7 @@ impl Service {
             additional_data: None,
             oidc_proxy_url: new_cfg.auth.oidc_proxy_url.clone(),
             additional_auth_scopes: new_cfg.auth.additional_auth_scopes.clone(),
+            authentication_timeout: new_cfg.auth.authentication_timeout,
         };
         let new_enc_key = frp_core::encryption::derive_key(&new_auth_cfg.token);
         let new_allow_ports = if !new_cfg.allow_ports.is_empty() {

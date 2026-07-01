@@ -134,6 +134,7 @@ fn default_user_conn_timeout() -> u64 { 10 }
 fn default_udp_packet_size() -> usize { 65535 }
 fn default_nathole_analysis_data_reserve_hours() -> u64 { 1 }
 fn default_graceful_timeout() -> u64 { 30 }
+fn default_authentication_timeout() -> i64 { 15 }
 
 /// Parse a bandwidth limit string like "1MB", "500KB", "100K".
 /// Returns bytes per second, or None if unparseable.
@@ -321,6 +322,13 @@ pub struct AuthServerConfig {
     /// Go frp compat: additionalAuthScopes.
     #[serde(default, alias = "additionalAuthScopes")]
     pub additional_auth_scopes: Vec<String>,
+    /// Maximum allowed clock skew for timestamp-based replay protection,
+    /// in seconds. 0 disables the check. Default: 15.
+    /// Go frp v0.69.1 default: 900. This implementation defaults to 15
+    /// for tighter replay protection.
+    /// Go frp compat: authentication_timeout.
+    #[serde(default = "default_authentication_timeout", alias = "authenticationTimeout")]
+    pub authentication_timeout: i64,
 }
 
 impl Default for AuthServerConfig {
@@ -335,6 +343,7 @@ impl Default for AuthServerConfig {
             oidc_skip_issuer: false,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
+            authentication_timeout: 15,
         }
     }
 }
@@ -562,6 +571,11 @@ pub struct AuthClientConfig {
     /// Go frp compat: additionalAuthScopes.
     #[serde(default, alias = "additionalAuthScopes")]
     pub additional_auth_scopes: Vec<String>,
+    /// Maximum allowed clock skew for timestamp-based replay protection
+    /// (server-side only; client ignores this field). 0 disables the check.
+    /// Go frp compat: authentication_timeout.
+    #[serde(default = "default_authentication_timeout", alias = "authenticationTimeout")]
+    pub authentication_timeout: i64,
 }
 
 impl Default for AuthClientConfig {
@@ -580,6 +594,7 @@ impl Default for AuthClientConfig {
             oidc_tls_insecure_skip_verify: false,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
+            authentication_timeout: 15,
         }
     }
 }

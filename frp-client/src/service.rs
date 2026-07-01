@@ -138,6 +138,7 @@ impl Service {
             additional_data: None,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
+            authentication_timeout: 0, // client side doesn't validate timestamps
         };
 
         let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
@@ -1126,8 +1127,9 @@ impl Service {
                                     oidc_skip_expiry: false,
                                     oidc_skip_issuer: false,
                                     additional_data: None,
-            oidc_proxy_url: String::new(),
+                                    oidc_proxy_url: String::new(),
                                     additional_auth_scopes: Vec::new(),
+                                    authentication_timeout: 0,
                                 };
                                 ping_msg.privilege_key = ping_auth.generate_login_key(ts);
                                 ping_msg.timestamp = Some(ts);
