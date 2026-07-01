@@ -5,6 +5,8 @@ on:
     branches: [main]
     tags:
       - 'v*'
+  pull_request:
+    types: [opened, synchronize, reopened]
   # release:published kept as fallback — but GITHUB_TOKEN-created
   # releases don't chain-trigger other workflows, so we also listen
   # on tag pushes above.
@@ -97,6 +99,14 @@ jobs:
               echo "tags=${IMAGE}:${VER},${IMAGE}:${VER}-${SHA},${IMAGE}:latest" >> $GITHUB_OUTPUT
             else
               echo "tags=${IMAGE}:${VER}${VARIANT},${IMAGE}:${VER}-${SHA}${VARIANT}" >> $GITHUB_OUTPUT
+            fi
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            PR_NUM="${{ github.event.pull_request.number }}"
+            echo "version=pr-${PR_NUM}" >> $GITHUB_OUTPUT
+            if [ -z "${VARIANT}" ]; then
+              echo "tags=${IMAGE}:pr-${PR_NUM},${IMAGE}:pr-${PR_NUM}-${SHA}" >> $GITHUB_OUTPUT
+            else
+              echo "tags=${IMAGE}:pr-${PR_NUM}${VARIANT},${IMAGE}:pr-${PR_NUM}-${SHA}${VARIANT}" >> $GITHUB_OUTPUT
             fi
           else
             # Push / manual: tag as test-SHA
