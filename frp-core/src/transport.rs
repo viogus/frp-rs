@@ -1896,13 +1896,29 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
     tcp.write_all(resp.as_bytes()).await
         .map_err(|e| crate::Error::Transport(format!("WS write response: {e}")))?;
 
-    let mut ws = WsByteStream::from_raw(Box::new(tcp), false);
-    let mut all_leftover = extra_pre_read;
-    all_leftover.extend_from_slice(&leftover);
-    if !all_leftover.is_empty() {
-        ws.read_buf = all_leftover;
-        ws.read_pos = 0;
-    }
+    // Feed leftover raw TCP bytes back into the stream so WsByteStream
+    // parses them as WebSocket frames. Previously these bytes were placed
+    // directly into ws.read_buf (treated as already-extracted payload),
+    // which caused V1 dispatch to see raw WS frame headers instead of
+    // the Login message.
+    let raw_stream: Box<dyn AsyncReadWrite> = if !leftover.is_empty() {
+        tracing::trace!(
+            leftover_len = leftover.len(),
+            "Replaying {} BufReader leftover bytes for WS frame parsing",
+            leftover.len()
+        );
+        Box::new(PreReadStream::new(leftover, tcp))
+    } else {
+        Box::new(tcp)
+    };
+    // extra_pre_read has already been consumed by BufReader
+    // (drained via IoStream::PreRead::poll_read). No need to replay.
+    debug_assert!(
+        extra_pre_read.is_empty(),
+        "extra_pre_read should be empty after BufReader consumption, got {} bytes",
+        extra_pre_read.len()
+    );
+    let ws = WsByteStream::from_raw(raw_stream, false);
     Ok(IoStream::WebSocket(ws))
 }
 
