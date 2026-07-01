@@ -430,6 +430,11 @@ impl AsyncRead for WsByteStream {
                                     if *filled < 2 {
                                         return Poll::Pending;
                                     }
+                                    // Log first few frames to diagnose parsing issues
+                                    tracing::debug!(
+                                        head_hex = %hex::encode(&head[..2]),
+                                        "WS Raw frame header"
+                                    );
                                     let opcode = head[0] & 0x0f;
                                     let masked = (head[1] & 0x80) != 0;
                                     let raw_len = (head[1] & 0x7f) as u64;
@@ -1928,12 +1933,14 @@ pub async fn accept_websocket_from_peeked(
     // Parse HTTP headers from peeked data. Read more from raw if the
     // complete request (ending with \r\n\r\n) is not in peeked.
     let mut buf = peeked;
+    let mut read_more = false;
     let extra: Vec<u8> = loop {
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             let tail = buf.split_off(pos + 4);
             buf.truncate(pos + 4);
             break tail;
         }
+        read_more = true;
         // Need more data — read from raw stream
         let mut chunk = vec![0u8; 1024];
         let n = raw
@@ -1943,8 +1950,21 @@ pub async fn accept_websocket_from_peeked(
         if n == 0 {
             return Err(crate::Error::Transport("WS: connection closed during headers".into()));
         }
+        tracing::info!(
+            read_n = n,
+            chunk_hex = %hex::encode(&chunk[..n.min(32)]),
+            "accept_websocket_from_peeked: read {} more bytes from raw stream",
+            n
+        );
         buf.extend_from_slice(&chunk[..n]);
     };
+
+    tracing::info!(
+        peeked_len = buf.len(),
+        read_more = read_more,
+        extra_len = extra.len(),
+        "accept_websocket_from_peeked: headers complete"
+    );
 
     let headers_str = String::from_utf8_lossy(&buf);
     let mut key = String::new();
