@@ -1141,7 +1141,16 @@ impl Service {
                                         // Try V2 magic detection
                                         let mut magic = [0u8; 7];
                                         let is_v2 = match ws.read_exact(&mut magic).await {
-                                            Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                            Ok(_) => {
+                                                let matches = magic == frp_core::protocol::V2_MAGIC_BYTES;
+                                                debug!(
+                                                    addr = %addr,
+                                                    magic_hex = %magic.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(""),
+                                                    is_v2 = matches,
+                                                    "WS post-upgrade first 7 bytes"
+                                                );
+                                                matches
+                                            }
                                             Err(_) => false,
                                         };
 
