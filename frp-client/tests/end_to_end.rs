@@ -218,13 +218,7 @@ async fn test_e2e_tcp_proxy_over_tls() {
         auth: frp_core::config::AuthServerConfig {
             method: "token".into(),
             token: token.to_string(),
-            oidc_issuer: String::new(),
-            oidc_audience: String::new(),
-            oidc_token_endpoint: String::new(),
-            oidc_skip_expiry: false,
-            oidc_skip_issuer: false,
-                    oidc_proxy_url: String::new(),
-                    additional_auth_scopes: Vec::new(),
+            ..Default::default()
         },
         tls_enable: true,
         tls_cert_file: cert_dir.join("server.crt").to_string_lossy().into(),

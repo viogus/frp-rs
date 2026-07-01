@@ -34,6 +34,15 @@ pub struct AuthConfig {
     /// When listed, corresponding message types require authentication.
     /// Go frp compat: additionalAuthScopes.
     pub additional_auth_scopes: Vec<String>,
+    /// Maximum allowed clock skew for timestamp-based replay protection,
+    /// in seconds. Login messages with `|ts - now| > authentication_timeout`
+    /// are rejected. Set to 0 to disable timestamp verification (accepts
+    /// any timestamp, weakening replay protection).
+    ///
+    /// Go frp v0.69.1 default: 900 (15 minutes). This implementation defaults
+    /// to 15 seconds for tighter replay protection.
+    /// Go frp compat: authentication_timeout.
+    pub authentication_timeout: i64,
 }
 
 impl Default for AuthConfig {
@@ -48,6 +57,7 @@ impl Default for AuthConfig {
             additional_data: None,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
+            authentication_timeout: 15,
         }
     }
 }
@@ -77,12 +87,14 @@ impl AuthConfig {
                     Some(t) => t,
                     None => return Err("timestamp required for authentication".into()),
                 };
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                if (ts - now).abs() > 15 {
-                    return Err("timestamp outside acceptable window".into());
+                if self.authentication_timeout > 0 {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    if (ts - now).abs() > self.authentication_timeout {
+                        return Err("timestamp outside acceptable window".into());
+                    }
                 }
                 let expected = generate_token(&self.token, ts);
                 if key != expected {
@@ -715,6 +727,7 @@ mod tests {
             additional_data: None,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
+            authentication_timeout: 15,
         };
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -742,6 +755,7 @@ mod tests {
             additional_data: None,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
+            authentication_timeout: 0,
         };
         // AuthConfig::validate_login for OIDC returns error when no server-side verifier
         let result = cfg.validate_login(Some("some-jwt-token"), Some(100));
@@ -831,6 +845,7 @@ mod tests {
             additional_data: None,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
+            authentication_timeout: 0,
         };
         assert!(cfg.generate_login_key(100).is_none());
     }
@@ -872,5 +887,139 @@ mod tests {
         // Use /bin/echo on Unix — portable across macOS and Linux
         let result = resolve_dynamic_token("exec:///bin/echo dynamic-token-value");
         assert_eq!(result, "dynamic-token-value");
+    }
+
+    // --- Authentication timeout (replay protection) tests ---
+
+    #[test]
+    fn test_auth_timeout_default_is_15() {
+        let cfg = AuthConfig::default();
+        assert_eq!(cfg.authentication_timeout, 15);
+    }
+
+    #[test]
+    fn test_auth_timeout_zero_disables_check() {
+        let cfg = AuthConfig {
+            method: AuthMethod::Token,
+            token: "secret".into(),
+            authentication_timeout: 0,
+            ..Default::default()
+        };
+        // Token with a timestamp far in the past should still verify
+        // when timeout is disabled (only token matters, not timestamp)
+        let far_past = 0i64;
+        let key = generate_token("secret", far_past);
+        assert!(cfg.validate_login(Some(&key), Some(far_past)).is_ok());
+    }
+
+    #[test]
+    fn test_auth_timeout_rejects_future_timestamp() {
+        let cfg = AuthConfig {
+            method: AuthMethod::Token,
+            token: "secret".into(),
+            authentication_timeout: 15,
+            ..Default::default()
+        };
+        let far_future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+            + 60; // 60 seconds in the future
+        let key = generate_token("secret", far_future);
+        let result = cfg.validate_login(Some(&key), Some(far_future));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("timestamp"));
+    }
+
+    #[test]
+    fn test_auth_timeout_rejects_past_timestamp() {
+        let cfg = AuthConfig {
+            method: AuthMethod::Token,
+            token: "secret".into(),
+            authentication_timeout: 15,
+            ..Default::default()
+        };
+        let far_past = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+            - 60; // 60 seconds in the past
+        let key = generate_token("secret", far_past);
+        let result = cfg.validate_login(Some(&key), Some(far_past));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("timestamp"));
+    }
+
+    #[test]
+    fn test_auth_timeout_accepts_current_timestamp() {
+        let cfg = AuthConfig {
+            method: AuthMethod::Token,
+            token: "secret".into(),
+            authentication_timeout: 15,
+            ..Default::default()
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let key = generate_token("secret", now);
+        assert!(cfg.validate_login(Some(&key), Some(now)).is_ok());
+    }
+
+    #[test]
+    fn test_auth_timeout_boundary_inside_window() {
+        let cfg = AuthConfig {
+            method: AuthMethod::Token,
+            token: "secret".into(),
+            authentication_timeout: 15,
+            ..Default::default()
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        // Exactly at the boundary (should be accepted: |ts-now| <= 15)
+        let at_boundary = now + 15;
+        let key = generate_token("secret", at_boundary);
+        assert!(cfg.validate_login(Some(&key), Some(at_boundary)).is_ok());
+    }
+
+    #[test]
+    fn test_auth_timeout_boundary_outside_window() {
+        let cfg = AuthConfig {
+            method: AuthMethod::Token,
+            token: "secret".into(),
+            authentication_timeout: 15,
+            ..Default::default()
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        // Just outside the boundary
+        let outside = now + 16;
+        let key = generate_token("secret", outside);
+        let result = cfg.validate_login(Some(&key), Some(outside));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_auth_timeout_still_rejects_wrong_token_inside_window() {
+        // Replay protection: even with a valid timestamp, wrong token fails
+        let cfg = AuthConfig {
+            method: AuthMethod::Token,
+            token: "secret".into(),
+            authentication_timeout: 15,
+            ..Default::default()
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        // Token generated with wrong secret
+        let wrong_key = generate_token("wrong-secret", now);
+        let result = cfg.validate_login(Some(&wrong_key), Some(now));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid authentication token"));
     }
 }

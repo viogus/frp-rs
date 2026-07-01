@@ -2924,8 +2924,159 @@ TOML
     fi
 }
 
+# -----------------------------------------------------------------------------
+# Test: Auth rejection — Go frpc wrong token -> Rust frps rejects
+# Verifies token-based auth replay protection across Go↔Rust boundary.
+# Wrong token: proxy port never appears. Correct token: proxy works.
+# -----------------------------------------------------------------------------
+test_auth_g2r_reject() {
+    local name="test_auth_g2r_reject"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="auth-test-token-g2r"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    # Start Rust frps
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Attempt 1: Go frpc with WRONG token — must fail
+    log "  $name: connecting with wrong token (expect rejection)..."
+    write_frpc_config go "$frps_port" "wrong-token-NEVER-VALID" "$echo_port" "$proxy_port" "tcp-plain" "$TEST_DIR/$name/frpc-bad.toml" ""
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc-bad.toml" \
+        > "$TEST_DIR/$name/frpc-bad.log" 2>&1 &
+    local bad_pid=$!
+    track_pid $bad_pid
+
+    # Wait a bit — proxy port should NOT appear
+    sleep 3
+    if lsof -iTCP:"$proxy_port" -sTCP:LISTEN -t >/dev/null 2>&1; then
+        kill $bad_pid 2>/dev/null || true
+        fail_test "$name" "proxy port $proxy_port appeared with wrong token (auth bypass!)"
+        return
+    fi
+    kill $bad_pid 2>/dev/null || true
+    wait $bad_pid 2>/dev/null || true
+    log "  $name: wrong token correctly rejected"
+
+    # Attempt 2: Go frpc with CORRECT token — must succeed
+    log "  $name: connecting with correct token..."
+    write_frpc_config go "$frps_port" "$token" "$echo_port" "$proxy_port" "tcp-plain" "$TEST_DIR/$name/frpc.toml" ""
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 10; then
+        fail_test "$name" "proxy port $proxy_port not reachable (auth rejection false positive?)"
+        return
+    fi
+
+    # Verify data round-trip
+    local result
+    result=$(send_and_expect "$proxy_port" "auth-test-data" "auth-test-data" 5)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Test: Auth rejection — Rust frpc wrong token -> Go frps rejects
+# Reverse direction of test_auth_g2r_reject.
+# -----------------------------------------------------------------------------
+test_auth_r2g_reject() {
+    local name="test_auth_r2g_reject"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="auth-test-token-r2g"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    # Start Go frps
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    # Attempt 1: Rust frpc with WRONG token — must fail
+    log "  $name: connecting with wrong token (expect rejection)..."
+    write_frpc_config rust "$frps_port" "wrong-token-NEVER-VALID" "$echo_port" "$proxy_port" "tcp-plain" "$TEST_DIR/$name/frpc-bad.toml" ""
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc-bad.toml" \
+        > "$TEST_DIR/$name/frpc-bad.log" 2>&1 &
+    local bad_pid=$!
+    track_pid $bad_pid
+
+    # Wait a bit — proxy port should NOT appear
+    sleep 4
+    if lsof -iTCP:"$proxy_port" -sTCP:LISTEN -t >/dev/null 2>&1; then
+        kill $bad_pid 2>/dev/null || true
+        fail_test "$name" "proxy port $proxy_port appeared with wrong token (auth bypass!)"
+        return
+    fi
+    kill $bad_pid 2>/dev/null || true
+    wait $bad_pid 2>/dev/null || true
+    log "  $name: wrong token correctly rejected"
+
+    # Attempt 2: Rust frpc with CORRECT token — must succeed
+    log "  $name: connecting with correct token..."
+    write_frpc_config rust "$frps_port" "$token" "$echo_port" "$proxy_port" "tcp-plain" "$TEST_DIR/$name/frpc.toml" ""
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 10; then
+        fail_test "$name" "proxy port $proxy_port not reachable (auth rejection false positive?)"
+        return
+    fi
+
+    # Verify data round-trip
+    local result
+    result=$(send_and_expect "$proxy_port" "auth-test-data" "auth-test-data" 5)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
 # --- Run tests ---
 if ! ${XTCP_ONLY:-false}; then
+# Phase 1: Auth compatibility (cross-boundary token verification)
+run_test test_auth_g2r_reject
+run_test test_auth_r2g_reject
+
 # Phase 2: Go frpc -> Rust frps TCP data plane
 run_test test_g2r_tcp_plain
 run_test test_g2r_tcp_encrypted

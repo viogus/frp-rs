@@ -50,13 +50,7 @@ async fn test_login_wrong_token_fails() {
         auth: frp_core::config::AuthServerConfig {
             method: "token".into(),
             token: "secret".into(),
-            oidc_issuer: String::new(),
-            oidc_audience: String::new(),
-            oidc_token_endpoint: String::new(),
-            oidc_skip_expiry: false,
-            oidc_skip_issuer: false,
-                    oidc_proxy_url: String::new(),
-                    additional_auth_scopes: Vec::new(),
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -90,13 +84,7 @@ async fn test_login_correct_token_succeeds() {
         auth: frp_core::config::AuthServerConfig {
             method: "token".into(),
             token: "secret".into(),
-            oidc_issuer: String::new(),
-            oidc_audience: String::new(),
-            oidc_token_endpoint: String::new(),
-            oidc_skip_expiry: false,
-            oidc_skip_issuer: false,
-                    oidc_proxy_url: String::new(),
-                    additional_auth_scopes: Vec::new(),
+            ..Default::default()
         },
         ..Default::default()
     };
