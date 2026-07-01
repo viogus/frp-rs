@@ -1159,8 +1159,15 @@ impl Service {
                                             info!(addr = %addr, "WebSocket upgrade over TLS for {}", addr);
                                             let mut magic = [0u8; 7];
                                             let is_v2 = match ws.read_exact(&mut magic).await {
-                                                Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
-                                                Err(_) => false,
+                                                Ok(_) => {
+                                                    let magic_hex = magic.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("");
+                                                    info!(addr = %addr, magic_hex = %magic_hex, "WS+TLS post-upgrade first 7 bytes: {}", magic_hex);
+                                                    magic == frp_core::protocol::V2_MAGIC_BYTES
+                                                }
+                                                Err(e) => {
+                                                    warn!(addr = %addr, error = %e, "WS+TLS failed to read first 7 bytes: {}", e);
+                                                    return;
+                                                }
                                             };
                                             if is_v2 {
                                                 let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ws).await {

@@ -65,7 +65,10 @@ pub async fn read_v1_frame<R: AsyncReadExt + Unpin>(
     );
 
     if length > V1_MAX_MSG_LENGTH as u64 {
-        return Err(crate::Error::Protocol(format!("invalid V1 msg length: {length}")));
+        return Err(crate::Error::Protocol(format!(
+            "invalid V1 msg length: {length}, raw header: {}",
+            hex::encode(header)
+        )));
     }
 
     let mut payload = vec![0u8; length as usize];
