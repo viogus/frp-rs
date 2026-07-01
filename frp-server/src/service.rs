@@ -1121,6 +1121,7 @@ impl Service {
                                     _ => false,
                                 };
 
+                                #[cfg(feature = "websocket")]
                                 if is_ws_tls {
                                     // WebSocket upgrade over TLS (Go frpc ws transport)
                                     let buf_read = IoStream::BufferedRead(ws_peek.to_vec(), 0, Box::new(io));
