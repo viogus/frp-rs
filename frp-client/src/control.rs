@@ -260,7 +260,7 @@ impl ControlConnection {
 
         let mut login = msg::Login {
             version: Some(VERSION.into()),
-            hostname: Some(hostname().await.unwrap_or_default()),
+            hostname: Some(hostname().await),
             os: Some(std::env::consts::OS.into()),
             arch: Some(std::env::consts::ARCH.into()),
             user: if self.user.is_empty() { None } else { Some(self.user.clone()) },
@@ -353,7 +353,14 @@ impl ControlConnection {
             stream.write_v1_frame(&np).await?;
         }
         info!(name = %p.name, "NewProxy sent for '{}', waiting for response...", p.name);
+        let mut iterations = 0u32;
         loop {
+            if iterations >= 100 {
+                return Err(frp_core::Error::Other(format!(
+                    "Proxy '{}' registration failed: too many non-response messages", p.name
+                )));
+            }
+            iterations += 1;
             let resp_msg = if self.v2 {
                 stream.read_v2_frame().await?
             } else {
@@ -402,7 +409,14 @@ impl ControlConnection {
         } else {
             stream.write_v1_frame(&nvc).await?;
         }
+        let mut iterations = 0u32;
         loop {
+            if iterations >= 100 {
+                return Err(frp_core::Error::Other(format!(
+                    "Visitor '{}' registration failed: too many non-response messages", v.name
+                )));
+            }
+            iterations += 1;
             let resp_msg = if self.v2 {
                 stream.read_v2_frame().await?
             } else {
@@ -446,37 +460,36 @@ impl ControlConnection {
 }
 
 
-/// Resolve the local hostname. All blocking I/O delegated to spawn_blocking.
-async fn hostname() -> Option<String> {
-    // Read /etc/hostname on a blocking thread
-    let etc_result = tokio::task::spawn_blocking(|| {
-        std::fs::read_to_string("/etc/hostname")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    })
-    .await
-    .unwrap_or(None);
+/// Resolve the local hostname. Cached via OnceLock — blocking I/O runs in
+/// `spawn_blocking` on first call to avoid stalling the tokio worker thread.
+static HOSTNAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-    if let Some(s) = etc_result {
-        return Some(s);
-    }
-
-    // Fallback: run hostname command on a blocking thread
-    let result = tokio::task::spawn_blocking(|| {
-        std::process::Command::new("hostname")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-    })
-    .await
-    .unwrap_or(None);
-
-    if let Some(s) = result {
-        if !s.is_empty() {
-            return Some(s);
+fn resolve_hostname() -> String {
+    // Read /etc/hostname
+    if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
+        let trimmed = s.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
         }
     }
-    Some("unknown".into())
+    // Fallback: run hostname command
+    if let Ok(o) = std::process::Command::new("hostname").output() {
+        if let Ok(s) = String::from_utf8(o.stdout) {
+            let trimmed = s.trim().to_string();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+    }
+    "unknown".into()
+}
+
+async fn hostname() -> String {
+    if let Some(h) = HOSTNAME.get() {
+        return h.clone();
+    }
+    let h = tokio::task::spawn_blocking(resolve_hostname)
+        .await
+        .unwrap_or_else(|_| "unknown".to_string());
+    HOSTNAME.get_or_init(|| h).clone()
 }

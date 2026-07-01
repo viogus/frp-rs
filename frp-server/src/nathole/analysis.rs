@@ -227,7 +227,7 @@ impl MakeHoleRecords {
     }
 
     /// Select highest-scored (mode, index), decrement it to rotate choices.
-    fn recommand(&mut self) -> (i32, i32) {
+    fn recommend(&mut self) -> (i32, i32) {
         if self.scores.is_empty() {
             return (0, 0);
         }
@@ -245,13 +245,17 @@ impl MakeHoleRecords {
 
     /// Report success: boost the matching (mode, index) score, max +2 cap at 10.
     fn report_success(&mut self, mode: i32, index: i32) {
+        let mut found = false;
         for s in &mut self.scores {
             if s.mode == mode && s.index == index {
                 s.score = (s.score + 2).min(10);
+                found = true;
                 break;
             }
         }
-        self.last_update_time = Instant::now();
+        if found {
+            self.last_update_time = Instant::now();
+        }
     }
 }
 
@@ -294,7 +298,7 @@ impl Analyzer {
     /// Get recommended behaviors for a hole-punch session.
     /// Returns (mode, index, c_behavior, v_behavior).
     /// Role swap rules are applied per Go frp v0.69.1.
-    pub fn get_recommand_behaviors(
+    pub fn get_recommend_behaviors(
         &self,
         key: &str,
         c_feature: &NatFeature,
@@ -305,7 +309,7 @@ impl Analyzer {
             let entry = records
                 .entry(key.to_string())
                 .or_insert_with(|| MakeHoleRecords::new(c_feature, v_feature));
-            entry.recommand()
+            entry.recommend()
         };
 
         let (mut c_behavior, mut v_behavior) = get_behavior_by_mode_and_index(mode, index);
@@ -369,7 +373,7 @@ mod tests {
         let cf = classify_nat_feature(&addrs, &[]).unwrap();
         let vf = classify_nat_feature(&addrs, &[]).unwrap();
 
-        let (mode, _, cb, vb) = analyzer.get_recommand_behaviors("test-key", &cf, &vf);
+        let (mode, _, cb, vb) = analyzer.get_recommend_behaviors("test-key", &cf, &vf);
         assert_eq!(mode, 0);
         // First entry: sender then receiver with TTL 7
         assert_eq!(cb.role, "sender");
@@ -385,7 +389,7 @@ mod tests {
 
         analyzer.report_success("test-key", 0, 0);
 
-        let (mode2, _, _, _) = analyzer.get_recommand_behaviors("test-key", &cf, &vf);
+        let (mode2, _, _, _) = analyzer.get_recommend_behaviors("test-key", &cf, &vf);
         // Should still prefer mode 0 since we boosted it
         assert_eq!(mode2, 0);
     }
@@ -397,7 +401,7 @@ mod tests {
         let cf = classify_nat_feature(&addrs, &[]).unwrap();
         let vf = classify_nat_feature(&addrs, &[]).unwrap();
 
-        analyzer.get_recommand_behaviors("test-key", &cf, &vf);
+        analyzer.get_recommend_behaviors("test-key", &cf, &vf);
         let (removed, _total) = analyzer.clean();
         assert!(removed > 0);
     }
@@ -412,7 +416,7 @@ mod tests {
 
         let mut seen_indices = std::collections::HashSet::new();
         for _ in 0..10 {
-            let (mode, index, _, _) = analyzer.get_recommand_behaviors("cycle-key", &cf, &vf);
+            let (mode, index, _, _) = analyzer.get_recommend_behaviors("cycle-key", &cf, &vf);
             assert_eq!(mode, 0);
             seen_indices.insert(index);
         }

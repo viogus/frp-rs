@@ -24,6 +24,10 @@ pub struct ProxyInfo {
     pub proxy_protocol_version: String,
     /// Response headers to inject into HTTP responses.
     pub response_headers: std::collections::HashMap<String, String>,
+    /// Custom domains for HTTP vhost routing.
+    pub custom_domains: Vec<String>,
+    /// Multiplexer type (e.g., "yamux").
+    pub multiplexer: String,
 }
 
 /// Manages all proxy registrations on the server.
@@ -54,12 +58,6 @@ impl ProxyManager {
 
     pub async fn register(&self, run_id: String, info: ProxyInfo) -> Result<(), String> {
         let name = info.name.clone();
-        {
-            let proxies = self.proxies.read().await;
-            if proxies.contains_key(&name) {
-                return Err(format!("proxy '{}' already registered", name));
-            }
-        }
         // Register in group index
         if let Some(ref group) = info.group {
             if !group.is_empty() {
@@ -67,7 +65,14 @@ impl ProxyManager {
                 groups.entry(group.clone()).or_default().push(name.clone());
             }
         }
-        self.proxies.write().await.insert(name.clone(), info.clone());
+        // Check-and-insert atomically under write lock (fixes TOCTOU).
+        {
+            let mut proxies = self.proxies.write().await;
+            if proxies.contains_key(&name) {
+                return Err(format!("proxy '{}' already registered", name));
+            }
+            proxies.insert(name.clone(), info.clone());
+        }
         self.by_client
             .write()
             .await
@@ -151,10 +156,8 @@ impl ProxyManager {
         }
         if !group_key.is_empty() {
             // Sticky session: hash the key to pick a backend
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            group_key.hash(&mut hasher);
-            let idx = hasher.finish() as usize % members.len();
+            let hash = group_key.bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
+            let idx = hash as usize % members.len();
             Some(members[idx].clone())
         } else {
             // True round-robin: increment counter, modulo member count.

@@ -30,7 +30,7 @@ where
 {
     let enabled = !user.is_empty() || !password.is_empty();
     if enabled {
-        tracing::warn!(
+        tracing::error!(
             "Admin API: Basic Auth enabled without TLS — credentials sent in plaintext. \
              Use a reverse proxy with TLS termination in production."
         );

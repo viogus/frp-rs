@@ -158,11 +158,15 @@ pub async fn bridge_encrypted(
         if let Some(ref mut dec) = decompressor {
             match dec.flush() {
                 Ok(plaintext) if !plaintext.is_empty() => {
-                    let _ = user_w.write_all(&plaintext).await;
+                    if let Err(e) = user_w.write_all(&plaintext).await {
+                        tracing::debug!(error = %e, "bridge_encrypted flush: user_w.write_all failed");
+                    }
                     if let Some(ref m) = metrics {
                         m.bytes_out.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
                     }
-                    let _ = user_w.flush().await;
+                    if let Err(e) = user_w.flush().await {
+                        tracing::debug!(error = %e, "bridge_encrypted flush: user_w.flush failed");
+                    }
                 }
                 #[cfg(feature = "compression")]
                 Err(e) => {
@@ -223,7 +227,9 @@ pub async fn bridge_plain(
         // the backend response. The frpc side will see EOF from user_w.shutdown()
         // in work_to_user after the response is complete.
         if !had_pre_read {
-            let _ = work_w.shutdown().await;
+            if let Err(e) = work_w.shutdown().await {
+                tracing::debug!(error = %e, "bridge_encrypted shutdown: work_w.shutdown failed");
+            }
         }
     };
     let work_to_user = async {
@@ -268,11 +274,15 @@ pub async fn bridge_plain(
         if let Some(ref mut dec) = decompressor {
             match dec.flush() {
                 Ok(plaintext) if !plaintext.is_empty() => {
-                    let _ = user_w.write_all(&plaintext).await;
+                    if let Err(e) = user_w.write_all(&plaintext).await {
+                        tracing::debug!(error = %e, "bridge_plain flush: user_w.write_all failed");
+                    }
                     if let Some(ref m) = metrics {
                         m.bytes_out.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
                     }
-                    let _ = user_w.flush().await;
+                    if let Err(e) = user_w.flush().await {
+                        tracing::debug!(error = %e, "bridge_plain flush: user_w.flush failed");
+                    }
                 }
                 #[cfg(feature = "compression")]
                 Err(e) => {
@@ -281,7 +291,9 @@ pub async fn bridge_plain(
                 _ => {}
             }
         }
-        let _ = user_w.shutdown().await;
+        if let Err(e) = user_w.shutdown().await {
+            tracing::debug!(error = %e, "bridge_plain shutdown: user_w.shutdown failed");
+        }
     };
     let _ = tokio::join!(user_to_work, work_to_user);
 }

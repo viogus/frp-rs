@@ -36,6 +36,8 @@ struct ResponseHeaderInjector<R> {
     buffer: Vec<u8>,
     buffer_offset: usize,
     complete: bool,
+    /// Persistent read buffer to avoid per-poll_read allocation.
+    read_buf: [u8; 4096],
 }
 
 impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
@@ -46,6 +48,7 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
             buffer: Vec::new(),
             buffer_offset: 0,
             complete: false,
+            read_buf: [0u8; 4096],
         }
     }
 }
@@ -70,8 +73,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
         let this = unsafe { self.as_mut().get_unchecked_mut() };
 
         // Read from inner into our buffer
-        let mut temp = vec![0u8; 4096];
-        let mut temp_buf = ReadBuf::new(&mut temp);
+        let mut temp_buf = ReadBuf::new(&mut this.read_buf);
         match Pin::new(&mut this.inner).poll_read(cx, &mut temp_buf) {
             Poll::Ready(Ok(())) => {
                 let n = temp_buf.filled().len();
@@ -79,7 +81,14 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                     this.complete = true;
                     return Poll::Ready(Ok(()));
                 }
-                this.buffer.extend_from_slice(&temp[..n]);
+                // Guard against memory exhaustion from backends that never send \r\n\r\n
+                if this.buffer.len() + n > 65536 {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "response header exceeds 64KB limit",
+                    )));
+                }
+                this.buffer.extend_from_slice(&this.read_buf[..n]);
             }
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => {

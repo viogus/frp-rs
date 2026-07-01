@@ -18,6 +18,9 @@ pub fn verify_token(token: &str, timestamp: i64, expected_hex: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
     pub method: AuthMethod,
+    /// NOTE: Token is stored as plain String in memory with no zeroization.
+    /// For defense-in-depth, a future version should use secrecy::Secret or
+    /// zeroize.
     pub token: String,
     pub oidc_issuer: String,
     pub oidc_audience: String,
@@ -62,14 +65,25 @@ impl AuthConfig {
     /// auth, populated from JWT 'sub' claim for OIDC). Returns Err if invalid.
     pub fn validate_login(&self, privilege_key: Option<&str>, timestamp: Option<i64>) -> Result<String, String> {
         if self.token.is_empty() && self.method == AuthMethod::Token {
+            tracing::warn!("Authentication token is empty — server accepts ALL connections. Set [auth].token in config.");
             return Ok(String::new());
         }
 
         let key = privilege_key.unwrap_or("");
-        let ts = timestamp.unwrap_or(0);
 
         match self.method {
             AuthMethod::Token => {
+                let ts = match timestamp {
+                    Some(t) => t,
+                    None => return Err("timestamp required for authentication".into()),
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                if (ts - now).abs() > 15 {
+                    return Err("timestamp outside acceptable window".into());
+                }
                 let expected = generate_token(&self.token, ts);
                 if key != expected {
                     return Err("invalid authentication token".into());
@@ -178,6 +192,13 @@ mod oidc_impl {
                 skip_issuer,
                 http,
             };
+
+            if verifier.skip_expiry {
+                tracing::warn!("OIDC: skip_expiry is enabled — expired tokens will be accepted. This weakens authentication security.");
+            }
+            if verifier.skip_issuer {
+                tracing::warn!("OIDC: skip_issuer is enabled — tokens from any issuer will be accepted. This weakens authentication security.");
+            }
 
             verifier.refresh_jwks().await?;
             Ok(verifier)
@@ -418,6 +439,7 @@ mod oidc_impl {
             }
 
             if tls_insecure_skip_verify {
+                tracing::warn!("OIDC: tls_insecure_skip_verify is enabled — TLS certificate verification is disabled. This weakens authentication security.");
                 client_builder = client_builder.danger_accept_invalid_certs(true);
             }
 
@@ -694,7 +716,10 @@ mod tests {
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
         };
-        let ts = 100i64;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
         let key = generate_token("secret", ts);
         assert!(cfg.validate_login(Some(&key), Some(ts)).is_ok());
         assert!(cfg.validate_login(Some(&key), Some(ts + 1)).is_err());

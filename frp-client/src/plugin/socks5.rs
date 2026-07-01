@@ -6,6 +6,18 @@ use frp_core::config::PluginConfig;
 
 use super::PluginHandle;
 
+/// Constant-time slice comparison for auth credential verification.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
 // ---------------------------------------------------------------
 // SOCKS5 plugin (RFC 1928)
 // ---------------------------------------------------------------
@@ -144,7 +156,9 @@ async fn handle_socks5_conn(
             .map_err(|e| format!("password utf8: {e}"))?
             .to_string();
 
-        if client_user == u && client_pass == p {
+        if constant_time_eq(client_user.as_bytes(), u.as_bytes())
+            && constant_time_eq(client_pass.as_bytes(), p.as_bytes())
+        {
             client.write_all(&[USERPASS_VERSION, USERPASS_OK]).await
                 .map_err(|e| format!("write auth ok: {e}"))?;
         } else {

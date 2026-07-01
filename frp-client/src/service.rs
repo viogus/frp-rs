@@ -37,6 +37,35 @@ use crate::proxy_runtime::{ProxyRuntimeInfo, ReloadRequest};
 use crate::admin::AdminState;
 use crate::work_conn::XtcpNotification;
 
+/// Dispatch to the correct plugin start function based on plugin_type.
+/// For `visitor_plugin`, `plugin_ctx` must be `Some`; for all other types,
+/// `plugin_ctx` is ignored.
+async fn dispatch_plugin_start(
+    plugin_cfg: &frp_core::config::PluginConfig,
+    plugin_ctx: Option<PluginContext>,
+) -> Result<PluginHandle, frp_core::Error> {
+    match plugin_cfg.plugin_type.as_str() {
+        "http_proxy" => plugin::start_http_proxy(plugin_cfg).await,
+        "socks5" => plugin::start_socks5_proxy(plugin_cfg).await,
+        "static_file" => plugin::start_static_file_proxy(plugin_cfg).await,
+        "unix_domain_socket" => plugin::start_unix_socket_plugin(plugin_cfg).await,
+        "tls2raw" => plugin::start_tls2raw_plugin(plugin_cfg).await,
+        "http2http" => plugin::start_http2http_plugin(plugin_cfg).await,
+        "http2https" => plugin::start_http2https_plugin(plugin_cfg).await,
+        "https2http" => plugin::start_https2http_plugin(plugin_cfg).await,
+        "https2https" => plugin::start_https2https_plugin(plugin_cfg).await,
+        "visitor_plugin" => {
+            let ctx = plugin_ctx.ok_or_else(|| frp_core::Error::Config(
+                "visitor_plugin requires PluginContext".into()
+            ))?;
+            plugin::start_visitor_plugin(plugin_cfg, ctx).await
+        }
+        other => Err(frp_core::Error::Config(
+            format!("unknown plugin type: {other}")
+        )),
+    }
+}
+
 /// The main frpc service.
 pub struct Service {
     cfg: ClientConfig,
@@ -57,18 +86,18 @@ pub struct Service {
     /// Channel to trigger config reload from external signal (SIGUSR1).
     reload_tx: mpsc::UnboundedSender<ReloadRequest>,
     /// Receiver side of reload channel — consumed by run().
-    reload_rx: Mutex<Option<mpsc::UnboundedReceiver<ReloadRequest>>>,
+    reload_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<ReloadRequest>>>,
     /// STUN server address for XTCP NAT traversal.
     nat_hole_stun_server: String,
     /// Channel from work connection tasks to the control loop for XTCP (provider side).
     xtcp_tx: mpsc::UnboundedSender<XtcpNotification>,
     /// Receiver side of XTCP channel — consumed by run().
-    xtcp_rx: Mutex<Option<mpsc::UnboundedReceiver<XtcpNotification>>>,
+    xtcp_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<XtcpNotification>>>,
     /// Channel from visitor tasks to the control loop (Go frps compat:
     /// NatHoleVisitor is sent on the control connection, not fresh TCP).
     visitor_tx: mpsc::UnboundedSender<VisitorRequest>,
     /// Receiver side of visitor channel — consumed by run().
-    visitor_rx: Mutex<Option<mpsc::UnboundedReceiver<VisitorRequest>>>,
+    visitor_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<VisitorRequest>>>,
     /// Shared TUN devices for vnet proxies, keyed by proxy name.
     /// Work connection tasks take ownership of the TUN device via Option::take().
     #[cfg(feature = "vnet")]
@@ -164,73 +193,25 @@ impl Service {
 
         for p in &cfg.proxies {
             if let Some(ref plugin_cfg) = p.plugin {
-                match plugin_cfg.plugin_type.as_str() {
-                    "http_proxy" => {
-                        record_plugin("http_proxy", &p.name,
-                            plugin::start_http_proxy(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles_map);
-                    }
-                    "socks5" => {
-                        record_plugin("socks5", &p.name,
-                            plugin::start_socks5_proxy(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles_map);
-                    }
-                    "static_file" => {
-                        record_plugin("static_file", &p.name,
-                            plugin::start_static_file_proxy(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles_map);
-                    }
-                    "unix_domain_socket" => {
-                        record_plugin("unix_domain_socket", &p.name,
-                            plugin::start_unix_socket_plugin(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles_map);
-                    }
-                    "tls2raw" => {
-                        record_plugin("tls2raw", &p.name,
-                            plugin::start_tls2raw_plugin(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles_map);
-                    }
-                    "http2http" => {
-                        record_plugin("http2http", &p.name,
-                            plugin::start_http2http_plugin(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles_map);
-                    }
-                    "http2https" => {
-                        record_plugin("http2https", &p.name,
-                            plugin::start_http2https_plugin(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles_map);
-                    }
-                    "https2http" => {
-                        record_plugin("https2http", &p.name,
-                            plugin::start_https2http_plugin(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles_map);
-                    }
-                    "https2https" => {
-                        record_plugin("https2https", &p.name,
-                            plugin::start_https2https_plugin(plugin_cfg).await,
-                            &mut plugin_addrs, &mut plugin_handles_map);
-                    }
-                    "visitor_plugin" => {
-                        let plugin_ctx = PluginContext {
-                            server_addr: cfg.server_addr.clone(),
-                            server_port: cfg.server_port,
-                            transport_protocol: cfg.transport_protocol.clone(),
-                            tls_enable: cfg.tls_enable,
-                            tls_server_name: cfg.tls_server_name.clone(),
-                            tls_ca_file: if cfg.tls_ca_file.is_empty() { None } else { Some(cfg.tls_ca_file.clone()) },
-                            use_encryption: p.use_encryption,
-                            use_compression: p.use_compression,
-                            token: auth_cfg.token.clone(),
-                            oidc_client: oidc_client.clone(),
-                        };
-                        record_plugin("visitor", &p.name,
-                            plugin::start_visitor_plugin(plugin_cfg, plugin_ctx).await,
-                            &mut plugin_addrs, &mut plugin_handles_map);
-                    }
-                    other => {
-                        warn!(plugin_type = %other, proxy_name = %p.name, "Unknown plugin type '{other}' for proxy '{}'", p.name);
-                    }
-                }
+                let result = if plugin_cfg.plugin_type == "visitor_plugin" {
+                    let plugin_ctx = PluginContext {
+                        server_addr: cfg.server_addr.clone(),
+                        server_port: cfg.server_port,
+                        transport_protocol: cfg.transport_protocol.clone(),
+                        tls_enable: cfg.tls_enable,
+                        tls_server_name: cfg.tls_server_name.clone(),
+                        tls_ca_file: if cfg.tls_ca_file.is_empty() { None } else { Some(cfg.tls_ca_file.clone()) },
+                        use_encryption: p.use_encryption,
+                        use_compression: p.use_compression,
+                        token: auth_cfg.token.clone(),
+                        oidc_client: oidc_client.clone(),
+                    };
+                    dispatch_plugin_start(plugin_cfg, Some(plugin_ctx)).await
+                } else {
+                    dispatch_plugin_start(plugin_cfg, None).await
+                };
+                record_plugin(&plugin_cfg.plugin_type, &p.name, result,
+                    &mut plugin_addrs, &mut plugin_handles_map);
             }
         }
 
@@ -299,12 +280,12 @@ impl Service {
             proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
             config_file,
             reload_tx,
-            reload_rx: Mutex::new(Some(reload_rx)),
+            reload_rx: std::sync::Mutex::new(Some(reload_rx)),
             nat_hole_stun_server,
             xtcp_tx,
-            xtcp_rx: Mutex::new(Some(xtcp_rx)),
+            xtcp_rx: std::sync::Mutex::new(Some(xtcp_rx)),
             visitor_tx,
-            visitor_rx: Mutex::new(Some(visitor_rx)),
+            visitor_rx: std::sync::Mutex::new(Some(visitor_rx)),
             #[cfg(feature = "vnet")]
             vnet_tuns,
             #[cfg(feature = "vnet")]
@@ -432,11 +413,11 @@ impl Service {
 
         // Start admin HTTP server if configured
         let reload_tx = self.reload_tx.clone();
-        let mut reload_rx = self.reload_rx.lock().await.take()
+        let mut reload_rx = self.reload_rx.lock().unwrap().take()
             .expect("reload_rx already taken — run() called twice?");
-        let mut xtcp_rx = self.xtcp_rx.lock().await.take()
+        let mut xtcp_rx = self.xtcp_rx.lock().unwrap().take()
             .expect("xtcp_rx already taken — run() called twice?");
-        let mut visitor_rx = self.visitor_rx.lock().await.take()
+        let mut visitor_rx = self.visitor_rx.lock().unwrap().take()
             .expect("visitor_rx already taken — run() called twice?");
         let xtcp_tx = self.xtcp_tx.clone();
         let nat_hole_stun_server = self.nat_hole_stun_server.clone();
@@ -543,6 +524,8 @@ impl Service {
             let quic_conn = quic_conn.map(std::sync::Arc::new);
             let v2 = self.cfg.v2;
             info!(run_id = %run_id, "Logged in. run_id: {}", run_id);
+
+            let session_alive = Arc::new(AtomicBool::new(true));
 
             // Register proxies using IoStream directly (supports TCP and TLS)
             for p in &proxies {
@@ -767,6 +750,7 @@ impl Service {
                     bind_addr: if self.cfg.connect_server_local_ip.is_empty() { None } else { Some(self.cfg.connect_server_local_ip.clone()) },
                     proxy_url: self.cfg.proxy_url.clone(),
                     xtcp_tx: xtcp_tx.clone(),
+                    session_alive: session_alive.clone(),
                     #[cfg(feature = "vnet")]
                     vnet_tuns: self.vnet_tuns.clone(),
                     #[cfg(feature = "vnet")]
@@ -851,6 +835,7 @@ impl Service {
                                     bind_addr: if self.cfg.connect_server_local_ip.is_empty() { None } else { Some(self.cfg.connect_server_local_ip.clone()) },
                                     proxy_url: self.cfg.proxy_url.clone(),
                                     xtcp_tx: xtcp_tx.clone(),
+                                    session_alive: session_alive.clone(),
                                     #[cfg(feature = "vnet")]
                                     vnet_tuns: self.vnet_tuns.clone(),
                                     #[cfg(feature = "vnet")]
@@ -887,7 +872,9 @@ impl Service {
                                     let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
                                         sid: Some(sid.clone()),
                                     });
-                                    let _ = write_msg(&mut *writer.lock().await, &report, v2).await;
+                                    if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
+                                        debug!(error = %e, "Failed to send NatHoleReport (no visitor_addr)");
+                                    }
                                     continue;
                                 }
 
@@ -938,7 +925,9 @@ impl Service {
                                                     let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
                                                         sid: Some(sid),
                                                     });
-                                                    let _ = write_msg(&mut *writer.lock().await, &report, v2).await;
+                                                    if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
+                                                        debug!(error = %e, "Failed to send NatHoleReport (connect local failed)");
+                                                    }
                                                 }
                                             }
                                         } else {
@@ -946,7 +935,9 @@ impl Service {
                                             let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
                                                 sid: Some(sid),
                                             });
-                                            let _ = write_msg(&mut *writer.lock().await, &report, v2).await;
+                                            if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
+                                                debug!(error = %e, "Failed to send NatHoleReport (no local addr)");
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -955,7 +946,9 @@ impl Service {
                                         let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
                                             sid: Some(sid),
                                         });
-                                        let _ = write_msg(&mut *writer.lock().await, &report, v2).await;
+                                        if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
+                                            debug!(error = %e, "Failed to send NatHoleReport (hole punch failed)");
+                                        }
                                     }
                                 }
                             }
@@ -1229,6 +1222,9 @@ impl Service {
                 }
             }
 
+            // Signal session end to stop pool replenishment cascade
+            session_alive.store(false, Ordering::Release);
+
             // Check if admin stop was requested
             if shutdown_flag.load(Ordering::SeqCst) {
                 info!("frpc shutting down");
@@ -1252,35 +1248,22 @@ impl Service {
         proxy_name: &str,
         plugin_cfg: &frp_core::config::PluginConfig,
     ) -> Option<PluginHandle> {
-        let result = match plugin_cfg.plugin_type.as_str() {
-            "http_proxy" => plugin::start_http_proxy(plugin_cfg).await,
-            "socks5" => plugin::start_socks5_proxy(plugin_cfg).await,
-            "static_file" => plugin::start_static_file_proxy(plugin_cfg).await,
-            "unix_domain_socket" => plugin::start_unix_socket_plugin(plugin_cfg).await,
-            "tls2raw" => plugin::start_tls2raw_plugin(plugin_cfg).await,
-            "http2http" => plugin::start_http2http_plugin(plugin_cfg).await,
-            "http2https" => plugin::start_http2https_plugin(plugin_cfg).await,
-            "https2http" => plugin::start_https2http_plugin(plugin_cfg).await,
-            "https2https" => plugin::start_https2https_plugin(plugin_cfg).await,
-            "visitor_plugin" => {
-                let ctx = PluginContext {
-                    server_addr: self.cfg.server_addr.clone(),
-                    server_port: self.cfg.server_port,
-                    transport_protocol: self.cfg.transport_protocol.clone(),
-                    tls_enable: self.cfg.tls_enable,
-                    tls_server_name: self.cfg.tls_server_name.clone(),
-                    tls_ca_file: if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
-                    use_encryption: true,
-                    use_compression: false,
-                    token: self.auth_cfg.token.clone(),
-                    oidc_client: self.oidc_client.clone(),
-                };
-                plugin::start_visitor_plugin(plugin_cfg, ctx).await
-            }
-            other => {
-                warn!(plugin_type = %other, proxy_name = %proxy_name, "Unknown plugin type '{}' for '{}'", other, proxy_name);
-                return None;
-            }
+        let result = if plugin_cfg.plugin_type == "visitor_plugin" {
+            let ctx = PluginContext {
+                server_addr: self.cfg.server_addr.clone(),
+                server_port: self.cfg.server_port,
+                transport_protocol: self.cfg.transport_protocol.clone(),
+                tls_enable: self.cfg.tls_enable,
+                tls_server_name: self.cfg.tls_server_name.clone(),
+                tls_ca_file: if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
+                use_encryption: true,
+                use_compression: false,
+                token: self.auth_cfg.token.clone(),
+                oidc_client: self.oidc_client.clone(),
+            };
+            dispatch_plugin_start(plugin_cfg, Some(ctx)).await
+        } else {
+            dispatch_plugin_start(plugin_cfg, None).await
         };
 
         match result {

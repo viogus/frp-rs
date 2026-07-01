@@ -516,9 +516,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for AeadStreamReader<R> {
 // Combined AeadStream (AsyncRead + AsyncWrite) — wraps Box<dyn AsyncReadWriteUnpin>
 // ---------------------------------------------------------------------------
 
-/// Trait alias for AsyncRead + AsyncWrite + Unpin + Send.
-pub trait AsyncReadWriteUnpin: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWriteUnpin for T {}
+use crate::cipher_stream::AsyncReadWriteUnpin;
 
 /// Combined AEAD stream wrapping a bidirectional byte transport.
 ///
@@ -717,10 +715,13 @@ impl AeadStream {
                 p
             }
             Err(e) => {
+                #[cfg(debug_assertions)]
                 tracing::warn!(frame = %self.read_frame_count, error = %e, nonce = %hex::encode(&self.read_nonce), stream_nonce = %hex::encode(stream_nonce), "[AEAD-READ] frame={} decrypt FAILED: {} (nonce={}, stream_nonce={})",
                     self.read_frame_count, e,
                     hex::encode(&self.read_nonce),
                     hex::encode(stream_nonce));
+                #[cfg(not(debug_assertions))]
+                tracing::warn!(frame = %self.read_frame_count, error = %e, "[AEAD-READ] frame={} decrypt FAILED: {}", self.read_frame_count, e);
                 return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData,
                     format!("AEAD decrypt: {e}"))));
             }
@@ -805,7 +806,10 @@ impl AsyncWrite for AeadStream {
 
         // Send stream nonce first if needed
         if !this.write_header_sent {
+            #[cfg(debug_assertions)]
             tracing::debug!(nonce = %hex::encode(&this.write_nonce), "[AEAD-WRITE] first write: nonce={}", hex::encode(&this.write_nonce));
+            #[cfg(not(debug_assertions))]
+            tracing::debug!("[AEAD-WRITE] first write");
             // Queue the nonce write
             let mut pending = this.write_stream_nonce.clone();
             let overhead = this.algorithm.overhead();

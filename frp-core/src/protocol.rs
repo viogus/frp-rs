@@ -49,7 +49,7 @@ pub async fn read_v1_frame<R: AsyncReadExt + Unpin>(
         .map_err(|e| crate::Error::Protocol(format!("read V1 header: {e}")))?;
 
     let type_byte = header[0];
-    let length = i64::from_be_bytes([
+    let length = u64::from_be_bytes([
         header[1], header[2], header[3], header[4],
         header[5], header[6], header[7], header[8],
     ]);
@@ -64,7 +64,7 @@ pub async fn read_v1_frame<R: AsyncReadExt + Unpin>(
         hex::encode(header)
     );
 
-    if !(0..=V1_MAX_MSG_LENGTH).contains(&length) {
+    if length > V1_MAX_MSG_LENGTH as u64 {
         return Err(crate::Error::Protocol(format!("invalid V1 msg length: {length}")));
     }
 

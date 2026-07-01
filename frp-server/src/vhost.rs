@@ -381,31 +381,44 @@ fn extract_path(request: &str) -> Option<&str> {
 
 /// Rewrite the Host header in an HTTP request's raw bytes.
 /// Finds the first `Host:` or `host:` line and replaces it with the given value.
+/// Byte-oriented to avoid mangling non-UTF-8 request data.
 /// Returns a new Vec<u8> with the rewritten header.
 fn rewrite_host_header(data: &[u8], new_host: &str) -> Vec<u8> {
-    let text = String::from_utf8_lossy(data);
-    let mut result = String::with_capacity(data.len() + new_host.len());
-
-    for line in text.lines() {
-        if line.len() >= 5 && line[..5].eq_ignore_ascii_case("host:") {
-            result.push_str(&format!("Host: {}\r\n", new_host));
-        } else {
-            result.push_str(line);
-            result.push_str("\r\n");
-        }
-    }
-
-    // Preserve trailing double-CRLF (end of headers) that lines() strips
-    if text.ends_with("\r\n\r\n")
-        && !result.ends_with("\r\n\r\n") {
-            if result.ends_with("\r\n") {
-                result.push_str("\r\n");
+    // Search for \r\nHost: or \nHost: (HTTP allows both)
+    let host_pos = data
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .and_then(|pos| {
+            let rest = &data[pos + 2..];
+            if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case(b"host:") {
+                Some(pos + 2)
             } else {
-                result.push_str("\r\n\r\n");
+                // Also check first-line Host: (no leading \r\n)
+                if data.len() >= 5 && data[..5].eq_ignore_ascii_case(b"host:") {
+                    Some(0)
+                } else {
+                    None
+                }
             }
-        }
+        });
 
-    result.into_bytes()
+    let Some(host_start) = host_pos else {
+        return data.to_vec();
+    };
+
+    // Find end of the Host header line
+    let line_end = data[host_start..]
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .map(|p| host_start + p + 2)
+        .unwrap_or(data.len());
+
+    let new_header = format!("Host: {}\r\n", new_host);
+    let mut result = Vec::with_capacity(data.len() + new_header.len());
+    result.extend_from_slice(&data[..host_start]);
+    result.extend_from_slice(new_header.as_bytes());
+    result.extend_from_slice(&data[line_end..]);
+    result
 }
 
 /// Extract HTTP Basic Auth credentials from the Authorization header.
@@ -524,7 +537,7 @@ pub fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
             let list_len = u16::from_be_bytes([ch[pos], ch[pos + 1]]) as usize;
             pos += 2;
             let list_end = pos + list_len;
-            if list_end > ch.len() {
+            if list_end > ext_end {
                 return None;
             }
 
@@ -533,7 +546,7 @@ pub fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
                 let name_len = u16::from_be_bytes([ch[pos + 1], ch[pos + 2]]) as usize;
                 pos += 3;
 
-                if name_type == 0x00 && pos + name_len <= ch.len() {
+                if name_type == 0x00 && pos + name_len <= list_end {
                     return String::from_utf8(ch[pos..pos + name_len].to_vec()).ok();
                 }
                 pos += name_len;

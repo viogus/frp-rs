@@ -84,7 +84,16 @@ impl TcpMuxManager {
     /// Look up by hostname (exact match, port-stripped).
     pub async fn lookup(&self, host: &str) -> Option<TcpMuxRoute> {
         // Strip port if present: example.com:443 → example.com
-        let hostname = host.rsplitn(2, ':').last().unwrap_or(host);
+        // Handle bracketed IPv6: [::1]:443 → ::1
+        let hostname = if host.starts_with('[') {
+            if let Some(end) = host.find(']') {
+                &host[1..end]
+            } else {
+                host
+            }
+        } else {
+            host.rsplitn(2, ':').last().unwrap_or(host)
+        };
         self.routes.read().await.get(hostname).cloned()
     }
 }
@@ -248,22 +257,24 @@ async fn read_http_headers(
         if total >= buf.len() {
             return Err("headers too large".into());
         }
+        // Read in chunks instead of byte-by-byte.
+        let chunk_end = (total + 512).min(buf.len());
         let n = stream
-            .read(&mut buf[total..total + 1])
+            .read(&mut buf[total..chunk_end])
             .await
             .map_err(|e| format!("read: {e}"))?;
         if n == 0 {
             return Err("connection closed".into());
         }
         total += n;
-        // Check for \r\n\r\n terminator
-        if total >= 4
-            && buf[total - 4] == b'\r'
-            && buf[total - 3] == b'\n'
-            && buf[total - 2] == b'\r'
-            && buf[total - 1] == b'\n'
+        // Search for \r\n\r\n terminator in the newly read data
+        // plus a 3-byte overlap from the previous chunk tail.
+        let search_start = if total >= n + 3 { total - n - 3 } else { 0 };
+        if let Some(pos) = buf[search_start..total]
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
         {
-            return Ok(total);
+            return Ok(search_start + pos + 4);
         }
     }
 }
@@ -294,7 +305,11 @@ fn extract_proxy_auth(request: &str) -> Option<(String, String)> {
         line.len() >= 20 && line[..20].eq_ignore_ascii_case("proxy-authorization:")
     })?;
     let value = auth_line[20..].trim();
-    let encoded = value.strip_prefix("Basic ")?.trim();
+    let encoded = if value.len() > 6 && value[..6].eq_ignore_ascii_case("Basic ") {
+        value[6..].trim()
+    } else {
+        return None;
+    };
     let decoded = data_encoding::BASE64.decode(encoded.as_bytes()).ok()?;
     let creds = String::from_utf8(decoded).ok()?;
     let (user, pwd) = creds.split_once(':')?;

@@ -30,9 +30,14 @@ pub async fn stun_binding(stun_addr: &str) -> Result<String, String> {
             .ok_or_else(|| format!("STUN DNS: no addresses found for '{}'", addr_str))?
     };
 
-    let socket = UdpSocket::bind("0.0.0.0:0")
-        .await
-        .map_err(|e| format!("STUN socket bind: {e}"))?;
+    // Bind [::]:0 first for dual-stack (IPv4+IPv6 on same socket).
+    // Fall back to 0.0.0.0:0 on IPv4-only hosts where IPv6 bind fails.
+    let socket = match UdpSocket::bind("[::]:0").await {
+        Ok(s) => s,
+        Err(_) => UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| format!("STUN socket bind: {e}"))?,
+    };
 
     let mut tx_id = [0u8; 12];
     rand::thread_rng().fill(&mut tx_id);

@@ -185,7 +185,9 @@ impl Service {
                 if let Ok(listener) = TcpListener::bind(&ws_addr2).await {
                     info!(addr = %ws_addr2, "WebSocket listener ready on {}", ws_addr2);
                     loop {
-                        if let Ok((stream, addr)) = listener.accept().await {
+                        tokio::select! {
+                            result = listener.accept() => {
+                                if let Ok((stream, addr)) = result {
                             info!(addr = %addr, "New WebSocket connection from {}", addr);
                             let state = ws_state.clone();
                             tokio::spawn(async move {
@@ -253,6 +255,9 @@ impl Service {
                                     }
                                 }
                             });
+                                }
+                            }
+                            _ = ws_state.shutdown_token.cancelled() => break,
                         }
                     }
                 }
@@ -348,10 +353,12 @@ impl Service {
                     }
                 };
                 tracing::info!(addr = %kcp_addr2, "KCP listener started on {}", kcp_addr2);
-                loop {
-                    match listener.accept().await {
-                        Ok(stream) => {
-                            let state = kcp_state.clone();
+                'kcp_accept: loop {
+                    tokio::select! {
+                        result = listener.accept() => {
+                            match result {
+                                Ok(stream) => {
+                                    let state = kcp_state.clone();
                             tokio::spawn(async move {
                                 let mut ctl = frp_core::transport::IoStream::Kcp(stream);
 
@@ -410,9 +417,12 @@ impl Service {
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "KCP accept error: {}", e);
-                            break;
+                            break 'kcp_accept;
                         }
                     }
+                    }
+                    _ = kcp_state.shutdown_token.cancelled() => break 'kcp_accept,
+                }
                 }
             });
             tracing::info!(addr = %kcp_addr, "KCP listener starting on {}", kcp_addr);
@@ -456,10 +466,12 @@ impl Service {
                     }
                 };
                 tracing::info!(addr = %quic_addr, "QUIC listener started on {}", quic_addr);
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, conn)) => {
-                            let state = quic_state.clone();
+                'quic_accept: loop {
+                    tokio::select! {
+                        result = listener.accept() => {
+                            match result {
+                                Ok((stream, conn)) => {
+                                    let state = quic_state.clone();
                             tokio::spawn(async move {
                                 let mut ctl = frp_core::transport::IoStream::Quic(stream);
 
@@ -658,9 +670,12 @@ impl Service {
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "QUIC accept error: {}", e);
-                            break;
+                            break 'quic_accept;
                         }
                     }
+                    }
+                    _ = quic_state.shutdown_token.cancelled() => break 'quic_accept,
+                }
                 }
             });
             tracing::info!(addr = %quic_addr2, "QUIC listener starting on {}", quic_addr2);
@@ -1334,6 +1349,7 @@ impl Service {
                 }
                 Err(e) => {
                     error!(error = %e, "Failed to accept connection: {}", e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
                 }

@@ -67,7 +67,8 @@ pub struct ServerConfig {
     #[serde(default)]
     pub allow_ports: String,
     /// Maximum number of proxies a single client can register.
-    /// 0 = unlimited (default). Go frp compat: maxPortsPerClient.
+    /// Max ports a single client can occupy. Default 50 to prevent port pool
+    /// exhaustion; set to 0 for unlimited. Go frp compat: maxPortsPerClient.
     #[serde(default)]
     pub max_ports_per_client: u64,
     /// Timeout in seconds for backend HTTP response in VHost handler.
@@ -143,17 +144,17 @@ pub fn parse_bandwidth_limit(s: &str) -> Option<u64> {
     }
     let s = s.trim().to_uppercase();
     let (num_str, mult) = if let Some(rest) = s.strip_suffix("GB") {
-        (rest.trim(), 1_000_000_000u64)
+        (rest.trim(), 1_073_741_824u64)
     } else if let Some(rest) = s.strip_suffix('G') {
-        (rest.trim(), 1_000_000_000u64)
+        (rest.trim(), 1_073_741_824u64)
     } else if let Some(rest) = s.strip_suffix("MB") {
-        (rest.trim(), 1_000_000u64)
+        (rest.trim(), 1_048_576u64)
     } else if let Some(rest) = s.strip_suffix('M') {
-        (rest.trim(), 1_000_000u64)
+        (rest.trim(), 1_048_576u64)
     } else if let Some(rest) = s.strip_suffix("KB") {
-        (rest.trim(), 1000u64)
+        (rest.trim(), 1024u64)
     } else if let Some(rest) = s.strip_suffix('K') {
-        (rest.trim(), 1000u64)
+        (rest.trim(), 1024u64)
     } else {
         (&s[..], 1u64)
     };
@@ -230,7 +231,7 @@ impl Default for ServerConfig {
             allow_port_start: default_allow_port_start(),
             allow_port_end: default_allow_port_end(),
             allow_ports: String::new(),
-            max_ports_per_client: 0,
+            max_ports_per_client: 50,
             vhost_http_timeout: default_vhost_http_timeout(),
             user_conn_timeout: default_user_conn_timeout(),
             tcp_mux_passthrough: false,
@@ -916,9 +917,13 @@ fn toml_to_json(v: toml::Value) -> serde_json::Value {
         toml::Value::String(s) => serde_json::Value::String(s),
         toml::Value::Integer(i) => serde_json::Value::Number(i.into()),
         toml::Value::Float(f) => {
-            serde_json::Number::from_f64(f)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
+            serde_json::Number::from_f64(f).map_or_else(
+                || {
+                    tracing::warn!(float = %f, "NaN/Inf float value in TOML config replaced with null");
+                    serde_json::Value::Null
+                },
+                serde_json::Value::Number,
+            )
         }
         toml::Value::Boolean(b) => serde_json::Value::Bool(b),
         toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
@@ -1731,23 +1736,23 @@ remote_port = 7001
         assert_eq!(parse_bandwidth_limit(""), None);
         assert_eq!(parse_bandwidth_limit("0"), None);
 
-        // KB variants (decimal: 1KB = 1000)
-        assert_eq!(parse_bandwidth_limit("1KB"), Some(1000));
-        assert_eq!(parse_bandwidth_limit("1K"), Some(1000));
+        // KB variants (binary: 1KB = 1024)
+        assert_eq!(parse_bandwidth_limit("1KB"), Some(1024));
+        assert_eq!(parse_bandwidth_limit("1K"), Some(1024));
 
         // MB variants
-        assert_eq!(parse_bandwidth_limit("1MB"), Some(1_000_000));
-        assert_eq!(parse_bandwidth_limit("1M"), Some(1_000_000));
+        assert_eq!(parse_bandwidth_limit("1MB"), Some(1_048_576));
+        assert_eq!(parse_bandwidth_limit("1M"), Some(1_048_576));
 
         // GB variant
-        assert_eq!(parse_bandwidth_limit("1GB"), Some(1_000_000_000));
+        assert_eq!(parse_bandwidth_limit("1GB"), Some(1_073_741_824));
 
         // Plain bytes
         assert_eq!(parse_bandwidth_limit("500"), Some(500));
 
         // Case insensitive (input uppercased internally)
-        assert_eq!(parse_bandwidth_limit("1mb"), Some(1_000_000));
-        assert_eq!(parse_bandwidth_limit("1kb"), Some(1000));
+        assert_eq!(parse_bandwidth_limit("1mb"), Some(1_048_576));
+        assert_eq!(parse_bandwidth_limit("1kb"), Some(1024));
 
         // Garbage → None
         assert_eq!(parse_bandwidth_limit("not-a-number"), None);

@@ -7,6 +7,11 @@ type Aes128CfbDec = cfb_mode::Decryptor<aes::Aes128>;
 
 /// Derive an AES-128 key from a token using PBKDF2-SHA1.
 /// Matches Go frp v0.69.1 binary: pbkdf2.Key(token, "frp", 64, 16, sha1.New)
+///
+/// V1 only. Uses PBKDF2-SHA1 with 64 iterations and salt "frp" — deliberately
+/// weak, for Go frp binary compatibility. For stronger key derivation, use the
+/// V2 AEAD path (HKDF-SHA256 with transcript hashing). Do not increase
+/// iterations: it breaks Go frp interop.
 pub fn derive_key(token: &str) -> [u8; 16] {
     let mut key = [0u8; 16];
     pbkdf2::pbkdf2_hmac::<sha1::Sha1>(token.as_bytes(), b"frp", 64, &mut key);
@@ -109,6 +114,10 @@ impl SnappyDecompressor {
     /// Returns an error only for truly corrupt input (bad magic, bad CRC);
     /// partial frames are silently buffered, not treated as errors.
     pub fn feed(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        const MAX_SNAPPY_BUFFER: usize = 16 * 1024 * 1024; // 16 MB
+        if self.buf.len() + data.len() > MAX_SNAPPY_BUFFER {
+            return Err("snappy decompression buffer exhausted".into());
+        }
         self.buf.extend_from_slice(data);
 
         let mut output = Vec::new();
