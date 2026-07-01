@@ -889,17 +889,54 @@ impl Service {
                                     }
                                 }
 
-                                // No SNI match — wrap stream to replay consumed bytes
-                                // for the TLS handshake fallthrough path.
-                                let stream = PreReadStream::new(sni_data, inner_stream);
-
+                                // No SNI match — check acceptor before creating stream.
                                 let acceptor = match acceptor {
                                     Some(a) => a,
                                     None => {
+                                        // Go frp compat: Go frpc sends 0x17 (FRP_TLS_HEAD_BYTE)
+                                        // by default even without TLS configured. Go frps
+                                        // falls back to plain TCP via CheckAndEnableTLSServerConnWithTimeout.
+                                        // Match that behavior: when the first byte is 0x17 and TLS
+                                        // is not configured, strip 0x17 (already done above) and
+                                        // treat the remaining data as V1.
+                                        if first_byte == frp_core::transport::FRP_TLS_HEAD_BYTE {
+                                            info!(addr = %addr, "TLS head byte (0x17) but TLS not configured, falling back to V1");
+                                            // sni_data contains the bytes after 0x17 (pre_read
+                                            // minus 0x17 + SNI peek). Replay them via PreRead
+                                            // and dispatch as V1.
+                                            let mut stream = IoStream::PreRead(sni_data, inner_stream);
+                                            match read_msg_v1(&mut stream).await {
+                                                Ok(FrpMessage::Login(login)) => {
+                                                    control::handle_control(stream, login, state, Some(addr), None, false, None).await;
+                                                }
+                                                Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                                    crate::handlers::handle_work_conn_inner(stream, nwc, state).await;
+                                                }
+                                                Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                                    crate::handlers::handle_visitor_conn_inner(stream, nvc, state, false).await;
+                                                }
+                                                Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                                    crate::handlers::handle_nat_hole_visitor(stream, nhv, state, Some(addr.to_string()), false).await;
+                                                }
+                                                Ok(other) => {
+                                                    warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 message after 0x17 fallback from {}: {:?}", addr, other.v1_type_byte());
+                                                }
+                                                Err(e) => {
+                                                    warn!(addr = %addr, error = %e, "V1 read error after 0x17 fallback from {}: {}", addr, e);
+                                                }
+                                            }
+                                            return;
+                                        }
+                                        // 0x16 (standard TLS ClientHello) — genuine TLS,
+                                        // can't fall back to V1.
                                         warn!(addr = %addr, "TLS connection from {} but TLS not configured", addr);
                                         return;
                                     }
                                 };
+
+                                // TLS acceptor exists — wrap stream to replay consumed bytes
+                                // for the TLS handshake.
+                                let stream = PreReadStream::new(sni_data, inner_stream);
                                 let tls_stream = match acceptor.accept(stream).await {
                                     Ok(s) => s,
                                     Err(e) => {
@@ -1047,7 +1084,45 @@ impl Service {
                             }
 
                             #[cfg(not(feature = "tls"))]
-                            ConnectionType::Tls(_) => {
+                            ConnectionType::Tls(first_byte) => {
+                                // Go frp compat: when TLS feature is not compiled in
+                                // but frpc sends 0x17 prefix, fall back to V1.
+                                if first_byte == frp_core::transport::FRP_TLS_HEAD_BYTE {
+                                    let (mut pre_read_bytes, inner_stream) = match stream_io {
+                                        IoStream::PreRead(buf, s) => (buf, s),
+                                        _ => {
+                                            warn!(addr = %addr, "Expected PreRead for 0x17 connection from {}", addr);
+                                            return;
+                                        }
+                                    };
+                                    // Strip 0x17 (Go frp TLS head byte).
+                                    if !pre_read_bytes.is_empty() {
+                                        pre_read_bytes.remove(0);
+                                    }
+                                    info!(addr = %addr, "TLS head byte (0x17) but TLS feature not enabled, falling back to V1");
+                                    let mut stream = IoStream::PreRead(pre_read_bytes, inner_stream);
+                                    match read_msg_v1(&mut stream).await {
+                                        Ok(FrpMessage::Login(login)) => {
+                                            control::handle_control(stream, login, state, Some(addr), None, false, None).await;
+                                        }
+                                        Ok(FrpMessage::NewWorkConn(nwc)) => {
+                                            crate::handlers::handle_work_conn_inner(stream, nwc, state).await;
+                                        }
+                                        Ok(FrpMessage::NewVisitorConn(nvc)) => {
+                                            crate::handlers::handle_visitor_conn_inner(stream, nvc, state, false).await;
+                                        }
+                                        Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+                                            crate::handlers::handle_nat_hole_visitor(stream, nhv, state, Some(addr.to_string()), false).await;
+                                        }
+                                        Ok(other) => {
+                                            warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 message after 0x17 fallback from {}: {:?}", addr, other.v1_type_byte());
+                                        }
+                                        Err(e) => {
+                                            warn!(addr = %addr, error = %e, "V1 read error after 0x17 fallback from {}: {}", addr, e);
+                                        }
+                                    }
+                                    return;
+                                }
                                 warn!(addr = %addr, "TLS connection from {} but TLS feature not enabled", addr);
                             }
 
