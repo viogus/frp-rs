@@ -1112,19 +1112,48 @@ impl Service {
                                 // Peek for WebSocket upgrade inside TLS (Go frp 'ws'
                                 // transport sends TLS ClientHello first, then WebSocket
                                 // upgrade inside the TLS tunnel).
-                                let mut ws_peek = [0u8; 4];
-                                let is_ws_tls = match tokio::time::timeout(
+                                //
+                                // Two-phase detection to avoid false positives from
+                                // health checks, scanners, and other non-frp HTTP
+                                // clients that connect to the frps TLS port.
+                                let mut ws_peek = vec![0u8; 4];
+                                let got_http = match tokio::time::timeout(
                                     std::time::Duration::from_secs(5),
-                                    io.read_exact(&mut ws_peek),
+                                    io.read_exact(&mut ws_peek[..4]),
                                 ).await {
-                                    Ok(Ok(n)) if n >= 4 => &ws_peek == b"GET ",
+                                    Ok(Ok(n)) if n >= 4 => &ws_peek[..4] == b"GET ",
                                     _ => false,
                                 };
+
+                                // Secondary validation: read more bytes and confirm
+                                // WebSocket upgrade headers are present before committing
+                                // to the WS path (which sends a 101 response and cannot
+                                // be undone).
+                                #[cfg(feature = "websocket")]
+                                let is_ws_tls = if got_http {
+                                    ws_peek.resize(1024, 0);
+                                    let extra = match tokio::time::timeout(
+                                        std::time::Duration::from_millis(500),
+                                        io.read(&mut ws_peek[4..]),
+                                    ).await {
+                                        Ok(Ok(n)) => n,
+                                        _ => 0,
+                                    };
+                                    ws_peek.truncate(4 + extra);
+                                    let data = String::from_utf8_lossy(&ws_peek);
+                                    let lower = data.to_lowercase();
+                                    lower.contains("upgrade: websocket")
+                                        && lower.contains("sec-websocket-key:")
+                                } else {
+                                    false
+                                };
+                                #[cfg(not(feature = "websocket"))]
+                                let is_ws_tls = false;
 
                                 #[cfg(feature = "websocket")]
                                 if is_ws_tls {
                                     // WebSocket upgrade over TLS (Go frpc ws transport)
-                                    let buf_read = IoStream::BufferedRead(ws_peek.to_vec(), 0, Box::new(io));
+                                    let buf_read = IoStream::BufferedRead(ws_peek, 0, Box::new(io));
                                     match accept_websocket(buf_read).await {
                                         Ok(mut ws) => {
                                             info!(addr = %addr, "WebSocket upgrade over TLS for {}", addr);
@@ -1187,7 +1216,7 @@ impl Service {
                                 }
 
                                 // Not WebSocket — replay peeked bytes.
-                                let mut io = IoStream::BufferedRead(ws_peek.to_vec(), 0, Box::new(io));
+                                let mut io = IoStream::BufferedRead(ws_peek, 0, Box::new(io));
 
                                 // When tcp_mux is enabled, wrap TLS stream in yamux
                                 // before reading the first message (matches Go frp).
