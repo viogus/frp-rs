@@ -22,7 +22,7 @@ use crate::transport::IoStream;
 use crate::protocol::{V2_FRAME_TYPE_CLIENT_HELLO, V2_FRAME_TYPE_SERVER_HELLO, V2_FRAME_TYPE_MESSAGE};
 
 /// Timeout for V2 handshake reads (matching Go frp connReadTimeout).
-const V2_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const V2_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Crypto random size in bytes (matching Go frp CryptoRandomSize = 32).
 const CRYPTO_RANDOM_SIZE: usize = 32;

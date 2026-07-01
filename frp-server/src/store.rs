@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rand::RngExt;
 use tracing::{error, info, warn};
 
 use frp_core::config::ProxyConfig;
@@ -69,14 +70,17 @@ pub fn save_store(path: &Path, configs: &HashMap<String, ProxyConfig>) {
         }
     };
 
-    // Unique temp file name to avoid races between concurrent dashboard handlers
+    // Unique temp file name to avoid races between concurrent dashboard handlers.
+    // Includes both a nanosecond timestamp and a random suffix to prevent
+    // collisions under concurrent writes from multiple handler invocations.
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    let random_suffix: u16 = rand::rng().random();
     let tmp_path = {
         let mut tmp = path.as_os_str().to_os_string();
-        tmp.push(format!(".{nanos}.tmp"));
+        tmp.push(format!(".{nanos}_{random_suffix:04x}.tmp"));
         PathBuf::from(tmp)
     };
 

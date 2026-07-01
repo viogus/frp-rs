@@ -85,18 +85,16 @@ async fn handle_static_file_conn(
     local_path: &str,
     strip_prefix: Option<&str>,
 ) -> Result<(), String> {
-    // Read HTTP request headers (reuse pattern from http_proxy)
+    // Read HTTP request headers in chunks until \r\n\r\n
     let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
+    let mut chunk = [0u8; 512];
     loop {
-        client.read_exact(&mut byte).await.map_err(|e| format!("read: {e}"))?;
-        buf.push(byte[0]);
-        if buf.len() > 3
-            && buf[buf.len() - 4] == b'\r'
-            && buf[buf.len() - 3] == b'\n'
-            && buf[buf.len() - 2] == b'\r'
-            && buf[buf.len() - 1] == b'\n'
-        {
+        let n = client.read(&mut chunk).await.map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            return Err("connection closed".into());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() >= 4 && buf[buf.len() - 4..] == *b"\r\n\r\n" {
             break;
         }
         if buf.len() > 65536 {
@@ -143,8 +141,9 @@ async fn handle_static_file_conn(
     // Decode URL and strip prefix to get relative filesystem path
     let rel_path = resolve_static_path(url_path, strip_prefix)?;
 
-    // Sanitize: reject path traversal
-    if rel_path.contains("..") {
+    // Sanitize: reject path traversal (component-level check)
+    let escaped = rel_path.split('/').all(|c| c != "..");
+    if !escaped {
         let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let _ = client.write_all(resp).await;
         return Err("path traversal rejected".into());

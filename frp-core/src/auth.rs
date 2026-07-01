@@ -18,6 +18,9 @@ pub fn verify_token(token: &str, timestamp: i64, expected_hex: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
     pub method: AuthMethod,
+    /// NOTE: Token is stored as plain String in memory with no zeroization.
+    /// For defense-in-depth, a future version should use secrecy::Secret or
+    /// zeroize.
     pub token: String,
     pub oidc_issuer: String,
     pub oidc_audience: String,
@@ -189,6 +192,13 @@ mod oidc_impl {
                 skip_issuer,
                 http,
             };
+
+            if verifier.skip_expiry {
+                tracing::warn!("OIDC: skip_expiry is enabled — expired tokens will be accepted. This weakens authentication security.");
+            }
+            if verifier.skip_issuer {
+                tracing::warn!("OIDC: skip_issuer is enabled — tokens from any issuer will be accepted. This weakens authentication security.");
+            }
 
             verifier.refresh_jwks().await?;
             Ok(verifier)
@@ -429,6 +439,7 @@ mod oidc_impl {
             }
 
             if tls_insecure_skip_verify {
+                tracing::warn!("OIDC: tls_insecure_skip_verify is enabled — TLS certificate verification is disabled. This weakens authentication security.");
                 client_builder = client_builder.danger_accept_invalid_certs(true);
             }
 

@@ -41,9 +41,10 @@ struct PluginDef {
 impl HttpPluginManager {
     /// Create a new manager from plugin configs.
     pub fn new(configs: Vec<HttpPluginConfig>) -> Self {
+        // Per-plugin timeout is enforced by tokio::time::timeout below.
+        // No reqwest-level timeout — the tokio wrapper covers connect + full
+        // request lifecycle and respects per-plugin timeout config.
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_default();
         let plugins = configs.into_iter().map(|cfg| PluginDef { cfg }).collect();

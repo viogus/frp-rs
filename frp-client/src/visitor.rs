@@ -166,7 +166,7 @@ pub(crate) async fn run_visitor_listener(
                             // mapped addresses to determine NAT type and behavior.
                             let mut mapped_addrs = Vec::new();
                             for _ in 0..2 {
-                                match frp_core::stun::stun_binding(&stun_server.clone()).await {
+                                match frp_core::stun::stun_binding(&stun_server).await {
                                     Ok(addr) => {
                                         debug!(visitor_name = %visitor_name, addr = %addr, "Visitor '{}': STUN mapped address: {}", visitor_name, addr);
                                         if !mapped_addrs.contains(&addr) {

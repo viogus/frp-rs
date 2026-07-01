@@ -268,9 +268,12 @@ fn dispatch_raw_frame(
             Poll::Ready(Ok(()))
         }
         0x09 => {
+            debug_assert!(payload.len() <= 125, "WS pong payload too long for short framing ({} bytes), would be truncated", payload.len());
             let mut pong = vec![0x8a, payload.len() as u8];
             pong.extend_from_slice(payload);
-            let _ = Pin::new(raw.as_mut()).poll_write(cx, &pong);
+            if let Poll::Ready(Err(e)) = Pin::new(raw.as_mut()).poll_write(cx, &pong) {
+                tracing::debug!(error = %e, "WS pong write failed");
+            }
             cx.waker().wake_by_ref();
             Poll::Pending
         }

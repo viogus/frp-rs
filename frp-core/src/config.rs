@@ -67,7 +67,8 @@ pub struct ServerConfig {
     #[serde(default)]
     pub allow_ports: String,
     /// Maximum number of proxies a single client can register.
-    /// 0 = unlimited (default). Go frp compat: maxPortsPerClient.
+    /// Max ports a single client can occupy. Default 50 to prevent port pool
+    /// exhaustion; set to 0 for unlimited. Go frp compat: maxPortsPerClient.
     #[serde(default)]
     pub max_ports_per_client: u64,
     /// Timeout in seconds for backend HTTP response in VHost handler.
@@ -230,7 +231,7 @@ impl Default for ServerConfig {
             allow_port_start: default_allow_port_start(),
             allow_port_end: default_allow_port_end(),
             allow_ports: String::new(),
-            max_ports_per_client: 0,
+            max_ports_per_client: 50,
             vhost_http_timeout: default_vhost_http_timeout(),
             user_conn_timeout: default_user_conn_timeout(),
             tcp_mux_passthrough: false,
@@ -916,9 +917,13 @@ fn toml_to_json(v: toml::Value) -> serde_json::Value {
         toml::Value::String(s) => serde_json::Value::String(s),
         toml::Value::Integer(i) => serde_json::Value::Number(i.into()),
         toml::Value::Float(f) => {
-            serde_json::Number::from_f64(f)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
+            serde_json::Number::from_f64(f).map_or_else(
+                || {
+                    tracing::warn!(float = %f, "NaN/Inf float value in TOML config replaced with null");
+                    serde_json::Value::Null
+                },
+                serde_json::Value::Number,
+            )
         }
         toml::Value::Boolean(b) => serde_json::Value::Bool(b),
         toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),

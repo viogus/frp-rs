@@ -112,8 +112,8 @@ pub async fn sync_from_state(state: &AppState) {
 
         PROXY_COUNTS_DETAILED.with_label_values(&[pt, pn]).set(1);
         CONNECTION_COUNTS.with_label_values(&[pn, pt]).set(snap.current_conns);
-        TRAFFIC_IN.with_label_values(&[pn, pt]).set(snap.bytes_in as i64);
-        TRAFFIC_OUT.with_label_values(&[pn, pt]).set(snap.bytes_out as i64);
+        TRAFFIC_IN.with_label_values(&[pn, pt]).set(i64::try_from(snap.bytes_in).unwrap_or(i64::MAX));
+        TRAFFIC_OUT.with_label_values(&[pn, pt]).set(i64::try_from(snap.bytes_out).unwrap_or(i64::MAX));
     }
 
     for (pt, count) in &type_counts {
@@ -127,10 +127,13 @@ pub fn render_metrics_text() -> String {
     let mut buf = Vec::new();
     let encoder = TextEncoder::new();
     let metric_families = REGISTRY.gather();
-    encoder
-        .encode(&metric_families, &mut buf)
-        .map(|_| String::from_utf8_lossy(&buf).to_string())
-        .unwrap_or_default()
+    match encoder.encode(&metric_families, &mut buf) {
+        Ok(()) => String::from_utf8_lossy(&buf).to_string(),
+        Err(e) => {
+            tracing::error!(error = %e, "Prometheus text encoding failed");
+            String::new()
+        }
+    }
 }
 
 #[cfg(test)]

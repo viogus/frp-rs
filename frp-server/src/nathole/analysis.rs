@@ -245,13 +245,17 @@ impl MakeHoleRecords {
 
     /// Report success: boost the matching (mode, index) score, max +2 cap at 10.
     fn report_success(&mut self, mode: i32, index: i32) {
+        let mut found = false;
         for s in &mut self.scores {
             if s.mode == mode && s.index == index {
                 s.score = (s.score + 2).min(10);
+                found = true;
                 break;
             }
         }
-        self.last_update_time = Instant::now();
+        if found {
+            self.last_update_time = Instant::now();
+        }
     }
 }
 

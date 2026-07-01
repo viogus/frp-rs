@@ -655,7 +655,16 @@ pub async fn handle_control<S>(
                         if !local_addr_str.is_empty() && !udp_local_to_proxy.contains_key(&local_addr_str) {
                             let fallback_pn = proxy_name
                                 .clone()
-                                .or_else(|| udp_sockets.keys().next().cloned());
+                                .or_else(|| {
+                                    let first = udp_sockets.keys().next().cloned();
+                                    if first.is_some() {
+                                        tracing::debug!(
+                                            local_addr = %local_addr_str,
+                                            "UDP packet local_addr→proxy_name not cached, falling back to first available socket"
+                                        );
+                                    }
+                                    first
+                                });
                             if let Some(ref pn) = fallback_pn {
                                 udp_local_to_proxy.insert(local_addr_str.clone(), pn.clone());
                             }

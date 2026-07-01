@@ -99,18 +99,16 @@ impl HttpProxyAuth {
 }
 
 async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> Result<(), String> {
-    // Read the first line (request line)
+    // Read headers in chunks until \r\n\r\n
     let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
+    let mut chunk = [0u8; 512];
     loop {
-        client.read_exact(&mut byte).await.map_err(|e| format!("read: {e}"))?;
-        buf.push(byte[0]);
-        if buf.len() > 3
-            && buf[buf.len() - 4] == b'\r'
-            && buf[buf.len() - 3] == b'\n'
-            && buf[buf.len() - 2] == b'\r'
-            && buf[buf.len() - 1] == b'\n'
-        {
+        let n = client.read(&mut chunk).await.map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            return Err("connection closed".into());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() >= 4 && buf[buf.len() - 4..] == *b"\r\n\r\n" {
             break;
         }
         if buf.len() > 65536 {

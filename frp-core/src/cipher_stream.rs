@@ -181,8 +181,11 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // SAFETY: W: Unpin guarantees we can project through Pin to access
-        // `state` and `inner` fields. No moves occur — only field mutation.
+        // SAFETY: CipherWriter<W> is Unpin because W: Unpin and all fields are
+        // Unpin. Pin<&mut CipherWriter<W>> is therefore equivalent to &mut
+        // CipherWriter<W>. get_unchecked_mut is sound because we never move
+        // out of `self` — only access fields through the returned &mut
+        // reference.
         let this = unsafe { self.as_mut().get_unchecked_mut() };
 
         // If still in initial Writing state with no buffered data, generate

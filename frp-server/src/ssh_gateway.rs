@@ -16,6 +16,18 @@ use tokio::sync::mpsc;
 use crate::proxy::allocate_port_multi;
 use crate::service::AppState;
 
+/// Constant-time slice comparison for SSH password verification.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
 /// Parsed result from an SSH remote command string.
 #[derive(Debug, PartialEq)]
 struct ParsedProxyArgs {
@@ -254,6 +266,9 @@ impl VirtualControl {
                                 tracing::debug!(
                                     "bridge: intercepted ReqWorkConn -> WorkConnRequest"
                                 );
+                                // proxy_name intentionally empty: ReqWorkConn
+                                // carries no proxy_name in V1 protocol, and
+                                // the work-connection pool does not use it.
                                 let _ = read_work_tx.send(WorkConnRequest {
                                     proxy_name: String::new(),
                                 });
@@ -460,7 +475,7 @@ impl Handler for SshSession {
                 partial_success: false,
             });
         }
-        if password == self.server_token {
+        if constant_time_eq(password.as_bytes(), self.server_token.as_bytes()) {
             Ok(Auth::Accept)
         } else {
             Ok(Auth::Reject {

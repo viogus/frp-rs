@@ -21,11 +21,12 @@ tokio-util.workspace = true
 axum = { workspace = true, optional = true, features = ["ws"] }
 prometheus = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
-rand = { version = "0.10", optional = true }
+rand = { version = "0.10" }
+ring.workspace = true
 
 [features]
 default = ["ssh", "dashboard", "websocket", "quic", "kcp", "oidc", "tls", "http-proxy", "vnet", "compression", "chacha20", "tcp-mux"]
-ssh = ["dep:russh", "dep:rand"]
+ssh = ["dep:russh"]
 dashboard = ["dep:prometheus", "dep:axum", "frp-core/admin-auth"]
 websocket = ["dep:tokio-tungstenite", "frp-core/websocket"]
 quic = ["frp-core/quic"]
