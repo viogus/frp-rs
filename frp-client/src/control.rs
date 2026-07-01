@@ -260,7 +260,7 @@ impl ControlConnection {
 
         let mut login = msg::Login {
             version: Some(VERSION.into()),
-            hostname: Some(hostname()),
+            hostname: Some(hostname().await),
             os: Some(std::env::consts::OS.into()),
             arch: Some(std::env::consts::ARCH.into()),
             user: if self.user.is_empty() { None } else { Some(self.user.clone()) },
@@ -460,27 +460,36 @@ impl ControlConnection {
 }
 
 
-/// Resolve the local hostname. Cached via OnceLock — blocking I/O runs once.
+/// Resolve the local hostname. Cached via OnceLock — blocking I/O runs in
+/// `spawn_blocking` on first call to avoid stalling the tokio worker thread.
 static HOSTNAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-fn hostname() -> String {
-    HOSTNAME.get_or_init(|| {
-        // Read /etc/hostname
-        if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
+fn resolve_hostname() -> String {
+    // Read /etc/hostname
+    if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
+        let trimmed = s.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    // Fallback: run hostname command
+    if let Ok(o) = std::process::Command::new("hostname").output() {
+        if let Ok(s) = String::from_utf8(o.stdout) {
             let trimmed = s.trim().to_string();
             if !trimmed.is_empty() {
                 return trimmed;
             }
         }
-        // Fallback: run hostname command
-        if let Ok(o) = std::process::Command::new("hostname").output() {
-            if let Ok(s) = String::from_utf8(o.stdout) {
-                let trimmed = s.trim().to_string();
-                if !trimmed.is_empty() {
-                    return trimmed;
-                }
-            }
-        }
-        "unknown".into()
-    }).clone()
+    }
+    "unknown".into()
+}
+
+async fn hostname() -> String {
+    if let Some(h) = HOSTNAME.get() {
+        return h.clone();
+    }
+    let h = tokio::task::spawn_blocking(resolve_hostname)
+        .await
+        .unwrap_or_else(|_| "unknown".to_string());
+    HOSTNAME.get_or_init(|| h).clone()
 }
