@@ -104,9 +104,9 @@ jobs:
             PR_NUM="${{ github.event.pull_request.number }}"
             echo "version=pr-${PR_NUM}" >> $GITHUB_OUTPUT
             if [ -z "${VARIANT}" ]; then
-              echo "tags=${IMAGE}:pr-${PR_NUM},${IMAGE}:pr-${PR_NUM}-${SHA}" >> $GITHUB_OUTPUT
+              echo "tags=${IMAGE}:pr-${PR_NUM},${IMAGE}:pr-${PR_NUM}-${SHA},${IMAGE}:pr" >> $GITHUB_OUTPUT
             else
-              echo "tags=${IMAGE}:pr-${PR_NUM}${VARIANT},${IMAGE}:pr-${PR_NUM}-${SHA}${VARIANT}" >> $GITHUB_OUTPUT
+              echo "tags=${IMAGE}:pr-${PR_NUM}${VARIANT},${IMAGE}:pr-${PR_NUM}-${SHA}${VARIANT},${IMAGE}:pr${VARIANT}" >> $GITHUB_OUTPUT
             fi
           else
             # Push / manual: tag as test-SHA
