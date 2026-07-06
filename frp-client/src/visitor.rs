@@ -215,15 +215,24 @@ pub(crate) async fn run_visitor_listener(
                             debug!(visitor_name = %visitor_name, sn = %sn, "Visitor '{}': sent NatHoleVisitor on control connection for '{}'", visitor_name, sn);
 
                             // --- Wait for NatHoleResp from control loop ---
-                            let resp = match reply_rx.await {
-                                Ok(Ok(resp)) => resp,
-                                Ok(Err(e)) => {
+                            // Timeout after 15s (server NAT_HOLE_TIMEOUT is 10s)
+                            let resp = match tokio::time::timeout(
+                                Duration::from_secs(15),
+                                reply_rx,
+                            ).await {
+                                Ok(Ok(Ok(resp))) => resp,
+                                Ok(Ok(Err(e))) => {
                                     warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': NatHoleResp error from server: {}", visitor_name, e);
                                     if keep_tunnel_open && attempt < max_retries { continue; }
                                     return;
                                 }
-                                Err(_) => {
+                                Ok(Err(_)) => {
                                     warn!(visitor_name = %visitor_name, "Visitor '{}': NatHoleResp channel closed (control loop dropped)", visitor_name);
+                                    if keep_tunnel_open && attempt < max_retries { continue; }
+                                    return;
+                                }
+                                Err(_elapsed) => {
+                                    warn!(visitor_name = %visitor_name, "Visitor '{}': NatHoleResp timed out after 15s", visitor_name);
                                     if keep_tunnel_open && attempt < max_retries { continue; }
                                     return;
                                 }

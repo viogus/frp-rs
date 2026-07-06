@@ -204,7 +204,7 @@ pub async fn handle_control<S>(
         );
         if let Err(e) = write_ctl_msg(&mut stream, &resp, v2).await {
             warn!(peer = ?peer, error = %e, "Failed to send login response to {:?}: {}", peer, e);
-            proxy_ops::unregister_control(&state, &run_id).await;
+            proxy_ops::unregister_control(&state, &run_id, false).await;
             return;
         }
         // Flush TLS stream to ensure LoginResp reaches KCP before we wrap in CipherStream
@@ -249,14 +249,14 @@ pub async fn handle_control<S>(
                     }
                     Err(e) => {
                         warn!(peer = ?peer, error = %e, "Failed to create AEAD stream for {:?}: {}", peer, e);
-                        proxy_ops::unregister_control(&state, &run_id).await;
+                        proxy_ops::unregister_control(&state, &run_id, false).await;
                         return;
                     }
                 }
             }
             Err(e) => {
                 warn!(peer = ?peer, error = %e, "Failed to derive AEAD keys for {:?}: {}", peer, e);
-                proxy_ops::unregister_control(&state, &run_id).await;
+                proxy_ops::unregister_control(&state, &run_id, false).await;
                 return;
             }
         }
@@ -281,7 +281,7 @@ pub async fn handle_control<S>(
             for i in 0..pool_count {
                 if let Err(e) = write_ctl_msg(&mut cipher, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
                     warn!(peer = ?peer, error = %e, i = i, "Failed to send ReqWorkConn #{}/{}: {}", i, pool_count, e);
-                    proxy_ops::unregister_control(&state, &run_id).await;
+                    proxy_ops::unregister_control(&state, &run_id, false).await;
                     return;
                 }
             }
@@ -618,6 +618,7 @@ pub async fn handle_control<S>(
                     }
                     Some(InternalMsg::Shutdown) => {
                         warn!(run_id = %run_id, "Shutdown received for run_id {} (replaced by new control connection)", run_id);
+                        shutting_down = true;
                         break;
                     }
                     #[cfg(feature = "vnet")]
@@ -1312,7 +1313,7 @@ pub async fn handle_control<S>(
             run_id: run_id.clone(),
         });
     }
-    proxy_ops::unregister_control(&state, &run_id).await;
+    proxy_ops::unregister_control(&state, &run_id, shutting_down).await;
     state.proxy_manager.remove_client(&run_id).await;
     info!(run_id = %run_id, "Control connection {} removed", run_id);
 }

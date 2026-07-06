@@ -488,9 +488,11 @@ pub(crate) async fn listen_and_proxy(
 
 
 
-pub(crate) async fn unregister_control(state: &Arc<AppState>, run_id: &str) {
-    // Scope the run_id_to_ctl_tx lock to just the remove call
-    {
+pub(crate) async fn unregister_control(state: &Arc<AppState>, run_id: &str, skip_ctl_unregister: bool) {
+    // When shutting down due to supersession (duplicate run_id), the new
+    // handler has already inserted its ControlTx. Skip removal to avoid
+    // deleting the replacement's entry.
+    if !skip_ctl_unregister {
         let mut map = state.run_id_to_ctl_tx.write().await;
         map.remove(run_id);
     }
