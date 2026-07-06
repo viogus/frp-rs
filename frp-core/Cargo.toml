@@ -34,6 +34,7 @@ ring = { workspace = true }
 yamux = { workspace = true, optional = true }
 tokio-util.workspace = true
 kcp = { workspace = true, optional = true }
+rust_tokio_kcp = { workspace = true, optional = true }
 quinn = { workspace = true, optional = true }
 
 socket2.workspace = true
@@ -50,7 +51,7 @@ admin-auth = ["dep:axum"]
 compression = ["dep:snap"]
 chacha20 = ["dep:chacha20poly1305"]
 quic = ["dep:quinn", "tls"]
-kcp = ["dep:kcp"]
+kcp = ["dep:kcp", "dep:rust_tokio_kcp"]
 websocket = ["dep:tokio-tungstenite"]
 oidc = ["dep:jsonwebtoken", "dep:reqwest"]
 vnet = []
