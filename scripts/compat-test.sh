@@ -4479,12 +4479,15 @@ run_test test_g2r_ws_encrypted
 run_test test_r2g_ws_encrypted
 
 # Phase 6b: WebSocket Secure (WSS) transport
-# TODO: fix WSS — tests fail with proxy port not reachable.
-# Likely TLS cert trust or WS upgrade detection issue.
-# run_test test_g2r_wss_plain
-# run_test test_r2g_wss_plain
-# run_test test_g2r_wss_encrypted
-# run_test test_r2g_wss_encrypted
+# NOTE: These tests previously failed with "proxy port not reachable".
+# Suspected root cause: TLS cert trust or WS upgrade detection mismatch
+# between Go and Rust WSS implementations.
+# TODO(wss): diagnose and fix — enable TLS debug logging on both sides
+# to capture the exact handshake failure point.
+run_test test_g2r_wss_plain
+run_test test_r2g_wss_plain
+run_test test_g2r_wss_encrypted
+run_test test_r2g_wss_encrypted
 
 # Phase 7: Plugin
 run_test test_g2r_socks5
