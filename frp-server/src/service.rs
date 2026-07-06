@@ -28,6 +28,19 @@ use crate::control;
 pub use crate::state::{InternalMsg, ControlTx, ReloadableState, AppState};
 
 // ---------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------
+
+/// Check if a 7-byte buffer matches the V2 protocol magic bytes.
+/// This check is repeated across all transport paths (TCP, KCP, QUIC, WS,
+/// with/without TLS, with/without yamux) — ~16 locations total.
+/// See V2_MAGIC_BYTES in frp_core::protocol.
+#[inline]
+fn is_v2_magic(buf: &[u8]) -> bool {
+    buf.len() >= 7 && buf[..7] == frp_core::protocol::V2_MAGIC_BYTES
+}
+
+// ---------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------
 
@@ -37,6 +50,8 @@ pub struct Service {
     /// Path to config file for SIGUSR1 reload.
     #[allow(dead_code)]
     config_file: Option<String>,
+    #[allow(dead_code)]
+    max_connections: usize,
 }
 
 impl Service {
@@ -92,6 +107,7 @@ impl Service {
             vec![(cfg.allow_port_start, cfg.allow_port_end)]
         };
         let sub_host = cfg.sub_domain_host.clone();
+        let max_connections: usize = 10000;
         let mut state = AppState::new(
             auth_cfg,
             if cfg.proxy_bind_addr.is_empty() {
@@ -117,6 +133,7 @@ impl Service {
             cfg.max_ports_per_client,
             cfg.nat_hole_analysis_data_reserve_hours,
             cfg.detailed_errors_to_client,
+            max_connections,
         );
 
         // Initialize prometheus registry when enabled
@@ -142,6 +159,7 @@ impl Service {
             state: Arc::new(state),
             cfg,
             config_file,
+            max_connections,
         })
     }
 
@@ -196,7 +214,14 @@ impl Service {
                                 if let Ok((stream, addr)) = result {
                             info!(addr = %addr, "New WebSocket connection from {}", addr);
                             let state = ws_state.clone();
+                            let permit = state.conn_semaphore.as_ref()
+                                .and_then(|s| s.clone().try_acquire_owned().ok());
+                            if permit.is_none() && state.conn_semaphore.is_some() {
+                                warn!(addr = %addr, "Max connections reached, rejecting WebSocket from {}", addr);
+                                continue;
+                            }
                             tokio::spawn(async move {
+                                let _permit = permit;
                                 match frp_core::transport::accept_websocket(IoStream::Tcp(stream)).await {
                                     Ok(mut ws) => {
                                         info!(addr = %addr, "WebSocket upgrade completed for {}", addr);
@@ -204,7 +229,7 @@ impl Service {
                                         // Try V2 magic detection
                                         let mut magic = [0u8; 7];
                                         let is_v2 = match ws.read_exact(&mut magic).await {
-                                            Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                            Ok(_) => is_v2_magic(&magic),
                                             Err(_) => false,
                                         };
 
@@ -270,7 +295,7 @@ impl Service {
                                                             // V2 detection on yamux stream
                                                             let mut magic = [0u8; 7];
                                                             let is_v2 = match io.read_exact(&mut magic).await {
-                                                                Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                                                Ok(_) => is_v2_magic(&magic),
                                                                 Err(_) => false,
                                                             };
                                                             if is_v2 {
@@ -331,7 +356,7 @@ impl Service {
 
                                                     let mut chicken = [0u8; 7];
                                                     let is_tls_v2 = match io.read_exact(&mut chicken).await {
-                                                        Ok(_) => chicken == frp_core::protocol::V2_MAGIC_BYTES,
+                                                        Ok(_) => is_v2_magic(&chicken),
                                                         Err(_) => false,
                                                     };
                                                     if is_tls_v2 {
@@ -522,8 +547,16 @@ impl Service {
                                 Ok(stream) => {
                                     tracing::debug!("KCP ACCEPT: got stream, spawning handler");
                                     let state = kcp_state.clone();
-                            tokio::spawn(async move {
-                                let peer = stream.peer_addr;
+                                    let addr = stream.peer_addr;
+                                    let permit = state.conn_semaphore.as_ref()
+                                        .and_then(|s| s.clone().try_acquire_owned().ok());
+                                    if permit.is_none() && state.conn_semaphore.is_some() {
+                                        warn!(addr = %addr, "Max connections reached, rejecting KCP from {}", addr);
+                                        continue;
+                                    }
+                                    tokio::spawn(async move {
+                                        let _permit = permit;
+                                        let peer = stream.peer_addr;
                                 let conv = stream.conv();
                                 tracing::debug!("KCP HANDLER: spawned peer={} conv={}", peer, conv);
                                 tracing::info!(peer = %peer, conv = conv, "KCP handler: spawned for {} conv={}", peer, conv);
@@ -532,7 +565,7 @@ impl Service {
                                 // Try V2 magic detection
                                 let mut magic = [0u8; 7];
                                 let is_v2 = match ctl.read_exact(&mut magic).await {
-                                    Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                    Ok(_) => is_v2_magic(&magic),
                                     Err(e) => {
                                         tracing::debug!(peer = %peer, error = %e, "KCP: failed to read initial 7 bytes from {}", peer);
                                         false
@@ -633,7 +666,7 @@ impl Service {
 
                                                         let mut yamux_magic = [0u8; 7];
                                                         let is_v2 = match io.read_exact(&mut yamux_magic).await {
-                                                            Ok(_) => yamux_magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                                            Ok(_) => is_v2_magic(&yamux_magic),
                                                             Err(_) => false,
                                                         };
                                                         if is_v2 {
@@ -670,6 +703,14 @@ impl Service {
                                                                     tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP TLS+yamux NewWorkConn from {}", peer);
                                                                     crate::handlers::handle_work_conn_inner(io, nwc, state).await;
                                                                 }
+                                                                Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
+                                                                    tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP TLS+yamux NewVisitorConn from {}", peer);
+                                                                    crate::handlers::handle_visitor_conn_inner(io, nvc, state, false).await;
+                                                                }
+                                                                Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
+                                                                    tracing::info!(peer = %peer, "KCP TLS+yamux NatHoleVisitor from {}", peer);
+                                                                    crate::handlers::handle_nat_hole_visitor(io, nhv, state, None, false).await;
+                                                                }
                                                                 Ok(other) => {
                                                                     tracing::warn!(peer = %peer, other = ?other.v1_type_byte(), "Unexpected KCP TLS+yamux message: {:?}", other.v1_type_byte());
                                                                 }
@@ -692,7 +733,7 @@ impl Service {
                                             // After TLS: detect V2 then V1 on the decrypted stream
                                             let mut tls_magic = [0u8; 7];
                                             let is_v2 = match ctl.read_exact(&mut tls_magic).await {
-                                                Ok(_) => tls_magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                                Ok(_) => is_v2_magic(&tls_magic),
                                                 Err(_) => false,
                                             };
                                             if is_v2 {
@@ -781,6 +822,14 @@ impl Service {
                                                                 tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP TLS NewWorkConn from {}", peer);
                                                                 crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
                                                             }
+                                                            Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
+                                                                tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP TLS NewVisitorConn from {}", peer);
+                                                                crate::handlers::handle_visitor_conn_inner(ctl, nvc, state, false).await;
+                                                            }
+                                                            Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
+                                                                tracing::info!(peer = %peer, "KCP TLS NatHoleVisitor from {}", peer);
+                                                                crate::handlers::handle_nat_hole_visitor(ctl, nhv, state, None, false).await;
+                                                            }
                                                             Ok(other) => {
                                                                 tracing::warn!(other = ?other.v1_type_byte(), "Unexpected KCP TLS message: {:?}", other.v1_type_byte());
                                                             }
@@ -818,7 +867,7 @@ impl Service {
                                                 // V2 magic detection on yamux stream
                                                 let mut yamux_magic = [0u8; 7];
                                                 let is_v2 = match io.read_exact(&mut yamux_magic).await {
-                                                    Ok(_) => yamux_magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                                    Ok(_) => is_v2_magic(&yamux_magic),
                                                     Err(_) => false,
                                                 };
                                                 if is_v2 {
@@ -855,6 +904,14 @@ impl Service {
                                                             tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP yamux NewWorkConn from {}", peer);
                                                             crate::handlers::handle_work_conn_inner(io, nwc, state).await;
                                                         }
+                                                        Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
+                                                            tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP yamux NewVisitorConn from {}", peer);
+                                                            crate::handlers::handle_visitor_conn_inner(io, nvc, state, false).await;
+                                                        }
+                                                        Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
+                                                            tracing::info!(peer = %peer, "KCP yamux NatHoleVisitor from {}", peer);
+                                                            crate::handlers::handle_nat_hole_visitor(io, nhv, state, None, false).await;
+                                                        }
                                                         Ok(other) => {
                                                             tracing::warn!(peer = %peer, other = ?other.v1_type_byte(), "Unexpected KCP yamux message: {:?}", other.v1_type_byte());
                                                         }
@@ -879,6 +936,14 @@ impl Service {
                                             Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                                 tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP NewWorkConn from {}", peer);
                                                 crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
+                                            }
+                                            Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
+                                                tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP NewVisitorConn from {}", peer);
+                                                crate::handlers::handle_visitor_conn_inner(ctl, nvc, state, false).await;
+                                            }
+                                            Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
+                                                tracing::info!(peer = %peer, "KCP NatHoleVisitor from {}", peer);
+                                                crate::handlers::handle_nat_hole_visitor(ctl, nhv, state, None, false).await;
                                             }
                                             Ok(other) => {
                                                 tracing::warn!(other = ?other.v1_type_byte(), "Unexpected KCP message: {:?}", other.v1_type_byte());
@@ -948,7 +1013,15 @@ impl Service {
                             match result {
                                 Ok(conn) => {
                                     let state = quic_state.clone();
+                                    let quic_addr = conn.remote_address();
+                                    let permit = state.conn_semaphore.as_ref()
+                                        .and_then(|s| s.clone().try_acquire_owned().ok());
+                                    if permit.is_none() && state.conn_semaphore.is_some() {
+                                        warn!(addr = %quic_addr, "Max connections reached, rejecting QUIC from {}", quic_addr);
+                                        continue;
+                                    }
                                     tokio::spawn(async move {
+                                        let _permit = permit;
                                         // Accept first bidirectional stream (control channel).
                                         // This is inside the handler, not in the accept loop —
                                         // matching Go frp's HandleQUICListener pattern where
@@ -998,7 +1071,7 @@ impl Service {
             // V2 detection, matching Go frp's WriteMagicIfV2() per stream.
             let mut magic = [0u8; 7];
             let is_v2 = match ctl.read_exact(&mut magic).await {
-                Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                Ok(_) => is_v2_magic(&magic),
                 Err(_) => false,
             };
 
@@ -1080,7 +1153,7 @@ impl Service {
                                         let mut wc = frp_core::transport::IoStream::Quic(work_stream);
                                         let mut wmagic = [0u8; 7];
                                         let w_is_v2 = match wc.read_exact(&mut wmagic).await {
-                                            Ok(_) => wmagic == frp_core::protocol::V2_MAGIC_BYTES,
+                                            Ok(_) => is_v2_magic(&wmagic),
                                             Err(_) => false,
                                         };
                                         if w_is_v2 {
@@ -1158,15 +1231,23 @@ impl Service {
         // but if the provider crashes or the network drops, this ensures sessions
         // older than 2 minutes don't leak memory.
         let nat_hole = self.state.nat_hole.clone();
+        let nat_shutdown_token = self.state.shutdown_token.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
-                interval.tick().await;
-                nat_hole.expire_sessions(Duration::from_secs(120)).await;
-                // Clean expired analyzer entries to prevent unbounded memory growth.
-                let (removed, total) = nat_hole.analyzer.clean();
-                if removed > 0 {
-                    tracing::debug!(removed = %removed, total = %total, "Analyzer cleanup: removed {}/{} expired entries", removed, total);
+                tokio::select! {
+                    _ = interval.tick() => {
+                        nat_hole.expire_sessions(Duration::from_secs(120)).await;
+                        // Clean expired analyzer entries to prevent unbounded memory growth.
+                        let (removed, total) = nat_hole.analyzer.clean();
+                        if removed > 0 {
+                            tracing::debug!(removed = %removed, total = %total, "Analyzer cleanup: removed {}/{} expired entries", removed, total);
+                        }
+                    }
+                    _ = nat_shutdown_token.cancelled() => {
+                        tracing::debug!("NAT cleanup task: shutdown requested, stopping");
+                        break;
+                    }
                 }
             }
         });
@@ -1192,40 +1273,47 @@ impl Service {
                 // Skip the first tick (fires immediately).
                 interval.tick().await;
                 loop {
-                    interval.tick().await;
-                    // Stat cert and key files. If either mtime changed, rebuild.
-                    let cert_meta = match std::fs::metadata(&cert_file) {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
-                    let key_meta = match std::fs::metadata(&key_file) {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
-                    let cert_mtime = cert_meta.modified().ok();
-                    let key_mtime = key_meta.modified().ok();
-                    let cert_changed = cert_mtime != last_cert_mtime;
-                    let key_changed = key_mtime != last_key_mtime;
-                    if cert_changed || key_changed {
-                        last_cert_mtime = cert_mtime;
-                        last_key_mtime = key_mtime;
-                        let ca = ca_file.as_deref();
-                        match build_tls_acceptor_or_generate(&cert_file, &key_file, ca) {
-                            Ok(new_acceptor) => {
-                                let mut guard = poll_state.tls_acceptor.write().unwrap();
-                                *guard = Some(new_acceptor);
-                                tracing::info!(
-                                    "TLS certificate hot-reloaded (cert: {}, key: {})",
-                                    cert_file,
-                                    key_file
-                                );
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            // Stat cert and key files. If either mtime changed, rebuild.
+                            let cert_meta = match std::fs::metadata(&cert_file) {
+                                Ok(m) => m,
+                                Err(_) => continue,
+                            };
+                            let key_meta = match std::fs::metadata(&key_file) {
+                                Ok(m) => m,
+                                Err(_) => continue,
+                            };
+                            let cert_mtime = cert_meta.modified().ok();
+                            let key_mtime = key_meta.modified().ok();
+                            let cert_changed = cert_mtime != last_cert_mtime;
+                            let key_changed = key_mtime != last_key_mtime;
+                            if cert_changed || key_changed {
+                                last_cert_mtime = cert_mtime;
+                                last_key_mtime = key_mtime;
+                                let ca = ca_file.as_deref();
+                                match build_tls_acceptor_or_generate(&cert_file, &key_file, ca) {
+                                    Ok(new_acceptor) => {
+                                        let mut guard = poll_state.tls_acceptor.write().unwrap();
+                                        *guard = Some(new_acceptor);
+                                        tracing::info!(
+                                            "TLS certificate hot-reloaded (cert: {}, key: {})",
+                                            cert_file,
+                                            key_file
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to reload TLS certificate: {} (keeping old config)",
+                                            e
+                                        );
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                tracing::error!(
-                                    "Failed to reload TLS certificate: {} (keeping old config)",
-                                    e
-                                );
-                            }
+                        }
+                        _ = poll_state.shutdown_token.cancelled() => {
+                            tracing::debug!("TLS hot-reload task: shutdown requested, stopping");
+                            break;
                         }
                     }
                 }
@@ -1254,7 +1342,14 @@ impl Service {
                     #[cfg(feature = "tls")]
                     let acceptor = state.tls_acceptor.read().unwrap().clone();
 
+                    let permit = state.conn_semaphore.as_ref()
+                        .and_then(|s| s.clone().try_acquire_owned().ok());
+                    if permit.is_none() && state.conn_semaphore.is_some() {
+                        warn!(addr = %addr, "Max connections reached, rejecting connection from {}", addr);
+                        continue;
+                    }
                     tokio::spawn(async move {
+                        let _permit = permit;
                         let (ct, mut stream_io) = match detect_and_strip_magic(stream).await {
                             Ok((c, s)) => (c, s),
                             Err(e) => {
@@ -1443,7 +1538,7 @@ impl Service {
                                             let mut magic = [0u8; 7];
                                             let is_v2 = match ws.read_exact(&mut magic).await {
                                                 Ok(_) => {
-                                                    magic == frp_core::protocol::V2_MAGIC_BYTES
+                                                    is_v2_magic(&magic)
                                                 }
                                                 Err(e) => {
                                                     warn!(addr = %addr, error = %e, "WS+TLS failed to read first 7 bytes: {}", e);
@@ -1490,7 +1585,7 @@ impl Service {
                                                         // Try V2 detection on yamux stream
                                                         let mut v2_magic = [0u8; 7];
                                                         let is_v2 = match io.read_exact(&mut v2_magic).await {
-                                                            Ok(_) => v2_magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                                            Ok(_) => is_v2_magic(&v2_magic),
                                                             Err(_) => false,
                                                         };
                                                         if is_v2 {
@@ -1593,7 +1688,7 @@ impl Service {
                                             // Try V2 detection on yamux stream (Go frp: magic on stream)
                                             let mut magic = [0u8; 7];
                                             let is_v2 = match io.read_exact(&mut magic).await {
-                                                Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                                Ok(_) => is_v2_magic(&magic),
                                                 Err(_) => false,
                                             };
                                             if is_v2 {
@@ -1656,7 +1751,7 @@ impl Service {
                                     // Try V2 magic detection
                                     let mut magic = [0u8; 7];
                                     let is_v2 = match io.read_exact(&mut magic).await {
-                                        Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                        Ok(_) => is_v2_magic(&magic),
                                         Err(_) => false,
                                     };
 
@@ -1771,7 +1866,7 @@ impl Service {
                                         let mut magic = [0u8; 7];
                                         let is_v2 = match ws.read_exact(&mut magic).await {
                                             Ok(_) => {
-                                                let matches = magic == frp_core::protocol::V2_MAGIC_BYTES;
+                                                let matches = is_v2_magic(&magic);
                                                 debug!(
                                                     addr = %addr,
                                                     magic_hex = %magic.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(""),
@@ -1855,7 +1950,7 @@ impl Service {
                                                             // V2 detection on yamux stream
                                                             let mut magic = [0u8; 7];
                                                             let is_v2 = match io.read_exact(&mut magic).await {
-                                                                Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                                                Ok(_) => is_v2_magic(&magic),
                                                                 Err(_) => false,
                                                             };
                                                             if is_v2 {
@@ -1917,7 +2012,7 @@ impl Service {
                                                     // V2 chicken check on the decrypted TLS stream
                                                     let mut chicken = [0u8; 7];
                                                     let is_tls_v2 = match io.read_exact(&mut chicken).await {
-                                                        Ok(_) => chicken == frp_core::protocol::V2_MAGIC_BYTES,
+                                                        Ok(_) => is_v2_magic(&chicken),
                                                         Err(_) => false,
                                                     };
                                                     if is_tls_v2 {
@@ -2142,7 +2237,7 @@ impl Service {
                                             // Go frp sends V2 magic on yamux stream (not raw TCP) when tcpMux.
                                             let mut magic = [0u8; 7];
                                             let is_v2 = match io.read_exact(&mut magic).await {
-                                                Ok(_) => magic == frp_core::protocol::V2_MAGIC_BYTES,
+                                                Ok(_) => is_v2_magic(&magic),
                                                 Err(_) => false,
                                             };
                                             if is_v2 {
