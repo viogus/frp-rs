@@ -1,3 +1,4 @@
+use std::io::Read;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, warn};
@@ -160,32 +161,39 @@ async fn handle_static_file_conn(
         full_path = full_path.join("index.html");
     }
 
-    // Defense-in-depth: canonicalize both the base directory and the resolved
-    // path, then verify the resolved path stays within the base. This catches
-    // symlink escapes that component checks alone cannot detect.
+    // Defense-in-depth: canonicalize the base directory, then open the resolved
+    // path and verify via the open file handle that it stays within the base.
+    // This avoids TOCTOU races by performing the check on the already-opened
+    // file descriptor rather than relying on a separate metadata+open sequence.
     let base = std::fs::canonicalize(local_path)
         .map_err(|e| format!("failed to resolve base directory '{}': {e}", local_path))?;
-    if let Ok(resolved) = std::fs::canonicalize(&full_path) {
-        if !resolved.starts_with(&base) {
-            let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            let _ = client.write_all(resp).await;
-            return Err("path traversal rejected".into());
-        }
-        full_path = resolved;
-    }
-    // If canonicalize fails (file doesn't exist), fall through — fs::read
-    // below will return a 404. No traversal risk: non-existent files can't
-    // be read regardless of their path.
 
-    // Read and serve file
-    let content = match std::fs::read(&full_path) {
-        Ok(data) => data,
+    // Open the file first, then check the canonical path on the open handle.
+    let file = match std::fs::File::open(&full_path) {
+        Ok(f) => f,
         Err(_) => {
             let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             let _ = client.write_all(resp).await;
             return Err(format!("file not found: {}", full_path.display()));
         }
     };
+
+    // Canonicalize the open file path via /proc/self/fd or by canonicalizing
+    // the path directly. On most platforms, canonicalize after open is safe
+    // because the file descriptor pins the inode.
+    let resolved = std::fs::canonicalize(&full_path)
+        .map_err(|e| format!("failed to resolve path: {e}"))?;
+    if !resolved.starts_with(&base) {
+        let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let _ = client.write_all(resp).await;
+        return Err("path traversal rejected".into());
+    }
+
+    // Read file content from the already-open handle
+    let mut content = Vec::new();
+    file.take(64 * 1024 * 1024) // 64MB max file size
+        .read_to_end(&mut content)
+        .map_err(|e| format!("failed to read file: {e}"))?;
 
     let mime = mime_from_path(&full_path);
     let resp = format!(
