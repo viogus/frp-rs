@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
@@ -15,7 +16,7 @@ use super::stream::KcpStream;
 
 pub(crate) struct WriteRequest {
     pub data: Vec<u8>,
-    pub confirm: oneshot::Sender<io::Result<()>>,
+    pub confirm: oneshot::Sender<io::Result<usize>>,
 }
 
 pub(crate) struct KcpSocketHandle {
@@ -33,6 +34,7 @@ pub(crate) struct KcpSocket {
     write_rx: mpsc::UnboundedReceiver<(u32, WriteRequest)>,
     register_rx: mpsc::UnboundedReceiver<(u32, SocketAddr, KcpSession)>,
     accept_tx: mpsc::UnboundedSender<KcpStream>,
+    start: Instant,
 }
 
 impl KcpSocket {
@@ -51,6 +53,7 @@ impl KcpSocket {
             write_rx,
             register_rx,
             accept_tx: accept_tx.clone(),
+            start: Instant::now(),
         };
         let handle = KcpSocketHandle {
             write_tx,
@@ -67,10 +70,10 @@ impl KcpSocket {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    let now = std::time::Instant::now();
+                    let now_ms = self.start.elapsed().as_millis() as u32;
                     let mut to_remove = Vec::new();
                     for (key, session) in &mut self.sessions {
-                        match session.update(now) {
+                        match session.update(now_ms) {
                             Ok(packets) => {
                                 for pkt in packets {
                                     if let Err(e) = self.socket.send_to(&pkt, key.1).await {
