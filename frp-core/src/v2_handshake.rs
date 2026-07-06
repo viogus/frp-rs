@@ -476,3 +476,64 @@ pub async fn v2_handshake_server(
         ))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ring::digest;
+
+    /// Build a transcript part from the spec:
+    /// part(label, payload) = "\x00" || label || "\x00" || BE64(len(payload)) || payload
+    fn make_part(label: &str, payload: &[u8]) -> Vec<u8> {
+        let mut part = Vec::new();
+        part.push(0u8);
+        part.extend_from_slice(label.as_bytes());
+        part.push(0u8);
+        part.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        part.extend_from_slice(payload);
+        part
+    }
+
+    /// Compute expected transcript hash directly from the spec.
+    fn expected_transcript_hash(ch: &[u8], sh: &[u8]) -> Vec<u8> {
+        let mut ctx = digest::Context::new(&digest::SHA256);
+        ctx.update(CRYPTO_TRANSCRIPT_LABEL.as_bytes());
+        ctx.update(&make_part("client hello", ch));
+        ctx.update(&make_part("server hello", sh));
+        ctx.finish().as_ref().to_vec()
+    }
+
+    #[test]
+    fn transcript_hash_known_payloads() {
+        let ch = br#"{"test":"client"}"#;
+        let sh = br#"{"test":"server"}"#;
+        let result = compute_transcript_hash(ch, sh);
+        let expected = expected_transcript_hash(ch, sh);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn transcript_hash_empty_payloads() {
+        let result = compute_transcript_hash(b"", b"");
+        let expected = expected_transcript_hash(b"", b"");
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn transcript_hash_asymmetric_payloads() {
+        let ch = b"client payload";
+        let sh = br#"{"error":"rejected"}"#;
+        let result = compute_transcript_hash(ch, sh);
+        let expected = expected_transcript_hash(ch, sh);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn transcript_hash_large_payloads() {
+        let ch = vec![b'C'; 4096];
+        let sh = vec![b'S'; 4096];
+        let result = compute_transcript_hash(&ch, &sh);
+        let expected = expected_transcript_hash(&ch, &sh);
+        assert_eq!(result, expected);
+    }
+}

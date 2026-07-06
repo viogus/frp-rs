@@ -30,7 +30,7 @@ where
 {
     let enabled = !user.is_empty() || !password.is_empty();
     if enabled {
-        tracing::error!(
+        tracing::warn!(
             "Admin API: Basic Auth enabled without TLS — credentials sent in plaintext. \
              Use a reverse proxy with TLS termination in production."
         );
@@ -47,25 +47,32 @@ where
     let state = Arc::new(AuthState { enabled, expected_header: expected });
 
     async fn check_auth(req: Request, next: Next) -> Response {
-        let state = req.extensions().get::<Arc<AuthState>>().cloned();
-        if let Some(s) = state {
-            if s.enabled {
-                let ok = req
-                    .headers()
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|v| v == s.expected_header)
-                    .unwrap_or(false);
-                if !ok {
-                    // Match Go frp's authFailDelay (200ms) to slow brute-force attacks
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        [("www-authenticate", "Basic realm=\"frp\"")],
-                        "Unauthorized",
-                    )
-                        .into_response();
-                }
+        let state = match req.extensions().get::<Arc<AuthState>>().cloned() {
+            Some(s) => s,
+            None => {
+                // Extension not injected — middleware layer was not properly
+                // applied. This is a configuration/programming error, not a
+                // client auth failure. Return 500 so the operator notices.
+                tracing::error!("Admin auth middleware: AuthState extension missing — middleware layer not properly applied");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Internal configuration error").into_response();
+            }
+        };
+        if state.enabled {
+            let ok = req
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v == state.expected_header)
+                .unwrap_or(false);
+            if !ok {
+                // Match Go frp's authFailDelay (200ms) to slow brute-force attacks
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    [("www-authenticate", "Basic realm=\"frp\"")],
+                    "Unauthorized",
+                )
+                    .into_response();
             }
         }
         next.run(req).await

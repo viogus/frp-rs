@@ -104,7 +104,7 @@ impl Default for TcpMuxConfig {
 }
 
 #[cfg(feature = "tcp-mux")]
-fn yamux_config(_cfg: &TcpMuxConfig) -> Config {
+fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     let mut cfg = Config::default();
     // Match Go frp's hashicorp/yamux settings for compatibility.
     // yamux-rs default: 1 GiB connection window, 512 streams.
@@ -113,6 +113,10 @@ fn yamux_config(_cfg: &TcpMuxConfig) -> Config {
     //   Use 128 MiB for safety margin.
     cfg.set_max_connection_receive_window(Some(128 * 1024 * 1024));
     cfg.set_max_num_streams(256);
+    // NOTE: yamux 0.14.0 does not expose set_keepalive_interval on Config.
+    // Keepalive is instead implemented via timeout-based poll loops in
+    // server_mux and client_mux background tasks.
+    let _ = tcp_mux_cfg.keepalive_interval;
     cfg
 }
 
@@ -186,19 +190,33 @@ where
     // StreamCommand::SendFrame AFTER draining pending_frames. The first
     // poll picks up queued stream writes into pending_frames; the second
     // poll actually sends them on the wire.
+    let keepalive = mux_cfg.keepalive_interval;
     tokio::task::spawn(async move {
         loop {
-            let result = poll_fn(|cx| {
-                match conn.poll_next_inbound(cx) {
-                    Poll::Ready(r) => Poll::Ready(r),
-                    Poll::Pending => {
-                        // Second poll: flush pending_frames to socket
-                        conn.poll_next_inbound(cx)
+            let result = tokio::time::timeout(
+                keepalive,
+                poll_fn(|cx| {
+                    match conn.poll_next_inbound(cx) {
+                        Poll::Ready(r) => Poll::Ready(r),
+                        Poll::Pending => {
+                            // Second poll: flush pending_frames to socket
+                            conn.poll_next_inbound(cx)
+                        }
                     }
-                }
-            }).await;
+                }),
+            ).await;
 
-            match result {
+            let stream = match result {
+                Ok(r) => r,
+                Err(_elapsed) => {
+                    // Keepalive: idle connection. poll_next_inbound was
+                    // called (driving I/O including next_ping()), but
+                    // no new stream arrived within keepalive_interval.
+                    continue;
+                }
+            };
+
+            match stream {
                 Some(Ok(stream)) => {
                     let compat = stream.compat();
                     if tx.send(compat).is_err() {
@@ -268,6 +286,7 @@ where
 
     let conn = Arc::new(Mutex::new(conn));
     let bg_conn = conn.clone();
+    let keepalive = mux_cfg.keepalive_interval;
 
     tokio::task::spawn(async move {
         loop {
@@ -336,6 +355,13 @@ where
                             break;
                         }
                     }
+                }
+                // Keepalive: periodically drive I/O so yamux's next_ping()
+                // fires and detects dead peers even on idle connections.
+                _ = tokio::time::sleep(keepalive) => {
+                    let _ = poll_fn(|cx| {
+                        bg_conn.lock().unwrap().poll_next_inbound(cx)
+                    }).await;
                 }
             }
         }

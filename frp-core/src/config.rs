@@ -837,7 +837,7 @@ pub struct ProxyConfig {
 
 /// STCP/XTCP visitor configuration — used by frpc to expose a local port
 /// that tunnels traffic to a remote STCP/XTCP proxy through the frps server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VisitorConfig {
     /// Name for this visitor (used in logs).
     #[serde(default)]

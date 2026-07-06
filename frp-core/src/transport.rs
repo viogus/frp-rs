@@ -269,9 +269,19 @@ fn dispatch_raw_frame(
             Poll::Ready(Ok(()))
         }
         0x09 => {
-            debug_assert!(payload.len() <= 125, "WS pong payload too long for short framing ({} bytes), would be truncated", payload.len());
-            let mut pong = vec![0x8a, payload.len() as u8];
-            pong.extend_from_slice(payload);
+            // RFC 6455 §5.5: control frame payload MUST be ≤125 bytes.
+            // Extended length encoding is disallowed for control frames.
+            let pong_payload = if payload.len() > 125 {
+                tracing::warn!(
+                    "WS pong payload {} bytes exceeds 125-byte limit, truncating",
+                    payload.len()
+                );
+                &payload[..125]
+            } else {
+                payload
+            };
+            let mut pong = vec![0x8a, pong_payload.len() as u8];
+            pong.extend_from_slice(pong_payload);
             if let Poll::Ready(Err(e)) = Pin::new(raw.as_mut()).poll_write(cx, &pong) {
                 tracing::debug!(error = %e, "WS pong write failed");
             }
@@ -1150,12 +1160,12 @@ impl IoStream {
                 (Box::new(r), Box::new(w))
             }
             IoStream::PreRead(pre_read, s) => {
-                debug_assert!(pre_read.is_empty(), "into_split called before pre_read bytes consumed");
+                assert!(pre_read.is_empty(), "into_split called before pre_read bytes consumed");
                 let (r, w) = tokio::io::split(s);
                 (Box::new(r), Box::new(w))
             }
             IoStream::BufferedRead(buf, pos, inner) => {
-                debug_assert!(pos >= buf.len(), "into_split called before buffered bytes consumed");
+                assert!(pos >= buf.len(), "into_split called before buffered bytes consumed");
                 inner.into_split()
             }
         }
@@ -1168,7 +1178,7 @@ impl IoStream {
             IoStream::BufferedRead(buf, pos, inner) => {
                 // Buffered bytes are preserved inside the returned Cipher wrapper;
                 // they will be replayed before encrypted reads begin.
-                debug_assert!(pos >= buf.len(), "into_encrypted called before buffered bytes consumed");
+                assert!(pos >= buf.len(), "into_encrypted called before buffered bytes consumed");
                 IoStream::BufferedRead(buf, pos, Box::new(inner.into_encrypted(key)))
             }
             IoStream::Aead(inner) => {
@@ -1540,10 +1550,13 @@ async fn connect_via_proxy(
                 )));
             }
 
-            // Read remaining bind address bytes
+            // Read remaining bind address bytes.
+            // resp[4..10] already contains first 6 bytes of bind address.
+            // IPv4: 4(IP)+2(port)=6 → all already in resp[4..10] → extra=0.
+            // IPv6: 16(IP)+2(port)=18 → 6 in resp[4..10] → extra=12.
             let extra = match resp[3] {
-                0x01 => 4 - 2, // IPv4: we already read 6 bytes of address (4 IP + 2 port), correct
-                0x04 => 16 - 2, // IPv6: need 14 more bytes
+                0x01 => 0,
+                0x04 => 12,
                 _ => 0,
             };
             if extra > 0 {
@@ -1814,6 +1827,31 @@ pub async fn detect_and_strip_magic(
 /// Accept a WebSocket upgrade on the server side.
 /// Returns an IoStream with a WsByteStream adapter already applied,
 /// so callers can use read_msg_v1/write_msg_v1 directly.
+#[cfg(feature = "websocket")]
+fn base64_encode(bytes: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        s.push(CHARS[((triple >> 18) & 0x3f) as usize] as char);
+        s.push(CHARS[((triple >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            s.push(CHARS[((triple >> 6) & 0x3f) as usize] as char);
+        } else {
+            s.push('=');
+        }
+        if chunk.len() > 2 {
+            s.push(CHARS[(triple & 0x3f) as usize] as char);
+        } else {
+            s.push('=');
+        }
+    }
+    s
+}
+
 /// Accept a WebSocket connection on a raw TcpStream.
 ///
 /// Does NOT use tungstenite — Go frp v0.69.1 (`golang.org/x/net/websocket`)
@@ -1856,30 +1894,7 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
     hasher.update(key.as_bytes());
     hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
     let hash = hasher.finalize();
-    let accept = {
-        // Inline base64 encoding
-        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut s = String::with_capacity(28);
-        for chunk in hash.chunks(3) {
-            let b0 = chunk[0] as u32;
-            let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-            let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-            let triple = (b0 << 16) | (b1 << 8) | b2;
-            s.push(CHARS[((triple >> 18) & 0x3f) as usize] as char);
-            s.push(CHARS[((triple >> 12) & 0x3f) as usize] as char);
-            if chunk.len() > 1 {
-                s.push(CHARS[((triple >> 6) & 0x3f) as usize] as char);
-            } else {
-                s.push('=');
-            }
-            if chunk.len() > 2 {
-                s.push(CHARS[(triple & 0x3f) as usize] as char);
-            } else {
-                s.push('=');
-            }
-        }
-        s
-    };
+    let accept = base64_encode(&hash);
 
     // Send HTTP 101 Switching Protocols.
     // Capture any bytes BufReader may have read-ahead past headers
@@ -1991,29 +2006,7 @@ pub async fn accept_websocket_from_peeked(
     hasher.update(key.as_bytes());
     hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
     let hash = hasher.finalize();
-    let accept = {
-        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut s = String::with_capacity(28);
-        for chunk in hash.chunks(3) {
-            let b0 = chunk[0] as u32;
-            let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-            let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-            let triple = (b0 << 16) | (b1 << 8) | b2;
-            s.push(CHARS[((triple >> 18) & 0x3f) as usize] as char);
-            s.push(CHARS[((triple >> 12) & 0x3f) as usize] as char);
-            if chunk.len() > 1 {
-                s.push(CHARS[((triple >> 6) & 0x3f) as usize] as char);
-            } else {
-                s.push('=');
-            }
-            if chunk.len() > 2 {
-                s.push(CHARS[(triple & 0x3f) as usize] as char);
-            } else {
-                s.push('=');
-            }
-        }
-        s
-    };
+    let accept = base64_encode(&hash);
 
     // Send 101 Switching Protocols
     let resp = format!(
@@ -2026,11 +2019,15 @@ pub async fn accept_websocket_from_peeked(
     if !extra.is_empty() {
         tracing::debug!(
             extra_len = extra.len(),
-            "Pipelined data after HTTP headers — Go frpc sent WS frame before 101"
+            "Pipelined data after HTTP headers — feeding into WsByteStream"
         );
     }
 
-    let ws = WsByteStream::from_raw(Box::new(raw), false);
+    let mut ws = WsByteStream::from_raw(Box::new(raw), false);
+    if !extra.is_empty() {
+        ws.read_buf = extra;
+        ws.read_pos = 0;
+    }
     Ok(IoStream::WebSocket(ws))
 }
 
@@ -2061,29 +2058,7 @@ where
 
     // Generate WebSocket key: 16 random bytes, base64 encoded
     let key_bytes: [u8; 16] = rand::random();
-    let key = {
-        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut s = String::with_capacity(24);
-        for chunk in key_bytes.chunks(3) {
-            let b0 = chunk[0] as u32;
-            let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-            let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-            let triple = (b0 << 16) | (b1 << 8) | b2;
-            s.push(CHARS[((triple >> 18) & 0x3f) as usize] as char);
-            s.push(CHARS[((triple >> 12) & 0x3f) as usize] as char);
-            if chunk.len() > 1 {
-                s.push(CHARS[((triple >> 6) & 0x3f) as usize] as char);
-            } else {
-                s.push('=');
-            }
-            if chunk.len() > 2 {
-                s.push(CHARS[(triple & 0x3f) as usize] as char);
-            } else {
-                s.push('=');
-            }
-        }
-        s
-    };
+    let key = base64_encode(&key_bytes);
 
     let req = format!(
         "GET {path} HTTP/1.1\r\n\
@@ -2223,7 +2198,7 @@ pub fn build_tls_acceptor(
 /// difference is irrelevant for TLS compatibility.
 #[cfg(feature = "tls")]
 pub fn generate_self_signed_tls_config() -> Result<rustls::ServerConfig, crate::Error> {
-    use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, BasicConstraints, KeyPair};
+    use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
 
     let key_pair = KeyPair::generate()
         .map_err(|e| crate::Error::Other(format!("generate TLS key pair: {e}")))?;
@@ -2235,11 +2210,10 @@ pub fn generate_self_signed_tls_config() -> Result<rustls::ServerConfig, crate::
     dn.push(DnType::CommonName, "frp");
     dn.push(DnType::OrganizationName, "frp-rs auto-generated");
     params.distinguished_name = dn;
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.is_ca = IsCa::NoCa;
     params.key_usages = vec![
         rcgen::KeyUsagePurpose::DigitalSignature,
         rcgen::KeyUsagePurpose::KeyEncipherment,
-        rcgen::KeyUsagePurpose::KeyCertSign,
     ];
     // Uses rcgen's default validity (now → now + 365 days).
     // Go frp uses 10 years but the auto-generated cert is regenerated on every

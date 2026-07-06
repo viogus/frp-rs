@@ -66,6 +66,8 @@ pub async fn bridge_encrypted(
         return;
     }
 
+    let had_pre_read = !pre_read.is_empty();
+
     // User → Work: write pre_read first (through CipherWriter), then bridge
     let user_to_work = async {
         if !pre_read.is_empty()
@@ -103,6 +105,14 @@ pub async fn bridge_encrypted(
 
             if enc_work_w.write_all(&processed).await.is_err() { break; }
             if enc_work_w.flush().await.is_err() { break; }
+        }
+        // Symmetric shutdown: signal EOF to work side (matching bridge_plain).
+        // When pre_read bytes were forwarded (e.g. VHost), leave work_w open
+        // so work_to_user can receive the backend response.
+        if !had_pre_read {
+            if let Err(e) = enc_work_w.shutdown().await {
+                tracing::debug!(error = %e, "bridge_encrypted shutdown: enc_work_w.shutdown failed");
+            }
         }
     };
 
@@ -175,6 +185,10 @@ pub async fn bridge_encrypted(
                 _ => {}
             }
         }
+        // Symmetric shutdown: signal EOF to user side (matching bridge_plain).
+        if let Err(e) = user_w.shutdown().await {
+            tracing::debug!(error = %e, "bridge_encrypted shutdown: user_w.shutdown failed");
+        }
     };
 
     // Use join! (not select!): both directions must complete, matching Go frp's WaitGroup
@@ -228,7 +242,7 @@ pub async fn bridge_plain(
         // in work_to_user after the response is complete.
         if !had_pre_read {
             if let Err(e) = work_w.shutdown().await {
-                tracing::debug!(error = %e, "bridge_encrypted shutdown: work_w.shutdown failed");
+                tracing::debug!(error = %e, "bridge_plain shutdown: work_w.shutdown failed");
             }
         }
     };

@@ -34,9 +34,11 @@ pub fn verify_token(token: &str, timestamp: i64, expected_hex: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
     pub method: AuthMethod,
-    /// NOTE: Token is stored as plain String in memory with no zeroization.
-    /// For defense-in-depth, a future version should use secrecy::Secret or
-    /// zeroize.
+    /// NOTE: Token is stored as plain String in memory with no automatic
+    /// zeroization. Callers should invoke [`zeroize_string`] on `self.token`
+    /// when the `AuthConfig` is dropped or before deallocation.
+    /// For defense-in-depth, a future version should use `secrecy::Secret` or
+    /// the `zeroize` crate.
     pub token: String,
     pub oidc_issuer: String,
     pub oidc_audience: String,
@@ -95,8 +97,8 @@ impl AuthConfig {
     /// auth, populated from JWT 'sub' claim for OIDC). Returns Err if invalid.
     pub fn validate_login(&self, privilege_key: Option<&str>, timestamp: Option<i64>) -> Result<String, String> {
         if self.token.is_empty() && self.method == AuthMethod::Token {
-            tracing::warn!("Authentication token is empty — server accepts ALL connections. Set [auth].token in config.");
-            return Ok(String::new());
+            tracing::error!("CRITICAL: [auth].token is empty with token auth method — server would accept ALL connections. Set a strong token in the config file.");
+            return Err("CRITICAL: [auth].token is empty with token auth method — server would accept ALL connections. Set a strong token in the config file.".into());
         }
 
         let key = privilege_key.unwrap_or("");
@@ -139,6 +141,15 @@ impl AuthConfig {
             #[cfg(feature = "oidc")]
             AuthMethod::Oidc => None,
         }
+    }
+
+    /// Check for critical security misconfigurations at startup.
+    /// Call this at server startup to reject dangerously insecure configurations.
+    pub fn check_startup(&self) -> Result<(), String> {
+        if self.method == AuthMethod::Token && self.token.is_empty() {
+            return Err("CRITICAL: [auth].token is empty with token auth method — server would accept ALL connections. Set a strong token in the config file.".into());
+        }
+        Ok(())
     }
 }
 
@@ -670,7 +681,31 @@ impl OidcVerifier {
     }
 }
 
+/// Zeroize a `String` in-place by overwriting each byte with `0x00`.
+///
+/// Uses `unsafe` to access the `Vec<u8>` backing buffer directly,
+/// bypassing Rust's immutability guarantees for `&mut str`.
+///
+/// Call this on `AuthConfig.token` before deallocation to reduce the
+/// window where plaintext credentials reside in memory.
+pub fn zeroize_string(s: &mut String) {
+    // SAFETY: Vec<u8> is the backing store for String.
+    // Overwriting with zeros preserves valid UTF-8 (NUL bytes are valid).
+    // No references into `s` can exist while we hold `&mut String`.
+    unsafe {
+        let v = s.as_mut_vec();
+        v.fill(0);
+    }
+    // Clear len so the now-zeroed bytes are not accidentally re-read.
+    s.clear();
+}
+
 /// Resolve a token that may use a URL scheme for dynamic sourcing.
+///
+/// **Prefer [`resolve_dynamic_token_checked`]** — it enforces the
+/// `UnsafeFeatures` allowlist for `exec://` and `file://` sources.
+/// This function exists for backward compatibility with callers that do
+/// not yet thread `UnsafeFeatures` through (frp-server/frp-client service.rs).
 ///
 /// Supported schemes:
 /// - `file:///absolute/path` — reads the first line of the file
@@ -678,20 +713,59 @@ impl OidcVerifier {
 /// - plain string — returned as-is
 ///
 /// Go frp compat: file:// and exec:// token sources.
-pub fn resolve_dynamic_token(token: &str) -> String {
+pub fn resolve_dynamic_token(token: &str) -> Result<String, String> {
+    resolve_dynamic_token_inner(token, None)
+}
+
+/// Resolve a dynamic token with `UnsafeFeatures` enforcement.
+///
+/// When the token uses `exec://` or `file://`, the corresponding feature
+/// must be enabled in `unsafe_features`. If the feature is not allowed,
+/// an error is returned.
+///
+/// Callers that have access to an `UnsafeFeatures` instance should use
+/// this function instead of [`resolve_dynamic_token`].
+pub fn resolve_dynamic_token_checked(
+    token: &str,
+    unsafe_features: &crate::unsafe_features::UnsafeFeatures,
+) -> Result<String, String> {
+    resolve_dynamic_token_inner(token, Some(unsafe_features))
+}
+
+fn resolve_dynamic_token_inner(
+    token: &str,
+    unsafe_features: Option<&crate::unsafe_features::UnsafeFeatures>,
+) -> Result<String, String> {
     if let Some(path) = token.strip_prefix("file://") {
-        match std::fs::read_to_string(path) {
-            Ok(content) => content.lines().next().unwrap_or("").trim().to_string(),
-            Err(e) => {
-                tracing::warn!(path = %path, error = %e, "Failed to read dynamic token file {}: {}", path, e);
-                String::new()
+        if let Some(uf) = unsafe_features {
+            if !uf.is_enabled(crate::unsafe_features::TOKEN_SOURCE_EXEC) {
+                return Err(
+                    "file:// token source blocked: TokenSourceExec not in UnsafeFeatures allowlist. \
+                     Set [common].unsafe_features = [\"TokenSourceExec\"] to enable."
+                        .into(),
+                );
             }
         }
+        match std::fs::read_to_string(path) {
+            Ok(content) => Ok(content.lines().next().unwrap_or("").trim().to_string()),
+            Err(e) => Err(format!(
+                "Failed to read dynamic token from file://{}: {}",
+                path, e
+            )),
+        }
     } else if let Some(cmd) = token.strip_prefix("exec://") {
+        if let Some(uf) = unsafe_features {
+            if !uf.is_enabled(crate::unsafe_features::TOKEN_SOURCE_EXEC) {
+                return Err(
+                    "exec:// token source blocked: TokenSourceExec not in UnsafeFeatures allowlist. \
+                     Set [common].unsafe_features = [\"TokenSourceExec\"] to enable."
+                        .into(),
+                );
+            }
+        }
         let parts: Vec<&str> = cmd.split_whitespace().collect();
         if parts.is_empty() {
-            tracing::warn!("Dynamic token exec:// with empty command");
-            return String::new();
+            return Err("Dynamic token exec:// with empty command".into());
         }
         match std::process::Command::new(parts[0])
             .args(&parts[1..])
@@ -699,26 +773,28 @@ pub fn resolve_dynamic_token(token: &str) -> String {
         {
             Ok(o) => {
                 if !o.status.success() {
-                    tracing::warn!(
-                        cmd = %cmd, status = %o.status,
-                        "Dynamic token exec command '{}' exited with {}",
-                        cmd, o.status
-                    );
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    return Err(format!(
+                        "Dynamic token exec command '{}' exited with {}: {}",
+                        cmd,
+                        o.status,
+                        stderr.trim()
+                    ));
                 }
-                String::from_utf8_lossy(&o.stdout)
+                Ok(String::from_utf8_lossy(&o.stdout)
                     .lines()
                     .next()
                     .unwrap_or("")
                     .trim()
-                    .to_string()
+                    .to_string())
             }
-            Err(e) => {
-                tracing::warn!(cmd = %cmd, error = %e, "Failed to exec dynamic token command '{}': {}", cmd, e);
-                String::new()
-            }
+            Err(e) => Err(format!(
+                "Failed to exec dynamic token command '{}': {}",
+                cmd, e
+            )),
         }
     } else {
-        token.to_string()
+        Ok(token.to_string())
     }
 }
 
@@ -753,7 +829,7 @@ mod tests {
         assert!(cfg.validate_login(Some("wrong"), Some(ts)).is_err());
 
         let empty_cfg = AuthConfig::default();
-        assert!(empty_cfg.validate_login(None, None).is_ok());
+        assert!(empty_cfg.validate_login(None, None).is_err());
     }
 
     #[test]
@@ -864,8 +940,8 @@ mod tests {
 
     #[test]
     fn test_resolve_dynamic_token_plain() {
-        assert_eq!(resolve_dynamic_token("my-token"), "my-token");
-        assert_eq!(resolve_dynamic_token(""), "");
+        assert_eq!(resolve_dynamic_token("my-token").unwrap(), "my-token");
+        assert_eq!(resolve_dynamic_token("").unwrap(), "");
     }
 
     #[test]
@@ -874,7 +950,7 @@ mod tests {
         let path = dir.join("frp-test-token.txt");
         std::fs::write(&path, "file-token-value\n").unwrap();
         let url = format!("file://{}", path.display());
-        assert_eq!(resolve_dynamic_token(&url), "file-token-value");
+        assert_eq!(resolve_dynamic_token(&url).unwrap(), "file-token-value");
         std::fs::remove_file(&path).ok();
     }
 
@@ -884,21 +960,29 @@ mod tests {
         let path = dir.join("frp-test-token-multi.txt");
         std::fs::write(&path, "first-line\nsecond-line\n").unwrap();
         let url = format!("file://{}", path.display());
-        assert_eq!(resolve_dynamic_token(&url), "first-line");
+        assert_eq!(resolve_dynamic_token(&url).unwrap(), "first-line");
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn test_resolve_dynamic_token_file_missing() {
         let result = resolve_dynamic_token("file:///nonexistent/path/token.txt");
-        assert!(result.is_empty());
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_resolve_dynamic_token_exec() {
         // Use /bin/echo on Unix — portable across macOS and Linux
-        let result = resolve_dynamic_token("exec:///bin/echo dynamic-token-value");
-        assert_eq!(result, "dynamic-token-value");
+        let uf = crate::unsafe_features::UnsafeFeatures::new(crate::unsafe_features::CLIENT_UNSAFE_FEATURES);
+        let result = resolve_dynamic_token_checked("exec:///bin/echo dynamic-token-value", &uf);
+        assert_eq!(result.unwrap(), "dynamic-token-value");
+    }
+
+    #[test]
+    fn test_resolve_dynamic_token_exec_blocked_when_not_allowed() {
+        let uf = crate::unsafe_features::UnsafeFeatures::default();
+        let result = resolve_dynamic_token_checked("exec:///bin/echo secret", &uf);
+        assert!(result.is_err());
     }
 
     // --- Authentication timeout (replay protection) tests ---
