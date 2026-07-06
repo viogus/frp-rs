@@ -328,15 +328,18 @@ pub(crate) async fn handle_nat_hole_visitor(
             "NatHole session {}: timeout waiting for provider NatHoleClient",
             sid
         );
-        let mut writer_guard = session.visitor_writer.lock().await;
-        if let Some(ref mut w) = *writer_guard {
-            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-                transaction_id: transaction_id.clone(),
-                error: Some("provider NAT detection timeout".into()),
-                ..Default::default()
-            });
-            let _ = write_msg(w, &resp, v2).await;
-        }
+        {
+            let mut writer_guard = session.visitor_writer.lock().await;
+            if let Some(ref mut w) = *writer_guard {
+                let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                    transaction_id: transaction_id.clone(),
+                    error: Some("provider NAT detection timeout".into()),
+                    ..Default::default()
+                });
+                let _ = write_msg(w, &resp, v2).await;
+            }
+        } // writer_guard dropped before remove() — avoids AB/BA deadlock
+           // with complete() which acquires sessions.write() then visitor_writer.lock()
         state.nat_hole.remove(&sid).await;
         drop(reader);
         return;
