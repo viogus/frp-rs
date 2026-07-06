@@ -190,13 +190,9 @@ async fn test_new_proxy_registration_auto_port() {
         multiplexer: None,
         virtual_net: None,
                     proxy_protocol_version: None,
-                    #[cfg(feature = "vnet")]
                     advertise_subnet: None,
-                    #[cfg(feature = "vnet")]
                     vnet_ip: None,
-                    #[cfg(feature = "vnet")]
                     vnet_netmask: None,
-                    #[cfg(feature = "vnet")]
                     vnet_mtu: None,
     });
     write_msg_v1(&mut stream, &np).await.expect("send NewProxy");
@@ -262,13 +258,9 @@ async fn test_new_proxy_duplicate_name_fails() {
         multiplexer: None,
         virtual_net: None,
                     proxy_protocol_version: None,
-                    #[cfg(feature = "vnet")]
                     advertise_subnet: None,
-                    #[cfg(feature = "vnet")]
                     vnet_ip: None,
-                    #[cfg(feature = "vnet")]
                     vnet_netmask: None,
-                    #[cfg(feature = "vnet")]
                     vnet_mtu: None,
     });
 
@@ -360,13 +352,9 @@ async fn test_vhost_location_routing() {
         multiplexer: None,
         virtual_net: None,
                     proxy_protocol_version: None,
-                    #[cfg(feature = "vnet")]
                     advertise_subnet: None,
-                    #[cfg(feature = "vnet")]
                     vnet_ip: None,
-                    #[cfg(feature = "vnet")]
                     vnet_netmask: None,
-                    #[cfg(feature = "vnet")]
                     vnet_mtu: None,
     });
     write_msg_v1(&mut provider, &np).await.expect("send NewProxy");
@@ -469,13 +457,9 @@ async fn test_vhost_location_path_mismatch_404() {
         multiplexer: None,
         virtual_net: None,
                     proxy_protocol_version: None,
-                    #[cfg(feature = "vnet")]
                     advertise_subnet: None,
-                    #[cfg(feature = "vnet")]
                     vnet_ip: None,
-                    #[cfg(feature = "vnet")]
                     vnet_netmask: None,
-                    #[cfg(feature = "vnet")]
                     vnet_mtu: None,
     });
     write_msg_v1(&mut provider, &np).await.expect("send NewProxy");
