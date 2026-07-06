@@ -8,3 +8,4 @@ Cargo.lock
 .worktrees/
 .claude/
 .autogen_ssh_key
+go-reference/

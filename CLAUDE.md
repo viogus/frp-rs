@@ -177,7 +177,7 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 
 - **TCP**: fully implemented (control + work connections, TLS, WebSocket upgrade)
 - **WebSocket**: fully implemented — dial, accept, message dispatch (control + work connections)
-- **KCP**: fully implemented — dial, accept, message dispatch (control + work connections)
+- **KCP**: fully implemented — dial, accept, TLS, yamux, message dispatch. Go frps dispatch order (service.go:670-710): read 1 byte → TLS detect (0x17=strip, 0x16=replay) → TLS accept → if tcpMux: yamux wrap → V2/V1 detection. Our KCP handler follows same order. Verified with Go frpc v0.69.1: KCP+TLS+tcpMux+CipherStream all working (RTT ~76ms).
 - **QUIC**: fully implemented — dial, accept, message dispatch (requires TLS cert on server)
 - **TcpMux** (`frp-core/src/mux.rs`, 258 lines): full yamux implementation — server and client mode, keepalive, stream accept/spawn
 - **Dashboard** (`frp-server/src/dashboard.rs`, 86 lines): basic status API with axum (version, uptime, client/proxy counts)
@@ -188,6 +188,7 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 - `login_fail_exit` defaults to `true` in `ClientConfig::default()` but README example shows `false` — be aware the code default is `true`
 - `#[serde(untagged)]` on `FrpMessage` enum — ordering matters for serde matching, but V1 protocol dispatches by type byte first via `deserialize_v1()`, so untagged matching is not involved in wire deserialization
 - `ProxyRuntimeInfo` must include `sk: String` field — XTCP P2P encryption derives its AES-128 key from the proxy's SecretKey via `derive_key(&sk)`. Adding new fields to `ProxyRuntimeInfo` requires updating all construction sites: `Service::new()`, `do_reload()` in `reload.rs`, and any other future sites.
+- **KCP handler dispatch order** (`service.rs:520-826`): MUST match Go frps `service.go:670-710` exactly — TLS detection before yamux wrapping before V2/V1. Order: read bytes → V2 magic? → TLS detect → TLS accept → (tcpMux? yamux : direct) → V2/V1. Getting this wrong was root cause of both "invalid V1 message length" (yamux SYN interpreted as FRP) and TLS rejection bugs.
 
 ### Testing & Tooling
 

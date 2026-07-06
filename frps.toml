@@ -9,17 +9,17 @@
 [common]
 ## Core
 bind_addr = "0.0.0.0"
-bind_port = 7000
+bind_port = 17000
 proxy_bind_addr = ""            # Separate bind address for proxy ports ("" = same as bind_addr)
 
 ## HTTP/HTTPS VHost
-vhost_http_port = 0              # 0 = disabled
-vhost_https_port = 0             # 0 = disabled
+vhost_http_port = 10080
+vhost_https_port = 10443
 subdomain_host = ""              # Host for sub-domain proxy support
 
 ## Alternative transports
-kcp_bind_port = 0                # KCP port (0 = disabled)
-quic_bind_port = 0               # QUIC port (0 = disabled)
+kcp_bind_port = 17000            # KCP port
+quic_bind_port = 17001           # QUIC port
 websocket_port = 0               # WebSocket listener port (0 = disabled)
 
 ## TLS
@@ -30,29 +30,22 @@ tls_trusted_ca_file = ""         # Note: maps to tls_ca_file internally
 
 ## Authentication (flat format, Go frp compatible)
 auth_method = "token"            # "token" or "oidc"
-token = ""                       # Shared secret (also settable as auth_token)
-# OIDC settings
-# oidc_issuer = ""
-# oidc_audience = ""
-# oidc_token_endpoint = ""
+token = "cc12122121212121212112565656CCtzT"
 
 ## Logging (flat format, Go frp compatible)
-log_level = "info"               # trace, debug, info, warn, error
+log_level = "debug"              # trace, debug, info, warn, error
 log_file = ""                    # "" = stderr
 log_max_days = 3
 
 ## Dashboard / Web API
-web_server_addr = ""             # "" = disabled
-web_server_port = 0
+web_server_addr = "0.0.0.0"
+web_server_port = 7500
 web_server_user = "admin"
 web_server_password = "admin"
-## Dashboard TLS (flat format) — HTTPS when both are non-empty
-web_server_tls_cert_file = ""
-web_server_tls_key_file = ""
 
 ## Transport
-tcp_mux = true                   # Flat format (also settable as transport.tcp_mux)
-# tcp_mux_keepalive_interval = 30
+tcp_mux = true
+tcp_mux_keepalive_interval = 30
 
 # =============================================================================
 # frp-rs native format (alternative to [common] above)
