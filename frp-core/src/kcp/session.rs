@@ -279,3 +279,124 @@ impl KcpSession {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::config::{KcpConfig, KcpNoDelayConfig};
+
+    fn test_config() -> KcpConfig {
+        KcpConfig {
+            mtu: 1400,
+            wnd_size: (128, 128),
+            stream: true,
+            flush_write: true,
+            data_shards: 0,
+            parity_shards: 0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_session_create_no_fec() {
+        let (read_tx, _read_rx) = tokio::sync::mpsc::unbounded_channel();
+        let session = KcpSession::new(
+            12345,
+            "127.0.0.1:9000".parse().unwrap(),
+            test_config(),
+            read_tx,
+        );
+        assert_eq!(session.conv(), 12345);
+        assert!(!session.is_dead_link());
+    }
+
+    #[test]
+    fn test_session_send_recv_roundtrip() {
+        let config = test_config();
+        let (read_tx1, mut read_rx1) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let mut s1 = KcpSession::new(
+            1,
+            "127.0.0.1:9001".parse().unwrap(),
+            config.clone(),
+            read_tx1,
+        );
+        let (read_tx2, mut read_rx2) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let mut s2 = KcpSession::new(
+            1,
+            "127.0.0.1:9000".parse().unwrap(),
+            config,
+            read_tx2,
+        );
+
+        // Send data from s1
+        s1.send(b"hello kcp").unwrap();
+
+        // Update s1 to flush output, feed into s2
+        let mut now_ms = 0u32;
+        for _ in 0..20 {
+            now_ms += 10;
+            let packets = s1.update(now_ms).unwrap();
+            for pkt in &packets {
+                s2.input(pkt).unwrap();
+            }
+            s2.update(now_ms).unwrap();
+            s2.recv_and_push().unwrap();
+
+            if let Ok(data) = read_rx2.try_recv() {
+                assert_eq!(data, b"hello kcp");
+                return; // success
+            }
+        }
+        panic!("timed out waiting for data");
+    }
+
+    #[test]
+    fn test_session_send_no_fec_produces_packets() {
+        let config = KcpConfig {
+            flush_write: true,
+            nodelay: KcpNoDelayConfig {
+                nodelay: true,
+                interval: 10,
+                resend: 2,
+                nc: true,
+            },
+            ..test_config()
+        };
+        let (read_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut session = KcpSession::new(
+            42,
+            "127.0.0.1:9999".parse().unwrap(),
+            config,
+            read_tx,
+        );
+
+        session.send(b"test data").unwrap();
+
+        // KCP stream mode requires a few update ticks to flush the stream buffer.
+        // With nodelay enabled, the flush should happen quickly.
+        let mut got_packets = false;
+        for tick in 0..10 {
+            let packets = session.update((tick + 1) * 10).unwrap();
+            if !packets.is_empty() {
+                got_packets = true;
+                break;
+            }
+        }
+        assert!(got_packets, "should produce output after send+flush");
+    }
+
+    #[test]
+    fn test_session_shutdown_produces_no_output() {
+        let (read_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut session = KcpSession::new(
+            1,
+            "127.0.0.1:9999".parse().unwrap(),
+            test_config(),
+            read_tx,
+        );
+
+        session.shutdown();
+        let packets = session.update(10).unwrap();
+        assert!(packets.is_empty(), "shutdown session should produce no output");
+    }
+}
