@@ -146,6 +146,11 @@ pub struct AppState {
     /// this acceptor atomically. SIGUSR1 reload also swaps when cert paths change.
     #[cfg(feature = "tls")]
     pub tls_acceptor: Arc<std::sync::RwLock<Option<tokio_rustls::TlsAcceptor>>>,
+    /// Semaphore to limit concurrent connections. None = unlimited.
+    pub conn_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Per-IP failed login attempt counter: IP -> (count, window_start).
+    /// Window resets after 60 seconds. Max 5 failed attempts per window.
+    pub login_throttle: Arc<tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>>,
     /// CancellationToken for graceful shutdown. Cancelled on SIGTERM/SIGINT.
     /// Main accept loop and control handlers watch this to stop accepting new
     /// connections while letting existing bridge tasks drain.
@@ -165,7 +170,7 @@ pub struct AppState {
 
 impl AppState {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, heartbeat_timeout: i64, udp_packet_size: usize, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16, vhost_http_timeout: u64, user_conn_timeout: u64, tcp_mux_passthrough: bool, custom_404_page: String, plugin_manager: Arc<crate::plugin::HttpPluginManager>, max_ports_per_client: u64, nat_hole_analysis_data_reserve_hours: u64, detailed_errors_to_client: bool) -> Self {
+    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, heartbeat_timeout: i64, udp_packet_size: usize, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16, vhost_http_timeout: u64, user_conn_timeout: u64, tcp_mux_passthrough: bool, custom_404_page: String, plugin_manager: Arc<crate::plugin::HttpPluginManager>, max_ports_per_client: u64, nat_hole_analysis_data_reserve_hours: u64, detailed_errors_to_client: bool, max_connections: usize) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             reloadable: Arc::new(std::sync::RwLock::new(ReloadableState {
@@ -202,6 +207,12 @@ impl AppState {
             proxy_config_store: Arc::new(RwLock::new(HashMap::new())),
             store_path: None,
             detailed_errors_to_client,
+            conn_semaphore: if max_connections > 0 {
+                Some(Arc::new(tokio::sync::Semaphore::new(max_connections)))
+            } else {
+                None
+            },
+            login_throttle: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "tls")]
             tls_acceptor: Arc::new(std::sync::RwLock::new(None)),
             shutdown_token: CancellationToken::new(),
@@ -211,5 +222,25 @@ impl AppState {
             #[cfg(feature = "dashboard")]
             event_tx: broadcast::channel(256).0,
         }
+    }
+
+    /// Check if an IP has exceeded the login attempt throttle.
+    /// Returns true if the login should be allowed, false if throttled.
+    /// Max 5 failed attempts per 60-second window per IP.
+    pub async fn check_login_throttle(&self, addr: std::net::SocketAddr) -> bool {
+        let ip = addr.ip();
+        let now = std::time::Instant::now();
+        let mut throttle = self.login_throttle.lock().await;
+        let (count, window_start) = throttle.entry(ip).or_insert((0, now));
+        if now.duration_since(*window_start) > std::time::Duration::from_secs(60) {
+            *count = 1;
+            *window_start = now;
+            return true;
+        }
+        if *count >= 5 {
+            return false;
+        }
+        *count += 1;
+        true
     }
 }
