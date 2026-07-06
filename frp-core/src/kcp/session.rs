@@ -57,7 +57,7 @@ pub(crate) struct KcpSession {
     fec_seqid: u32,
     shard_groups: HashMap<u32, ShardGroup>,
     recv_buf: Vec<u8>,
-    _read_tx: mpsc::UnboundedSender<Vec<u8>>,
+    read_tx: mpsc::UnboundedSender<Vec<u8>>,
     shutdown: bool,
 }
 
@@ -98,7 +98,7 @@ impl KcpSession {
             fec_seqid: 0,
             shard_groups: HashMap::new(),
             recv_buf: vec![0u8; 16384],
-            _read_tx: read_tx,
+            read_tx,
             shutdown: false,
         }
     }
@@ -242,7 +242,7 @@ impl KcpSession {
                     }
                     match self.kcp.recv(&mut self.recv_buf[..size]) {
                         Ok(n) => {
-                            if self._read_tx.send(self.recv_buf[..n].to_vec()).is_err() {
+                            if self.read_tx.send(self.recv_buf[..n].to_vec()).is_err() {
                                 self.shutdown = true;
                                 return Ok(());
                             }
