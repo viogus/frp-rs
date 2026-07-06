@@ -188,22 +188,36 @@ async fn handle_http_forward(
         .await
         .map_err(|e| format!("connect to {host}:{port}: {e}"))?;
 
+    // Split buffer on first \r\n\r\n to separate headers from any pre-read body data.
+    let header_end = raw_headers
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(raw_headers.len());
+    let header_bytes = &raw_headers[..header_end];
+    let body_bytes = &raw_headers[header_end..];
+
     // Build forwarded request: rewrite request line, strip Proxy-Auth, add Connection: close
-    let headers_str = String::from_utf8_lossy(raw_headers);
+    let headers_str = String::from_utf8_lossy(header_bytes);
     let mut header_lines: Vec<&str> = headers_str.lines().skip(1).collect();
     header_lines.retain(|line| {
         !line.to_lowercase().starts_with("proxy-authorization:")
     });
 
-    let mut fwd_headers = format!("{method} {path} HTTP/1.0\r\n");
+    let mut fwd = Vec::new();
+    fwd.extend_from_slice(format!("{method} {path} HTTP/1.0\r\n").as_bytes());
     for line in &header_lines {
-        fwd_headers.push_str(line);
-        fwd_headers.push_str("\r\n");
+        fwd.extend_from_slice(line.as_bytes());
+        fwd.extend_from_slice(b"\r\n");
     }
-    fwd_headers.push_str("Connection: close\r\n\r\n");
+    fwd.extend_from_slice(b"Connection: close\r\n\r\n");
+    // Append any pre-read body data after the headers
+    if !body_bytes.is_empty() {
+        fwd.extend_from_slice(body_bytes);
+    }
 
     remote
-        .write_all(fwd_headers.as_bytes())
+        .write_all(&fwd)
         .await
         .map_err(|e| format!("write forward request: {e}"))?;
 

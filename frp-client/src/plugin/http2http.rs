@@ -95,7 +95,13 @@ async fn handle_conn(
         }
     }
 
-    let headers_str = String::from_utf8_lossy(&buf);
+    // Split buffer on first \r\n\r\n to separate headers from any pre-read body data.
+    let header_end = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(buf.len());
+    let headers_str = String::from_utf8_lossy(&buf[..header_end]);
     let mut lines = headers_str.lines();
 
     // Parse request line: METHOD URL HTTP/1.x
