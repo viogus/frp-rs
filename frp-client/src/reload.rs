@@ -18,7 +18,13 @@ pub(crate) fn config_snapshot(p: &ProxyConfig) -> String {
     fields.push(("remote_port", p.remote_port.to_string()));
     fields.push(("use_encryption", p.use_encryption.to_string()));
     fields.push(("use_compression", p.use_compression.to_string()));
-    fields.push(("sk", p.sk.clone()));
+    // Hash sk for change detection — never include plaintext secret in snapshot.
+    let sk_hash = if p.sk.is_empty() {
+        String::new()
+    } else {
+        frp_core::auth::generate_token(&p.sk, 0)
+    };
+    fields.push(("sk", sk_hash));
     fields.push(("custom_domains", format!("{:?}", p.custom_domains)));
     fields.push(("subdomain", p.subdomain.clone()));
     fields.push(("http_user", p.http_user.clone()));

@@ -707,14 +707,26 @@ pub fn zeroize_string(s: &mut String) {
 /// This function exists for backward compatibility with callers that do
 /// not yet thread `UnsafeFeatures` through (frp-server/frp-client service.rs).
 ///
+/// When called without UnsafeFeatures, `exec://` and `file://` sources
+/// execute unconditionally (legacy behavior). Use [`resolve_dynamic_token_checked`]
+/// to enforce the allowlist.
+///
 /// Supported schemes:
 /// - `file:///absolute/path` — reads the first line of the file
 /// - `exec://command arg1 arg2` — runs the command, reads first line of stdout
 /// - plain string — returned as-is
 ///
 /// Go frp compat: file:// and exec:// token sources.
-pub fn resolve_dynamic_token(token: &str) -> Result<String, String> {
-    resolve_dynamic_token_inner(token, None)
+pub fn resolve_dynamic_token(token: &str) -> String {
+    // Prefer checked variant when available; for backward compat, None
+    // means legacy mode (no enforcement).
+    match resolve_dynamic_token_inner(token, None) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
+            String::new()
+        }
+    }
 }
 
 /// Resolve a dynamic token with `UnsafeFeatures` enforcement.
@@ -940,8 +952,8 @@ mod tests {
 
     #[test]
     fn test_resolve_dynamic_token_plain() {
-        assert_eq!(resolve_dynamic_token("my-token").unwrap(), "my-token");
-        assert_eq!(resolve_dynamic_token("").unwrap(), "");
+        assert_eq!(resolve_dynamic_token("my-token"), "my-token");
+        assert_eq!(resolve_dynamic_token(""), "");
     }
 
     #[test]
@@ -950,7 +962,7 @@ mod tests {
         let path = dir.join("frp-test-token.txt");
         std::fs::write(&path, "file-token-value\n").unwrap();
         let url = format!("file://{}", path.display());
-        assert_eq!(resolve_dynamic_token(&url).unwrap(), "file-token-value");
+        assert_eq!(resolve_dynamic_token(&url), "file-token-value");
         std::fs::remove_file(&path).ok();
     }
 
@@ -960,14 +972,14 @@ mod tests {
         let path = dir.join("frp-test-token-multi.txt");
         std::fs::write(&path, "first-line\nsecond-line\n").unwrap();
         let url = format!("file://{}", path.display());
-        assert_eq!(resolve_dynamic_token(&url).unwrap(), "first-line");
+        assert_eq!(resolve_dynamic_token(&url), "first-line");
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn test_resolve_dynamic_token_file_missing() {
         let result = resolve_dynamic_token("file:///nonexistent/path/token.txt");
-        assert!(result.is_err());
+        assert!(result.is_empty());
     }
 
     #[test]
