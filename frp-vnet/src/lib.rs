@@ -5,6 +5,7 @@ pub mod tun;
 pub mod router;
 pub mod controller;
 pub mod msg;
+pub mod virtual_client;
 
 #[cfg(target_os = "linux")]
 mod tun_linux;
