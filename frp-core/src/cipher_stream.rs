@@ -332,7 +332,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for CipherStream<S> {
                     let mut iv = [0u8; 16];
                     iv.copy_from_slice(&this.iv_buf);
                     this.read_cfb = Some(CfbState::new(&this.read_key, &iv));
-                    tracing::debug!(iv_hex = %hex::encode(&iv), "CipherStream: IV read complete");
+                    tracing::debug!(iv_hex = %hex::encode(iv), "CipherStream: IV read complete");
                 }
                 Poll::Ready(Err(e)) => {
                     tracing::warn!(error = %e, "CipherStream: error reading IV");
@@ -391,7 +391,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
         if !this.iv_sent {
             this.iv_sent = true;
             this.write_cfb = Some(CfbState::new(&this.write_key, &this.write_iv));
-            tracing::debug!(iv_hex = %hex::encode(&this.write_iv), data_len = buf.len(), "CipherStream: first write, sending IV + encrypted data");
+            tracing::debug!(iv_hex = %hex::encode(this.write_iv), data_len = buf.len(), "CipherStream: first write, sending IV + encrypted data");
             let mut encrypted = buf.to_vec();
             this.write_cfb.as_mut().unwrap().encrypt(&mut encrypted);
             let mut output = Vec::with_capacity(16 + encrypted.len());

@@ -242,6 +242,7 @@ enum RawReadState {
 /// Resets `raw_read_state` to Idle. Returns Poll::Pending for ping/pong
 /// so the caller loops back to read the next frame.
 #[cfg(feature = "websocket")]
+#[allow(clippy::too_many_arguments)]
 fn dispatch_raw_frame(
     read_buf: &mut Vec<u8>,
     read_pos: &mut usize,
@@ -1878,7 +1879,7 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
     let leftover = reader.buffer().to_vec();
     tracing::debug!(
         leftover_len = leftover.len(),
-        leftover_first16 = %if leftover.len() > 0 {
+        leftover_first16 = %if !leftover.is_empty() {
             leftover.iter().take(16).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
         } else {
             String::from("(empty)")
