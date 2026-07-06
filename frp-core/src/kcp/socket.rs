@@ -65,6 +65,13 @@ impl KcpSocket {
     }
 
     pub async fn run(mut self) {
+        // Drain any pending registrations sent before the driver was spawned.
+        // This prevents a race where recv_from fires before register_tx is processed,
+        // causing FEC fallback to create a duplicate session with wrong conv.
+        while let Ok((conv, addr, session)) = self.register_rx.try_recv() {
+            self.sessions.insert((conv, addr), session);
+        }
+
         let mut tick = interval(Duration::from_millis(10));
         let mut buf = vec![0u8; 1500];
 
@@ -117,21 +124,42 @@ impl KcpSocket {
                                     tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP input error");
                                 }
                             } else if key.0 != 0 {
-                                // New peer detected — create session + stream
-                                let (read_tx, read_rx) = mpsc::unbounded_channel();
-                                let mut session = KcpSession::new(
-                                    key.0, src, self.config.clone(), read_tx,
-                                );
-                                if let Err(e) = session.input(&data) {
-                                    tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP new peer input error");
+                                // FEC fallback: for FEC packets, non-shard-0 shards don't
+                                // contain the KCP header (conv is at offset 6 only in the
+                                // first data shard). Scan sessions by peer_addr as fallback.
+                                let is_fec = data.len() >= 10
+                                    && (u16::from_le_bytes([data[4], data[5]]) == 0xf1
+                                        || u16::from_le_bytes([data[4], data[5]]) == 0xf2);
+                                let fec_key = if is_fec {
+                                    self.sessions.keys()
+                                        .find(|(_, a)| *a == src)
+                                        .copied()
+                                } else {
+                                    None
+                                };
+                                if let Some(fk) = fec_key {
+                                    if let Some(session) = self.sessions.get_mut(&fk) {
+                                        if let Err(e) = session.input(&data) {
+                                            tracing::debug!(conv = fk.0, peer = %src, error = %e, "KCP FEC fallback input error");
+                                        }
+                                    }
+                                } else {
+                                    // New peer detected — create session + stream
+                                    let (read_tx, read_rx) = mpsc::unbounded_channel();
+                                    let mut session = KcpSession::new(
+                                        key.0, src, self.config.clone(), read_tx,
+                                    );
+                                    if let Err(e) = session.input(&data) {
+                                        tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP new peer input error");
+                                    }
+                                    let stream = KcpStream::new(
+                                        key.0, src,
+                                        self.write_tx.clone(),
+                                        read_rx,
+                                    );
+                                    let _ = self.accept_tx.send(stream);
+                                    self.sessions.insert(key, session);
                                 }
-                                let stream = KcpStream::new(
-                                    key.0, src,
-                                    self.write_tx.clone(),
-                                    read_rx,
-                                );
-                                let _ = self.accept_tx.send(stream);
-                                self.sessions.insert(key, session);
                             }
                         }
                         Err(e) => {
@@ -150,14 +178,15 @@ impl KcpSocket {
 
     /// Extract (conv, peer_addr) key from a raw UDP packet.
     /// KCP header: conv is first 4 bytes (little-endian u32).
-    /// FEC packets: conv is at offset 6 (after 6-byte FEC header).
+    /// FEC packets: 10-byte header [seqid: u32 LE][flag: u16 LE][conv: u32 LE].
+    /// Conv is at offset 6 for all FEC shards (previously only correct for shard 0).
     fn resolve_key(data: &[u8], src: SocketAddr) -> (u32, SocketAddr) {
         if data.len() >= 4 {
-            // Check if this is a FEC packet by looking at bytes [4..6] for flag
+            // Check for FEC packet by looking at bytes [4..6] for flag
             if data.len() >= 10 {
                 let flag = u16::from_le_bytes([data[4], data[5]]);
                 if flag == 0xf1 || flag == 0xf2 {
-                    // FEC packet: conv is at offset 6
+                    // FEC packet: 10-byte header, conv at offset 6
                     let conv = u32::from_le_bytes([data[6], data[7], data[8], data[9]]);
                     if conv != 0 {
                         return (conv, src);

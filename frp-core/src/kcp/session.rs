@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use super::config::KcpConfig;
 use crate::kcp_compat::Fec;
 
-const FEC_HEADER_SIZE: usize = 6;
+const FEC_HEADER_SIZE: usize = 10;
 const TYPE_DATA: u16 = 0xf1;
 const TYPE_PARITY: u16 = 0xf2;
 const MAX_SHARD_SETS: usize = 3;
@@ -156,10 +156,11 @@ impl KcpSession {
                     let mut packet = Vec::with_capacity(FEC_HEADER_SIZE + shard.len());
                     packet.extend_from_slice(&self.fec_seqid.to_le_bytes());
                     packet.extend_from_slice(&flag.to_le_bytes());
+                    packet.extend_from_slice(&self.conv.to_le_bytes());
                     packet.extend_from_slice(shard);
                     packets.push(packet);
+                    self.fec_seqid = self.fec_seqid.wrapping_add(1);
                 }
-                self.fec_seqid = self.fec_seqid.wrapping_add(1);
             }
         } else {
             packets = output;
@@ -191,9 +192,9 @@ impl KcpSession {
             }
 
             let shard_data = &data[FEC_HEADER_SIZE..];
-            let shard_id = seqid / self.config.data_shards as u32;
-            let shard_index = seqid as usize % self.config.data_shards;
             let total = self.config.data_shards + self.config.parity_shards;
+            let shard_id = seqid / total as u32;
+            let shard_index = seqid as usize % total;
 
             let group = self
                 .shard_groups
@@ -318,7 +319,7 @@ mod tests {
     #[test]
     fn test_session_send_recv_roundtrip() {
         let config = test_config();
-        let (read_tx1, mut read_rx1) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (read_tx1, _read_rx1) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let mut s1 = KcpSession::new(
             1,
             "127.0.0.1:9001".parse().unwrap(),

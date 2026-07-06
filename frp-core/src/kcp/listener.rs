@@ -64,22 +64,16 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
     let (read_tx, read_rx) = mpsc::unbounded_channel();
     let session = KcpSession::new(conv, remote, config.clone(), read_tx);
 
-    // Spawn driver BEFORE registering the session so the driver is already
-    // running (or at least scheduled) when the registration message arrives.
-    // This prevents a race where a fast write() can arrive before the driver
-    // has processed the session registration.
-    tokio::spawn(async move { kcp_socket.run().await });
-    // Yield to let the driver task begin executing.
-    tokio::task::yield_now().await;
-
+    // Register session BEFORE spawning driver so the driver can route
+    // incoming FEC packets to the correct session from the start.
+    // Otherwise a race: driver spawns → recvs packet → resolve_key gives
+    // wrong conv → creates duplicate session before register_tx processed.
     handle
         .register_tx
         .send((conv, remote, session))
         .map_err(|_| io::Error::other("driver closed"))?;
 
-    // Yield again to give the driver a chance to process the registration
-    // before the caller sends data.
-    tokio::task::yield_now().await;
+    tokio::spawn(async move { kcp_socket.run().await });
 
     Ok(KcpStream::new(conv, remote, handle.write_tx, read_rx))
 }
