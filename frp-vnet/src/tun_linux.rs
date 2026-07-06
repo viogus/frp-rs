@@ -1,6 +1,6 @@
 use std::io;
 use std::net::Ipv4Addr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::task::{Context, Poll};
