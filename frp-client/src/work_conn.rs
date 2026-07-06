@@ -76,60 +76,6 @@ pub(crate) struct WorkConnConfig {
     pub vnet_routes: Arc<RwLock<frp_vnet::router::RouteTable>>,
 }
 
-/// Write HAProxy PROXY protocol v2 binary header to the stream.
-///
-/// Format: 12-byte signature + 4-byte header + address block (binary).
-async fn write_proxy_protocol_v2(
-    stream: &mut (impl tokio::io::AsyncWriteExt + Unpin),
-    src_addr: &str,
-    dst_addr: &str,
-    src_port: u16,
-    dst_port: u16,
-) -> Result<(), String> {
-    // Parse source address
-    let src_ip: std::net::IpAddr = src_addr.parse().map_err(|e| format!("v2 src_addr parse: {e}"))?;
-    let dst_ip: std::net::IpAddr = dst_addr.parse().map_err(|e| format!("v2 dst_addr parse: {e}"))?;
-
-    // Determine transport and address families
-    let (transport_byte, addr_len) = match (&src_ip, &dst_ip) {
-        (std::net::IpAddr::V4(_), std::net::IpAddr::V4(_)) => (0x11u8, 12u16),
-        (std::net::IpAddr::V6(_), std::net::IpAddr::V6(_)) => (0x21u8, 36u16),
-        _ => return Err("v2 PROXY: mismatched address families (IPv4/IPv6)".into()),
-    };
-
-    let mut buf = Vec::with_capacity(16 + addr_len as usize);
-
-    // 12-byte v2 signature
-    buf.extend_from_slice(b"\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A");
-
-    // 1 byte: version (0x20) | command (0x01 = PROXY for locally-terminated connections)
-    buf.push(0x21);
-
-    // 1 byte: transport protocol (0x11 = TCPv4, 0x21 = TCPv6)
-    buf.push(transport_byte);
-
-    // 2 bytes: address length (big-endian)
-    buf.extend_from_slice(&addr_len.to_be_bytes());
-
-    // Address block: src_addr + dst_addr + src_port + dst_port (all binary)
-    match (&src_ip, &dst_ip) {
-        (std::net::IpAddr::V4(s4), std::net::IpAddr::V4(d4)) => {
-            buf.extend_from_slice(&s4.octets());
-            buf.extend_from_slice(&d4.octets());
-        }
-        (std::net::IpAddr::V6(s6), std::net::IpAddr::V6(d6)) => {
-            buf.extend_from_slice(&s6.octets());
-            buf.extend_from_slice(&d6.octets());
-        }
-        _ => unreachable!(),
-    }
-    buf.extend_from_slice(&src_port.to_be_bytes());
-    buf.extend_from_slice(&dst_port.to_be_bytes());
-
-    stream.write_all(&buf).await.map_err(|e| format!("v2 PROXY write: {e}"))?;
-    Ok(())
-}
-
 /// Spawn a single work connection task.
 ///
 /// The task:
@@ -658,24 +604,30 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                             if !info.proxy_protocol_version.is_empty() {
                                 if let Some(ref src) = swc.src_addr {
                                     if info.proxy_protocol_version == "v1" {
-                                        let header = format!(
-                                            "PROXY TCP4 {} {} {} {}\r\n",
+                                        let header = frp_core::proxy_protocol::build_proxy_protocol_v1(
                                             src,
                                             swc.dst_addr.as_deref().unwrap_or("0.0.0.0"),
-                                            swc.src_port.unwrap_or(0),
-                                            swc.dst_port.unwrap_or(0),
+                                            swc.src_port.unwrap_or(0) as u16,
+                                            swc.dst_port.unwrap_or(0) as u16,
                                         );
                                         if let Err(e) = local.write_all(header.as_bytes()).await {
                                             warn!(error = %e, "Failed to write PROXY v1 header: {}", e);
                                         }
                                     } else if info.proxy_protocol_version == "v2" {
-                                        if let Err(e) = write_proxy_protocol_v2(
-                                            &mut local, src,
+                                        match frp_core::proxy_protocol::build_proxy_protocol_v2(
+                                            src,
                                             swc.dst_addr.as_deref().unwrap_or("0.0.0.0"),
                                             swc.src_port.unwrap_or(0) as u16,
                                             swc.dst_port.unwrap_or(0) as u16,
-                                        ).await {
-                                            warn!(error = %e, "Failed to write PROXY v2 header: {}", e);
+                                        ) {
+                                            Ok(header) => {
+                                                if let Err(e) = local.write_all(&header).await {
+                                                    warn!(error = %e, "Failed to write PROXY v2 header: {}", e);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!(error = %e, "Failed to build PROXY v2 header: {}", e);
+                                            }
                                         }
                                     }
                                 }
