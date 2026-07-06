@@ -1070,6 +1070,12 @@ impl<Output> Kcp<Output> {
     pub fn is_dead_link(&self) -> bool {
         self.state != 0
     }
+
+    /// Get a mutable reference to the output writer.
+    #[inline]
+    pub fn output_mut(&mut self) -> &mut Output {
+        &mut self.output.0
+    }
 }
 
 impl<Output: Write> Kcp<Output> {
