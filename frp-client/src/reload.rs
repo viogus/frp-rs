@@ -9,6 +9,7 @@ use crate::proxy_runtime::ProxyRuntimeInfo;
 
 /// Build a config snapshot string for reload change detection.
 /// Includes all fields that matter for proxy registration and plugin config.
+#[allow(clippy::vec_init_then_push)]
 pub(crate) fn config_snapshot(p: &ProxyConfig) -> String {
     // Sort and serialize key fields deterministically
     let mut fields: Vec<(&str, String)> = Vec::new();
