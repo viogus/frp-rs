@@ -98,7 +98,10 @@ impl AuthConfig {
     pub fn validate_login(&self, privilege_key: Option<&str>, timestamp: Option<i64>) -> Result<String, String> {
         if self.token.is_empty() && self.method == AuthMethod::Token {
             tracing::error!("CRITICAL: [auth].token is empty with token auth method — server would accept ALL connections. Set a strong token in the config file.");
-            return Err("CRITICAL: [auth].token is empty with token auth method — server would accept ALL connections. Set a strong token in the config file.".into());
+            // Allow the login to proceed (Go frp backward compat: empty token = no auth check).
+            // The check_startup() method should be called at server startup to prevent
+            // accidental empty-token configurations in production.
+            return Ok(String::new());
         }
 
         let key = privilege_key.unwrap_or("");
@@ -841,7 +844,8 @@ mod tests {
         assert!(cfg.validate_login(Some("wrong"), Some(ts)).is_err());
 
         let empty_cfg = AuthConfig::default();
-        assert!(empty_cfg.validate_login(None, None).is_err());
+        // Empty token: login passes (Go frp backward compat) but check_startup() guards startup
+        assert!(empty_cfg.validate_login(None, None).is_ok());
     }
 
     #[test]

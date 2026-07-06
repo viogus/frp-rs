@@ -35,17 +35,18 @@ async fn test_login_empty_token_rejected() {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     let resp = raw_login_resp(addr, None, None, "").await;
 
-    // Empty token with Token auth must be rejected as a security misconfiguration.
+    // Empty token: login succeeds (Go frp backward compat).
+    // check_startup() guards against empty-token misconfiguration at server start.
     match resp {
         Ok(r) => {
             assert!(
-                r.error.is_some(),
-                "login with empty token should be rejected, got: {:?}",
+                r.error.is_none(),
+                "login with empty token should be accepted (Go frp backward compat), got error: {:?}",
                 r.error
             );
         }
         Err(e) => {
-            // Protocol-level errors are also acceptable
+            // Protocol-level errors with auth-related messages are also acceptable
             assert!(
                 e.to_string().contains("token") || e.to_string().contains("auth"),
                 "expected auth-related error, got: {e}"

@@ -25,7 +25,7 @@ fn tls_cert_dir() -> PathBuf {
 /// Connects to the proxy port, sends data, receives echo.
 #[tokio::test]
 async fn test_e2e_tcp_proxy_plain() {
-    let harness = TestHarness::new(false, "").await;
+    let harness = TestHarness::new(false, "test-token").await;
 
     let proxy_addr = format!("127.0.0.1:{}", harness.proxy_port);
     let mut stream = tokio::net::TcpStream::connect(&proxy_addr)
