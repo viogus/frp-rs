@@ -313,7 +313,8 @@ pub async fn handle_control<S>(
     // Ping interval: max 10s to stay well within Go frpc's heartbeat timeout
     let ping_interval = Duration::from_secs(10);
     let mut ping_tick = tokio::time::interval(ping_interval);
-    // First tick fires immediately to unblock Go frpc's read loop
+    // Defer first ping to ping_interval from now (Go frpc heartbeat timeout is 90s)
+    ping_tick.reset();
     ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // --- Main select loop ---

@@ -23,9 +23,9 @@ quic_bind_port = 17001           # QUIC port
 websocket_port = 0               # WebSocket listener port (0 = disabled)
 
 ## TLS
-tls_enable = false
-tls_cert_file = ""
-tls_key_file = ""
+tls_enable = true
+tls_cert_file = "/tmp/frp-test-cert.pem"
+tls_key_file = "/tmp/frp-test-key.pem"
 tls_trusted_ca_file = ""         # Note: maps to tls_ca_file internally
 
 ## Authentication (flat format, Go frp compatible)
