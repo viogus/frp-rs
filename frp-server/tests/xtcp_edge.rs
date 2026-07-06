@@ -8,7 +8,7 @@ use frp_core::msg::{self, FrpMessage, NatHoleVisitor, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
 
-use common::{allocate_port, raw_login, start_test_server};
+use common::{allocate_port, login_with_test_token, raw_login, start_test_server, test_auth_cfg};
 
 /// Helper: build a minimal `NewProxy` for XTCP with only the required fields set.
 fn xtcp_proxy(name: &str, sk: &str, local_str: &str) -> NewProxy {
@@ -71,6 +71,7 @@ async fn test_xtcp_concurrent_3_sessions() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
@@ -87,7 +88,7 @@ async fn test_xtcp_concurrent_3_sessions() {
 
             // --- Login ---
             let (mut provider_ctl, resp) =
-                raw_login(*addr, None, None, "").await.expect("provider login");
+                login_with_test_token(*addr).await.expect("provider login");
             let run_id = resp.run_id.expect("provider should get run_id");
 
             // --- Register XTCP proxy ---
@@ -250,6 +251,7 @@ async fn test_xtcp_multiple_providers_same_server() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
@@ -257,7 +259,7 @@ async fn test_xtcp_multiple_providers_same_server() {
 
     // --- Provider A: login + register proxy A ---
     let (mut provider_a_ctl, resp_a) =
-        raw_login(addr, None, None, "").await.expect("provider A login");
+        login_with_test_token(addr).await.expect("provider A login");
     let run_id_a = resp_a.run_id.expect("provider A run_id");
 
     let np_a = FrpMessage::NewProxy(xtcp_proxy(
@@ -295,7 +297,7 @@ async fn test_xtcp_multiple_providers_same_server() {
 
     // --- Provider B: login + register proxy B ---
     let (mut provider_b_ctl, resp_b) =
-        raw_login(addr, None, None, "").await.expect("provider B login");
+        login_with_test_token(addr).await.expect("provider B login");
     let run_id_b = resp_b.run_id.expect("provider B run_id");
 
     let np_b = FrpMessage::NewProxy(xtcp_proxy(
@@ -552,6 +554,7 @@ async fn test_xtcp_encrypted_proxy_registration() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
@@ -559,7 +562,7 @@ async fn test_xtcp_encrypted_proxy_registration() {
 
     // --- Provider login + register XTCP proxy with encryption/compression ---
     let (mut provider_ctl, resp) =
-        raw_login(addr, None, None, "").await.expect("provider login");
+        login_with_test_token(addr).await.expect("provider login");
     let run_id = resp.run_id.expect("provider should get run_id");
 
     let np = FrpMessage::NewProxy(xtcp_proxy_encrypted(

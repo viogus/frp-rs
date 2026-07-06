@@ -1,6 +1,6 @@
 mod common;
 
-use common::{allocate_port, start_test_server};
+use common::{allocate_port, start_test_server, test_auth_cfg};
 use frp_core::config::ServerConfig;
 use tokio::io::AsyncReadExt;
 use tokio::time::{timeout, Duration};
@@ -9,6 +9,7 @@ fn ssh_test_config(ssh_port: u16, bind_port: u16) -> ServerConfig {
     let mut cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     cfg.ssh_tunnel_gateway.bind_port = ssh_port;
@@ -67,6 +68,7 @@ async fn test_ssh_gateway_disabled_by_default() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     // ssh_tunnel_gateway.bind_port defaults to 0 → disabled

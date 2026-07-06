@@ -5,7 +5,7 @@ use frp_core::msg::{self, FrpMessage, NatHoleVisitor, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
 
-use common::{allocate_port, raw_login, start_test_server};
+use common::{allocate_port, login_with_test_token, raw_login, start_test_server, test_auth_cfg};
 
 /// Helper: build a minimal `NewProxy` for XTCP with only the required fields set.
 fn xtcp_proxy(name: &str, sk: &str, local_str: &str) -> NewProxy {
@@ -55,6 +55,7 @@ async fn test_xtcp_precheck_nonexistent_proxy() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
@@ -106,6 +107,7 @@ async fn test_xtcp_precheck_disconnect_does_not_crash() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
@@ -113,7 +115,7 @@ async fn test_xtcp_precheck_disconnect_does_not_crash() {
 
     // Login as provider and register an XTCP proxy
     let (mut provider_ctl, _resp) =
-        raw_login(addr, None, None, "").await.expect("provider login");
+        login_with_test_token(addr).await.expect("provider login");
 
     let np = FrpMessage::NewProxy(xtcp_proxy(
         "xtcp-drop-test",
@@ -202,6 +204,7 @@ async fn test_xtcp_nat_hole_client_invalid_sid() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
@@ -209,7 +212,7 @@ async fn test_xtcp_nat_hole_client_invalid_sid() {
 
     // Provider logs in and registers an XTCP proxy
     let (mut provider_ctl, _resp) =
-        raw_login(addr, None, None, "").await.expect("provider login");
+        login_with_test_token(addr).await.expect("provider login");
 
     let np = FrpMessage::NewProxy(xtcp_proxy(
         "xtcp-sid-test",
@@ -278,6 +281,7 @@ async fn test_xtcp_nat_hole_client_without_sid() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
@@ -285,7 +289,7 @@ async fn test_xtcp_nat_hole_client_without_sid() {
 
     // Provider logs in and registers an XTCP proxy
     let (mut provider_ctl, _resp) =
-        raw_login(addr, None, None, "").await.expect("provider login");
+        login_with_test_token(addr).await.expect("provider login");
 
     let np = FrpMessage::NewProxy(xtcp_proxy(
         "xtcp-nosid-test",
@@ -359,6 +363,7 @@ async fn test_xtcp_nat_hole_report_cleanup() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
@@ -366,7 +371,7 @@ async fn test_xtcp_nat_hole_report_cleanup() {
 
     // --- Provider login + register XTCP proxy ---
     let (mut provider_ctl, resp) =
-        raw_login(addr, None, None, "").await.expect("provider login");
+        login_with_test_token(addr).await.expect("provider login");
     let run_id = resp.run_id.expect("provider should get run_id");
 
     let xtcp_sk = "cleanup-test-sk";

@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use frp_core::auth;
 use frp_core::config::ServerConfig;
 use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage, NewProxy, NewWorkConn};
@@ -11,7 +12,7 @@ use frp_core::transport::{DialOptions, IoStream};
 use frp_core::v2_handshake;
 use frp_core::mux;
 use frp_server::service::Service;
-use common::allocate_port;
+use common::{allocate_port, test_auth_cfg};
 
 /// Full end-to-end V2 protocol test: Rust frps vs Rust frpc (in-process).
 ///
@@ -50,6 +51,7 @@ async fn test_v2_tcp_proxy() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let service = Service::new(cfg, None).await.expect("create service");
@@ -95,6 +97,7 @@ async fn test_v2_tcp_proxy() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
+    let auth_key = auth::generate_token("test-token", ts);
     let login = FrpMessage::Login(msg::Login {
         version: Some(frp_core::VERSION.into()),
         hostname: Some("v2-test-host".into()),
@@ -105,7 +108,7 @@ async fn test_v2_tcp_proxy() {
         client_id: None,
         pool_count: Some(1),
         timestamp: Some(ts),
-        privilege_key: None,
+        privilege_key: Some(auth_key),
         metas: None,
         client_spec: None,
         multiplexer: Some("yamux".into()),
@@ -130,7 +133,7 @@ async fn test_v2_tcp_proxy() {
     println!("V2 login succeeded, run_id: {run_id}");
 
     // ---- Wrap control stream in AES-128-CFB encryption (matching server post-login) ----
-    let enc_key = encryption::derive_key(""); // empty token = no auth
+    let enc_key = encryption::derive_key("test-token");
     let mut control = control.into_encrypted(enc_key);
 
     // Drain initial ReqWorkConn v2 frames sent by server after LoginResp
@@ -305,6 +308,7 @@ async fn test_v2_ping_pong_raw_tcp() {
             tcp_mux: false,
             ..Default::default()
         },
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let service = Service::new(cfg, None).await.expect("create service");
@@ -334,6 +338,7 @@ async fn test_v2_ping_pong_raw_tcp() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
+    let auth_key = auth::generate_token("test-token", ts);
     let login = FrpMessage::Login(msg::Login {
         version: Some(frp_core::VERSION.into()),
         hostname: Some("v2-smoke".into()),
@@ -344,7 +349,7 @@ async fn test_v2_ping_pong_raw_tcp() {
         client_id: None,
         pool_count: Some(1),
         timestamp: Some(ts),
-        privilege_key: None,
+        privilege_key: Some(auth_key),
         metas: None,
         client_spec: None,
         multiplexer: None,
@@ -368,7 +373,7 @@ async fn test_v2_ping_pong_raw_tcp() {
     println!("V2 login OK (raw TCP)");
 
     // Wrap in encryption
-    let enc_key = encryption::derive_key("");
+    let enc_key = encryption::derive_key("test-token");
     let mut stream = stream.into_encrypted(enc_key);
 
     // Drain initial ReqWorkConn v2 frames sent by server after LoginResp
@@ -410,6 +415,7 @@ async fn test_v2_ping_pong_yamux() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let service = Service::new(cfg, None).await.expect("create service");
@@ -449,6 +455,7 @@ async fn test_v2_ping_pong_yamux() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
+    let auth_key = auth::generate_token("test-token", ts);
     let login = FrpMessage::Login(msg::Login {
         version: Some(frp_core::VERSION.into()),
         hostname: Some("v2-yamux".into()),
@@ -459,7 +466,7 @@ async fn test_v2_ping_pong_yamux() {
         client_id: None,
         pool_count: Some(1),
         timestamp: Some(ts),
-        privilege_key: None,
+        privilege_key: Some(auth_key),
         metas: None,
         client_spec: None,
         multiplexer: Some("yamux".into()),
@@ -476,7 +483,7 @@ async fn test_v2_ping_pong_yamux() {
     println!("V2 login OK (yamux)");
 
     // Wrap in encryption
-    let enc_key = encryption::derive_key("");
+    let enc_key = encryption::derive_key("test-token");
     let mut control = control.into_encrypted(enc_key);
 
     // Drain initial ReqWorkConn v2 frames sent by server after LoginResp
@@ -517,6 +524,7 @@ async fn test_v2_aead_ping_pong_yamux() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let service = Service::new(cfg, None).await.expect("create service");
@@ -562,6 +570,7 @@ async fn test_v2_aead_ping_pong_yamux() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
+    let auth_key = auth::generate_token("test-token", ts);
     let login = FrpMessage::Login(msg::Login {
         version: Some(frp_core::VERSION.into()),
         hostname: Some("v2-aead".into()),
@@ -572,7 +581,7 @@ async fn test_v2_aead_ping_pong_yamux() {
         client_id: None,
         pool_count: Some(1),
         timestamp: Some(ts),
-        privilege_key: None,
+        privilege_key: Some(auth_key),
         metas: None,
         client_spec: None,
         multiplexer: Some("yamux".into()),
@@ -590,7 +599,7 @@ async fn test_v2_aead_ping_pong_yamux() {
 
     // Wrap in AEAD after LoginResp (matching Go frp flow)
     let (write_key, read_key) = frp_core::crypto::derive_aead_control_keys(
-        b"", // empty token = no auth
+        b"test-token",
         crypto_ctx.algorithm,
         &crypto_ctx.transcript_hash,
     )
