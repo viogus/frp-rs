@@ -88,6 +88,11 @@ impl AsyncRead for KcpStream {
         match self.read_rx.poll_recv(cx) {
             Poll::Ready(Some(data)) => {
                 let n = data.len().min(buf.remaining());
+                let hex_preview = if n > 0 {
+                    hex::encode(&data[..n.min(16)])
+                } else {
+                    String::new()
+                };
                 buf.put_slice(&data[..n]);
                 if n < data.len() {
                     self.read_buffer = data;
@@ -100,11 +105,7 @@ impl AsyncRead for KcpStream {
                     conv = self.conv,
                     n = n,
                     total = self.read_count,
-                    first_hex = if n > 0 {
-                        hex::encode(&data[..n.min(16)])
-                    } else {
-                        String::new()
-                    },
+                    first_hex = hex_preview,
                     "KCP read: {} bytes (total={})",
                     n,
                     self.read_count,

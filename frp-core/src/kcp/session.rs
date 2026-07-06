@@ -131,7 +131,7 @@ impl KcpSession {
             for raw in &output {
                 let block_size =
                     (raw.len() + self.config.data_shards - 1) / self.config.data_shards;
-                let mut blocks: Vec<Vec<u8>> = (0..self.config.data_shards)
+                let blocks: Vec<Vec<u8>> = (0..self.config.data_shards)
                     .map(|i| {
                         let start = i * block_size;
                         let end = ((i + 1) * block_size).min(raw.len());
@@ -172,6 +172,9 @@ impl KcpSession {
 
     /// Feed received UDP data into KCP. Handles FEC decode if enabled.
     pub fn input(&mut self, data: &[u8]) -> io::Result<()> {
+        // Prune before borrowing self.fec to avoid borrow conflict
+        self.prune_old_groups();
+
         if let Some(ref fec) = self.fec {
             if data.len() < FEC_HEADER_SIZE {
                 return Ok(());
@@ -189,8 +192,6 @@ impl KcpSession {
             let shard_id = seqid / self.config.data_shards as u32;
             let shard_index = seqid as usize % self.config.data_shards;
             let total = self.config.data_shards + self.config.parity_shards;
-
-            self.prune_old_groups();
 
             let group = self
                 .shard_groups

@@ -1748,11 +1748,19 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 connect_ws_raw(stream, &host, opts.server_port, FRP_WEBSOCKET_PATH, "http").await
             }
         }
-        #[cfg(any(feature = "kcp", feature = "quic"))]
-        TransportProtocol::Kcp | TransportProtocol::Quic => {
+        #[cfg(feature = "kcp")]
+        TransportProtocol::Kcp => {
             Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "KCP/QUIC should be handled before TCP connect path",
+                "KCP should be handled before TCP connect path",
+            )
+            .into())
+        }
+        #[cfg(feature = "quic")]
+        TransportProtocol::Quic => {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "QUIC should be handled before TCP connect path",
             )
             .into())
         }
