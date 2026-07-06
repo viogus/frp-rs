@@ -21,6 +21,9 @@ pub mod quic;
 pub mod v2_handshake;
 pub mod crypto;
 pub mod stun;
+pub mod feature_gate;
+pub mod unsafe_features;
+pub mod internal_listener;
 
 use thiserror::Error;
 
