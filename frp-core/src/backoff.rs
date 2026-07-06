@@ -93,7 +93,12 @@ impl BackoffManager for FastBackoff {
         if self.options.fast_retry_count > 0 && previous_condition_error {
             self.counts_in_fast_retry_window += 1;
             if self.counts_in_fast_retry_window <= self.options.fast_retry_count {
-                return jitter(self.options.fast_retry_delay, self.options.fast_retry_jitter);
+                let d = if self.options.fast_retry_jitter > 0.0 {
+                    jitter(self.options.fast_retry_delay, self.options.fast_retry_jitter)
+                } else {
+                    self.options.fast_retry_delay
+                };
+                return d;
             }
             if let Some(cutoff) = self.fast_retry_cutoff {
                 if now > cutoff {
@@ -135,11 +140,11 @@ impl BackoffManager for FastBackoff {
 }
 
 /// Add random jitter: returns a duration in `[duration, duration * (1 + max_factor))`.
+///
+/// When `max_factor <= 0.0`, defaults to `1.0` (matching Go frp's `Jitter()`).
 pub fn jitter(duration: Duration, max_factor: f64) -> Duration {
-    if max_factor <= 0.0 {
-        return duration;
-    }
-    let extra = rand::thread_rng().gen::<f64>() * max_factor * duration.as_secs_f64();
+    let factor = if max_factor <= 0.0 { 1.0 } else { max_factor };
+    let extra = rand::thread_rng().gen::<f64>() * factor * duration.as_secs_f64();
     duration + Duration::from_secs_f64(extra)
 }
 

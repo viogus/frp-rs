@@ -96,18 +96,17 @@ impl ClientRegistry {
 
         let now = Instant::now();
 
-        // Check for conflict under read lock first
+        let mut clients = self.clients.write().unwrap();
+        let mut run_index = self.run_index.write().unwrap();
+
+        // Conflict check under write lock (atomic with registration, matching Go)
         if enforce_unique {
-            let clients = self.clients.read().unwrap();
             if let Some(info) = clients.get(&key) {
                 if info.online && !info.run_id.is_empty() && info.run_id != run_id {
                     return (key, true);
                 }
             }
         }
-
-        let mut clients = self.clients.write().unwrap();
-        let mut run_index = self.run_index.write().unwrap();
 
         let info = clients.entry(key.clone()).or_insert_with(|| ClientInfo {
             key: key.clone(),
