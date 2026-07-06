@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use super::socket::WriteRequest;
 
@@ -137,10 +137,8 @@ impl AsyncWrite for KcpStream {
             hex::encode(&buf[..buf.len().min(32)])
         );
 
-        let (confirm_tx, confirm_rx) = oneshot::channel();
         let req = WriteRequest {
             data: buf.to_vec(),
-            confirm: confirm_tx,
         };
 
         if self.write_tx.send((self.conv, req)).is_err() {
@@ -150,10 +148,8 @@ impl AsyncWrite for KcpStream {
             )));
         }
 
-        // Fire-and-forget: don't block on confirm — KCP's flow control via send window
-        // handles backpressure. The oneshot confirm is for error reporting only.
-        // Drop the receiver — we don't wait.
-        drop(confirm_rx);
+        // Fire-and-forget: KCP's send window handles backpressure.
+        // Write errors surface via the driver's debug log.
 
         let n = buf.len();
         self.write_count += n as u64;

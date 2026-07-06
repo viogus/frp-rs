@@ -47,7 +47,6 @@ impl Write for KcpWriter {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) struct KcpSession {
     conv: u32,
     peer_addr: SocketAddr,
@@ -129,17 +128,26 @@ impl KcpSession {
         let mut packets = Vec::new();
         if let Some(ref fec) = self.fec {
             // Encode each raw KCP packet with FEC.
+            // Prepend 2-byte LE length prefix so decoder knows exact original
+            // size after reassembly (avoids lossy trailing-zero stripping).
             // Fec::encode expects exactly data_shards slices. Split the raw
             // KCP output into data_shards equal-sized blocks (padding last block).
             for raw in &output {
-                let block_size = raw.len().div_ceil(self.config.data_shards);
+                let data_len = raw.len();
+                let mut prefixed = Vec::with_capacity(2 + data_len);
+                prefixed.extend_from_slice(&(data_len as u16).to_le_bytes());
+                prefixed.extend_from_slice(raw);
+                let payload = &prefixed;
+                let total_len = payload.len();
+
+                let block_size = total_len.div_ceil(self.config.data_shards);
                 let blocks: Vec<Vec<u8>> = (0..self.config.data_shards)
                     .map(|i| {
                         let start = i * block_size;
-                        let end = ((i + 1) * block_size).min(raw.len());
+                        let end = ((i + 1) * block_size).min(total_len);
                         let mut block = vec![0u8; block_size];
-                        if start < raw.len() {
-                            block[..(end - start)].copy_from_slice(&raw[start..end]);
+                        if start < total_len {
+                            block[..(end - start)].copy_from_slice(&payload[start..end]);
                         }
                         block
                     })
@@ -215,11 +223,17 @@ impl KcpSession {
                     for s in group.shards.iter().take(self.config.data_shards).flatten() {
                         reassembled.extend_from_slice(s);
                     }
-                    while reassembled.last() == Some(&0) {
-                        reassembled.pop();
-                    }
-                    if !reassembled.is_empty() {
-                        self.kcp.input(&reassembled).map_err(io::Error::other)?;
+                    // First 2 bytes are original data length (u16 LE).
+                    // Truncate to stored length instead of stripping trailing
+                    // zeros, which would corrupt KCP packets ending in 0x00.
+                    if reassembled.len() >= 2 {
+                        let original_len =
+                            u16::from_le_bytes([reassembled[0], reassembled[1]]) as usize;
+                        let data = &reassembled[2..];
+                        let end = original_len.min(data.len());
+                        if end > 0 {
+                            self.kcp.input(&data[..end]).map_err(io::Error::other)?;
+                        }
                     }
                 }
                 self.shard_groups.remove(&shard_id);
@@ -404,5 +418,163 @@ mod tests {
         session.shutdown();
         let packets = session.update(10).unwrap();
         assert!(packets.is_empty(), "shutdown session should produce no output");
+    }
+
+    fn fec_config() -> KcpConfig {
+        KcpConfig {
+            mtu: 1400,
+            wnd_size: (128, 128),
+            stream: true,
+            flush_write: true,
+            data_shards: 10,
+            parity_shards: 3,
+            nodelay: KcpNoDelayConfig {
+                nodelay: true,
+                interval: 10,
+                resend: 2,
+                nc: true,
+            },
+        }
+    }
+
+    #[test]
+    fn test_fec_encode_decode_roundtrip() {
+        let config = fec_config();
+        // Sender session with FEC
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let mut sender = KcpSession::new(
+            1,
+            "127.0.0.1:9001".parse().unwrap(),
+            config.clone(),
+            tx1,
+        );
+        // Receiver session with FEC
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let mut receiver = KcpSession::new(
+            1,
+            "127.0.0.1:9000".parse().unwrap(),
+            config,
+            tx2,
+        );
+
+        sender.send(b"hello fec").unwrap();
+
+        // Update sender to produce FEC-encoded packets, feed into receiver
+        let mut now_ms = 0u32;
+        for _ in 0..50 {
+            now_ms += 10;
+            let packets = sender.update(now_ms).unwrap();
+            for pkt in &packets {
+                receiver.input(pkt).unwrap();
+            }
+            receiver.update(now_ms).unwrap();
+            receiver.recv_and_push().unwrap();
+
+            if let Ok(data) = rx2.try_recv() {
+                assert_eq!(data, b"hello fec");
+                return;
+            }
+        }
+        panic!("timed out waiting for FEC data");
+    }
+
+    #[test]
+    fn test_fec_encode_decode_data_ending_with_zero() {
+        let config = fec_config();
+        // Sender session with FEC
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let mut sender = KcpSession::new(
+            2,
+            "127.0.0.1:9001".parse().unwrap(),
+            config.clone(),
+            tx1,
+        );
+        // Receiver session with FEC
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let mut receiver = KcpSession::new(
+            2,
+            "127.0.0.1:9000".parse().unwrap(),
+            config,
+            tx2,
+        );
+
+        // Data ending with zero bytes — the old trailing-zero stripping
+        // would corrupt this to b"hello\0\0\0\x01" (losing the trailing 0x00).
+        let data = b"hello\0\0\0\x01\x00";
+        sender.send(data).unwrap();
+
+        let mut now_ms = 0u32;
+        for _ in 0..50 {
+            now_ms += 10;
+            let packets = sender.update(now_ms).unwrap();
+            for pkt in &packets {
+                receiver.input(pkt).unwrap();
+            }
+            receiver.update(now_ms).unwrap();
+            receiver.recv_and_push().unwrap();
+
+            if let Ok(received) = rx2.try_recv() {
+                assert_eq!(received, data, "data with trailing zero preserved");
+                return;
+            }
+        }
+        panic!("timed out waiting for FEC data with trailing zero");
+    }
+
+    #[test]
+    fn test_fec_parity_recovery() {
+        let config = fec_config();
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let mut sender = KcpSession::new(
+            3,
+            "127.0.0.1:9001".parse().unwrap(),
+            config.clone(),
+            tx1,
+        );
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let mut receiver = KcpSession::new(
+            3,
+            "127.0.0.1:9000".parse().unwrap(),
+            config,
+            tx2,
+        );
+
+        sender.send(b"parity test payload").unwrap();
+
+        let mut now_ms = 0u32;
+        let mut fec_packets = Vec::new();
+        for _ in 0..50 {
+            now_ms += 10;
+            let packets = sender.update(now_ms).unwrap();
+            if !packets.is_empty() {
+                fec_packets = packets;
+                break;
+            }
+        }
+        assert!(!fec_packets.is_empty(), "sender should produce FEC packets");
+
+        // Drop the 3rd data shard (index 2) — parity shards should recover it.
+        // Count data vs parity to find a data shard to drop.
+        let total = 13; // 10 data + 3 parity
+        let mut skipped_one = false;
+        for (i, pkt) in fec_packets.iter().enumerate() {
+            let flag = u16::from_le_bytes([pkt[4], pkt[5]]);
+            let is_data = flag == 0xf1;
+            let shard_idx = i % total;
+            if is_data && shard_idx == 2 && !skipped_one {
+                skipped_one = true;
+                continue; // drop this data shard
+            }
+            receiver.input(pkt).unwrap();
+        }
+        assert!(skipped_one, "should have skipped shard index 2");
+
+        receiver.update(now_ms).unwrap();
+        receiver.recv_and_push().unwrap();
+
+        match rx2.try_recv() {
+            Ok(data) => assert_eq!(data, b"parity test payload"),
+            Err(_) => panic!("parity recovery failed — data not recovered"),
+        }
     }
 }

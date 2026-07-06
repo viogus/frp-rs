@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 
 use super::config::KcpConfig;
@@ -16,7 +16,6 @@ use super::stream::KcpStream;
 
 pub(crate) struct WriteRequest {
     pub data: Vec<u8>,
-    pub confirm: oneshot::Sender<io::Result<usize>>,
 }
 
 pub(crate) struct KcpSocketHandle {
@@ -107,11 +106,10 @@ impl KcpSocket {
 
                 Some((conv, req)) = self.write_rx.recv() => {
                     // Route write to session matching conv (pick first match)
-                    let result = self.sessions.iter_mut()
+                    let _result = self.sessions.iter_mut()
                         .find(|((c, _), _)| *c == conv)
                         .map(|(_, s)| s.send(&req.data))
                         .unwrap_or_else(|| Err(io::Error::new(io::ErrorKind::NotConnected, "session not found")));
-                    let _ = req.confirm.send(result);
                 }
 
                 recv_result = self.socket.recv_from(&mut buf) => {
