@@ -130,7 +130,7 @@ impl Service {
 
         let auth_cfg = AuthConfig {
             method: auth_method.clone(),
-            token: frp_core::auth::resolve_dynamic_token(&cfg.token),
+            token: frp_core::auth::resolve_dynamic_token(&cfg.token).map_err(|e| anyhow::anyhow!("{e}"))?,
             oidc_issuer: cfg.auth.as_ref().map(|a| a.oidc_issuer.clone()).unwrap_or_default(),
             oidc_audience: cfg.auth.as_ref().map(|a| a.oidc_audience.clone()).unwrap_or_default(),
             oidc_skip_expiry: false,
@@ -300,13 +300,17 @@ impl Service {
     }
 
     /// Compute reconnect delay with exponential backoff and jitter.
-    /// Formula: min(24s × failed_count, 720s) × jitter[0.8, 1.2].
-    /// Matches Go frp v0.69.1 reconnect behavior.
+    /// Formula: min(24s × 1.5^(failed_count-1), 720s) × jitter[0.8, 1.2].
+    /// Matches Go frp v0.69.1 reconnect behavior:
+    /// `reconnectInterval * math.Pow(1.5, failedCount-1)`.
     fn reconnect_delay_secs(failed_count: u32) -> u64 {
-        let base = (24 * failed_count as u64).min(720);
+        if failed_count == 0 {
+            return 24; // base interval for first reconnect
+        }
+        let base = (24.0_f64 * 1.5_f64.powi(failed_count as i32 - 1)).min(720.0);
         let mut rng = rand::thread_rng();
         let jitter: f64 = rng.gen_range(0.8..1.2);
-        ((base as f64) * jitter) as u64
+        ((base) * jitter) as u64
     }
 
     async fn reconnect_delay(failed_count: u32) {
@@ -383,6 +387,11 @@ impl Service {
         // Health checks send the proxy name; the control loop sends CloseProxy to the server.
         let (health_tx, mut health_rx) = mpsc::unbounded_channel::<String>();
 
+        // Cancellation flags for health check tasks — set to true when a proxy
+        // is closed (via CloseProxy from server, admin, or health check failure).
+        let health_cancels: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
         // Spawn health checks once, outside reconnect loop (they are per-proxy, not per-session)
         for p in &proxies {
             let hc_type = p.health_check_type.clone();
@@ -408,8 +417,13 @@ impl Service {
             let tx = health_tx.clone();
             let hc_url = if hc_type == "http" { p.health_check_url.clone() } else { String::new() };
             let hc_headers = p.health_check_http_headers.clone();
+            let cancel = Arc::new(AtomicBool::new(false));
+            {
+                let mut cancels = health_cancels.lock().unwrap();
+                cancels.insert(pn.clone(), cancel.clone());
+            }
             tokio::spawn(async move {
-                crate::health::run_health_check(pn, la, hc_type, hc_url, hc_headers, interval, timeout, max_failed, tx).await;
+                crate::health::run_health_check(pn, la, hc_type, hc_url, hc_headers, interval, timeout, max_failed, tx, cancel).await;
             });
         }
 
@@ -463,10 +477,13 @@ impl Service {
         }
 
         // Main session loop with reconnection.
-        // Exponential backoff: 24s × failedCount with jitter [0.8, 1.2], capped at 720s.
-        // Matches Go frp v0.69.1 reconnect behavior.
+        // Exponential backoff: 24s × 1.5^(failedCount-1) with jitter [0.8, 1.2], capped at 720s.
+        // Matches Go frp v0.69.1 reconnect behavior:
+        // `reconnectInterval * math.Pow(1.5, failedCount-1)`.
         let mut did_login_once = false;
         let mut failed_count: u32 = 0;
+        // Track visitor listener tasks so they can be cancelled on reconnect.
+        let mut visitor_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         loop {
             let mut ctl = ControlConnection::new(
                 self.cfg.server_addr.clone(),
@@ -760,6 +777,11 @@ impl Service {
                 });
             }
 
+            // Cancel old visitor listener tasks from a previous session.
+            for h in visitor_handles.drain(..) {
+                h.abort();
+            }
+
             // Spawn STCP/XTCP visitor listeners
             for v in &self.cfg.visitors {
                 if v.bind_port == 0 {
@@ -785,11 +807,12 @@ impl Service {
                 let stun_server = nat_hole_stun_server.clone();
                 let fallback_to = v.fallback_to.clone();
                 let vtx = self.visitor_tx.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     crate::visitor::run_visitor_listener(sa, sp, pt, server_name, secret_key, bind_addr, use_enc, use_comp, name,
                         tls_enable, tls_server_name, tls_ca_file, visitor_type, fallback_timeout_ms,
                         keep_tunnel_open, max_retries_an_hour, min_retry_interval, stun_server, vtx, fallback_to).await;
                 });
+                visitor_handles.push(handle);
             }
 
             // --- Message loop ---
@@ -849,9 +872,17 @@ impl Service {
                             }
                             Ok(FrpMessage::CloseProxy(cp)) => {
                                 info!(proxy_name = %cp.proxy_name, "Server closed proxy: {}", cp.proxy_name);
+                                // Cancel health check task for this proxy.
+                                if let Some(cancel) = health_cancels.lock().unwrap().get(&cp.proxy_name) {
+                                    cancel.store(true, Ordering::Relaxed);
+                                }
                             }
                             Ok(FrpMessage::CloseProxyResp(cpr)) => {
                                 info!(proxy_name = %cpr.proxy_name, "Server confirmed proxy close: {}", cpr.proxy_name);
+                                // Cancel health check task for this proxy.
+                                if let Some(cancel) = health_cancels.lock().unwrap().get(&cpr.proxy_name) {
+                                    cancel.store(true, Ordering::Relaxed);
+                                }
                             }
                             Ok(FrpMessage::Error(err)) => {
                                 warn!(error = %err.error, "Server error: {}", err.error);
@@ -1152,6 +1183,11 @@ impl Service {
                         });
                         if let Err(e) = write_msg(&mut *writer.lock().await, &close, v2).await {
                             warn!(proxy_name = %proxy_name, error = %e, "Failed to send CloseProxy for {}: {}", proxy_name, e);
+                        }
+                        // Cancel health check task for this proxy (already stopped itself,
+                        // but set the flag for any other listeners).
+                        if let Some(cancel) = health_cancels.lock().unwrap().get(&proxy_name) {
+                            cancel.store(true, Ordering::Relaxed);
                         }
                     }
 
@@ -1477,14 +1513,17 @@ mod tests {
 
     #[test]
     fn reconnect_delay_secs_failed_count_zero() {
-        // failed_count=0 → base=0 → delay=0 regardless of jitter
-        let delay = Service::reconnect_delay_secs(0);
-        assert_eq!(delay, 0, "no failures → zero delay");
+        // failed_count=0 → returns base interval of 24s → jitter [19, 28]
+        for _ in 0..100 {
+            let delay = Service::reconnect_delay_secs(0);
+            assert!(delay >= 19, "delay {} too low for n=0", delay);
+            assert!(delay <= 29, "delay {} too high for n=0", delay);
+        }
     }
 
     #[test]
     fn reconnect_delay_secs_failed_count_one() {
-        // failed_count=1 → base=24s → jitter [0.8, 1.2] → [19, 28]
+        // failed_count=1 → base=24s × 1.5^0=24s → jitter [19, 28]
         for _ in 0..100 {
             let delay = Service::reconnect_delay_secs(1);
             assert!(delay >= 19, "delay {} too low for n=1", delay);
@@ -1493,18 +1532,18 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_delay_secs_linear_growth() {
-        // failed_count=2 → base=48s → [38, 57]
+    fn reconnect_delay_secs_exponential_growth() {
+        // failed_count=2 → base=24s × 1.5^1=36s → jitter [28, 43]
         for _ in 0..100 {
             let delay = Service::reconnect_delay_secs(2);
-            assert!(delay >= 38, "delay {} too low for n=2", delay);
-            assert!(delay <= 58, "delay {} too high for n=2", delay);
+            assert!(delay >= 28, "delay {} too low for n=2", delay);
+            assert!(delay <= 44, "delay {} too high for n=2", delay);
         }
     }
 
     #[test]
     fn reconnect_delay_secs_caps_at_720s() {
-        // failed_count=100 → base=min(2400, 720)=720 → [576, 864]
+        // failed_count=100 → base=min(24×1.5^99, 720)=720 → jitter [576, 864]
         for _ in 0..100 {
             let delay = Service::reconnect_delay_secs(100);
             assert!(delay >= 576, "delay {} below 80% of cap", delay);
