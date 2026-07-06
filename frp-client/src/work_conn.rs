@@ -313,6 +313,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                         oidc_proxy_url: String::new(),
                         additional_auth_scopes: Vec::new(),
                         authentication_timeout: 0,
+                        use_encryption: false,
                     };
                     nwc_msg.privilege_key = auth_cfg.generate_login_key(timestamp);
                     nwc_msg.timestamp = Some(timestamp);

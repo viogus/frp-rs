@@ -63,7 +63,7 @@ pub trait BlockCrypt: Send + Sync + std::fmt::Debug {
     /// 
     /// # 返回
     /// 返回写入的字节数（包含认证标签）
-    fn seal(&self, dst: &mut [u8], nonce: &[u8], plaintext: &[u8]) -> Result<usize, String> {
+    fn seal(&self, _dst: &mut [u8], nonce: &[u8], plaintext: &[u8]) -> Result<usize, String> {
         // 默认实现：对于非 AEAD 模式，panic（与 kcp-go 一致）
         panic!("called Seal on non-AEAD crypt")
     }

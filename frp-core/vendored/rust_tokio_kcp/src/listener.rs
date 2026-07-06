@@ -5,7 +5,6 @@ use std::{
     task::{Context, Poll},
     time::Duration,
     collections::HashMap,
-    sync::Mutex,
 };
 
 use byte_string::ByteStr;
@@ -259,7 +258,7 @@ impl KcpListener {
 
                                 // Read conv from the KCP packet position (in decrypted packet)
                                 let conv_bytes = &decrypted_packet[kcp_packet_offset..kcp_packet_offset + 4];
-                                let mut conv = u32::from_le_bytes([conv_bytes[0], conv_bytes[1], conv_bytes[2], conv_bytes[3]]);
+                                let conv = u32::from_le_bytes([conv_bytes[0], conv_bytes[1], conv_bytes[2], conv_bytes[3]]);
 
                                 if let Some(ref crypt) = config.crypt {
                                     if !crypt.is_aead() {
