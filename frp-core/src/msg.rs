@@ -191,16 +191,12 @@ pub struct NewProxy {
     pub virtual_net: Option<String>,
     #[serde(rename = "proxyProtocolVersion", skip_serializing_if = "Option::is_none")]
     pub proxy_protocol_version: Option<String>,
-    #[cfg(feature = "vnet")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub advertise_subnet: Option<String>,
-    #[cfg(feature = "vnet")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vnet_ip: Option<String>,
-    #[cfg(feature = "vnet")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vnet_netmask: Option<String>,
-    #[cfg(feature = "vnet")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vnet_mtu: Option<u16>,
 }
