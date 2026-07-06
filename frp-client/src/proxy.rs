@@ -21,10 +21,16 @@ pub fn create_visitor_conn_msg(server_name: &str, secret_key: &str, use_encrypti
         None
     } else {
         let hash = frp_core::auth::generate_token(secret_key, timestamp);
+        // Redact secret key in logs: only show first 4 chars for debugging.
+        let sk_redacted = if secret_key.len() > 4 {
+            format!("{}...", &secret_key[..4])
+        } else {
+            "****".to_string()
+        };
         debug!(
-            secret_key = %secret_key, timestamp = %timestamp, sign_key = %hash,
+            secret_key = %sk_redacted, timestamp = %timestamp, sign_key = %hash,
             "STCP visitor auth: sk='{}' ts={} sign_key={}",
-            secret_key, timestamp, hash
+            sk_redacted, timestamp, hash
         );
         Some(hash)
     };
