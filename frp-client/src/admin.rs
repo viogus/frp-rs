@@ -261,7 +261,6 @@ pub async fn run_admin_server(
                 .layer(DefaultBodyLimit::max(1024 * 1024))
         );
 
-    #[cfg(feature = "tls")]
     let app = apply_admin_auth(app, &auth_user, &auth_password);
     let app = app.with_state(state);
 
@@ -282,7 +281,7 @@ pub async fn run_admin_server(
     }
     #[cfg(not(feature = "tls"))]
     {
-        let _ = (&auth_user, &auth_password, &tls_cert_file, &tls_key_file);
+        let _ = (&tls_cert_file, &tls_key_file);
         tracing::info!(addr = %addr, "frpc admin server listening on {}", addr);
         axum::serve(listener, app).await?;
     }
@@ -297,6 +296,7 @@ const SENSITIVE_KEYS: &[&str] = &[
     "http_pwd", "http_password",
     "sk", "group_key",
     "oidc_client_secret",
+    "user", "password",
 ];
 
 /// Recursively redact sensitive values in TOML, returning a copy with

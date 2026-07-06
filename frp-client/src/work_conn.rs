@@ -411,7 +411,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     // for XTCP notification (separate frame for Go frp compat).
                     // Go frp v0.69.1 doesn't support V2 XTCP, so this is
                     // Rust↔Rust only.
-                    {
+                    if v2 {
                         use frp_core::protocol::{read_v2_frame_raw, V2_FRAME_TYPE_MESSAGE};
                         let mut peek_buf = Vec::new();
                         match read_v2_frame_raw(&mut work).await {

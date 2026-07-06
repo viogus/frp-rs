@@ -309,6 +309,7 @@ pub async fn handle_control<S>(
     let mut udp_sockets: std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>> = std::collections::HashMap::new();
     // Reverse mapping: local_addr → proxy_name for routing UDPPacket responses
     let mut udp_local_to_proxy: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut shutting_down = false;
     let mut last_ping = Instant::now();
     // Ping interval: max 10s to stay well within Go frpc's heartbeat timeout
     let ping_interval = Duration::from_secs(10);
@@ -1278,7 +1279,9 @@ pub async fn handle_control<S>(
                     break;
                 }
                 debug!(peer = ?peer, "Sent Ping to {:?}", peer);
-                last_ping = Instant::now();
+                // Do NOT update last_ping here — only update when Pong is
+                // received from client. Updating on server-initiated Pings
+                // would prevent the heartbeat timeout from ever triggering.
             }
             _ = state.shutdown_token.cancelled() => {
                 info!(run_id = %run_id, "Graceful shutdown: draining control handler for {}", run_id);
