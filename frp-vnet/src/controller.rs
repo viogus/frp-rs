@@ -114,7 +114,7 @@ impl VnetController {
                         }
                         Err(e) => {
                             tracing::error!(%self.proxy_name, %e, "TUN read error");
-                            break;
+                            return Err(anyhow::anyhow!("TUN read error: {e}"));
                         }
                     }
                 }

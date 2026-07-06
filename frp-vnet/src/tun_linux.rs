@@ -1,8 +1,8 @@
-use std::cell::Cell;
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, unix::AsyncFd};
 
@@ -12,11 +12,11 @@ use super::tun::TunDevice;
 pub struct LinuxTun {
     async_fd: AsyncFd<OwnedFd>,
     name: String,
-    mtu: Cell<u16>,
+    mtu: AtomicU16,
 }
 
+// SAFETY: AsyncFd<OwnedFd> is Send + Sync on Unix; AtomicU16 is Sync.
 unsafe impl Send for LinuxTun {}
-unsafe impl Sync for LinuxTun {}
 
 impl LinuxTun {
     pub async fn open(requested_name: &str) -> anyhow::Result<Box<dyn TunDevice>> {
@@ -72,8 +72,8 @@ impl LinuxTun {
             ));
         }
 
+        let raw_fd = dev.into_raw_fd();
         let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-        std::mem::forget(dev);
 
         let async_fd = AsyncFd::new(fd)?;
         tracing::info!(name = %name, "Linux TUN device opened");
@@ -81,7 +81,7 @@ impl LinuxTun {
         Ok(Box::new(LinuxTun {
             async_fd,
             name,
-            mtu: Cell::new(1500),
+            mtu: AtomicU16::new(1500),
         }))
     }
 }
@@ -164,7 +164,7 @@ impl TunDevice for LinuxTun {
                 io::Error::last_os_error()
             ));
         }
-        self.mtu.set(mtu);
+        self.mtu.store(mtu, Ordering::Relaxed);
 
         // Bring up
         let ret = unsafe { libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &ifr) };
@@ -196,7 +196,7 @@ impl TunDevice for LinuxTun {
         &self.name
     }
     fn mtu(&self) -> u16 {
-        self.mtu.get()
+        self.mtu.load(Ordering::Relaxed)
     }
 }
 

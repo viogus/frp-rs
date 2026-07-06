@@ -7,8 +7,8 @@ use std::net::Ipv4Addr;
 pub struct RouteTable {
     /// Sorted by prefix length descending (longest first) for lookup priority.
     routes: Vec<(Ipv4Net, String)>,
-    /// Index by proxy_name for removal.
-    by_name: HashMap<String, (Ipv4Net, String)>,
+    /// Index by proxy_name for fast removal.
+    by_name: HashMap<String, Ipv4Net>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,13 +71,22 @@ impl RouteTable {
                         net, name, existing, existing_name
                     ));
                 }
+                if overlaps {
+                    tracing::warn!(
+                        subnet = %net,
+                        proxy = name,
+                        existing = %existing,
+                        existing_proxy = existing_name,
+                        "overlapping subnets with different prefix lengths (resolved by longest-prefix match)"
+                    );
+                }
             }
         }
 
         // Remove old entry for this proxy if exists
         self.remove(name);
 
-        self.by_name.insert(name.to_string(), (net.clone(), name.to_string()));
+        self.by_name.insert(name.to_string(), net.clone());
         self.routes.push((net, name.to_string()));
         // Sort by prefix length descending for longest-prefix match
         self.routes.sort_by_key(|item| std::cmp::Reverse(item.0.prefix_len));
