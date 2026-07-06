@@ -221,8 +221,13 @@ impl Controller {
     #[instrument(skip(self, msg), fields(transaction_id = %msg.transaction_id, sid = ?msg.sid))]
     pub async fn handle_client(&self, msg: msg::NatHoleClient) {
         if let Some(ref sid) = msg.sid {
-            let sessions = self.sessions.read().await;
-            if let Some(session) = sessions.get(sid) {
+            // Clone Arc<Session> while holding read lock, then drop the lock
+            // before acquiring per-session mutexes to avoid blocking writers.
+            let session = {
+                let sessions = self.sessions.read().await;
+                sessions.get(sid).cloned()
+            };
+            if let Some(session) = session {
                 trace!(
                     sid = %sid,
                     proxy_name = %msg.proxy_name,
@@ -243,8 +248,13 @@ impl Controller {
     /// Handle NatHoleReport from provider.
     pub async fn handle_report(&self, msg: &msg::NatHoleReport) {
         if let Some(sid) = msg.sid.as_deref() {
-            let sessions = self.sessions.read().await;
-            if let Some(session) = sessions.get(sid) {
+            // Clone Arc<Session> while holding read lock, then drop the lock
+            // before acquiring per-session mutexes to avoid blocking writers.
+            let session = {
+                let sessions = self.sessions.read().await;
+                sessions.get(sid).cloned()
+            };
+            if let Some(session) = session {
                 *session.last_activity.lock().unwrap() = Instant::now();
                 // Report success to analyzer
                 let v_resp = session.v_resp.lock().await;
