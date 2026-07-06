@@ -790,7 +790,7 @@ pub enum IoStream {
     Yamux(YamuxStream),
     /// AES-128-CFB encrypted control stream.
     /// Created after login by wrapping the inner IoStream.
-    Cipher(Box<crate::cipher_stream::CipherStream>),
+    Cipher(Box<crate::cipher_stream::CipherStream<IoStream>>),
     /// AEAD encrypted V2 control stream (AES-256-GCM or XChaCha20-Poly1305).
     /// Created after V2 handshake with crypto negotiation.
     Aead(Box<crate::crypto::AeadStream>),
@@ -1175,7 +1175,7 @@ impl IoStream {
                 IoStream::Aead(inner)
             }
             other => {
-                let c = crate::cipher_stream::CipherStream::new(Box::new(other), key);
+                let c = crate::cipher_stream::CipherStream::new(other, key);
                 IoStream::Cipher(Box::new(c))
             }
         }
@@ -1627,7 +1627,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
         #[cfg(feature = "kcp")]
         TransportProtocol::Kcp => {
             let addr = format!("{}:{}", opts.server_addr, opts.server_port);
-            let stream = crate::kcp::dial_kcp(&addr, Default::default()).await
+            let stream = crate::kcp::dial_kcp(&addr, crate::kcp::default_kcp_config()).await
                 .map_err(|e| crate::Error::Transport(format!("KCP dial: {e}")))?;
             return Ok(IoStream::Kcp(stream));
         }
