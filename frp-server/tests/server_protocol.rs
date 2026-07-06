@@ -7,6 +7,7 @@ use frp_core::protocol::{read_msg_v1, write_msg_v1};
 
 use common::{allocate_port, login_with_test_token, raw_login, raw_login_resp, start_test_server, test_auth_cfg};
 use frp_core::transport::{DialOptions, IoStream, TransportProtocol, dial_server};
+use frp_server::service::Service;
 use std::path::PathBuf;
 
 fn test_cert_dir() -> PathBuf {
@@ -30,29 +31,17 @@ async fn test_login_empty_token_rejected() {
         bind_port: port,
         ..Default::default()
     };
-    let (_handle, _) = start_test_server(cfg).await;
 
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let resp = raw_login_resp(addr, None, None, "").await;
-
-    // Empty token: login succeeds (Go frp backward compat).
-    // check_startup() guards against empty-token misconfiguration at server start.
-    match resp {
-        Ok(r) => {
-            assert!(
-                r.error.is_none(),
-                "login with empty token should be accepted (Go frp backward compat), got error: {:?}",
-                r.error
-            );
-        }
-        Err(e) => {
-            // Protocol-level errors with auth-related messages are also acceptable
-            assert!(
-                e.to_string().contains("token") || e.to_string().contains("auth"),
-                "expected auth-related error, got: {e}"
-            );
-        }
-    }
+    // check_startup() rejects empty-token configurations at server startup.
+    // This catches accidental empty-token deployments before they go live.
+    let err = match Service::new(cfg, None).await {
+        Ok(_) => panic!("Server should reject empty token at startup via check_startup()"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("security misconfiguration") || err.contains("CRITICAL") || err.contains("token"),
+        "Expected startup rejection with security message, got: {err}"
+    );
 }
 
 #[tokio::test]

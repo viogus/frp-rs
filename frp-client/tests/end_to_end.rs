@@ -108,6 +108,10 @@ async fn test_e2e_tcp_proxy_over_websocket() {
         bind_port: server_port,
         allow_port_start: proxy_port.saturating_sub(50),
         allow_port_end: proxy_port.saturating_add(50).min(u16::MAX),
+        auth: frp_core::config::AuthServerConfig {
+            token: "test-token".into(),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let server_svc = ServerService::new(server_cfg, None).await.expect("create server service");
@@ -121,7 +125,7 @@ async fn test_e2e_tcp_proxy_over_websocket() {
         server_addr: "127.0.0.1".into(),
         server_port,
         transport_protocol: "websocket".into(),
-        token: String::new(),
+        token: "test-token".into(),
         login_fail_exit: false,
         pool_count: 1,
         proxies: vec![ProxyConfig {
@@ -331,6 +335,10 @@ async fn test_e2e_tcp_proxy_over_yamux() {
         bind_port: server_port,
         allow_port_start: proxy_port.saturating_sub(50),
         allow_port_end: proxy_port.saturating_add(50).min(u16::MAX),
+        auth: frp_core::config::AuthServerConfig {
+            token: "test-token".into(),
+            ..Default::default()
+        },
         transport: frp_core::config::ServerTransportConfig {
             tcp_mux: true,
             tcp_mux_keepalive_interval: 30,
@@ -348,7 +356,7 @@ async fn test_e2e_tcp_proxy_over_yamux() {
     let client_cfg = ClientConfig {
         server_addr: "127.0.0.1".into(),
         server_port,
-        token: String::new(),
+        token: "test-token".into(),
         login_fail_exit: false,
         pool_count: 1,
         tcp_mux: true,
