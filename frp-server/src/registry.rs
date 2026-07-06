@@ -71,6 +71,7 @@ impl ClientRegistry {
     ///
     /// Returns `(key, conflict)` where `conflict=true` means an online client
     /// with the same key but different run_id already exists.
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &self,
         user: &str,

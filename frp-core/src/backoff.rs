@@ -79,9 +79,9 @@ impl BackoffManager for FastBackoff {
 
         if self.last_called.is_none() {
             self.last_called = Some(now);
-        } else {
-            self.last_called = Some(now);
+            return self.options.duration;
         }
+        self.last_called = Some(now);
 
         if previous_condition_error {
             self.consecutive_err_count += 1;
@@ -279,8 +279,12 @@ mod tests {
             ..Default::default()
         });
 
-        // First 3 errors within fast_retry_window get fast_retry_delay
-        let d1 = b.backoff(Duration::ZERO, true);
+        // First call always returns base duration (Go compat)
+        let d0 = b.backoff(Duration::ZERO, true);
+        assert_eq!(d0, Duration::from_secs(10));
+
+        // Next 3 errors within fast_retry_window get fast_retry_delay
+        let d1 = b.backoff(d0, true);
         assert_eq!(d1, Duration::from_millis(50));
 
         let d2 = b.backoff(d1, true);
@@ -289,7 +293,7 @@ mod tests {
         let d3 = b.backoff(d2, true);
         assert_eq!(d3, Duration::from_millis(50));
 
-        // 4th error: normal backoff
+        // 4th error (after first): normal backoff
         let d4 = b.backoff(d3, true);
         assert!(d4 > Duration::from_millis(50));
     }
