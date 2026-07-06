@@ -196,6 +196,7 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 - **Property/fuzz tests**: proptest-based config normalization (`frp-core/src/config.rs`, 14 tests) and V1/V2 protocol frame fuzzing (`frp-core/src/protocol.rs`, 13 tests, 0 panics found).
 - **Stress tests**: `scripts/stress-test.sh` runs frps + frpc under load with connection churn, monitored via `scripts/frp-stress/`. Weekly CI run in `stress-test.yml`.
 - **Cross-compat tests**: `scripts/compat-test.sh` — 40 default + 2 guarded (XTCP 16-test pairwise matrix, V2 `GO_FRP_V2=1`). Runs on every push via `compat.yml`. XTCP compat runs daily on VPS via `xtcp-compat.yml`.
+- **Security audit**: Run `cargo audit` and `cargo deny check` before each release to catch known vulnerabilities and license issues in the dependency tree.
 
 ### Dependency Policy (mandatory)
 
