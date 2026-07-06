@@ -9,6 +9,7 @@ use tracing::{info, error, warn, debug, instrument};
 
 use frp_core::config::ServerConfig;
 use frp_core::auth::{AuthConfig, AuthMethod};
+use frp_core::unsafe_features::UnsafeFeatures;
 #[cfg(feature = "oidc")]
 use frp_core::auth::OidcVerifier;
 use frp_core::msg::FrpMessage;
@@ -62,7 +63,10 @@ impl Service {
                 "oidc" => AuthMethod::Oidc,
                 _ => AuthMethod::Token,
             },
-            token: frp_core::auth::resolve_dynamic_token(&cfg.auth.token),
+            token: frp_core::auth::resolve_dynamic_token_checked(&cfg.auth.token, &UnsafeFeatures::default()).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
+                String::new()
+            }),
             oidc_issuer: cfg.auth.oidc_issuer.clone(),
             oidc_audience: cfg.auth.oidc_audience.clone(),
             oidc_skip_expiry: cfg.auth.oidc_skip_expiry,
@@ -73,6 +77,9 @@ impl Service {
             authentication_timeout: cfg.auth.authentication_timeout,
             use_encryption: cfg.auth.use_encryption,
         };
+        auth_cfg
+            .check_startup()
+            .map_err(|e| format!("security misconfiguration: {e}"))?;
 
         #[cfg(feature = "oidc")]
         let oidc_verifier = if auth_cfg.method == AuthMethod::Oidc {
@@ -107,7 +114,11 @@ impl Service {
             vec![(cfg.allow_port_start, cfg.allow_port_end)]
         };
         let sub_host = cfg.sub_domain_host.clone();
-        let max_connections: usize = 10000;
+        let max_connections: usize = match cfg.max_connections {
+            Some(0) => usize::MAX, // 0 = unlimited
+            Some(n) => n as usize,
+            None => 10000, // default
+        };
         let mut state = AppState::new(
             auth_cfg,
             if cfg.proxy_bind_addr.is_empty() {
@@ -2384,7 +2395,10 @@ impl Service {
                 "oidc" => AuthMethod::Oidc,
                 _ => AuthMethod::Token,
             },
-            token: frp_core::auth::resolve_dynamic_token(&new_cfg.auth.token),
+            token: frp_core::auth::resolve_dynamic_token_checked(&new_cfg.auth.token, &UnsafeFeatures::default()).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
+                String::new()
+            }),
             oidc_issuer: new_cfg.auth.oidc_issuer.clone(),
             oidc_audience: new_cfg.auth.oidc_audience.clone(),
             oidc_skip_expiry: new_cfg.auth.oidc_skip_expiry,
@@ -2395,6 +2409,9 @@ impl Service {
             authentication_timeout: new_cfg.auth.authentication_timeout,
             use_encryption: new_cfg.auth.use_encryption,
         };
+        new_auth_cfg
+            .check_startup()
+            .map_err(|e| format!("security misconfiguration: {e}"))?;
         let new_enc_key = frp_core::encryption::derive_key(&new_auth_cfg.token);
         let new_allow_ports = if !new_cfg.allow_ports.is_empty() {
             frp_core::config::parse_allow_ports(&new_cfg.allow_ports)

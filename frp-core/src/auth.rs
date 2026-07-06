@@ -66,6 +66,32 @@ pub struct AuthConfig {
     pub use_encryption: bool,
 }
 
+impl Drop for AuthConfig {
+    fn drop(&mut self) {
+        zeroize_string(&mut self.token);
+    }
+}
+
+impl AuthConfig {
+    /// Construct an `AuthConfig` with default fields and the given token.
+    /// Convenience constructor for tests and simple configurations.
+    pub fn with_token(token: impl Into<String>) -> Self {
+        Self {
+            method: AuthMethod::Token,
+            token: token.into(),
+            oidc_issuer: String::new(),
+            oidc_audience: String::new(),
+            oidc_skip_expiry: false,
+            oidc_skip_issuer: false,
+            additional_data: None,
+            oidc_proxy_url: String::new(),
+            additional_auth_scopes: Vec::new(),
+            authentication_timeout: 0,
+            use_encryption: false,
+        }
+    }
+}
+
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
@@ -828,12 +854,8 @@ mod tests {
 
     #[test]
     fn test_auth_config_validate() {
-        let cfg = AuthConfig {
-            method: AuthMethod::Token,
-            token: "secret".into(),
-            authentication_timeout: 15,
-            ..Default::default()
-        };
+        let mut cfg = AuthConfig::with_token("secret");
+        cfg.authentication_timeout = 15;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -853,12 +875,16 @@ mod tests {
     fn test_auth_config_oidc_rejects_without_verifier() {
         let cfg = AuthConfig {
             method: AuthMethod::Oidc,
+            token: String::new(),
             oidc_issuer: "https://issuer.example.com".into(),
             oidc_audience: "my-audience".into(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+            additional_data: None,
             oidc_proxy_url: String::new(),
-            ..Default::default()
+            additional_auth_scopes: Vec::new(),
+            authentication_timeout: 0,
+            use_encryption: false,
         };
         // AuthConfig::validate_login for OIDC returns error when no server-side verifier
         let result = cfg.validate_login(Some("some-jwt-token"), Some(100));
@@ -1011,12 +1037,7 @@ mod tests {
 
     #[test]
     fn test_auth_timeout_zero_disables_check() {
-        let cfg = AuthConfig {
-            method: AuthMethod::Token,
-            token: "secret".into(),
-            authentication_timeout: 0,
-            ..Default::default()
-        };
+        let cfg = AuthConfig::with_token("secret");
         // Token with a timestamp far in the past should still verify
         // when timeout is disabled (only token matters, not timestamp)
         let far_past = 0i64;
@@ -1026,12 +1047,8 @@ mod tests {
 
     #[test]
     fn test_auth_timeout_rejects_future_timestamp() {
-        let cfg = AuthConfig {
-            method: AuthMethod::Token,
-            token: "secret".into(),
-            authentication_timeout: 15,
-            ..Default::default()
-        };
+        let mut cfg = AuthConfig::with_token("secret");
+        cfg.authentication_timeout = 15;
         let far_future = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1045,12 +1062,8 @@ mod tests {
 
     #[test]
     fn test_auth_timeout_rejects_past_timestamp() {
-        let cfg = AuthConfig {
-            method: AuthMethod::Token,
-            token: "secret".into(),
-            authentication_timeout: 15,
-            ..Default::default()
-        };
+        let mut cfg = AuthConfig::with_token("secret");
+        cfg.authentication_timeout = 15;
         let far_past = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1064,12 +1077,8 @@ mod tests {
 
     #[test]
     fn test_auth_timeout_accepts_current_timestamp() {
-        let cfg = AuthConfig {
-            method: AuthMethod::Token,
-            token: "secret".into(),
-            authentication_timeout: 15,
-            ..Default::default()
-        };
+        let mut cfg = AuthConfig::with_token("secret");
+        cfg.authentication_timeout = 15;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1080,12 +1089,8 @@ mod tests {
 
     #[test]
     fn test_auth_timeout_boundary_inside_window() {
-        let cfg = AuthConfig {
-            method: AuthMethod::Token,
-            token: "secret".into(),
-            authentication_timeout: 15,
-            ..Default::default()
-        };
+        let mut cfg = AuthConfig::with_token("secret");
+        cfg.authentication_timeout = 15;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1098,12 +1103,8 @@ mod tests {
 
     #[test]
     fn test_auth_timeout_boundary_outside_window() {
-        let cfg = AuthConfig {
-            method: AuthMethod::Token,
-            token: "secret".into(),
-            authentication_timeout: 15,
-            ..Default::default()
-        };
+        let mut cfg = AuthConfig::with_token("secret");
+        cfg.authentication_timeout = 15;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1118,12 +1119,8 @@ mod tests {
     #[test]
     fn test_auth_timeout_still_rejects_wrong_token_inside_window() {
         // Replay protection: even with a valid timestamp, wrong token fails
-        let cfg = AuthConfig {
-            method: AuthMethod::Token,
-            token: "secret".into(),
-            authentication_timeout: 15,
-            ..Default::default()
-        };
+        let mut cfg = AuthConfig::with_token("secret");
+        cfg.authentication_timeout = 15;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

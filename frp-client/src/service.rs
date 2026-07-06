@@ -17,6 +17,7 @@ use tracing::{info, warn, debug, instrument};
 use rand::Rng;
 
 use frp_core::auth::{AuthConfig, AuthMethod, OidcClient};
+use frp_core::unsafe_features::UnsafeFeatures;
 use frp_core::config::ClientConfig;
 
 #[cfg(feature = "vnet")]
@@ -130,7 +131,10 @@ impl Service {
 
         let auth_cfg = AuthConfig {
             method: auth_method.clone(),
-            token: frp_core::auth::resolve_dynamic_token(&cfg.token),
+            token: frp_core::auth::resolve_dynamic_token_checked(&cfg.token, &UnsafeFeatures::default()).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
+                String::new()
+            }),
             oidc_issuer: cfg.auth.as_ref().map(|a| a.oidc_issuer.clone()).unwrap_or_default(),
             oidc_audience: cfg.auth.as_ref().map(|a| a.oidc_audience.clone()).unwrap_or_default(),
             oidc_skip_expiry: false,
