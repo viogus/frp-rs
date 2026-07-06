@@ -286,6 +286,7 @@ impl KcpSessionManager {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn alloc_conv(&mut self) -> u32 {
         let mut conv = rand::random();
         while conv == 0 {

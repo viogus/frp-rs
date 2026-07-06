@@ -35,7 +35,8 @@ pub struct KcpListener {
     udp: Arc<UdpSocket>,
     accept_rx: mpsc::Receiver<(KcpStream, SocketAddr)>,
     task_watcher: JoinHandle<()>,
-    mode:ListenerMode,
+    #[allow(dead_code)]
+    mode: ListenerMode,
     custom_mode_tx:tokio::sync::mpsc::Sender<CustomModeOperate>,
     //conv_map: Arc<Mutex<HashMap<u32, Vec<u8>>>>,
 }
@@ -218,7 +219,7 @@ impl KcpListener {
 
                                 // Now check if this is a FEC packet (after decryption)
                                 // If FEC is disabled (both shards are 0), skip FEC check
-                                let (kcp_packet_offset, is_fec, fec_offset) = if fec_data_shards == 0 && fec_parity_shards == 0 {
+                                let (kcp_packet_offset, _is_fec, _fec_offset) = if fec_data_shards == 0 && fec_parity_shards == 0 {
                                     // FEC is disabled, packet format is [KCP数据] (no FEC header)
                                     (0, false, 0)
                                 } else if decrypted_packet.len() >= FEC_HEADER_SIZE_PLUS_2 {
