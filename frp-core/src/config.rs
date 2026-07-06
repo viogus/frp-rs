@@ -385,6 +385,7 @@ fn default_max_days() -> i32 { 3 }
 /// the `otel` feature is compiled in. The `OTEL_EXPORTER_OTLP_ENDPOINT`
 /// environment variable takes precedence over this config field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct ObservabilityConfig {
     #[serde(default)]
     pub otlp_endpoint: String,
@@ -392,14 +393,6 @@ pub struct ObservabilityConfig {
     pub service_name: String,
 }
 
-impl Default for ObservabilityConfig {
-    fn default() -> Self {
-        Self {
-            otlp_endpoint: String::new(),
-            service_name: String::new(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[derive(Default)]

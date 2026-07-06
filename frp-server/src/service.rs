@@ -729,7 +729,7 @@ impl Service {
                                                 // a valid V1 header or reach 2 KiB without one.
                                                 let mut scan_data = tls_magic.to_vec();
                                                 fn is_v1_type_byte(b: u8) -> bool {
-                                                    b.is_ascii_alphanumeric() || matches!(b, 0x40 | 0x41 | 0x42)
+                                                    b.is_ascii_alphanumeric() || matches!(b, 0x40..=0x42)
                                                 }
                                                 let find_v1 = |data: &[u8]| -> Option<usize> {
                                                     data.windows(9).position(|w| {

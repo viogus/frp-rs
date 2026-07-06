@@ -44,10 +44,10 @@ required-features = ["full"]
 
 [[bin]]
 name = "frps-tiny"
-path = "src/main.rs"
+path = "src/main-tiny.rs"
 required-features = ["tiny"]
 
 [[bin]]
 name = "frps-micro"
-path = "src/main.rs"
+path = "src/main-micro.rs"
 required-features = ["micro"]
