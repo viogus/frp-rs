@@ -79,6 +79,14 @@ pub async fn handle_control<S>(
 {
     info!(peer = ?peer, "New control connection from {:?}", peer);
 
+    // --- Login throttle: max 5 failed attempts per 60s per IP ---
+    if let Some(ref peer_addr) = peer {
+        if !state.check_login_throttle(*peer_addr).await {
+            warn!(peer = %peer_addr, "Login throttle: too many failed attempts from {}", peer_addr);
+            return;
+        }
+    }
+
     // --- Authenticate ---
     let oidc_subject: Option<String> = if let Some(ref verifier) = state.oidc_verifier {
         let token = login.privilege_key.as_deref().unwrap_or("");
