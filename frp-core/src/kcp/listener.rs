@@ -14,7 +14,8 @@ use super::stream::KcpStream;
 
 pub struct KcpListener {
     local_addr: SocketAddr,
-    handle: KcpSocketHandle,
+    /// Held to keep write/register channels alive for spawned driver.
+    _handle: KcpSocketHandle,
     accept_rx: mpsc::UnboundedReceiver<KcpStream>,
 }
 
@@ -31,7 +32,7 @@ impl KcpListener {
 
         Ok(Self {
             local_addr,
-            handle,
+            _handle: handle,
             accept_rx,
         })
     }
@@ -42,7 +43,7 @@ impl KcpListener {
         self.accept_rx
             .recv()
             .await
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "KCP listener closed"))
+            .ok_or_else(|| io::Error::other("KCP listener closed"))
     }
 
     /// Local address of the underlying UDP socket.
@@ -74,7 +75,7 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
     handle
         .register_tx
         .send((conv, remote, session))
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "driver closed"))?;
+        .map_err(|_| io::Error::other("driver closed"))?;
 
     // Yield again to give the driver a chance to process the registration
     // before the caller sends data.

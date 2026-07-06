@@ -23,6 +23,7 @@ pub(crate) struct KcpSocketHandle {
     pub write_tx: mpsc::UnboundedSender<(u32, WriteRequest)>,
     pub register_tx: mpsc::UnboundedSender<(u32, SocketAddr, KcpSession)>,
     /// Channel to send newly accepted streams back to KcpListener::accept().
+    #[allow(dead_code)]
     pub accept_tx: mpsc::UnboundedSender<KcpStream>,
 }
 

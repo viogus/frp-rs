@@ -159,7 +159,7 @@ impl AsyncWrite for KcpStream {
         self.write_count += n as u64;
         KCP_WRITE_BYTES.fetch_add(n as u64, Ordering::Relaxed);
         KCP_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
-        if self.write_count <= 80 || self.write_count % 1024 == 0 {
+        if self.write_count <= 80 || self.write_count.is_multiple_of(1024) {
             tracing::debug!(
                 conv = self.conv,
                 n = n,

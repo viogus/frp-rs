@@ -47,6 +47,7 @@ impl Write for KcpWriter {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) struct KcpSession {
     conv: u32,
     peer_addr: SocketAddr,
@@ -102,10 +103,12 @@ impl KcpSession {
         }
     }
 
+    #[allow(dead_code)]
     pub fn conv(&self) -> u32 {
         self.conv
     }
 
+    #[allow(dead_code)]
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
     }
@@ -129,8 +132,7 @@ impl KcpSession {
             // Fec::encode expects exactly data_shards slices. Split the raw
             // KCP output into data_shards equal-sized blocks (padding last block).
             for raw in &output {
-                let block_size =
-                    (raw.len() + self.config.data_shards - 1) / self.config.data_shards;
+                let block_size = raw.len().div_ceil(self.config.data_shards);
                 let blocks: Vec<Vec<u8>> = (0..self.config.data_shards)
                     .map(|i| {
                         let start = i * block_size;
@@ -254,16 +256,19 @@ impl KcpSession {
     }
 
     /// Returns ms until next update is needed, or 0 if update now.
+    #[allow(dead_code)]
     pub fn check(&self, now_ms: u32) -> u32 {
         self.kcp.check(now_ms)
     }
 
     /// Check if the KCP connection is dead (too many retransmissions).
+    #[allow(dead_code)]
     pub fn is_dead_link(&self) -> bool {
         self.kcp.is_dead_link()
     }
 
     /// Mark session for shutdown. Driver will remove it on next tick.
+    #[allow(dead_code)]
     pub fn shutdown(&mut self) {
         self.shutdown = true;
     }
