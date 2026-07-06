@@ -1,5 +1,6 @@
 pub mod msg;
 pub mod proxy_protocol;
+pub mod backoff;
 pub mod protocol;
 pub mod transport;
 pub mod auth;
