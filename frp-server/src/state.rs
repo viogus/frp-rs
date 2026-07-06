@@ -226,8 +226,42 @@ impl AppState {
 
     /// Check if an IP has exceeded the login attempt throttle.
     /// Returns true if the login should be allowed, false if throttled.
+    /// This method only reads the counter; it does NOT increment it.
+    /// Call [`record_login_failure`] after an actual authentication failure.
     /// Max 5 failed attempts per 60-second window per IP.
+    ///
+    /// Also performs inline cleanup of expired entries to prevent unbounded
+    /// memory growth from DDoS attacks with randomized source IPs.
     pub async fn check_login_throttle(&self, addr: std::net::SocketAddr) -> bool {
+        let ip = addr.ip();
+        let now = std::time::Instant::now();
+        let mut throttle = self.login_throttle.lock().await;
+
+        // Cleanup: remove entries older than 5 minutes past window expiration.
+        // 5-minute grace avoids cleaning entries that just expired but might
+        // have active connections in flight. Under DDoS with randomized IPs,
+        // this prevents unbounded HashMap growth.
+        const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(360); // 5 min + 60s window
+        throttle.retain(|_, (_, window_start)| {
+            now.duration_since(*window_start) < CLEANUP_TIMEOUT
+        });
+
+        match throttle.get(&ip) {
+            Some((count, window_start)) => {
+                if now.duration_since(*window_start) > std::time::Duration::from_secs(60) {
+                    // Window expired — entry is stale but will be cleaned up on next call.
+                    // For this check, expired window means not throttled.
+                    return true;
+                }
+                *count < 5
+            }
+            None => true,
+        }
+    }
+
+    /// Record a failed login attempt for the given IP address.
+    /// Should be called only after authentication actually fails.
+    pub async fn record_login_failure(&self, addr: std::net::SocketAddr) {
         let ip = addr.ip();
         let now = std::time::Instant::now();
         let mut throttle = self.login_throttle.lock().await;
@@ -235,12 +269,8 @@ impl AppState {
         if now.duration_since(*window_start) > std::time::Duration::from_secs(60) {
             *count = 1;
             *window_start = now;
-            return true;
+        } else {
+            *count += 1;
         }
-        if *count >= 5 {
-            return false;
-        }
-        *count += 1;
-        true
     }
 }
