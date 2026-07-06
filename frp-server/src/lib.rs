@@ -15,3 +15,4 @@ pub mod plugin;
 #[cfg(feature = "ssh")]
 pub mod ssh_gateway;
 pub mod handlers;
+pub mod registry;
