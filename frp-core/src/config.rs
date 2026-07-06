@@ -329,6 +329,13 @@ pub struct AuthServerConfig {
     /// Go frp compat: authentication_timeout.
     #[serde(default = "default_authentication_timeout", alias = "authenticationTimeout")]
     pub authentication_timeout: i64,
+    /// Whether to encrypt proxy data-plane bridges (AES-128-CFB).
+    /// Go frp compat: use_encryption. Default: false (TLS alone is sufficient).
+    /// NOTE: Control-plane encryption (AES-128-CFB after LoginResp) is ALWAYS
+    /// applied regardless of this flag, matching Go frp behavior where both
+    /// frps and frpc unconditionally wrap the control stream in CryptoReadWriter.
+    #[serde(default)]
+    pub use_encryption: bool,
 }
 
 impl Default for AuthServerConfig {
@@ -344,6 +351,7 @@ impl Default for AuthServerConfig {
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
             authentication_timeout: 15,
+            use_encryption: false,
         }
     }
 }

@@ -73,7 +73,23 @@ pub async fn raw_login(
         FrpMessage::LoginResp(resp) => {
             // Wrap in AES-128-CFB encryption (matches server post-login)
             let enc_key = encryption::derive_key(token);
-            let encrypted = io.into_encrypted(enc_key);
+            let mut encrypted = io.into_encrypted(enc_key);
+
+            // Drain initial ReqWorkConn messages sent by server after LoginResp.
+            // Server sends pool_count ReqWorkConn immediately after wrapping
+            // in CipherStream (matching Go frps ctl.Start()).
+            let pool_count = if let FrpMessage::Login(ref l) = login {
+                l.pool_count.unwrap_or(1).max(1) as usize
+            } else {
+                1
+            };
+            for _ in 0..pool_count {
+                match read_msg_v1(&mut encrypted).await {
+                    Ok(FrpMessage::ReqWorkConn(_)) => continue,
+                    Ok(_) => break,
+                    Err(_) => break,
+                }
+            }
             Ok((encrypted, resp))
         }
         other => Err(frp_core::Error::Protocol(format!(

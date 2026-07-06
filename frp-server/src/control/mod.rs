@@ -189,11 +189,30 @@ pub async fn handle_control<S>(
             error: None,
             server_additional_auth_scopes: if additional_auth_scopes.is_empty() { None } else { Some(additional_auth_scopes) },
         });
+        // Hex-dump the raw LoginResp V1 frame for Go compat debugging
+        let type_byte = resp.v1_type_byte();
+        let payload = serde_json::to_vec(&resp).unwrap_or_default();
+        let frame_len = 9 + payload.len();
+        info!(
+            peer = ?peer, run_id = %run_id,
+            type_byte = format_args!("{:#04x}", type_byte),
+            payload_len = payload.len(),
+            payload_text = %String::from_utf8_lossy(&payload),
+            "LoginResp V1 frame: type={:#04x} len={} frame_total={} json={}",
+            type_byte, payload.len(), frame_len,
+            String::from_utf8_lossy(&payload),
+        );
         if let Err(e) = write_ctl_msg(&mut stream, &resp, v2).await {
             warn!(peer = ?peer, error = %e, "Failed to send login response to {:?}: {}", peer, e);
             proxy_ops::unregister_control(&state, &run_id).await;
             return;
         }
+        // Flush TLS stream to ensure LoginResp reaches KCP before we wrap in CipherStream
+        if let Err(e) = stream.flush().await {
+            warn!(peer = ?peer, error = %e, "Failed to flush after LoginResp: {}", e);
+        }
+        info!(peer = ?peer, run_id = %run_id, "LoginResp sent to {:?}, flushed", peer);
+
         // Emit WebSocket event for dashboard subscribers
         #[cfg(feature = "dashboard")]
         {
@@ -242,12 +261,41 @@ pub async fn handle_control<S>(
             }
         }
     } else {
-        // V1 or plain V2: wrap in AES-128-CFB
+        // V1 or plain V2: ALWAYS wrap in AES-128-CFB after LoginResp.
+        // Go frp v0.69.1 always encrypts the control connection after login
+        // (both frps service.go:460 and frpc control_session.go:219 call
+        // NewCryptoReadWriter unconditionally — no config flag gates it).
+        // The use_encryption config flag controls proxy bridge (data plane)
+        // encryption, not control plane encryption.
+        info!(peer = ?peer, run_id = %run_id, "Wrapping control stream in CipherStream (AES-128-CFB)");
         let enc_key = encryption::derive_key(&reloadable.auth_cfg.token);
-        let cipher = frp_core::cipher_stream::CipherStream::new(Box::new(stream), enc_key);
+        let mut cipher = frp_core::cipher_stream::CipherStream::new(Box::new(stream), enc_key);
+
+        // --- Send ReqWorkConn BEFORE tokio::io::split ---
+        // Matching Go frps service.go:496 ctl.Start() which sends ReqWorkConn
+        // immediately after LoginResp. This triggers our first encrypted write
+        // (IV + ReqWorkConn), unblocking Go frpc's crypto.Reader.Read().
+        {
+            let pool_count = login.pool_count.unwrap_or(1).max(1) as usize;
+            info!(peer = ?peer, pool_count = pool_count, "Sending ReqWorkConn x{} through cipher (before split)", pool_count);
+            for i in 0..pool_count {
+                if let Err(e) = write_ctl_msg(&mut cipher, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
+                    warn!(peer = ?peer, error = %e, i = i, "Failed to send ReqWorkConn #{}/{}: {}", i, pool_count, e);
+                    proxy_ops::unregister_control(&state, &run_id).await;
+                    return;
+                }
+            }
+            if let Err(e) = cipher.flush().await {
+                warn!(peer = ?peer, error = %e, "Failed to flush after ReqWorkConn: {}", e);
+            }
+            info!(peer = ?peer, pool_count = pool_count, "ReqWorkConn x{} sent (pre-split)", pool_count);
+        }
+
         let (r, w) = tokio::io::split(cipher);
         (Box::new(r), Box::new(w))
     };
+
+    info!(peer = ?peer, run_id = %run_id, "Control stream encrypted, entering message loop");
 
     // --- Per-client state ---
     let pool_cap = login.pool_count.unwrap_or(1).max(0) as usize + WORK_POOL_EXTRA;
@@ -262,6 +310,12 @@ pub async fn handle_control<S>(
     // Reverse mapping: local_addr → proxy_name for routing UDPPacket responses
     let mut udp_local_to_proxy: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut last_ping = Instant::now();
+    // Ping interval: max 10s to stay well within Go frpc's heartbeat timeout
+    let ping_interval = Duration::from_secs(10);
+    let mut ping_tick = tokio::time::interval(ping_interval);
+    // Defer first ping to ping_interval from now (Go frpc heartbeat timeout is 90s)
+    ping_tick.reset();
+    ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // --- Main select loop ---
     loop {
@@ -703,6 +757,7 @@ pub async fn handle_control<S>(
                         }
                     }
                     Ok(FrpMessage::NewProxy(np)) => {
+                        info!(proxy_name = %np.proxy_name, "KCP TLS: received NewProxy for {}", np.proxy_name);
                         proxy_ops::handle_new_proxy(np, &run_id, &state, &mut writer, &internal_tx, &mut listener_handles, &mut udp_sockets, &mut udp_local_to_proxy, v2).await;
                     }
                     #[cfg(feature = "vnet")]
@@ -1203,10 +1258,27 @@ pub async fn handle_control<S>(
                         debug!(peer = ?peer, "Unhandled message from {:?}", peer);
                     }
                     Err(e) => {
-                        info!(peer = ?peer, error = %e, "Control connection {:?} closed: {}", peer, e);
+                        info!(peer = ?peer, error = %e, run_id = %run_id, "Control connection {:?} closed: {} (run_id={})", peer, e, run_id);
                         break;
                     }
                 }
+            }
+            _ = ping_tick.tick() => {
+                // Send periodic Ping to keep the control connection alive.
+                // Go frpc expects server Pings; without them it times out and reconnects.
+                let ping = FrpMessage::Ping(msg::Ping {
+                    timestamp: Some(std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64),
+                    privilege_key: Some(reloadable.auth_cfg.token.clone()),
+                });
+                if let Err(e) = write_ctl_msg(&mut writer, &ping, v2).await {
+                    warn!(peer = ?peer, error = %e, "Failed to send Ping: {}", e);
+                    break;
+                }
+                debug!(peer = ?peer, "Sent Ping to {:?}", peer);
+                last_ping = Instant::now();
             }
             _ = state.shutdown_token.cancelled() => {
                 info!(run_id = %run_id, "Graceful shutdown: draining control handler for {}", run_id);

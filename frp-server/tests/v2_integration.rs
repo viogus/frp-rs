@@ -133,6 +133,15 @@ async fn test_v2_tcp_proxy() {
     let enc_key = encryption::derive_key(""); // empty token = no auth
     let mut control = control.into_encrypted(enc_key);
 
+    // Drain initial ReqWorkConn v2 frames sent by server after LoginResp
+    for _ in 0..1 {
+        match control.read_v2_frame().await {
+            Ok(FrpMessage::ReqWorkConn(_)) => continue,
+            Ok(_) => break,
+            Err(_) => break,
+        }
+    }
+
     // ---- Register TCP proxy ----
     let np = FrpMessage::NewProxy(NewProxy {
         proxy_name: "v2-tcp-test".into(),
@@ -362,6 +371,15 @@ async fn test_v2_ping_pong_raw_tcp() {
     let enc_key = encryption::derive_key("");
     let mut stream = stream.into_encrypted(enc_key);
 
+    // Drain initial ReqWorkConn v2 frames sent by server after LoginResp
+    for _ in 0..1 {
+        match stream.read_v2_frame().await {
+            Ok(FrpMessage::ReqWorkConn(_)) => continue,
+            Ok(_) => break,
+            Err(_) => break,
+        }
+    }
+
     // Ping
     let ping = FrpMessage::Ping(msg::Ping {
         privilege_key: None,
@@ -460,6 +478,15 @@ async fn test_v2_ping_pong_yamux() {
     // Wrap in encryption
     let enc_key = encryption::derive_key("");
     let mut control = control.into_encrypted(enc_key);
+
+    // Drain initial ReqWorkConn v2 frames sent by server after LoginResp
+    for _ in 0..1 {
+        match control.read_v2_frame().await {
+            Ok(FrpMessage::ReqWorkConn(_)) => continue,
+            Ok(_) => break,
+            Err(_) => break,
+        }
+    }
 
     // Ping
     let ping = FrpMessage::Ping(msg::Ping {
@@ -576,6 +603,15 @@ async fn test_v2_aead_ping_pong_yamux() {
     )
     .expect("create AeadStream");
     let mut control = IoStream::Aead(Box::new(aead));
+
+    // Drain initial ReqWorkConn v2 frames sent by server after LoginResp
+    for _ in 0..1 {
+        match control.read_v2_frame().await {
+            Ok(FrpMessage::ReqWorkConn(_)) => continue,
+            Ok(_) => break,
+            Err(_) => break,
+        }
+    }
 
     // Ping (second encrypted frame in each direction)
     let ping = FrpMessage::Ping(msg::Ping {

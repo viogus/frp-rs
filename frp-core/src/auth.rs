@@ -43,6 +43,9 @@ pub struct AuthConfig {
     /// to 15 seconds for tighter replay protection.
     /// Go frp compat: authentication_timeout.
     pub authentication_timeout: i64,
+    /// Whether to wrap control connection in AES-128-CFB after LoginResp.
+    /// Go frp compat: use_encryption. Default: false (TLS alone is sufficient).
+    pub use_encryption: bool,
 }
 
 impl Default for AuthConfig {
@@ -58,6 +61,7 @@ impl Default for AuthConfig {
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
             authentication_timeout: 15,
+            use_encryption: false,
         }
     }
 }
@@ -720,14 +724,8 @@ mod tests {
         let cfg = AuthConfig {
             method: AuthMethod::Token,
             token: "secret".into(),
-            oidc_issuer: String::new(),
-            oidc_audience: String::new(),
-            oidc_skip_expiry: false,
-            oidc_skip_issuer: false,
-            additional_data: None,
-            oidc_proxy_url: String::new(),
-            additional_auth_scopes: Vec::new(),
             authentication_timeout: 15,
+            ..Default::default()
         };
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -747,15 +745,12 @@ mod tests {
     fn test_auth_config_oidc_rejects_without_verifier() {
         let cfg = AuthConfig {
             method: AuthMethod::Oidc,
-            token: String::new(),
             oidc_issuer: "https://issuer.example.com".into(),
             oidc_audience: "my-audience".into(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
-            additional_data: None,
             oidc_proxy_url: String::new(),
-            additional_auth_scopes: Vec::new(),
-            authentication_timeout: 0,
+            ..Default::default()
         };
         // AuthConfig::validate_login for OIDC returns error when no server-side verifier
         let result = cfg.validate_login(Some("some-jwt-token"), Some(100));
@@ -846,6 +841,7 @@ mod tests {
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
             authentication_timeout: 0,
+            use_encryption: false,
         };
         assert!(cfg.generate_login_key(100).is_none());
     }
