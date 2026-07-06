@@ -89,6 +89,21 @@ pub(super) fn base64_decode(input: &str) -> Result<String, ()> {
 }
 
 pub(super) fn split_host_port(s: &str) -> (&str, u16) {
+    // IPv6 bracket notation: [::1]:8080 or [fe80::1%eth0]:443
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some((host, port_str)) = rest.split_once(']') {
+            // Port follows the closing bracket, e.g. "]:8080"
+            if let Some(port_str) = port_str.strip_prefix(':') {
+                if port_str.chars().all(|c| c.is_ascii_digit()) {
+                    let port: u16 = port_str.parse().unwrap_or(80);
+                    return (host, port);
+                }
+            }
+            // No port after bracket, use default
+            return (host, 80);
+        }
+        // Malformed bracket — fall through
+    }
     if let Some((host, port_str)) = s.rsplit_once(':') {
         // Check if the port part is numeric (not IPv6 address)
         if port_str.chars().all(|c| c.is_ascii_digit()) {
