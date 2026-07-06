@@ -138,9 +138,8 @@ impl TunDevice for LinuxTun {
                 u32::from(addr).to_be(),
             )
         }
-        .map_err(|e| {
+        .inspect_err(|_| {
             unsafe { libc::close(sock) };
-            e
         })?;
         unsafe {
             set_sockaddr(
@@ -150,9 +149,8 @@ impl TunDevice for LinuxTun {
                 u32::from(netmask).to_be(),
             )
         }
-        .map_err(|e| {
+        .inspect_err(|_| {
             unsafe { libc::close(sock) };
-            e
         })?;
 
         ifr.ifr_ifru.ifru_mtu = mtu as libc::c_int;
