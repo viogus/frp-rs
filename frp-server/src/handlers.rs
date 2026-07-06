@@ -377,8 +377,9 @@ pub(crate) async fn handle_nat_hole_visitor(
     // --- Step 5: Run analysis and build responses ---
     let (v_resp, c_resp) = if let (Some(ref vf), Some(ref cf)) = (&v_feature, &c_feature) {
         let key = nathole_ctrl::gen_analysis_key(cf, vf);
-        let (mode, _index, c_behavior, v_behavior) =
+        let (mode, index, c_behavior, v_behavior) =
             state.nat_hole.analyzer.get_recommend_behaviors(&key, cf, vf);
+        *session.selected_index.lock().await = Some(index);
 
         let timeout_ms = c_behavior.send_delay_ms.max(v_behavior.send_delay_ms) + 5000;
         let v_read_timeout = timeout_ms - v_behavior.send_delay_ms;

@@ -1182,10 +1182,12 @@ pub async fn handle_control<S>(
                             let c_feature = classify::classify_nat_feature(&client_mapped, &[]).ok();
 
                             // Run analysis and build responses
+                            let analysis_index;
                             let (v_resp, c_resp) = if let (Some(ref vf), Some(ref cf)) = (&v_feature, &c_feature) {
                                 let key = nathole_ctrl::gen_analysis_key(cf, vf);
-                                let (mode, _index, c_behavior, v_behavior) =
+                                let (mode, index, c_behavior, v_behavior) =
                                     nat_hole.analyzer.get_recommend_behaviors(&key, cf, vf);
+                                analysis_index = Some(index);
 
                                 let timeout_ms = c_behavior.send_delay_ms.max(v_behavior.send_delay_ms) + 5000;
                                 let v_read_timeout = timeout_ms - v_behavior.send_delay_ms;
@@ -1203,6 +1205,7 @@ pub async fn handle_control<S>(
                                 );
                                 (v_resp, Some(c_resp))
                             } else {
+                                analysis_index = None;
                                 let v_resp = msg::NatHoleResp {
                                     transaction_id: tid.clone(),
                                     error: None,
@@ -1223,6 +1226,25 @@ pub async fn handle_control<S>(
                                 };
                                 (v_resp, Some(c_resp))
                             };
+
+                            // Store v_resp, NAT features, and selected_index on
+                            // session for analyzer feedback in handle_report
+                            // (C15, C16). The accept-loop path stores these in
+                            // handlers.rs; the Go frp compat control-path did not,
+                            // so report_success always used index=0 with no features.
+                            {
+                                let sessions = nat_hole.sessions.read().await;
+                                if let Some(s) = sessions.get(&tid) {
+                                    *s.v_resp.lock().await = Some(v_resp.clone());
+                                    *s.selected_index.lock().await = analysis_index;
+                                    if let Some(ref vf) = v_feature {
+                                        *s.v_nat_feature.lock().await = Some(vf.clone());
+                                    }
+                                    if let Some(ref cf) = c_feature {
+                                        *s.c_nat_feature.lock().await = Some(cf.clone());
+                                    }
+                                }
+                            }
 
                             // Send NatHoleResp to visitor via control channel
                             let _ = visitor_tx.send(InternalMsg::WriteNatHoleResp {

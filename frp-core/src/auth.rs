@@ -1,5 +1,19 @@
 use md5::{Md5, Digest};
 
+/// Constant-time slice comparison for auth token verification.
+/// XOR-accumulates every byte pair so execution time depends only on
+/// the longer input length, not on where the first difference occurs.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
 /// Generate a token for authentication using MD5 (matching Go frp v0.69.1).
 /// The message is typically the timestamp as a string.
 pub fn generate_token(token: &str, timestamp: i64) -> String {
@@ -10,8 +24,10 @@ pub fn generate_token(token: &str, timestamp: i64) -> String {
 }
 
 /// Verify a token against a known secret and timestamp.
+/// Uses constant-time comparison to prevent timing side-channel attacks.
 pub fn verify_token(token: &str, timestamp: i64, expected_hex: &str) -> bool {
-    generate_token(token, timestamp) == expected_hex
+    let computed = generate_token(token, timestamp);
+    constant_time_eq(computed.as_bytes(), expected_hex.as_bytes())
 }
 
 /// Authentication configuration.
@@ -101,7 +117,7 @@ impl AuthConfig {
                     }
                 }
                 let expected = generate_token(&self.token, ts);
-                if key != expected {
+                if !constant_time_eq(key.as_bytes(), expected.as_bytes()) {
                     return Err("invalid authentication token".into());
                 }
                 Ok(String::new())

@@ -51,6 +51,8 @@ pub struct Session {
     pub created_at: Instant,
     /// Last activity timestamp for expiry (updated on handle_client and handle_report).
     pub last_activity: std::sync::Mutex<Instant>,
+    /// Selected behavior index from get_recommend_behaviors, stored for report_success feedback.
+    pub selected_index: Mutex<Option<i32>>,
 }
 
 /// Central XTCP NAT hole punch controller.
@@ -135,6 +137,7 @@ impl Controller {
             report_tx: Mutex::new(Some(report_tx)),
             created_at: Instant::now(),
             last_activity: std::sync::Mutex::new(Instant::now()),
+            selected_index: Mutex::new(None),
         });
         // Check-and-insert atomically under write lock (fixes TOCTOU).
         {
@@ -188,6 +191,7 @@ impl Controller {
             report_tx: Mutex::new(Some(report_tx)),
             created_at: Instant::now(),
             last_activity: std::sync::Mutex::new(Instant::now()),
+            selected_index: Mutex::new(None),
         });
         // Check-and-insert atomically under write lock (fixes TOCTOU).
         {
@@ -250,7 +254,8 @@ impl Controller {
                         let c_feat = session.c_nat_feature.lock().await;
                         if let (Some(ref vf), Some(ref cf)) = (&*v_feat, &*c_feat) {
                             let key = gen_analysis_key(cf, vf);
-                            self.analyzer.report_success(&key, db.mode, 0);
+                            let index = *session.selected_index.lock().await;
+                            self.analyzer.report_success(&key, db.mode, index.unwrap_or(0));
                         }
                     }
                 }

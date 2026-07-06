@@ -363,7 +363,8 @@ impl KcpCompatSession {
 
     /// Encode a single data packet for sending.
     ///
-    /// If FEC enabled: splits into data_shards + parity_shards, returns all shards.
+    /// If FEC enabled: prepends a 2-byte LE length prefix, splits into
+    /// data_shards + parity_shards, returns all shards.
     /// If XOR enabled: applies XOR before FEC.
     /// If neither: returns the input as-is (single shard).
     pub fn encode_packet(&self, data: &[u8]) -> Vec<Vec<u8>> {
@@ -375,15 +376,22 @@ impl KcpCompatSession {
             return vec![d];
         }
 
-        // Split data into data_shards blocks
-        let block_size = data.len().div_ceil(self.fec.data_shards);
+        // Prepend 2-byte LE length prefix to allow exact truncation after
+        // decoding (avoids lossy trailing-zero stripping). Matching
+        // KcpSession::update() in session.rs.
+        let mut prefixed = Vec::with_capacity(2 + data.len());
+        prefixed.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        prefixed.extend_from_slice(data);
+
+        // Split prefixed data into data_shards blocks
+        let block_size = prefixed.len().div_ceil(self.fec.data_shards);
         let mut shards: Vec<Vec<u8>> = (0..self.fec.data_shards)
             .map(|i| {
                 let start = i * block_size;
-                let end = ((i + 1) * block_size).min(data.len());
+                let end = ((i + 1) * block_size).min(prefixed.len());
                 let mut shard = vec![0u8; block_size];
-                if start < data.len() {
-                    shard[..end - start].copy_from_slice(&data[start..end]);
+                if start < prefixed.len() {
+                    shard[..end - start].copy_from_slice(&prefixed[start..end]);
                 }
                 shard
             })
@@ -433,12 +441,17 @@ impl KcpCompatSession {
             data.extend_from_slice(s);
         }
 
-        // Remove padding (trailing zeros)
-        while data.last() == Some(&0) {
-            data.pop();
+        // Read original length from first 2 bytes (u16 LE) and truncate.
+        // This replaces lossy trailing-zero stripping with exact length prefix,
+        // matching KcpSession::input() in session.rs.
+        if data.len() < 2 {
+            return None;
         }
+        let original_len = u16::from_le_bytes([data[0], data[1]]) as usize;
+        let payload = &data[2..];
+        let end = original_len.min(payload.len());
 
-        Some(data)
+        Some(payload[..end].to_vec())
     }
 }
 

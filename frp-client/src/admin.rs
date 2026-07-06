@@ -12,7 +12,6 @@ use serde::Serialize;
 use tokio::sync::{mpsc, RwLock, oneshot};
 
 use frp_core::metrics::ProxyMetricsRegistry;
-#[cfg(feature = "tls")]
 use frp_core::admin_auth::apply_admin_auth;
 
 use crate::proxy_runtime::{ProxyRuntimeInfo, ReloadRequest};
