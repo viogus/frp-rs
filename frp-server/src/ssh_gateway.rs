@@ -6,6 +6,8 @@
 //! The remote command string is parsed into a ProxyConfig.
 
 use std::sync::Arc;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use anyhow::anyhow;
 use frp_core::msg::{FrpMessage, NewProxy};
@@ -1104,6 +1106,18 @@ async fn load_or_generate_host_key(
     }
     std::fs::write(auto_gen_path, pem.as_bytes())
         .map_err(|e| format!("write auto-gen key {}: {}", auto_gen_path, e))?;
+
+    // Restrict permissions: private key must be 0600 (owner read/write only).
+    // Default umask typically creates 0644, which is world-readable.
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(auto_gen_path)
+            .map_err(|e| format!("stat key file: {}", e))?
+            .permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(auto_gen_path, perms)
+            .map_err(|e| format!("set key permissions: {}", e))?;
+    }
 
     Ok(key)
 }
