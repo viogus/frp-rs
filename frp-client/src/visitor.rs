@@ -388,14 +388,23 @@ pub(crate) async fn run_visitor_listener(
                             }
                         }
 
-                        let mut user = user_conn;
-                        match tokio::io::copy_bidirectional(&mut user, &mut server_conn).await {
-                            Ok((to_server, to_user)) => {
-                                debug!(visitor_name = %visitor_name, to_server = %to_server, to_user = %to_user, "Visitor '{}' closed: {}B to server, {}B to user", visitor_name, to_server, to_user);
-                            }
-                            Err(e) => {
-                                debug!(visitor_name = %visitor_name, error = %e, "Visitor '{}' bridge error: {}", visitor_name, e);
-                            }
+                        let user = user_conn;
+                        let (user_r, user_w) = user.into_split();
+                        let (srv_r, srv_w) = server_conn.into_split();
+                        let use_enc_relay = use_encryption && !sk.is_empty();
+                        if use_enc_relay {
+                            let key = frp_core::encryption::derive_key(&sk);
+                            frp_core::bridge::bridge_encrypted(
+                                user_r, user_w, srv_r, srv_w,
+                                &key, use_compression, vec![], None, None, None,
+                            ).await;
+                            debug!(visitor_name = %visitor_name, "Visitor '{}' STCP encrypted relay closed", visitor_name);
+                        } else {
+                            frp_core::bridge::bridge_plain(
+                                user_r, user_w, srv_r, srv_w,
+                                use_compression, vec![], None,
+                            ).await;
+                            debug!(visitor_name = %visitor_name, "Visitor '{}' STCP relay closed", visitor_name);
                         }
                     }
                 });
