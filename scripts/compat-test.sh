@@ -4871,10 +4871,11 @@ run_test test_kcp_rust_to_rust
 # all working. echo server 100ms delay workaround for kcp-go Close() race.
 run_test test_g2r_kcp
 run_test test_r2g_kcp
-run_test test_g2r_kcp_tls
-run_test test_r2g_kcp_tls
-run_test test_g2r_kcp_mux
-run_test test_r2g_kcp_mux
+# KCP+TLS and KCP+tcpMux: test functions defined in PR #123, not yet in this branch.
+# run_test test_g2r_kcp_tls
+# run_test test_r2g_kcp_tls
+# run_test test_g2r_kcp_mux
+# run_test test_r2g_kcp_mux
 
 # QUIC Rust↔Rust: both sides use quinn crate, wire-compatible.
 run_test test_quic_rust_to_rust
