@@ -121,11 +121,12 @@ impl KcpSocket {
                                 if let Err(e) = session.input(&data) {
                                     tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP input error");
                                 }
-                            } else if key.0 != 0 {
-                                // FEC fallback: for FEC packets, non-shard-0 shards don't
-                                // contain the KCP header (conv is at offset 6 only in the
-                                // first data shard). Scan sessions by peer_addr as fallback.
-                                let is_fec = data.len() >= 10
+                            } else {
+                                // FEC fallback: parity shards and data shards whose conv
+                                // wasn't found in sessions are routed by peer_addr.
+                                // With 6-byte FEC header (Go kcp-go format), conv is only
+                                // available in data shards at offset 8.
+                                let is_fec = data.len() >= 6
                                     && (u16::from_le_bytes([data[4], data[5]]) == 0xf1
                                         || u16::from_le_bytes([data[4], data[5]]) == 0xf2);
                                 let fec_key = if is_fec {
@@ -141,7 +142,7 @@ impl KcpSocket {
                                             tracing::debug!(conv = fk.0, peer = %src, error = %e, "KCP FEC fallback input error");
                                         }
                                     }
-                                } else {
+                                } else if !is_fec {
                                     // New peer detected — create session + stream
                                     let (read_tx, read_rx) = mpsc::unbounded_channel();
                                     let mut session = KcpSession::new(
@@ -175,23 +176,28 @@ impl KcpSocket {
     }
 
     /// Extract (conv, peer_addr) key from a raw UDP packet.
-    /// KCP header: conv is first 4 bytes (little-endian u32).
-    /// FEC packets: 10-byte header [seqid: u32 LE][flag: u16 LE][conv: u32 LE].
-    /// Conv is at offset 6 for all FEC shards (previously only correct for shard 0).
+    /// Plain KCP: conv is first 4 bytes (little-endian u32).
+    /// FEC data shard: 6-byte header [seqid: u32 LE][flag: u16 LE], then
+    ///   SIZE(2B) + raw KCP data; conv at offset 8 (skip 6B header + 2B SIZE).
+    /// FEC parity shard: 6-byte header, no conv available → return (0, src);
+    ///   routing handled by FEC fallback below.
     fn resolve_key(data: &[u8], src: SocketAddr) -> (u32, SocketAddr) {
-        if data.len() >= 4 {
-            // Check for FEC packet by looking at bytes [4..6] for flag
-            if data.len() >= 10 {
-                let flag = u16::from_le_bytes([data[4], data[5]]);
-                if flag == 0xf1 || flag == 0xf2 {
-                    // FEC packet: 10-byte header, conv at offset 6
-                    let conv = u32::from_le_bytes([data[6], data[7], data[8], data[9]]);
+        if data.len() >= 6 {
+            let flag = u16::from_le_bytes([data[4], data[5]]);
+            if flag == 0xf1 || flag == 0xf2 {
+                // FEC packet: 6-byte header, no conv field.
+                if flag == 0xf1 && data.len() >= 12 {
+                    // Data shard: KCP conv at offset 8 (6B header + 2B SIZE).
+                    let conv = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
                     if conv != 0 {
                         return (conv, src);
                     }
                 }
+                // Parity shard or short data shard: can't extract conv.
+                return (0, src);
             }
-            // Plain KCP: conv at offset 0
+        }
+        if data.len() >= 4 {
             let conv = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
             return (conv, src);
         }
