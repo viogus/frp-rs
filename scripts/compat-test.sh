@@ -225,7 +225,7 @@ wait_for_port_gone() {
 start_echo_server() {
     local port="$1"
     python3 -c "
-import socket, sys
+import socket, sys, time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('127.0.0.1', $port))
@@ -236,6 +236,12 @@ while True:
         data = conn.recv(65536)
         if data:
             conn.sendall(data)
+        # KCP: give kcp-go output goroutine time to flush pending writes
+        # before Close(). Without this, Go frpc's libio.Join closes the
+        # dialed KCP work conn immediately after echo server responds,
+        # and kcp-go's Close() (flush=false) kills the output goroutine
+        # before pending data reaches the wire.
+        time.sleep(0.1)
         conn.close()
     except:
         break
