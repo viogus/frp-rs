@@ -196,7 +196,7 @@ pub async fn run_tcpmux_listener(
             // Check Proxy-Authorization if configured
             if !route.http_user.is_empty() {
                 let auth_ok = extract_proxy_auth(&request_text)
-                    .map(|(u, p)| u == route.http_user && p == route.http_pwd)
+                    .map(|(u, p)| crate::constant_time_eq_str(&u, &route.http_user) && crate::constant_time_eq_str(&p, &route.http_pwd))
                     .unwrap_or(false);
                 if !auth_ok {
                     let _ = stream.write_all(

@@ -19,10 +19,9 @@ on:
         required: false
         default: ''
 
-# Use write-all for GITHUB_TOKEN — workaround for GHCR push from
-# user-owned repos where packages:write alone may not permit first-time
-# package creation under the user namespace.
-permissions: write-all
+permissions:
+  contents: read
+  packages: write
 
 env:
   REGISTRY: ghcr.io

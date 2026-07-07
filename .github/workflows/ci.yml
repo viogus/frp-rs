@@ -29,13 +29,17 @@ jobs:
       - name: Install Rust stable
         run: rustup default stable
       - name: Clippy
-        run: cargo clippy --workspace
+        run: cargo clippy --workspace -- -D warnings
       - name: Build binaries (needed for integration tests)
         run: cargo build --bin frps --bin frpc
       - name: Run tests
         run: cargo test --workspace
       - name: Check benchmarks compile
         run: cargo bench --workspace --no-run
+      - name: Check tiny feature set compiles
+        run: cargo check --workspace --no-default-features --features tiny
+      - name: Check micro feature set compiles
+        run: cargo check --workspace --no-default-features --features micro
 
   build:
     name: Build (release)

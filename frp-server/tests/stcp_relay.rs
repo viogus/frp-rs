@@ -4,7 +4,7 @@ use frp_core::config::ServerConfig;
 use frp_core::msg::{self, FrpMessage, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 
-use common::{allocate_port, raw_login, start_test_server};
+use common::{allocate_port, login_with_test_token, raw_login, start_test_server, test_auth_cfg};
 
 /// Full STCP relay test:
 /// 1. Provider logs in and registers an STCP proxy with sk
@@ -18,6 +18,7 @@ async fn test_stcp_visitor_routed_to_provider() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
@@ -25,7 +26,7 @@ async fn test_stcp_visitor_routed_to_provider() {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // --- Step 1: Provider logs in ---
-    let (mut provider, resp) = raw_login(addr, None, None, "").await.expect("provider login");
+    let (mut provider, resp) = login_with_test_token(addr).await.expect("provider login");
     let run_id = resp.run_id.expect("provider should get run_id");
 
     // --- Step 2: Provider registers STCP proxy ---

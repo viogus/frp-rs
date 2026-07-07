@@ -79,6 +79,14 @@ pub async fn handle_control<S>(
 {
     info!(peer = ?peer, "New control connection from {:?}", peer);
 
+    // --- Login throttle: max 5 failed attempts per 60s per IP ---
+    if let Some(ref peer_addr) = peer {
+        if !state.check_login_throttle(*peer_addr).await {
+            warn!(peer = %peer_addr, "Login throttle: too many failed attempts from {}", peer_addr);
+            return;
+        }
+    }
+
     // --- Authenticate ---
     let oidc_subject: Option<String> = if let Some(ref verifier) = state.oidc_verifier {
         let token = login.privilege_key.as_deref().unwrap_or("");
@@ -89,6 +97,9 @@ pub async fn handle_control<S>(
             }
             Err(e) => {
                 warn!(peer = ?peer, error = %e, "OIDC auth failed for {:?}: {}", peer, e);
+                if let Some(ref peer_addr) = peer {
+                    state.record_login_failure(*peer_addr).await;
+                }
                 let (_, mut writer) = tokio::io::split(stream);
                 let resp = FrpMessage::LoginResp(msg::LoginResp {
                     version: Some(frp_core::VERSION.into()),
@@ -107,6 +118,9 @@ pub async fn handle_control<S>(
             login.timestamp,
         ) {
             warn!(peer = ?peer, error = %e, "Authentication failed for {:?}: {}", peer, e);
+            if let Some(ref peer_addr) = peer {
+                state.record_login_failure(*peer_addr).await;
+            }
             // Emit WebSocket event for dashboard subscribers
             #[cfg(feature = "dashboard")]
             {
@@ -204,7 +218,7 @@ pub async fn handle_control<S>(
         );
         if let Err(e) = write_ctl_msg(&mut stream, &resp, v2).await {
             warn!(peer = ?peer, error = %e, "Failed to send login response to {:?}: {}", peer, e);
-            proxy_ops::unregister_control(&state, &run_id).await;
+            proxy_ops::unregister_control(&state, &run_id, false).await;
             return;
         }
         // Flush TLS stream to ensure LoginResp reaches KCP before we wrap in CipherStream
@@ -249,14 +263,14 @@ pub async fn handle_control<S>(
                     }
                     Err(e) => {
                         warn!(peer = ?peer, error = %e, "Failed to create AEAD stream for {:?}: {}", peer, e);
-                        proxy_ops::unregister_control(&state, &run_id).await;
+                        proxy_ops::unregister_control(&state, &run_id, false).await;
                         return;
                     }
                 }
             }
             Err(e) => {
                 warn!(peer = ?peer, error = %e, "Failed to derive AEAD keys for {:?}: {}", peer, e);
-                proxy_ops::unregister_control(&state, &run_id).await;
+                proxy_ops::unregister_control(&state, &run_id, false).await;
                 return;
             }
         }
@@ -281,7 +295,7 @@ pub async fn handle_control<S>(
             for i in 0..pool_count {
                 if let Err(e) = write_ctl_msg(&mut cipher, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
                     warn!(peer = ?peer, error = %e, i = i, "Failed to send ReqWorkConn #{}/{}: {}", i, pool_count, e);
-                    proxy_ops::unregister_control(&state, &run_id).await;
+                    proxy_ops::unregister_control(&state, &run_id, false).await;
                     return;
                 }
             }
@@ -309,6 +323,7 @@ pub async fn handle_control<S>(
     let mut udp_sockets: std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>> = std::collections::HashMap::new();
     // Reverse mapping: local_addr → proxy_name for routing UDPPacket responses
     let mut udp_local_to_proxy: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut shutting_down = false;
     let mut last_ping = Instant::now();
     // Ping interval: max 10s to stay well within Go frpc's heartbeat timeout
     let ping_interval = Duration::from_secs(10);
@@ -617,6 +632,7 @@ pub async fn handle_control<S>(
                     }
                     Some(InternalMsg::Shutdown) => {
                         warn!(run_id = %run_id, "Shutdown received for run_id {} (replaced by new control connection)", run_id);
+                        shutting_down = true;
                         break;
                     }
                     #[cfg(feature = "vnet")]
@@ -1180,10 +1196,12 @@ pub async fn handle_control<S>(
                             let c_feature = classify::classify_nat_feature(&client_mapped, &[]).ok();
 
                             // Run analysis and build responses
+                            let analysis_index;
                             let (v_resp, c_resp) = if let (Some(ref vf), Some(ref cf)) = (&v_feature, &c_feature) {
                                 let key = nathole_ctrl::gen_analysis_key(cf, vf);
-                                let (mode, _index, c_behavior, v_behavior) =
+                                let (mode, index, c_behavior, v_behavior) =
                                     nat_hole.analyzer.get_recommend_behaviors(&key, cf, vf);
+                                analysis_index = Some(index);
 
                                 let timeout_ms = c_behavior.send_delay_ms.max(v_behavior.send_delay_ms) + 5000;
                                 let v_read_timeout = timeout_ms - v_behavior.send_delay_ms;
@@ -1201,6 +1219,7 @@ pub async fn handle_control<S>(
                                 );
                                 (v_resp, Some(c_resp))
                             } else {
+                                analysis_index = None;
                                 let v_resp = msg::NatHoleResp {
                                     transaction_id: tid.clone(),
                                     error: None,
@@ -1221,6 +1240,25 @@ pub async fn handle_control<S>(
                                 };
                                 (v_resp, Some(c_resp))
                             };
+
+                            // Store v_resp, NAT features, and selected_index on
+                            // session for analyzer feedback in handle_report
+                            // (C15, C16). The accept-loop path stores these in
+                            // handlers.rs; the Go frp compat control-path did not,
+                            // so report_success always used index=0 with no features.
+                            {
+                                let sessions = nat_hole.sessions.read().await;
+                                if let Some(s) = sessions.get(&tid) {
+                                    *s.v_resp.lock().await = Some(v_resp.clone());
+                                    *s.selected_index.lock().await = analysis_index;
+                                    if let Some(ref vf) = v_feature {
+                                        *s.v_nat_feature.lock().await = Some(vf.clone());
+                                    }
+                                    if let Some(ref cf) = c_feature {
+                                        *s.c_nat_feature.lock().await = Some(cf.clone());
+                                    }
+                                }
+                            }
 
                             // Send NatHoleResp to visitor via control channel
                             let _ = visitor_tx.send(InternalMsg::WriteNatHoleResp {
@@ -1278,7 +1316,9 @@ pub async fn handle_control<S>(
                     break;
                 }
                 debug!(peer = ?peer, "Sent Ping to {:?}", peer);
-                last_ping = Instant::now();
+                // Do NOT update last_ping here — only update when Pong is
+                // received from client. Updating on server-initiated Pings
+                // would prevent the heartbeat timeout from ever triggering.
             }
             _ = state.shutdown_token.cancelled() => {
                 info!(run_id = %run_id, "Graceful shutdown: draining control handler for {}", run_id);
@@ -1309,7 +1349,7 @@ pub async fn handle_control<S>(
             run_id: run_id.clone(),
         });
     }
-    proxy_ops::unregister_control(&state, &run_id).await;
+    proxy_ops::unregister_control(&state, &run_id, shutting_down).await;
     state.proxy_manager.remove_client(&run_id).await;
     info!(run_id = %run_id, "Control connection {} removed", run_id);
 }

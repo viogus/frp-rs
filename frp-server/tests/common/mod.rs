@@ -126,6 +126,31 @@ pub async fn raw_login_resp(
     Ok(resp)
 }
 
+/// Default test token used for authentication in integration tests.
+pub const TEST_TOKEN: &str = "test-token";
+
+/// Create a default `AuthServerConfig` with a test token for integration tests.
+pub fn test_auth_cfg() -> frp_core::config::AuthServerConfig {
+    frp_core::config::AuthServerConfig {
+        method: "token".into(),
+        token: TEST_TOKEN.into(),
+        ..Default::default()
+    }
+}
+
+/// Convenience: log in with the default test token.
+/// Generates a fresh timestamp and privilege_key on every call.
+pub async fn login_with_test_token(
+    addr: SocketAddr,
+) -> Result<(IoStream, LoginResp), frp_core::Error> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let key = frp_core::auth::generate_token(TEST_TOKEN, ts);
+    raw_login(addr, Some(key), Some(ts), TEST_TOKEN).await
+}
+
 /// Handle to a running frps child process with dashboard.
 /// Kills the process on drop.
 pub struct FrpsHandle {

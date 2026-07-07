@@ -3,7 +3,7 @@ use tokio::net::TcpListener;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
-use frp_core::auth::AuthConfig;
+use frp_core::auth::{AuthConfig, AuthMethod};
 use frp_core::config::PluginConfig;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
@@ -171,8 +171,17 @@ async fn handle_visitor_conn(
         .unwrap_or_default()
         .as_secs() as i64;
     let auth_cfg = AuthConfig {
+        method: AuthMethod::Token,
         token: auth_token.to_string(),
-        ..Default::default()
+        oidc_issuer: String::new(),
+        oidc_audience: String::new(),
+        oidc_skip_expiry: false,
+        oidc_skip_issuer: false,
+        additional_data: None,
+        oidc_proxy_url: String::new(),
+        additional_auth_scopes: Vec::new(),
+        authentication_timeout: 0,
+        use_encryption: false,
     };
     let mut login = msg::Login {
         version: Some(VERSION.into()),

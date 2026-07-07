@@ -55,6 +55,51 @@ pub(crate) async fn handle_new_proxy(
     }
     let remote_port = raw_port as u16;
 
+    // Validate string lengths and reject control characters to prevent
+    // resource exhaustion and injection attacks.
+    if np.proxy_name.len() > 255 {
+        let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
+            proxy_name: np.proxy_name.clone(),
+            remote_addr: None,
+            error: Some("proxy_name exceeds 255 characters".into()),
+        });
+        write_resp(writer, &resp, v2).await;
+        return;
+    }
+    if np.proxy_name.contains(|c: char| c.is_control() && c != '\n' && c != '\r') {
+        let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
+            proxy_name: np.proxy_name.clone(),
+            remote_addr: None,
+            error: Some("proxy_name contains invalid control characters".into()),
+        });
+        write_resp(writer, &resp, v2).await;
+        return;
+    }
+    if let Some(ref domains) = np.custom_domains {
+        for domain in domains {
+            if domain.len() > 253 {
+                let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
+                    proxy_name: np.proxy_name.clone(),
+                    remote_addr: None,
+                    error: Some(format!("custom_domain '{}' exceeds 253 characters (RFC 1035 FQDN limit)", domain)),
+                });
+                write_resp(writer, &resp, v2).await;
+                return;
+            }
+        }
+    }
+    if let Some(ref subdomain) = np.subdomain {
+        if subdomain.len() > 63 {
+            let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
+                proxy_name: np.proxy_name.clone(),
+                remote_addr: None,
+                error: Some(format!("subdomain '{}' exceeds 63 characters (RFC 1035 label limit)", subdomain)),
+            });
+            write_resp(writer, &resp, v2).await;
+            return;
+        }
+    }
+
     // Server plugin: new_proxy hook (before port allocation).
     // Control-enabled plugins can reject the proxy registration.
     let np_content = serde_json::json!({
@@ -488,9 +533,11 @@ pub(crate) async fn listen_and_proxy(
 
 
 
-pub(crate) async fn unregister_control(state: &Arc<AppState>, run_id: &str) {
-    // Scope the run_id_to_ctl_tx lock to just the remove call
-    {
+pub(crate) async fn unregister_control(state: &Arc<AppState>, run_id: &str, skip_ctl_unregister: bool) {
+    // When shutting down due to supersession (duplicate run_id), the new
+    // handler has already inserted its ControlTx. Skip removal to avoid
+    // deleting the replacement's entry.
+    if !skip_ctl_unregister {
         let mut map = state.run_id_to_ctl_tx.write().await;
         map.remove(run_id);
     }
@@ -524,5 +571,13 @@ pub(crate) async fn unregister_control(state: &Arc<AppState>, run_id: &str) {
     {
         let mut routes = state.vnet_routes.write().await;
         routes.retain(|_, (_, name)| !proxies.iter().any(|p| &p.name == name));
+    }
+    // Clean up OIDC subject mappings for all proxies of this client.
+    // When a control connection drops, any OIDC subject→proxy entries
+    // pointing to this client's proxies must be removed to prevent
+    // unbounded memory growth.
+    {
+        let mut subjects = state.oidc_subjects.write().await;
+        subjects.retain(|_, proxy_name| !proxies.iter().any(|p| &p.name == proxy_name));
     }
 }

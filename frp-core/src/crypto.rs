@@ -437,18 +437,22 @@ impl<R: AsyncRead + Unpin> AeadStreamReader<R> {
     fn read_exact(&mut self, len: usize, cx: &mut Context<'_>) -> Poll<io::Result<Vec<u8>>> {
         let mut data = vec![0u8; len];
         let mut buf = ReadBuf::new(&mut data);
+        let mut prev_filled = buf.filled().len();
         loop {
             let pin = Pin::new(&mut self.inner);
             match pin.poll_read(cx, &mut buf) {
                 Poll::Ready(Ok(())) => {
-                    if buf.filled().len() < len {
-                        // Need more data; continue
-                        continue;
-                    }
-                    // Check if we got EOF
-                    if buf.filled().is_empty() {
+                    let filled = buf.filled().len();
+                    // EOF detection: if no progress was made on this iteration,
+                    // the inner stream has reached EOF before filling `len` bytes.
+                    if filled == prev_filled {
                         return Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof,
                             "AEAD stream: unexpected EOF")));
+                    }
+                    prev_filled = filled;
+                    if filled < len {
+                        // Need more data; continue
+                        continue;
                     }
                     return Poll::Ready(Ok(data));
                 }

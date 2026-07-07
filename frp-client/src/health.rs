@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,6 +12,8 @@ use tracing::{info, warn, debug};
 /// When the local service exceeds max_failed consecutive failures, sends
 /// the proxy name on `health_tx` so the control loop can send CloseProxy
 /// to the server.
+/// The `cancel` flag is set externally when the proxy is closed; the task
+/// checks it before each health check interval and exits when true.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_health_check(
     proxy_name: String,
@@ -21,6 +25,7 @@ pub(crate) async fn run_health_check(
     timeout: Duration,
     max_failed: u32,
     health_tx: mpsc::UnboundedSender<String>,
+    cancel: Arc<AtomicBool>,
 ) {
     info!(check_type = %check_type, proxy_name = %proxy_name, local_addr = %local_addr, interval = ?interval, timeout = ?timeout, "Health check ({}) started for '{}' -> {} (interval: {:?}, timeout: {:?})",
         check_type, proxy_name, local_addr, interval, timeout);
@@ -28,6 +33,12 @@ pub(crate) async fn run_health_check(
     let mut failures: u32 = 0;
 
     loop {
+        // Check cancellation before each sleep/check cycle.
+        if cancel.load(Ordering::Relaxed) {
+            info!(proxy_name = %proxy_name, "Health check cancelled for '{}'", proxy_name);
+            return;
+        }
+
         tokio::time::sleep(interval).await;
 
         let result = if check_type == "http" {
@@ -51,7 +62,9 @@ pub(crate) async fn run_health_check(
             warn!(proxy_name = %proxy_name, max_failed = %max_failed, "Health check: proxy '{}' exceeded max failures ({}), sending CloseProxy",
                 proxy_name, max_failed);
             let _ = health_tx.send(proxy_name.clone());
-            failures = 0; // Reset to avoid repeated warnings
+            // Stop this health check task — the proxy is being closed.
+            info!(proxy_name = %proxy_name, "Health check stopped for '{}' after CloseProxy", proxy_name);
+            return;
         }
     }
 }
@@ -98,19 +111,11 @@ pub(crate) async fn run_http_check(addr: &str, url: &str, timeout: Duration, hea
     if n == 0 {
         return Err("empty response".into());
     }
-
-    // Parse status line: "HTTP/1.x NNN ..."
-    let response = std::str::from_utf8(&buf[..n]).map_err(|e| format!("utf8: {e}"))?;
-    let status_line = response.lines().next().ok_or("no status line")?;
-    let parts: Vec<&str> = status_line.split_whitespace().collect();
-    if parts.len() < 2 {
-        return Err(format!("bad status line: {status_line}"));
-    }
-    let code: u16 = parts[1].parse().map_err(|_| format!("bad status code: {}", parts[1]))?;
-
-    if (200..300).contains(&code) {
+    let response = String::from_utf8_lossy(&buf[..n]);
+    let status_line = response.lines().next().unwrap_or("");
+    if status_line.contains("200") || status_line.contains(" 2") {
         Ok(())
     } else {
-        Err(format!("HTTP {code}"))
+        Err(format!("non-2xx status: {}", status_line))
     }
 }

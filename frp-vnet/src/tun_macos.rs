@@ -1,8 +1,8 @@
-use std::cell::Cell;
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, unix::AsyncFd};
 
@@ -19,11 +19,11 @@ const UTUN_OPT_IFNAME: i32 = 2;
 pub struct MacOSTun {
     async_fd: AsyncFd<OwnedFd>,
     name: String,
-    mtu: Cell<u16>,
+    mtu: AtomicU16,
 }
 
+// SAFETY: AsyncFd<OwnedFd> is Send + Sync on Unix; AtomicU16 is Sync.
 unsafe impl Send for MacOSTun {}
-unsafe impl Sync for MacOSTun {}
 
 impl MacOSTun {
     pub async fn open(requested_name: &str) -> anyhow::Result<Box<dyn TunDevice>> {
@@ -137,7 +137,7 @@ impl MacOSTun {
         Ok(Box::new(MacOSTun {
             async_fd,
             name,
-            mtu: Cell::new(1500),
+            mtu: AtomicU16::new(1500),
         }))
     }
 }
@@ -152,7 +152,7 @@ impl TunDevice for MacOSTun {
         // Use ifconfig to configure the interface (macOS lacks Linux-style netdevice ioctls)
         let output = std::process::Command::new("ifconfig")
             .args([
-                &name, "inet", &addr_str, &addr_str, "netmask", &mask_str, "mtu", &mtu_str, "up",
+                &name, "inet", &addr_str, "netmask", &mask_str, "mtu", &mtu_str, "up",
             ])
             .output()?;
         if !output.status.success() {
@@ -161,7 +161,7 @@ impl TunDevice for MacOSTun {
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
-        self.mtu.set(mtu);
+        self.mtu.store(mtu, Ordering::Relaxed);
         tracing::info!(name = %self.name, %addr, %netmask, mtu, "macOS TUN configured");
         Ok(())
     }
@@ -170,7 +170,34 @@ impl TunDevice for MacOSTun {
         &self.name
     }
     fn mtu(&self) -> u16 {
-        self.mtu.get()
+        self.mtu.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for MacOSTun {
+    fn drop(&mut self) {
+        let output = std::process::Command::new("ifconfig")
+            .args([&self.name, "destroy"])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                tracing::info!(name = %self.name, "macOS utun interface destroyed");
+            }
+            Ok(o) => {
+                tracing::warn!(
+                    name = %self.name,
+                    stderr = %String::from_utf8_lossy(&o.stderr),
+                    "failed to destroy macOS utun interface"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    name = %self.name,
+                    error = %e,
+                    "failed to run ifconfig destroy for macOS utun interface"
+                );
+            }
+        }
     }
 }
 

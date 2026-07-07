@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use frp_core::config::ServerConfig;
 use frp_core::msg::{FrpMessage, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
-use common::{allocate_port, raw_login, start_test_server};
+use common::{allocate_port, login_with_test_token, start_test_server, test_auth_cfg};
 
 /// Helper: construct a tcpmux NewProxy with minimal fields.
 fn tcpmux_proxy(name: &str, domains: Vec<String>, local: &str) -> NewProxy {
@@ -61,6 +61,7 @@ async fn test_tcpmux_connect_routing() {
         bind_addr: "127.0.0.1".into(),
         bind_port,
         tcpmux_httpconnect_port: tcpmux_port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
@@ -68,7 +69,7 @@ async fn test_tcpmux_connect_routing() {
     let tcpmux_addr: SocketAddr = format!("127.0.0.1:{}", tcpmux_port).parse().unwrap();
 
     // Provider logs in and registers tcpmux proxy
-    let (mut provider, resp) = raw_login(addr, None, None, "").await.expect("provider login");
+    let (mut provider, resp) = login_with_test_token(addr).await.expect("provider login");
     let _run_id = resp.run_id.expect("provider should get run_id");
 
     let np = FrpMessage::NewProxy(tcpmux_proxy(
@@ -129,6 +130,7 @@ async fn test_tcpmux_unknown_domain_returns_404() {
         bind_addr: "127.0.0.1".into(),
         bind_port,
         tcpmux_httpconnect_port: tcpmux_port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
@@ -136,7 +138,7 @@ async fn test_tcpmux_unknown_domain_returns_404() {
     let tcpmux_addr: SocketAddr = format!("127.0.0.1:{}", tcpmux_port).parse().unwrap();
 
     // Register a tcpmux proxy so TcpMuxManager is active
-    let (mut provider, resp) = raw_login(addr, None, None, "").await.expect("provider login");
+    let (mut provider, resp) = login_with_test_token(addr).await.expect("provider login");
     let _run_id = resp.run_id.expect("provider should get run_id");
     let np = FrpMessage::NewProxy(tcpmux_proxy(
         "tcpmux-1",
@@ -184,6 +186,7 @@ async fn test_tcpmux_proxy_auth() {
         bind_addr: "127.0.0.1".into(),
         bind_port,
         tcpmux_httpconnect_port: tcpmux_port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
@@ -191,7 +194,7 @@ async fn test_tcpmux_proxy_auth() {
     let tcpmux_addr: SocketAddr = format!("127.0.0.1:{}", tcpmux_port).parse().unwrap();
 
     // Register tcpmux proxy with auth
-    let (mut provider, resp) = raw_login(addr, None, None, "").await.expect("provider login");
+    let (mut provider, resp) = login_with_test_token(addr).await.expect("provider login");
     let _run_id = resp.run_id.expect("provider should get run_id");
 
     let mut auth_np = tcpmux_proxy(

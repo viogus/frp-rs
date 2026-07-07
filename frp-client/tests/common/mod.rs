@@ -56,11 +56,7 @@ pub async fn start_frps(port: u16, token: &str) -> JoinHandle<()> {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
         auth: frp_core::config::AuthServerConfig {
-            method: if token.is_empty() {
-                "token".into()
-            } else {
-                "token".into()
-            },
+            method: "token".into(),
             token: token.to_string(),
             ..Default::default()
         },

@@ -608,7 +608,7 @@ fn tcpmux_cmd() -> impl Parser<FrpcCmd> {
 fn verify_cmd() -> impl Parser<FrpcCmd> {
     let config = long("config").short('c').argument::<String>("FILE");
     let args = construct!(VerifyArgs { config });
-    args.to_options().command("verify").help("Verify that the configures is valid").map(FrpcCmd::Verify)
+    args.to_options().command("verify").help("Verify that the configuration is valid").map(FrpcCmd::Verify)
 }
 
 /// Compose all frpc subcommands + run-mode fallback.

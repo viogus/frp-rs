@@ -710,14 +710,32 @@ pub async fn run_dashboard(
 
     let app = app.with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    // Security: when no admin auth is configured, force binding to localhost
+    // to prevent unauthenticated access to the dashboard and /metrics endpoint.
+    let bind_addr = if auth_user.is_empty() && auth_password.is_empty() {
+        let localhost_addr = format!(
+            "127.0.0.1:{}",
+            addr.rsplit(':').next().unwrap_or("7500")
+        );
+        tracing::warn!(
+            original = %addr,
+            bind = %localhost_addr,
+            "Dashboard: no admin auth configured — binding to {} (localhost only) to prevent unauthenticated public access. Set [webServer].user and [webServer].password to expose on a public interface.",
+            localhost_addr
+        );
+        localhost_addr
+    } else {
+        addr.clone()
+    };
+
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
     match (tls_cert_file, tls_key_file) {
         (Some(cert), Some(key)) if !cert.is_empty() && !key.is_empty() => {
             #[cfg(feature = "tls")]
             {
                 let acceptor = frp_core::transport::build_tls_acceptor(&cert, &key, None)?;
-                tracing::info!(addr = %addr, "Dashboard listening on {} (TLS)", addr);
+                tracing::info!(addr = %bind_addr, "Dashboard listening on {} (TLS)", bind_addr);
                 let tls_listener = TlsListener::new(listener, acceptor);
                 axum::serve(tls_listener, app).await?;
             }
@@ -728,7 +746,7 @@ pub async fn run_dashboard(
             }
         }
         _ => {
-            tracing::info!(addr = %addr, "Dashboard listening on {}", addr);
+            tracing::info!(addr = %bind_addr, "Dashboard listening on {}", bind_addr);
             axum::serve(listener, app).await?;
         }
     }

@@ -430,3 +430,108 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+
+    const TEST_KEY: [u8; 16] = [0x42u8; 16];
+
+    #[tokio::test]
+    async fn round_trip() {
+        let (client, server) = duplex(128 * 1024);
+        let mut writer = CipherWriter::new(client, TEST_KEY);
+        let mut reader = CipherReader::new(server, TEST_KEY);
+
+        let data = b"hello world round trip test data";
+        writer.write_all(data).await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let mut buf = vec![0u8; data.len()];
+        reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, data);
+    }
+
+    #[tokio::test]
+    async fn empty_payload() {
+        let (client, server) = duplex(1024);
+        let mut writer = CipherWriter::new(client, TEST_KEY);
+        let mut reader = CipherReader::new(server, TEST_KEY);
+
+        writer.write_all(b"X").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let mut buf = [0u8; 1];
+        reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf[0], b'X');
+    }
+
+    #[tokio::test]
+    async fn corrupted_ciphertext() {
+        let (a1, mut b1) = duplex(64 * 1024);
+        let mut writer = CipherWriter::new(a1, TEST_KEY);
+        let data = b"secret message to be corrupted";
+        writer.write_all(data).await.unwrap();
+        writer.shutdown().await.unwrap();
+        drop(writer);
+
+        let mut raw = vec![];
+        b1.read_to_end(&mut raw).await.unwrap();
+        assert!(raw.len() > 20, "encrypted output too short");
+
+        // Corrupt a byte in the ciphertext region (after the 16-byte IV)
+        raw[20] ^= 0xFF;
+
+        let (mut a2, b2) = duplex(64 * 1024);
+        a2.write_all(&raw).await.unwrap();
+        drop(a2);
+
+        let mut reader = CipherReader::new(b2, TEST_KEY);
+        let mut decoded = vec![];
+        reader.read_to_end(&mut decoded).await.unwrap();
+
+        // CFB corruption: altered ciphertext produces different plaintext
+        assert_ne!(decoded.as_slice(), data.as_slice(),
+            "corrupted ciphertext must not decrypt to original plaintext");
+    }
+
+    #[tokio::test]
+    async fn large_payload() {
+        let (client, server) = duplex(256 * 1024);
+        let mut writer = CipherWriter::new(client, TEST_KEY);
+        let mut reader = CipherReader::new(server, TEST_KEY);
+
+        let data = vec![0x5Au8; 70 * 1024]; // > 64KB
+        let write_data = data.clone();
+        let write_handle = tokio::spawn(async move {
+            writer.write_all(&write_data).await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+
+        let mut buf = vec![0u8; data.len()];
+        reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, data);
+
+        write_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cipher_stream_round_trip() {
+        let (c1, c2) = duplex(128 * 1024);
+        let mut cs1 = CipherStream::new(c1, TEST_KEY);
+        let mut cs2 = CipherStream::new(c2, TEST_KEY);
+
+        let data = b"CipherStream bidirectional round trip";
+
+        let write_handle = tokio::spawn(async move {
+            cs1.write_all(data).await.unwrap();
+        });
+
+        let mut buf = vec![0u8; data.len()];
+        cs2.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, data);
+
+        write_handle.await.unwrap();
+    }
+}

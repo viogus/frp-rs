@@ -1,5 +1,19 @@
 use md5::{Md5, Digest};
 
+/// Constant-time slice comparison for auth token verification.
+/// XOR-accumulates every byte pair so execution time depends only on
+/// the longer input length, not on where the first difference occurs.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
 /// Generate a token for authentication using MD5 (matching Go frp v0.69.1).
 /// The message is typically the timestamp as a string.
 pub fn generate_token(token: &str, timestamp: i64) -> String {
@@ -10,17 +24,21 @@ pub fn generate_token(token: &str, timestamp: i64) -> String {
 }
 
 /// Verify a token against a known secret and timestamp.
+/// Uses constant-time comparison to prevent timing side-channel attacks.
 pub fn verify_token(token: &str, timestamp: i64, expected_hex: &str) -> bool {
-    generate_token(token, timestamp) == expected_hex
+    let computed = generate_token(token, timestamp);
+    constant_time_eq(computed.as_bytes(), expected_hex.as_bytes())
 }
 
 /// Authentication configuration.
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
     pub method: AuthMethod,
-    /// NOTE: Token is stored as plain String in memory with no zeroization.
-    /// For defense-in-depth, a future version should use secrecy::Secret or
-    /// zeroize.
+    /// NOTE: Token is stored as plain String in memory with no automatic
+    /// zeroization. Callers should invoke [`zeroize_string`] on `self.token`
+    /// when the `AuthConfig` is dropped or before deallocation.
+    /// For defense-in-depth, a future version should use `secrecy::Secret` or
+    /// the `zeroize` crate.
     pub token: String,
     pub oidc_issuer: String,
     pub oidc_audience: String,
@@ -46,6 +64,32 @@ pub struct AuthConfig {
     /// Whether to wrap control connection in AES-128-CFB after LoginResp.
     /// Go frp compat: use_encryption. Default: false (TLS alone is sufficient).
     pub use_encryption: bool,
+}
+
+impl Drop for AuthConfig {
+    fn drop(&mut self) {
+        zeroize_string(&mut self.token);
+    }
+}
+
+impl AuthConfig {
+    /// Construct an `AuthConfig` with default fields and the given token.
+    /// Convenience constructor for tests and simple configurations.
+    pub fn with_token(token: impl Into<String>) -> Self {
+        Self {
+            method: AuthMethod::Token,
+            token: token.into(),
+            oidc_issuer: String::new(),
+            oidc_audience: String::new(),
+            oidc_skip_expiry: false,
+            oidc_skip_issuer: false,
+            additional_data: None,
+            oidc_proxy_url: String::new(),
+            additional_auth_scopes: Vec::new(),
+            authentication_timeout: 0,
+            use_encryption: false,
+        }
+    }
 }
 
 impl Default for AuthConfig {
@@ -79,7 +123,10 @@ impl AuthConfig {
     /// auth, populated from JWT 'sub' claim for OIDC). Returns Err if invalid.
     pub fn validate_login(&self, privilege_key: Option<&str>, timestamp: Option<i64>) -> Result<String, String> {
         if self.token.is_empty() && self.method == AuthMethod::Token {
-            tracing::warn!("Authentication token is empty — server accepts ALL connections. Set [auth].token in config.");
+            tracing::error!("CRITICAL: [auth].token is empty with token auth method — server would accept ALL connections. Set a strong token in the config file.");
+            // Allow the login to proceed (Go frp backward compat: empty token = no auth check).
+            // The check_startup() method should be called at server startup to prevent
+            // accidental empty-token configurations in production.
             return Ok(String::new());
         }
 
@@ -101,7 +148,7 @@ impl AuthConfig {
                     }
                 }
                 let expected = generate_token(&self.token, ts);
-                if key != expected {
+                if !constant_time_eq(key.as_bytes(), expected.as_bytes()) {
                     return Err("invalid authentication token".into());
                 }
                 Ok(String::new())
@@ -123,6 +170,15 @@ impl AuthConfig {
             #[cfg(feature = "oidc")]
             AuthMethod::Oidc => None,
         }
+    }
+
+    /// Check for critical security misconfigurations at startup.
+    /// Call this at server startup to reject dangerously insecure configurations.
+    pub fn check_startup(&self) -> Result<(), String> {
+        if self.method == AuthMethod::Token && self.token.is_empty() {
+            return Err("CRITICAL: [auth].token is empty with token auth method — server would accept ALL connections. Set a strong token in the config file.".into());
+        }
+        Ok(())
     }
 }
 
@@ -654,7 +710,35 @@ impl OidcVerifier {
     }
 }
 
+/// Zeroize a `String` in-place by overwriting each byte with `0x00`.
+///
+/// Uses `unsafe` to access the `Vec<u8>` backing buffer directly,
+/// bypassing Rust's immutability guarantees for `&mut str`.
+///
+/// Call this on `AuthConfig.token` before deallocation to reduce the
+/// window where plaintext credentials reside in memory.
+pub fn zeroize_string(s: &mut String) {
+    // SAFETY: Vec<u8> is the backing store for String.
+    // Overwriting with zeros preserves valid UTF-8 (NUL bytes are valid).
+    // No references into `s` can exist while we hold `&mut String`.
+    unsafe {
+        let v = s.as_mut_vec();
+        v.fill(0);
+    }
+    // Clear len so the now-zeroed bytes are not accidentally re-read.
+    s.clear();
+}
+
 /// Resolve a token that may use a URL scheme for dynamic sourcing.
+///
+/// **Prefer [`resolve_dynamic_token_checked`]** — it enforces the
+/// `UnsafeFeatures` allowlist for `exec://` and `file://` sources.
+/// This function exists for backward compatibility with callers that do
+/// not yet thread `UnsafeFeatures` through (frp-server/frp-client service.rs).
+///
+/// When called without UnsafeFeatures, `exec://` and `file://` sources
+/// execute unconditionally (legacy behavior). Use [`resolve_dynamic_token_checked`]
+/// to enforce the allowlist.
 ///
 /// Supported schemes:
 /// - `file:///absolute/path` — reads the first line of the file
@@ -663,19 +747,66 @@ impl OidcVerifier {
 ///
 /// Go frp compat: file:// and exec:// token sources.
 pub fn resolve_dynamic_token(token: &str) -> String {
+    // Prefer checked variant when available; for backward compat, None
+    // means legacy mode (no enforcement).
+    match resolve_dynamic_token_inner(token, None) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
+            String::new()
+        }
+    }
+}
+
+/// Resolve a dynamic token with `UnsafeFeatures` enforcement.
+///
+/// When the token uses `exec://` or `file://`, the corresponding feature
+/// must be enabled in `unsafe_features`. If the feature is not allowed,
+/// an error is returned.
+///
+/// Callers that have access to an `UnsafeFeatures` instance should use
+/// this function instead of [`resolve_dynamic_token`].
+pub fn resolve_dynamic_token_checked(
+    token: &str,
+    unsafe_features: &crate::unsafe_features::UnsafeFeatures,
+) -> Result<String, String> {
+    resolve_dynamic_token_inner(token, Some(unsafe_features))
+}
+
+fn resolve_dynamic_token_inner(
+    token: &str,
+    unsafe_features: Option<&crate::unsafe_features::UnsafeFeatures>,
+) -> Result<String, String> {
     if let Some(path) = token.strip_prefix("file://") {
-        match std::fs::read_to_string(path) {
-            Ok(content) => content.lines().next().unwrap_or("").trim().to_string(),
-            Err(e) => {
-                tracing::warn!(path = %path, error = %e, "Failed to read dynamic token file {}: {}", path, e);
-                String::new()
+        if let Some(uf) = unsafe_features {
+            if !uf.is_enabled(crate::unsafe_features::TOKEN_SOURCE_EXEC) {
+                return Err(
+                    "file:// token source blocked: TokenSourceExec not in UnsafeFeatures allowlist. \
+                     Set [common].unsafe_features = [\"TokenSourceExec\"] to enable."
+                        .into(),
+                );
             }
         }
+        match std::fs::read_to_string(path) {
+            Ok(content) => Ok(content.lines().next().unwrap_or("").trim().to_string()),
+            Err(e) => Err(format!(
+                "Failed to read dynamic token from file://{}: {}",
+                path, e
+            )),
+        }
     } else if let Some(cmd) = token.strip_prefix("exec://") {
+        if let Some(uf) = unsafe_features {
+            if !uf.is_enabled(crate::unsafe_features::TOKEN_SOURCE_EXEC) {
+                return Err(
+                    "exec:// token source blocked: TokenSourceExec not in UnsafeFeatures allowlist. \
+                     Set [common].unsafe_features = [\"TokenSourceExec\"] to enable."
+                        .into(),
+                );
+            }
+        }
         let parts: Vec<&str> = cmd.split_whitespace().collect();
         if parts.is_empty() {
-            tracing::warn!("Dynamic token exec:// with empty command");
-            return String::new();
+            return Err("Dynamic token exec:// with empty command".into());
         }
         match std::process::Command::new(parts[0])
             .args(&parts[1..])
@@ -683,26 +814,28 @@ pub fn resolve_dynamic_token(token: &str) -> String {
         {
             Ok(o) => {
                 if !o.status.success() {
-                    tracing::warn!(
-                        cmd = %cmd, status = %o.status,
-                        "Dynamic token exec command '{}' exited with {}",
-                        cmd, o.status
-                    );
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    return Err(format!(
+                        "Dynamic token exec command '{}' exited with {}: {}",
+                        cmd,
+                        o.status,
+                        stderr.trim()
+                    ));
                 }
-                String::from_utf8_lossy(&o.stdout)
+                Ok(String::from_utf8_lossy(&o.stdout)
                     .lines()
                     .next()
                     .unwrap_or("")
                     .trim()
-                    .to_string()
+                    .to_string())
             }
-            Err(e) => {
-                tracing::warn!(cmd = %cmd, error = %e, "Failed to exec dynamic token command '{}': {}", cmd, e);
-                String::new()
-            }
+            Err(e) => Err(format!(
+                "Failed to exec dynamic token command '{}': {}",
+                cmd, e
+            )),
         }
     } else {
-        token.to_string()
+        Ok(token.to_string())
     }
 }
 
@@ -721,12 +854,8 @@ mod tests {
 
     #[test]
     fn test_auth_config_validate() {
-        let cfg = AuthConfig {
-            method: AuthMethod::Token,
-            token: "secret".into(),
-            authentication_timeout: 15,
-            ..Default::default()
-        };
+        let mut cfg = AuthConfig::with_token("secret");
+        cfg.authentication_timeout = 15;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -737,6 +866,7 @@ mod tests {
         assert!(cfg.validate_login(Some("wrong"), Some(ts)).is_err());
 
         let empty_cfg = AuthConfig::default();
+        // Empty token: login passes (Go frp backward compat) but check_startup() guards startup
         assert!(empty_cfg.validate_login(None, None).is_ok());
     }
 
@@ -745,12 +875,16 @@ mod tests {
     fn test_auth_config_oidc_rejects_without_verifier() {
         let cfg = AuthConfig {
             method: AuthMethod::Oidc,
+            token: String::new(),
             oidc_issuer: "https://issuer.example.com".into(),
             oidc_audience: "my-audience".into(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+            additional_data: None,
             oidc_proxy_url: String::new(),
-            ..Default::default()
+            additional_auth_scopes: Vec::new(),
+            authentication_timeout: 0,
+            use_encryption: false,
         };
         // AuthConfig::validate_login for OIDC returns error when no server-side verifier
         let result = cfg.validate_login(Some("some-jwt-token"), Some(100));
@@ -881,8 +1015,16 @@ mod tests {
     #[test]
     fn test_resolve_dynamic_token_exec() {
         // Use /bin/echo on Unix — portable across macOS and Linux
-        let result = resolve_dynamic_token("exec:///bin/echo dynamic-token-value");
-        assert_eq!(result, "dynamic-token-value");
+        let uf = crate::unsafe_features::UnsafeFeatures::new(crate::unsafe_features::CLIENT_UNSAFE_FEATURES);
+        let result = resolve_dynamic_token_checked("exec:///bin/echo dynamic-token-value", &uf);
+        assert_eq!(result.unwrap(), "dynamic-token-value");
+    }
+
+    #[test]
+    fn test_resolve_dynamic_token_exec_blocked_when_not_allowed() {
+        let uf = crate::unsafe_features::UnsafeFeatures::default();
+        let result = resolve_dynamic_token_checked("exec:///bin/echo secret", &uf);
+        assert!(result.is_err());
     }
 
     // --- Authentication timeout (replay protection) tests ---
@@ -895,12 +1037,7 @@ mod tests {
 
     #[test]
     fn test_auth_timeout_zero_disables_check() {
-        let cfg = AuthConfig {
-            method: AuthMethod::Token,
-            token: "secret".into(),
-            authentication_timeout: 0,
-            ..Default::default()
-        };
+        let cfg = AuthConfig::with_token("secret");
         // Token with a timestamp far in the past should still verify
         // when timeout is disabled (only token matters, not timestamp)
         let far_past = 0i64;
@@ -910,12 +1047,8 @@ mod tests {
 
     #[test]
     fn test_auth_timeout_rejects_future_timestamp() {
-        let cfg = AuthConfig {
-            method: AuthMethod::Token,
-            token: "secret".into(),
-            authentication_timeout: 15,
-            ..Default::default()
-        };
+        let mut cfg = AuthConfig::with_token("secret");
+        cfg.authentication_timeout = 15;
         let far_future = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -929,12 +1062,8 @@ mod tests {
 
     #[test]
     fn test_auth_timeout_rejects_past_timestamp() {
-        let cfg = AuthConfig {
-            method: AuthMethod::Token,
-            token: "secret".into(),
-            authentication_timeout: 15,
-            ..Default::default()
-        };
+        let mut cfg = AuthConfig::with_token("secret");
+        cfg.authentication_timeout = 15;
         let far_past = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -948,12 +1077,8 @@ mod tests {
 
     #[test]
     fn test_auth_timeout_accepts_current_timestamp() {
-        let cfg = AuthConfig {
-            method: AuthMethod::Token,
-            token: "secret".into(),
-            authentication_timeout: 15,
-            ..Default::default()
-        };
+        let mut cfg = AuthConfig::with_token("secret");
+        cfg.authentication_timeout = 15;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -964,12 +1089,8 @@ mod tests {
 
     #[test]
     fn test_auth_timeout_boundary_inside_window() {
-        let cfg = AuthConfig {
-            method: AuthMethod::Token,
-            token: "secret".into(),
-            authentication_timeout: 15,
-            ..Default::default()
-        };
+        let mut cfg = AuthConfig::with_token("secret");
+        cfg.authentication_timeout = 15;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -982,12 +1103,8 @@ mod tests {
 
     #[test]
     fn test_auth_timeout_boundary_outside_window() {
-        let cfg = AuthConfig {
-            method: AuthMethod::Token,
-            token: "secret".into(),
-            authentication_timeout: 15,
-            ..Default::default()
-        };
+        let mut cfg = AuthConfig::with_token("secret");
+        cfg.authentication_timeout = 15;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1002,12 +1119,8 @@ mod tests {
     #[test]
     fn test_auth_timeout_still_rejects_wrong_token_inside_window() {
         // Replay protection: even with a valid timestamp, wrong token fails
-        let cfg = AuthConfig {
-            method: AuthMethod::Token,
-            token: "secret".into(),
-            authentication_timeout: 15,
-            ..Default::default()
-        };
+        let mut cfg = AuthConfig::with_token("secret");
+        cfg.authentication_timeout = 15;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

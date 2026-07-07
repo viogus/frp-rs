@@ -125,6 +125,11 @@ pub struct ServerConfig {
     /// OpenTelemetry / observability settings.
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    /// Maximum concurrent connections allowed. None = default (10000).
+    /// When the limit is reached, new connections are rejected.
+    /// Set to 0 to disable the connection limit entirely.
+    #[serde(default, alias = "maxConnections")]
+    pub max_connections: Option<u32>,
 }
 
 fn default_allow_port_start() -> u16 { 10000 }
@@ -244,6 +249,7 @@ impl Default for ServerConfig {
             ssh_tunnel_gateway: SshTunnelGatewayConfig::default(),
             nat_hole_analysis_data_reserve_hours: default_nathole_analysis_data_reserve_hours(),
             observability: ObservabilityConfig::default(),
+            max_connections: None,
             graceful_shutdown_timeout: default_graceful_timeout(),
         }
     }
@@ -837,7 +843,7 @@ pub struct ProxyConfig {
 
 /// STCP/XTCP visitor configuration — used by frpc to expose a local port
 /// that tunnels traffic to a remote STCP/XTCP proxy through the frps server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VisitorConfig {
     /// Name for this visitor (used in logs).
     #[serde(default)]

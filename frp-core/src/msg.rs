@@ -191,16 +191,12 @@ pub struct NewProxy {
     pub virtual_net: Option<String>,
     #[serde(rename = "proxyProtocolVersion", skip_serializing_if = "Option::is_none")]
     pub proxy_protocol_version: Option<String>,
-    #[cfg(feature = "vnet")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub advertise_subnet: Option<String>,
-    #[cfg(feature = "vnet")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vnet_ip: Option<String>,
-    #[cfg(feature = "vnet")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vnet_netmask: Option<String>,
-    #[cfg(feature = "vnet")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vnet_mtu: Option<u16>,
 }
@@ -640,13 +636,9 @@ impl FrpMessage {
                 metas: None, multiplexer: None,
                 virtual_net: None,
                 proxy_protocol_version: None,
-                #[cfg(feature = "vnet")]
                 advertise_subnet: None,
-                #[cfg(feature = "vnet")]
                 vnet_ip: None,
-                #[cfg(feature = "vnet")]
                 vnet_netmask: None,
-                #[cfg(feature = "vnet")]
                 vnet_mtu: None,
             })),
             TYPE_NEW_PROXY_RESP => Some(FrpMessage::NewProxyResp(NewProxyResp {
@@ -828,13 +820,9 @@ mod tests {
             multiplexer: None,
             virtual_net: None,
             proxy_protocol_version: None,
-            #[cfg(feature = "vnet")]
             advertise_subnet: None,
-            #[cfg(feature = "vnet")]
             vnet_ip: None,
-            #[cfg(feature = "vnet")]
             vnet_netmask: None,
-            #[cfg(feature = "vnet")]
             vnet_mtu: None,
         };
         let json = serde_json::to_string(&np).expect("serialize");

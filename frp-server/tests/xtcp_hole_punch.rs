@@ -5,7 +5,7 @@ use frp_core::msg::{self, FrpMessage, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
 
-use common::{allocate_port, raw_login, start_test_server};
+use common::{allocate_port, login_with_test_token, raw_login, start_test_server, test_auth_cfg};
 
 /// Server-side XTCP message routing test — Go frp v0.69.1 compat flow.
 ///
@@ -30,13 +30,14 @@ async fn test_xtcp_nat_hole_message_routing() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // --- Step 1: Provider logs in and registers XTCP proxy ---
-    let (mut provider_ctl, resp) = raw_login(addr, None, None, "").await.expect("provider login");
+    let (mut provider_ctl, resp) = login_with_test_token(addr).await.expect("provider login");
     let run_id = resp.run_id.expect("provider should get run_id");
 
     let xtcp_sk = "xtcp-test-sk";
@@ -333,12 +334,13 @@ async fn test_xtcp_ignore_nat_hole_client_no_sid() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let (mut provider_ctl, resp) = raw_login(addr, None, None, "").await.expect("login");
+    let (mut provider_ctl, resp) = login_with_test_token(addr).await.expect("login");
     let _run_id = resp.run_id.expect("run_id");
 
     // Register XTCP proxy

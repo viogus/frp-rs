@@ -4867,16 +4867,11 @@ run_test test_r2g_socks5
 # Phase 8: KCP + QUIC transport cross-compat
 # Rust↔Rust KCP: both sides use raw kcp crate, wire-compatible.
 run_test test_kcp_rust_to_rust
-# KCP Go↔Rust: FAILS — FEC/wire-format incompatibility between rust_tokio_kcp
-# and Go frp kcp-go. g2r: Go frpc times out (no Login received by Rust frps).
-# r2g: Rust frpc sends Login but Go frps doesn't respond. KCP sessions are
-# established but data doesn't decode. Needs deeper fix: either wire
-# KcpCompatSession into production path or fix rust_tokio_kcp FEC.
-# TODO: fix rust_tokio_kcp ↔ kcp-go FEC compat.
+# KCP Go↔Rust: FEC compat + poll_flush fix. Control login, work conn routing
+# all working. echo server 100ms delay workaround for kcp-go Close() race.
 run_test test_g2r_kcp
 run_test test_r2g_kcp
-# KCP+TLS and KCP+tcpMux: also blocked by FEC incompatibility. Once base KCP
-# Go↔Rust is fixed, uncomment these to test encryption + multiplexing over KCP.
+# KCP+TLS and KCP+tcpMux: test functions defined in PR #123, not yet in this branch.
 # run_test test_g2r_kcp_tls
 # run_test test_r2g_kcp_tls
 # run_test test_g2r_kcp_mux

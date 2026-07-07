@@ -21,10 +21,16 @@ pub fn create_visitor_conn_msg(server_name: &str, secret_key: &str, use_encrypti
         None
     } else {
         let hash = frp_core::auth::generate_token(secret_key, timestamp);
+        // Redact secret key in logs: only show first 4 chars for debugging.
+        let sk_redacted = if secret_key.len() > 4 {
+            format!("{}...", &secret_key[..4])
+        } else {
+            "****".to_string()
+        };
         debug!(
-            secret_key = %secret_key, timestamp = %timestamp, sign_key = %hash,
+            secret_key = %sk_redacted, timestamp = %timestamp, sign_key = %hash,
             "STCP visitor auth: sk='{}' ts={} sign_key={}",
-            secret_key, timestamp, hash
+            sk_redacted, timestamp, hash
         );
         Some(hash)
     };
@@ -79,13 +85,9 @@ pub fn create_new_proxy_msg(
         multiplexer: if p.multiplexer.is_empty() { None } else { Some(p.multiplexer.clone()) },
         virtual_net: if p.virtual_net.is_empty() { None } else { Some(p.virtual_net.clone()) },
         proxy_protocol_version: if p.proxy_protocol_version.is_empty() { None } else { Some(p.proxy_protocol_version.clone()) },
-        #[cfg(feature = "vnet")]
         advertise_subnet: if p.advertise_subnet.is_empty() { None } else { Some(p.advertise_subnet.clone()) },
-        #[cfg(feature = "vnet")]
         vnet_ip: if p.vnet_ip.is_empty() { None } else { Some(p.vnet_ip.clone()) },
-        #[cfg(feature = "vnet")]
         vnet_netmask: if p.vnet_netmask.is_empty() { None } else { Some(p.vnet_netmask.clone()) },
-        #[cfg(feature = "vnet")]
         vnet_mtu: if p.vnet_mtu == 0 { None } else { Some(p.vnet_mtu) },
     });
 

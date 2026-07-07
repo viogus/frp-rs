@@ -215,15 +215,24 @@ pub(crate) async fn run_visitor_listener(
                             debug!(visitor_name = %visitor_name, sn = %sn, "Visitor '{}': sent NatHoleVisitor on control connection for '{}'", visitor_name, sn);
 
                             // --- Wait for NatHoleResp from control loop ---
-                            let resp = match reply_rx.await {
-                                Ok(Ok(resp)) => resp,
-                                Ok(Err(e)) => {
+                            // Timeout after 15s (server NAT_HOLE_TIMEOUT is 10s)
+                            let resp = match tokio::time::timeout(
+                                Duration::from_secs(15),
+                                reply_rx,
+                            ).await {
+                                Ok(Ok(Ok(resp))) => resp,
+                                Ok(Ok(Err(e))) => {
                                     warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': NatHoleResp error from server: {}", visitor_name, e);
                                     if keep_tunnel_open && attempt < max_retries { continue; }
                                     return;
                                 }
-                                Err(_) => {
+                                Ok(Err(_)) => {
                                     warn!(visitor_name = %visitor_name, "Visitor '{}': NatHoleResp channel closed (control loop dropped)", visitor_name);
+                                    if keep_tunnel_open && attempt < max_retries { continue; }
+                                    return;
+                                }
+                                Err(_elapsed) => {
+                                    warn!(visitor_name = %visitor_name, "Visitor '{}': NatHoleResp timed out after 15s", visitor_name);
                                     if keep_tunnel_open && attempt < max_retries { continue; }
                                     return;
                                 }
@@ -294,12 +303,10 @@ pub(crate) async fn run_visitor_listener(
                         };
 
                         let stcp_proxy_name = if fb_to.is_empty() { sn.clone() } else { fb_to.clone() };
-                        // STCP fallback is always plain relay through server.
-                        // P2P encryption uses derive_key(sk) on the direct P2P channel.
-                        // Sending use_encryption=true in NewVisitorConn would cause
-                        // Go frps to encrypt the server↔provider work conn bridge,
-                        // but the visitor side uses plain copy_bidirectional → mismatch.
-                        let nvc = crate::proxy::create_visitor_conn_msg(&stcp_proxy_name, &sk, false, false);
+                        // Use the visitor's configured encryption/compression settings
+                        // for the STCP fallback relay. Both the NewVisitorConn message
+                        // and the visitor-side bridge must agree on encryption.
+                        let nvc = crate::proxy::create_visitor_conn_msg(&stcp_proxy_name, &sk, use_encryption, use_compression);
                         debug!(visitor_name = %visitor_name, json = %serde_json::to_string(&nvc).unwrap_or_default(), "Visitor '{}': NewVisitorConn JSON: {}", visitor_name, serde_json::to_string(&nvc).unwrap_or_default());
                         if let Err(e) = server_conn.write_v1_frame(&nvc).await {
                             warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STCP fallback send NewVisitorConn failed: {}", visitor_name, e);
@@ -326,15 +333,23 @@ pub(crate) async fn run_visitor_listener(
                             }
                         }
 
-                        let mut user = user_conn;
-                        match tokio::io::copy_bidirectional(&mut user, &mut server_conn).await {
-                            Ok((to_server, to_user)) => {
-                                debug!(visitor_name = %visitor_name, to_server = %to_server, to_user = %to_user, "Visitor '{}' STCP relay closed: {}B to server, {}B to user",
-                                    visitor_name, to_server, to_user);
-                            }
-                            Err(e) => {
-                                debug!(visitor_name = %visitor_name, error = %e, "Visitor '{}' STCP relay bridge error: {}", visitor_name, e);
-                            }
+                        let user = user_conn;
+                        let (user_r, user_w) = user.into_split();
+                        let (srv_r, srv_w) = server_conn.into_split();
+                        let use_enc_fallback = use_encryption && !sk.is_empty();
+                        if use_enc_fallback {
+                            let key = frp_core::encryption::derive_key(&sk);
+                            frp_core::bridge::bridge_encrypted(
+                                user_r, user_w, srv_r, srv_w,
+                                &key, use_compression, vec![], None, None, None,
+                            ).await;
+                            debug!(visitor_name = %visitor_name, "Visitor '{}' STCP encrypted relay closed", visitor_name);
+                        } else {
+                            frp_core::bridge::bridge_plain(
+                                user_r, user_w, srv_r, srv_w,
+                                use_compression, vec![], None,
+                            ).await;
+                            debug!(visitor_name = %visitor_name, "Visitor '{}' STCP relay closed", visitor_name);
                         }
                     } else {
                         // --- STCP relay path (existing) ---
@@ -373,14 +388,23 @@ pub(crate) async fn run_visitor_listener(
                             }
                         }
 
-                        let mut user = user_conn;
-                        match tokio::io::copy_bidirectional(&mut user, &mut server_conn).await {
-                            Ok((to_server, to_user)) => {
-                                debug!(visitor_name = %visitor_name, to_server = %to_server, to_user = %to_user, "Visitor '{}' closed: {}B to server, {}B to user", visitor_name, to_server, to_user);
-                            }
-                            Err(e) => {
-                                debug!(visitor_name = %visitor_name, error = %e, "Visitor '{}' bridge error: {}", visitor_name, e);
-                            }
+                        let user = user_conn;
+                        let (user_r, user_w) = user.into_split();
+                        let (srv_r, srv_w) = server_conn.into_split();
+                        let use_enc_relay = use_encryption && !sk.is_empty();
+                        if use_enc_relay {
+                            let key = frp_core::encryption::derive_key(&sk);
+                            frp_core::bridge::bridge_encrypted(
+                                user_r, user_w, srv_r, srv_w,
+                                &key, use_compression, vec![], None, None, None,
+                            ).await;
+                            debug!(visitor_name = %visitor_name, "Visitor '{}' STCP encrypted relay closed", visitor_name);
+                        } else {
+                            frp_core::bridge::bridge_plain(
+                                user_r, user_w, srv_r, srv_w,
+                                use_compression, vec![], None,
+                            ).await;
+                            debug!(visitor_name = %visitor_name, "Visitor '{}' STCP relay closed", visitor_name);
                         }
                     }
                 });

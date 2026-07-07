@@ -4,15 +4,14 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use axum::{
     Router, Json,
-    extract::{State, Query, DefaultBodyLimit},
+    extract::{State, DefaultBodyLimit},
     routing::get,
-    http::StatusCode,
+    http::{StatusCode, header},
 };
 use serde::Serialize;
 use tokio::sync::{mpsc, RwLock, oneshot};
 
 use frp_core::metrics::ProxyMetricsRegistry;
-#[cfg(feature = "tls")]
 use frp_core::admin_auth::apply_admin_auth;
 
 use crate::proxy_runtime::{ProxyRuntimeInfo, ReloadRequest};
@@ -118,9 +117,12 @@ async fn handle_status(State(state): State<AdminState>) -> Json<serde_json::Valu
 
 async fn handle_reload(
     State(state): State<AdminState>,
-    Query(params): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<String, (StatusCode, String)> {
-    let strict = params.get("strictConfig").map(|v| v == "true").unwrap_or(false);
+    let strict = body
+        .get("strictConfig")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let (tx, rx) = oneshot::channel();
     let req = ReloadRequest { strict, reply: tx };
     state.reload_tx.send(req).map_err(|_| {
@@ -143,20 +145,39 @@ async fn handle_get_config(State(state): State<AdminState>) -> Result<String, (S
     let path = state.config_path.as_ref()
         .ok_or_else(|| (StatusCode::NOT_FOUND, "no config file path stored".into()))?;
     let raw = std::fs::read_to_string(path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read config: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(path = %path, error = %e, "Failed to read config file: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to read config file".into())
+        })?;
 
     // Parse and redact sensitive fields before returning
     let value: toml::Value = toml::from_str(&raw)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("parse config: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("invalid TOML syntax: {e}")))?;
     let redacted = redact_sensitive(value);
     toml::to_string(&redacted)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("serialize config: {e}")))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to serialize config: {e}")))
 }
 
 async fn handle_put_config(
     State(state): State<AdminState>,
+    headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<&'static str, (StatusCode, String)> {
+    // Validate content type — only accept TOML
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !content_type.contains("application/toml")
+        && !content_type.contains("text/x-toml")
+        && !content_type.contains("text/plain")
+    {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type must be application/toml, text/x-toml, or text/plain".into(),
+        ));
+    }
+
     let path = state.config_path.as_ref()
         .ok_or_else(|| (StatusCode::NOT_FOUND, "no config file path stored".into()))?;
 
@@ -165,7 +186,10 @@ async fn handle_put_config(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid config: {e}")))?;
 
     std::fs::write(path, &body)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write config: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(path = %path, error = %e, "Failed to write config file: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to write config file".into())
+        })?;
     // Trigger reload after config update
     let (tx, rx) = oneshot::channel();
     let req = ReloadRequest { strict: false, reply: tx };
@@ -253,7 +277,7 @@ pub async fn run_admin_server(
     let app = Router::new()
         .route("/api/status", get(handle_status))
         .route("/api/metrics", get(handle_metrics))
-        .route("/api/reload", get(handle_reload))
+        .route("/api/reload", axum::routing::post(handle_reload))
         .route("/api/stop", axum::routing::post(handle_stop))
         .route("/api/config",
             get(handle_get_config)
@@ -261,7 +285,6 @@ pub async fn run_admin_server(
                 .layer(DefaultBodyLimit::max(1024 * 1024))
         );
 
-    #[cfg(feature = "tls")]
     let app = apply_admin_auth(app, &auth_user, &auth_password);
     let app = app.with_state(state);
 
@@ -282,7 +305,7 @@ pub async fn run_admin_server(
     }
     #[cfg(not(feature = "tls"))]
     {
-        let _ = (&auth_user, &auth_password, &tls_cert_file, &tls_key_file);
+        let _ = (&tls_cert_file, &tls_key_file);
         tracing::info!(addr = %addr, "frpc admin server listening on {}", addr);
         axum::serve(listener, app).await?;
     }
@@ -297,6 +320,7 @@ const SENSITIVE_KEYS: &[&str] = &[
     "http_pwd", "http_password",
     "sk", "group_key",
     "oidc_client_secret",
+    "user", "password",
 ];
 
 /// Recursively redact sensitive values in TOML, returning a copy with

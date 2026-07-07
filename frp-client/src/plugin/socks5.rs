@@ -115,7 +115,7 @@ async fn handle_socks5_conn(
 
     let chosen_method = if use_auth && methods.contains(&AUTH_USER_PASS) {
         AUTH_USER_PASS
-    } else if methods.contains(&AUTH_NO_AUTH) {
+    } else if !use_auth && methods.contains(&AUTH_NO_AUTH) {
         AUTH_NO_AUTH
     } else {
         client.write_all(&[SOCKS5_VERSION, AUTH_NO_ACCEPTABLE]).await

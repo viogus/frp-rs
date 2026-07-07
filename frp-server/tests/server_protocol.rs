@@ -5,8 +5,9 @@ use frp_core::config::ServerConfig;
 use frp_core::msg::{self, FrpMessage, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 
-use common::{allocate_port, raw_login, raw_login_resp, start_test_server};
+use common::{allocate_port, login_with_test_token, raw_login, raw_login_resp, start_test_server, test_auth_cfg};
 use frp_core::transport::{DialOptions, IoStream, TransportProtocol, dial_server};
+use frp_server::service::Service;
 use std::path::PathBuf;
 
 fn test_cert_dir() -> PathBuf {
@@ -23,22 +24,24 @@ fn test_cert_dir() -> PathBuf {
 // ---------------------------------------------------------------
 
 #[tokio::test]
-async fn test_login_empty_token_succeeds() {
+async fn test_login_empty_token_rejected() {
     let port = allocate_port();
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
         ..Default::default()
     };
-    let (_handle, _) = start_test_server(cfg).await;
 
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let resp = raw_login_resp(addr, None, None, "").await.expect("login should succeed");
-
-    assert!(resp.error.is_none(), "expected no error, got: {:?}", resp.error);
-    assert!(resp.run_id.is_some(), "expected run_id to be set");
-    let run_id = resp.run_id.unwrap();
-    assert!(!run_id.is_empty(), "run_id should not be empty");
+    // check_startup() rejects empty-token configurations at server startup.
+    // This catches accidental empty-token deployments before they go live.
+    let err = match Service::new(cfg, None).await {
+        Ok(_) => panic!("Server should reject empty token at startup via check_startup()"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("security misconfiguration") || err.contains("CRITICAL") || err.contains("token"),
+        "Expected startup rejection with security message, got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -115,12 +118,13 @@ async fn test_ping_pong_no_auth() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let (mut stream, _resp) = raw_login(addr, None, None, "").await.expect("login");
+    let (mut stream, _resp) = login_with_test_token(addr).await.expect("login");
 
     // Send Ping
     let ping = FrpMessage::Ping(msg::Ping {
@@ -150,12 +154,13 @@ async fn test_new_proxy_registration_auto_port() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let (mut stream, _resp) = raw_login(addr, None, None, "").await.expect("login");
+    let (mut stream, _resp) = login_with_test_token(addr).await.expect("login");
 
     // Register a TCP proxy with auto-assign port (remote_port = 0)
     let np = FrpMessage::NewProxy(msg::NewProxy {
@@ -185,13 +190,9 @@ async fn test_new_proxy_registration_auto_port() {
         multiplexer: None,
         virtual_net: None,
                     proxy_protocol_version: None,
-                    #[cfg(feature = "vnet")]
                     advertise_subnet: None,
-                    #[cfg(feature = "vnet")]
                     vnet_ip: None,
-                    #[cfg(feature = "vnet")]
                     vnet_netmask: None,
-                    #[cfg(feature = "vnet")]
                     vnet_mtu: None,
     });
     write_msg_v1(&mut stream, &np).await.expect("send NewProxy");
@@ -222,12 +223,13 @@ async fn test_new_proxy_duplicate_name_fails() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let (mut stream, _resp) = raw_login(addr, None, None, "").await.expect("login");
+    let (mut stream, _resp) = login_with_test_token(addr).await.expect("login");
 
     let mk_proxy = || FrpMessage::NewProxy(msg::NewProxy {
         proxy_name: "dup-tcp".into(),
@@ -256,13 +258,9 @@ async fn test_new_proxy_duplicate_name_fails() {
         multiplexer: None,
         virtual_net: None,
                     proxy_protocol_version: None,
-                    #[cfg(feature = "vnet")]
                     advertise_subnet: None,
-                    #[cfg(feature = "vnet")]
                     vnet_ip: None,
-                    #[cfg(feature = "vnet")]
                     vnet_netmask: None,
-                    #[cfg(feature = "vnet")]
                     vnet_mtu: None,
     });
 
@@ -300,6 +298,7 @@ async fn test_vhost_location_routing() {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
         vhost_http_port: vhost_port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
@@ -323,7 +322,7 @@ async fn test_vhost_location_routing() {
     }
 
     // Provider logs in and registers HTTP proxy with locations
-    let (mut provider, resp) = raw_login(addr, None, None, "").await.expect("provider login");
+    let (mut provider, resp) = login_with_test_token(addr).await.expect("provider login");
     let run_id = resp.run_id.expect("provider should get run_id");
 
     let np = FrpMessage::NewProxy(NewProxy {
@@ -353,13 +352,9 @@ async fn test_vhost_location_routing() {
         multiplexer: None,
         virtual_net: None,
                     proxy_protocol_version: None,
-                    #[cfg(feature = "vnet")]
                     advertise_subnet: None,
-                    #[cfg(feature = "vnet")]
                     vnet_ip: None,
-                    #[cfg(feature = "vnet")]
                     vnet_netmask: None,
-                    #[cfg(feature = "vnet")]
                     vnet_mtu: None,
     });
     write_msg_v1(&mut provider, &np).await.expect("send NewProxy");
@@ -409,6 +404,7 @@ async fn test_vhost_location_path_mismatch_404() {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
         vhost_http_port: vhost_port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
@@ -432,7 +428,7 @@ async fn test_vhost_location_path_mismatch_404() {
     }
 
     // Provider registers HTTP proxy with locations (only /api)
-    let (mut provider, _resp) = raw_login(addr, None, None, "").await.expect("provider login");
+    let (mut provider, _resp) = login_with_test_token(addr).await.expect("provider login");
 
     let np = FrpMessage::NewProxy(NewProxy {
         proxy_name: "http-loc-only".into(),
@@ -461,13 +457,9 @@ async fn test_vhost_location_path_mismatch_404() {
         multiplexer: None,
         virtual_net: None,
                     proxy_protocol_version: None,
-                    #[cfg(feature = "vnet")]
                     advertise_subnet: None,
-                    #[cfg(feature = "vnet")]
                     vnet_ip: None,
-                    #[cfg(feature = "vnet")]
                     vnet_netmask: None,
-                    #[cfg(feature = "vnet")]
                     vnet_mtu: None,
     });
     write_msg_v1(&mut provider, &np).await.expect("send NewProxy");
@@ -507,6 +499,7 @@ async fn test_login_via_websocket() {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
@@ -527,6 +520,11 @@ async fn test_login_via_websocket() {
     }
 
     // Send login
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let key = auth::generate_token("test-token", ts);
     let login = FrpMessage::Login(msg::Login {
         version: Some(frp_core::VERSION.into()),
         hostname: Some("test-ws-host".into()),
@@ -536,12 +534,12 @@ async fn test_login_via_websocket() {
         run_id: None,
         client_id: None,
         pool_count: Some(1),
-        timestamp: None,
-        privilege_key: None,
+        timestamp: Some(ts),
+        privilege_key: Some(key),
         metas: None,
         client_spec: None,
         multiplexer: None,
-        
+
     });
     io.write_v1_frame(&login).await.expect("send login over WS");
 
@@ -569,6 +567,7 @@ async fn test_login_via_tls() {
         tls_enable: true,
         tls_cert_file: cert_dir.join("server.crt").to_string_lossy().into(),
         tls_key_file: cert_dir.join("server.key").to_string_lossy().into(),
+        auth: test_auth_cfg(),
         ..Default::default()
     };
     let (_handle, _) = start_test_server(cfg).await;
@@ -592,6 +591,11 @@ async fn test_login_via_tls() {
     }
 
     // Send login
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let key = auth::generate_token("test-token", ts);
     let login = FrpMessage::Login(msg::Login {
         version: Some(frp_core::VERSION.into()),
         hostname: Some("test-tls-host".into()),
@@ -601,12 +605,12 @@ async fn test_login_via_tls() {
         run_id: None,
         client_id: None,
         pool_count: Some(1),
-        timestamp: None,
-        privilege_key: None,
+        timestamp: Some(ts),
+        privilege_key: Some(key),
         metas: None,
         client_spec: None,
         multiplexer: None,
-        
+
     });
     io.write_v1_frame(&login).await.expect("send login over TLS");
 
