@@ -225,7 +225,7 @@ wait_for_port_gone() {
 start_echo_server() {
     local port="$1"
     python3 -c "
-import socket, sys
+import socket, sys, time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('127.0.0.1', $port))
@@ -236,6 +236,12 @@ while True:
         data = conn.recv(65536)
         if data:
             conn.sendall(data)
+        # KCP: give kcp-go output goroutine time to flush pending writes
+        # before Close(). Without this, Go frpc's libio.Join closes the
+        # dialed KCP work conn immediately after echo server responds,
+        # and kcp-go's Close() (flush=false) kills the output goroutine
+        # before pending data reaches the wire.
+        time.sleep(0.1)
         conn.close()
     except:
         break
@@ -594,6 +600,7 @@ run_test() {
 write_frps_config() {
     local impl="$1" port="$2" token="$3" out="$4" features="${5:-}"
     local has_tls=false has_mux=false has_ws=false kcp_port="" quic_port="" tcpmux_port="" extra_line=""
+    local vhost_wss_port=""
     for feat in $features; do
         case "$feat" in
             tls) has_tls=true ;;
@@ -602,6 +609,7 @@ write_frps_config() {
             kcp=*) kcp_port="${feat#kcp=}" ;;
             quic=*) quic_port="${feat#quic=}"; has_tls=true ;;
             tcpmux=*) tcpmux_port="${feat#tcpmux=}" ;;
+            vhost_wss=*) vhost_wss_port="${feat#vhost_wss=}" ;;
             extra=*) extra_line="${feat#extra=}" ;;
         esac
     done
@@ -613,13 +621,21 @@ write_frps_config() {
             [[ -n "$quic_port" ]] && printf 'quicBindPort = %s\n' "$quic_port"
             [[ -n "$tcpmux_port" ]] && printf 'tcpmuxHTTPConnectPort = %s\n' "$tcpmux_port"
             printf '\nauth.method = "token"\nauth.token = "%s"\n\n' "$token"
-            if $has_tls; then
+            if [[ -n "$vhost_wss_port" ]]; then
+                # WSS: separate vhostHTTPSPort (Go frp requires different port
+                # from bindPort for WSS; same-port tls.force+vhostHTTPPort breaks frpMuxer).
+                printf 'transport.tls.certFile = "%s/server.crt"\n' "$CERT_DIR"
+                printf 'transport.tls.keyFile = "%s/server.key"\n' "$CERT_DIR"
+            elif $has_tls; then
                 printf 'transport.tls.force = true\n'
                 printf 'transport.tls.certFile = "%s/server.crt"\n' "$CERT_DIR"
                 printf 'transport.tls.keyFile = "%s/server.key"\n' "$CERT_DIR"
             fi
             printf 'transport.tcpMux = %s\n\n' "$mux_val"
-            if $has_ws; then
+            if [[ -n "$vhost_wss_port" ]]; then
+                printf '# Separate WSS port — HandleMux HTTPS listener\n'
+                printf 'vhostHTTPSPort = %s\n\n' "$vhost_wss_port"
+            elif $has_ws; then
                 printf '# Same port as bindPort — enables HandleMux WS→VHost internal proxy\n'
                 printf 'vhostHTTPPort = %s\n\n' "$port"
             fi
@@ -709,6 +725,7 @@ write_frpc_config() {
                 printf 'tls_enable = true\n'
                 printf 'tls_ca_file = "%s/ca.crt"\n' "$CERT_DIR"
                 printf 'tls_server_name = "localhost"\n'
+                printf 'disable_custom_tls_first_byte = true\n'
             fi
             printf '\n[[proxies]]\nname = "%s"\ntype = "tcp"\nlocal_ip = "127.0.0.1"\n' "$name"
             printf 'local_port = %s\nremote_port = %s\n' "$echo_port" "$proxy_port"
@@ -2113,6 +2130,184 @@ TOML
     fi
 }
 
+# =============================================================================
+# Test: Go frpc -> Rust frps, STCP relay + encryption
+# =============================================================================
+test_g2r_stcp_encrypted() {
+    local name="go-to-rust-stcp-encrypted"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local echo_port=$(random_port)
+    local visitor_port=$(random_port)
+    local token="test-token-g2r-stcp-enc"
+    local sk="stcp-secret-key-enc-42"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    # Start Rust frps
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
+    RUST_LOG=debug "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Start Go frpc provider (stcp proxy, encrypted)
+    cat > "$TEST_DIR/$name/frpc-provider.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-provider-$name.log"
+log.level = "debug"
+
+[[proxies]]
+name = "stcp-svc-enc"
+type = "stcp"
+secretKey = "$sk"
+localIP = "127.0.0.1"
+localPort = $echo_port
+transport.useEncryption = true
+TOML
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
+        > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
+    track_pid $!
+
+    # Start Go frpc visitor (stcp visitor)
+    cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-visitor-$name.log"
+log.level = "debug"
+
+[[visitors]]
+name = "stcp-visitor-enc"
+type = "stcp"
+serverName = "stcp-svc-enc"
+secretKey = "$sk"
+bindAddr = "127.0.0.1"
+bindPort = $visitor_port
+TOML
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc-visitor.toml" \
+        > "$TEST_DIR/$name/frpc-visitor.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$visitor_port" 15; then
+        fail_test "$name" "visitor port $visitor_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$visitor_port" "stcp-enc-data" "stcp-enc-data" 5)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Rust frpc -> Go frps, STCP relay + encryption
+# =============================================================================
+test_r2g_stcp_encrypted() {
+    local name="rust-to-go-stcp-encrypted"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local echo_port=$(random_port)
+    local visitor_port=$(random_port)
+    local token="test-token-r2g-stcp-enc"
+    local sk="stcp-secret-key-enc-43"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    # Start Go frps
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" ""
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    # Start Rust frpc provider (STCP, encrypted)
+    cat > "$TEST_DIR/$name/frpc-provider.toml" <<TOML
+server_addr = "127.0.0.1"
+server_port = $frps_port
+token = "$token"
+tcp_mux = false
+login_fail_exit = true
+pool_count = 1
+
+[[proxies]]
+name = "stcp-svc-enc"
+type = "stcp"
+local_ip = "127.0.0.1"
+local_port = $echo_port
+sk = "$sk"
+use_encryption = true
+TOML
+    RUST_LOG=debug "$RUST_FRPC" -c "$TEST_DIR/$name/frpc-provider.toml" \
+        > "$TEST_DIR/$name/frpc-provider.log" 2>&1 &
+    track_pid $!
+
+    # Start Rust frpc visitor (STCP visitor)
+    cat > "$TEST_DIR/$name/frpc-visitor.toml" <<TOML
+server_addr = "127.0.0.1"
+server_port = $frps_port
+token = "$token"
+tcp_mux = false
+login_fail_exit = true
+pool_count = 1
+
+[[visitors]]
+name = "stcp-visitor-enc"
+type = "stcp"
+server_name = "stcp-svc-enc"
+sk = "$sk"
+bind_addr = "127.0.0.1"
+bind_port = $visitor_port
+TOML
+    RUST_LOG=debug "$RUST_FRPC" -c "$TEST_DIR/$name/frpc-visitor.toml" \
+        > "$TEST_DIR/$name/frpc-visitor.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$visitor_port" 15; then
+        fail_test "$name" "visitor port $visitor_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$visitor_port" "r2g-stcp-enc-data" "r2g-stcp-enc-data" 5)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
 # ═══ XTCP test infrastructure ═══════════════════════════════════════════════
 
 # Generic XTCP end-to-end test runner.
@@ -3115,6 +3310,8 @@ run_test test_g2r_tcpmux
 run_test test_r2g_tcpmux
 run_test test_g2r_stcp
 run_test test_r2g_stcp
+run_test test_g2r_stcp_encrypted
+run_test test_r2g_stcp_encrypted
 fi
 
 # ── XTCP tests (Phase 1: VPS CI or RUN_XTCP=1) ──
@@ -3565,6 +3762,7 @@ test_r2g_wss_plain() {
 
     log "=== $name ==="
     local frps_port=$(random_port)
+    local wss_port=$(random_port)
     local proxy_port=$(random_port)
     local echo_port=$(random_port)
     local token="test-token-r2g-wss"
@@ -3577,7 +3775,7 @@ test_r2g_wss_plain() {
         return
     }
 
-    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "tls ws"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "tls ws vhost_wss=$wss_port"
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3585,8 +3783,12 @@ test_r2g_wss_plain() {
         fail_test "$name" "Go frps did not start"
         return
     }
+    wait_for_port 127.0.0.1 "$wss_port" 5 || {
+        fail_test "$name" "Go frps WSS port $wss_port not listening"
+        return
+    }
 
-    write_frpc_config rust "$frps_port" "$token" "$echo_port" "$proxy_port" "wss-plain" "$TEST_DIR/$name/frpc.toml" "wss"
+    write_frpc_config rust "$wss_port" "$token" "$echo_port" "$proxy_port" "wss-plain" "$TEST_DIR/$name/frpc.toml" "wss"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -3655,6 +3857,55 @@ test_g2r_wss_encrypted() {
 }
 
 # =============================================================================
+# Test: Go frpc -> Rust frps, WSS transport + tcpMux
+# =============================================================================
+test_g2r_wss_mux() {
+    local name="go-to-rust-wss-mux"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-wss-mux"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "tls mux"
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    write_frpc_config go "$frps_port" "$token" "$echo_port" "$proxy_port" "wss-mux" "$TEST_DIR/$name/frpc.toml" "wss mux"
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "wss-mux-data" "wss-mux-data" 5)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
 # Test: Rust frpc -> Go frps, WSS transport + encryption
 # =============================================================================
 test_r2g_wss_encrypted() {
@@ -3663,6 +3914,7 @@ test_r2g_wss_encrypted() {
 
     log "=== $name ==="
     local frps_port=$(random_port)
+    local wss_port=$(random_port)
     local proxy_port=$(random_port)
     local echo_port=$(random_port)
     local token="test-token-r2g-wss-enc"
@@ -3675,7 +3927,7 @@ test_r2g_wss_encrypted() {
         return
     }
 
-    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "tls ws"
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "tls ws vhost_wss=$wss_port"
     run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
@@ -3683,8 +3935,12 @@ test_r2g_wss_encrypted() {
         fail_test "$name" "Go frps did not start"
         return
     }
+    wait_for_port 127.0.0.1 "$wss_port" 5 || {
+        fail_test "$name" "Go frps WSS port $wss_port not listening"
+        return
+    }
 
-    write_frpc_config rust "$frps_port" "$token" "$echo_port" "$proxy_port" "wss-enc" "$TEST_DIR/$name/frpc.toml" "wss enc"
+    write_frpc_config rust "$wss_port" "$token" "$echo_port" "$proxy_port" "wss-enc" "$TEST_DIR/$name/frpc.toml" "wss enc"
     RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
         > "$TEST_DIR/$name/frpc.log" 2>&1 &
     track_pid $!
@@ -4156,6 +4412,118 @@ GOFPC_EOF
 }
 
 # =============================================================================
+# Test: Go frpc -> Rust frps, QUIC transport + encryption
+# =============================================================================
+test_g2r_quic_encrypted() {
+    local name="go-to-rust-quic-encrypted"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local quic_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-quic-enc"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "quic=$quic_port"
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    # QUIC uses UDP, wait for the TCP bind port as readiness signal
+    wait_for_port 127.0.0.1 "$frps_port" 10 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    # Go frpc with QUIC + bridge encryption
+    write_frpc_config go "$quic_port" "$token" "$echo_port" "$proxy_port" "quic-enc" "$TEST_DIR/$name/frpc.toml" "quic enc"
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    # QUIC transport needs extra time for multi-stream setup
+    sleep 2
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 25; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    # Idle resilience: verify QUIC survives idle period
+    sleep 5
+
+    local result
+    result=$(send_and_expect "$proxy_port" "quic-enc-data" "quic-enc-data" 15)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Rust frpc -> Go frps, QUIC transport + encryption
+# =============================================================================
+test_r2g_quic_encrypted() {
+    local name="rust-to-go-quic-encrypted"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local quic_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-r2g-quic-enc"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_frps_config go "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "quic=$quic_port"
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 10 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    # Rust frpc with QUIC + bridge encryption
+    write_frpc_config rust "$quic_port" "$token" "$echo_port" "$proxy_port" "quic-enc" "$TEST_DIR/$name/frpc.toml" "quic enc"
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    # Idle resilience: verify QUIC survives idle period
+    sleep 5
+
+    local result
+    result=$(send_and_expect "$proxy_port" "quic-r2g-enc" "quic-r2g-enc" 10)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
 # Test: Go frpc (V2 wire protocol) -> Rust frps
 # =============================================================================
 test_g2r_v2_tcp() {
@@ -4429,7 +4797,6 @@ bindPort = $frps_port
 auth.method = "token"
 auth.token = "$token"
 
-sshTunnelGateway.bindAddr = "127.0.0.1"
 sshTunnelGateway.bindPort = $ssh_port
 
 log.to = "$TEST_DIR/go-frps-$name.log"
@@ -4479,12 +4846,16 @@ run_test test_g2r_ws_encrypted
 run_test test_r2g_ws_encrypted
 
 # Phase 6b: WebSocket Secure (WSS) transport
-# TODO: fix WSS — tests fail with proxy port not reachable.
-# Likely TLS cert trust or WS upgrade detection issue.
-# run_test test_g2r_wss_plain
+# g2r: Go frpc → Rust frps — TLS+WS upgrade detected in Rust frps accept loop. WORKS.
+run_test test_g2r_wss_plain
+run_test test_g2r_wss_encrypted
+run_test test_g2r_wss_mux
+# r2g: Rust frpc → Go frps — blocked by Go frp v0.69.1 vhostHTTPSPort TLS SNI bug.
+# Go frps sends fatal UnrecognisedName alert (112). Rust frpc rustls aborts.
+# TODO: fix after Go frp v0.69.1 vhostHTTPSPort TLS config resolved.
 # run_test test_r2g_wss_plain
-# run_test test_g2r_wss_encrypted
 # run_test test_r2g_wss_encrypted
+# run_test test_r2g_wss_mux
 
 # Phase 7: Plugin
 run_test test_g2r_socks5
@@ -4496,11 +4867,20 @@ run_test test_r2g_socks5
 # Phase 8: KCP + QUIC transport cross-compat
 # Rust↔Rust KCP: both sides use raw kcp crate, wire-compatible.
 run_test test_kcp_rust_to_rust
-# KCP Go↔Rust: FEC compat layer implemented but needs work-conn routing fix.
-# Control connection login works; work connection bridging is broken.
-# TODO: enable after FEC work-connection routing is fixed.
-# run_test test_g2r_kcp
-# run_test test_r2g_kcp
+# KCP Go↔Rust: FAILS — FEC/wire-format incompatibility between rust_tokio_kcp
+# and Go frp kcp-go. g2r: Go frpc times out (no Login received by Rust frps).
+# r2g: Rust frpc sends Login but Go frps doesn't respond. KCP sessions are
+# established but data doesn't decode. Needs deeper fix: either wire
+# KcpCompatSession into production path or fix rust_tokio_kcp FEC.
+# TODO: fix rust_tokio_kcp ↔ kcp-go FEC compat.
+run_test test_g2r_kcp
+run_test test_r2g_kcp
+# KCP+TLS and KCP+tcpMux: also blocked by FEC incompatibility. Once base KCP
+# Go↔Rust is fixed, uncomment these to test encryption + multiplexing over KCP.
+# run_test test_g2r_kcp_tls
+# run_test test_r2g_kcp_tls
+# run_test test_g2r_kcp_mux
+# run_test test_r2g_kcp_mux
 
 # QUIC Rust↔Rust: both sides use quinn crate, wire-compatible.
 run_test test_quic_rust_to_rust
@@ -4510,6 +4890,8 @@ run_test test_quic_rust_to_rust
 run_test test_g2r_quic
 run_test test_r2g_quic
 run_test test_g2r_quic_multi_proxy
+run_test test_g2r_quic_encrypted
+run_test test_r2g_quic_encrypted
 
 # Phase 9: V2 wire protocol
 # g2r: Go frpc needs source build for transport.wireProtocol config support.
@@ -4527,8 +4909,7 @@ fi
 # Phase 10: SSH Gateway compat
 run_test test_ssh_gateway_banner
 run_test test_ssh_gateway_auth_rejection
-# TODO: fix — Go frps SSH gateway config may differ from frp-rs.
-# run_test test_ssh_gateway_go_frps_compat
+run_test test_ssh_gateway_go_frps_compat
 
 fi
 
