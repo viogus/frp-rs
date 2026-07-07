@@ -207,22 +207,31 @@ pub async fn bridge_plain(
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
     let had_pre_read = !pre_read.is_empty();
+    tracing::debug!(had_pre_read, "bridge_plain: starting, had_pre_read={}", had_pre_read);
     let user_to_work = async {
         if !pre_read.is_empty()
             && work_w.write_all(&pre_read).await.is_err() {
+                tracing::warn!("bridge_plain: pre_read write_all failed");
                 return;
             }
         let mut buf = vec![0u8; 65536];
         loop {
             let n = match user_r.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    tracing::debug!("bridge_plain: user_r EOF");
+                    break;
+                }
                 Ok(n) => {
+                    tracing::trace!(n, first_hex = %hex::encode(&buf[..n.min(32)]), "bridge_plain: user_r read {} bytes", n);
                     if let Some(ref m) = metrics {
                         m.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
                     }
                     n
                 }
-                Err(_) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, "bridge_plain: user_r read error");
+                    break;
+                }
             };
             let payload = &buf[..n];
             let processed = if use_compression {
@@ -233,8 +242,14 @@ pub async fn bridge_plain(
             } else {
                 payload.to_vec()
             };
-            if work_w.write_all(&processed).await.is_err() { break; }
-            if work_w.flush().await.is_err() { break; }
+            if work_w.write_all(&processed).await.is_err() {
+                tracing::warn!(len = processed.len(), "bridge_plain: work_w write_all failed");
+                break;
+            }
+            if work_w.flush().await.is_err() {
+                tracing::warn!("bridge_plain: work_w flush failed");
+                break;
+            }
         }
         // When pre_read bytes were forwarded (e.g. VHost HTTP handler consumed
         // the user's request), leave work_w open so work_to_user can receive
@@ -245,8 +260,10 @@ pub async fn bridge_plain(
                 tracing::debug!(error = %e, "bridge_plain shutdown: work_w.shutdown failed");
             }
         }
+        tracing::debug!("bridge_plain: user_to_work done");
     };
     let work_to_user = async {
+        tracing::debug!("bridge_plain: work_to_user starting");
         let mut buf = vec![0u8; 65536];
         #[cfg(feature = "compression")]
         let mut decompressor = if use_compression {
@@ -258,9 +275,18 @@ pub async fn bridge_plain(
         let mut decompressor: Option<encryption::SnappyDecompressor> = None;
         loop {
             let n = match work_r.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(_) => break,
+                Ok(0) => {
+                    tracing::debug!("bridge_plain: work_r EOF");
+                    break;
+                }
+                Ok(n) => {
+                    tracing::trace!(n, first_hex = %hex::encode(&buf[..n.min(32)]), "bridge_plain: work_r read {} bytes", n);
+                    n
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "bridge_plain: work_r read error");
+                    break;
+                }
             };
             let plaintext = if let Some(ref mut dec) = decompressor {
                 match dec.feed(&buf[..n]) {
@@ -277,13 +303,20 @@ pub async fn bridge_plain(
                 buf[..n].to_vec()
             };
             if !plaintext.is_empty() {
-                if user_w.write_all(&plaintext).await.is_err() { break; }
+                if user_w.write_all(&plaintext).await.is_err() {
+                    tracing::warn!(len = plaintext.len(), "bridge_plain: user_w write_all failed");
+                    break;
+                }
                 if let Some(ref m) = metrics {
                     m.bytes_out.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
                 }
-                if user_w.flush().await.is_err() { break; }
+                if user_w.flush().await.is_err() {
+                    tracing::warn!("bridge_plain: user_w flush failed");
+                    break;
+                }
             }
         }
+        tracing::debug!("bridge_plain: work_to_user done");
         // Flush remaining buffered compressed data
         if let Some(ref mut dec) = decompressor {
             match dec.flush() {

@@ -14,8 +14,9 @@ use super::config::KcpConfig;
 use super::session::KcpSession;
 use super::stream::KcpStream;
 
-pub(crate) struct WriteRequest {
-    pub data: Vec<u8>,
+pub(crate) enum WriteRequest {
+    Data(Vec<u8>),
+    Flush(tokio::sync::oneshot::Sender<()>),
 }
 
 pub(crate) struct KcpSocketHandle {
@@ -105,11 +106,56 @@ impl KcpSocket {
                 }
 
                 Some((conv, req)) = self.write_rx.recv() => {
-                    // Route write to session matching conv (pick first match)
-                    let _result = self.sessions.iter_mut()
-                        .find(|((c, _), _)| *c == conv)
-                        .map(|(_, s)| s.send(&req.data))
-                        .unwrap_or_else(|| Err(io::Error::new(io::ErrorKind::NotConnected, "session not found")));
+                    match req {
+                        WriteRequest::Data(data) => {
+                            let len = data.len();
+                            let _result = self.sessions.iter_mut()
+                                .find(|((c, _), _)| *c == conv)
+                                .map(|(_, s)| s.send(&data))
+                                .unwrap_or_else(|| Err(io::Error::new(io::ErrorKind::NotConnected, "session not found")));
+                            if let Err(ref e) = _result {
+                                tracing::error!(conv, len, error = %e, "KCP SOCKET: write failed — session not found");
+                            } else {
+                                tracing::trace!(conv, len, "KCP SOCKET: write queued {} bytes", len);
+                            }
+                        }
+                        WriteRequest::Flush(tx) => {
+                            // Force immediate KCP flush: update → drain output →
+                            // FEC encode → send UDP now. Critical for protocol
+                            // correctness: caller needs StartWorkConn on wire
+                            // before bridge data so Go frpc can process them as
+                            // separate messages.
+                            tracing::trace!(conv, "KCP SOCKET: flush");
+                            let packets = if let Some(session) = self.sessions.iter_mut()
+                                .find(|((c, _), _)| *c == conv)
+                                .map(|(_, s)| s)
+                            {
+                                let now_ms = self.start.elapsed().as_millis() as u32;
+                                match session.force_flush(now_ms) {
+                                    Ok(pkts) => pkts,
+                                    Err(e) => {
+                                        tracing::debug!(conv, error = %e, "KCP SOCKET: force_flush error");
+                                        Vec::new()
+                                    }
+                                }
+                            } else {
+                                Vec::new()
+                            };
+                            // Send all output packets immediately.
+                            let peer = self.sessions.iter()
+                                .find(|((c, _), _)| *c == conv)
+                                .map(|((_, a), _)| *a);
+                            if let Some(addr) = peer {
+                                for pkt in &packets {
+                                    if let Err(e) = self.socket.send_to(pkt, addr).await {
+                                        tracing::debug!(conv, peer = %addr, error = %e, "KCP SOCKET: flush send error");
+                                    }
+                                }
+                            }
+                            tracing::trace!(conv, npkts = packets.len(), "KCP SOCKET: flush sent {} packets", packets.len());
+                            let _ = tx.send(());
+                        }
+                    }
                 }
 
                 recv_result = self.socket.recv_from(&mut buf) => {
@@ -117,15 +163,20 @@ impl KcpSocket {
                         Ok((n, src)) => {
                             let data = buf[..n].to_vec();
                             let key = Self::resolve_key(&data, src);
+                            let is_fec = data.len() >= 6
+                                && (u16::from_le_bytes([data[4], data[5]]) == 0xf1
+                                    || u16::from_le_bytes([data[4], data[5]]) == 0xf2);
+                            tracing::trace!(conv = key.0, peer = %src, n, is_fec, "KCP SOCKET: recv {} bytes conv={} fec={}", n, key.0, is_fec);
                             if let Some(session) = self.sessions.get_mut(&key) {
                                 if let Err(e) = session.input(&data) {
                                     tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP input error");
                                 }
-                            } else if key.0 != 0 {
-                                // FEC fallback: for FEC packets, non-shard-0 shards don't
-                                // contain the KCP header (conv is at offset 6 only in the
-                                // first data shard). Scan sessions by peer_addr as fallback.
-                                let is_fec = data.len() >= 10
+                            } else {
+                                // FEC fallback: parity shards and data shards whose conv
+                                // wasn't found in sessions are routed by peer_addr.
+                                // With 6-byte FEC header (Go kcp-go format), conv is only
+                                // available in data shards at offset 8.
+                                let is_fec = data.len() >= 6
                                     && (u16::from_le_bytes([data[4], data[5]]) == 0xf1
                                         || u16::from_le_bytes([data[4], data[5]]) == 0xf2);
                                 let fec_key = if is_fec {
@@ -141,7 +192,7 @@ impl KcpSocket {
                                             tracing::debug!(conv = fk.0, peer = %src, error = %e, "KCP FEC fallback input error");
                                         }
                                     }
-                                } else {
+                                } else if key.0 != 0 {
                                     // New peer detected — create session + stream
                                     let (read_tx, read_rx) = mpsc::unbounded_channel();
                                     let mut session = KcpSession::new(
@@ -175,23 +226,28 @@ impl KcpSocket {
     }
 
     /// Extract (conv, peer_addr) key from a raw UDP packet.
-    /// KCP header: conv is first 4 bytes (little-endian u32).
-    /// FEC packets: 10-byte header [seqid: u32 LE][flag: u16 LE][conv: u32 LE].
-    /// Conv is at offset 6 for all FEC shards (previously only correct for shard 0).
+    /// Plain KCP: conv is first 4 bytes (little-endian u32).
+    /// FEC data shard: 6-byte header [seqid: u32 LE][flag: u16 LE], then
+    ///   SIZE(2B) + raw KCP data; conv at offset 8 (skip 6B header + 2B SIZE).
+    /// FEC parity shard: 6-byte header, no conv available → return (0, src);
+    ///   routing handled by FEC fallback below.
     fn resolve_key(data: &[u8], src: SocketAddr) -> (u32, SocketAddr) {
-        if data.len() >= 4 {
-            // Check for FEC packet by looking at bytes [4..6] for flag
-            if data.len() >= 10 {
-                let flag = u16::from_le_bytes([data[4], data[5]]);
-                if flag == 0xf1 || flag == 0xf2 {
-                    // FEC packet: 10-byte header, conv at offset 6
-                    let conv = u32::from_le_bytes([data[6], data[7], data[8], data[9]]);
+        if data.len() >= 6 {
+            let flag = u16::from_le_bytes([data[4], data[5]]);
+            if flag == 0xf1 || flag == 0xf2 {
+                // FEC packet: 6-byte header, no conv field.
+                if flag == 0xf1 && data.len() >= 12 {
+                    // Data shard: KCP conv at offset 8 (6B header + 2B SIZE).
+                    let conv = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
                     if conv != 0 {
                         return (conv, src);
                     }
                 }
+                // Parity shard or short data shard: can't extract conv.
+                return (0, src);
             }
-            // Plain KCP: conv at offset 0
+        }
+        if data.len() >= 4 {
             let conv = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
             return (conv, src);
         }

@@ -24,6 +24,8 @@ pub fn default_kcp_config() -> KcpConfig {
         },
         wnd_size: (1024, 1024),
         mtu: 1350,
+        // Go frp v0.69.1 ListenKcp() uses kcp.ListenWithOptions(addr, nil, 10, 3).
+        // FEC IS enabled by default for KCP in Go frp. Match this for compat.
         data_shards: 10,
         parity_shards: 3,
         stream: true,
