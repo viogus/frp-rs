@@ -14,8 +14,9 @@ use super::config::KcpConfig;
 use super::session::KcpSession;
 use super::stream::KcpStream;
 
-pub(crate) struct WriteRequest {
-    pub data: Vec<u8>,
+pub(crate) enum WriteRequest {
+    Data(Vec<u8>),
+    Flush(tokio::sync::oneshot::Sender<()>),
 }
 
 pub(crate) struct KcpSocketHandle {
@@ -105,11 +106,56 @@ impl KcpSocket {
                 }
 
                 Some((conv, req)) = self.write_rx.recv() => {
-                    // Route write to session matching conv (pick first match)
-                    let _result = self.sessions.iter_mut()
-                        .find(|((c, _), _)| *c == conv)
-                        .map(|(_, s)| s.send(&req.data))
-                        .unwrap_or_else(|| Err(io::Error::new(io::ErrorKind::NotConnected, "session not found")));
+                    match req {
+                        WriteRequest::Data(data) => {
+                            let len = data.len();
+                            let _result = self.sessions.iter_mut()
+                                .find(|((c, _), _)| *c == conv)
+                                .map(|(_, s)| s.send(&data))
+                                .unwrap_or_else(|| Err(io::Error::new(io::ErrorKind::NotConnected, "session not found")));
+                            if let Err(ref e) = _result {
+                                tracing::error!(conv, len, error = %e, "KCP SOCKET: write failed — session not found");
+                            } else {
+                                tracing::trace!(conv, len, "KCP SOCKET: write queued {} bytes", len);
+                            }
+                        }
+                        WriteRequest::Flush(tx) => {
+                            // Force immediate KCP flush: update → drain output →
+                            // FEC encode → send UDP now. Critical for protocol
+                            // correctness: caller needs StartWorkConn on wire
+                            // before bridge data so Go frpc can process them as
+                            // separate messages.
+                            tracing::trace!(conv, "KCP SOCKET: flush");
+                            let packets = if let Some(session) = self.sessions.iter_mut()
+                                .find(|((c, _), _)| *c == conv)
+                                .map(|(_, s)| s)
+                            {
+                                let now_ms = self.start.elapsed().as_millis() as u32;
+                                match session.force_flush(now_ms) {
+                                    Ok(pkts) => pkts,
+                                    Err(e) => {
+                                        tracing::debug!(conv, error = %e, "KCP SOCKET: force_flush error");
+                                        Vec::new()
+                                    }
+                                }
+                            } else {
+                                Vec::new()
+                            };
+                            // Send all output packets immediately.
+                            let peer = self.sessions.iter()
+                                .find(|((c, _), _)| *c == conv)
+                                .map(|((_, a), _)| *a);
+                            if let Some(addr) = peer {
+                                for pkt in &packets {
+                                    if let Err(e) = self.socket.send_to(pkt, addr).await {
+                                        tracing::debug!(conv, peer = %addr, error = %e, "KCP SOCKET: flush send error");
+                                    }
+                                }
+                            }
+                            tracing::trace!(conv, npkts = packets.len(), "KCP SOCKET: flush sent {} packets", packets.len());
+                            let _ = tx.send(());
+                        }
+                    }
                 }
 
                 recv_result = self.socket.recv_from(&mut buf) => {
@@ -117,6 +163,10 @@ impl KcpSocket {
                         Ok((n, src)) => {
                             let data = buf[..n].to_vec();
                             let key = Self::resolve_key(&data, src);
+                            let is_fec = data.len() >= 6
+                                && (u16::from_le_bytes([data[4], data[5]]) == 0xf1
+                                    || u16::from_le_bytes([data[4], data[5]]) == 0xf2);
+                            tracing::trace!(conv = key.0, peer = %src, n, is_fec, "KCP SOCKET: recv {} bytes conv={} fec={}", n, key.0, is_fec);
                             if let Some(session) = self.sessions.get_mut(&key) {
                                 if let Err(e) = session.input(&data) {
                                     tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP input error");

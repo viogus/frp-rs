@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tracing::{debug, info, warn};
 
 use frp_core::metrics::ConnGuard;
@@ -306,6 +306,14 @@ pub(crate) async fn assign_work_to_proxy(
     if let Err(e) = write_result {
         warn!(error = %e, "Failed to send StartWorkConn: {}", e);
         return;
+    }
+
+    // Flush StartWorkConn to wire before bridge data. KcpStream::poll_flush
+    // now triggers immediate force_flush (update + drain + FEC encode + UDP send)
+    // in the KCP driver, so Go frpc receives StartWorkConn as a separate KCP
+    // output before bridge data arrives.
+    if let Err(e) = work_conn.flush().await {
+        warn!(error = %e, "Failed to flush StartWorkConn: {}", e);
     }
 
     // For XTCP STCP fallback: send a dummy NatHoleSid frame with

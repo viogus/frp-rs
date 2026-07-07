@@ -26,6 +26,8 @@ pub struct KcpStream {
     read_count: u64,
     write_count: u64,
     shutdown: bool,
+    /// Pending flush confirmation — set by poll_flush, cleared on receipt.
+    flush_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl KcpStream {
@@ -45,6 +47,7 @@ impl KcpStream {
             read_count: 0,
             write_count: 0,
             shutdown: false,
+            flush_rx: None,
         }
     }
 
@@ -137,9 +140,7 @@ impl AsyncWrite for KcpStream {
             hex::encode(&buf[..buf.len().min(32)])
         );
 
-        let req = WriteRequest {
-            data: buf.to_vec(),
-        };
+        let req = WriteRequest::Data(buf.to_vec());
 
         if self.write_tx.send((self.conv, req)).is_err() {
             return Poll::Ready(Err(io::Error::new(
@@ -171,8 +172,38 @@ impl AsyncWrite for KcpStream {
         Poll::Ready(Ok(n))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // If we have a pending flush, check if it's done.
+        if let Some(ref mut rx) = self.flush_rx {
+            match rx.try_recv() {
+                Ok(()) => {
+                    self.flush_rx = None;
+                    return Poll::Ready(Ok(()));
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    // Driver dropped the sender — treat as flushed.
+                    self.flush_rx = None;
+                    return Poll::Ready(Ok(()));
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    // Still waiting — re-register waker.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        // Send a flush request to the KCP driver.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.write_tx.send((self.conv, WriteRequest::Flush(tx))).is_err() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "KCP driver closed",
+            )));
+        }
+        self.flush_rx = Some(rx);
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {

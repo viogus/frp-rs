@@ -139,6 +139,7 @@ impl KcpSession {
             return Ok(Vec::new());
         }
 
+        tracing::trace!(conv = self.conv, output_count = output.len(), fec_avail = self.fec.is_some(), "KCP SESSION: update produced {} output packets", output.len());
         let mut packets = Vec::new();
         if let Some(ref fec) = self.fec {
             for raw in &output {
@@ -201,11 +202,63 @@ impl KcpSession {
         self.kcp.send(data).map_err(io::Error::other)
     }
 
-    /// Force KCP to flush pending stream data to output.
-    /// Call after send() to force immediate packet generation (useful for tests).
-    #[allow(dead_code)]
-    pub fn flush_kcp(&mut self) -> io::Result<()> {
-        self.kcp.flush().map_err(io::Error::other)
+    /// Force KCP to flush pending data and produce output packets immediately.
+    /// Does update (flush stream data + move snd_queue→snd_buf), then drains
+    /// and FEC-encodes output. Returns packets ready for UDP send.
+    pub fn force_flush(&mut self, now_ms: u32) -> io::Result<Vec<Vec<u8>>> {
+        // update() handles timing-based flush and ensures updated=true.
+        self.kcp.update(now_ms).map_err(io::Error::other)?;
+        // Force another flush in case update() skipped due to interval timing.
+        // This is a no-op if snd_queue was already drained, but critical when
+        // poll_flush is called between ticks (e.g. StartWorkConn → flush →
+        // bridge data sequence).
+        self.kcp.flush().map_err(io::Error::other)?;
+        let output = self.kcp.output_mut().drain();
+        if output.is_empty() {
+            return Ok(Vec::new());
+        }
+        tracing::trace!(conv = self.conv, output_count = output.len(), "KCP SESSION: force_flush produced {} packets", output.len());
+        let mut packets = Vec::new();
+        if let Some(ref fec) = self.fec {
+            for raw in &output {
+                let size = (2u16 + raw.len() as u16).to_le_bytes();
+                let mut rs_data = Vec::with_capacity(2 + raw.len());
+                rs_data.extend_from_slice(&size);
+                rs_data.extend_from_slice(raw);
+                let mut packet = Vec::with_capacity(FEC_HEADER_SIZE + rs_data.len());
+                packet.extend_from_slice(&self.fec_seqid.to_le_bytes());
+                packet.extend_from_slice(&TYPE_DATA.to_le_bytes());
+                packet.extend_from_slice(&rs_data);
+                packets.push(packet);
+                self.fec_seqid = self.fec_seqid.wrapping_add(1);
+                let rs_len = rs_data.len();
+                self.pending_shards.push(rs_data);
+                self.pending_max_size = self.pending_max_size.max(rs_len);
+                if self.pending_shards.len() == self.config.data_shards {
+                    let max_size = self.pending_max_size;
+                    for shard in &mut self.pending_shards {
+                        shard.resize(max_size, 0);
+                    }
+                    let shard_refs: Vec<&[u8]> =
+                        self.pending_shards.iter().map(|s| s.as_slice()).collect();
+                    let all_shards = fec.encode(&shard_refs);
+                    for parity in &all_shards[self.config.data_shards..] {
+                        let mut packet =
+                            Vec::with_capacity(FEC_HEADER_SIZE + parity.len());
+                        packet.extend_from_slice(&self.fec_seqid.to_le_bytes());
+                        packet.extend_from_slice(&TYPE_PARITY.to_le_bytes());
+                        packet.extend_from_slice(parity);
+                        packets.push(packet);
+                        self.fec_seqid = self.fec_seqid.wrapping_add(1);
+                    }
+                    self.pending_shards.clear();
+                    self.pending_max_size = 0;
+                }
+            }
+        } else {
+            packets = output;
+        }
+        Ok(packets)
     }
 
     /// Feed received UDP data into KCP. Handles FEC decode if enabled.
@@ -214,6 +267,7 @@ impl KcpSession {
 
         if let Some(ref fec) = self.fec {
             if data.len() < FEC_HEADER_SIZE {
+                tracing::error!(conv = self.conv, len = data.len(), "KCP SESSION: input too short for FEC header ({} bytes)", data.len());
                 return Ok(());
             }
             let seqid = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -221,9 +275,12 @@ impl KcpSession {
 
             if flag != TYPE_DATA && flag != TYPE_PARITY {
                 // Not FEC — treat as raw KCP.
+                tracing::error!(conv = self.conv, len = data.len(), flag, "KCP SESSION: input raw KCP (non-FEC), {} bytes", data.len());
                 self.kcp.input(data).map_err(io::Error::other)?;
                 return Ok(());
             }
+
+            tracing::error!(conv = self.conv, len = data.len(), seqid, flag, "KCP SESSION: input FEC {} shard seqid={}", if flag == TYPE_DATA {"DATA"} else {"PARITY"}, seqid);
 
             let shard_data = &data[FEC_HEADER_SIZE..];
             let total = self.config.data_shards + self.config.parity_shards;
@@ -242,7 +299,7 @@ impl KcpSession {
 
             // Feed data shards to KCP immediately (Go kcp-go behavior).
             // Raw KCP data = shard_data[2..][..SIZE-2] where SIZE is first 2 bytes.
-            if flag == TYPE_DATA && !group.shards[shard_index].is_some() {
+            if flag == TYPE_DATA && group.shards[shard_index].is_none() {
                 if shard_data.len() >= 2 {
                     let size = u16::from_le_bytes([shard_data[0], shard_data[1]]) as usize;
                     if size >= 2 {
@@ -332,8 +389,10 @@ impl KcpSession {
                     }
                     match self.kcp.recv(&mut self.recv_buf[..size]) {
                         Ok(n) => {
+                            tracing::trace!(conv = self.conv, n, "KCP SESSION: recv_and_push got {} bytes", n);
                             if self.read_tx.send(self.recv_buf[..n].to_vec()).is_err() {
                                 self.shutdown = true;
+                                tracing::error!(conv = self.conv, "KCP SESSION: read_tx closed, shutting down conv {}", self.conv);
                                 return Ok(());
                             }
                         }
