@@ -4867,8 +4867,8 @@ run_test test_kcp_rust_to_rust
 # established but data doesn't decode. Needs deeper fix: either wire
 # KcpCompatSession into production path or fix rust_tokio_kcp FEC.
 # TODO: fix rust_tokio_kcp ↔ kcp-go FEC compat.
-# run_test test_g2r_kcp
-# run_test test_r2g_kcp
+run_test test_g2r_kcp
+run_test test_r2g_kcp
 # KCP+TLS and KCP+tcpMux: also blocked by FEC incompatibility. Once base KCP
 # Go↔Rust is fixed, uncomment these to test encryption + multiplexing over KCP.
 # run_test test_g2r_kcp_tls

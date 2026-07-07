@@ -142,7 +142,7 @@ impl KcpSocket {
                                             tracing::debug!(conv = fk.0, peer = %src, error = %e, "KCP FEC fallback input error");
                                         }
                                     }
-                                } else if !is_fec {
+                                } else if key.0 != 0 {
                                     // New peer detected — create session + stream
                                     let (read_tx, read_rx) = mpsc::unbounded_channel();
                                     let mut session = KcpSession::new(
