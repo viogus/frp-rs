@@ -1937,11 +1937,15 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
 
 /// Accept a WebSocket upgrade from pre-peeked HTTP request bytes and a raw stream.
 ///
-/// Unlike [`accept_websocket`], this function does NOT wrap the stream in BufReader
-/// or BufferedRead — it parses the HTTP request from `peeked` (already read from the
-/// stream), writes the 101 response directly to `raw`, and returns a WsByteStream
-/// backed by the original stream. This avoids the nested BufferedRead issue that
-/// corrupts reads when the inner stream is TLS.
+/// Unlike [`accept_websocket`], this function does NOT wrap the stream in a
+/// `BufReader` — it parses the HTTP request from `peeked` (already read from the
+/// stream) and writes the 101 response directly to `raw`. Any bytes pipelined
+/// after the HTTP headers (`extra`) are replayed through a single
+/// [`IoStream::BufferedRead`] layer placed *below* the WsByteStream, so they
+/// reach the WS frame parser's input before any further socket bytes. This is
+/// the correct replay mechanism: a `BufReader` would silently swallow bytes and
+/// corrupt reads when the inner stream is TLS, whereas a single `BufferedRead`
+/// only prepends the captured plaintext and preserves ordering.
 #[cfg(feature = "websocket")]
 pub async fn accept_websocket_from_peeked(
     peeked: Vec<u8>,
@@ -2019,16 +2023,15 @@ pub async fn accept_websocket_from_peeked(
     if !extra.is_empty() {
         tracing::debug!(
             extra_len = extra.len(),
-            "Pipelined data after HTTP headers — feeding into WsByteStream"
+            "Pipelined data after HTTP headers — wrapping in BufferedRead for WS frame parsing"
         );
+        let inner = IoStream::BufferedRead(extra, 0, Box::new(raw));
+        let ws = WsByteStream::from_raw(Box::new(inner), false);
+        Ok(IoStream::WebSocket(ws))
+    } else {
+        let ws = WsByteStream::from_raw(Box::new(raw), false);
+        Ok(IoStream::WebSocket(ws))
     }
-
-    let mut ws = WsByteStream::from_raw(Box::new(raw), false);
-    if !extra.is_empty() {
-        ws.read_buf = extra;
-        ws.read_pos = 0;
-    }
-    Ok(IoStream::WebSocket(ws))
 }
 
 /// Connect via WebSocket using manual HTTP upgrade (Raw mode, client side).

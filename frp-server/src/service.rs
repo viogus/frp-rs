@@ -1540,9 +1540,10 @@ impl Service {
                                 #[cfg(feature = "websocket")]
                                 if is_ws_tls {
                                     // WebSocket upgrade over TLS (Go frpc ws transport).
-                                    // Use accept_websocket_from_peeked to avoid nested
-                                    // BufferedRead wrapping on TLS streams — BufReader
-                                    // leftover handling corrupts the read position.
+                                    // accept_websocket_from_peeked replays pipelined bytes
+                                    // through a single BufferedRead layer (no BufReader),
+                                    // which preserves the read position on TLS streams —
+                                    // `ws_peek` here is already TLS-decrypted plaintext.
                                     match accept_websocket_from_peeked(ws_peek, io).await {
                                         Ok(mut ws) => {
                                             info!(addr = %addr, "WebSocket upgrade over TLS for {}", addr);
