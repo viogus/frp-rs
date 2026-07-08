@@ -792,14 +792,13 @@ fn resolve_dynamic_token_inner(
             )),
         }
     } else if let Some(cmd) = token.strip_prefix("exec://") {
-        if let Some(uf) = unsafe_features {
-            if !uf.is_enabled(crate::unsafe_features::TOKEN_SOURCE_EXEC) {
-                return Err(
-                    "exec:// token source blocked: TokenSourceExec not in UnsafeFeatures allowlist. \
-                     Set [common].unsafe_features = [\"TokenSourceExec\"] to enable."
-                        .into(),
-                );
-            }
+        if unsafe_features.is_some_and(|uf| !uf.is_enabled(crate::unsafe_features::TOKEN_SOURCE_EXEC))
+        {
+            return Err(
+                "exec:// token source blocked: TokenSourceExec not in UnsafeFeatures allowlist. \
+                 Set [common].unsafe_features = [\"TokenSourceExec\"] to enable."
+                    .into(),
+            );
         }
         let parts: Vec<&str> = cmd.split_whitespace().collect();
         if parts.is_empty() {

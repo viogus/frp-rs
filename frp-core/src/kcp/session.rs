@@ -299,10 +299,10 @@ impl KcpSession {
 
             // Feed data shards to KCP immediately (Go kcp-go behavior).
             // Raw KCP data = shard_data[2..][..SIZE-2] where SIZE is first 2 bytes.
-            if flag == TYPE_DATA && group.shards[shard_index].is_none() {
-                if shard_data.len() >= 2 {
-                    let size = u16::from_le_bytes([shard_data[0], shard_data[1]]) as usize;
-                    if size >= 2 {
+            if flag == TYPE_DATA && group.shards[shard_index].is_none() && shard_data.len() >= 2
+            {
+                let size = u16::from_le_bytes([shard_data[0], shard_data[1]]) as usize;
+                if size >= 2 {
                         let payload_end = (size - 2).min(shard_data.len() - 2);
                         if payload_end > 0 {
                             self.kcp
@@ -310,7 +310,6 @@ impl KcpSession {
                                 .map_err(io::Error::other)?;
                         }
                     }
-                }
             }
 
             if group.shards[shard_index].is_none() {
