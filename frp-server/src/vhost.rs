@@ -284,7 +284,7 @@ pub async fn run_vhost_https_listener(
         let acceptor = state
             .tls_acceptor
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
             .expect("TLS acceptor not initialized");
 

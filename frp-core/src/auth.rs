@@ -760,9 +760,13 @@ pub fn resolve_dynamic_token(token: &str) -> String {
 
 /// Resolve a dynamic token with `UnsafeFeatures` enforcement.
 ///
-/// When the token uses `exec://` or `file://`, the corresponding feature
+/// When the token uses `exec://`, the `TokenSourceExec` feature
 /// must be enabled in `unsafe_features`. If the feature is not allowed,
 /// an error is returned.
+///
+/// `file://` tokens do NOT require an unsafe feature — reading a file
+/// is not command execution. This matches Go frp behavior where both
+/// `file://` and `exec://` work unconditionally.
 ///
 /// Callers that have access to an `UnsafeFeatures` instance should use
 /// this function instead of [`resolve_dynamic_token`].
@@ -778,15 +782,8 @@ fn resolve_dynamic_token_inner(
     unsafe_features: Option<&crate::unsafe_features::UnsafeFeatures>,
 ) -> Result<String, String> {
     if let Some(path) = token.strip_prefix("file://") {
-        if let Some(uf) = unsafe_features {
-            if !uf.is_enabled(crate::unsafe_features::TOKEN_SOURCE_EXEC) {
-                return Err(
-                    "file:// token source blocked: TokenSourceExec not in UnsafeFeatures allowlist. \
-                     Set [common].unsafe_features = [\"TokenSourceExec\"] to enable."
-                        .into(),
-                );
-            }
-        }
+        // file:// does NOT require TokenSourceExec — reading a file is not
+        // command execution. Go frp allows file:// unconditionally.
         match std::fs::read_to_string(path) {
             Ok(content) => Ok(content.lines().next().unwrap_or("").trim().to_string()),
             Err(e) => Err(format!(
