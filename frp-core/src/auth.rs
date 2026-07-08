@@ -732,7 +732,8 @@ pub fn zeroize_string(s: &mut String) {
 /// Resolve a token that may use a URL scheme for dynamic sourcing.
 ///
 /// **Prefer [`resolve_dynamic_token_checked`]** — it enforces the
-/// `UnsafeFeatures` allowlist for `exec://` and `file://` sources.
+/// `UnsafeFeatures` allowlist for `exec://` sources (`file://` is always
+/// allowed, matching Go frp).
 /// This function exists for backward compatibility with callers that do
 /// not yet thread `UnsafeFeatures` through (frp-server/frp-client service.rs).
 ///
@@ -1021,6 +1022,21 @@ mod tests {
         let uf = crate::unsafe_features::UnsafeFeatures::default();
         let result = resolve_dynamic_token_checked("exec:///bin/echo secret", &uf);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_dynamic_token_file_allowed_without_unsafe_feature() {
+        // I3: file:// must NOT require TokenSourceExec — reading a file is not
+        // command execution. Matches Go frp (file:// works unconditionally).
+        let dir = std::env::temp_dir();
+        let path = dir.join("frp-test-token-i3.txt");
+        std::fs::write(&path, "file-token-no-gate\n").unwrap();
+        let url = format!("file://{}", path.display());
+        // Default UnsafeFeatures has TokenSourceExec DISABLED.
+        let uf = crate::unsafe_features::UnsafeFeatures::default();
+        let result = resolve_dynamic_token_checked(&url, &uf);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(result.unwrap(), "file-token-no-gate");
     }
 
     // --- Authentication timeout (replay protection) tests ---
