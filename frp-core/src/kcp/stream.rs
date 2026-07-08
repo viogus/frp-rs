@@ -2,6 +2,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
@@ -173,37 +174,31 @@ impl AsyncWrite for KcpStream {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // If we have a pending flush, check if it's done.
-        if let Some(ref mut rx) = self.flush_rx {
-            match rx.try_recv() {
-                Ok(()) => {
-                    self.flush_rx = None;
-                    return Poll::Ready(Ok(()));
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    // Driver dropped the sender — treat as flushed.
-                    self.flush_rx = None;
-                    return Poll::Ready(Ok(()));
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                    // Still waiting — re-register waker.
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
+        // Send a flush request if we don't have one pending.
+        if self.flush_rx.is_none() {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if self.write_tx.send((self.conv, WriteRequest::Flush(tx))).is_err() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "KCP driver closed",
+                )));
             }
+            self.flush_rx = Some(rx);
         }
 
-        // Send a flush request to the KCP driver.
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if self.write_tx.send((self.conv, WriteRequest::Flush(tx))).is_err() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "KCP driver closed",
-            )));
+        // Poll the oneshot — properly registers the waker (no busy-spin).
+        let mut rx = self.flush_rx.take().unwrap();
+        match Pin::new(&mut rx).poll(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(_)) => {
+                // Driver dropped the sender — treat as flushed.
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => {
+                self.flush_rx = Some(rx);
+                Poll::Pending
+            }
         }
-        self.flush_rx = Some(rx);
-        cx.waker().wake_by_ref();
-        Poll::Pending
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
