@@ -54,7 +54,7 @@ impl axum::serve::Listener for TlsListener {
             let tls_acceptor = match self
                 .acceptor
                 .read()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .clone()
             {
                 Some(acceptor) => acceptor,

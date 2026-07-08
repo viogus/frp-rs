@@ -732,7 +732,8 @@ pub fn zeroize_string(s: &mut String) {
 /// Resolve a token that may use a URL scheme for dynamic sourcing.
 ///
 /// **Prefer [`resolve_dynamic_token_checked`]** — it enforces the
-/// `UnsafeFeatures` allowlist for `exec://` and `file://` sources.
+/// `UnsafeFeatures` allowlist for `exec://` sources (`file://` is always
+/// allowed, matching Go frp).
 /// This function exists for backward compatibility with callers that do
 /// not yet thread `UnsafeFeatures` through (frp-server/frp-client service.rs).
 ///
@@ -760,9 +761,13 @@ pub fn resolve_dynamic_token(token: &str) -> String {
 
 /// Resolve a dynamic token with `UnsafeFeatures` enforcement.
 ///
-/// When the token uses `exec://` or `file://`, the corresponding feature
+/// When the token uses `exec://`, the `TokenSourceExec` feature
 /// must be enabled in `unsafe_features`. If the feature is not allowed,
 /// an error is returned.
+///
+/// `file://` tokens do NOT require an unsafe feature — reading a file
+/// is not command execution. This matches Go frp behavior where both
+/// `file://` and `exec://` work unconditionally.
 ///
 /// Callers that have access to an `UnsafeFeatures` instance should use
 /// this function instead of [`resolve_dynamic_token`].
@@ -778,15 +783,8 @@ fn resolve_dynamic_token_inner(
     unsafe_features: Option<&crate::unsafe_features::UnsafeFeatures>,
 ) -> Result<String, String> {
     if let Some(path) = token.strip_prefix("file://") {
-        if let Some(uf) = unsafe_features {
-            if !uf.is_enabled(crate::unsafe_features::TOKEN_SOURCE_EXEC) {
-                return Err(
-                    "file:// token source blocked: TokenSourceExec not in UnsafeFeatures allowlist. \
-                     Set [common].unsafe_features = [\"TokenSourceExec\"] to enable."
-                        .into(),
-                );
-            }
-        }
+        // file:// does NOT require TokenSourceExec — reading a file is not
+        // command execution. Go frp allows file:// unconditionally.
         match std::fs::read_to_string(path) {
             Ok(content) => Ok(content.lines().next().unwrap_or("").trim().to_string()),
             Err(e) => Err(format!(
@@ -795,14 +793,13 @@ fn resolve_dynamic_token_inner(
             )),
         }
     } else if let Some(cmd) = token.strip_prefix("exec://") {
-        if let Some(uf) = unsafe_features {
-            if !uf.is_enabled(crate::unsafe_features::TOKEN_SOURCE_EXEC) {
-                return Err(
-                    "exec:// token source blocked: TokenSourceExec not in UnsafeFeatures allowlist. \
-                     Set [common].unsafe_features = [\"TokenSourceExec\"] to enable."
-                        .into(),
-                );
-            }
+        if unsafe_features.is_some_and(|uf| !uf.is_enabled(crate::unsafe_features::TOKEN_SOURCE_EXEC))
+        {
+            return Err(
+                "exec:// token source blocked: TokenSourceExec not in UnsafeFeatures allowlist. \
+                 Set [common].unsafe_features = [\"TokenSourceExec\"] to enable."
+                    .into(),
+            );
         }
         let parts: Vec<&str> = cmd.split_whitespace().collect();
         if parts.is_empty() {
@@ -989,7 +986,7 @@ mod tests {
     #[test]
     fn test_resolve_dynamic_token_file() {
         let dir = std::env::temp_dir();
-        let path = dir.join("frp-test-token.txt");
+        let path = dir.join(format!("frp-test-token-{}.txt", std::process::id()));
         std::fs::write(&path, "file-token-value\n").unwrap();
         let url = format!("file://{}", path.display());
         assert_eq!(resolve_dynamic_token(&url), "file-token-value");
@@ -999,7 +996,7 @@ mod tests {
     #[test]
     fn test_resolve_dynamic_token_file_multiline() {
         let dir = std::env::temp_dir();
-        let path = dir.join("frp-test-token-multi.txt");
+        let path = dir.join(format!("frp-test-token-multi-{}.txt", std::process::id()));
         std::fs::write(&path, "first-line\nsecond-line\n").unwrap();
         let url = format!("file://{}", path.display());
         assert_eq!(resolve_dynamic_token(&url), "first-line");
@@ -1025,6 +1022,21 @@ mod tests {
         let uf = crate::unsafe_features::UnsafeFeatures::default();
         let result = resolve_dynamic_token_checked("exec:///bin/echo secret", &uf);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_dynamic_token_file_allowed_without_unsafe_feature() {
+        // I3: file:// must NOT require TokenSourceExec — reading a file is not
+        // command execution. Matches Go frp (file:// works unconditionally).
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("frp-test-token-i3-{}.txt", std::process::id()));
+        std::fs::write(&path, "file-token-no-gate\n").unwrap();
+        let url = format!("file://{}", path.display());
+        // Default UnsafeFeatures has TokenSourceExec DISABLED.
+        let uf = crate::unsafe_features::UnsafeFeatures::default();
+        let result = resolve_dynamic_token_checked(&url, &uf);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(result.unwrap(), "file-token-no-gate");
     }
 
     // --- Authentication timeout (replay protection) tests ---

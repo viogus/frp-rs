@@ -202,7 +202,7 @@ impl Service {
                 }
             };
             // Store in shared state for hot-reload access.
-            *self.state.tls_acceptor.write().unwrap() = Some(acceptor);
+            *self.state.tls_acceptor.write().unwrap_or_else(|e| e.into_inner()) = Some(acceptor);
         }
         #[cfg(not(feature = "tls"))]
         let _tls_acceptor: Option<()> = None;
@@ -270,7 +270,7 @@ impl Service {
                                         } else if magic[0] == 0x16 {
                                             #[cfg(feature = "tls")]
                                             {
-                                                let tls_acceptor = match state.tls_acceptor.read().unwrap().clone() {
+                                                let tls_acceptor = match state.tls_acceptor.read().unwrap_or_else(|e| e.into_inner()).clone() {
                                                     Some(a) => a,
                                                     None => {
                                                         tracing::warn!(addr = %addr, "TLS ClientHello in WS frame but TLS not configured");
@@ -614,7 +614,7 @@ impl Service {
                                     let first_byte = magic[0];
 
                                     #[cfg(feature = "tls")]
-                                    let is_tls = state.tls_acceptor.read().unwrap().is_some()
+                                    let is_tls = state.tls_acceptor.read().unwrap_or_else(|e| e.into_inner()).is_some()
                                         && (first_byte == 0x16 || first_byte == frp_core::transport::FRP_TLS_HEAD_BYTE);
                                     #[cfg(not(feature = "tls"))]
                                     let is_tls = false;
@@ -635,7 +635,7 @@ impl Service {
                                             let ctl = frp_core::transport::IoStream::BufferedRead(
                                                 tls_pre_read, 0, Box::new(ctl),
                                             );
-                                            let acceptor = match state.tls_acceptor.read().unwrap().clone() {
+                                            let acceptor = match state.tls_acceptor.read().unwrap_or_else(|e| e.into_inner()).clone() {
                                                 Some(a) => a,
                                                 None => {
                                                     tracing::warn!("KCP TLS connection but no TLS acceptor configured");
@@ -1305,7 +1305,7 @@ impl Service {
                                 let ca = ca_file.as_deref();
                                 match build_tls_acceptor_or_generate(&cert_file, &key_file, ca) {
                                     Ok(new_acceptor) => {
-                                        let mut guard = poll_state.tls_acceptor.write().unwrap();
+                                        let mut guard = poll_state.tls_acceptor.write().unwrap_or_else(|e| e.into_inner());
                                         *guard = Some(new_acceptor);
                                         tracing::info!(
                                             "TLS certificate hot-reloaded (cert: {}, key: {})",
@@ -1351,7 +1351,7 @@ impl Service {
                 Ok((stream, addr)) => {
                     let state = self.state.clone();
                     #[cfg(feature = "tls")]
-                    let acceptor = state.tls_acceptor.read().unwrap().clone();
+                    let acceptor = state.tls_acceptor.read().unwrap_or_else(|e| e.into_inner()).clone();
 
                     let permit = state.conn_semaphore.as_ref()
                         .and_then(|s| s.clone().try_acquire_owned().ok());
@@ -1919,7 +1919,7 @@ impl Service {
                                             // Go frps auto-generated cert behavior.
                                             #[cfg(feature = "tls")]
                                             {
-                                                let tls_acceptor = match state.tls_acceptor.read().unwrap().clone() {
+                                                let tls_acceptor = match state.tls_acceptor.read().unwrap_or_else(|e| e.into_inner()).clone() {
                                                     Some(a) => a,
                                                     None => {
                                                         warn!(addr = %addr, "TLS ClientHello in WS frame but TLS not configured");
@@ -2477,7 +2477,7 @@ impl Service {
             };
             match build_tls_acceptor_or_generate(&new_cfg.tls_cert_file, &new_cfg.tls_key_file, ca) {
                 Ok(acceptor) => {
-                    *self.state.tls_acceptor.write().unwrap() = Some(acceptor);
+                    *self.state.tls_acceptor.write().unwrap_or_else(|e| e.into_inner()) = Some(acceptor);
                     changes.push(format!(
                         "TLS certificate reloaded (cert: {}, key: {})",
                         new_cfg.tls_cert_file, new_cfg.tls_key_file
