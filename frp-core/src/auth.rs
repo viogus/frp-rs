@@ -986,7 +986,7 @@ mod tests {
     #[test]
     fn test_resolve_dynamic_token_file() {
         let dir = std::env::temp_dir();
-        let path = dir.join("frp-test-token.txt");
+        let path = dir.join(format!("frp-test-token-{}.txt", std::process::id()));
         std::fs::write(&path, "file-token-value\n").unwrap();
         let url = format!("file://{}", path.display());
         assert_eq!(resolve_dynamic_token(&url), "file-token-value");
@@ -996,7 +996,7 @@ mod tests {
     #[test]
     fn test_resolve_dynamic_token_file_multiline() {
         let dir = std::env::temp_dir();
-        let path = dir.join("frp-test-token-multi.txt");
+        let path = dir.join(format!("frp-test-token-multi-{}.txt", std::process::id()));
         std::fs::write(&path, "first-line\nsecond-line\n").unwrap();
         let url = format!("file://{}", path.display());
         assert_eq!(resolve_dynamic_token(&url), "first-line");
@@ -1029,7 +1029,7 @@ mod tests {
         // I3: file:// must NOT require TokenSourceExec — reading a file is not
         // command execution. Matches Go frp (file:// works unconditionally).
         let dir = std::env::temp_dir();
-        let path = dir.join("frp-test-token-i3.txt");
+        let path = dir.join(format!("frp-test-token-i3-{}.txt", std::process::id()));
         std::fs::write(&path, "file-token-no-gate\n").unwrap();
         let url = format!("file://{}", path.display());
         // Default UnsafeFeatures has TokenSourceExec DISABLED.
