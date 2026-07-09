@@ -106,17 +106,44 @@ impl Fec {
     /// Create a new FEC codec.
     /// `data_shards` and `parity_shards` match Go kcp-go parameters.
     /// When both are 0, FEC is effectively disabled (no-op).
+    ///
+    /// The encoding matrix is byte-compatible with Go kcp-go's
+    /// `klauspost/reedsolomon.New(data, parity)` default (`buildMatrix`):
+    /// a `(total × data)` Vandermonde matrix `vm[r][c] = r^c` in GF(2^8),
+    /// made systematic by right-multiplying with the inverse of its top
+    /// `data × data` square. The parity rows (`data..total`) become the
+    /// encode matrix. This is REQUIRED for cross-impl FEC recovery: a custom
+    /// matrix (e.g. `(i+1)^j`) is self-consistent but reconstructs Go-encoded
+    /// parity into garbage, corrupting the KCP stream under packet loss.
     pub fn new(data_shards: usize, parity_shards: usize) -> Self {
         let total_shards = data_shards + parity_shards;
-        let mut encode_matrix = Vec::with_capacity(parity_shards);
-        for i in 0..parity_shards {
-            let mut row = vec![0u8; data_shards];
-            for (j, item) in row.iter_mut().enumerate() {
-                // Vandermonde: (i+1)^j
-                *item = gf256::pow((i + 1) as u8, j as u32);
+        let encode_matrix = if data_shards > 0 && parity_shards > 0 {
+            // Vandermonde: vm[r][c] = r^c (r from 0), matching klauspost galExp.
+            let vm: Vec<Vec<u8>> = (0..total_shards)
+                .map(|r| (0..data_shards).map(|c| gf256::pow(r as u8, c as u32)).collect())
+                .collect();
+            // Invert the top data×data square; distinct nodes 0..data-1 make it
+            // non-singular for data <= 256.
+            let top: Vec<Vec<u8>> = vm[..data_shards].to_vec();
+            let top_inv = invert_matrix(&top)
+                .expect("Vandermonde top square is invertible for distinct nodes");
+            // systematic = vm * top_inv; keep only the parity rows.
+            let mut rows = Vec::with_capacity(parity_shards);
+            for vm_row in vm.iter().skip(data_shards) {
+                let mut row = vec![0u8; data_shards];
+                for (c, cell) in row.iter_mut().enumerate() {
+                    let mut sum = 0u8;
+                    for (k, &vm_k) in vm_row.iter().enumerate() {
+                        sum ^= gf256::mul(vm_k, top_inv[k][c]);
+                    }
+                    *cell = sum;
+                }
+                rows.push(row);
             }
-            encode_matrix.push(row);
-        }
+            rows
+        } else {
+            Vec::new()
+        };
         Self {
             data_shards,
             parity_shards,
@@ -445,6 +472,40 @@ impl KcpCompatSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cross-implementation golden vectors from Go kcp-go's
+    /// `klauspost/reedsolomon.New(10, 3)`. If the encode matrix ever diverges
+    /// from klauspost's `buildMatrix`, FEC recovery of Go-encoded parity yields
+    /// garbage and corrupts the KCP stream under packet loss — this test guards
+    /// that exact regression (was `(i+1)^j`, incompatible with Go).
+    #[test]
+    fn test_fec_klauspost_golden() {
+        let d = 10usize;
+        let mut data: Vec<Vec<u8>> = Vec::new();
+        for i in 0..d {
+            data.push(vec![
+                (i + 1) as u8,
+                (i * 7) as u8,
+                (i * 13 + 5) as u8,
+                (255 - i) as u8,
+            ]);
+        }
+        let refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+        let fec = Fec::new(10, 3);
+        let out = fec.encode(&refs);
+
+        // Parity bytes must match klauspost exactly.
+        assert_eq!(out[10], vec![0x45, 0x98, 0x0a, 0xf5], "parity[10] != klauspost");
+        assert_eq!(out[11], vec![0xf2, 0xb4, 0x9a, 0xf4], "parity[11] != klauspost");
+        assert_eq!(out[12], vec![0x12, 0xdc, 0x0d, 0xf3], "parity[12] != klauspost");
+
+        // Reconstruct a lost data shard (drop #3, keep all parity).
+        let mut shards: Vec<Option<Vec<u8>>> = out.iter().map(|s| Some(s.clone())).collect();
+        let orig3 = shards[3].clone().unwrap();
+        shards[3] = None;
+        assert!(fec.decode(&mut shards), "decode should reconstruct");
+        assert_eq!(shards[3].as_ref().unwrap(), &orig3, "reconstructed shard[3] wrong");
+    }
 
     #[test]
     fn test_xor_roundtrip() {

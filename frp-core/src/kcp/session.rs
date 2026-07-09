@@ -267,7 +267,7 @@ impl KcpSession {
 
         if let Some(ref fec) = self.fec {
             if data.len() < FEC_HEADER_SIZE {
-                tracing::error!(conv = self.conv, len = data.len(), "KCP SESSION: input too short for FEC header ({} bytes)", data.len());
+                tracing::debug!(conv = self.conv, len = data.len(), "KCP SESSION: input too short for FEC header ({} bytes)", data.len());
                 return Ok(());
             }
             let seqid = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -275,12 +275,12 @@ impl KcpSession {
 
             if flag != TYPE_DATA && flag != TYPE_PARITY {
                 // Not FEC — treat as raw KCP.
-                tracing::error!(conv = self.conv, len = data.len(), flag, "KCP SESSION: input raw KCP (non-FEC), {} bytes", data.len());
+                tracing::trace!(conv = self.conv, len = data.len(), flag, "KCP SESSION: input raw KCP (non-FEC), {} bytes", data.len());
                 self.kcp.input(data).map_err(io::Error::other)?;
                 return Ok(());
             }
 
-            tracing::error!(conv = self.conv, len = data.len(), seqid, flag, "KCP SESSION: input FEC {} shard seqid={}", if flag == TYPE_DATA {"DATA"} else {"PARITY"}, seqid);
+            tracing::trace!(conv = self.conv, len = data.len(), seqid, flag, "KCP SESSION: input FEC {} shard seqid={}", if flag == TYPE_DATA {"DATA"} else {"PARITY"}, seqid);
 
             let shard_data = &data[FEC_HEADER_SIZE..];
             let total = self.config.data_shards + self.config.parity_shards;
@@ -391,7 +391,7 @@ impl KcpSession {
                             tracing::trace!(conv = self.conv, n, "KCP SESSION: recv_and_push got {} bytes", n);
                             if self.read_tx.send(self.recv_buf[..n].to_vec()).is_err() {
                                 self.shutdown = true;
-                                tracing::error!(conv = self.conv, "KCP SESSION: read_tx closed, shutting down conv {}", self.conv);
+                                tracing::debug!(conv = self.conv, "KCP SESSION: read_tx closed, shutting down conv {}", self.conv);
                                 return Ok(());
                             }
                         }
