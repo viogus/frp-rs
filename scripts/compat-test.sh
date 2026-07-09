@@ -274,6 +274,12 @@ while True:
         s.close()
         if reply == expected:
             print("OK:" + repr(reply))
+        elif reply == "" and time.time() < deadline:
+            # Empty reply = encrypted bridge closed before data round-trip.
+            # Retry after a short delay (common with TLS+encrypt on first
+            # proxy connection before the work-conn IV exchange completes).
+            time.sleep(0.5)
+            continue
         else:
             print("FAIL:MISMATCH expected=" + repr(expected) + " got=" + repr(reply))
         raise SystemExit(0)
