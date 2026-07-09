@@ -673,8 +673,7 @@ docker pull ghcr.io/viogus/frpc-rs:latest
 docker run -d -p 7000:7000 -v $(pwd)/frps.toml:/app/frp.toml ghcr.io/viogus/frps-rs:latest
 ```
 
-Two Dockerfile variants in `docker/`:
-- `Dockerfile` — downloads pre-built release binary
+One Dockerfile variant in `docker/`:
 - `Dockerfile.source` — builds from source via multi-stage Rust image (used for CI auto-builds)
 
 ---

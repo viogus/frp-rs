@@ -19,7 +19,6 @@
 
 | Dockerfile | 用途 |
 |------------|------|
-| `Dockerfile` | 从 GitHub Release 下载预编译 musl 二进制，多架构 |
 | `Dockerfile.source` | 从源码编译（交叉编译），arm64 使用 `aarch64-unknown-linux-gnu` |
 
 ## 用法
