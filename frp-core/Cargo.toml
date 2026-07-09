@@ -2,6 +2,7 @@
 name = "frp-core"
 version = "0.69.1"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 tokio.workspace = true

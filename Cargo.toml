@@ -42,7 +42,7 @@ ring = "0.17"
 jsonwebtoken = "9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 axum = "0.8.9"
-prometheus = "0.13"
+prometheus = "0.14"
 yamux = "0.14"
 russh = { version = "0.61", default-features = false, features = ["ring", "rsa"] }
 tokio-util = { version = "0.7", features = ["compat"] }
