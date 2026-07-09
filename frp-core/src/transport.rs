@@ -2138,31 +2138,27 @@ pub fn build_tls_acceptor(
     key_file: &str,
     ca_file: Option<&str>,
 ) -> Result<TlsAcceptor, crate::Error> {
-    use std::fs::File;
-    use std::io::BufReader;
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-    let cert_file = File::open(cert_file)
+    let cert_bytes = std::fs::read(cert_file)
         .map_err(|e| crate::Error::Other(format!("open cert file: {e}")))?;
-    let mut reader = BufReader::new(cert_file);
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_slice_iter(&cert_bytes)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| crate::Error::Other(format!("read certs: {e}")))?;
 
-    let key_file = File::open(key_file)
+    let key_bytes = std::fs::read(key_file)
         .map_err(|e| crate::Error::Other(format!("open key file: {e}")))?;
-    let mut reader = BufReader::new(key_file);
-    let key = rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| crate::Error::Other(format!("read private key: {e}")))?
-        .ok_or_else(|| crate::Error::Other("no private key found".into()))?;
+    let key = PrivateKeyDer::from_pem_slice(&key_bytes)
+        .map_err(|e| crate::Error::Other(format!("read private key: {e}")))?;
 
     // Build server config with optional client certificate verification (mTLS)
     let config = if let Some(ca_path) = ca_file {
         if !ca_path.is_empty() {
             let mut roots = rustls::RootCertStore::empty();
-            let ca_file = File::open(ca_path)
+            let ca_bytes = std::fs::read(ca_path)
                 .map_err(|e| crate::Error::Other(format!("open CA file: {e}")))?;
-            let mut ca_reader = BufReader::new(ca_file);
-            let ca_certs = rustls_pemfile::certs(&mut ca_reader)
+            let ca_certs = CertificateDer::pem_slice_iter(&ca_bytes)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| crate::Error::Other(format!("read CA certs: {e}")))?;
             roots.add_parsable_certificates(ca_certs);
@@ -2264,13 +2260,15 @@ pub fn build_tls_acceptor_or_generate(
 /// the platform verifier instead).
 #[cfg(feature = "tls")]
 pub fn build_root_store(ca_file: Option<&str>) -> Result<Option<rustls::RootCertStore>, crate::Error> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::CertificateDer;
+
     match ca_file {
         Some(ca_path) if !ca_path.is_empty() => {
             let mut root_store = rustls::RootCertStore::empty();
-            let file = std::fs::File::open(ca_path)
+            let ca_bytes = std::fs::read(ca_path)
                 .map_err(|e| crate::Error::Other(format!("open CA file: {e}")))?;
-            let mut reader = std::io::BufReader::new(file);
-            let certs = rustls_pemfile::certs(&mut reader)
+            let certs = CertificateDer::pem_slice_iter(&ca_bytes)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| crate::Error::Other(format!("read CA certs: {e}")))?;
             root_store.add_parsable_certificates(certs);
@@ -2293,6 +2291,8 @@ pub fn build_tls_connector(
 ) -> Result<TlsConnector, crate::Error> {
     use rustls_platform_verifier::BuilderVerifierExt;
     use rustls_platform_verifier::ConfigVerifierExt;
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     let root_store = build_root_store(ca_file)?;
 
@@ -2300,18 +2300,15 @@ pub fn build_tls_connector(
         // Custom CA: use RootCertStore
         if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
             if !cert_path.is_empty() && !key_path.is_empty() {
-                let cert_file = std::fs::File::open(cert_path)
+                let cert_bytes = std::fs::read(cert_path)
                     .map_err(|e| crate::Error::Other(format!("open client cert file: {e}")))?;
-                let mut cert_reader = std::io::BufReader::new(cert_file);
-                let client_certs = rustls_pemfile::certs(&mut cert_reader)
+                let client_certs = CertificateDer::pem_slice_iter(&cert_bytes)
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| crate::Error::Other(format!("read client certs: {e}")))?;
-                let key_file = std::fs::File::open(key_path)
+                let key_bytes = std::fs::read(key_path)
                     .map_err(|e| crate::Error::Other(format!("open client key file: {e}")))?;
-                let mut key_reader = std::io::BufReader::new(key_file);
-                let client_key = rustls_pemfile::private_key(&mut key_reader)
-                    .map_err(|e| crate::Error::Other(format!("read client key: {e}")))?
-                    .ok_or_else(|| crate::Error::Other("no client private key found".into()))?;
+                let client_key = PrivateKeyDer::from_pem_slice(&key_bytes)
+                    .map_err(|e| crate::Error::Other(format!("read client key: {e}")))?;
                 rustls::ClientConfig::builder()
                     .with_root_certificates(Arc::new(store))
                     .with_client_auth_cert(client_certs, client_key)
@@ -2329,18 +2326,15 @@ pub fn build_tls_connector(
     } else if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
         // Platform verifier with client certificate (mTLS)
         if !cert_path.is_empty() && !key_path.is_empty() {
-            let cert_file = std::fs::File::open(cert_path)
+            let cert_bytes = std::fs::read(cert_path)
                 .map_err(|e| crate::Error::Other(format!("open client cert file: {e}")))?;
-            let mut cert_reader = std::io::BufReader::new(cert_file);
-            let client_certs = rustls_pemfile::certs(&mut cert_reader)
+            let client_certs = CertificateDer::pem_slice_iter(&cert_bytes)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| crate::Error::Other(format!("read client certs: {e}")))?;
-            let key_file = std::fs::File::open(key_path)
+            let key_bytes = std::fs::read(key_path)
                 .map_err(|e| crate::Error::Other(format!("open client key file: {e}")))?;
-            let mut key_reader = std::io::BufReader::new(key_file);
-            let client_key = rustls_pemfile::private_key(&mut key_reader)
-                .map_err(|e| crate::Error::Other(format!("read client key: {e}")))?
-                .ok_or_else(|| crate::Error::Other("no client private key found".into()))?;
+            let client_key = PrivateKeyDer::from_pem_slice(&key_bytes)
+                .map_err(|e| crate::Error::Other(format!("read client key: {e}")))?;
             rustls::ClientConfig::builder()
                 .with_platform_verifier()
                 .map_err(|e| crate::Error::Other(format!("platform verifier: {e}")))?

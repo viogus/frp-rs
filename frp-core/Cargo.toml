@@ -2,6 +2,7 @@
 name = "frp-core"
 version = "0.69.1"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 tokio.workspace = true
@@ -29,7 +30,6 @@ rand.workspace = true
 futures-util.workspace = true
 tokio-rustls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
-rustls-pemfile = { workspace = true, optional = true }
 rustls-platform-verifier = { workspace = true, optional = true }
 ring = { workspace = true }
 yamux = { workspace = true, optional = true }
@@ -46,7 +46,7 @@ rcgen = { version = "0.13", optional = true, default-features = false, features 
 [features]
 default = ["quic", "kcp", "websocket", "oidc", "tls", "compression", "chacha20", "vnet", "tcp-mux"]
 tcp-mux = ["dep:yamux"]
-tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:rustls-platform-verifier", "dep:rcgen"]
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-platform-verifier", "dep:rcgen"]
 admin-auth = ["dep:axum"]
 compression = ["dep:snap"]
 chacha20 = ["dep:chacha20poly1305"]

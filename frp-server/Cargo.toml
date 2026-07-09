@@ -2,6 +2,7 @@
 name = "frp-server"
 version = "0.69.1"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 frp-core = { path = "../frp-core", default-features = false }

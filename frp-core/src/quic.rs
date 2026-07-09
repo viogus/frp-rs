@@ -12,6 +12,9 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
 /// Configurable QUIC transport parameters, matching Go frp's `quic` config block.
 ///
 /// Defaults match Go frp v0.69.1 `QUICOptions.Complete()`:
@@ -128,12 +131,11 @@ impl QuicListener {
         key_pem: &str,
         params: QuicTransportParams,
     ) -> io::Result<Self> {
-        let cert_chain = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        let cert_chain = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| io::Error::other(format!("parse cert: {e}")))?;
-        let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-            .map_err(|e| io::Error::other(format!("parse key: {e}")))?
-            .ok_or_else(|| io::Error::other("missing private key"))?;
+        let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+            .map_err(|e| io::Error::other(format!("parse key: {e}")))?;
 
         let mut tls_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -223,12 +225,11 @@ pub async fn dial_quic_with_params(
                 .map_err(|e| io::Error::other(format!("read QUIC client cert: {e}")))?;
             let key_pem = std::fs::read_to_string(key_path)
                 .map_err(|e| io::Error::other(format!("read QUIC client key: {e}")))?;
-            let cert_chain = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            let cert_chain = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| io::Error::other(format!("parse QUIC client cert: {e}")))?;
-            let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-                .map_err(|e| io::Error::other(format!("parse QUIC client key: {e}")))?
-                .ok_or_else(|| io::Error::other("missing QUIC client private key"))?;
+            let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+                .map_err(|e| io::Error::other(format!("parse QUIC client key: {e}")))?;
             builder
                 .with_client_auth_cert(cert_chain, key)
                 .map_err(|e| io::Error::other(format!("QUIC mTLS config: {e}")))?

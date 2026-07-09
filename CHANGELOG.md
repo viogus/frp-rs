@@ -2,15 +2,62 @@
 
 All notable changes to frp-rs.
 
-## v0.4.0 (unreleased)
+## v0.69.1 (unreleased)
+
+### Security
+
+- Constant-time comparison for HTTP Basic Auth and proxy credentials
+- Auth hardening: `check_startup()` rejects empty tokens at startup, dynamic token resolution with zeroize on Drop
+- Login throttle: split check/record to close race window, memory leak cleanup, throttle check before authentication
+- Connection limits: `max_connections` in ServerConfig (was hardcoded 10000), per-IP rate limiting
+- OIDC: fix subject leak in error paths, validate proxy name/length
+- SSH: host key permissions set to 0600
+- Dashboard: bind to localhost when no admin credentials configured
+- Remove `unsafe` from ResponseHeaderInjector (safe slice manipulation)
+- Fix async mutex held across await in NAT hole handler and session read lock
+- Client: fix TOCTOU race in static file serving, secure admin API endpoints, hash secret key in config snapshot
+- Client: redact secret key in STCP visitor auth debug log
+- Client: split HTTP buffer on header terminator to prevent request smuggling
+- Client: handle IPv6 bracket notation in host:port parsing
+- Cipher: fix partial-write re-encrypt bug — buffer encrypted output on subsequent writes
+- Server: RwLock poison recovery via `RwLockExt` trait (26 sites) — single panicked task no longer cascades
+- Deps: drop unmaintained `rustls-pemfile` (RUSTSEC-2025-0134), migrate cert/key parsing to `rustls::pki_types::pem::PemObject`
 
 ### Added
-- Virtual Net L3 VPN: new `type = "vnet"` proxy with TUN device routing (#48)
+
+- Virtual Net L3 VPN: new `type = "vnet"` proxy with TUN device routing
 - New `frp-vnet` crate: cross-platform TUN (Linux/macOS), CIDR routing table, VnetController
 - Server-side vnet route management with subnet conflict detection
-- Client-side VnetController: TUN<->work_conn bidirectional packet loop
+- Client-side VnetController: TUN↔work_conn bidirectional packet loop
 - OS route injection for peer subnet reachability (Linux, macOS)
 - Feature-gated behind `vnet` flag (full=on, tiny/micro=off)
+- KCP: removed vendored `rust_tokio_kcp` (~5900 lines), replaced with 1502-line direct tokio-KCP module (`frp-core/src/kcp/`)
+
+### Fixed
+
+- KCP FEC: wire format now matches Go kcp-go (6-byte header + inter-packet FEC encoding)
+- KCP: proper poll_flush via force_flush in driver loop, fix busy-spin on idle connections
+- KCP: Go↔Rust cross-compat FEC defaults + session routing
+- WebSocket: fix pipelined-data framing (partial frame boundary handling)
+- Cipher: buffer encrypted output on subsequent partial writes (re-encrypt on split writes)
+- STCP: apply encryption to pure-relay visitor path, use configured encryption in fallback relay
+- Client: cancel old visitor tasks on reconnect (no more orphaned tasks), exponential backoff
+- Client: restore health check cancellation (no more leaked health check tasks)
+- Accept empty token at login for backward compatibility (startup check still guards)
+- Bridge diagnostic logs downgraded from ERROR to debug/trace/warn
+- Clippy: fix warnings for Rust 1.96.0 (manual_inspect, io_other_error, manual_div_ceil, vec_init_then_push, collapsible_if)
+- VNet: fix missing IntoRawFd import, remove stale `#[cfg(vnet)]` gates from NewProxy
+
+### Compat Tests
+
+- Phase 2: 5 transport combo tests enabled (STCP+enc, QUIC+enc, WSS+mux)
+- KCP Go↔Rust cross-compat: all transport combos verified (plain/yamux/TLS/TLS+yamux)
+- WSS Go↔Rust cross-compat: uncommented g2r WSS tests
+- SSH Go frps gateway test: re-enabled
+- Fix flaky `go-to-rust-tcp-tls-encrypt`: retry on empty reply in send_and_expect
+- Add 100ms delay to echo server before close (reduces timing races)
+- Default test suite: 40 passing + 2 guarded (XTCP 16-test matrix, V2 protocol)
+- Integration tests: add auth tokens to all server tests
 
 ## [0.3.2] - 2026-06-30
 
