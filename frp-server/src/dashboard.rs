@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::collections::HashMap;
 use axum::{Router, Json, extract::{State, Path, Query, ws::{WebSocketUpgrade, WebSocket, Message}}, response::Html, routing::{get, delete}};
@@ -85,6 +86,11 @@ struct StatusResponse {
     uptime_secs: u64,
     client_count: usize,
     proxy_count: usize,
+    pool_hits: u64,
+    pool_misses: u64,
+    pool_drops: u64,
+    pool_size: i64,
+    pool_pending: i64,
 }
 
 #[derive(Serialize)]
@@ -142,6 +148,8 @@ struct ClientEntry {
     login_time_secs: u64,
     proxy_count: usize,
     proxies: Vec<String>,
+    pool_size: i64,
+    pending_requests: i64,
 }
 
 #[derive(Serialize)]
@@ -152,32 +160,58 @@ struct ClientDetail {
     login_time_secs: u64,
     proxy_count: usize,
     proxies: Vec<ProxyEntry>,
+    pool_size: i64,
+    pending_requests: i64,
 }
 
 // --- Handlers ---
 
 async fn handle_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let uptime = state.dashboard_start.elapsed().as_secs();
-    let client_count = state.run_id_to_ctl_tx.read().await.len();
+    let ctl_map = state.run_id_to_ctl_tx.read().await;
+    let client_count = ctl_map.len();
     let proxies = state.proxy_manager.list().await;
+
+    let (total_pool_size, total_pending) = ctl_map.values().fold((0i64, 0i64), |(s, p), ctl| {
+        (s + ctl.pool_stats.pool_size.load(Ordering::Relaxed),
+         p + ctl.pool_stats.pending_requests.load(Ordering::Relaxed))
+    });
+    drop(ctl_map);
+
     Json(StatusResponse {
         version: frp_core::VERSION.to_string(),
         uptime_secs: uptime,
         client_count,
         proxy_count: proxies.len(),
+        pool_hits: state.pool_hits.load(Ordering::Relaxed),
+        pool_misses: state.pool_misses.load(Ordering::Relaxed),
+        pool_drops: state.pool_drops.load(Ordering::Relaxed),
+        pool_size: total_pool_size,
+        pool_pending: total_pending,
     })
 }
 
 /// GET /api/serverinfo — Go frp compat alias for /api/status.
 async fn handle_serverinfo(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let uptime = state.dashboard_start.elapsed().as_secs();
-    let client_count = state.run_id_to_ctl_tx.read().await.len();
+    let ctl_map = state.run_id_to_ctl_tx.read().await;
+    let client_count = ctl_map.len();
     let proxies = state.proxy_manager.list().await;
+    let (total_pool_size, total_pending) = ctl_map.values().fold((0i64, 0i64), |(s, p), ctl| {
+        (s + ctl.pool_stats.pool_size.load(Ordering::Relaxed),
+         p + ctl.pool_stats.pending_requests.load(Ordering::Relaxed))
+    });
+    drop(ctl_map);
     Json(StatusResponse {
         version: frp_core::VERSION.to_string(),
         uptime_secs: uptime,
         client_count,
         proxy_count: proxies.len(),
+        pool_hits: state.pool_hits.load(Ordering::Relaxed),
+        pool_misses: state.pool_misses.load(Ordering::Relaxed),
+        pool_drops: state.pool_drops.load(Ordering::Relaxed),
+        pool_size: total_pool_size,
+        pool_pending: total_pending,
     })
 }
 
@@ -313,6 +347,8 @@ async fn handle_clients(State(state): State<Arc<AppState>>) -> Json<Vec<ClientEn
             login_time_secs: ctl.login_time.elapsed().as_secs(),
             proxy_count: proxies.len(),
             proxies,
+            pool_size: ctl.pool_stats.pool_size.load(Ordering::Relaxed),
+            pending_requests: ctl.pool_stats.pending_requests.load(Ordering::Relaxed),
         });
     }
     Json(clients)
@@ -357,6 +393,8 @@ async fn handle_client_detail(
         login_time_secs: ctl.login_time.elapsed().as_secs(),
         proxy_count: proxies.len(),
         proxies,
+        pool_size: ctl.pool_stats.pool_size.load(Ordering::Relaxed),
+        pending_requests: ctl.pool_stats.pending_requests.load(Ordering::Relaxed),
     }))
 }
 

@@ -10,6 +10,7 @@ pub mod config;
 pub mod encryption;
 pub mod cipher_stream;
 pub mod mux;
+pub mod buffer_pool;
 pub mod bridge;
 pub mod bandwidth;
 pub mod metrics;

@@ -4,6 +4,7 @@
 
 use prometheus::{Encoder, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
 use std::sync::LazyLock;
+use std::sync::atomic::Ordering;
 
 use crate::service::AppState;
 
@@ -60,7 +61,39 @@ static TRAFFIC_OUT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("metric definition must be valid")
 });
 
-/// Register all 6 metrics with the registry. Called once at startup.
+// --- Pool metrics (new in frp-rs, no Go frp equivalent) ---
+
+/// frp_server_pool_hits_total — lifetime work connection pool hits.
+static POOL_HITS: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::with_opts(Opts::new("frp_server_pool_hits_total", "lifetime work conn pool hits"))
+        .expect("metric definition must be valid")
+});
+
+/// frp_server_pool_misses_total — lifetime pool misses (pool empty, ReqWorkConn sent).
+static POOL_MISSES: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::with_opts(Opts::new("frp_server_pool_misses_total", "lifetime pool misses"))
+        .expect("metric definition must be valid")
+});
+
+/// frp_server_pool_drops_total — lifetime pool drops (pool full, conn discarded).
+static POOL_DROPS: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::with_opts(Opts::new("frp_server_pool_drops_total", "lifetime pool drops"))
+        .expect("metric definition must be valid")
+});
+
+/// frp_server_pool_size — current number of idle work connections across all clients.
+static POOL_SIZE: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::with_opts(Opts::new("frp_server_pool_size", "current idle work conns"))
+        .expect("metric definition must be valid")
+});
+
+/// frp_server_pool_pending_requests — current pending requests waiting for work conns.
+static POOL_PENDING: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::with_opts(Opts::new("frp_server_pool_pending_requests", "current pending requests"))
+        .expect("metric definition must be valid")
+});
+
+/// Register all 11 metrics with the registry. Called once at startup.
 /// Idempotent — safe to call multiple times (subsequent calls are no-ops).
 pub fn register_all() {
     use std::sync::Once;
@@ -72,6 +105,11 @@ pub fn register_all() {
         REGISTRY.register(Box::new(CONNECTION_COUNTS.clone())).ok();
         REGISTRY.register(Box::new(TRAFFIC_IN.clone())).ok();
         REGISTRY.register(Box::new(TRAFFIC_OUT.clone())).ok();
+        REGISTRY.register(Box::new(POOL_HITS.clone())).ok();
+        REGISTRY.register(Box::new(POOL_MISSES.clone())).ok();
+        REGISTRY.register(Box::new(POOL_DROPS.clone())).ok();
+        REGISTRY.register(Box::new(POOL_SIZE.clone())).ok();
+        REGISTRY.register(Box::new(POOL_PENDING.clone())).ok();
     });
 }
 
@@ -119,6 +157,21 @@ pub async fn sync_from_state(state: &AppState) {
     for (pt, count) in &type_counts {
         PROXY_COUNTS.with_label_values(&[pt]).set(*count);
     }
+
+    // Pool metrics — aggregate from AppState counters + per-client PoolStats
+    POOL_HITS.set(i64::try_from(state.pool_hits.load(Ordering::Relaxed)).unwrap_or(i64::MAX));
+    POOL_MISSES.set(i64::try_from(state.pool_misses.load(Ordering::Relaxed)).unwrap_or(i64::MAX));
+    POOL_DROPS.set(i64::try_from(state.pool_drops.load(Ordering::Relaxed)).unwrap_or(i64::MAX));
+
+    let total_pool_size: i64 = state.run_id_to_ctl_tx.read().await.values()
+        .map(|ctl| ctl.pool_stats.pool_size.load(Ordering::Relaxed))
+        .sum();
+    POOL_SIZE.set(total_pool_size);
+
+    let total_pending: i64 = state.run_id_to_ctl_tx.read().await.values()
+        .map(|ctl| ctl.pool_stats.pending_requests.load(Ordering::Relaxed))
+        .sum();
+    POOL_PENDING.set(total_pending);
 }
 
 /// Render Prometheus text format from the frp registry.
@@ -163,6 +216,12 @@ mod tests {
         // HEADER line present for gauge (always renders)
         assert!(text.contains("TYPE frp_server_client_counts gauge"));
         assert!(text.contains("TYPE frp_server_traffic_in gauge"));
+        // Pool metrics should appear even without touching them (they're plain IntGauges)
+        assert!(text.contains("frp_server_pool_hits_total"));
+        assert!(text.contains("frp_server_pool_misses_total"));
+        assert!(text.contains("frp_server_pool_drops_total"));
+        assert!(text.contains("frp_server_pool_size"));
+        assert!(text.contains("frp_server_pool_pending_requests"));
         // Cleanup
         PROXY_COUNTS.reset();
         PROXY_COUNTS_DETAILED.reset();
