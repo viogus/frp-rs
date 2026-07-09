@@ -303,10 +303,13 @@ pub(crate) async fn run_visitor_listener(
                         };
 
                         let stcp_proxy_name = if fb_to.is_empty() { sn.clone() } else { fb_to.clone() };
-                        // Use the visitor's configured encryption/compression settings
-                        // for the STCP fallback relay. Both the NewVisitorConn message
-                        // and the visitor-side bridge must agree on encryption.
-                        let nvc = crate::proxy::create_visitor_conn_msg(&stcp_proxy_name, &sk, use_encryption, use_compression);
+                        // STCP fallback is always plain relay. Go frp semantics:
+                        // `fallbackTo` routes to a SEPARATE STCP visitor with its own
+                        // encryption config; the XTCP visitor's use_encryption applies
+                        // to the P2P channel ONLY and does not carry into the fallback.
+                        // Sending use_encryption=true here would make the server↔provider
+                        // work-conn bridge encrypted while this side stays plain → mismatch.
+                        let nvc = crate::proxy::create_visitor_conn_msg(&stcp_proxy_name, &sk, false, false);
                         debug!(visitor_name = %visitor_name, json = %serde_json::to_string(&nvc).unwrap_or_default(), "Visitor '{}': NewVisitorConn JSON: {}", visitor_name, serde_json::to_string(&nvc).unwrap_or_default());
                         if let Err(e) = server_conn.write_v1_frame(&nvc).await {
                             warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STCP fallback send NewVisitorConn failed: {}", visitor_name, e);
@@ -336,21 +339,11 @@ pub(crate) async fn run_visitor_listener(
                         let user = user_conn;
                         let (user_r, user_w) = user.into_split();
                         let (srv_r, srv_w) = server_conn.into_split();
-                        let use_enc_fallback = use_encryption && !sk.is_empty();
-                        if use_enc_fallback {
-                            let key = frp_core::encryption::derive_key(&sk);
-                            frp_core::bridge::bridge_encrypted(
-                                user_r, user_w, srv_r, srv_w,
-                                &key, use_compression, vec![], None, None, None,
-                            ).await;
-                            debug!(visitor_name = %visitor_name, "Visitor '{}' STCP encrypted relay closed", visitor_name);
-                        } else {
-                            frp_core::bridge::bridge_plain(
-                                user_r, user_w, srv_r, srv_w,
-                                use_compression, vec![], None,
-                            ).await;
-                            debug!(visitor_name = %visitor_name, "Visitor '{}' STCP relay closed", visitor_name);
-                        }
+                        frp_core::bridge::bridge_plain(
+                            user_r, user_w, srv_r, srv_w,
+                            false, vec![], None,
+                        ).await;
+                        debug!(visitor_name = %visitor_name, "Visitor '{}' STCP relay closed", visitor_name);
                     } else {
                         // --- STCP relay path (existing) ---
                         let mut server_conn = match dial_server(&opts).await {
