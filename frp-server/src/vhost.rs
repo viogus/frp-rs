@@ -6,6 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, instrument, warn, debug};
 
 use crate::service::{AppState, InternalMsg};
+#[cfg(feature = "tls")]
+use crate::lock::RwLockExt;
 
 /// A route mapping: domain or location -> proxy entry.
 #[derive(Debug, Clone)]
@@ -283,8 +285,7 @@ pub async fn run_vhost_https_listener(
         // swaps a new acceptor under write lock; read-lock is cheap.
         let acceptor = state
             .tls_acceptor
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .read_ok()
             .clone()
             .expect("TLS acceptor not initialized");
 

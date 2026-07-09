@@ -15,6 +15,7 @@ use russh::server::{Auth, Handler, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use tokio::sync::mpsc;
 
+use crate::lock::RwLockExt;
 use crate::proxy::allocate_port_multi;
 use crate::service::AppState;
 
@@ -590,7 +591,7 @@ impl Handler for SshSession {
             let state = self.state.clone();
             let mut used = state.used_ports.write().await;
             // Re-allocate the actual proxy remote_port (not the SSH listen port)
-            let ranges = state.reloadable.read().unwrap().allow_ports.clone();
+            let ranges = state.reloadable.read_ok().allow_ports.clone();
             allocate_port_multi(&mut used, args.remote_port, &ranges)
                 .ok_or_else(|| anyhow!("no port available for remote_port {}", args.remote_port))?
         };
@@ -642,7 +643,7 @@ impl Handler for SshSession {
         let state = self.state.clone();
         let allocated = {
             let mut used = state.used_ports.write().await;
-            let ranges = state.reloadable.read().unwrap().allow_ports.clone();
+            let ranges = state.reloadable.read_ok().allow_ports.clone();
             allocate_port_multi(&mut used, 0, &ranges)
                 .ok_or_else(|| anyhow!("no port available in configured ranges"))?
         };

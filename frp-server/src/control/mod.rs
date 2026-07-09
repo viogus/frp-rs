@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant};
 use tracing::{info, warn, debug, instrument};
+use crate::lock::RwLockExt;
 use crate::nathole::NAT_HOLE_TIMEOUT;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 
@@ -112,7 +113,7 @@ pub async fn handle_control<S>(
             }
         }
     } else {
-        let auth_cfg = state.reloadable.read().unwrap().auth_cfg.clone();
+        let auth_cfg = state.reloadable.read_ok().auth_cfg.clone();
         if let Err(e) = auth_cfg.validate_login(
             login.privilege_key.as_deref(),
             login.timestamp,
@@ -142,7 +143,7 @@ pub async fn handle_control<S>(
         None
     };
 
-    let reloadable = state.reloadable.read().unwrap().clone();
+    let reloadable = state.reloadable.read_ok().clone();
 
     let run_id = login.run_id.clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
