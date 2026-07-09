@@ -11,9 +11,12 @@ targets = [
 
 [advisories]
 ignore = [
-    # rsa 0.10.0-rc.18: Marvin Attack timing sidechannel (RUSTSEC-2023-0071)
-    # No fixed version available. Dependency chain: russh → ssh-key → rsa.
-    # Medium severity (5.9). russh upgrade to stable rsa blocked on ecosystem.
+    # rsa 0.10.0-rc.18: Marvin Attack timing sidechannel (RUSTSEC-2023-0071).
+    # Pulled by the russh "rsa" feature (RSA client-key auth). NOT REACHABLE:
+    # the Marvin sidechannel is in RSA private-key decryption, but frp-rs never
+    # performs RSA private-key ops — the SSH host key is Ed25519 and RSA is used
+    # only for signature *verification* of client public keys. Feature kept so
+    # RSA-key clients can still authenticate. No fixed rsa version exists.
     "RUSTSEC-2023-0071",
 ]
 
