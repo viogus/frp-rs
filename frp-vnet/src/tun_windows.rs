@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::io;
 use std::net::Ipv4Addr;
 use std::pin::Pin;
@@ -14,7 +13,7 @@ use super::tun::TunDevice;
 /// either bundling wintun.dll or detecting a system-installed copy.
 pub struct WindowsTun {
     name: String,
-    mtu: Cell<u16>,
+    mtu: u16,
 }
 
 impl WindowsTun {
@@ -35,7 +34,7 @@ impl TunDevice for WindowsTun {
         &self.name
     }
     fn mtu(&self) -> u16 {
-        self.mtu.get()
+        self.mtu
     }
 }
 
