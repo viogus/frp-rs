@@ -9,6 +9,7 @@ use frp_core::protocol::write_msg;
 use frp_core::transport::IoStream;
 use frp_core::format_socket_addr;
 
+use crate::lock::RwLockExt;
 use crate::proxy::{ProxyInfo, allocate_port_multi};
 use crate::service::{AppState, InternalMsg};
 
@@ -163,11 +164,11 @@ pub(crate) async fn handle_new_proxy(
         if ports.contains(&remote_port) {
             Some(remote_port)
         } else {
-            allocate_port_multi(&mut ports, remote_port, &state.reloadable.read().unwrap().allow_ports)
+            allocate_port_multi(&mut ports, remote_port, &state.reloadable.read_ok().allow_ports)
         }
     } else {
         let mut ports = state.used_ports.write().await;
-        allocate_port_multi(&mut ports, remote_port, &state.reloadable.read().unwrap().allow_ports)
+        allocate_port_multi(&mut ports, remote_port, &state.reloadable.read_ok().allow_ports)
     };
 
     match allocated_port {

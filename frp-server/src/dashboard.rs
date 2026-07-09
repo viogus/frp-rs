@@ -5,6 +5,8 @@ use axum::{Router, Json, extract::{State, Path, Query, ws::{WebSocketUpgrade, We
 use axum::http::StatusCode;
 use serde::{Serialize, Deserialize};
 use crate::service::AppState;
+#[cfg(feature = "tls")]
+use crate::lock::RwLockExt;
 use frp_core::admin_auth::apply_admin_auth;
 use frp_core::metrics::MetricsSnapshot;
 
@@ -53,8 +55,7 @@ impl axum::serve::Listener for TlsListener {
             };
             let tls_acceptor = match self
                 .acceptor
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
+                .read_ok()
                 .clone()
             {
                 Some(acceptor) => acceptor,

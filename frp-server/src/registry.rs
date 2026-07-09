@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::Instant;
 
+use crate::lock::RwLockExt;
+
 /// Metadata about a connected frpc instance.
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
@@ -96,8 +98,8 @@ impl ClientRegistry {
 
         let now = Instant::now();
 
-        let mut clients = self.clients.write().unwrap();
-        let mut run_index = self.run_index.write().unwrap();
+        let mut clients = self.clients.write_ok();
+        let mut run_index = self.run_index.write_ok();
 
         // Conflict check under write lock (atomic with registration, matching Go)
         if enforce_unique {
@@ -149,14 +151,14 @@ impl ClientRegistry {
     /// If the client has no `raw_client_id`, the entry is removed entirely.
     /// Otherwise, the entry persists with `online=false` and `disconnected_at` set.
     pub fn mark_offline_by_run_id(&self, run_id: &str) {
-        let mut run_index = self.run_index.write().unwrap();
+        let mut run_index = self.run_index.write_ok();
         let key = match run_index.remove(run_id) {
             Some(k) => k,
             None => return,
         };
         drop(run_index);
 
-        let mut clients = self.clients.write().unwrap();
+        let mut clients = self.clients.write_ok();
         if let Some(info) = clients.get_mut(&key) {
             if info.run_id == run_id {
                 if info.raw_client_id.is_empty() {
@@ -172,13 +174,13 @@ impl ClientRegistry {
 
     /// Return a snapshot of all known clients.
     pub fn list(&self) -> Vec<ClientInfo> {
-        let clients = self.clients.read().unwrap();
+        let clients = self.clients.read_ok();
         clients.values().cloned().collect()
     }
 
     /// Look up a client by its composite key.
     pub fn get_by_key(&self, key: &str) -> Option<ClientInfo> {
-        let clients = self.clients.read().unwrap();
+        let clients = self.clients.read_ok();
         clients.get(key).cloned()
     }
 }

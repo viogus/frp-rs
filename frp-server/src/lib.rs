@@ -15,6 +15,7 @@ pub mod plugin;
 #[cfg(feature = "ssh")]
 pub mod ssh_gateway;
 pub mod handlers;
+pub mod lock;
 pub mod registry;
 
 /// Constant-time string comparison for credential verification.

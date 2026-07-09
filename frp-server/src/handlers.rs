@@ -8,6 +8,7 @@ use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::write_msg;
 use frp_core::transport::IoStream;
 
+use crate::lock::RwLockExt;
 use crate::state::{AppState, InternalMsg};
 use crate::control;
 use crate::nathole::controller as nathole_ctrl;
@@ -552,7 +553,7 @@ pub(crate) async fn handle_work_conn_inner(
 
     // Verify work connection auth (Go frp v0.69.1 compat).
     // Only validate when "NewWorkConns" is in additional_auth_scopes.
-    let requires_nwc_auth = state.reloadable.read().unwrap()
+    let requires_nwc_auth = state.reloadable.read_ok()
         .additional_auth_scopes.iter().any(|s| s == "NewWorkConns");
     let nwc_auth_result = if !requires_nwc_auth {
         Ok(())
@@ -564,7 +565,7 @@ pub(crate) async fn handle_work_conn_inner(
             &expected_sub,
         ).await
     } else {
-        state.reloadable.read().unwrap().auth_cfg.validate_login(
+        state.reloadable.read_ok().auth_cfg.validate_login(
             msg.privilege_key.as_deref(),
             msg.timestamp,
         ).map(|_| ())
