@@ -74,6 +74,36 @@ for specific environments (XTCP 16-test pairwise matrix on VPS, V2 auto-detected
 - **XTCP**: Full cross-compat with Go frp (requires public internet for STUN/NAT probes).
   See [full audit](docs/go-frp-compat-audit.md) for details.
 
+### Why frp-rs?
+
+**Smaller and lighter than Go frp.** Rust compiles to native code with no runtime, no GC, and aggressive size optimizations:
+
+| Metric | Go frp v0.69.1 | frp-rs (full) | frp-rs (`tiny`) | frp-rs (`micro`) |
+|--------|---------------|---------------|-----------------|-------------------|
+| frps binary | ~14 MB | ~4.8 MB | ~2.7 MB | ~1.6 MB |
+| frpc binary | ~12 MB | ~3.7 MB | ~2.3 MB | ~1.7 MB |
+| Memory (idle) | ~8-12 MB | ~2-4 MB | ~1.5-3 MB | ~1-2 MB |
+
+**Three build sizes via feature flags.** Trim unused protocols and features to match your deployment:
+
+- **full** (default): All transports (TCP, WS, TLS, KCP, QUIC), SSH gateway, OIDC auth, dashboard, compression, XChaCha20 V2 encryption, HTTP proxy, TCP mux.
+- **`tiny`**: Drops QUIC, KCP, WebSocket, SSH, OIDC, dashboard. Keeps TLS, compression, TCP mux. Ideal for edge devices.
+- **`micro`**: Core only — no TLS, no compression, no chacha20, no HTTP proxy, no TCP mux. Minimal attack surface and footprint.
+
+```bash
+# Tiny build (no heavy protocols)
+cargo build --release -p frps -p frpc --no-default-features --features tiny
+
+# Micro build (core only)
+cargo build --release -p frps -p frpc --no-default-features --features micro
+```
+
+**No GC pauses.** Rust's ownership model eliminates garbage collection — consistent tail latency under load, no stop-the-world spikes.
+
+**Memory safety.** All protocol parsing, FEC encoding, and encryption run in safe Rust. No buffer overflows, no use-after-free, no null pointer derefs at the wire boundary.
+
+**Go frp wire compatible.** Drop `frps` in place of Go frps, `frpc` in place of Go frpc. Same config files, same protocol, same encryption. Zero migration cost.
+
 ---
 
 ## Architecture
@@ -123,6 +153,39 @@ cargo build --release
 ```
 
 The binaries land at `target/release/frps` and `target/release/frpc`.
+
+### Binary Variants
+
+Three size tiers (see [Why frp-rs?](#why-frp-rs) for sizes):
+
+```bash
+# Full — all features (~4.8 MB frps, ~3.7 MB frpc)
+cargo build --release -p frps -p frpc
+
+# Tiny — no QUIC/KCP/WS/SSH/OIDC/dashboard, keeps TLS (~2.7 MB / ~2.3 MB)
+cargo build --release -p frps -p frpc --no-default-features --features tiny
+
+# Micro — core only, no TLS/compression/chacha20/http-proxy/tcp-mux (~1.6 MB / ~1.7 MB)
+cargo build --release -p frps -p frpc --no-default-features --features micro
+```
+
+Individual feature flags (all default ON) let you cherry-pick:
+
+| Feature | Removes |
+|---------|---------|
+| `quic` | QUIC transport (quinn, ~1 MB) |
+| `kcp` | KCP transport |
+| `websocket` | WebSocket transport |
+| `oidc` | OIDC auth (jsonwebtoken, reqwest) |
+| `ssh` | SSH gateway (russh) |
+| `dashboard` | Metrics/status API (prometheus, axum) |
+| `tls` | TLS encryption (rustls) |
+| `compression` | Snappy bridge compression |
+| `chacha20` | XChaCha20-Poly1305 V2 cipher (AES-256-GCM stays) |
+| `http-proxy` | HTTP proxy plugin |
+| `tcp-mux` | yamux stream multiplexing (~80 KB) |
+
+`quic` implies `tls`; `oidc` implies `reqwest`; `ssh` implies `rand`.
 
 ### Quick Start
 
