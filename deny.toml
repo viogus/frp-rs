@@ -15,9 +15,6 @@ ignore = [
     # No fixed version available. Dependency chain: russh → ssh-key → rsa.
     # Medium severity (5.9). russh upgrade to stable rsa blocked on ecosystem.
     "RUSTSEC-2023-0071",
-    # rustls-pemfile is unmaintained (RUSTSEC-2025-0134)
-    # Pending migration to rustls-pki-types::pem::PemObject.
-    "RUSTSEC-2025-0134",
 ]
 
 [licenses]

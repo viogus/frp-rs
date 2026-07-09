@@ -21,6 +21,7 @@ All notable changes to frp-rs.
 - Client: handle IPv6 bracket notation in host:port parsing
 - Cipher: fix partial-write re-encrypt bug — buffer encrypted output on subsequent writes
 - Server: RwLock poison recovery via `RwLockExt` trait (26 sites) — single panicked task no longer cascades
+- Deps: drop unmaintained `rustls-pemfile` (RUSTSEC-2025-0134), migrate cert/key parsing to `rustls::pki_types::pem::PemObject`
 
 ### Added
 
