@@ -67,13 +67,13 @@ jobs:
           mkdir -p dist dist/tiny dist/micro
           cp target/${{ matrix.target }}/release/frps dist/frps
           cp target/${{ matrix.target }}/release/frpc dist/frpc
-          tar czf frp-rs_${{ github.ref_name }}_${{ matrix.target }}.tar.gz -C dist frps frpc
+          tar czf dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}.tar.gz -C dist frps frpc
           cp target/${{ matrix.target }}/release/frps-tiny dist/tiny/frps
           cp target/${{ matrix.target }}/release/frpc-tiny dist/tiny/frpc
-          tar czf frp-rs_${{ github.ref_name }}_${{ matrix.target }}-tiny.tar.gz -C dist/tiny frps frpc
+          tar czf dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}-tiny.tar.gz -C dist/tiny frps frpc
           cp target/${{ matrix.target }}/release/frps-micro dist/micro/frps
           cp target/${{ matrix.target }}/release/frpc-micro dist/micro/frpc
-          tar czf frp-rs_${{ github.ref_name }}_${{ matrix.target }}-micro.tar.gz -C dist/micro frps frpc
+          tar czf dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}-micro.tar.gz -C dist/micro frps frpc
 
       - uses: actions/upload-artifact@v4
         with:
@@ -114,13 +114,13 @@ jobs:
           mkdir -p dist dist/tiny dist/micro
           cp target/${{ matrix.target }}/release/frps dist/frps
           cp target/${{ matrix.target }}/release/frpc dist/frpc
-          tar czf frp-rs_${{ github.ref_name }}_${{ matrix.target }}.tar.gz -C dist frps frpc
+          tar czf dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}.tar.gz -C dist frps frpc
           cp target/${{ matrix.target }}/release/frps-tiny dist/tiny/frps
           cp target/${{ matrix.target }}/release/frpc-tiny dist/tiny/frpc
-          tar czf frp-rs_${{ github.ref_name }}_${{ matrix.target }}-tiny.tar.gz -C dist/tiny frps frpc
+          tar czf dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}-tiny.tar.gz -C dist/tiny frps frpc
           cp target/${{ matrix.target }}/release/frps-micro dist/micro/frps
           cp target/${{ matrix.target }}/release/frpc-micro dist/micro/frpc
-          tar czf frp-rs_${{ github.ref_name }}_${{ matrix.target }}-micro.tar.gz -C dist/micro frps frpc
+          tar czf dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}-micro.tar.gz -C dist/micro frps frpc
 
       - uses: actions/upload-artifact@v4
         with:
