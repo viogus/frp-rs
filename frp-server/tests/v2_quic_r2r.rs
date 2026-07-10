@@ -70,7 +70,7 @@ fn ensure_tls_certs() -> (String, String, String) {
         .args([
             "req", "-x509", "-newkey", "rsa:2048", "-keyout",
             ca_key.to_str().unwrap(), "-out", ca_cert.to_str().unwrap(),
-            "-days", "1", "-nodes",
+            "-days", "3650", "-nodes",
             "-subj", "/CN=frp-test-ca",
             "-addext", "basicConstraints=critical,CA:TRUE",
         ])
@@ -83,7 +83,7 @@ fn ensure_tls_certs() -> (String, String, String) {
         .args([
             "req", "-newkey", "rsa:2048", "-keyout",
             srv_key.to_str().unwrap(), "-out", dir.join("server.csr").to_str().unwrap(),
-            "-days", "1", "-nodes",
+            "-days", "3650", "-nodes",
             "-subj", "/CN=localhost",
         ])
         .output()
@@ -103,7 +103,7 @@ fn ensure_tls_certs() -> (String, String, String) {
             "-CAkey", ca_key.to_str().unwrap(),
             "-CAcreateserial",
             "-out", srv_cert.to_str().unwrap(),
-            "-days", "1",
+            "-days", "3650",
             "-extfile", ext_path.to_str().unwrap(),
         ])
         .output()
