@@ -42,6 +42,34 @@ fn is_v2_magic(buf: &[u8]) -> bool {
     buf.len() >= 7 && buf[..7] == frp_core::protocol::V2_MAGIC_BYTES
 }
 
+/// Run V2 handshake then read the first message frame. Returns `None` on error
+/// (already logged). `addr` is `None` for listeners that don't capture peer addr.
+async fn v2_handshake_and_read(
+    io: &mut IoStream,
+    addr: Option<std::net::SocketAddr>,
+    log_prefix: &str,
+) -> Option<(Vec<u8>, Option<frp_core::v2_handshake::CryptoContext>)> {
+    let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(io).await {
+        Ok((Some(p), crypto)) => (p, crypto),
+        Ok((None, crypto)) => match io.read_raw_v2_frame().await {
+            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+            Ok((ft, _, _)) => {
+                tracing::warn!(frame_type = ?ft, peer = ?addr, "{}: unexpected frame type {} after handshake", log_prefix, ft);
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(peer = ?addr, error = %e, "{}: failed to read message after handshake: {}", log_prefix, e);
+                return None;
+            }
+        },
+        Err(e) => {
+            tracing::warn!(peer = ?addr, error = %e, "{} handshake error: {}", log_prefix, e);
+            return None;
+        }
+    };
+    Some((msg_payload, crypto_ctx))
+}
+
 // ---------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------
@@ -247,25 +275,9 @@ impl Service {
 
                                         if is_v2 {
                                             // V2 path: ClientHello/ServerHello handshake
-                                            let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ws).await {
-                                                Ok((Some(p), crypto)) => (p, crypto),
-                                                Ok((None, crypto)) => {
-                                                    match ws.read_raw_v2_frame().await {
-                                                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                        Ok((ft, _, _)) => {
-                                                            tracing::warn!(frame_type = ?ft, addr = %addr, "WS V2: unexpected frame type {} after handshake from {}", ft, addr);
-                                                            return;
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::warn!(addr = %addr, error = %e, "WS V2: failed to read message after handshake from {}: {}", addr, e);
-                                                            return;
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(addr = %addr, error = %e, "WS V2 handshake error from {}: {}", addr, e);
-                                                    return;
-                                                }
+                                            let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut ws, Some(addr), "WS V2").await {
+                                                Some(v) => v,
+                                                None => return,
                                             };
                                             crate::handlers::dispatch_v2_message(ws, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
                                         } else if magic[0] == 0x16 {
@@ -311,25 +323,9 @@ impl Service {
                                                                 Err(_) => false,
                                                             };
                                                             if is_v2 {
-                                                                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                                                    Ok((Some(p), crypto)) => (p, crypto),
-                                                                    Ok((None, crypto)) => {
-                                                                        match io.read_raw_v2_frame().await {
-                                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                                            Ok((ft, _, _)) => {
-                                                                                tracing::warn!(frame_type = ?ft, addr = %addr, "WS+TLS+yamux V2: unexpected frame type {} from {}", ft, addr);
-                                                                                return;
-                                                                            }
-                                                                            Err(e) => {
-                                                                                tracing::warn!(addr = %addr, error = %e, "WS+TLS+yamux V2: failed to read message from {}: {}", addr, e);
-                                                                                return;
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                    Err(e) => {
-                                                                        tracing::warn!(addr = %addr, error = %e, "WS+TLS+yamux V2 handshake error from {}: {}", addr, e);
-                                                                        return;
-                                                                    }
+                                                                let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut io, Some(addr), "WS+TLS+yamux V2").await {
+                                                                    Some(v) => v,
+                                                                    None => return,
                                                                 };
                                                                 crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, Some(incoming), None, crypto_ctx).await;
                                                             } else {
@@ -372,25 +368,9 @@ impl Service {
                                                         Err(_) => false,
                                                     };
                                                     if is_tls_v2 {
-                                                        let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                                            Ok((Some(p), crypto)) => (p, crypto),
-                                                            Ok((None, crypto)) => {
-                                                                match io.read_raw_v2_frame().await {
-                                                                    Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                                    Ok((ft, _, _)) => {
-                                                                        tracing::warn!(frame_type = ?ft, addr = %addr, "WS+TLS+V2: unexpected frame type {} from {}", ft, addr);
-                                                                        return;
-                                                                    }
-                                                                    Err(e) => {
-                                                                        tracing::warn!(addr = %addr, error = %e, "WS+TLS+V2: failed to read message from {}: {}", addr, e);
-                                                                        return;
-                                                                    }
-                                                                }
-                                                            }
-                                                            Err(e) => {
-                                                                tracing::warn!(addr = %addr, error = %e, "WS+TLS+V2 handshake error from {}: {}", addr, e);
-                                                                return;
-                                                            }
+                                                        let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut io, Some(addr), "WS+TLS+V2").await {
+                                                            Some(v) => v,
+                                                            None => return,
                                                         };
                                                         crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
                                                     } else {

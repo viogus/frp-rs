@@ -895,6 +895,29 @@ impl tokio::io::AsyncRead for IoStream {
     }
 }
 
+// Shared by poll_flush/poll_shutdown — dispatch over 11 IoStream variants.
+macro_rules! io_stream_dispatch_poll {
+    ($self:expr, $cx:expr, $method:ident) => {
+        match $self.get_mut() {
+            IoStream::Tcp(s) => Pin::new(s).$method($cx),
+            #[cfg(feature = "tls")]
+            IoStream::Tls(s) => Pin::new(s).$method($cx),
+            #[cfg(feature = "kcp")]
+            IoStream::Kcp(s) => Pin::new(s).$method($cx),
+            #[cfg(feature = "quic")]
+            IoStream::Quic(s) => Pin::new(s).$method($cx),
+            #[cfg(feature = "websocket")]
+            IoStream::WebSocket(s) => Pin::new(s).$method($cx),
+            IoStream::Yamux(s) => Pin::new(s).$method($cx),
+            IoStream::Cipher(s) => Pin::new(s).$method($cx),
+            IoStream::Aead(s) => Pin::new(s).$method($cx),
+            IoStream::SshChannel(s) => Pin::new(s.as_mut()).$method($cx),
+            IoStream::PreRead(_, s) => Pin::new(s).$method($cx),
+            IoStream::BufferedRead(_, _, inner) => Pin::new(inner.as_mut()).$method($cx),
+        }
+    };
+}
+
 impl tokio::io::AsyncWrite for IoStream {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -921,43 +944,11 @@ impl tokio::io::AsyncWrite for IoStream {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            IoStream::Tcp(s) => Pin::new(s).poll_flush(cx),
-            #[cfg(feature = "tls")]
-            IoStream::Tls(s) => Pin::new(s).poll_flush(cx),
-            #[cfg(feature = "kcp")]
-            IoStream::Kcp(s) => Pin::new(s).poll_flush(cx),
-            #[cfg(feature = "quic")]
-            IoStream::Quic(s) => Pin::new(s).poll_flush(cx),
-            #[cfg(feature = "websocket")]
-            IoStream::WebSocket(s) => Pin::new(s).poll_flush(cx),
-            IoStream::Yamux(s) => Pin::new(s).poll_flush(cx),
-            IoStream::Cipher(s) => Pin::new(s).poll_flush(cx),
-            IoStream::Aead(s) => Pin::new(s).poll_flush(cx),
-            IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_flush(cx),
-            IoStream::PreRead(_, s) => Pin::new(s).poll_flush(cx),
-            IoStream::BufferedRead(_, _, inner) => Pin::new(inner.as_mut()).poll_flush(cx),
-        }
+        io_stream_dispatch_poll!(self, cx, poll_flush)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            IoStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
-            #[cfg(feature = "tls")]
-            IoStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
-            #[cfg(feature = "kcp")]
-            IoStream::Kcp(s) => Pin::new(s).poll_shutdown(cx),
-            #[cfg(feature = "quic")]
-            IoStream::Quic(s) => Pin::new(s).poll_shutdown(cx),
-            #[cfg(feature = "websocket")]
-            IoStream::WebSocket(s) => Pin::new(s).poll_shutdown(cx),
-            IoStream::Yamux(s) => Pin::new(s).poll_shutdown(cx),
-            IoStream::Cipher(s) => Pin::new(s).poll_shutdown(cx),
-            IoStream::Aead(s) => Pin::new(s).poll_shutdown(cx),
-            IoStream::SshChannel(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
-            IoStream::PreRead(_, s) => Pin::new(s).poll_shutdown(cx),
-            IoStream::BufferedRead(_, _, inner) => Pin::new(inner.as_mut()).poll_shutdown(cx),
-        }
+        io_stream_dispatch_poll!(self, cx, poll_shutdown)
     }
 }
 

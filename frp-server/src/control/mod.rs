@@ -103,6 +103,42 @@ where
     Ok(())
 }
 
+/// Write StartWorkConn with embedded `nat_hole_sid` + a separate NatHoleSid
+/// frame for Go frpc compat. Go frp ignores unknown JSON fields, so the
+/// standalone frame is needed for XTCP notification recognition.
+async fn write_start_work_conn_with_nat_hole_sid<W: tokio::io::AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    proxy_name: &str,
+    use_enc: bool,
+    use_comp: bool,
+    sid: &str,
+    v2: bool,
+    context: &str,
+) {
+    let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
+        proxy_name: proxy_name.to_string(),
+        src_addr: None, src_port: None,
+        dst_addr: None, dst_port: None, error: None,
+        use_encryption: if use_enc { Some(true) } else { None },
+        use_compression: if use_comp { Some(true) } else { None },
+        nat_hole_sid: Some(sid.to_string()),
+        nat_hole_visitor_addr: None,
+    });
+    if let Err(e) = write_ctl_msg(writer, &swc, v2).await {
+        warn!(error = %e, "Failed to send StartWorkConn with NatHoleSid{}: {}", context, e);
+    } else {
+        debug!(sid = %sid, "Sent StartWorkConn with embedded NatHoleSid {} to provider{}", sid, context);
+        // Standalone NatHoleSid V1 frame for Go frpc compat.
+        let nhs = FrpMessage::NatHoleSid(msg::NatHoleSid {
+            sid: Some(sid.to_string()),
+            provider_addr: None,
+        });
+        if let Err(e) = write_ctl_msg(writer, &nhs, v2).await {
+            debug!(error = %e, "Failed to send separate NatHoleSid frame (non-fatal): {}", e);
+        }
+    }
+}
+
 /// Handle a control connection from a frpc client.
 /// The login message has already been consumed from the stream.
 /// `peer` is passed separately because generic stream types don't have peer_addr().
@@ -434,32 +470,7 @@ pub async fn handle_control<S>(
                             let (use_enc, use_comp) = state.proxy_manager.get(&proxy_name).await
                                 .map(|p| (p.use_encryption, p.use_compression))
                                 .unwrap_or((false, false));
-                            // Embed NatHoleSid info directly in StartWorkConn JSON.
-                            // This avoids a separate NatHoleSid frame after StartWorkConn
-                            // which Go frpc would misinterpret as bridge data.
-                            let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
-                                proxy_name: proxy_name.clone(),
-                                src_addr: None, src_port: None,
-                                dst_addr: None, dst_port: None, error: None,
-                                use_encryption: if use_enc { Some(true) } else { None },
-                                use_compression: if use_comp { Some(true) } else { None },
-                                nat_hole_sid: Some(sid.clone()),
-                                nat_hole_visitor_addr: None,
-                            });
-                            if let Err(e) = write_ctl_msg(&mut stream, &swc, v2).await {
-                                warn!(error = %e, "Failed to send pending StartWorkConn with NatHoleSid: {}", e);
-                            } else {
-                                // Also send a separate NatHoleSid V1 frame for Go frpc compat.
-                                // Go frp ignores unknown JSON fields (embedded nat_hole_sid),
-                                // so it needs the standalone frame to recognize the XTCP notification.
-                                let nhs = FrpMessage::NatHoleSid(msg::NatHoleSid {
-                                    sid: Some(sid.clone()),
-                                    provider_addr: None,
-                                });
-                                if let Err(e) = write_ctl_msg(&mut stream, &nhs, v2).await {
-                                    debug!(error = %e, "Failed to send separate NatHoleSid frame (non-fatal): {}", e);
-                                }
-                            }
+                            write_start_work_conn_with_nat_hole_sid(&mut stream, &proxy_name, use_enc, use_comp, &sid, v2, " (pending)").await;
                             // Work conn consumed for XTCP notification — drop it.
                         } else {
                             // Expire stale pending UDP requests first
@@ -644,37 +655,7 @@ pub async fn handle_control<S>(
                             let (use_enc, use_comp) = state.proxy_manager.get(&proxy_name).await
                                 .map(|p| (p.use_encryption, p.use_compression))
                                 .unwrap_or((false, false));
-                            // Embed NatHoleSid info directly in StartWorkConn JSON.
-                            // This avoids a separate NatHoleSid frame after StartWorkConn
-                            // which Go frpc would misinterpret as bridge data.
-                            // Go frp ignores unknown JSON fields, so the embedded fields
-                            // are backward-compatible.
-                            let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
-                                proxy_name: proxy_name.clone(),
-                                src_addr: None, src_port: None,
-                                dst_addr: None, dst_port: None, error: None,
-                                use_encryption: if use_enc { Some(true) } else { None },
-                                use_compression: if use_comp { Some(true) } else { None },
-                                nat_hole_sid: Some(sid.clone()),
-                                nat_hole_visitor_addr: None,
-                            });
-                            if let Err(e) = write_ctl_msg(&mut work_conn, &swc, v2).await {
-                                warn!(error = %e, "Failed to send StartWorkConn with NatHoleSid on work conn: {}", e);
-                            } else {
-                                debug!(sid = %sid, "Sent StartWorkConn with embedded NatHoleSid {} to provider on work conn", sid);
-                                // Also send a separate NatHoleSid V1 frame for Go frpc compat.
-                                // Go frp ignores unknown JSON fields (embedded nat_hole_sid),
-                                // so it needs the standalone frame to recognize the XTCP notification.
-                                // Rust frpc checks the embedded field first and returns early,
-                                // so the separate frame is harmlessly dropped with the connection.
-                                let nhs = FrpMessage::NatHoleSid(msg::NatHoleSid {
-                                    sid: Some(sid.clone()),
-                                    provider_addr: None,
-                                });
-                                if let Err(e) = write_ctl_msg(&mut work_conn, &nhs, v2).await {
-                                    debug!(error = %e, "Failed to send separate NatHoleSid frame (non-fatal): {}", e);
-                                }
-                            }
+                            write_start_work_conn_with_nat_hole_sid(&mut work_conn, &proxy_name, use_enc, use_comp, &sid, v2, " on work conn").await;
                             // Connection consumed — Go frp doesn't reuse after NatHoleSid.
                             drop(work_conn);
                         } else {
