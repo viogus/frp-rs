@@ -166,7 +166,9 @@ struct ClientDetail {
 
 // --- Handlers ---
 
-async fn handle_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
+/// Build the shared status payload for `/api/status` and its Go-frp-compat
+/// alias `/api/serverinfo`.
+async fn build_status_response(state: &Arc<AppState>) -> StatusResponse {
     let uptime = state.dashboard_start.elapsed().as_secs();
     let ctl_map = state.run_id_to_ctl_tx.read().await;
     let client_count = ctl_map.len();
@@ -178,7 +180,7 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> Json<StatusRespons
     });
     drop(ctl_map);
 
-    Json(StatusResponse {
+    StatusResponse {
         version: frp_core::VERSION.to_string(),
         uptime_secs: uptime,
         client_count,
@@ -188,31 +190,16 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> Json<StatusRespons
         pool_drops: state.pool_drops.load(Ordering::Relaxed),
         pool_size: total_pool_size,
         pool_pending: total_pending,
-    })
+    }
+}
+
+async fn handle_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
+    Json(build_status_response(&state).await)
 }
 
 /// GET /api/serverinfo — Go frp compat alias for /api/status.
 async fn handle_serverinfo(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
-    let uptime = state.dashboard_start.elapsed().as_secs();
-    let ctl_map = state.run_id_to_ctl_tx.read().await;
-    let client_count = ctl_map.len();
-    let proxies = state.proxy_manager.list().await;
-    let (total_pool_size, total_pending) = ctl_map.values().fold((0i64, 0i64), |(s, p), ctl| {
-        (s + ctl.pool_stats.pool_size.load(Ordering::Relaxed),
-         p + ctl.pool_stats.pending_requests.load(Ordering::Relaxed))
-    });
-    drop(ctl_map);
-    Json(StatusResponse {
-        version: frp_core::VERSION.to_string(),
-        uptime_secs: uptime,
-        client_count,
-        proxy_count: proxies.len(),
-        pool_hits: state.pool_hits.load(Ordering::Relaxed),
-        pool_misses: state.pool_misses.load(Ordering::Relaxed),
-        pool_drops: state.pool_drops.load(Ordering::Relaxed),
-        pool_size: total_pool_size,
-        pool_pending: total_pending,
-    })
+    Json(build_status_response(&state).await)
 }
 
 /// GET /api/proxies — list all proxies, optional ?type= filter.
