@@ -9,6 +9,49 @@ use crate::encryption;
 use crate::transport::IoStream;
 use tracing::instrument;
 
+/// Compress a plaintext chunk when compression is enabled, else copy it.
+/// Returns `None` on compression failure — the caller should break its loop.
+#[inline]
+fn compress_chunk(payload: &[u8], use_compression: bool) -> Option<Vec<u8>> {
+    if use_compression {
+        encryption::compress(payload).ok()
+    } else {
+        Some(payload.to_vec())
+    }
+}
+
+/// Build a streaming Snappy decompressor when compression is enabled and the
+/// `compression` feature is present; otherwise `None` (plaintext passthrough).
+#[inline]
+fn make_decompressor(use_compression: bool) -> Option<encryption::SnappyDecompressor> {
+    #[cfg(feature = "compression")]
+    {
+        if use_compression {
+            Some(encryption::SnappyDecompressor::new())
+        } else {
+            None
+        }
+    }
+    #[cfg(not(feature = "compression"))]
+    {
+        let _ = use_compression;
+        None
+    }
+}
+
+/// Feed a chunk through the decompressor if present, else copy it.
+/// Returns `None` on decompress error — the caller should break its loop.
+#[inline]
+fn decompress_chunk(
+    dec: &mut Option<encryption::SnappyDecompressor>,
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    match dec {
+        Some(d) => d.feed(data).ok(),
+        None => Some(data.to_vec()),
+    }
+}
+
 /// Bridge encrypted data between two IoStreams, splitting them internally.
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip(user, work, key, pre_read, read_limiter, write_limiter, metrics), fields(use_compression))]
@@ -90,13 +133,9 @@ pub async fn bridge_encrypted(
             };
             let payload = &buf.data()[..n];
 
-            let processed = if use_compression {
-                match encryption::compress(payload) {
-                    Ok(c) => c,
-                    Err(_) => break,
-                }
-            } else {
-                payload.to_vec()
+            let processed = match compress_chunk(payload, use_compression) {
+                Some(p) => p,
+                None => break,
             };
 
             // Apply write bandwidth limit before send
@@ -120,14 +159,7 @@ pub async fn bridge_encrypted(
     // Work → User: read from work (decrypted), decompress, write to user
     let work_to_user = async {
         let mut buf = PoolGuard::acquire();
-        #[cfg(feature = "compression")]
-        let mut decompressor = if use_compression {
-            Some(encryption::SnappyDecompressor::new())
-        } else {
-            None
-        };
-        #[cfg(not(feature = "compression"))]
-        let mut decompressor: Option<encryption::SnappyDecompressor> = None;
+        let mut decompressor = make_decompressor(use_compression);
         loop {
             let n = match enc_work_r.read(buf.as_mut_slice()).await {
                 Ok(0) => break,
@@ -136,19 +168,9 @@ pub async fn bridge_encrypted(
             };
             let decrypted = &buf.data()[..n];
 
-            let plaintext = if let Some(ref mut dec) = decompressor {
-                match dec.feed(decrypted) {
-                    Ok(p) => p,
-                    #[cfg(feature = "compression")]
-                    Err(e) => {
-                        tracing::warn!(error = %e, "snappy decompress error in encrypted bridge: {}", e);
-                        break;
-                    }
-                    #[cfg(not(feature = "compression"))]
-                    Err(_) => break,
-                }
-            } else {
-                decrypted.to_vec()
+            let plaintext = match decompress_chunk(&mut decompressor, decrypted) {
+                Some(p) => p,
+                None => break,
             };
 
             if !plaintext.is_empty() {
@@ -235,13 +257,9 @@ pub async fn bridge_plain(
                 }
             };
             let payload = &buf.data()[..n];
-            let processed = if use_compression {
-                match encryption::compress(payload) {
-                    Ok(c) => c,
-                    Err(_) => break,
-                }
-            } else {
-                payload.to_vec()
+            let processed = match compress_chunk(payload, use_compression) {
+                Some(p) => p,
+                None => break,
             };
             if work_w.write_all(&processed).await.is_err() {
                 tracing::warn!(len = processed.len(), "bridge_plain: work_w write_all failed");
@@ -266,14 +284,7 @@ pub async fn bridge_plain(
     let work_to_user = async {
         tracing::debug!("bridge_plain: work_to_user starting");
         let mut buf = PoolGuard::acquire();
-        #[cfg(feature = "compression")]
-        let mut decompressor = if use_compression {
-            Some(encryption::SnappyDecompressor::new())
-        } else {
-            None
-        };
-        #[cfg(not(feature = "compression"))]
-        let mut decompressor: Option<encryption::SnappyDecompressor> = None;
+        let mut decompressor = make_decompressor(use_compression);
         loop {
             let n = match work_r.read(buf.as_mut_slice()).await {
                 Ok(0) => {
@@ -289,19 +300,9 @@ pub async fn bridge_plain(
                     break;
                 }
             };
-            let plaintext = if let Some(ref mut dec) = decompressor {
-                match dec.feed(&buf.data()[..n]) {
-                    Ok(p) => p,
-                    #[cfg(feature = "compression")]
-                    Err(e) => {
-                        tracing::warn!(error = %e, "snappy decompress error in bridge: {}", e);
-                        break;
-                    }
-                    #[cfg(not(feature = "compression"))]
-                    Err(_) => break,
-                }
-            } else {
-                buf.data()[..n].to_vec()
+            let plaintext = match decompress_chunk(&mut decompressor, &buf.data()[..n]) {
+                Some(p) => p,
+                None => break,
             };
             if !plaintext.is_empty() {
                 if user_w.write_all(&plaintext).await.is_err() {
@@ -485,6 +486,28 @@ mod tests {
         drop(w_w_test);
 
         handle.await.unwrap();
+    }
+
+    #[test]
+    fn test_compress_chunk_identity_when_disabled() {
+        let out = compress_chunk(b"hello", false).unwrap();
+        assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn test_compress_decompress_roundtrip() {
+        let original = b"AAAA".repeat(64);
+        let compressed = compress_chunk(&original, true).expect("compress ok");
+        let mut dec = make_decompressor(true);
+        let out = decompress_chunk(&mut dec, &compressed).expect("decompress ok");
+        assert_eq!(out, original);
+    }
+
+    #[test]
+    fn test_decompress_chunk_identity_when_none() {
+        let mut dec: Option<encryption::SnappyDecompressor> = None;
+        let out = decompress_chunk(&mut dec, b"raw").unwrap();
+        assert_eq!(out, b"raw");
     }
 }
 
