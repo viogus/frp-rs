@@ -47,7 +47,10 @@ fn decompress_chunk(
     data: &[u8],
 ) -> Option<Vec<u8>> {
     match dec {
-        Some(d) => d.feed(data).ok(),
+        Some(d) => d.feed(data).inspect_err(|e| {
+            #[cfg(feature = "compression")]
+            tracing::warn!(error = %e, "snappy decompress error in bridge: {}", e);
+        }).ok(),
         None => Some(data.to_vec()),
     }
 }
