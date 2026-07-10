@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicI64};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -81,11 +81,20 @@ pub enum InternalMsg {
     },
 }
 
+/// Per-client pool statistics, shared between the control handler
+/// and Prometheus scrape / admin API threads.
+#[derive(Debug, Default)]
+pub struct PoolStats {
+    pub pool_size: AtomicI64,
+    pub pending_requests: AtomicI64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ControlTx {
     pub tx: mpsc::UnboundedSender<InternalMsg>,
     pub client_addr: Option<SocketAddr>,
     pub login_time: Instant,
+    pub pool_stats: Arc<PoolStats>,
 }
 
 /// Hot-reloadable server configuration subset, updated atomically on SIGUSR1.
@@ -158,6 +167,14 @@ pub struct AppState {
     /// Active bridge connection counter. Incremented when a bridge task starts,
     /// decremented when it completes. The drain phase polls this counter.
     pub active_connections: AtomicU64,
+    /// Aggregate pool counters: work connection pool hits/misses/drops.
+    /// Updated atomically from control handlers, read by Prometheus /admin API.
+    pub pool_hits: AtomicU64,
+    pub pool_misses: AtomicU64,
+    pub pool_drops: AtomicU64,
+    /// How long a pooled work connection can sit idle before being dropped.
+    /// Duration::ZERO = disabled (connections stay pooled indefinitely).
+    pub pool_idle_timeout: Duration,
     /// Virtual network routing table: (virtual_net, subnet) → (run_id, proxy_name).
     /// Populated by VnetRouteAdvertise messages, used to forward VnetPacket.
     #[cfg(feature = "vnet")]
@@ -217,6 +234,10 @@ impl AppState {
             tls_acceptor: Arc::new(std::sync::RwLock::new(None)),
             shutdown_token: CancellationToken::new(),
             active_connections: AtomicU64::new(0),
+            pool_hits: AtomicU64::new(0),
+            pool_misses: AtomicU64::new(0),
+            pool_drops: AtomicU64::new(0),
+            pool_idle_timeout: Duration::ZERO,
             #[cfg(feature = "vnet")]
             vnet_routes: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "dashboard")]

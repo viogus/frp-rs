@@ -3,6 +3,7 @@ use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::bandwidth::BandwidthLimiter;
+use crate::buffer_pool::PoolGuard;
 use crate::cipher_stream::{CipherReader, CipherWriter};
 use crate::encryption;
 use crate::transport::IoStream;
@@ -75,9 +76,9 @@ pub async fn bridge_encrypted(
         {
             return;
         }
-        let mut buf = vec![0u8; 65536];
+        let mut buf = PoolGuard::acquire();
         loop {
-            let n = match user_r.read(&mut buf).await {
+            let n = match user_r.read(buf.as_mut_slice()).await {
                 Ok(0) => break,
                 Ok(n) => {
                     if let Some(ref m) = metrics {
@@ -87,7 +88,7 @@ pub async fn bridge_encrypted(
                 }
                 Err(_) => break,
             };
-            let payload = &buf[..n];
+            let payload = &buf.data()[..n];
 
             let processed = if use_compression {
                 match encryption::compress(payload) {
@@ -118,7 +119,7 @@ pub async fn bridge_encrypted(
 
     // Work → User: read from work (decrypted), decompress, write to user
     let work_to_user = async {
-        let mut buf = vec![0u8; 65536];
+        let mut buf = PoolGuard::acquire();
         #[cfg(feature = "compression")]
         let mut decompressor = if use_compression {
             Some(encryption::SnappyDecompressor::new())
@@ -128,12 +129,12 @@ pub async fn bridge_encrypted(
         #[cfg(not(feature = "compression"))]
         let mut decompressor: Option<encryption::SnappyDecompressor> = None;
         loop {
-            let n = match enc_work_r.read(&mut buf).await {
+            let n = match enc_work_r.read(buf.as_mut_slice()).await {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(_) => break,
             };
-            let decrypted = &buf[..n];
+            let decrypted = &buf.data()[..n];
 
             let plaintext = if let Some(ref mut dec) = decompressor {
                 match dec.feed(decrypted) {
@@ -214,15 +215,15 @@ pub async fn bridge_plain(
                 tracing::warn!("bridge_plain: pre_read write_all failed");
                 return;
             }
-        let mut buf = vec![0u8; 65536];
+        let mut buf = PoolGuard::acquire();
         loop {
-            let n = match user_r.read(&mut buf).await {
+            let n = match user_r.read(buf.as_mut_slice()).await {
                 Ok(0) => {
                     tracing::debug!("bridge_plain: user_r EOF");
                     break;
                 }
                 Ok(n) => {
-                    tracing::trace!(n, first_hex = %hex::encode(&buf[..n.min(32)]), "bridge_plain: user_r read {} bytes", n);
+                    tracing::trace!(n, first_hex = %hex::encode(&buf.data()[..n.min(32)]), "bridge_plain: user_r read {} bytes", n);
                     if let Some(ref m) = metrics {
                         m.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
                     }
@@ -233,7 +234,7 @@ pub async fn bridge_plain(
                     break;
                 }
             };
-            let payload = &buf[..n];
+            let payload = &buf.data()[..n];
             let processed = if use_compression {
                 match encryption::compress(payload) {
                     Ok(c) => c,
@@ -264,7 +265,7 @@ pub async fn bridge_plain(
     };
     let work_to_user = async {
         tracing::debug!("bridge_plain: work_to_user starting");
-        let mut buf = vec![0u8; 65536];
+        let mut buf = PoolGuard::acquire();
         #[cfg(feature = "compression")]
         let mut decompressor = if use_compression {
             Some(encryption::SnappyDecompressor::new())
@@ -274,13 +275,13 @@ pub async fn bridge_plain(
         #[cfg(not(feature = "compression"))]
         let mut decompressor: Option<encryption::SnappyDecompressor> = None;
         loop {
-            let n = match work_r.read(&mut buf).await {
+            let n = match work_r.read(buf.as_mut_slice()).await {
                 Ok(0) => {
                     tracing::debug!("bridge_plain: work_r EOF");
                     break;
                 }
                 Ok(n) => {
-                    tracing::trace!(n, first_hex = %hex::encode(&buf[..n.min(32)]), "bridge_plain: work_r read {} bytes", n);
+                    tracing::trace!(n, first_hex = %hex::encode(&buf.data()[..n.min(32)]), "bridge_plain: work_r read {} bytes", n);
                     n
                 }
                 Err(e) => {
@@ -289,7 +290,7 @@ pub async fn bridge_plain(
                 }
             };
             let plaintext = if let Some(ref mut dec) = decompressor {
-                match dec.feed(&buf[..n]) {
+                match dec.feed(&buf.data()[..n]) {
                     Ok(p) => p,
                     #[cfg(feature = "compression")]
                     Err(e) => {
@@ -300,7 +301,7 @@ pub async fn bridge_plain(
                     Err(_) => break,
                 }
             } else {
-                buf[..n].to_vec()
+                buf.data()[..n].to_vec()
             };
             if !plaintext.is_empty() {
                 if user_w.write_all(&plaintext).await.is_err() {
@@ -506,9 +507,9 @@ pub async fn bridge_plain_rate_limited(
 ) {
     // User → Work
     let user_to_work = async {
-        let mut buf = vec![0u8; 65536];
+        let mut buf = PoolGuard::acquire();
         loop {
-            let n = match user_r.read(&mut buf).await {
+            let n = match user_r.read(buf.as_mut_slice()).await {
                 Ok(0) => break,
                 Ok(n) => {
                     if let Some(ref m) = metrics {
@@ -521,7 +522,7 @@ pub async fn bridge_plain_rate_limited(
             if let Some(ref mut lim) = write_limiter {
                 lim.consume(n).await;
             }
-            if work_w.write_all(&buf[..n]).await.is_err() { break; }
+            if work_w.write_all(&buf.data()[..n]).await.is_err() { break; }
             if work_w.flush().await.is_err() { break; }
         }
         // Signal EOF to work side so the peer knows we're done writing
@@ -530,9 +531,9 @@ pub async fn bridge_plain_rate_limited(
 
     // Work → User
     let work_to_user = async {
-        let mut buf = vec![0u8; 65536];
+        let mut buf = PoolGuard::acquire();
         loop {
-            let n = match work_r.read(&mut buf).await {
+            let n = match work_r.read(buf.as_mut_slice()).await {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(_) => break,
@@ -540,7 +541,7 @@ pub async fn bridge_plain_rate_limited(
             if let Some(ref mut lim) = read_limiter {
                 lim.consume(n).await;
             }
-            if user_w.write_all(&buf[..n]).await.is_err() { break; }
+            if user_w.write_all(&buf.data()[..n]).await.is_err() { break; }
             if let Some(ref m) = metrics {
                 m.bytes_out.fetch_add(n as u64, Ordering::Relaxed);
             }

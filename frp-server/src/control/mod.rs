@@ -3,6 +3,7 @@ mod proxy_ops;
 
 use proxy_ops::err_msg;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::net::SocketAddr;
 use std::collections::VecDeque;
 use tokio::sync::{mpsc, oneshot};
@@ -50,6 +51,12 @@ pub(super) const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Max work connections to pool beyond what the client requested (Go frp: poolCount + 10).
 const WORK_POOL_EXTRA: usize = 10;
+
+/// A pooled work connection with its pool-entry timestamp for idle expiry.
+struct PoolEntry {
+    conn: IoStream,
+    pooled_at: Instant,
+}
 
 /// A pending request from a proxy listener waiting for a work connection.
 pub(super) struct PendingRequest {
@@ -182,6 +189,7 @@ pub async fn handle_control<S>(
 
     // Register control channel. If a previous handler exists for this run_id,
     // send Shutdown to it so it stops listening (Go frp v0.69.1 compat).
+    let pool_stats = Arc::new(crate::state::PoolStats::default());
     {
         let mut map = state.run_id_to_ctl_tx.write().await;
         if let Some(old_ctl) = map.get(&run_id) {
@@ -192,6 +200,7 @@ pub async fn handle_control<S>(
             tx: internal_tx.clone(),
             client_addr: peer,
             login_time: std::time::Instant::now(),
+            pool_stats: pool_stats.clone(),
         });
     }
 
@@ -314,7 +323,7 @@ pub async fn handle_control<S>(
 
     // --- Per-client state ---
     let pool_cap = login.pool_count.unwrap_or(1).max(0) as usize + WORK_POOL_EXTRA;
-    let mut work_pool: VecDeque<IoStream> = VecDeque::new();
+    let mut work_pool: VecDeque<PoolEntry> = VecDeque::new();
     let mut pending_requests: VecDeque<PendingRequest> = VecDeque::new();
     let mut pending_udp: VecDeque<(String, Instant)> = VecDeque::new();
     let mut pending_nat_hole_sids: VecDeque<(String, String, Instant)> = VecDeque::new();
@@ -339,9 +348,24 @@ pub async fn handle_control<S>(
         while let Some(req) = pending_requests.front() {
             if req.created_at.elapsed() > PENDING_REQUEST_TIMEOUT {
                 let expired = pending_requests.pop_front().unwrap();
+                pool_stats.pending_requests.store(pending_requests.len() as i64, Ordering::Relaxed);
                 debug!(proxy_name = %expired.proxy_name, timeout = ?PENDING_REQUEST_TIMEOUT, "Pending request for proxy '{}' timed out after {:?}", expired.proxy_name, PENDING_REQUEST_TIMEOUT);
             } else {
                 break;
+            }
+        }
+
+        // Expire idle pooled connections (if timeout configured)
+        let pool_idle_timeout = state.pool_idle_timeout;
+        if pool_idle_timeout > Duration::ZERO {
+            while let Some(entry) = work_pool.front() {
+                if entry.pooled_at.elapsed() >= pool_idle_timeout {
+                    work_pool.pop_front();
+                    pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
+                    debug!(run_id = %run_id, idle_timeout = ?pool_idle_timeout, "Idle work conn expired after {:?}", pool_idle_timeout);
+                } else {
+                    break;
+                }
             }
         }
 
@@ -426,17 +450,23 @@ pub async fn handle_control<S>(
                                 while let Some(req) = pending_requests.front() {
                                     if req.created_at.elapsed() > PENDING_REQUEST_TIMEOUT {
                                         pending_requests.pop_front();
+                                        pool_stats.pending_requests.store(pending_requests.len() as i64, Ordering::Relaxed);
                                     } else {
                                         break;
                                     }
                                 }
                                 if let Some(req) = pending_requests.pop_front() {
+                                    state.pool_hits.fetch_add(1, Ordering::Relaxed);
+                                    pool_stats.pending_requests.store(pending_requests.len() as i64, Ordering::Relaxed);
+                                    pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
                                     let enc_key = reloadable.encryption_key;
                                     bridge::assign_work_to_proxy(stream, req, enc_key, state.clone(), v2).await;
                                 } else if work_pool.len() < pool_cap {
-                                    work_pool.push_back(stream);
+                                    work_pool.push_back(PoolEntry { conn: stream, pooled_at: Instant::now() });
+                                    pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
                                     debug!(run_id = %run_id, pool_size = %work_pool.len(), pool_cap = %pool_cap, "Work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
                                 } else {
+                                    state.pool_drops.fetch_add(1, Ordering::Relaxed);
                                     debug!(run_id = %run_id, pool_size = %work_pool.len(), pool_cap = %pool_cap, "Work pool full for {} ({}/{}), dropping work conn", run_id, work_pool.len(), pool_cap);
                                 }
                             }
@@ -461,16 +491,20 @@ pub async fn handle_control<S>(
                             let pt = p.as_ref().map(|p| p.proxy_type.clone()).unwrap_or_default();
                             (e, c, rh, pt)
                         };
-                        if let Some(work_conn) = work_pool.pop_front() {
+                        if let Some(entry) = work_pool.pop_front() {
+                            state.pool_hits.fetch_add(1, Ordering::Relaxed);
+                            pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
                             let enc_key = reloadable.encryption_key;
-                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type }, enc_key, state.clone(), v2).await;
+                            bridge::assign_work_to_proxy(entry.conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type }, enc_key, state.clone(), v2).await;
                         } else {
+                            state.pool_misses.fetch_add(1, Ordering::Relaxed);
                             debug!("No pooled work conn for STCP, sending ReqWorkConn");
                             if let Err(e) = write_ctl_msg(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
                                 warn!(error = %e, "Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
                             pending_requests.push_back(PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type });
+                            pool_stats.pending_requests.store(pending_requests.len() as i64, Ordering::Relaxed);
                         }
                     }
                     Some(InternalMsg::ProxyUserConn { proxy_name, user_conn, pre_read }) => {
@@ -527,16 +561,20 @@ pub async fn handle_control<S>(
                             let pt = p.as_ref().map(|p| p.proxy_type.clone()).unwrap_or_default();
                             (e, c, rh, pt)
                         };
-                        if let Some(work_conn) = work_pool.pop_front() {
+                        if let Some(entry) = work_pool.pop_front() {
+                            state.pool_hits.fetch_add(1, Ordering::Relaxed);
+                            pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
                             let enc_key = reloadable.encryption_key;
-                            bridge::assign_work_to_proxy(work_conn, PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type }, enc_key, state.clone(), v2).await;
+                            bridge::assign_work_to_proxy(entry.conn, PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type }, enc_key, state.clone(), v2).await;
                         } else {
+                            state.pool_misses.fetch_add(1, Ordering::Relaxed);
                             debug!(target_proxy = %target_proxy, "No pooled work conn, sending ReqWorkConn for {}", target_proxy);
                             if let Err(e) = write_ctl_msg(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
                                 warn!(error = %e, "Failed to send ReqWorkConn: {}", e);
                                 break;
                             }
                             pending_requests.push_back(PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type });
+                            pool_stats.pending_requests.store(pending_requests.len() as i64, Ordering::Relaxed);
                         }
                     }
                     Some(InternalMsg::UdpNeedsWorkConn { proxy_name }) => {
@@ -583,7 +621,10 @@ pub async fn handle_control<S>(
                     }
                     Some(InternalMsg::NatHoleSidOnWorkConn { sid, proxy_name }) => {
                         debug!(sid = %sid, proxy_name = %proxy_name, "Sending NatHoleSid {} for proxy {} to provider on work conn", sid, proxy_name);
-                        if let Some(mut work_conn) = work_pool.pop_front() {
+                        if let Some(entry) = work_pool.pop_front() {
+                            let mut work_conn = entry.conn;
+                            state.pool_hits.fetch_add(1, Ordering::Relaxed);
+                            pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
                             // Look up proxy flags for StartWorkConn (encryption/compression propagation)
                             let (use_enc, use_comp) = state.proxy_manager.get(&proxy_name).await
                                 .map(|p| (p.use_encryption, p.use_compression))
@@ -622,6 +663,7 @@ pub async fn handle_control<S>(
                             // Connection consumed — Go frp doesn't reuse after NatHoleSid.
                             drop(work_conn);
                         } else {
+                            state.pool_misses.fetch_add(1, Ordering::Relaxed);
                             // No pooled work conn — request one, queue sid.
                             debug!(sid = %sid, "No pooled work conn for NatHoleSid {}, requesting via ReqWorkConn", sid);
                             if let Err(e) = write_ctl_msg(&mut writer,
@@ -699,17 +741,23 @@ pub async fn handle_control<S>(
                     while let Some(req) = pending_requests.front() {
                         if req.created_at.elapsed() > PENDING_REQUEST_TIMEOUT {
                             pending_requests.pop_front();
+                            pool_stats.pending_requests.store(pending_requests.len() as i64, Ordering::Relaxed);
                         } else {
                             break;
                         }
                     }
                     if let Some(req) = pending_requests.pop_front() {
+                        state.pool_hits.fetch_add(1, Ordering::Relaxed);
+                        pool_stats.pending_requests.store(pending_requests.len() as i64, Ordering::Relaxed);
+                        pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
                         let enc_key = reloadable.encryption_key;
                         bridge::assign_work_to_proxy(io, req, enc_key, state.clone(), v2).await;
                     } else if work_pool.len() < pool_cap {
-                        work_pool.push_back(io);
+                        work_pool.push_back(PoolEntry { conn: io, pooled_at: Instant::now() });
+                        pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
                         debug!(run_id = %run_id, pool_size = %work_pool.len(), pool_cap = %pool_cap, "Yamux work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
                     } else {
+                        state.pool_drops.fetch_add(1, Ordering::Relaxed);
                         debug!(run_id = %run_id, pool_size = %work_pool.len(), pool_cap = %pool_cap, "Work pool full for {} ({}/{}), dropping yamux work conn", run_id, work_pool.len(), pool_cap);
                     }
                 }
