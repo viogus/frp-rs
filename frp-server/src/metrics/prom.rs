@@ -159,9 +159,9 @@ pub async fn sync_from_state(state: &AppState) {
     }
 
     // Pool metrics — aggregate from AppState counters + per-client PoolStats
-    POOL_HITS.set(i64::try_from(state.pool_hits.load(Ordering::Relaxed)).unwrap_or(i64::MAX));
-    POOL_MISSES.set(i64::try_from(state.pool_misses.load(Ordering::Relaxed)).unwrap_or(i64::MAX));
-    POOL_DROPS.set(i64::try_from(state.pool_drops.load(Ordering::Relaxed)).unwrap_or(i64::MAX));
+    POOL_HITS.set(i64::try_from(state.pool.hits.load(Ordering::Relaxed)).unwrap_or(i64::MAX));
+    POOL_MISSES.set(i64::try_from(state.pool.misses.load(Ordering::Relaxed)).unwrap_or(i64::MAX));
+    POOL_DROPS.set(i64::try_from(state.pool.drops.load(Ordering::Relaxed)).unwrap_or(i64::MAX));
 
     let total_pool_size: i64 = state.run_id_to_ctl_tx.read().await.values()
         .map(|ctl| ctl.pool_stats.pool_size.load(Ordering::Relaxed))

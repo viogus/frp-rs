@@ -106,6 +106,28 @@ pub struct ReloadableState {
     pub additional_auth_scopes: Vec<String>,
 }
 
+/// Aggregate work-conn pool metrics, read by Prometheus / admin API.
+#[derive(Debug, Default)]
+pub struct PoolMetrics {
+    pub hits: AtomicU64,
+    pub misses: AtomicU64,
+    pub drops: AtomicU64,
+    /// Idle timeout for pooled work conns. `Duration::ZERO` = disabled.
+    pub idle_timeout: Duration,
+}
+
+/// OIDC verification state.
+pub struct OidcState {
+    pub verifier: Option<Arc<OidcVerifier>>,
+    pub subjects: Arc<RwLock<HashMap<String, String>>>,
+}
+
+/// XTCP NAT-hole-punch coordination state.
+pub struct XtcpState {
+    pub nat_hole: Arc<Controller>,
+    pub sk_index: Arc<RwLock<HashMap<String, String>>>,
+}
+
 pub struct AppState {
     pub proxy_manager: Arc<ProxyManager>,
     /// Hot-reloadable config (auth, encryption, allow_ports).
@@ -117,7 +139,8 @@ pub struct AppState {
     pub proxy_bind_addr: String,
     pub vhost_manager: Arc<VhostManager>,
     pub vhost_http_port: u16,
-    pub sk_index: Arc<RwLock<HashMap<String, String>>>,
+    pub xtcp: XtcpState,
+    pub oidc: OidcState,
     pub dashboard_start: std::time::Instant,
     pub sub_domain_host: String,
     pub tcp_mux: bool,
@@ -125,9 +148,6 @@ pub struct AppState {
     pub heartbeat_timeout: i64,
     pub udp_packet_size: usize,
     pub tls_only: bool,
-    pub oidc_verifier: Option<Arc<OidcVerifier>>,
-    pub oidc_subjects: Arc<RwLock<HashMap<String, String>>>,
-    pub nat_hole: Arc<Controller>,
     /// Shared UDP port for SUDP proxies. When > 0, all SUDP proxies
     /// use this port instead of their individual remote_port.
     pub sudp_port: u16,
@@ -167,14 +187,9 @@ pub struct AppState {
     /// Active bridge connection counter. Incremented when a bridge task starts,
     /// decremented when it completes. The drain phase polls this counter.
     pub active_connections: AtomicU64,
-    /// Aggregate pool counters: work connection pool hits/misses/drops.
+    /// Aggregate work-conn pool metrics (hits/misses/drops/idle_timeout).
     /// Updated atomically from control handlers, read by Prometheus /admin API.
-    pub pool_hits: AtomicU64,
-    pub pool_misses: AtomicU64,
-    pub pool_drops: AtomicU64,
-    /// How long a pooled work connection can sit idle before being dropped.
-    /// Duration::ZERO = disabled (connections stay pooled indefinitely).
-    pub pool_idle_timeout: Duration,
+    pub pool: PoolMetrics,
     /// Virtual network routing table: (virtual_net, subnet) → (run_id, proxy_name).
     /// Populated by VnetRouteAdvertise messages, used to forward VnetPacket.
     #[cfg(feature = "vnet")]
@@ -202,16 +217,22 @@ impl AppState {
             vhost_manager: Arc::new(VhostManager::new()),
             vhost_http_port: 0, // set by Service::run() before starting listeners
             dashboard_start: std::time::Instant::now(),
-            sk_index: Arc::new(RwLock::new(HashMap::new())),
+            xtcp: XtcpState {
+                nat_hole: Arc::new(Controller::new(Duration::from_secs(
+                    nat_hole_analysis_data_reserve_hours.saturating_mul(3600),
+                ))),
+                sk_index: Arc::new(RwLock::new(HashMap::new())),
+            },
             sub_domain_host,
             tcp_mux,
             tcp_mux_keepalive,
             heartbeat_timeout,
             udp_packet_size,
             tls_only,
-            oidc_verifier,
-            oidc_subjects: Arc::new(RwLock::new(HashMap::new())),
-            nat_hole: Arc::new(Controller::new(Duration::from_secs(nat_hole_analysis_data_reserve_hours.saturating_mul(3600)))),
+            oidc: OidcState {
+                verifier: oidc_verifier,
+                subjects: Arc::new(RwLock::new(HashMap::new())),
+            },
             tcpmux_manager: Arc::new(TcpMuxManager::new()),
             proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
             max_ports_per_client,
@@ -234,10 +255,7 @@ impl AppState {
             tls_acceptor: Arc::new(std::sync::RwLock::new(None)),
             shutdown_token: CancellationToken::new(),
             active_connections: AtomicU64::new(0),
-            pool_hits: AtomicU64::new(0),
-            pool_misses: AtomicU64::new(0),
-            pool_drops: AtomicU64::new(0),
-            pool_idle_timeout: Duration::ZERO,
+            pool: PoolMetrics::default(),
             #[cfg(feature = "vnet")]
             vnet_routes: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "dashboard")]

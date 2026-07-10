@@ -69,7 +69,7 @@ pub(crate) async fn handle_visitor_conn_inner(
         Some(pn) => pn,
         None => {
             // Fall back to raw sk lookup for old Rust clients that send raw sk as sign_key
-            let pn = state.sk_index.read().await.get(&sign_key).cloned();
+            let pn = state.xtcp.sk_index.read().await.get(&sign_key).cloned();
             match pn {
                 Some(pn) => {
                     debug!(proxy_name = %pn, "STCP visitor auth OK (raw sk_index lookup) for proxy '{}'", pn);
@@ -261,7 +261,7 @@ pub(crate) async fn handle_nat_hole_visitor(
 
     // --- Step 1: Create session and notify provider ---
     let (session, report_rx) = match state
-        .nat_hole
+        .xtcp.nat_hole
         .create_session_with_writer(
             sid.clone(),
             proxy_name.clone(),
@@ -301,7 +301,7 @@ pub(crate) async fn handle_nat_hole_visitor(
         .is_err()
     {
         warn!(run_id = %run_id, "Provider for run_id {} has gone away", run_id);
-        state.nat_hole.remove(&transaction_id).await;
+        state.xtcp.nat_hole.remove(&transaction_id).await;
         return;
     }
 
@@ -346,7 +346,7 @@ pub(crate) async fn handle_nat_hole_visitor(
             // Return the writer to the session
             *session.visitor_writer.lock().await = taken_writer;
         }
-        state.nat_hole.remove(&sid).await;
+        state.xtcp.nat_hole.remove(&sid).await;
         drop(reader);
         return;
     }
@@ -357,7 +357,7 @@ pub(crate) async fn handle_nat_hole_visitor(
         Some(m) => m,
         None => {
             warn!(sid = %sid, "NatHole session {}: no client message after notify", sid);
-            state.nat_hole.remove(&sid).await;
+            state.xtcp.nat_hole.remove(&sid).await;
             drop(reader);
             return;
         }
@@ -384,7 +384,7 @@ pub(crate) async fn handle_nat_hole_visitor(
     let (v_resp, c_resp) = if let (Some(ref vf), Some(ref cf)) = (&v_feature, &c_feature) {
         let key = nathole_ctrl::gen_analysis_key(cf, vf);
         let (mode, index, c_behavior, v_behavior) =
-            state.nat_hole.analyzer.get_recommend_behaviors(&key, cf, vf);
+            state.xtcp.nat_hole.analyzer.get_recommend_behaviors(&key, cf, vf);
         *session.selected_index.lock().await = Some(index);
 
         let timeout_ms = c_behavior.send_delay_ms.max(v_behavior.send_delay_ms) + 5000;
@@ -474,11 +474,11 @@ pub(crate) async fn handle_nat_hole_visitor(
         }
         Ok(Err(_)) => {
             debug!(sid = %sid, "NatHole session {}: provider dropped without report", sid);
-            state.nat_hole.remove(&sid).await;
+            state.xtcp.nat_hole.remove(&sid).await;
         }
         Err(_) => {
             warn!(sid = %sid, "NatHole session {}: timed out waiting for provider report", sid);
-            state.nat_hole.remove(&sid).await;
+            state.xtcp.nat_hole.remove(&sid).await;
             drop(reader);
         }
     }
@@ -557,8 +557,8 @@ pub(crate) async fn handle_work_conn_inner(
         .additional_auth_scopes.iter().any(|s| s == "NewWorkConns");
     let nwc_auth_result = if !requires_nwc_auth {
         Ok(())
-    } else if let Some(ref verifier) = state.oidc_verifier {
-        let expected_sub = state.oidc_subjects.read().await
+    } else if let Some(ref verifier) = state.oidc.verifier {
+        let expected_sub = state.oidc.subjects.read().await
             .get(&run_id).cloned().unwrap_or_default();
         verifier.verify_new_work_conn(
             msg.privilege_key.as_deref().unwrap_or(""),

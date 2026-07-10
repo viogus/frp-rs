@@ -185,9 +185,9 @@ async fn build_status_response(state: &Arc<AppState>) -> StatusResponse {
         uptime_secs: uptime,
         client_count,
         proxy_count: proxies.len(),
-        pool_hits: state.pool_hits.load(Ordering::Relaxed),
-        pool_misses: state.pool_misses.load(Ordering::Relaxed),
-        pool_drops: state.pool_drops.load(Ordering::Relaxed),
+        pool_hits: state.pool.hits.load(Ordering::Relaxed),
+        pool_misses: state.pool.misses.load(Ordering::Relaxed),
+        pool_drops: state.pool.drops.load(Ordering::Relaxed),
         pool_size: total_pool_size,
         pool_pending: total_pending,
     }
@@ -529,7 +529,7 @@ async fn handle_store_proxy_delete(
     // Clean up sk_index
     if let Some(ref sk) = proxy.sk {
         if !sk.is_empty() {
-            state.sk_index.write().await.remove(sk);
+            state.xtcp.sk_index.write().await.remove(sk);
         }
     }
     // Clean up VHost and TCPMux routes
@@ -563,7 +563,7 @@ async fn handle_proxies_delete(
             }
             if let Some(ref sk) = proxy.sk {
                 if !sk.is_empty() {
-                    state.sk_index.write().await.remove(sk);
+                    state.xtcp.sk_index.write().await.remove(sk);
                 }
             }
             state.vhost_manager.unregister(name).await;

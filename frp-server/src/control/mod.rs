@@ -88,11 +88,11 @@ where
     W: tokio::io::AsyncWriteExt + Unpin,
 {
     if let Some(entry) = work_pool.pop_front() {
-        state.pool_hits.fetch_add(1, Ordering::Relaxed);
+        state.pool.hits.fetch_add(1, Ordering::Relaxed);
         pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
         bridge::assign_work_to_proxy(entry.conn, req, enc_key, state.clone(), v2).await;
     } else {
-        state.pool_misses.fetch_add(1, Ordering::Relaxed);
+        state.pool.misses.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = write_ctl_msg(writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
             warn!(error = %e, "Failed to send ReqWorkConn: {}", e);
             return Err(());
@@ -129,7 +129,7 @@ pub async fn handle_control<S>(
     }
 
     // --- Authenticate ---
-    let oidc_subject: Option<String> = if let Some(ref verifier) = state.oidc_verifier {
+    let oidc_subject: Option<String> = if let Some(ref verifier) = state.oidc.verifier {
         let token = login.privilege_key.as_deref().unwrap_or("");
         match verifier.verify_login(token).await {
             Ok(oidc_token) => {
@@ -191,7 +191,7 @@ pub async fn handle_control<S>(
 
     // Store OIDC subject for ping/NWC verification
     if let Some(ref sub) = oidc_subject {
-        state.oidc_subjects.write().await.insert(run_id.clone(), sub.clone());
+        state.oidc.subjects.write().await.insert(run_id.clone(), sub.clone());
     }
 
     // --- Server plugin: login hook ---
@@ -389,7 +389,7 @@ pub async fn handle_control<S>(
         }
 
         // Expire idle pooled connections (if timeout configured)
-        let pool_idle_timeout = state.pool_idle_timeout;
+        let pool_idle_timeout = state.pool.idle_timeout;
         if pool_idle_timeout > Duration::ZERO {
             while let Some(entry) = work_pool.front() {
                 if entry.pooled_at.elapsed() >= pool_idle_timeout {
@@ -489,7 +489,7 @@ pub async fn handle_control<S>(
                                     }
                                 }
                                 if let Some(req) = pending_requests.pop_front() {
-                                    state.pool_hits.fetch_add(1, Ordering::Relaxed);
+                                    state.pool.hits.fetch_add(1, Ordering::Relaxed);
                                     pool_stats.pending_requests.store(pending_requests.len() as i64, Ordering::Relaxed);
                                     pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
                                     let enc_key = reloadable.encryption_key;
@@ -499,7 +499,7 @@ pub async fn handle_control<S>(
                                     pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
                                     debug!(run_id = %run_id, pool_size = %work_pool.len(), pool_cap = %pool_cap, "Work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
                                 } else {
-                                    state.pool_drops.fetch_add(1, Ordering::Relaxed);
+                                    state.pool.drops.fetch_add(1, Ordering::Relaxed);
                                     debug!(run_id = %run_id, pool_size = %work_pool.len(), pool_cap = %pool_cap, "Work pool full for {} ({}/{}), dropping work conn", run_id, work_pool.len(), pool_cap);
                                 }
                             }
@@ -638,7 +638,7 @@ pub async fn handle_control<S>(
                         debug!(sid = %sid, proxy_name = %proxy_name, "Sending NatHoleSid {} for proxy {} to provider on work conn", sid, proxy_name);
                         if let Some(entry) = work_pool.pop_front() {
                             let mut work_conn = entry.conn;
-                            state.pool_hits.fetch_add(1, Ordering::Relaxed);
+                            state.pool.hits.fetch_add(1, Ordering::Relaxed);
                             pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
                             // Look up proxy flags for StartWorkConn (encryption/compression propagation)
                             let (use_enc, use_comp) = state.proxy_manager.get(&proxy_name).await
@@ -678,7 +678,7 @@ pub async fn handle_control<S>(
                             // Connection consumed — Go frp doesn't reuse after NatHoleSid.
                             drop(work_conn);
                         } else {
-                            state.pool_misses.fetch_add(1, Ordering::Relaxed);
+                            state.pool.misses.fetch_add(1, Ordering::Relaxed);
                             // No pooled work conn — request one, queue sid.
                             debug!(sid = %sid, "No pooled work conn for NatHoleSid {}, requesting via ReqWorkConn", sid);
                             if let Err(e) = write_ctl_msg(&mut writer,
@@ -762,7 +762,7 @@ pub async fn handle_control<S>(
                         }
                     }
                     if let Some(req) = pending_requests.pop_front() {
-                        state.pool_hits.fetch_add(1, Ordering::Relaxed);
+                        state.pool.hits.fetch_add(1, Ordering::Relaxed);
                         pool_stats.pending_requests.store(pending_requests.len() as i64, Ordering::Relaxed);
                         pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
                         let enc_key = reloadable.encryption_key;
@@ -772,7 +772,7 @@ pub async fn handle_control<S>(
                         pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
                         debug!(run_id = %run_id, pool_size = %work_pool.len(), pool_cap = %pool_cap, "Yamux work conn pooled for {} (pool size: {}/{})", run_id, work_pool.len(), pool_cap);
                     } else {
-                        state.pool_drops.fetch_add(1, Ordering::Relaxed);
+                        state.pool.drops.fetch_add(1, Ordering::Relaxed);
                         debug!(run_id = %run_id, pool_size = %work_pool.len(), pool_cap = %pool_cap, "Work pool full for {} ({}/{}), dropping yamux work conn", run_id, work_pool.len(), pool_cap);
                     }
                 }
@@ -886,7 +886,7 @@ pub async fn handle_control<S>(
                             // Clean up STCP sk_index
                             if let Some(ref sk) = info.sk {
                                 if !sk.is_empty() {
-                                    state.sk_index.write().await.remove(sk);
+                                    state.xtcp.sk_index.write().await.remove(sk);
                                 }
                             }
                             // Clean up VHost routes
@@ -935,16 +935,16 @@ pub async fn handle_control<S>(
                             "Received NatHoleClient from provider: txn={}, addrs={:?}",
                             client_msg.transaction_id, client_msg.mapped_addrs
                         );
-                        state.nat_hole.handle_client(client_msg.clone()).await;
+                        state.xtcp.nat_hole.handle_client(client_msg.clone()).await;
                     }
                     Ok(FrpMessage::NatHoleSid(ref sid_msg)) => {
                         debug!(sid = ?sid_msg.sid, "Received NatHoleSid from provider: {:?}", sid_msg.sid);
                         if let Some(ref sid) = sid_msg.sid {
                             let provider_addr = peer.as_ref().map(|a| a.to_string());
                             // Try control-channel path first (Go frp compat).
-                            if state.nat_hole.forward_sid_via_ctl(sid, provider_addr.clone()).await {
+                            if state.xtcp.nat_hole.forward_sid_via_ctl(sid, provider_addr.clone()).await {
                                 debug!(sid = %sid, "Forwarded NatHoleSid via control channel for {}", sid);
-                            } else if let Some(mut writer) = state.nat_hole.take_writer(sid).await {
+                            } else if let Some(mut writer) = state.xtcp.nat_hole.take_writer(sid).await {
                                 // Fallback: accept-loop writer path
                                 let forward = FrpMessage::NatHoleSid(msg::NatHoleSid {
                                     sid: Some(sid.clone()),
@@ -955,7 +955,7 @@ pub async fn handle_control<S>(
                                 } else {
                                     warn!(sid = %sid, "Failed to write NatHoleSid to visitor for session {}", sid);
                                 }
-                                state.nat_hole.return_writer(sid, writer).await;
+                                state.xtcp.nat_hole.return_writer(sid, writer).await;
                             } else {
                                 warn!(sid = %sid, "NatHoleSid for unknown session {}", sid);
                             }
@@ -969,7 +969,7 @@ pub async fn handle_control<S>(
                         // for TCP simultaneous open.
                         let tid = &resp_msg.transaction_id;
                         // Try control-channel path first.
-                        if state.nat_hole.forward_nat_hole_resp_via_ctl(
+                        if state.xtcp.nat_hole.forward_nat_hole_resp_via_ctl(
                             tid,
                             resp_msg.error.clone(),
                             resp_msg.sid.clone(),
@@ -978,7 +978,7 @@ pub async fn handle_control<S>(
                             resp_msg.assisted_addrs.clone(),
                         ).await {
                             debug!(tid = %tid, "Forwarded NatHoleResp via control channel for {}", tid);
-                        } else if let Some(mut writer) = state.nat_hole.take_writer(tid).await {
+                        } else if let Some(mut writer) = state.xtcp.nat_hole.take_writer(tid).await {
                             let forward = FrpMessage::NatHoleResp(msg::NatHoleResp {
                                 transaction_id: tid.clone(),
                                 error: resp_msg.error.clone(),
@@ -989,7 +989,7 @@ pub async fn handle_control<S>(
                                 ..Default::default()
                             });
                             let _ = write_ctl_msg(&mut writer, &forward, v2).await;
-                            state.nat_hole.return_writer(tid, writer).await;
+                            state.xtcp.nat_hole.return_writer(tid, writer).await;
                         } else {
                             warn!(tid = %tid, "NatHoleResp for unknown session {}", tid);
                         }
@@ -998,7 +998,7 @@ pub async fn handle_control<S>(
                         // with its discovered addresses. We store them as if they
                         // arrived via NatHoleClient so the accept-loop path can
                         // build the combined NatHoleResp for both sides.
-                        state.nat_hole.handle_client(msg::NatHoleClient {
+                        state.xtcp.nat_hole.handle_client(msg::NatHoleClient {
                             sid: resp_msg.sid.clone().or_else(|| Some(tid.clone())),
                             transaction_id: tid.clone(),
                             proxy_name: String::new(),
@@ -1012,16 +1012,16 @@ pub async fn handle_control<S>(
                         debug!(sid = ?report_msg.sid, "Received NatHoleReport from provider: {:?}", report_msg.sid);
                         if let Some(ref sid) = report_msg.sid {
                             // Try control-channel path first (Go frp compat).
-                            if !state.nat_hole.forward_report_via_ctl(sid).await {
+                            if !state.xtcp.nat_hole.forward_report_via_ctl(sid).await {
                                 // Fallback: accept-loop writer path
-                                if let Some(mut writer) = state.nat_hole.take_writer(sid).await {
+                                if let Some(mut writer) = state.xtcp.nat_hole.take_writer(sid).await {
                                     let forward = FrpMessage::NatHoleReport(msg::NatHoleReport {
                                         sid: Some(sid.clone()),
                                     });
                                     let _ = write_ctl_msg(&mut writer, &forward, v2).await;
                                 }
                             }
-                            state.nat_hole.complete(sid).await;
+                            state.xtcp.nat_hole.complete(sid).await;
                         }
                     }
                     Ok(FrpMessage::Ping(ref ping_msg)) => {
@@ -1031,8 +1031,8 @@ pub async fn handle_control<S>(
                             .additional_auth_scopes.iter().any(|s| s == "HeartBeats");
                         let ping_auth_result = if !requires_ping_auth {
                             Ok(())
-                        } else if let Some(ref verifier) = state.oidc_verifier {
-                            let expected_sub = state.oidc_subjects.read().await
+                        } else if let Some(ref verifier) = state.oidc.verifier {
+                            let expected_sub = state.oidc.subjects.read().await
                                 .get(&run_id).cloned().unwrap_or_default();
                             verifier.verify_ping(
                                 ping_msg.privilege_key.as_deref().unwrap_or(""),
@@ -1176,7 +1176,7 @@ pub async fn handle_control<S>(
                         };
 
                         // Create session via control-channel path
-                        let (session, report_rx) = match state.nat_hole
+                        let (session, report_rx) = match state.xtcp.nat_hole
                             .create_session_with_ctl(
                                 transaction_id.clone(),
                                 proxy_name.clone(),
@@ -1205,14 +1205,14 @@ pub async fn handle_control<S>(
                             proxy_name: proxy_name.clone(),
                         }).is_err() {
                             warn!(provider_run_id = %provider_run_id, "Provider for run_id {} has gone away", provider_run_id);
-                            state.nat_hole.remove(&transaction_id).await;
+                            state.xtcp.nat_hole.remove(&transaction_id).await;
                             continue;
                         }
 
                         // Spawn task for full Go-compat analysis flow.
                         // Waits for provider's NatHoleClient on control, runs NAT analysis,
                         // and sends NatHoleResp to both sides.
-                        let nat_hole = state.nat_hole.clone();
+                        let nat_hole = state.xtcp.nat_hole.clone();
                         let visitor_tx = internal_tx.clone();
                         let provider_tx = provider_ctl.tx.clone();
                         let tid = transaction_id.clone();

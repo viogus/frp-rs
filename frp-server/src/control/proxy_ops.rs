@@ -233,7 +233,7 @@ pub(crate) async fn handle_new_proxy(
                         } else {
                             format!("{}:{}", vn, sk)
                         };
-                        state.sk_index.write().await.insert(sk_key, np.proxy_name.clone());
+                        state.xtcp.sk_index.write().await.insert(sk_key, np.proxy_name.clone());
                         info!(proxy_name = %np.proxy_name, vn = %vn, "STCP/XTCP proxy '{}' registered with sk{}",
                             np.proxy_name,
                             if vn.is_empty() { String::new() } else { format!(" (virtual_net: {vn})") });
@@ -557,7 +557,7 @@ pub(crate) async fn unregister_control(state: &Arc<AppState>, run_id: &str, skip
                 } else {
                     sk.clone()
                 };
-                state.sk_index.write().await.remove(&sk_key);
+                state.xtcp.sk_index.write().await.remove(&sk_key);
             }
         }
     }
@@ -578,7 +578,7 @@ pub(crate) async fn unregister_control(state: &Arc<AppState>, run_id: &str, skip
     // pointing to this client's proxies must be removed to prevent
     // unbounded memory growth.
     {
-        let mut subjects = state.oidc_subjects.write().await;
+        let mut subjects = state.oidc.subjects.write().await;
         subjects.retain(|_, proxy_name| !proxies.iter().any(|p| &p.name == proxy_name));
     }
 }

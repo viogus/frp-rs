@@ -1242,7 +1242,7 @@ impl Service {
         // Sessions should normally be completed by the provider's NatHoleReport,
         // but if the provider crashes or the network drops, this ensures sessions
         // older than 2 minutes don't leak memory.
-        let nat_hole = self.state.nat_hole.clone();
+        let nat_hole = self.state.xtcp.nat_hole.clone();
         let nat_shutdown_token = self.state.shutdown_token.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
