@@ -962,6 +962,58 @@ fn toml_to_json(v: toml::Value) -> serde_json::Value {
     }
 }
 
+/// Move matching top-level keys into a sub-table, optionally stripping known prefixes.
+/// e.g. `flatten_to_table(t, &["log_file","log_level"], "log", &["log_"])`
+fn flatten_to_table(
+    table: &mut toml::Table,
+    keys: &[&str],
+    target: &str,
+    strip_prefixes: &[&str],
+) {
+    let mut items: Vec<(String, toml::Value)> = Vec::new();
+    for &key in keys {
+        if let Some(v) = table.remove(key) {
+            let sub_key = strip_prefixes
+                .iter()
+                .find_map(|p| key.strip_prefix(p))
+                .unwrap_or(key)
+                .to_string();
+            items.push((sub_key, v));
+        }
+    }
+    if !items.is_empty() {
+        let target_table = table
+            .entry(target.to_string())
+            .or_insert_with(|| toml::Value::Table(Default::default()));
+        if let toml::Value::Table(ref mut t) = target_table {
+            for (k, v) in items {
+                t.entry(k).or_insert(v);
+            }
+        }
+    }
+}
+
+/// Generic config loader shared by `load_server_config` and `load_client_config`.
+fn load_config_from_file<C: serde::de::DeserializeOwned>(
+    path: &str,
+    strict_config: bool,
+    known_keys: fn() -> std::collections::HashSet<&'static str>,
+    normalize: fn(&mut toml::Value),
+) -> Result<C, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    let format = detect_format(path);
+    let mut value: toml::Value = parse_to_toml_value(&content, format)?;
+    let base_dir = Path::new(path).parent().unwrap_or(Path::new("."));
+    process_includes(&mut value, base_dir)?;
+    normalize(&mut value);
+    if strict_config {
+        run_strict_check(&value, &known_keys(), path)?;
+    }
+    let json_value = toml_to_json(value);
+    let cfg: C = serde_json::from_value(json_value)?;
+    Ok(cfg)
+}
+
 #[allow(clippy::collapsible_match)]
 fn normalize_server_config(value: &mut toml::Value) {
     use toml::Value;
@@ -983,73 +1035,10 @@ fn normalize_server_config(value: &mut toml::Value) {
             }
         }
 
-        // Flatten auth_* fields into auth table
-        let mut auth_items: Vec<(String, Value)> = Vec::new();
-        for key in ["auth_method", "auth_token", "token", "oidc_issuer", "oidc_audience", "oidc_token_endpoint"] {
-            if let Some(v) = table.remove(key) {
-                let sub_key = key.strip_prefix("auth_").or_else(|| key.strip_prefix("oidc_")).unwrap_or(key);
-                auth_items.push((sub_key.to_string(), v));
-            }
-        }
-        if !auth_items.is_empty() {
-            let auth_table = table.entry("auth").or_insert_with(|| Value::Table(Default::default()));
-            if let Value::Table(ref mut t) = auth_table {
-                for (k, v) in auth_items {
-                    t.entry(k).or_insert(v);
-                }
-            }
-        }
-
-        // Flatten log_* fields into log table
-        let mut log_items: Vec<(String, Value)> = Vec::new();
-        for key in ["log_file", "log_level", "log_max_days"] {
-            if let Some(v) = table.remove(key) {
-                let sub_key = key.strip_prefix("log_").unwrap_or(key);
-                log_items.push((sub_key.to_string(), v));
-            }
-        }
-        if !log_items.is_empty() {
-            let log_table = table.entry("log").or_insert_with(|| Value::Table(Default::default()));
-            if let Value::Table(ref mut t) = log_table {
-                for (k, v) in log_items {
-                    t.entry(k).or_insert(v);
-                }
-            }
-        }
-
-        // Flatten web_server_* fields into web_server table
-        let mut ws_items: Vec<(String, Value)> = Vec::new();
-        for key in ["web_server_addr", "web_server_port", "web_server_user", "web_server_password", "web_server_enable_prometheus", "enable_prometheus", "web_server_tls_cert_file", "web_server_tls_key_file"] {
-            if let Some(v) = table.remove(key) {
-                let sub_key = key.strip_prefix("web_server_").unwrap_or(key);
-                ws_items.push((sub_key.to_string(), v));
-            }
-        }
-        if !ws_items.is_empty() {
-            let ws_table = table.entry("web_server").or_insert_with(|| Value::Table(Default::default()));
-            if let Value::Table(ref mut t) = ws_table {
-                for (k, v) in ws_items {
-                    t.entry(k).or_insert(v);
-                }
-            }
-        }
-
-        // Flatten transport_* fields into transport table
-        // Also handle flat tcp_mux, tcp_mux_keepalive_interval at top level
-        let mut tr_items: Vec<(String, Value)> = Vec::new();
-        for key in ["tcp_mux", "tcp_mux_keepalive_interval"] {
-            if let Some(v) = table.remove(key) {
-                tr_items.push((key.to_string(), v));
-            }
-        }
-        if !tr_items.is_empty() {
-            let tr_table = table.entry("transport").or_insert_with(|| Value::Table(Default::default()));
-            if let Value::Table(ref mut t) = tr_table {
-                for (k, v) in tr_items {
-                    t.entry(k).or_insert(v);
-                }
-            }
-        }
+        flatten_to_table(table, &["auth_method", "auth_token", "token", "oidc_issuer", "oidc_audience", "oidc_token_endpoint"], "auth", &["auth_", "oidc_"]);
+        flatten_to_table(table, &["log_file", "log_level", "log_max_days"], "log", &["log_"]);
+        flatten_to_table(table, &["web_server_addr", "web_server_port", "web_server_user", "web_server_password", "web_server_enable_prometheus", "enable_prometheus", "web_server_tls_cert_file", "web_server_tls_key_file"], "web_server", &["web_server_"]);
+        flatten_to_table(table, &["tcp_mux", "tcp_mux_keepalive_interval"], "transport", &[]);
 
         // Normalize camelCase section names to snake_case
         if let Some(ssh_section) = table.remove("sshTunnelGateway") {
@@ -1109,21 +1098,7 @@ fn normalize_client_config(value: &mut toml::Value) {
         }
 
         // Flatten log_* fields into log table (client side)
-        let mut log_items: Vec<(String, Value)> = Vec::new();
-        for key in ["log_file", "log_level", "log_max_days"] {
-            if let Some(v) = table.remove(key) {
-                let sub_key = key.strip_prefix("log_").unwrap_or(key);
-                log_items.push((sub_key.to_string(), v));
-            }
-        }
-        if !log_items.is_empty() {
-            let log_table = table.entry("log").or_insert_with(|| Value::Table(Default::default()));
-            if let Value::Table(ref mut t) = log_table {
-                for (k, v) in log_items {
-                    t.entry(k).or_insert(v);
-                }
-            }
-        }
+        flatten_to_table(table, &["log_file", "log_level", "log_max_days"], "log", &["log_"]);
     }
 }
 
@@ -1133,18 +1108,7 @@ pub fn load_server_config(
     path: &str,
     strict_config: bool,
 ) -> Result<ServerConfig, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)?;
-    let format = detect_format(path);
-    let mut value: toml::Value = parse_to_toml_value(&content, format)?;
-    let base_dir = Path::new(path).parent().unwrap_or(Path::new("."));
-    process_includes(&mut value, base_dir)?;
-    normalize_server_config(&mut value);
-    if strict_config {
-        run_strict_check(&value, &known_server_keys(), path)?;
-    }
-    let json_value = toml_to_json(value);
-    let cfg: ServerConfig = serde_json::from_value(json_value)?;
-    Ok(cfg)
+    load_config_from_file::<ServerConfig>(path, strict_config, known_server_keys, normalize_server_config)
 }
 
 /// Load a client configuration from a file path, auto-detecting format by extension.
@@ -1153,17 +1117,7 @@ pub fn load_client_config(
     path: &str,
     strict_config: bool,
 ) -> Result<ClientConfig, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)?;
-    let format = detect_format(path);
-    let mut value: toml::Value = parse_to_toml_value(&content, format)?;
-    let base_dir = Path::new(path).parent().unwrap_or(Path::new("."));
-    process_includes(&mut value, base_dir)?;
-    normalize_client_config(&mut value);
-    if strict_config {
-        run_strict_check(&value, &known_client_keys(), path)?;
-    }
-    let cfg: ClientConfig = serde_json::from_value(toml_to_json(value))?;
-    Ok(cfg)
+    load_config_from_file::<ClientConfig>(path, strict_config, known_client_keys, normalize_client_config)
 }
 
 /// Process `includes` directives in a TOML config: for each glob pattern,
@@ -1500,10 +1454,14 @@ fn infer_ini_value(s: &str) -> toml::Value {
 
 // ─── Strict config mode ──────────────────────────────────────────────
 
+fn known_set_from(keys: &[&'static str]) -> std::collections::HashSet<&'static str> {
+    let mut set = std::collections::HashSet::new();
+    set.extend(keys);
+    set
+}
+
 fn known_server_keys() -> std::collections::HashSet<&'static str> {
-    use std::collections::HashSet;
-    let mut keys = HashSet::new();
-    keys.extend([
+    known_set_from(&[
         "bind_addr", "bind_port", "proxy_bind_addr", "vhost_http_port",
         "vhost_https_port", "kcp_bind_port", "quic_bind_port", "sudp_port",
         "tcpmux_httpconnect_port", "sub_domain_host", "websocket_port",
@@ -1514,9 +1472,7 @@ fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "detailed_errors_to_client", "tcp_mux_passthrough", "udp_packet_size",
         "http_plugins", "feature", "includes", "ssh_tunnel_gateway",
         "nat_hole_analysis_data_reserve_hours", "observability",
-    ]);
-    // Go compat normalization aliases
-    keys.extend([
+        // Go compat normalization aliases
         "common", "auth_method", "auth_token", "token", "oidc_issuer",
         "oidc_audience", "oidc_token_endpoint", "log_file", "log_level",
         "log_max_days", "web_server_addr", "web_server_port",
@@ -1527,14 +1483,11 @@ fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "vhostHTTPPort", "vhostHTTPSPort", "kcpBindPort", "quicBindPort",
         "sudpPort", "tcpmuxHTTPConnectPort", "proxyBindAddr",
         "websocketPort",
-    ]);
-    keys
+    ])
 }
 
 fn known_client_keys() -> std::collections::HashSet<&'static str> {
-    use std::collections::HashSet;
-    let mut keys = HashSet::new();
-    keys.extend([
+    known_set_from(&[
         "server_addr", "server_port", "transport_protocol", "token",
         "auth", "user", "client_id", "metas", "metadatas",
         "proxy_url", "proxyURL", "nat_hole_stun_server", "natHoleStunServer",
@@ -1549,8 +1502,7 @@ fn known_client_keys() -> std::collections::HashSet<&'static str> {
         "feature", "common", "protocol", "tls_trusted_ca_file",
         "serverAddr", "serverPort", "transport",
         "log_file", "log_level", "log_max_days", "observability",
-    ]);
-    keys
+    ])
 }
 
 fn run_strict_check(
