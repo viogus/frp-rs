@@ -70,6 +70,39 @@ pub(super) struct PendingRequest {
     proxy_type: String,
 }
 
+/// Assign `req` to a pooled work connection if one is available (pool hit),
+/// otherwise record a miss, send `ReqWorkConn`, and queue the request.
+/// Returns `Err(())` if the `ReqWorkConn` write failed — caller must break.
+#[allow(clippy::too_many_arguments)]
+async fn assign_or_queue<W>(
+    work_pool: &mut VecDeque<PoolEntry>,
+    pending_requests: &mut VecDeque<PendingRequest>,
+    pool_stats: &crate::state::PoolStats,
+    state: &Arc<AppState>,
+    writer: &mut W,
+    req: PendingRequest,
+    enc_key: [u8; 16],
+    v2: bool,
+) -> Result<(), ()>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
+    if let Some(entry) = work_pool.pop_front() {
+        state.pool_hits.fetch_add(1, Ordering::Relaxed);
+        pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
+        bridge::assign_work_to_proxy(entry.conn, req, enc_key, state.clone(), v2).await;
+    } else {
+        state.pool_misses.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = write_ctl_msg(writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
+            warn!(error = %e, "Failed to send ReqWorkConn: {}", e);
+            return Err(());
+        }
+        pending_requests.push_back(req);
+        pool_stats.pending_requests.store(pending_requests.len() as i64, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
 /// Handle a control connection from a frpc client.
 /// The login message has already been consumed from the stream.
 /// `peer` is passed separately because generic stream types don't have peer_addr().
@@ -491,21 +524,12 @@ pub async fn handle_control<S>(
                             let pt = p.as_ref().map(|p| p.proxy_type.clone()).unwrap_or_default();
                             (e, c, rh, pt)
                         };
-                        if let Some(entry) = work_pool.pop_front() {
-                            state.pool_hits.fetch_add(1, Ordering::Relaxed);
-                            pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
-                            let enc_key = reloadable.encryption_key;
-                            bridge::assign_work_to_proxy(entry.conn, PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type }, enc_key, state.clone(), v2).await;
-                        } else {
-                            state.pool_misses.fetch_add(1, Ordering::Relaxed);
-                            debug!("No pooled work conn for STCP, sending ReqWorkConn");
-                            if let Err(e) = write_ctl_msg(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
-                                warn!(error = %e, "Failed to send ReqWorkConn: {}", e);
-                                break;
-                            }
-                            pending_requests.push_back(PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type });
-                            pool_stats.pending_requests.store(pending_requests.len() as i64, Ordering::Relaxed);
-                        }
+                        if assign_or_queue(
+                            &mut work_pool, &mut pending_requests, &pool_stats, &state,
+                            &mut writer,
+                            PendingRequest { proxy_name, user_conn: visitor_conn, pre_read: Vec::new(), use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type },
+                            reloadable.encryption_key, v2,
+                        ).await.is_err() { break; }
                     }
                     Some(InternalMsg::ProxyUserConn { proxy_name, user_conn, pre_read }) => {
                         // NewUserConn plugin hook — control-enabled plugins can reject
@@ -561,21 +585,12 @@ pub async fn handle_control<S>(
                             let pt = p.as_ref().map(|p| p.proxy_type.clone()).unwrap_or_default();
                             (e, c, rh, pt)
                         };
-                        if let Some(entry) = work_pool.pop_front() {
-                            state.pool_hits.fetch_add(1, Ordering::Relaxed);
-                            pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
-                            let enc_key = reloadable.encryption_key;
-                            bridge::assign_work_to_proxy(entry.conn, PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type }, enc_key, state.clone(), v2).await;
-                        } else {
-                            state.pool_misses.fetch_add(1, Ordering::Relaxed);
-                            debug!(target_proxy = %target_proxy, "No pooled work conn, sending ReqWorkConn for {}", target_proxy);
-                            if let Err(e) = write_ctl_msg(&mut writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
-                                warn!(error = %e, "Failed to send ReqWorkConn: {}", e);
-                                break;
-                            }
-                            pending_requests.push_back(PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type });
-                            pool_stats.pending_requests.store(pending_requests.len() as i64, Ordering::Relaxed);
-                        }
+                        if assign_or_queue(
+                            &mut work_pool, &mut pending_requests, &pool_stats, &state,
+                            &mut writer,
+                            PendingRequest { proxy_name: target_proxy, user_conn, pre_read, use_encryption: enc, use_compression: comp, created_at: Instant::now(), response_headers, proxy_type },
+                            reloadable.encryption_key, v2,
+                        ).await.is_err() { break; }
                     }
                     Some(InternalMsg::UdpNeedsWorkConn { proxy_name }) => {
                         debug!(proxy_name = %proxy_name, "UDP proxy '{}' needs work connection", proxy_name);
