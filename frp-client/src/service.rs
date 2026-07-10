@@ -396,43 +396,10 @@ impl Service {
         let health_cancels: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-        // Spawn health checks once, outside reconnect loop (they are per-proxy, not per-session)
-        for p in &proxies {
-            let hc_type = p.health_check_type.clone();
-            if hc_type.is_empty() {
-                continue;
-            }
-            if hc_type != "tcp" && hc_type != "http" {
-                warn!(health_check_type = %hc_type, proxy_name = %p.name, "Health check type '{}' not yet supported for '{}'", hc_type, p.name);
-                continue;
-            }
-            let la = self.proxy_info_map.read().await
-                .get(&p.name)
-                .map(|info| info.local_addr.clone())
-                .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
-            let pn = p.name.clone();
-            let interval = std::time::Duration::from_secs(
-                p.health_check_interval_seconds.max(10)
-            );
-            let timeout = std::time::Duration::from_secs(
-                p.health_check_timeout_seconds.max(3)
-            );
-            let max_failed = p.health_check_max_failed.max(1);
-            let tx = health_tx.clone();
-            let hc_url = if hc_type == "http" { p.health_check_url.clone() } else { String::new() };
-            let hc_headers = p.health_check_http_headers.clone();
-            let cancel = Arc::new(AtomicBool::new(false));
-            {
-                let mut cancels = health_cancels.lock().unwrap();
-                cancels.insert(pn.clone(), cancel.clone());
-            }
-            tokio::spawn(async move {
-                crate::health::run_health_check(pn, la, hc_type, hc_url, hc_headers, interval, timeout, max_failed, tx, cancel).await;
-            });
-        }
+        self.spawn_health_checks(&proxies, &health_tx, &health_cancels).await;
 
         // Start admin HTTP server if configured
-        let reload_tx = self.reload_tx.clone();
+        let _reload_tx = self.reload_tx.clone();
         let mut reload_rx = self.reload_rx.lock().unwrap().take()
             .expect("reload_rx already taken — run() called twice?");
         let mut xtcp_rx = self.xtcp_rx.lock().unwrap().take()
@@ -441,44 +408,11 @@ impl Service {
             .expect("visitor_rx already taken — run() called twice?");
         let xtcp_tx = self.xtcp_tx.clone();
         let nat_hole_stun_server = self.nat_hole_stun_server.clone();
-        let (stop_tx, mut stop_rx) = mpsc::unbounded_channel::<()>();
+        let (_stop_tx, mut stop_rx) = mpsc::unbounded_channel::<()>();
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         #[cfg(feature = "admin")]
-        if self.cfg.web_server.port > 0 {
-            let admin_addr = frp_core::format_socket_addr(
-                &self.cfg.web_server.addr,
-                self.cfg.web_server.port,
-            );
-            let admin_state = AdminState {
-                proxy_metrics: self.proxy_metrics.clone(),
-                proxies: self.proxy_info_map.clone(),
-                reload_tx: reload_tx.clone(),
-                stop_tx: stop_tx.clone(),
-                config_path: self.config_file.clone(),
-            };
-            let admin_auth_user = self.cfg.web_server.user.clone();
-            let admin_auth_pwd = self.cfg.web_server.password.clone();
-            let admin_tls_cert = if self.cfg.web_server.tls_cert_file.is_empty() {
-                None
-            } else {
-                Some(self.cfg.web_server.tls_cert_file.clone())
-            };
-            let admin_tls_key = if self.cfg.web_server.tls_key_file.is_empty() {
-                None
-            } else {
-                Some(self.cfg.web_server.tls_key_file.clone())
-            };
-            tokio::spawn(async move {
-                if let Err(e) = crate::admin::run_admin_server(
-                    admin_addr, admin_state, admin_auth_user, admin_auth_pwd,
-                    admin_tls_cert, admin_tls_key,
-                ).await {
-                    tracing::error!(error = %e, "frpc admin server failed: {}", e);
-                }
-            });
-            info!(addr = %self.cfg.web_server.addr, port = %self.cfg.web_server.port, "frpc admin server starting on {}:{}", self.cfg.web_server.addr, self.cfg.web_server.port);
-        }
+        self.spawn_admin_server(&_reload_tx, &_stop_tx);
 
         // Main session loop with reconnection.
         // Exponential backoff: 24s × 1.5^(failedCount-1) with jitter [0.8, 1.2], capped at 720s.
@@ -892,189 +826,10 @@ impl Service {
                                 warn!(error = %err.error, "Server error: {}", err.error);
                             }
                             Ok(FrpMessage::NatHoleClient(nhc)) => {
-                                debug!(proxy_name = %nhc.proxy_name, "Received NatHoleClient for proxy '{}'", nhc.proxy_name);
-                                let visitor_addr = nhc.visitor_addr.unwrap_or_default();
-                                let proxy_name = nhc.proxy_name.clone();
-                                let sid = nhc.transaction_id.clone();
-                                let proxy_info = self.proxy_info_map.read().await
-                                    .get(&proxy_name)
-                                    .map(|p| (p.local_addr.clone(), p.use_encryption, p.use_compression, p.sk.clone()));
-                                let local_addr = proxy_info.as_ref().map(|p| p.0.clone());
-                                let xtcp_use_enc = proxy_info.as_ref().map(|p| p.1).unwrap_or(false);
-                                let xtcp_use_comp = proxy_info.as_ref().map(|p| p.2).unwrap_or(false);
-                                let xtcp_sk = proxy_info.as_ref().map(|p| p.3.clone()).unwrap_or_default();
-
-                                if visitor_addr.is_empty() {
-                                    warn!(proxy_name = %proxy_name, "NatHoleClient without visitor_addr for '{}'", proxy_name);
-                                    let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
-                                        sid: Some(sid.clone()),
-                                    });
-                                    if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
-                                        debug!(error = %e, "Failed to send NatHoleReport (no visitor_addr)");
-                                    }
-                                    continue;
-                                }
-
-                                // Send NatHoleSid FIRST — so visitor can start punching concurrently
-                                let sid_msg = FrpMessage::NatHoleSid(msg::NatHoleSid {
-                                    sid: Some(sid.clone()),
-                                    provider_addr: None, // server fills from control connection peer addr
-                                });
-                                if let Err(e) = write_msg(&mut *writer.lock().await, &sid_msg, v2).await {
-                                    warn!(error = %e, "Failed to send NatHoleSid: {}", e);
-                                    continue;
-                                }
-
-                                // TCP simultaneous open (visitor is punching at the same time)
-                                match crate::visitor::tcp_simultaneous_open(&visitor_addr, 5000).await {
-                                    Ok(p2p_stream) => {
-                                        // Connect to local service and bridge
-                                        if let Some(ref local) = local_addr {
-                                            match tokio::net::TcpStream::connect(local).await {
-                                                Ok(local_stream) => {
-                                                    let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
-                                                    let use_comp = xtcp_use_comp;
-                                                    let sk = xtcp_sk.clone();
-                                                    let pn = proxy_name.clone();
-                                                    tokio::spawn(async move {
-                                                        let (p2p_r, p2p_w) = p2p_stream.into_split();
-                                                        let (local_r, local_w) = local_stream.into_split();
-                                                        if use_enc {
-                                                            let key = frp_core::encryption::derive_key(&sk);
-                                                            frp_core::bridge::bridge_encrypted(
-                                                                local_r, local_w, p2p_r, p2p_w,
-                                                                &key, use_comp, vec![], None, None, None,
-                                                            ).await;
-                                                            debug!(proxy_name = %pn, "XTCP provider '{}' encrypted P2P closed", pn);
-                                                        } else {
-                                                            frp_core::bridge::bridge_plain(
-                                                                local_r, local_w, p2p_r, p2p_w,
-                                                                use_comp, vec![], None,
-                                                            ).await;
-                                                            debug!(proxy_name = %pn, "XTCP provider '{}' P2P closed", pn);
-                                                        }
-                                                    });
-                                                    // Don't send NatHoleReport — Go frp uses implicit success.
-                                                    // If bridge fails, the TCP close propagates naturally.
-                                                }
-                                                Err(e) => {
-                                                    warn!(proxy_name = %proxy_name, error = %e, "XTCP provider '{}': connect local failed: {}", proxy_name, e);
-                                                    let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
-                                                        sid: Some(sid),
-                                                    });
-                                                    if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
-                                                        debug!(error = %e, "Failed to send NatHoleReport (connect local failed)");
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            warn!(proxy_name = %proxy_name, "XTCP provider '{}': no local address", proxy_name);
-                                            let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
-                                                sid: Some(sid),
-                                            });
-                                            if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
-                                                debug!(error = %e, "Failed to send NatHoleReport (no local addr)");
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(proxy_name = %proxy_name, error = %e, "XTCP hole punch for '{}' failed: {}", proxy_name, e);
-                                        // Report failure — triggers STCP fallback on visitor side
-                                        let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
-                                            sid: Some(sid),
-                                        });
-                                        if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
-                                            debug!(error = %e, "Failed to send NatHoleReport (hole punch failed)");
-                                        }
-                                    }
-                                }
+                                self.handle_nat_hole_client(nhc, &writer, v2).await;
                             }
                             Ok(FrpMessage::NatHoleResp(resp)) => {
-                                // Route to waiting visitor first (Go frps compat path).
-                                // CRITICAL: Go frps generates its own sid for the NAT session,
-                                // different from the visitor's transaction_id. The NatHoleResp
-                                // contains BOTH: transaction_id (from visitor) and sid (from server).
-                                // Route by transaction_id (what the visitor set).
-                                let txn_id = resp.transaction_id.clone();
-                                if !txn_id.is_empty() {
-                                    if let Some(tx) = visitor_pending.remove(&txn_id) {
-                                        info!(transaction_id = %txn_id, "XTCP visitor: received NatHoleResp for txn '{}'", txn_id);
-                                        let _ = tx.send(Ok(resp));
-                                        continue;
-                                    }
-                                }
-                                // Fall through: route to provider by server sid
-                                let sid = resp.sid.clone().unwrap_or_default();
-                                // Provider receives server's analysis with visitor's candidate addresses.
-                                if let Some(err) = resp.error {
-                                    warn!(error = %err, "XTCP NatHoleResp error: {}", err);
-                                    // Clean up pending tracking
-                                    if let Some(ref sid) = resp.sid {
-                                        pending_xtcp.remove(sid);
-                                    }
-                                    continue;
-                                }
-                                let proxy_name = pending_xtcp.remove(&sid).unwrap_or_default();
-                                if proxy_name.is_empty() {
-                                    warn!(sid = %sid, "XTCP NatHoleResp: unknown sid '{}'", sid);
-                                    continue;
-                                }
-                                let candidate_addrs = resp.candidate_addrs.unwrap_or_default();
-                                info!(proxy_name = %proxy_name, candidate_count = %candidate_addrs.len(), "XTCP provider '{}': received {} candidate addresses from server",
-                                    proxy_name, candidate_addrs.len());
-
-                                // Spawn hole punch task (don't block control loop)
-                                let proxy_info = self.proxy_info_map.read().await
-                                    .get(&proxy_name)
-                                    .map(|p| (p.local_addr.clone(), p.use_encryption, p.use_compression, p.sk.clone()));
-                                let local_addr = proxy_info.as_ref().map(|p| p.0.clone());
-                                let xtcp_use_enc = proxy_info.as_ref().map(|p| p.1).unwrap_or(false);
-                                let xtcp_use_comp = proxy_info.as_ref().map(|p| p.2).unwrap_or(false);
-                                let xtcp_sk = proxy_info.as_ref().map(|p| p.3.clone()).unwrap_or_default();
-                                let proxy_name_clone = proxy_name.clone();
-                                tokio::spawn(async move {
-                                    for addr in &candidate_addrs {
-                                        debug!(proxy_name = %proxy_name_clone, addr = %addr, "XTCP provider '{}': trying simultaneous open to {}", proxy_name_clone, addr);
-                                        match crate::visitor::tcp_simultaneous_open(addr, 5000).await {
-                                            Ok(p2p) => {
-                                                info!(proxy_name = %proxy_name_clone, addr = %addr, "XTCP provider '{}': P2P connected to {}", proxy_name_clone, addr);
-                                                if let Some(ref local) = local_addr {
-                                                    match tokio::net::TcpStream::connect(local).await {
-                                                        Ok(local_conn) => {
-                                                            let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
-                                                            let (p2p_r, p2p_w) = p2p.into_split();
-                                                            let (local_r, local_w) = local_conn.into_split();
-                                                            if use_enc {
-                                                                let key = frp_core::encryption::derive_key(&xtcp_sk);
-                                                                frp_core::bridge::bridge_encrypted(
-                                                                    local_r, local_w, p2p_r, p2p_w,
-                                                                    &key, xtcp_use_comp, vec![], None, None, None,
-                                                                ).await;
-                                                                debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' encrypted P2P closed", proxy_name_clone);
-                                                            } else {
-                                                                frp_core::bridge::bridge_plain(
-                                                                    local_r, local_w, p2p_r, p2p_w,
-                                                                    xtcp_use_comp, vec![], None,
-                                                                ).await;
-                                                                debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' P2P closed", proxy_name_clone);
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': connect local failed: {}", proxy_name_clone, e);
-                                                        }
-                                                    }
-                                                } else {
-                                                    warn!(proxy_name = %proxy_name_clone, "XTCP provider '{}': no local address", proxy_name_clone);
-                                                }
-                                                return;
-                                            }
-                                            Err(e) => {
-                                                debug!(proxy_name = %proxy_name_clone, addr = %addr, error = %e, "XTCP provider '{}': hole punch to {} failed: {}", proxy_name_clone, addr, e);
-                                            }
-                                        }
-                                    }
-                                    warn!(proxy_name = %proxy_name_clone, "XTCP provider '{}': all hole punch attempts failed", proxy_name_clone);
-                                });
+                                self.handle_nat_hole_resp(resp, &mut pending_xtcp, &mut visitor_pending).await;
                             }
                             Ok(FrpMessage::NewProxyResp(resp)) => {
                                 if let Some(err) = resp.error {
@@ -1282,6 +1037,289 @@ impl Service {
                 Self::reconnect_delay_secs(failed_count), failed_count);
             Self::reconnect_delay(failed_count).await;
         }
+    }
+
+    /// Spawn per-proxy health check tasks (once, outside reconnect loop).
+    /// Reads local address from proxy_info_map to determine what to check.
+    async fn spawn_health_checks(
+        &self,
+        proxies: &[frp_core::config::ProxyConfig],
+        health_tx: &mpsc::UnboundedSender<String>,
+        health_cancels: &Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    ) {
+        for p in proxies {
+            let hc_type = p.health_check_type.clone();
+            if hc_type.is_empty() {
+                continue;
+            }
+            if hc_type != "tcp" && hc_type != "http" {
+                warn!(health_check_type = %hc_type, proxy_name = %p.name, "Health check type '{}' not yet supported for '{}'", hc_type, p.name);
+                continue;
+            }
+            let la = self.proxy_info_map.read().await
+                .get(&p.name)
+                .map(|info| info.local_addr.clone())
+                .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
+            let pn = p.name.clone();
+            let interval = std::time::Duration::from_secs(
+                p.health_check_interval_seconds.max(10)
+            );
+            let timeout = std::time::Duration::from_secs(
+                p.health_check_timeout_seconds.max(3)
+            );
+            let max_failed = p.health_check_max_failed.max(1);
+            let tx = health_tx.clone();
+            let hc_url = if hc_type == "http" { p.health_check_url.clone() } else { String::new() };
+            let hc_headers = p.health_check_http_headers.clone();
+            let cancel = Arc::new(AtomicBool::new(false));
+            {
+                let mut cancels = health_cancels.lock().unwrap();
+                cancels.insert(pn.clone(), cancel.clone());
+            }
+            tokio::spawn(async move {
+                crate::health::run_health_check(pn, la, hc_type, hc_url, hc_headers, interval, timeout, max_failed, tx, cancel).await;
+            });
+        }
+    }
+
+    /// Start the admin HTTP server if configured.
+    /// Spawns as a background task; returns immediately.
+    #[cfg(feature = "admin")]
+    fn spawn_admin_server(
+        &self,
+        reload_tx: &mpsc::UnboundedSender<ReloadRequest>,
+        stop_tx: &mpsc::UnboundedSender<()>,
+    ) {
+        if self.cfg.web_server.port > 0 {
+            let admin_addr = frp_core::format_socket_addr(
+                &self.cfg.web_server.addr,
+                self.cfg.web_server.port,
+            );
+            let admin_state = AdminState {
+                proxy_metrics: self.proxy_metrics.clone(),
+                proxies: self.proxy_info_map.clone(),
+                reload_tx: reload_tx.clone(),
+                stop_tx: stop_tx.clone(),
+                config_path: self.config_file.clone(),
+            };
+            let admin_auth_user = self.cfg.web_server.user.clone();
+            let admin_auth_pwd = self.cfg.web_server.password.clone();
+            let admin_tls_cert = if self.cfg.web_server.tls_cert_file.is_empty() {
+                None
+            } else {
+                Some(self.cfg.web_server.tls_cert_file.clone())
+            };
+            let admin_tls_key = if self.cfg.web_server.tls_key_file.is_empty() {
+                None
+            } else {
+                Some(self.cfg.web_server.tls_key_file.clone())
+            };
+            tokio::spawn(async move {
+                if let Err(e) = crate::admin::run_admin_server(
+                    admin_addr, admin_state, admin_auth_user, admin_auth_pwd,
+                    admin_tls_cert, admin_tls_key,
+                ).await {
+                    tracing::error!(error = %e, "frpc admin server failed: {}", e);
+                }
+            });
+            info!(addr = %self.cfg.web_server.addr, port = %self.cfg.web_server.port, "frpc admin server starting on {}:{}", self.cfg.web_server.addr, self.cfg.web_server.port);
+        }
+    }
+
+    /// Handle a NatHoleClient message from the server (XTCP provider side).
+    ///
+    /// Sends NatHoleSid to synchronize with the visitor, performs TCP simultaneous
+    /// open, connects to local service, and spawns a P2P bridge task.
+    async fn handle_nat_hole_client(
+        &self,
+        nhc: msg::NatHoleClient,
+        writer: &Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>,
+        v2: bool,
+    ) {
+        debug!(proxy_name = %nhc.proxy_name, "Received NatHoleClient for proxy '{}'", nhc.proxy_name);
+        let visitor_addr = nhc.visitor_addr.unwrap_or_default();
+        let proxy_name = nhc.proxy_name.clone();
+        let sid = nhc.transaction_id.clone();
+        let proxy_info = self.proxy_info_map.read().await
+            .get(&proxy_name)
+            .map(|p| (p.local_addr.clone(), p.use_encryption, p.use_compression, p.sk.clone()));
+        let local_addr = proxy_info.as_ref().map(|p| p.0.clone());
+        let xtcp_use_enc = proxy_info.as_ref().map(|p| p.1).unwrap_or(false);
+        let xtcp_use_comp = proxy_info.as_ref().map(|p| p.2).unwrap_or(false);
+        let xtcp_sk = proxy_info.as_ref().map(|p| p.3.clone()).unwrap_or_default();
+
+        if visitor_addr.is_empty() {
+            warn!(proxy_name = %proxy_name, "NatHoleClient without visitor_addr for '{}'", proxy_name);
+            let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                sid: Some(sid.clone()),
+            });
+            if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
+                debug!(error = %e, "Failed to send NatHoleReport (no visitor_addr)");
+            }
+            return;
+        }
+
+        // Send NatHoleSid FIRST — so visitor can start punching concurrently
+        let sid_msg = FrpMessage::NatHoleSid(msg::NatHoleSid {
+            sid: Some(sid.clone()),
+            provider_addr: None,
+        });
+        if let Err(e) = write_msg(&mut *writer.lock().await, &sid_msg, v2).await {
+            warn!(error = %e, "Failed to send NatHoleSid: {}", e);
+            return;
+        }
+
+        // TCP simultaneous open (visitor is punching at the same time)
+        match crate::visitor::tcp_simultaneous_open(&visitor_addr, 5000).await {
+            Ok(p2p_stream) => {
+                if let Some(ref local) = local_addr {
+                    match tokio::net::TcpStream::connect(local).await {
+                        Ok(local_stream) => {
+                            let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
+                            let use_comp = xtcp_use_comp;
+                            let sk = xtcp_sk.clone();
+                            let pn = proxy_name.clone();
+                            tokio::spawn(async move {
+                                let (p2p_r, p2p_w) = p2p_stream.into_split();
+                                let (local_r, local_w) = local_stream.into_split();
+                                if use_enc {
+                                    let key = frp_core::encryption::derive_key(&sk);
+                                    frp_core::bridge::bridge_encrypted(
+                                        local_r, local_w, p2p_r, p2p_w,
+                                        &key, use_comp, vec![], None, None, None,
+                                    ).await;
+                                    debug!(proxy_name = %pn, "XTCP provider '{}' encrypted P2P closed", pn);
+                                } else {
+                                    frp_core::bridge::bridge_plain(
+                                        local_r, local_w, p2p_r, p2p_w,
+                                        use_comp, vec![], None,
+                                    ).await;
+                                    debug!(proxy_name = %pn, "XTCP provider '{}' P2P closed", pn);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            warn!(proxy_name = %proxy_name, error = %e, "XTCP provider '{}': connect local failed: {}", proxy_name, e);
+                            let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                                sid: Some(sid),
+                            });
+                            if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
+                                debug!(error = %e, "Failed to send NatHoleReport (connect local failed)");
+                            }
+                        }
+                    }
+                } else {
+                    warn!(proxy_name = %proxy_name, "XTCP provider '{}': no local address", proxy_name);
+                    let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                        sid: Some(sid),
+                    });
+                    if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
+                        debug!(error = %e, "Failed to send NatHoleReport (no local addr)");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(proxy_name = %proxy_name, error = %e, "XTCP hole punch for '{}' failed: {}", proxy_name, e);
+                let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                    sid: Some(sid),
+                });
+                if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
+                    debug!(error = %e, "Failed to send NatHoleReport (hole punch failed)");
+                }
+            }
+        }
+    }
+
+    /// Handle a NatHoleResp message from the server (XTCP response).
+    ///
+    /// Routes to waiting visitor (by transaction_id) or spawns provider hole
+    /// punch task (by sid). Provider side iterates candidate addresses from
+    /// the server's NAT analysis.
+    async fn handle_nat_hole_resp(
+        &self,
+        resp: msg::NatHoleResp,
+        pending_xtcp: &mut HashMap<String, String>,
+        visitor_pending: &mut HashMap<String, oneshot::Sender<Result<msg::NatHoleResp, String>>>,
+    ) {
+        // Route to waiting visitor first (Go frps compat path).
+        let txn_id = resp.transaction_id.clone();
+        if !txn_id.is_empty() {
+            if let Some(tx) = visitor_pending.remove(&txn_id) {
+                info!(transaction_id = %txn_id, "XTCP visitor: received NatHoleResp for txn '{}'", txn_id);
+                let _ = tx.send(Ok(resp));
+                return;
+            }
+        }
+        // Fall through: route to provider by server sid
+        let sid = resp.sid.clone().unwrap_or_default();
+        if let Some(err) = resp.error {
+            warn!(error = %err, "XTCP NatHoleResp error: {}", err);
+            if let Some(ref sid) = resp.sid {
+                pending_xtcp.remove(sid);
+            }
+            return;
+        }
+        let proxy_name = pending_xtcp.remove(&sid).unwrap_or_default();
+        if proxy_name.is_empty() {
+            warn!(sid = %sid, "XTCP NatHoleResp: unknown sid '{}'", sid);
+            return;
+        }
+        let candidate_addrs = resp.candidate_addrs.unwrap_or_default();
+        info!(proxy_name = %proxy_name, candidate_count = %candidate_addrs.len(), "XTCP provider '{}': received {} candidate addresses from server",
+            proxy_name, candidate_addrs.len());
+
+        // Spawn hole punch task (don't block control loop)
+        let proxy_info = self.proxy_info_map.read().await
+            .get(&proxy_name)
+            .map(|p| (p.local_addr.clone(), p.use_encryption, p.use_compression, p.sk.clone()));
+        let local_addr = proxy_info.as_ref().map(|p| p.0.clone());
+        let xtcp_use_enc = proxy_info.as_ref().map(|p| p.1).unwrap_or(false);
+        let xtcp_use_comp = proxy_info.as_ref().map(|p| p.2).unwrap_or(false);
+        let xtcp_sk = proxy_info.as_ref().map(|p| p.3.clone()).unwrap_or_default();
+        let proxy_name_clone = proxy_name.clone();
+        tokio::spawn(async move {
+            for addr in &candidate_addrs {
+                debug!(proxy_name = %proxy_name_clone, addr = %addr, "XTCP provider '{}': trying simultaneous open to {}", proxy_name_clone, addr);
+                match crate::visitor::tcp_simultaneous_open(addr, 5000).await {
+                    Ok(p2p) => {
+                        info!(proxy_name = %proxy_name_clone, addr = %addr, "XTCP provider '{}': P2P connected to {}", proxy_name_clone, addr);
+                        if let Some(ref local) = local_addr {
+                            match tokio::net::TcpStream::connect(local).await {
+                                Ok(local_conn) => {
+                                    let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
+                                    let (p2p_r, p2p_w) = p2p.into_split();
+                                    let (local_r, local_w) = local_conn.into_split();
+                                    if use_enc {
+                                        let key = frp_core::encryption::derive_key(&xtcp_sk);
+                                        frp_core::bridge::bridge_encrypted(
+                                            local_r, local_w, p2p_r, p2p_w,
+                                            &key, xtcp_use_comp, vec![], None, None, None,
+                                        ).await;
+                                        debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' encrypted P2P closed", proxy_name_clone);
+                                    } else {
+                                        frp_core::bridge::bridge_plain(
+                                            local_r, local_w, p2p_r, p2p_w,
+                                            xtcp_use_comp, vec![], None,
+                                        ).await;
+                                        debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' P2P closed", proxy_name_clone);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': connect local failed: {}", proxy_name_clone, e);
+                                }
+                            }
+                        } else {
+                            warn!(proxy_name = %proxy_name_clone, "XTCP provider '{}': no local address", proxy_name_clone);
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        debug!(proxy_name = %proxy_name_clone, addr = %addr, error = %e, "XTCP provider '{}': hole punch to {} failed: {}", proxy_name_clone, addr, e);
+                    }
+                }
+            }
+            warn!(proxy_name = %proxy_name_clone, "XTCP provider '{}': all hole punch attempts failed", proxy_name_clone);
+        });
     }
 
     /// Start a single plugin and return its handle with resolved bound address.
