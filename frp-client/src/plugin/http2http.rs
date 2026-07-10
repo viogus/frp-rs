@@ -10,12 +10,14 @@
 //! - host_header_rewrite: optional Host header override
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, warn};
+use tokio::net::TcpStream;
+#[cfg(test)]
+use tokio::net::TcpListener;
+use tracing::debug;
 
 use frp_core::config::PluginConfig;
 
-use super::PluginHandle;
+use super::{PluginHandle, serve_plugin};
 
 /// Start an http2http plugin server.
 pub async fn start_http2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle, frp_core::Error> {
@@ -27,50 +29,11 @@ pub async fn start_http2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle, 
         ));
     };
     let host_rewrite = cfg.host_header_rewrite.clone();
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
-        frp_core::Error::Transport(format!("http2http plugin: bind: {e}"))
-    })?;
-    let local_addr = listener.local_addr().map_err(|e| {
-        frp_core::Error::Transport(format!("http2http plugin: local_addr: {e}"))
-    })?;
-
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-    let task = tokio::spawn(async move {
-        debug!(local_addr = %local_addr, "http2http plugin listening on {}", local_addr);
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((client, peer)) => {
-                            let target = target_addr.clone();
-                            let rewrite = host_rewrite.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_conn(client, &target, &rewrite).await {
-                                    debug!(peer = %peer, error = %e, "http2http: {peer} error: {e}");
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "http2http plugin accept error: {e}");
-                            break;
-                        }
-                    }
-                }
-                _ = &mut shutdown_rx => {
-                    debug!("http2http plugin shutting down");
-                    break;
-                }
-            }
+    serve_plugin("http2http", (target_addr, host_rewrite), |client, peer, (target, rewrite)| async move {
+        if let Err(e) = handle_conn(client, &target, &rewrite).await {
+            debug!(%peer, error = %e, "http2http: {peer} error: {e}");
         }
-    });
-
-    Ok(PluginHandle {
-        local_addr,
-        _task: task,
-        shutdown: Some(shutdown_tx),
-    })
+    }).await
 }
 
 async fn handle_conn(

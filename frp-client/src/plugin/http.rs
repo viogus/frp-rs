@@ -1,10 +1,10 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, warn};
+use tokio::net::TcpStream;
+use tracing::debug;
 
 use frp_core::config::PluginConfig;
 
-use super::{PluginHandle, base64_decode, split_host_port};
+use super::{PluginHandle, base64_decode, serve_plugin, split_host_port};
 
 /// Start an HTTP proxy plugin server.
 ///
@@ -13,50 +13,12 @@ use super::{PluginHandle, base64_decode, split_host_port};
 /// - Plain HTTP forwarding
 /// - Optional basic auth via `http_user` / `http_password`
 pub async fn start_http_proxy(cfg: &PluginConfig) -> Result<PluginHandle, frp_core::Error> {
-    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
-        frp_core::Error::Transport(format!("http_proxy plugin: bind: {e}"))
-    })?;
-    let local_addr = listener.local_addr().map_err(|e| {
-        frp_core::Error::Transport(format!("http_proxy plugin: local_addr: {e}"))
-    })?;
-
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
     let auth = HttpProxyAuth::from_config(cfg);
-
-    let task = tokio::spawn(async move {
-        debug!(local_addr = %local_addr, "http_proxy plugin listening on {}", local_addr);
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((stream, peer)) => {
-                            let auth = auth.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_http_proxy_conn(stream, auth).await {
-                                    debug!(peer = %peer, error = %e, "http_proxy: {peer} error: {e}");
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "http_proxy plugin accept error: {e}");
-                            break;
-                        }
-                    }
-                }
-                _ = &mut shutdown_rx => {
-                    debug!("http_proxy plugin shutting down");
-                    break;
-                }
-            }
+    serve_plugin("http_proxy", auth, |stream, peer, auth| async move {
+        if let Err(e) = handle_http_proxy_conn(stream, auth).await {
+            debug!(%peer, error = %e, "http_proxy: {peer} error: {e}");
         }
-    });
-
-    Ok(PluginHandle {
-        local_addr,
-        _task: task,
-        shutdown: Some(shutdown_tx),
-    })
+    }).await
 }
 
 #[derive(Clone)]

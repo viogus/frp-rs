@@ -1,10 +1,10 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, warn};
+use tokio::net::TcpStream;
+use tracing::debug;
 
 use frp_core::config::PluginConfig;
 
-use super::PluginHandle;
+use super::{PluginHandle, serve_plugin};
 
 /// Constant-time slice comparison for auth credential verification.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -43,52 +43,13 @@ const USERPASS_FAIL: u8 = 0x01;
 /// Supports CONNECT command only (TCP tunnel).
 /// Optional username/password auth via PluginConfig `username` / `password`.
 pub async fn start_socks5_proxy(cfg: &PluginConfig) -> Result<PluginHandle, frp_core::Error> {
-    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
-        frp_core::Error::Transport(format!("socks5 plugin: bind: {e}"))
-    })?;
-    let local_addr = listener.local_addr().map_err(|e| {
-        frp_core::Error::Transport(format!("socks5 plugin: local_addr: {e}"))
-    })?;
-
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
     let user = if cfg.username.is_empty() { None } else { Some(cfg.username.clone()) };
     let pass = if cfg.password.is_empty() { None } else { Some(cfg.password.clone()) };
-
-    let task = tokio::spawn(async move {
-        debug!(local_addr = %local_addr, "socks5 plugin listening on {}", local_addr);
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((stream, peer)) => {
-                            let u = user.clone();
-                            let p = pass.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_socks5_conn(stream, u, p).await {
-                                    debug!(peer = %peer, error = %e, "socks5: {peer} error: {e}");
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "socks5 plugin accept error: {e}");
-                            break;
-                        }
-                    }
-                }
-                _ = &mut shutdown_rx => {
-                    debug!("socks5 plugin shutting down");
-                    break;
-                }
-            }
+    serve_plugin("socks5", (user, pass), |stream, peer, (u, p)| async move {
+        if let Err(e) = handle_socks5_conn(stream, u, p).await {
+            debug!(%peer, error = %e, "socks5: {peer} error: {e}");
         }
-    });
-
-    Ok(PluginHandle {
-        local_addr,
-        _task: task,
-        shutdown: Some(shutdown_tx),
-    })
+    }).await
 }
 
 async fn handle_socks5_conn(

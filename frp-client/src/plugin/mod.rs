@@ -12,6 +12,8 @@
 
 use std::net::SocketAddr;
 
+use tokio::net::TcpStream;
+
 
 mod http;
 mod http2http;
@@ -53,6 +55,63 @@ impl Drop for PluginHandle {
             let _ = tx.send(());
         }
     }
+}
+
+/// Shared plugin server skeleton — handles bind, shutdown channel, accept
+/// loop, and `PluginHandle` construction. All 8 plugin `start_*` functions
+/// delegate to this.
+///
+/// `handler` receives the accepted `TcpStream`, peer address, and a clone of
+/// `state`. It is spawned as a fresh `tokio::task` per connection.
+pub(crate) async fn serve_plugin<S, H, Fut>(
+    plugin_name: &'static str,
+    state: S,
+    handler: H,
+) -> Result<PluginHandle, frp_core::Error>
+where
+    S: Clone + Send + Sync + 'static,
+    H: Fn(TcpStream, std::net::SocketAddr, S) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
+        frp_core::Error::Transport(format!("{plugin_name} plugin: bind: {e}"))
+    })?;
+    let local_addr = listener.local_addr().map_err(|e| {
+        frp_core::Error::Transport(format!("{plugin_name} plugin: local_addr: {e}"))
+    })?;
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let task = tokio::spawn(async move {
+        tracing::debug!(%local_addr, "{plugin_name} plugin listening on {local_addr}");
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, peer)) => {
+                            let s = state.clone();
+                            tokio::spawn(handler(stream, peer, s));
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "{plugin_name} plugin accept error: {e}");
+                            break;
+                        }
+                    }
+                }
+                _ = &mut shutdown_rx => {
+                    tracing::debug!("{plugin_name} plugin shutting down");
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(PluginHandle {
+        local_addr,
+        _task: task,
+        shutdown: Some(shutdown_tx),
+    })
 }
 
 /// Simple base64 decode (no external dep needed for this).

@@ -1,11 +1,11 @@
 use std::io::Read;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, warn};
+use tokio::net::TcpStream;
+use tracing::debug;
 
 use frp_core::config::PluginConfig;
 
-use super::{PluginHandle, urlencoding_decode};
+use super::{PluginHandle, serve_plugin, urlencoding_decode};
 use super::http::HttpProxyAuth;
 
 // ---------------------------------------------------------------
@@ -23,16 +23,6 @@ pub async fn start_static_file_proxy(cfg: &PluginConfig) -> Result<PluginHandle,
             "static_file plugin requires local_path".into()
         ));
     }
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
-        frp_core::Error::Transport(format!("static_file plugin: bind: {e}"))
-    })?;
-    let local_addr = listener.local_addr().map_err(|e| {
-        frp_core::Error::Transport(format!("static_file plugin: local_addr: {e}"))
-    })?;
-
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
     let auth = HttpProxyAuth::from_config(cfg);
     let local_path = cfg.local_path.clone();
     let strip_prefix: Option<String> = if cfg.strip_prefix.is_empty() {
@@ -40,44 +30,12 @@ pub async fn start_static_file_proxy(cfg: &PluginConfig) -> Result<PluginHandle,
     } else {
         Some(cfg.strip_prefix.trim_matches('/').to_string())
     };
-
-    let task = tokio::spawn(async move {
-        debug!(local_addr = %local_addr, "static_file plugin listening on {}", local_addr);
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((stream, peer)) => {
-                            let a = auth.clone();
-                            let lp = local_path.clone();
-                            let sp = strip_prefix.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) =
-                                    handle_static_file_conn(stream, a, &lp, sp.as_deref()).await
-                                {
-                                    debug!(peer = %peer, error = %e, "static_file: {peer} error: {e}");
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "static_file plugin accept error: {e}");
-                            break;
-                        }
-                    }
-                }
-                _ = &mut shutdown_rx => {
-                    debug!("static_file plugin shutting down");
-                    break;
-                }
-            }
+    let state = (auth, local_path, strip_prefix);
+    serve_plugin("static_file", state, |stream, peer, (a, lp, sp)| async move {
+        if let Err(e) = handle_static_file_conn(stream, a, &lp, sp.as_deref()).await {
+            debug!(%peer, error = %e, "static_file: {peer} error: {e}");
         }
-    });
-
-    Ok(PluginHandle {
-        local_addr,
-        _task: task,
-        shutdown: Some(shutdown_tx),
-    })
+    }).await
 }
 
 async fn handle_static_file_conn(

@@ -13,17 +13,17 @@
 #[cfg(feature = "tls")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(feature = "tls")]
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 #[cfg(feature = "tls")]
 use rustls::pki_types::ServerName;
 #[cfg(feature = "tls")]
-use tracing::{debug, warn};
+use tracing::debug;
 
 use frp_core::config::PluginConfig;
 #[cfg(feature = "tls")]
 use frp_core::transport::build_tls_connector;
 
-use super::PluginHandle;
+use super::{PluginHandle, serve_plugin};
 #[cfg(feature = "tls")]
 use super::split_host_port;
 
@@ -38,59 +38,14 @@ pub async fn start_http2https_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
         ));
     };
     let host_rewrite = cfg.host_header_rewrite.clone();
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
-        frp_core::Error::Transport(format!("http2https plugin: bind: {e}"))
+    let tls_connector = build_tls_connector(None, None, None).map_err(|e| {
+        frp_core::Error::Transport(format!("http2https plugin: TLS connector: {e}"))
     })?;
-    let local_addr = listener.local_addr().map_err(|e| {
-        frp_core::Error::Transport(format!("http2https plugin: local_addr: {e}"))
-    })?;
-
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-    let task = tokio::spawn(async move {
-        let tls_connector = match build_tls_connector(None, None, None) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "http2https plugin: failed to build TLS connector: {}", e);
-                return;
-            }
-        };
-
-        debug!(local_addr = %local_addr, "http2https plugin listening on {}", local_addr);
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((client, peer)) => {
-                            let target = target_addr.clone();
-                            let rewrite = host_rewrite.clone();
-                            let connector = tls_connector.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_conn(client, &target, &rewrite, &connector).await {
-                                    debug!(peer = %peer, error = %e, "http2https: {peer} error: {e}");
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "http2https plugin accept error: {e}");
-                            break;
-                        }
-                    }
-                }
-                _ = &mut shutdown_rx => {
-                    debug!("http2https plugin shutting down");
-                    break;
-                }
-            }
+    serve_plugin("http2https", (target_addr, host_rewrite, tls_connector), |client, peer, (target, rewrite, connector)| async move {
+        if let Err(e) = handle_conn(client, &target, &rewrite, &connector).await {
+            debug!(%peer, error = %e, "http2https: {peer} error: {e}");
         }
-    });
-
-    Ok(PluginHandle {
-        local_addr,
-        _task: task,
-        shutdown: Some(shutdown_tx),
-    })
+    }).await
 }
 
 #[cfg(not(feature = "tls"))]

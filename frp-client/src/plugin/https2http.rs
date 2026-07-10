@@ -15,15 +15,15 @@
 #[cfg(feature = "tls")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(feature = "tls")]
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 #[cfg(feature = "tls")]
-use tracing::{debug, warn};
+use tracing::debug;
 
 use frp_core::config::PluginConfig;
 #[cfg(feature = "tls")]
 use frp_core::transport::build_tls_acceptor;
 
-use super::PluginHandle;
+use super::{PluginHandle, serve_plugin};
 #[cfg(feature = "tls")]
 use super::split_host_port;
 
@@ -37,69 +37,23 @@ pub async fn start_https2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
             "https2http plugin: local_addr is required".into(),
         ));
     };
-
     if cfg.crt_file.is_empty() || cfg.key_file.is_empty() {
         return Err(frp_core::Error::Transport(
             "https2http plugin: crt_file and key_file are required".into(),
         ));
     }
-
     let host_rewrite = cfg.host_header_rewrite.clone();
-
     let tls_acceptor = build_tls_acceptor(&cfg.crt_file, &cfg.key_file, None)?;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
-        frp_core::Error::Transport(format!("https2http plugin: bind: {e}"))
-    })?;
-    let local_addr = listener.local_addr().map_err(|e| {
-        frp_core::Error::Transport(format!("https2http plugin: local_addr: {e}"))
-    })?;
-
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-    let task = tokio::spawn(async move {
-        debug!(local_addr = %local_addr, "https2http plugin listening on {} (TLS)", local_addr);
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((tcp, peer)) => {
-                            let target = target_addr.clone();
-                            let rewrite = host_rewrite.clone();
-                            let acceptor = tls_acceptor.clone();
-                            tokio::spawn(async move {
-                                // Accept TLS on the incoming connection
-                                match acceptor.accept(tcp).await {
-                                    Ok(tls) => {
-                                        if let Err(e) = handle_conn(tls, &target, &rewrite).await {
-                                            debug!(peer = %peer, error = %e, "https2http: {peer} error: {e}");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        debug!(peer = %peer, error = %e, "https2http: {peer} TLS error: {e}");
-                                    }
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "https2http plugin accept error: {e}");
-                            break;
-                        }
-                    }
-                }
-                _ = &mut shutdown_rx => {
-                    debug!("https2http plugin shutting down");
-                    break;
+    serve_plugin("https2http", (target_addr, host_rewrite, tls_acceptor), |tcp, peer, (target, rewrite, acceptor)| async move {
+        match acceptor.accept(tcp).await {
+            Ok(tls) => {
+                if let Err(e) = handle_conn(tls, &target, &rewrite).await {
+                    debug!(%peer, error = %e, "https2http: {peer} error: {e}");
                 }
             }
+            Err(e) => debug!(%peer, %e, "https2http: {peer} TLS error: {e}"),
         }
-    });
-
-    Ok(PluginHandle {
-        local_addr,
-        _task: task,
-        shutdown: Some(shutdown_tx),
-    })
+    }).await
 }
 
 #[cfg(not(feature = "tls"))]
