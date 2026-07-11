@@ -676,44 +676,53 @@ impl Service {
                 .map(|a| a.additional_auth_scopes.clone())
                 .unwrap_or_default();
             let server_scopes = self.server_auth_scopes.read().await.clone();
-            for i in 0..pool_count {
-                #[cfg(feature = "quic")]
-                let quic_arg = quic_conn.clone();
-                #[cfg(not(feature = "quic"))]
-                let quic_arg = ();
+            // Both the pool-spawn loop below and the on-demand ReqWorkConn
+            // handler build a byte-identical WorkConnConfig differing only in
+            // `pool_id`. Collapse into one macro (defined here so its free
+            // identifier references resolve against the locals in scope).
+            macro_rules! spawn_wc {
+                ($pool_id:expr) => {{
+                    #[cfg(feature = "quic")]
+                    let quic_arg = quic_conn.clone();
+                    #[cfg(not(feature = "quic"))]
+                    let quic_arg = ();
+                    crate::work_conn::spawn_work_conn(crate::work_conn::WorkConnConfig {
+                        server_addr: self.cfg.server_addr.clone(),
+                        server_port: self.cfg.server_port,
+                        protocol: protocol.clone(),
+                        run_id: run_id.clone(),
+                        proxy_info_map: self.proxy_info_map.clone(),
+                        enc_key: self.encryption_key,
+                        pool_id: $pool_id,
+                        auth_token: auth_token.clone(),
+                        tls_enable: self.cfg.tls_enable,
+                        tls_server_name: self.cfg.tls_server_name.clone(),
+                        tls_ca_file: opt_if_empty!(self.cfg.tls_ca_file),
+                        yamux: yamux.clone(),
+                        quic_conn: quic_arg,
+                        v2,
+                        oidc_client: self.oidc_client.clone(),
+                        udp_sockets: udp_sockets.clone(),
+                        udp_enc_cfg: udp_enc_cfg.clone(),
+                        proxy_metrics: self.proxy_metrics.clone(),
+                        client_auth_scopes: client_scopes.clone(),
+                        server_auth_scopes: server_scopes.clone(),
+                        disable_custom_tls_first_byte: self.cfg.disable_custom_tls_first_byte,
+                        keepalive_secs: self.cfg.dial_server_keepalive.max(0) as u64,
+                        bind_addr: opt_if_empty!(self.cfg.connect_server_local_ip),
+                        proxy_url: self.cfg.proxy_url.clone(),
+                        xtcp_tx: xtcp_tx.clone(),
+                        session_alive: session_alive.clone(),
+                        #[cfg(feature = "vnet")]
+                        vnet_tuns: self.vnet_tuns.clone(),
+                        #[cfg(feature = "vnet")]
+                        vnet_routes: self.vnet_routes.clone(),
+                    });
+                }};
+            }
 
-                crate::work_conn::spawn_work_conn(crate::work_conn::WorkConnConfig {
-                    server_addr: self.cfg.server_addr.clone(),
-                    server_port: self.cfg.server_port,
-                    protocol: protocol.clone(),
-                    run_id: run_id.clone(),
-                    proxy_info_map: self.proxy_info_map.clone(),
-                    enc_key: self.encryption_key,
-                    pool_id: i,
-                    auth_token: auth_token.clone(),
-                    tls_enable: self.cfg.tls_enable,
-                    tls_server_name: self.cfg.tls_server_name.clone(),
-                    tls_ca_file: opt_if_empty!(self.cfg.tls_ca_file),
-                    yamux: yamux.clone(),
-                    quic_conn: quic_arg,
-                    v2,
-                    oidc_client: self.oidc_client.clone(),
-                    udp_sockets: udp_sockets.clone(),
-                    udp_enc_cfg: udp_enc_cfg.clone(),
-                    proxy_metrics: self.proxy_metrics.clone(),
-                    client_auth_scopes: client_scopes.clone(),
-                    server_auth_scopes: server_scopes.clone(),
-                    disable_custom_tls_first_byte: self.cfg.disable_custom_tls_first_byte,
-                    keepalive_secs: self.cfg.dial_server_keepalive.max(0) as u64,
-                    bind_addr: opt_if_empty!(self.cfg.connect_server_local_ip),
-                    proxy_url: self.cfg.proxy_url.clone(),
-                    xtcp_tx: xtcp_tx.clone(),
-                    session_alive: session_alive.clone(),
-                    #[cfg(feature = "vnet")]
-                    vnet_tuns: self.vnet_tuns.clone(),
-                    #[cfg(feature = "vnet")]
-                    vnet_routes: self.vnet_routes.clone(),
-                });
+            for i in 0..pool_count {
+                spawn_wc!(i);
             }
 
             // Cancel old visitor listener tasks from a previous session.
@@ -769,42 +778,7 @@ impl Service {
                         match msg {
                             Ok(FrpMessage::ReqWorkConn(_)) => {
                                 debug!("Received ReqWorkConn, creating work connection");
-                                #[cfg(feature = "quic")]
-                                let quic_arg = quic_conn.clone();
-                                #[cfg(not(feature = "quic"))]
-                                let quic_arg = ();
-                                crate::work_conn::spawn_work_conn(crate::work_conn::WorkConnConfig {
-                                    server_addr: self.cfg.server_addr.clone(),
-                                    server_port: self.cfg.server_port,
-                                    protocol: protocol.clone(),
-                                    run_id: run_id.clone(),
-                                    proxy_info_map: self.proxy_info_map.clone(),
-                                    enc_key: self.encryption_key,
-                                    pool_id: -1, // on-demand, not pool
-                                    auth_token: auth_token.clone(),
-                                    tls_enable: self.cfg.tls_enable,
-                                    tls_server_name: self.cfg.tls_server_name.clone(),
-                                    tls_ca_file: opt_if_empty!(self.cfg.tls_ca_file),
-                                    yamux: yamux.clone(),
-                                    quic_conn: quic_arg,
-                                    v2,
-                                    oidc_client: self.oidc_client.clone(),
-                                    udp_sockets: udp_sockets.clone(),
-                                    udp_enc_cfg: udp_enc_cfg.clone(),
-                                    proxy_metrics: self.proxy_metrics.clone(),
-                                    client_auth_scopes: client_scopes.clone(),
-                                    server_auth_scopes: server_scopes.clone(),
-                                    disable_custom_tls_first_byte: self.cfg.disable_custom_tls_first_byte,
-                                    keepalive_secs: self.cfg.dial_server_keepalive.max(0) as u64,
-                                    bind_addr: opt_if_empty!(self.cfg.connect_server_local_ip),
-                                    proxy_url: self.cfg.proxy_url.clone(),
-                                    xtcp_tx: xtcp_tx.clone(),
-                                    session_alive: session_alive.clone(),
-                                    #[cfg(feature = "vnet")]
-                                    vnet_tuns: self.vnet_tuns.clone(),
-                                    #[cfg(feature = "vnet")]
-                                    vnet_routes: self.vnet_routes.clone(),
-                                });
+                                spawn_wc!(-1); // on-demand, not pool
                             }
                             Ok(FrpMessage::Pong(_)) => {
                                 debug!("Pong received");
