@@ -1,0 +1,4 @@
+{"label":"idle_plain","mode":"idle_hold","connections":500,"encrypt":false,"live_bytes_idle":119552,"live_bytes_peak":5073077,"total_alloc":7736393,"rss_kb_frps":17312,"rss_kb_frpc":16160,"live_per_conn":9907}
+{"label":"idle_encrypt","mode":"idle_hold","connections":500,"encrypt":true,"live_bytes_idle":215790,"live_bytes_peak":21881501,"total_alloc":103863015,"rss_kb_frps":46208,"rss_kb_frpc":45488,"live_per_conn":43331}
+{"label":"churn_plain","mode":"churn","connections":500,"encrypt":false,"live_bytes_idle":217360,"live_bytes_peak":257737,"total_alloc":8700417,"rss_kb_frps":17936,"rss_kb_frpc":16272,"live_per_conn":0}
+{"label":"churn_encrypt","mode":"churn","connections":500,"encrypt":true,"live_bytes_idle":215008,"live_bytes_peak":2320836,"total_alloc":31004826,"rss_kb_frps":40304,"rss_kb_frpc":12000,"live_per_conn":0}

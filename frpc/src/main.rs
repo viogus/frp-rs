@@ -13,9 +13,15 @@ use frp_core::cli::{
 use frp_core::config::{load_client_config, collect_config_files, ClientConfig, ProxyConfig};
 use frp_client::service::Service;
 
+#[cfg(feature = "mem-profile")]
+#[global_allocator]
+static GLOBAL: frp_core::mem_profile::CountingAlloc = frp_core::mem_profile::CountingAlloc;
+
 #[tokio::main]
 async fn main() {
     let cmd = parse_frpc_args();
+    #[cfg(feature = "mem-profile")]
+    frp_core::mem_profile::spawn_emitter();
     match cmd {
         FrpcCmd::Run(args) => run_normal(args).await,
         FrpcCmd::Tcp(args) => run_single_proxy(

@@ -55,6 +55,7 @@ kcp = ["dep:kcp"]
 websocket = ["dep:tokio-tungstenite"]
 oidc = ["dep:jsonwebtoken", "dep:reqwest"]
 vnet = []
+mem-profile = []
 
 
 [dev-dependencies]

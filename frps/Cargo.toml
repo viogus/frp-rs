@@ -22,6 +22,8 @@ debug-logs = []
 # All optional; zero binary size impact when `otel` feature disabled.
 # Estimated binary size impact with otel: +2-3 MB (http-proto only, no tonic).
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+# Measurement-only counting global allocator. OFF in all shipped builds.
+mem-profile = ["frp-server/mem-profile"]
 
 [dependencies]
 frp-core = { path = "../frp-core", default-features = false }

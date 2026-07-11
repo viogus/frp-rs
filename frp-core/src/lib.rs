@@ -29,6 +29,8 @@ pub mod stun;
 pub mod feature_gate;
 pub mod unsafe_features;
 pub mod internal_listener;
+#[cfg(feature = "mem-profile")]
+pub mod mem_profile;
 
 use thiserror::Error;
 

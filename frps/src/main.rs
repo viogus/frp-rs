@@ -7,9 +7,15 @@ use frp_core::cli::{parse_frps_args, FrpsArgs};
 use frp_core::config::{load_server_config, collect_config_files, ServerConfig};
 use frp_server::service::Service;
 
+#[cfg(feature = "mem-profile")]
+#[global_allocator]
+static GLOBAL: frp_core::mem_profile::CountingAlloc = frp_core::mem_profile::CountingAlloc;
+
 #[tokio::main]
 async fn main() {
     let cli = parse_frps_args();
+    #[cfg(feature = "mem-profile")]
+    frp_core::mem_profile::spawn_emitter();
     run(cli).await;
 }
 
