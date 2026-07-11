@@ -1293,6 +1293,7 @@ impl Service {
                 result = listener.accept() => {
                     match result {
                 Ok((stream, addr)) => {
+                    frp_core::transport::set_nodelay(&stream);
                     let state = self.state.clone();
                     #[cfg(feature = "tls")]
                     let acceptor = state.tls_acceptor.read_ok().clone();

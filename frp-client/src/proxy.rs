@@ -105,9 +105,11 @@ pub fn create_new_proxy_msg(
 
 /// Connects to a local service and returns the TCP stream.
 pub async fn connect_local(addr: &str) -> Result<TcpStream, frp_core::Error> {
-    TcpStream::connect(addr)
+    let stream = TcpStream::connect(addr)
         .await
-        .map_err(|e| frp_core::Error::Transport(format!("connect to local {}: {}", addr, e)))
+        .map_err(|e| frp_core::Error::Transport(format!("connect to local {}: {}", addr, e)))?;
+    frp_core::transport::set_nodelay(&stream);
+    Ok(stream)
 }
 
 /// Bridge data between two streams with optional encryption, compression,

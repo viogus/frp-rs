@@ -49,6 +49,7 @@ pub(crate) async fn tcp_simultaneous_open(peer_addr: &str, timeout_ms: u64) -> R
     match tokio::time::timeout(Duration::from_millis(timeout_ms), local.connect(peer)).await {
         Ok(Ok(stream)) => {
             debug!(peer = %peer, "TCP simultaneous open to {} succeeded", peer);
+            frp_core::transport::set_nodelay(&stream);
             Ok(stream)
         }
         Ok(Err(e)) => {
@@ -100,6 +101,7 @@ pub(crate) async fn run_visitor_listener(
     loop {
         match listener.accept().await {
             Ok((user_conn, peer)) => {
+                frp_core::transport::set_nodelay(&user_conn);
                 debug!(name = %name, peer = %peer, "Visitor '{}': user connection from {}", name, peer);
 
                 let sa = server_addr.clone();

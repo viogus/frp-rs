@@ -275,6 +275,7 @@ pub async fn run_vhost_http_listener(
 
     loop {
         let (stream, peer) = listener.accept().await?;
+        frp_core::transport::set_nodelay(&stream);
         let state = state.clone();
 
         tokio::spawn(async move {
@@ -296,6 +297,7 @@ pub async fn run_vhost_https_listener(
 
     loop {
         let (stream, peer) = listener.accept().await?;
+        frp_core::transport::set_nodelay(&stream);
         let state = state.clone();
         // Read the current TLS acceptor from shared state. Hot-reload
         // swaps a new acceptor under write lock; read-lock is cheap.

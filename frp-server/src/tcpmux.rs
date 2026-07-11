@@ -113,6 +113,7 @@ pub async fn run_tcpmux_listener(
 
     loop {
         let (mut stream, peer) = listener.accept().await?;
+        frp_core::transport::set_nodelay(&stream);
         let state = state.clone();
 
         tokio::spawn(async move {

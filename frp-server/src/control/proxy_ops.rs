@@ -470,6 +470,7 @@ pub(crate) async fn listen_and_proxy(
     loop {
         match listener.accept().await {
             Ok((user_conn, _addr)) => {
+                frp_core::transport::set_nodelay(&user_conn);
                 if internal_tx.send(InternalMsg::ProxyUserConn {
                     proxy_name: proxy_name.clone(),
                     user_conn: IoStream::Tcp(user_conn),

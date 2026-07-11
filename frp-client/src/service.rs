@@ -1133,6 +1133,7 @@ impl Service {
                 if let Some(ref local) = local_addr {
                     match tokio::net::TcpStream::connect(local).await {
                         Ok(local_stream) => {
+                            frp_core::transport::set_nodelay(&local_stream);
                             let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
                             let use_comp = xtcp_use_comp;
                             let sk = xtcp_sk.clone();
@@ -1243,6 +1244,7 @@ impl Service {
                         if let Some(ref local) = local_addr {
                             match tokio::net::TcpStream::connect(local).await {
                                 Ok(local_conn) => {
+                                    frp_core::transport::set_nodelay(&local_conn);
                                     let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
                                     let (p2p_r, p2p_w) = p2p.into_split();
                                     let (local_r, local_w) = local_conn.into_split();

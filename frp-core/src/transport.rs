@@ -1403,7 +1403,19 @@ async fn connect_direct(
         })?;
     }
 
+    // Disable Nagle for low-latency small-message RTT (Go frp parity).
+    crate::transport::set_nodelay(&stream);
+
     Ok(stream)
+}
+
+/// Enable TCP_NODELAY (disable Nagle) on a stream, matching Go frp's default
+/// (`net.TCPConn` sets NoDelay(true)). A failed socket option must not kill the
+/// connection, so errors are logged at debug and ignored. Wire-invisible.
+pub fn set_nodelay(stream: &tokio::net::TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!(error = %e, "set_nodelay failed (continuing with Nagle on)");
+    }
 }
 
 /// Connect to a target through an HTTP CONNECT or SOCKS5 proxy.
@@ -1567,6 +1579,9 @@ async fn connect_via_proxy(
             )));
         }
     }
+
+    // Disable Nagle on the tunneled stream (Go frp parity).
+    crate::transport::set_nodelay(&stream);
 
     Ok(stream)
 }
