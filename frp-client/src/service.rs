@@ -911,19 +911,7 @@ impl Service {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs() as i64;
-                                let ping_auth = AuthConfig {
-                                    method: AuthMethod::Token,
-                                    token: self.auth_cfg.token.clone(),
-                                    oidc_issuer: String::new(),
-                                    oidc_audience: String::new(),
-                                    oidc_skip_expiry: false,
-                                    oidc_skip_issuer: false,
-                                    additional_data: None,
-                                    oidc_proxy_url: String::new(),
-                                    additional_auth_scopes: Vec::new(),
-                                    authentication_timeout: 0,
-                                    use_encryption: false,
-                                };
+                                let ping_auth = AuthConfig::with_token(self.auth_cfg.token.clone());
                                 ping_msg.privilege_key = ping_auth.generate_login_key(ts);
                                 ping_msg.timestamp = Some(ts);
                             }

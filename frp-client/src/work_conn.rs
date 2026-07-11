@@ -6,7 +6,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{info, warn, debug};
 
-use frp_core::auth::{AuthConfig, AuthMethod, OidcClient};
+use frp_core::auth::{AuthConfig, OidcClient};
 use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1, write_msg_v2};
@@ -249,19 +249,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as i64;
-                    let auth_cfg = AuthConfig {
-                        method: AuthMethod::Token,
-                        token: nwc_token,
-                        oidc_issuer: String::new(),
-                        oidc_audience: String::new(),
-                        oidc_skip_expiry: false,
-                        oidc_skip_issuer: false,
-                        additional_data: None,
-                        oidc_proxy_url: String::new(),
-                        additional_auth_scopes: Vec::new(),
-                        authentication_timeout: 0,
-                        use_encryption: false,
-                    };
+                    let auth_cfg = AuthConfig::with_token(nwc_token);
                     nwc_msg.privilege_key = auth_cfg.generate_login_key(timestamp);
                     nwc_msg.timestamp = Some(timestamp);
                 }
