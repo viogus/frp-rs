@@ -11,8 +11,16 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::LazyLock;
 
-/// Default size for pooled buffers (64KB — matches bridge.rs read buffer).
-pub const BUFFER_SIZE: usize = 65536;
+/// Pooled buffer size in bytes. Defaults to 64KB; override for experiments
+/// via FRP_BRIDGE_BUF_KB (e.g. 256). Read once at process start.
+pub static BUFFER_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("FRP_BRIDGE_BUF_KB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|kb| *kb >= 4 && *kb <= 1024)
+        .map(|kb| kb * 1024)
+        .unwrap_or(65536)
+});
 
 /// Maximum number of buffers to retain in the pool.
 const MAX_POOLED_BUFFERS: usize = 32;
@@ -45,7 +53,7 @@ impl BufferPool {
     /// allocates via `Vec::with_capacity`, returning length 0.
     pub fn acquire(&self) -> Vec<u8> {
         let mut inner = self.inner.lock().expect("buffer pool lock poisoned");
-        inner.pop_front().unwrap_or_else(|| Vec::with_capacity(BUFFER_SIZE))
+        inner.pop_front().unwrap_or_else(|| Vec::with_capacity(*BUFFER_SIZE))
     }
 
     /// Return a buffer to the pool for reuse.
@@ -85,8 +93,8 @@ impl PoolGuard {
         // Only zero-fill on a freshly allocated (len 0) buffer. Recycled buffers
         // already have length BUFFER_SIZE, so skip the 64KB memset. read() fills
         // the slice and callers use only the [..n] prefix, so stale bytes are safe.
-        if buf.len() < BUFFER_SIZE {
-            buf.resize(BUFFER_SIZE, 0);
+        if buf.len() < *BUFFER_SIZE {
+            buf.resize(*BUFFER_SIZE, 0);
         }
         Self { buf }
     }
@@ -119,7 +127,7 @@ mod tests {
     fn test_default_creates_empty_pool() {
         let pool = BufferPool::default();
         let buf = pool.acquire();
-        assert!(buf.capacity() >= BUFFER_SIZE);
+        assert!(buf.capacity() >= *BUFFER_SIZE);
         assert_eq!(buf.len(), 0);
         pool.release(buf);
     }
@@ -136,7 +144,7 @@ mod tests {
         // would flip len back to 0).
         let buf2 = pool.acquire();
         assert_eq!(buf2.len(), 1, "release must not clear: length is preserved");
-        assert!(buf2.capacity() >= BUFFER_SIZE);
+        assert!(buf2.capacity() >= *BUFFER_SIZE);
         pool.release(buf2);
     }
 
@@ -148,12 +156,12 @@ mod tests {
         // Prime the global pool with one full-length buffer via a dropped guard.
         {
             let mut g = PoolGuard::acquire();
-            assert_eq!(g.as_mut_slice().len(), BUFFER_SIZE);
+            assert_eq!(g.as_mut_slice().len(), *BUFFER_SIZE);
         } // dropped -> released at len BUFFER_SIZE (release no longer clears)
 
         // Reacquire: buffer is still full length, so the resize guard is a no-op.
         let g2 = PoolGuard::acquire();
-        assert_eq!(g2.data().len(), BUFFER_SIZE, "recycled buffer stays full length");
+        assert_eq!(g2.data().len(), *BUFFER_SIZE, "recycled buffer stays full length");
     }
 
     #[test]
@@ -174,7 +182,7 @@ mod tests {
     #[test]
     fn test_global_pool_works() {
         let buf = BUFFER_POOL.acquire();
-        assert!(buf.capacity() >= BUFFER_SIZE);
+        assert!(buf.capacity() >= *BUFFER_SIZE);
         BUFFER_POOL.release(buf);
     }
 }
