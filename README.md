@@ -379,6 +379,26 @@ use_compression = false
 | `nat_hole_stun_server` | `""` | Custom STUN server for NAT traversal |
 | `dns_server` | `""` | Custom DNS server for resolving server address |
 
+#### Latency tuning (`pool_count`)
+
+`pool_count` pre-warms work connections on the server so they are ready
+before a user connects. With `pool_count = 0` (the default, matching Go frp),
+each new user connection first pays a `ReqWorkConn` → `StartWorkConn` control
+round-trip before the first byte can flow. A small positive `pool_count`
+absorbs that round-trip up front.
+
+Measured connection-setup latency (64 B probe, 2000 samples, loopback):
+
+| `pool_count` | setup p50 | setup p99 |
+|--------------|-----------|-----------|
+| `0` (cold)   | 251 µs    | 633 µs    |
+| `4` (warm)   | 191 µs    | 372 µs    |
+
+Warming the pool cut setup p50 by ~24% and p99 by ~41% on loopback. The
+default stays at `0` for Go frp parity and to avoid holding idle connections;
+latency-sensitive deployments should set `pool_count` to a small positive
+value.
+
 #### Proxy entries (`[[proxies]]`)
 
 | Field | Default | Description |
