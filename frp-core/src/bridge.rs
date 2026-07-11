@@ -242,6 +242,7 @@ pub async fn bridge_plain(
                 return;
             }
         let mut buf = PoolGuard::acquire();
+        let cap = buf.as_mut_slice().len();
         loop {
             let n = match user_r.read(buf.as_mut_slice()).await {
                 Ok(0) => {
@@ -269,7 +270,9 @@ pub async fn bridge_plain(
                 tracing::warn!(len = processed.len(), "bridge_plain: work_w write_all failed");
                 break;
             }
-            if work_w.flush().await.is_err() {
+            // Flush only when the read drained the source (short read) — a
+            // full-capacity read means more is likely queued, so batch it.
+            if n < cap && work_w.flush().await.is_err() {
                 tracing::warn!("bridge_plain: work_w flush failed");
                 break;
             }
@@ -278,6 +281,7 @@ pub async fn bridge_plain(
         // the user's request), leave work_w open so work_to_user can receive
         // the backend response. The frpc side will see EOF from user_w.shutdown()
         // in work_to_user after the response is complete.
+        let _ = work_w.flush().await;
         if !had_pre_read {
             if let Err(e) = work_w.shutdown().await {
                 tracing::debug!(error = %e, "bridge_plain shutdown: work_w.shutdown failed");
@@ -288,6 +292,7 @@ pub async fn bridge_plain(
     let work_to_user = async {
         tracing::debug!("bridge_plain: work_to_user starting");
         let mut buf = PoolGuard::acquire();
+        let cap = buf.as_mut_slice().len();
         let mut decompressor = make_decompressor(use_compression);
         loop {
             let n = match work_r.read(buf.as_mut_slice()).await {
@@ -316,13 +321,14 @@ pub async fn bridge_plain(
                 if let Some(ref m) = metrics {
                     m.bytes_out.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
                 }
-                if user_w.flush().await.is_err() {
+                if n < cap && user_w.flush().await.is_err() {
                     tracing::warn!("bridge_plain: user_w flush failed");
                     break;
                 }
             }
         }
         tracing::debug!("bridge_plain: work_to_user done");
+        let _ = user_w.flush().await;
         // Flush remaining buffered compressed data
         if let Some(ref mut dec) = decompressor {
             match dec.flush() {
@@ -490,6 +496,54 @@ mod tests {
         drop(w_w_test);
 
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bridge_plain_batches_flushes_on_full_reads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncWrite, AsyncRead, ReadBuf};
+
+        // Writer that counts flush() calls and discards data.
+        struct CountingWriter(Arc<AtomicUsize>);
+        impl AsyncWrite for CountingWriter {
+            fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, b: &[u8]) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Ok(b.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        // Reader that yields two full-capacity chunks then EOF.
+        struct TwoFullChunks(usize);
+        impl AsyncRead for TwoFullChunks {
+            fn poll_read(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+                if self.0 == 0 { return Poll::Ready(Ok(())); } // EOF
+                self.0 -= 1;
+                let n = buf.remaining();
+                buf.initialize_unfilled_to(n);
+                buf.advance(n);
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let user_r = TwoFullChunks(2);
+        let work_w = CountingWriter(flushes.clone());
+        // work_r EOFs immediately; user_w sinks.
+        let work_r = TwoFullChunks(0);
+        let user_w = CountingWriter(Arc::new(AtomicUsize::new(0)));
+
+        bridge_plain(user_r, user_w, work_r, work_w, false, Vec::new(), None).await;
+
+        // Two full-capacity reads => no per-chunk flush; exactly one final flush.
+        assert_eq!(flushes.load(Ordering::SeqCst), 1, "expected batched flush, got per-chunk");
     }
 
     #[test]
