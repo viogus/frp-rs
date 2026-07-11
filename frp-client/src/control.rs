@@ -12,6 +12,8 @@ use frp_core::transport::{IoStream, TransportProtocol, DialOptions, dial_server}
 use frp_core::quic::QuicConnection;
 use frp_core::VERSION;
 
+use crate::util::opt_if_empty;
+
 #[cfg(feature = "quic")]
 type LoginRet = (IoStream, String, Option<YamuxSession>, Option<QuicConnection>);
 #[cfg(not(feature = "quic"))]
@@ -123,7 +125,7 @@ impl ControlConnection {
             disable_custom_tls_first_byte: self.disable_custom_tls_first_byte,
             keepalive_secs: self.keepalive_secs,
             bind_addr: self.bind_addr.clone(),
-            proxy_url: if self.proxy_url.is_empty() { None } else { Some(self.proxy_url.clone()) },
+            proxy_url: opt_if_empty!(self.proxy_url),
             v2: self.v2,
             caller_handles_mux: propose_mux,
             ..Default::default()
@@ -263,13 +265,13 @@ impl ControlConnection {
             hostname: Some(hostname().await),
             os: Some(std::env::consts::OS.into()),
             arch: Some(std::env::consts::ARCH.into()),
-            user: if self.user.is_empty() { None } else { Some(self.user.clone()) },
+            user: opt_if_empty!(self.user),
             run_id: None,
-            client_id: if self.client_id.is_empty() { None } else { Some(self.client_id.clone()) },
+            client_id: opt_if_empty!(self.client_id),
             pool_count: Some(self.pool_count),
             timestamp: Some(timestamp),
             privilege_key: None,
-            metas: if self.metas.is_empty() { None } else { Some(self.metas.clone()) },
+            metas: opt_if_empty!(self.metas),
             client_spec: None,
             multiplexer: if propose_mux { Some("yamux".into()) } else { None },
         };

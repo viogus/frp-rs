@@ -10,6 +10,8 @@ use frp_core::msg::{self, FrpMessage};
 use frp_core::bridge;
 use frp_core::transport::IoStream;
 
+use crate::util::opt_if_empty;
+
 /// Build a NewVisitorConn message for an STCP/XTCP visitor connection.
 /// sign_key = MD5(sk + timestamp) matching Go frp v0.69.1 behaviour.
 pub fn create_visitor_conn_msg(server_name: &str, secret_key: &str, use_encryption: bool, use_compression: bool) -> FrpMessage {
@@ -55,39 +57,39 @@ pub fn create_new_proxy_msg(
         proxy_type: p.proxy_type.clone(),
         use_encryption: if p.use_encryption { Some(true) } else { None },
         use_compression: if p.use_compression { Some(true) } else { None },
-        group: if p.group.is_empty() { None } else { Some(p.group.clone()) },
-        group_key: if p.group_key.is_empty() { None } else { Some(p.group_key.clone()) },
+        group: opt_if_empty!(p.group),
+        group_key: opt_if_empty!(p.group_key),
         local_str: Some(local_addr.to_string()),
         remote_port: if p.remote_port == 0 { None } else { Some(p.remote_port as i32) },
         sk: {
-            let sk_val = if p.sk.is_empty() { None } else { Some(p.sk.clone()) };
+            let sk_val = opt_if_empty!(p.sk);
             debug!(name = %p.name, sk = ?sk_val, "NewProxy '{}': sk={:?}", p.name, sk_val);
             sk_val
         },
-        custom_domains: if p.custom_domains.is_empty() { None } else { Some(p.custom_domains.clone()) },
-        subdomain: if p.subdomain.is_empty() { None } else { Some(p.subdomain.clone()) },
-        locations: if p.locations.is_empty() { None } else { Some(p.locations.clone()) },
-        http_user: if p.http_user.is_empty() { None } else { Some(p.http_user.clone()) },
+        custom_domains: opt_if_empty!(p.custom_domains),
+        subdomain: opt_if_empty!(p.subdomain),
+        locations: opt_if_empty!(p.locations),
+        http_user: opt_if_empty!(p.http_user),
         http_pwd: {
             // Prefer http_pwd; fall back to http_password for Go compat
             let pwd = if !p.http_pwd.is_empty() { &p.http_pwd } else { &p.http_password };
             if pwd.is_empty() { None } else { Some(pwd.clone()) }
         },
-        host_header_rewrite: if p.host_header_rewrite.is_empty() { None } else { Some(p.host_header_rewrite.clone()) },
-        headers: if p.headers.is_empty() { None } else { Some(p.headers.clone()) },
-        response_headers: if p.response_headers.is_empty() { None } else { Some(p.response_headers.clone()) },
-        route_by_http_user: if p.route_by_http_user.is_empty() { None } else { Some(p.route_by_http_user.clone()) },
-        allow_users: if p.allow_users.is_empty() { None } else { Some(p.allow_users.clone()) },
-        bandwidth_limit: if p.bandwidth_limit.is_empty() { None } else { Some(p.bandwidth_limit.clone()) },
-        bandwidth_limit_mode: if p.bandwidth_limit_mode.is_empty() { None } else { Some(p.bandwidth_limit_mode.clone()) },
-        annotations: if p.annotations.is_empty() { None } else { Some(p.annotations.clone()) },
-        metas: if p.metas.is_empty() { None } else { Some(p.metas.clone()) },
-        multiplexer: if p.multiplexer.is_empty() { None } else { Some(p.multiplexer.clone()) },
-        virtual_net: if p.virtual_net.is_empty() { None } else { Some(p.virtual_net.clone()) },
-        proxy_protocol_version: if p.proxy_protocol_version.is_empty() { None } else { Some(p.proxy_protocol_version.clone()) },
-        advertise_subnet: if p.advertise_subnet.is_empty() { None } else { Some(p.advertise_subnet.clone()) },
-        vnet_ip: if p.vnet_ip.is_empty() { None } else { Some(p.vnet_ip.clone()) },
-        vnet_netmask: if p.vnet_netmask.is_empty() { None } else { Some(p.vnet_netmask.clone()) },
+        host_header_rewrite: opt_if_empty!(p.host_header_rewrite),
+        headers: opt_if_empty!(p.headers),
+        response_headers: opt_if_empty!(p.response_headers),
+        route_by_http_user: opt_if_empty!(p.route_by_http_user),
+        allow_users: opt_if_empty!(p.allow_users),
+        bandwidth_limit: opt_if_empty!(p.bandwidth_limit),
+        bandwidth_limit_mode: opt_if_empty!(p.bandwidth_limit_mode),
+        annotations: opt_if_empty!(p.annotations),
+        metas: opt_if_empty!(p.metas),
+        multiplexer: opt_if_empty!(p.multiplexer),
+        virtual_net: opt_if_empty!(p.virtual_net),
+        proxy_protocol_version: opt_if_empty!(p.proxy_protocol_version),
+        advertise_subnet: opt_if_empty!(p.advertise_subnet),
+        vnet_ip: opt_if_empty!(p.vnet_ip),
+        vnet_netmask: opt_if_empty!(p.vnet_netmask),
         vnet_mtu: if p.vnet_mtu == 0 { None } else { Some(p.vnet_mtu) },
     });
 

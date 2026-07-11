@@ -6,6 +6,8 @@ use frp_core::config::PluginConfig;
 
 use super::{PluginHandle, serve_plugin};
 
+use crate::util::opt_if_empty;
+
 /// Constant-time slice comparison for auth credential verification.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -43,8 +45,8 @@ const USERPASS_FAIL: u8 = 0x01;
 /// Supports CONNECT command only (TCP tunnel).
 /// Optional username/password auth via PluginConfig `username` / `password`.
 pub async fn start_socks5_proxy(cfg: &PluginConfig) -> Result<PluginHandle, frp_core::Error> {
-    let user = if cfg.username.is_empty() { None } else { Some(cfg.username.clone()) };
-    let pass = if cfg.password.is_empty() { None } else { Some(cfg.password.clone()) };
+    let user = opt_if_empty!(cfg.username);
+    let pass = opt_if_empty!(cfg.password);
     serve_plugin("socks5", (user, pass), |stream, peer, (u, p)| async move {
         if let Err(e) = handle_socks5_conn(stream, u, p).await {
             debug!(%peer, error = %e, "socks5: {peer} error: {e}");

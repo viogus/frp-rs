@@ -18,6 +18,7 @@ use frp_core::metrics::ProxyMetricsRegistry;
 
 use crate::proxy;
 use crate::proxy_runtime::ProxyRuntimeInfo;
+use crate::util::opt_if_empty;
 
 #[cfg(feature = "vnet")]
 type VnetTunMap = Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>;
@@ -179,7 +180,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                 disable_custom_tls_first_byte,
                 keepalive_secs,
                 bind_addr: bind_addr.clone(),
-                proxy_url: if proxy_url.is_empty() { None } else { Some(proxy_url.clone()) },
+                proxy_url: opt_if_empty!(proxy_url),
                 ..Default::default()
             };
             match dial_server(&opts).await {
@@ -215,7 +216,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                 disable_custom_tls_first_byte,
                 keepalive_secs,
                 bind_addr: bind_addr.clone(),
-                proxy_url: if proxy_url.is_empty() { None } else { Some(proxy_url.clone()) },
+                proxy_url: opt_if_empty!(proxy_url),
                 ..Default::default()
             };
             match dial_server(&opts).await {

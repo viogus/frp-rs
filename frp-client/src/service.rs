@@ -33,6 +33,7 @@ use frp_core::metrics::ProxyMetricsRegistry;
 
 use crate::plugin::{self, PluginHandle, PluginContext};
 use crate::control::ControlConnection;
+use crate::util::opt_if_empty;
 use crate::proxy_runtime::{ProxyRuntimeInfo, ReloadRequest};
 #[cfg(feature = "admin")]
 use crate::admin::AdminState;
@@ -206,7 +207,7 @@ impl Service {
                         transport_protocol: cfg.transport_protocol.clone(),
                         tls_enable: cfg.tls_enable,
                         tls_server_name: cfg.tls_server_name.clone(),
-                        tls_ca_file: if cfg.tls_ca_file.is_empty() { None } else { Some(cfg.tls_ca_file.clone()) },
+                        tls_ca_file: opt_if_empty!(cfg.tls_ca_file),
                         use_encryption: p.use_encryption,
                         use_compression: p.use_compression,
                         token: auth_cfg.token.clone(),
@@ -433,14 +434,14 @@ impl Service {
                 self.cfg.client_id.clone(),
                 self.cfg.tls_enable,
                 self.cfg.tls_server_name.clone(),
-                if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
-                if self.cfg.tls_cert_file.is_empty() { None } else { Some(self.cfg.tls_cert_file.clone()) },
-                if self.cfg.tls_key_file.is_empty() { None } else { Some(self.cfg.tls_key_file.clone()) },
-                if self.cfg.dns_server.is_empty() { None } else { Some(self.cfg.dns_server.clone()) },
+                opt_if_empty!(self.cfg.tls_ca_file),
+                opt_if_empty!(self.cfg.tls_cert_file),
+                opt_if_empty!(self.cfg.tls_key_file),
+                opt_if_empty!(self.cfg.dns_server),
                 self.cfg.tcp_mux,
                 self.cfg.disable_custom_tls_first_byte,
                 self.cfg.dial_server_keepalive.max(0) as u64,
-                if self.cfg.connect_server_local_ip.is_empty() { None } else { Some(self.cfg.connect_server_local_ip.clone()) },
+                opt_if_empty!(self.cfg.connect_server_local_ip),
                 self.cfg.v2,
                 self.oidc_client.clone(),
                 self.cfg.metas.clone(),
@@ -692,7 +693,7 @@ impl Service {
                     auth_token: auth_token.clone(),
                     tls_enable: self.cfg.tls_enable,
                     tls_server_name: self.cfg.tls_server_name.clone(),
-                    tls_ca_file: if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
+                    tls_ca_file: opt_if_empty!(self.cfg.tls_ca_file),
                     yamux: yamux.clone(),
                     quic_conn: quic_arg,
                     v2,
@@ -704,7 +705,7 @@ impl Service {
                     server_auth_scopes: server_scopes.clone(),
                     disable_custom_tls_first_byte: self.cfg.disable_custom_tls_first_byte,
                     keepalive_secs: self.cfg.dial_server_keepalive.max(0) as u64,
-                    bind_addr: if self.cfg.connect_server_local_ip.is_empty() { None } else { Some(self.cfg.connect_server_local_ip.clone()) },
+                    bind_addr: opt_if_empty!(self.cfg.connect_server_local_ip),
                     proxy_url: self.cfg.proxy_url.clone(),
                     xtcp_tx: xtcp_tx.clone(),
                     session_alive: session_alive.clone(),
@@ -736,7 +737,7 @@ impl Service {
                 let name = v.name.clone();
                 let tls_enable = self.cfg.tls_enable;
                 let tls_server_name = self.cfg.tls_server_name.clone();
-                let tls_ca_file = if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) };
+                let tls_ca_file = opt_if_empty!(self.cfg.tls_ca_file);
                 let visitor_type = v.visitor_type.clone();
                 let fallback_timeout_ms = v.fallback_timeout_ms;
                 let keep_tunnel_open = v.keep_tunnel_open;
@@ -783,7 +784,7 @@ impl Service {
                                     auth_token: auth_token.clone(),
                                     tls_enable: self.cfg.tls_enable,
                                     tls_server_name: self.cfg.tls_server_name.clone(),
-                                    tls_ca_file: if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
+                                    tls_ca_file: opt_if_empty!(self.cfg.tls_ca_file),
                                     yamux: yamux.clone(),
                                     quic_conn: quic_arg,
                                     v2,
@@ -795,7 +796,7 @@ impl Service {
                                     server_auth_scopes: server_scopes.clone(),
                                     disable_custom_tls_first_byte: self.cfg.disable_custom_tls_first_byte,
                                     keepalive_secs: self.cfg.dial_server_keepalive.max(0) as u64,
-                                    bind_addr: if self.cfg.connect_server_local_ip.is_empty() { None } else { Some(self.cfg.connect_server_local_ip.clone()) },
+                                    bind_addr: opt_if_empty!(self.cfg.connect_server_local_ip),
                                     proxy_url: self.cfg.proxy_url.clone(),
                                     xtcp_tx: xtcp_tx.clone(),
                                     session_alive: session_alive.clone(),
@@ -1337,7 +1338,7 @@ impl Service {
                 transport_protocol: self.cfg.transport_protocol.clone(),
                 tls_enable: self.cfg.tls_enable,
                 tls_server_name: self.cfg.tls_server_name.clone(),
-                tls_ca_file: if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.clone()) },
+                tls_ca_file: opt_if_empty!(self.cfg.tls_ca_file),
                 use_encryption: true,
                 use_compression: false,
                 token: self.auth_cfg.token.clone(),
