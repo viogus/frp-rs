@@ -104,6 +104,19 @@ fn resolve_allow_ports(cfg: &ServerConfig) -> Vec<(u16, u16)> {
     }
 }
 
+/// Record a "restart required" change entry when `old != new`. Used by
+/// `reload()` for settings that only take effect on a full restart.
+fn note_restart_change<T: PartialEq + std::fmt::Display>(
+    old: &T,
+    new: &T,
+    name: &str,
+    changes: &mut Vec<String>,
+) {
+    if *old != *new {
+        changes.push(format!("{name}: {old} -> {new} (restart required)"));
+    }
+}
+
 // ---------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------
@@ -2142,24 +2155,9 @@ impl Service {
         }
 
         // Log settings that require restart
-        if self.cfg.bind_port != new_cfg.bind_port {
-            changes.push(format!(
-                "bind_port: {} -> {} (restart required)",
-                self.cfg.bind_port, new_cfg.bind_port
-            ));
-        }
-        if self.cfg.bind_addr != new_cfg.bind_addr {
-            changes.push(format!(
-                "bind_addr: {} -> {} (restart required)",
-                self.cfg.bind_addr, new_cfg.bind_addr
-            ));
-        }
-        if self.cfg.tls_enable != new_cfg.tls_enable {
-            changes.push(format!(
-                "tls_enable: {} -> {} (restart required)",
-                self.cfg.tls_enable, new_cfg.tls_enable
-            ));
-        }
+        note_restart_change(&self.cfg.bind_port, &new_cfg.bind_port, "bind_port", &mut changes);
+        note_restart_change(&self.cfg.bind_addr, &new_cfg.bind_addr, "bind_addr", &mut changes);
+        note_restart_change(&self.cfg.tls_enable, &new_cfg.tls_enable, "tls_enable", &mut changes);
         // TLS certificate hot-reload: if cert/key/ca paths changed, rebuild
         // acceptor and swap atomically. Existing connections keep old config;
         // new connections pick up the new cert immediately.
