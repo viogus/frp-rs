@@ -30,6 +30,21 @@ async fn write_resp(
     }
 }
 
+/// Build and send a `NewProxyResp` rejecting a proxy with `error`.
+async fn reject_new_proxy(
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    proxy_name: &str,
+    error: String,
+    v2: bool,
+) {
+    let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
+        proxy_name: proxy_name.to_string(),
+        remote_addr: None,
+        error: Some(error),
+    });
+    write_resp(writer, &resp, v2).await;
+}
+
 /// Register a new proxy and start listening on its assigned port.
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip(state, writer, internal_tx, listener_handles, udp_sockets, udp_local_to_proxy), fields(proxy_name = %np.proxy_name, proxy_type = %np.proxy_type, run_id = %run_id))]
@@ -46,12 +61,7 @@ pub(crate) async fn handle_new_proxy(
 ) {
     let raw_port = np.remote_port.unwrap_or(0);
     if raw_port < 0 || raw_port > u16::MAX as i32 {
-        let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
-            proxy_name: np.proxy_name.clone(),
-            remote_addr: None,
-            error: Some(format!("remote_port {} out of valid range (0-65535)", raw_port)),
-        });
-        write_resp(writer, &resp, v2).await;
+        reject_new_proxy(writer, &np.proxy_name, format!("remote_port {} out of valid range (0-65535)", raw_port), v2).await;
         return;
     }
     let remote_port = raw_port as u16;
@@ -59,44 +69,24 @@ pub(crate) async fn handle_new_proxy(
     // Validate string lengths and reject control characters to prevent
     // resource exhaustion and injection attacks.
     if np.proxy_name.len() > 255 {
-        let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
-            proxy_name: np.proxy_name.clone(),
-            remote_addr: None,
-            error: Some("proxy_name exceeds 255 characters".into()),
-        });
-        write_resp(writer, &resp, v2).await;
+        reject_new_proxy(writer, &np.proxy_name, "proxy_name exceeds 255 characters".into(), v2).await;
         return;
     }
     if np.proxy_name.contains(|c: char| c.is_control() && c != '\n' && c != '\r') {
-        let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
-            proxy_name: np.proxy_name.clone(),
-            remote_addr: None,
-            error: Some("proxy_name contains invalid control characters".into()),
-        });
-        write_resp(writer, &resp, v2).await;
+        reject_new_proxy(writer, &np.proxy_name, "proxy_name contains invalid control characters".into(), v2).await;
         return;
     }
     if let Some(ref domains) = np.custom_domains {
         for domain in domains {
             if domain.len() > 253 {
-                let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
-                    proxy_name: np.proxy_name.clone(),
-                    remote_addr: None,
-                    error: Some(format!("custom_domain '{}' exceeds 253 characters (RFC 1035 FQDN limit)", domain)),
-                });
-                write_resp(writer, &resp, v2).await;
+                reject_new_proxy(writer, &np.proxy_name, format!("custom_domain '{}' exceeds 253 characters (RFC 1035 FQDN limit)", domain), v2).await;
                 return;
             }
         }
     }
     if let Some(ref subdomain) = np.subdomain {
         if subdomain.len() > 63 {
-            let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
-                proxy_name: np.proxy_name.clone(),
-                remote_addr: None,
-                error: Some(format!("subdomain '{}' exceeds 63 characters (RFC 1035 label limit)", subdomain)),
-            });
-            write_resp(writer, &resp, v2).await;
+            reject_new_proxy(writer, &np.proxy_name, format!("subdomain '{}' exceeds 63 characters (RFC 1035 label limit)", subdomain), v2).await;
             return;
         }
     }
@@ -119,12 +109,7 @@ pub(crate) async fn handle_new_proxy(
                 context: Some("new_proxy".into()),
             });
         }
-        let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
-            proxy_name: np.proxy_name.clone(),
-            remote_addr: None,
-            error: Some(reason),
-        });
-        write_resp(writer, &resp, v2).await;
+        reject_new_proxy(writer, &np.proxy_name, reason, v2).await;
         return;
     }
 
@@ -132,15 +117,10 @@ pub(crate) async fn handle_new_proxy(
     if state.max_ports_per_client > 0 {
         let count = state.proxy_manager.list_client_proxy_names(run_id).await.len();
         if count >= state.max_ports_per_client as usize {
-            let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
-                proxy_name: np.proxy_name.clone(),
-                remote_addr: None,
-                error: Some(format!(
-                    "maximum number of proxies ({}) reached for this client",
-                    state.max_ports_per_client
-                )),
-            });
-            write_resp(writer, &resp, v2).await;
+            reject_new_proxy(writer, &np.proxy_name, format!(
+                "maximum number of proxies ({}) reached for this client",
+                state.max_ports_per_client
+            ), v2).await;
             return;
         }
     }
@@ -196,12 +176,7 @@ pub(crate) async fn handle_new_proxy(
 
             if let Err(e) = state.proxy_manager.register(run_id.to_string(), info.clone()).await {
                 state.used_ports.write().await.remove(&port);
-                let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
-                    proxy_name: np.proxy_name.clone(),
-                    remote_addr: None,
-                    error: Some(err_msg(state.detailed_errors_to_client, e, "proxy registration conflict")),
-                });
-                write_resp(writer, &resp, v2).await;
+                reject_new_proxy(writer, &np.proxy_name, err_msg(state.detailed_errors_to_client, e, "proxy registration conflict"), v2).await;
                 return;
             }
 
@@ -332,12 +307,7 @@ pub(crate) async fn handle_new_proxy(
                 let domains: Vec<String> = np.custom_domains.clone().unwrap_or_default();
                 if domains.is_empty() {
                     // TCPMux requires at least one domain for routing
-                    let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
-                        proxy_name: np.proxy_name.clone(),
-                        remote_addr: None,
-                        error: Some("tcpmux proxy requires custom_domains".into()),
-                    });
-                    write_resp(writer, &resp, v2).await;
+                    reject_new_proxy(writer, &np.proxy_name, "tcpmux proxy requires custom_domains".into(), v2).await;
                     state.proxy_manager.remove(&np.proxy_name).await;
                     return;
                 }
@@ -392,12 +362,7 @@ pub(crate) async fn handle_new_proxy(
                             None => {
                                 tracing::error!(port = %port, error = %e, "SUDP port {} bind failed (no existing socket to share): {}", port, e);
                                 state.proxy_manager.remove(&np.proxy_name).await;
-                                let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
-                                    proxy_name: np.proxy_name.clone(),
-                                    remote_addr: None,
-                                    error: Some(err_msg(state.detailed_errors_to_client, format!("SUDP bind failed: {e}"), "SUDP bind failed")),
-                                });
-                                write_resp(writer, &resp, v2).await;
+                                reject_new_proxy(writer, &np.proxy_name, err_msg(state.detailed_errors_to_client, format!("SUDP bind failed: {e}"), "SUDP bind failed"), v2).await;
                                 return;
                             }
                         }
@@ -406,12 +371,7 @@ pub(crate) async fn handle_new_proxy(
                         tracing::error!(port = %port, error = %e, "Failed to bind UDP port {}: {}", port, e);
                         state.used_ports.write().await.remove(&port);
                         state.proxy_manager.remove(&np.proxy_name).await;
-                        let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
-                            proxy_name: np.proxy_name.clone(),
-                            remote_addr: None,
-                            error: Some(err_msg(state.detailed_errors_to_client, format!("UDP bind failed: {e}"), "UDP bind failed")),
-                        });
-                        write_resp(writer, &resp, v2).await;
+                        reject_new_proxy(writer, &np.proxy_name, err_msg(state.detailed_errors_to_client, format!("UDP bind failed: {e}"), "UDP bind failed"), v2).await;
                         return;
                     }
                 };
@@ -482,12 +442,7 @@ pub(crate) async fn handle_new_proxy(
         }
         None => {
             warn!(proxy_name = %np.proxy_name, "No available port for proxy '{}'", np.proxy_name);
-            let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
-                proxy_name: np.proxy_name.clone(),
-                remote_addr: None,
-                error: Some("no available port".into()),
-            });
-            write_resp(writer, &resp, v2).await;
+            reject_new_proxy(writer, &np.proxy_name, "no available port".into(), v2).await;
         }
     }
 }
