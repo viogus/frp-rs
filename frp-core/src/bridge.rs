@@ -242,6 +242,7 @@ pub async fn bridge_plain(
                 return;
             }
         let mut buf = PoolGuard::acquire();
+        // cap is constant: PoolGuard::acquire() always yields a *BUFFER_SIZE buffer.
         let cap = buf.as_mut_slice().len();
         loop {
             let n = match user_r.read(buf.as_mut_slice()).await {
@@ -270,9 +271,11 @@ pub async fn bridge_plain(
                 tracing::warn!(len = processed.len(), "bridge_plain: work_w write_all failed");
                 break;
             }
-            // Flush only when the read drained the source (short read) — a
-            // full-capacity read means more is likely queued, so batch it.
-            if n < cap && work_w.flush().await.is_err() {
+            // Flush when compressing (strict req/resp clients need each echo
+            // pushed through buffering writers), or when the read drained the
+            // source (short read). A full-capacity plain read means more is
+            // likely queued, so batch it.
+            if (use_compression || n < cap) && work_w.flush().await.is_err() {
                 tracing::warn!("bridge_plain: work_w flush failed");
                 break;
             }
@@ -292,6 +295,7 @@ pub async fn bridge_plain(
     let work_to_user = async {
         tracing::debug!("bridge_plain: work_to_user starting");
         let mut buf = PoolGuard::acquire();
+        // cap is constant: PoolGuard::acquire() always yields a *BUFFER_SIZE buffer.
         let cap = buf.as_mut_slice().len();
         let mut decompressor = make_decompressor(use_compression);
         loop {
@@ -321,7 +325,7 @@ pub async fn bridge_plain(
                 if let Some(ref m) = metrics {
                     m.bytes_out.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
                 }
-                if n < cap && user_w.flush().await.is_err() {
+                if (use_compression || n < cap) && user_w.flush().await.is_err() {
                     tracing::warn!("bridge_plain: user_w flush failed");
                     break;
                 }
