@@ -449,8 +449,26 @@ pub(crate) async fn assign_work_to_proxy(
                         debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
                     }
                 }
+            } else if !comp_key
+                && bridge_pre_read.is_empty()
+                && req.response_headers.is_empty()
+            {
+                // Fast path: pure plain relay with no compression, no VHost
+                // pre-read, and no header injection. copy_bidirectional uses
+                // an internal buffer and avoids bridge_plain's per-chunk
+                // compress/flush indirection. Bytes relayed are identical.
+                let mut user_conn = req.user_conn;
+                match tokio::io::copy_bidirectional(&mut user_conn, &mut work_conn).await {
+                    Ok((a, b)) => {
+                        metrics.bytes_in.fetch_add(a, Ordering::Relaxed);
+                        metrics.bytes_out.fetch_add(b, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "plain fast-path bridge closed: {}", e);
+                    }
+                }
             } else {
-                // Plain bridge with optional compression.
+                // Slow path: compression, VHost pre-read, or header injection.
                 let (u_r, u_w) = req.user_conn.into_split();
                 let (w_r, w_w) = work_conn.into_split();
                 if !req.response_headers.is_empty() && req.proxy_type.starts_with("http") {
