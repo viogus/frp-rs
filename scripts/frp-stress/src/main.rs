@@ -50,6 +50,18 @@ struct Cli {
     /// Disable the throughput pass/fail floor (baseline measurement mode)
     #[arg(long, default_value = "false")]
     no_floor: bool,
+
+    /// Latency mode: "steady" (persistent conn RTT) or "setup" (fresh-conn connect->first-byte)
+    #[arg(long, default_value = "steady")]
+    mode: String,
+
+    /// Number of latency samples to collect
+    #[arg(long, default_value = "2000")]
+    samples: usize,
+
+    /// Message size in bytes for latency probes
+    #[arg(long, default_value = "64")]
+    msg_bytes: usize,
 }
 
 #[tokio::main]
@@ -69,6 +81,7 @@ async fn main() -> Result<()> {
         "burst" => scenarios::burst::run(&cli).await?,
         "mixed" => scenarios::mixed::run(&cli).await?,
         "echo" => scenarios::echo::run(&cli).await?,
+        "latency" => scenarios::latency::run(&cli).await?,
         "all" => scenarios::run_all(&cli).await?,
         _ => anyhow::bail!("unknown scenario: {}", cli.scenario),
     }
