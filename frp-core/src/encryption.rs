@@ -50,7 +50,12 @@ pub fn decrypt(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
 pub fn compress(data: &[u8]) -> Result<Vec<u8>, String> {
     use snap::write::FrameEncoder;
     use std::io::Write;
-    let mut encoder = FrameEncoder::new(Vec::new());
+    // Pre-size the sink to the frame-format upper bound: raw max-compress-len
+    // plus per-64KiB-block frame overhead (8-byte chunk header) and the stream
+    // identifier. Avoids Vec regrowth during encoding. Frame bytes unchanged.
+    let cap = snap::raw::max_compress_len(data.len())
+        .saturating_add(data.len() / 65_536 * 8 + 24);
+    let mut encoder = FrameEncoder::new(Vec::with_capacity(cap));
     encoder
         .write_all(data)
         .map_err(|e| format!("snappy compress: {e}"))?;
