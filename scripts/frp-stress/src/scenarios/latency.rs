@@ -21,6 +21,9 @@ fn percentiles_us(mut samples_ns: Vec<u128>) -> (f64, f64, f64, f64, f64) {
 }
 
 pub async fn run(cli: &Cli) -> Result<()> {
+    if cli.samples == 0 {
+        anyhow::bail!("--samples must be >= 1");
+    }
     let target = format!(
         "{}:{}",
         cli.frps_addr.split(':').next().unwrap_or("127.0.0.1"),
@@ -100,9 +103,9 @@ mod tests {
         // 1..=100 microseconds (as ns). p50~50us, p99~99us, max=100us.
         let samples: Vec<u128> = (1..=100).map(|v| v as u128 * 1000).collect();
         let (p50, p95, p99, max, mean) = percentiles_us(samples);
-        assert!((p50 - 50.0).abs() < 1.5, "p50={p50}");
-        assert!((p95 - 95.0).abs() < 1.5, "p95={p95}");
-        assert!((p99 - 99.0).abs() < 1.5, "p99={p99}");
+        assert!((p50 - 50.0).abs() < 0.001, "p50={p50}");
+        assert!((p95 - 95.0).abs() < 0.001, "p95={p95}");
+        assert!((p99 - 99.0).abs() < 0.001, "p99={p99}");
         assert!((max - 100.0).abs() < 0.001, "max={max}");
         assert!((mean - 50.5).abs() < 0.001, "mean={mean}");
     }

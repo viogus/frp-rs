@@ -66,9 +66,11 @@ run_case() {
   "$FRPC" -c /tmp/lat-frpc.toml & PIDS+=($!)
   sleep 2
 
-  "$STRESS" --scenario latency --mode "$mode" --port "$REMOTE_PORT" \
-    --frps-addr "127.0.0.1:$FRPS_PORT" --token "$TOKEN" \
-    --samples "$SAMPLES" --msg-bytes 64 --label "$label" --json-out "$OUT" || true
+  if ! "$STRESS" --scenario latency --mode "$mode" --port "$REMOTE_PORT" \
+    --frps-addr "127.0.0.1:$FRPS_PORT" \
+    --samples "$SAMPLES" --msg-bytes 64 --label "$label" --json-out "$OUT"; then
+    echo "WARNING: latency run for '$label' failed (exit code $?)" >&2
+  fi
 
   for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
   PIDS=()
