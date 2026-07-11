@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use frp_core::metrics::ConnGuard;
 use frp_core::msg::{self, FrpMessage};
@@ -336,7 +336,7 @@ pub(crate) async fn assign_work_to_proxy(
         }
     }
 
-    info!(proxy_name = %req.proxy_name, proxy_type = %req.proxy_type, "Bridging user conn to work conn for proxy '{}' (type={})", req.proxy_name, req.proxy_type);
+    debug!(proxy_name = %req.proxy_name, proxy_type = %req.proxy_type, "Bridging user conn to work conn for proxy '{}' (type={})", req.proxy_name, req.proxy_type);
 
     let proxy_name = req.proxy_name.clone();
     let metrics = state.proxy_metrics.get_or_create(&proxy_name).await;
@@ -461,6 +461,6 @@ pub(crate) async fn assign_work_to_proxy(
                 }
             }
         }
-        info!(proxy_name = %req.proxy_name, "Proxy '{}' bridge completed", req.proxy_name);
+        debug!(proxy_name = %req.proxy_name, "Proxy '{}' bridge completed", req.proxy_name);
     });
 }

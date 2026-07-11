@@ -142,7 +142,7 @@ async fn write_start_work_conn_with_nat_hole_sid<W: tokio::io::AsyncWriteExt + U
 /// Handle a control connection from a frpc client.
 /// The login message has already been consumed from the stream.
 /// `peer` is passed separately because generic stream types don't have peer_addr().
-#[instrument(skip(stream, state, incoming, crypto_ctx), fields(run_id = %login.run_id.clone().unwrap_or_default(), peer = ?peer))]
+#[instrument(skip(stream, state, incoming, crypto_ctx, login), fields(run_id = %login.run_id.clone().unwrap_or_default(), peer = ?peer))]
 pub async fn handle_control<S>(
     mut stream: S,
     login: msg::Login,
