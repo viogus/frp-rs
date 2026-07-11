@@ -4,6 +4,7 @@ pub mod throughput;
 pub mod longevity;
 pub mod burst;
 pub mod mixed;
+pub mod echo;
 
 use crate::Cli;
 use anyhow::Result;

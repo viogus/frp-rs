@@ -7,6 +7,7 @@ members = [
     "frp-vnet",
     "frps",
     "frpc",
+    "scripts/frp-stress",
 ]
 
 [workspace.dependencies]

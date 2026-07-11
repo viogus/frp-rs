@@ -34,6 +34,22 @@ struct Cli {
     /// Proxy base port (server-side port allocation starts here)
     #[arg(short, long, default_value = "7000")]
     port: u16,
+
+    /// Single-stream count override for throughput (defaults to --concurrency)
+    #[arg(long, default_value = "0")]
+    streams: usize,
+
+    /// Write structured JSON result to this path (append mode)
+    #[arg(long)]
+    json_out: Option<String>,
+
+    /// Configuration label recorded in JSON output (e.g. "plain", "tls")
+    #[arg(long, default_value = "unlabeled")]
+    label: String,
+
+    /// Disable the throughput pass/fail floor (baseline measurement mode)
+    #[arg(long, default_value = "false")]
+    no_floor: bool,
 }
 
 #[tokio::main]
@@ -52,6 +68,7 @@ async fn main() -> Result<()> {
         "longevity" => scenarios::longevity::run(&cli).await?,
         "burst" => scenarios::burst::run(&cli).await?,
         "mixed" => scenarios::mixed::run(&cli).await?,
+        "echo" => scenarios::echo::run(&cli).await?,
         "all" => scenarios::run_all(&cli).await?,
         _ => anyhow::bail!("unknown scenario: {}", cli.scenario),
     }
