@@ -73,11 +73,18 @@ mod tests {
 
     #[test]
     fn snapshot_monotonic_total() {
-        // total_alloc is cumulative and never decreases across two snapshots.
+        // total_alloc is cumulative; a direct CountingAlloc.alloc must
+        // increase it. (Vec::with_capacity uses System, not CountingAlloc,
+        // in the test binary — so we allocate through the wrapper directly.)
         let (_, t0, _) = snapshot();
-        let _v: Vec<u8> = Vec::with_capacity(4096);
-        let (_, t1, _) = snapshot();
-        assert!(t1 >= t0, "total_alloc must be monotonic: {t1} >= {t0}");
+        let layout = Layout::from_size_align(4096, 8).unwrap();
+        unsafe {
+            let p = CountingAlloc.alloc(layout);
+            assert!(!p.is_null());
+            let (_, t1, _) = snapshot();
+            assert!(t1 >= t0 + 4096, "total_alloc must increase by >= alloc size: {t1} >= {t0}");
+            CountingAlloc.dealloc(p, layout);
+        }
     }
 
     #[test]
