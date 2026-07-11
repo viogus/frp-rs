@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -12,11 +13,11 @@ use tracing::instrument;
 /// Compress a plaintext chunk when compression is enabled, else copy it.
 /// Returns `None` on compression failure — the caller should break its loop.
 #[inline]
-fn compress_chunk(payload: &[u8], use_compression: bool) -> Option<Vec<u8>> {
+fn compress_chunk(payload: &[u8], use_compression: bool) -> Option<Cow<'_, [u8]>> {
     if use_compression {
-        encryption::compress(payload).ok()
+        encryption::compress(payload).ok().map(Cow::Owned)
     } else {
-        Some(payload.to_vec())
+        Some(Cow::Borrowed(payload))
     }
 }
 
@@ -42,16 +43,16 @@ fn make_decompressor(use_compression: bool) -> Option<encryption::SnappyDecompre
 /// Feed a chunk through the decompressor if present, else copy it.
 /// Returns `None` on decompress error — the caller should break its loop.
 #[inline]
-fn decompress_chunk(
+fn decompress_chunk<'a>(
     dec: &mut Option<encryption::SnappyDecompressor>,
-    data: &[u8],
-) -> Option<Vec<u8>> {
+    data: &'a [u8],
+) -> Option<Cow<'a, [u8]>> {
     match dec {
         Some(d) => d.feed(data).inspect_err(|e| {
             #[cfg(feature = "compression")]
             tracing::warn!(error = %e, "snappy decompress error in bridge: {}", e);
-        }).ok(),
-        None => Some(data.to_vec()),
+        }).ok().map(Cow::Owned),
+        None => Some(Cow::Borrowed(data)),
     }
 }
 
@@ -146,7 +147,7 @@ pub async fn bridge_encrypted(
                 lim.consume(processed.len()).await;
             }
 
-            if enc_work_w.write_all(&processed).await.is_err() { break; }
+            if enc_work_w.write_all(processed.as_ref()).await.is_err() { break; }
             if enc_work_w.flush().await.is_err() { break; }
         }
         // Symmetric shutdown: signal EOF to work side (matching bridge_plain).
@@ -182,7 +183,7 @@ pub async fn bridge_encrypted(
                     lim.consume(plaintext.len()).await;
                 }
 
-                if user_w.write_all(&plaintext).await.is_err() { break; }
+                if user_w.write_all(plaintext.as_ref()).await.is_err() { break; }
                 // Count bytes written to user (download)
                 if let Some(ref m) = metrics {
                     m.bytes_out.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
@@ -264,7 +265,7 @@ pub async fn bridge_plain(
                 Some(p) => p,
                 None => break,
             };
-            if work_w.write_all(&processed).await.is_err() {
+            if work_w.write_all(processed.as_ref()).await.is_err() {
                 tracing::warn!(len = processed.len(), "bridge_plain: work_w write_all failed");
                 break;
             }
@@ -308,7 +309,7 @@ pub async fn bridge_plain(
                 None => break,
             };
             if !plaintext.is_empty() {
-                if user_w.write_all(&plaintext).await.is_err() {
+                if user_w.write_all(plaintext.as_ref()).await.is_err() {
                     tracing::warn!(len = plaintext.len(), "bridge_plain: user_w write_all failed");
                     break;
                 }
@@ -494,7 +495,7 @@ mod tests {
     #[test]
     fn test_compress_chunk_identity_when_disabled() {
         let out = compress_chunk(b"hello", false).unwrap();
-        assert_eq!(out, b"hello");
+        assert_eq!(out.as_ref(), b"hello");
     }
 
     #[test]
@@ -502,15 +503,15 @@ mod tests {
         let original = b"AAAA".repeat(64);
         let compressed = compress_chunk(&original, true).expect("compress ok");
         let mut dec = make_decompressor(true);
-        let out = decompress_chunk(&mut dec, &compressed).expect("decompress ok");
-        assert_eq!(out, original);
+        let out = decompress_chunk(&mut dec, compressed.as_ref()).expect("decompress ok");
+        assert_eq!(out.as_ref(), original);
     }
 
     #[test]
     fn test_decompress_chunk_identity_when_none() {
         let mut dec: Option<encryption::SnappyDecompressor> = None;
         let out = decompress_chunk(&mut dec, b"raw").unwrap();
-        assert_eq!(out, b"raw");
+        assert_eq!(out.as_ref(), b"raw");
     }
 }
 
