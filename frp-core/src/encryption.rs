@@ -37,7 +37,7 @@ pub fn decrypt(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
     }
     let iv: &[u8; 16] = data[..16]
         .try_into()
-        .map_err(|_| "data too short for AES-CFB (need at least 16-byte IV)")?;
+        .expect("IV is exactly 16 bytes: length checked above");
     let ciphertext = &data[16..];
     let mut result = ciphertext.to_vec();
     let cipher = Aes128CfbDec::new(key.into(), iv.into());
@@ -50,9 +50,11 @@ pub fn decrypt(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
 pub fn compress(data: &[u8]) -> Result<Vec<u8>, String> {
     use snap::write::FrameEncoder;
     use std::io::Write;
-    // Pre-size the sink to the frame-format upper bound: raw max-compress-len
+    // Pre-size the sink with an approximate capacity hint: raw max-compress-len
     // plus per-64KiB-block frame overhead (8-byte chunk header) and the stream
-    // identifier. Avoids Vec regrowth during encoding. Frame bytes unchanged.
+    // identifier. Exact for single-block (<=64 KiB) inputs, which is all the
+    // bridge produces; larger multi-block inputs may take one tail realloc.
+    // Vec::with_capacity is advisory — emitted frame bytes are identical either way.
     let cap = snap::raw::max_compress_len(data.len())
         .saturating_add(data.len() / 65_536 * 8 + 24);
     let mut encoder = FrameEncoder::new(Vec::with_capacity(cap));

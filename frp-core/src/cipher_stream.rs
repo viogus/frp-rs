@@ -1141,6 +1141,21 @@ mod tests {
             }
             assert_eq!(got, want, "chunked encrypt mismatch for {:?}", chunks);
 
+            // Chunked decrypt vs reference: feed the SAME ciphertext through
+            // both implementations in identical chunk splits, directly
+            // verifying cross-chunk `used` carry on the decrypt path.
+            let mut got_dec = got.clone();
+            let mut want_dec = got.clone();
+            let mut got_dec_cfb = CfbState::new(&key, &iv);
+            let mut want_dec_cfb = RefCfb::new(&key, &iv);
+            let mut doff = 0;
+            for &c in *chunks {
+                got_dec_cfb.decrypt(&mut got_dec[doff..doff + c]);
+                want_dec_cfb.decrypt(&mut want_dec[doff..doff + c]);
+                doff += c;
+            }
+            assert_eq!(got_dec, want_dec, "chunked decrypt mismatch for {:?}", chunks);
+
             // Round-trip: decrypting the ciphertext restores plaintext.
             let mut rt = got.clone();
             CfbState::new(&key, &iv).decrypt(&mut rt);
