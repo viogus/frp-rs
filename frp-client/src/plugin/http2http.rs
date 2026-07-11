@@ -9,7 +9,7 @@
 //! - local_addr: backend host:port (e.g. "127.0.0.1:8080")
 //! - host_header_rewrite: optional Host header override
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 #[cfg(test)]
 use tokio::net::TcpListener;
@@ -41,60 +41,12 @@ async fn handle_conn(
     target: &str,
     host_rewrite: &str,
 ) -> Result<(), String> {
-    // Read HTTP headers in chunks until \r\n\r\n
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 512];
-    loop {
-        let n = client.read(&mut chunk).await.map_err(|e| format!("read: {e}"))?;
-        if n == 0 {
-            return Err("connection closed".into());
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() >= 4 && buf[buf.len() - 4..] == *b"\r\n\r\n" {
-            break;
-        }
-        if buf.len() > 65536 {
-            return Err("request headers too large".into());
-        }
-    }
-
-    // Split buffer on first \r\n\r\n to separate headers from any pre-read body data.
-    let header_end = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
-        .unwrap_or(buf.len());
-    let headers_str = String::from_utf8_lossy(&buf[..header_end]);
-    let mut lines = headers_str.lines();
-
-    // Parse request line: METHOD URL HTTP/1.x
-    let request_line = lines.next().ok_or("empty request")?;
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() < 2 {
-        return Err(format!("bad request line: {request_line}"));
-    }
-    let method = parts[0];
-    let path = parts[1];
+    let fwd = crate::plugin::read_request_and_build_forward(&mut client, host_rewrite).await?;
 
     // Connect to backend
     let mut remote = TcpStream::connect(target)
         .await
         .map_err(|e| format!("connect to {target}: {e}"))?;
-
-    // Build forwarded request with optional Host rewrite
-    let mut fwd = format!("{method} {path} HTTP/1.0\r\n");
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        if !host_rewrite.is_empty() && line.to_lowercase().starts_with("host:") {
-            fwd.push_str(&format!("Host: {host_rewrite}\r\n"));
-        } else {
-            fwd.push_str(line);
-            fwd.push_str("\r\n");
-        }
-    }
-    fwd.push_str("Connection: close\r\n\r\n");
 
     remote
         .write_all(fwd.as_bytes())
