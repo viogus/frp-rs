@@ -187,6 +187,82 @@ pub(crate) async fn write_http_error(
     }
 }
 
+/// Shared per-connection VHost handling: read the request head, extract Host
+/// header and path, apply Basic Auth and host_header_rewrite, then route the
+/// stream via InternalMsg::ProxyUserConn. `scheme` labels log lines
+/// ("HTTP"/"HTTPS"). `wrap` converts the (readable+writable) stream into the
+/// IoStream variant carried to the control handler.
+async fn serve_vhost_request<S>(
+    mut stream: S,
+    peer: std::net::SocketAddr,
+    state: Arc<AppState>,
+    scheme: &str,
+    wrap: impl FnOnce(S) -> frp_core::transport::IoStream,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    // Read the first 4096 bytes to extract Host header (with 10s timeout)
+    let mut buf = [0u8; 4096];
+    let n = match tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => n,
+        _ => return,
+    };
+
+    let pre_read = buf[..n].to_vec();
+    let request_text = String::from_utf8_lossy(&buf[..n]);
+    let host = match extract_host_header(&request_text) {
+        Some(h) => h.to_string(),
+        None => {
+            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            return;
+        }
+    };
+    let path = extract_path(&request_text).unwrap_or("/");
+
+    debug!(host = %host, path = %path, peer = %peer, "{} VHost request for '{}' path '{}' from {}", scheme, host, path, peer);
+
+    if let Some(route) = state.vhost_manager.lookup_combined(&host, path).await {
+        // HTTP Basic Auth check (Go frp compat)
+        if !route.http_user.is_empty() {
+            let auth_ok = extract_basic_auth(&request_text)
+                .map(|(u, p)| crate::constant_time_eq_str(&u, &route.http_user) && crate::constant_time_eq_str(&p, &route.http_pwd))
+                .unwrap_or(false);
+            if !auth_ok {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"frp\"\r\n\r\n"
+                ).await;
+                return;
+            }
+        }
+
+        // Apply host_header_rewrite if configured
+        let pre_read = if !route.host_header_rewrite.is_empty() {
+            rewrite_host_header(&pre_read, &route.host_header_rewrite)
+        } else {
+            pre_read
+        };
+
+        let internal_tx = {
+            let map = state.run_id_to_ctl_tx.read().await;
+            map.get(&route.run_id).cloned()
+        };
+
+        if let Some(ctl_tx) = internal_tx {
+            let _ = ctl_tx.tx.send(InternalMsg::ProxyUserConn {
+                proxy_name: route.proxy_name.clone(),
+                user_conn: wrap(stream),
+                pre_read,
+            }).ok();
+        } else {
+            warn!(host = %host, path = %path, "{} VHost route for '{}' path '{}' found but control handler gone", scheme, host, path);
+            write_http_error(&mut stream, "HTTP/1.1 502 Bad Gateway", "").await;
+        }
+    } else {
+        warn!(host = %host, path = %path, peer = %peer, "No {} VHost route for '{}' path '{}' from {}", scheme, host, path, peer);
+        write_http_error(&mut stream, "HTTP/1.1 404 Not Found", &state.custom_404_page).await;
+    }
+}
+
 /// Run an HTTP VHost listener on the given address.
 /// Accepts connections, reads the Host header, and routes via InternalMsg.
 #[instrument(skip(state), fields(addr = %addr))]
@@ -202,67 +278,7 @@ pub async fn run_vhost_http_listener(
         let state = state.clone();
 
         tokio::spawn(async move {
-            // Read the first 4096 bytes to extract Host header (with 10s timeout)
-            let mut buf = [0u8; 4096];
-            let mut stream = stream;
-            let n = match tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buf)).await {
-                Ok(Ok(n)) if n > 0 => n,
-                _ => return,
-            };
-
-            let pre_read = buf[..n].to_vec();
-            let request_text = String::from_utf8_lossy(&buf[..n]);
-            let host = match extract_host_header(&request_text) {
-                Some(h) => h.to_string(),
-                None => {
-                    let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
-                    return;
-                }
-            };
-            let path = extract_path(&request_text).unwrap_or("/");
-
-            debug!(host = %host, path = %path, peer = %peer, "HTTP VHost request for '{}' path '{}' from {}", host, path, peer);
-
-            if let Some(route) = state.vhost_manager.lookup_combined(&host, path).await {
-                // HTTP Basic Auth check (Go frp compat)
-                if !route.http_user.is_empty() {
-                    let auth_ok = extract_basic_auth(&request_text)
-                        .map(|(u, p)| crate::constant_time_eq_str(&u, &route.http_user) && crate::constant_time_eq_str(&p, &route.http_pwd))
-                        .unwrap_or(false);
-                    if !auth_ok {
-                        let _ = stream.write_all(
-                            b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"frp\"\r\n\r\n"
-                        ).await;
-                        return;
-                    }
-                }
-
-                // Apply host_header_rewrite if configured
-                let pre_read = if !route.host_header_rewrite.is_empty() {
-                    rewrite_host_header(&pre_read, &route.host_header_rewrite)
-                } else {
-                    pre_read
-                };
-
-                let internal_tx = {
-                    let map = state.run_id_to_ctl_tx.read().await;
-                    map.get(&route.run_id).cloned()
-                };
-
-                if let Some(ctl_tx) = internal_tx {
-                    let _ = ctl_tx.tx.send(InternalMsg::ProxyUserConn {
-                        proxy_name: route.proxy_name.clone(),
-                        user_conn: frp_core::transport::IoStream::Tcp(stream),
-                        pre_read,
-                    }).ok();
-                } else {
-                    warn!(host = %host, path = %path, "VHost route for '{}' path '{}' found but control handler gone", host, path);
-                    write_http_error(&mut stream, "HTTP/1.1 502 Bad Gateway", "").await;
-                }
-            } else {
-                warn!(host = %host, path = %path, peer = %peer, "No VHost route for '{}' path '{}' from {}", host, path, peer);
-                write_http_error(&mut stream, "HTTP/1.1 404 Not Found", &state.custom_404_page).await;
-            }
+            serve_vhost_request(stream, peer, state, "HTTP", frp_core::transport::IoStream::Tcp).await;
         });
     }
 }
@@ -290,7 +306,7 @@ pub async fn run_vhost_https_listener(
             .expect("TLS acceptor not initialized");
 
         tokio::spawn(async move {
-            let mut tls_stream = match acceptor.accept(stream).await {
+            let tls_stream = match acceptor.accept(stream).await {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(peer = %peer, error = %e, "TLS handshake failed from {}: {}", peer, e);
@@ -298,67 +314,13 @@ pub async fn run_vhost_https_listener(
                 }
             };
 
-            let mut buf = [0u8; 4096];
-            let n = match tokio::time::timeout(std::time::Duration::from_secs(10), tls_stream.read(&mut buf)).await {
-                Ok(Ok(n)) if n > 0 => n,
-                _ => return,
-            };
-
-            let pre_read = buf[..n].to_vec();
-            let request_text = String::from_utf8_lossy(&buf[..n]);
-            let host = match extract_host_header(&request_text) {
-                Some(h) => h.to_string(),
-                None => {
-                    let _ = tokio::io::AsyncWriteExt::write_all(&mut tls_stream, b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
-                    return;
-                }
-            };
-            let path = extract_path(&request_text).unwrap_or("/");
-
-            debug!(host = %host, path = %path, peer = %peer, "HTTPS VHost request for '{}' path '{}' from {}", host, path, peer);
-
-            if let Some(route) = state.vhost_manager.lookup_combined(&host, path).await {
-                // HTTP Basic Auth check (Go frp compat)
-                if !route.http_user.is_empty() {
-                    let auth_ok = extract_basic_auth(&request_text)
-                        .map(|(u, p)| crate::constant_time_eq_str(&u, &route.http_user) && crate::constant_time_eq_str(&p, &route.http_pwd))
-                        .unwrap_or(false);
-                    if !auth_ok {
-                        let _ = tokio::io::AsyncWriteExt::write_all(
-                            &mut tls_stream,
-                            b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"frp\"\r\n\r\n"
-                        ).await;
-                        return;
-                    }
-                }
-
-                // Apply host_header_rewrite if configured
-                let pre_read = if !route.host_header_rewrite.is_empty() {
-                    rewrite_host_header(&pre_read, &route.host_header_rewrite)
-                } else {
-                    pre_read
-                };
-
-                let internal_tx = {
-                    let map = state.run_id_to_ctl_tx.read().await;
-                    map.get(&route.run_id).cloned()
-                };
-                if let Some(ctl_tx) = internal_tx {
-                    let _ = ctl_tx.tx.send(crate::service::InternalMsg::ProxyUserConn {
-                        proxy_name: route.proxy_name.clone(),
-                        user_conn: frp_core::transport::IoStream::Tls(
-                            Box::new(tokio_rustls::TlsStream::Server(tls_stream))
-                        ),
-                        pre_read,
-                    }).ok();
-                } else {
-                    warn!(host = %host, path = %path, "HTTPS VHost route for '{}' path '{}' found but control handler gone", host, path);
-                    write_http_error(&mut tls_stream, "HTTP/1.1 502 Bad Gateway", "").await;
-                }
-            } else {
-                warn!(host = %host, path = %path, peer = %peer, "No VHost route for '{}' path '{}' from {}", host, path, peer);
-                write_http_error(&mut tls_stream, "HTTP/1.1 404 Not Found", &state.custom_404_page).await;
-            }
+            serve_vhost_request(
+                tls_stream,
+                peer,
+                state,
+                "HTTPS",
+                |s| frp_core::transport::IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(s))),
+            ).await;
         });
     }
 }
