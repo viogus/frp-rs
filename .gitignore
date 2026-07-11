@@ -9,3 +9,4 @@ Cargo.lock
 .claude/
 .autogen_ssh_key
 go-reference/
+scripts/frp-stress/target/

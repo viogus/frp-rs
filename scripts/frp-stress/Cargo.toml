@@ -4,11 +4,17 @@ version = "0.1.0"
 edition = "2021"
 description = "CI stress testing framework for frp-rs"
 
+# Standalone workspace: frp-stress is gated dev tooling, not part of the
+# shipped frps/frpc workspace. Keeping it separate avoids pulling its deps
+# (clap) into the release binaries' Cargo.lock / audit scope, and keeps the
+# Docker build (which does not copy scripts/) from failing on a missing member.
+[workspace]
+
 [dependencies]
-tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["net", "io-util", "time", "sync", "macros", "rt-multi-thread", "signal"] }
 clap = { version = "4", features = ["derive"] }
-anyhow = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-futures-util = { workspace = true }
-serde_json = { workspace = true }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
+serde_json = "1"

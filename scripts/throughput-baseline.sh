@@ -26,12 +26,14 @@ CERT=/tmp/baseline-srv.crt
 KEY=/tmp/baseline-srv.key
 
 echo "=== Building release binaries ==="
-# frp-stress is a workspace member → all three build to the workspace-root target dir.
-cargo build --release -p frps -p frpc -p frp-stress 2>&1 | tail -2
+# frps/frpc are the shipped workspace; frp-stress is a standalone workspace
+# under scripts/, built separately (keeps its deps out of the release lock).
+cargo build --release -p frps -p frpc 2>&1 | tail -2
+(cd scripts/frp-stress && cargo build --release 2>&1 | tail -2)
 
 FRPS=./target/release/frps
 FRPC=./target/release/frpc
-STRESS=./target/release/frp-stress
+STRESS=./scripts/frp-stress/target/release/frp-stress
 
 # TLS row certs: a CA plus a CA-signed end-entity leaf. rustls (webpki) rejects
 # a self-signed CA cert used directly as the server leaf (CaUsedAsEndEntity), and
