@@ -53,6 +53,12 @@ Two-tier, matching the throughput sub-project's discipline:
 - **Micro (primary gate):** existing criterion groups in `frp-core/benches/crypto_bridge.rs` — `cipher_stream/aes128cfb_encrypt_N_bytes`, `aes128cfb_decrypt_N_bytes`, `compression/snappy_compress_N_bytes`, `snappy_decompress_N_bytes`. Capture `cargo bench -p frp-core` numbers before each change, keep the change only if the targeted group improves and no other group regresses. These isolate CPU cost from loopback/scheduler I/O noise.
 - **Macro (confirmation):** `bash scripts/throughput-baseline.sh` `encrypt` / `encrypt_compress` / `compress` rows — end-to-end confirmation that the micro win reaches real throughput. Regression threshold: any config dropping >5% MB/s rejects the change (same gate as the throughput baseline).
 
+## Update (post-T1): root-cause correction
+
+The block-wise CFB rewrite (C1) landed correct and wire-identical but delivered **no encrypt-row throughput gain** — the macro gate showed 24.3 → 25.3 MB/s (noise). The original hypothesis (byte-by-byte loop = the 28x cliff) is **falsified**. Measurement located the true cause: the `aes` crate runs its **software backend** on aarch64. `cipher_stream/aes128cfb_encrypt_65536` measures 52 MiB/s on the software backend vs **547 MiB/s** with `RUSTFLAGS='--cfg aes_armv8'` (+948%). x86_64 already autodetects AES-NI, so the cliff is aarch64-specific (Apple Silicon / Graviton / ARM SBC); the baseline was taken on Mac aarch64.
+
+**Added target C4 (the real fix):** upgrade `aes` 0.8→0.9 + `cfb-mode` 0.8→0.9 (both `cipher` 0.5.2). aes 0.9 does runtime ARMv8-AES detection (no `--cfg`, portable software fallback). aes 0.9 is already in-tree via russh, so no new crate. C1 is retained as a correct, wire-identical, no-regression cleanup. See the implementation plan Task 4.
+
 ## Architecture — Optimization Targets (ordered by benefit/risk)
 
 ### C1 — Block-wise streaming CFB (high benefit, low risk) — the headline fix

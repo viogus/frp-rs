@@ -391,6 +391,106 @@ throughput baseline. No code change; revisit if UDP throughput enters scope."
 
 ---
 
+### Task 4: Hardware-AES upgrade — aes 0.8→0.9 (C4, the real headline fix)
+
+**Added after T1's macro gate falsified the spec's original hypothesis.** T1 (block-wise CFB) is correct and wire-identical but delivered no encrypt-row gain: the encrypt cliff is not the byte-loop, it is the `aes` crate running its **software backend** on aarch64. Proof: `cipher_stream/aes128cfb_encrypt_65536` = 52 MiB/s software vs **547 MiB/s** with `RUSTFLAGS='--cfg aes_armv8'` (+948%). x86_64 already autodetects AES-NI at runtime, so this is an aarch64 issue (Apple Silicon / Graviton / ARM SBC).
+
+Fix path chosen (user): **upgrade to `aes` 0.9 + `cfb-mode` 0.9**, which do **runtime** ARMv8-AES detection via `cpubits`/`cpufeatures` — no `--cfg` flag, automatic software fallback on cores without the crypto extension (portable, no SIGILL risk). `aes` 0.9.1 and `cfb-mode` 0.9.1 both target `cipher` 0.5.2, and `aes` 0.9 is already in the dependency tree (via russh), so no new crate is added — only version bumps of two already-approved deps.
+
+**Files:**
+- Modify: `Cargo.toml` (workspace `[workspace.dependencies]`: `aes = "0.8"` → `"0.9"`, `cfb-mode = "0.8"` → `"0.9"`)
+- Modify: `frp-core/src/encryption.rs:1-6,28,42` (cipher 0.4→0.5 trait imports / calls)
+- Modify: `frp-core/src/cipher_stream.rs:32-51` (`CfbState::new`/`refill` — `aes::cipher::{BlockEncrypt, KeyInit}` imports and `encrypt_block` call)
+- Reference (no change expected): `frp-core/benches/crypto_bridge.rs`
+
+**Interfaces:**
+- Consumes: `aes::Aes128`, `cfb_mode::{Encryptor, Decryptor}`, and the cipher traits for block-encrypt / key-init / key-iv-init / async-stream. The exact 0.5 trait names/paths differ from 0.4 and MUST be confirmed against `https://docs.rs/cipher/0.5.2/` (block and stream modules) and the compiler — likely renames: `BlockEncrypt` → `BlockCipherEncrypt` (method `encrypt_block` may take the block via a different type), imports may move under `cipher::` directly. Do not guess; let the compiler and docs drive.
+- Produces: `derive_key`, `encrypt`, `decrypt` (encryption.rs) and `CipherReader`/`CipherWriter` (cipher_stream.rs) with **byte-identical wire output** — same AES-128-CFB, only a faster backend. Public signatures unchanged.
+
+This is an integration/version-bump task with API churn; the guards are the existing round-trip + characterization + compat tests (wire format must not change) and the bench go/no-go gate below.
+
+- [ ] **Step 1: Record the software-backend baseline**
+
+Run: `cargo bench -p frp-core -- aes128cfb_encrypt_65536` (NO RUSTFLAGS)
+Expected: ~52 MiB/s (the software-backend number). Record it — this is the before-side of the go/no-go gate.
+
+- [ ] **Step 2: Bump the workspace deps**
+
+In `Cargo.toml` `[workspace.dependencies]`, change `aes = "0.8"` to `aes = "0.9"` and `cfb-mode = "0.8"` to `cfb-mode = "0.9"`. Run `cargo update -p aes -p cfb-mode` (or let the build resolve). Confirm the lock now has `aes 0.9.x` and `cfb-mode 0.9.x` as the versions frp-core uses.
+
+- [ ] **Step 3: Adapt `encryption.rs` to cipher 0.5**
+
+The current code (`frp-core/src/encryption.rs:1-6,28,42`) is:
+
+```rust
+use cfb_mode::cipher::AsyncStreamCipher;
+use cfb_mode::cipher::KeyIvInit;
+// ...
+type Aes128CfbEnc = cfb_mode::Encryptor<aes::Aes128>;
+type Aes128CfbDec = cfb_mode::Decryptor<aes::Aes128>;
+// ...
+let cipher = Aes128CfbEnc::new(key.into(), &iv.into());
+cipher.encrypt(&mut result[16..]);
+// ...
+let cipher = Aes128CfbDec::new(key.into(), iv.into());
+cipher.decrypt(&mut result);
+```
+
+Adapt the trait imports and (if changed) the `new`/`encrypt`/`decrypt` call shapes to the cipher 0.5 / cfb-mode 0.9 API. Keep the `[16-byte IV][ciphertext]` output layout and the PBKDF2 `derive_key` unchanged. Fix compiler errors against the real 0.5 API — consult `docs.rs/cipher/0.5.2` and `docs.rs/cfb-mode/0.9.1`.
+
+- [ ] **Step 4: Adapt `cipher_stream.rs` to cipher 0.5**
+
+The current code (`frp-core/src/cipher_stream.rs:32-51`) uses:
+
+```rust
+use aes::cipher::{BlockEncrypt, KeyInit};   // in CfbState::new
+let aes = Aes128::new_from_slice(key).expect("AES-128 key must be 16 bytes");
+// ...
+state.aes.encrypt_block((&mut state.keystream).into());   // in new + refill
+```
+
+Adapt the trait imports (`BlockEncrypt`/`KeyInit`) and the `new_from_slice` / `encrypt_block` calls to the 0.5 API (likely `BlockCipherEncrypt`; verify method + block-type on docs). The `CfbState` struct fields, the block-wise `encrypt`/`decrypt` methods from Task 1, and the `refill`/`used` accounting stay unchanged — only the AES construction and single-block-encrypt call sites adapt.
+
+- [ ] **Step 5: Build the whole workspace**
+
+Run: `cargo build --workspace`
+Expected: clean build, no errors. If `cipher 0.4` API references remain, fix them.
+
+- [ ] **Step 6: Run the frp-core test suite**
+
+Run: `cargo test -p frp-core`
+Expected: PASS, including the Task-1 characterization tests, the `encryption` round-trip tests, and all `cipher_stream` tests. Wire output is unchanged, so every existing test stays green. If any crypto test fails, the API adaptation changed behavior — stop and fix.
+
+- [ ] **Step 7: GO/NO-GO — confirm runtime hardware AES**
+
+Run: `cargo bench -p frp-core -- aes128cfb_encrypt_65536` (NO RUSTFLAGS, NO `.cargo/config` changes)
+Expected: **~500+ MiB/s** (a ~10x jump from Step 1's ~52 MiB/s), proving `aes` 0.9 selected the ARMv8 hardware backend at runtime with no build flags. **Go/no-go:** if it stays ~52 MiB/s, aes 0.9 did NOT autodetect on this target — report BLOCKED with the number; do not commit. (The controller then reconsiders path A: `--cfg aes_armv8`.)
+
+- [ ] **Step 8: Confirm feature-tier builds**
+
+Run: `cargo build --release -p frps -p frpc --no-default-features --features tiny` then `... --features micro`
+Expected: clean. `aes` is in `frp-core` core (not feature-gated — it is the V1 CFB cipher), so all tiers use it; confirm the bump does not break the slim builds.
+
+- [ ] **Step 9: Run the cross-compat suite**
+
+Run: `bash scripts/compat-test.sh --verbose`
+Expected: `RESULTS:` line with 0 failures — same AES-128-CFB wire format, only a faster backend. Verify the RESULTS line explicitly (a partial run with no RESULTS line is not a pass; kill stale `frps`/`frpc` and re-run if needed).
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add Cargo.toml Cargo.lock frp-core/src/encryption.rs frp-core/src/cipher_stream.rs
+git commit -m "perf(crypto): upgrade aes 0.8->0.9 for runtime hardware AES
+
+aes 0.9 + cfb-mode 0.9 (cipher 0.5) autodetect the ARMv8 AES backend at
+runtime via cpufeatures — no --cfg flag, portable software fallback. Fixes
+the aarch64 encrypt-row cliff: cipher_stream encrypt 64KB ~52 -> ~5xx MiB/s.
+Wire-identical AES-128-CFB (round-trip + compat tests green). aes 0.9 was
+already in-tree via russh; no new crate. x86_64 already used AES-NI."
+```
+
+---
+
 ## Post-Task: Macro Confirmation + Baseline Refresh
 
 After Tasks 1-3 are reviewed and complete, confirm the end-to-end win and refresh the committed baseline.
