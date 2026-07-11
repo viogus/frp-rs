@@ -335,6 +335,11 @@ pub struct AeadStreamReader<R: AsyncRead + Unpin> {
     buf: Vec<u8>,
     buf_pos: usize,
     read_err: Option<io::Error>,
+    scratch: Vec<u8>,
+    scratch_filled: usize,
+    // Per-frame header persisted across polls (see AeadStream).
+    header_buf: [u8; AEAD_FRAME_HEADER_SIZE],
+    header_have: bool,
 }
 
 impl<R: AsyncRead + Unpin> AeadStreamReader<R> {
@@ -353,6 +358,10 @@ impl<R: AsyncRead + Unpin> AeadStreamReader<R> {
             buf: Vec::new(),
             buf_pos: 0,
             read_err: None,
+            scratch: Vec::new(),
+            scratch_filled: 0,
+            header_buf: [0u8; AEAD_FRAME_HEADER_SIZE],
+            header_have: false,
         })
     }
 
@@ -372,18 +381,21 @@ impl<R: AsyncRead + Unpin> AeadStreamReader<R> {
         }
 
         // Read 4-byte header (ciphertext length). EOF here = clean end of stream.
-        let header = match self.read_exact(AEAD_FRAME_HEADER_SIZE, cx) {
-            Poll::Ready(Ok(data)) => {
-                let mut h = [0u8; AEAD_FRAME_HEADER_SIZE];
-                h.copy_from_slice(&data);
-                h
+        // Persisted across polls so a mid-ciphertext `Pending` does not re-read it.
+        if !self.header_have {
+            match self.read_exact(AEAD_FRAME_HEADER_SIZE, cx) {
+                Poll::Ready(Ok(data)) => {
+                    self.header_buf.copy_from_slice(&data);
+                    self.header_have = true;
+                }
+                Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Poll::Ready(Ok(false)); // clean EOF
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                return Poll::Ready(Ok(false)); // clean EOF
-            }
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
-        };
+        }
+        let header = self.header_buf;
 
         if let Some(ref max) = self.max_frame_count {
             if self.frame_count >= *max {
@@ -429,37 +441,41 @@ impl<R: AsyncRead + Unpin> AeadStreamReader<R> {
         }
         self.frame_count += 1;
 
+        // Frame consumed: allow the next frame to read its own header.
+        self.header_have = false;
         self.buf = plaintext;
         self.buf_pos = 0;
         Poll::Ready(Ok(true))
     }
 
     fn read_exact(&mut self, len: usize, cx: &mut Context<'_>) -> Poll<io::Result<Vec<u8>>> {
-        let mut data = vec![0u8; len];
-        let mut buf = ReadBuf::new(&mut data);
-        let mut prev_filled = buf.filled().len();
-        loop {
+        // Resume an in-progress read of this exact length, or start a fresh one.
+        // On completion the scratch is emptied (len 0), so any new read re-sizes.
+        if self.scratch.len() != len {
+            self.scratch.clear();
+            self.scratch.resize(len, 0);
+            self.scratch_filled = 0;
+        }
+        while self.scratch_filled < len {
+            let mut rb = ReadBuf::new(&mut self.scratch[self.scratch_filled..]);
             let pin = Pin::new(&mut self.inner);
-            match pin.poll_read(cx, &mut buf) {
+            match pin.poll_read(cx, &mut rb) {
                 Poll::Ready(Ok(())) => {
-                    let filled = buf.filled().len();
-                    // EOF detection: if no progress was made on this iteration,
-                    // the inner stream has reached EOF before filling `len` bytes.
-                    if filled == prev_filled {
+                    let n = rb.filled().len();
+                    if n == 0 {
+                        // No progress on a Ready poll => inner reached EOF before `len` bytes.
                         return Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof,
-                            "AEAD stream: unexpected EOF")));
+                            format!("AEAD stream: unexpected EOF (need {len}, got {})", self.scratch_filled))));
                     }
-                    prev_filled = filled;
-                    if filled < len {
-                        // Need more data; continue
-                        continue;
-                    }
-                    return Poll::Ready(Ok(data));
+                    self.scratch_filled += n;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => return Poll::Pending, // progress saved in scratch_filled
             }
         }
+        let data = std::mem::take(&mut self.scratch);
+        self.scratch_filled = 0;
+        Poll::Ready(Ok(data))
     }
 }
 
@@ -540,6 +556,12 @@ pub struct AeadStream {
     read_buf: Vec<u8>,
     read_buf_pos: usize,
     read_err: Option<io::Error>,
+    read_scratch: Vec<u8>,
+    read_scratch_filled: usize,
+    // Per-frame header persisted across polls so a mid-ciphertext `Pending`
+    // does not re-read (and re-consume) the 4-byte length header.
+    read_header_buf: [u8; AEAD_FRAME_HEADER_SIZE],
+    read_header_have: bool,
     // Write state
     write_cipher: AeadCipher,
     write_nonce: Vec<u8>,
@@ -580,6 +602,10 @@ impl AeadStream {
             read_buf: Vec::new(),
             read_buf_pos: 0,
             read_err: None,
+            read_scratch: Vec::new(),
+            read_scratch_filled: 0,
+            read_header_buf: [0u8; AEAD_FRAME_HEADER_SIZE],
+            read_header_have: false,
             write_cipher,
             write_nonce: write_nonce.clone(),
             write_stream_nonce: write_nonce,
@@ -669,19 +695,23 @@ impl AeadStream {
             }
         }
 
-        // Read 4-byte header. EOF here = clean end of stream.
-        let header = match self.read_exact(AEAD_FRAME_HEADER_SIZE, cx) {
-            Poll::Ready(Ok(data)) => {
-                let mut h = [0u8; AEAD_FRAME_HEADER_SIZE];
-                h.copy_from_slice(&data);
-                h
+        // Read 4-byte header. EOF here = clean end of stream. Persisted across
+        // polls: once obtained, a mid-ciphertext `Pending` re-enters this fn but
+        // must not re-read the header (those bytes are already consumed).
+        if !self.read_header_have {
+            match self.read_exact(AEAD_FRAME_HEADER_SIZE, cx) {
+                Poll::Ready(Ok(data)) => {
+                    self.read_header_buf.copy_from_slice(&data);
+                    self.read_header_have = true;
+                }
+                Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Poll::Ready(Ok(false)); // clean EOF
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                return Poll::Ready(Ok(false)); // clean EOF
-            }
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
-        };
+        }
+        let header = self.read_header_buf;
 
         if let Some(ref max) = self.read_max_frame_count {
             if self.read_frame_count >= *max {
@@ -736,36 +766,42 @@ impl AeadStream {
         }
         self.read_frame_count += 1;
 
+        // Frame consumed: allow the next frame to read its own header.
+        self.read_header_have = false;
         self.read_buf = plaintext;
         self.read_buf_pos = 0;
         Poll::Ready(Ok(true))
     }
 
     fn read_exact(&mut self, len: usize, cx: &mut Context<'_>) -> Poll<io::Result<Vec<u8>>> {
-        let mut data = vec![0u8; len];
-        let mut buf = ReadBuf::new(&mut data);
-        while buf.filled().len() < len {
-            let prev = buf.filled().len();
+        // Resume an in-progress read of this exact length, or start a fresh one.
+        // On completion the scratch is emptied (len 0), so any new read re-sizes.
+        if self.read_scratch.len() != len {
+            self.read_scratch.clear();
+            self.read_scratch.resize(len, 0);
+            self.read_scratch_filled = 0;
+        }
+        while self.read_scratch_filled < len {
+            let mut rb = ReadBuf::new(&mut self.read_scratch[self.read_scratch_filled..]);
             let pin = Pin::new(&mut *self.inner);
-            match pin.poll_read(cx, &mut buf) {
+            match pin.poll_read(cx, &mut rb) {
                 Poll::Ready(Ok(())) => {
-                    if buf.filled().len() == prev {
-                        // EOF: no more bytes available
+                    let n = rb.filled().len();
+                    if n == 0 {
+                        // No progress on a Ready poll => inner reached EOF before `len` bytes.
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
-                            format!("AEAD stream: unexpected EOF (need {len}, got {prev})"),
+                            format!("AEAD stream: unexpected EOF (need {len}, got {})", self.read_scratch_filled),
                         )));
                     }
-                    if buf.filled().len() == buf.capacity() {
-                        return Poll::Ready(Ok(data));
-                    }
-                    // Need more bytes — loop
-                    continue;
+                    self.read_scratch_filled += n;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => return Poll::Pending, // progress saved in read_scratch_filled
             }
         }
+        let data = std::mem::take(&mut self.read_scratch);
+        self.read_scratch_filled = 0;
         Poll::Ready(Ok(data))
     }
 }
@@ -1084,5 +1120,139 @@ mod tests {
         assert_eq!(&buf[..total], b"hello world this is a test of AEAD");
 
         write_task.await.unwrap();
+    }
+
+    /// Reproduces the `read_exact` partial-read bug: when the inner stream
+    /// delivers a frame across multiple reads with a `Poll::Pending` in
+    /// between (normal under network fragmentation), `read_exact` allocates a
+    /// fresh buffer each poll and drops the bytes already consumed from the
+    /// inner stream. Those bytes are lost from the wire, corrupting the AEAD
+    /// frame → decrypt auth failure or length/content mismatch.
+    #[tokio::test]
+    async fn test_aead_stream_survives_fragmented_pending_reads() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{timeout, Duration};
+
+        let key = generate_random(32).unwrap();
+
+        // --- Produce a real multi-frame AEAD ciphertext stream ---
+        // 100KB forces 2 frames since the max payload size is 64KB.
+        let plaintext = (0..100_000u32).map(|i| i as u8).collect::<Vec<u8>>();
+
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let mut writer =
+            AeadStream::new(Box::new(client), AeadAlgorithm::Aes256Gcm, &key, &key).unwrap();
+
+        let plaintext_for_task = plaintext.clone();
+        let write_task = tokio::spawn(async move {
+            writer.write_all(&plaintext_for_task).await.unwrap();
+            writer.flush().await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+
+        // Read the raw framed AEAD bytes (stream_nonce + frames) off the
+        // server end of the duplex to EOF.
+        let mut server = server;
+        let mut ciphertext = Vec::new();
+        server.read_to_end(&mut ciphertext).await.unwrap();
+        write_task.await.unwrap();
+        assert!(
+            ciphertext.len() > 100_000,
+            "expected framed ciphertext larger than plaintext, got {}",
+            ciphertext.len()
+        );
+
+        // --- Mock reader: tiny 3-byte chunks with a Pending injected between
+        // every delivery, guaranteeing partial-then-Pending sequences mid-frame.
+        struct ChunkedPendingReader {
+            ciphertext: Vec<u8>,
+            pos: usize,
+            toggle: bool,
+        }
+
+        impl ChunkedPendingReader {
+            fn new(ciphertext: Vec<u8>) -> Self {
+                Self { ciphertext, pos: 0, toggle: false }
+            }
+        }
+
+        impl AsyncRead for ChunkedPendingReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let this = self.get_mut();
+                if this.pos >= this.ciphertext.len() {
+                    // EOF: nothing filled.
+                    return Poll::Ready(Ok(()));
+                }
+                this.toggle = !this.toggle;
+                if this.toggle {
+                    // "Pending turn": deliver no bytes, wake so the runtime
+                    // re-polls immediately.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                // "Deliver turn": hand over a tiny chunk.
+                let n = (this.ciphertext.len() - this.pos).min(3).min(buf.remaining());
+                let start = this.pos;
+                buf.put_slice(&this.ciphertext[start..start + n]);
+                this.pos += n;
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl AsyncWrite for ChunkedPendingReader {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut reader = AeadStream::new(
+            Box::new(ChunkedPendingReader::new(ciphertext)),
+            AeadAlgorithm::Aes256Gcm,
+            &key,
+            &key,
+        )
+        .unwrap();
+
+        let got = timeout(Duration::from_secs(10), async move {
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let n = reader
+                    .read(&mut buf[..])
+                    .await
+                    .expect("AEAD read failed — bug: read_exact lost partial data on Pending");
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            got
+        })
+        .await
+        .expect("timed out — bug: read_exact loses partial data on Pending");
+
+        assert_eq!(
+            got.len(),
+            100_000,
+            "length mismatch: read_exact dropped bytes on Pending"
+        );
+        assert_eq!(
+            got, plaintext,
+            "content mismatch: AEAD frame corruption from lost partial reads"
+        );
     }
 }
