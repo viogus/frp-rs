@@ -11,6 +11,11 @@ use crate::lock::RwLockExt;
 use frp_core::admin_auth::apply_admin_auth;
 use frp_core::metrics::MetricsSnapshot;
 
+/// Build a 404 Not Found response tuple with the given error message.
+fn not_found(msg: &str) -> (StatusCode, Json<ErrorResponse>) {
+    (StatusCode::NOT_FOUND, Json(ErrorResponse { error: msg.into() }))
+}
+
 // --- Local TlsListener (moved from frp-core to avoid axum in core) ---
 
 #[cfg(feature = "tls")]
@@ -218,9 +223,7 @@ async fn handle_proxies(
         let online = ctl_map.contains_key(&p.run_id);
         let traffic = state.proxy_metrics.get(&p.name).await
             .map(|m| m.snapshot())
-            .unwrap_or_else(|| MetricsSnapshot {
-                bytes_in: 0, bytes_out: 0, current_conns: 0, total_conns: 0,
-            });
+            .unwrap_or_default();
         entries.push(ProxyEntry {
             name: p.name.clone(),
             proxy_type: p.proxy_type.clone(),
@@ -240,17 +243,12 @@ async fn handle_proxy_detail(
     Path(name): Path<String>,
 ) -> Result<Json<ProxyDetail>, (axum::http::StatusCode, Json<ErrorResponse>)> {
     let proxy = state.proxy_manager.get(&name).await
-        .ok_or_else(|| (
-            axum::http::StatusCode::NOT_FOUND,
-            Json(ErrorResponse { error: "proxy not found".into() }),
-        ))?;
+        .ok_or_else(|| not_found("proxy not found"))?;
 
     let online = state.run_id_to_ctl_tx.read().await.contains_key(&proxy.run_id);
     let traffic = state.proxy_metrics.get(&name).await
         .map(|m| m.snapshot())
-        .unwrap_or_else(|| MetricsSnapshot {
-            bytes_in: 0, bytes_out: 0, current_conns: 0, total_conns: 0,
-        });
+        .unwrap_or_default();
 
     Ok(Json(ProxyDetail {
         name: proxy.name.clone(),
@@ -274,16 +272,11 @@ async fn handle_proxy_traffic(
 ) -> Result<Json<MetricsSnapshot>, (axum::http::StatusCode, Json<ErrorResponse>)> {
     // Verify proxy exists
     let _proxy = state.proxy_manager.get(&name).await
-        .ok_or_else(|| (
-            axum::http::StatusCode::NOT_FOUND,
-            Json(ErrorResponse { error: "proxy not found".into() }),
-        ))?;
+        .ok_or_else(|| not_found("proxy not found"))?;
 
     let traffic = state.proxy_metrics.get(&name).await
         .map(|m| m.snapshot())
-        .unwrap_or_else(|| MetricsSnapshot {
-            bytes_in: 0, bytes_out: 0, current_conns: 0, total_conns: 0,
-        });
+        .unwrap_or_default();
 
     Ok(Json(traffic))
 }
@@ -293,33 +286,7 @@ async fn handle_proxy_by_name(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<ProxyDetail>, (axum::http::StatusCode, Json<ErrorResponse>)> {
-    let proxy = state.proxy_manager.get(&name).await
-        .ok_or_else(|| (
-            axum::http::StatusCode::NOT_FOUND,
-            Json(ErrorResponse { error: "proxy not found".into() }),
-        ))?;
-
-    let online = state.run_id_to_ctl_tx.read().await.contains_key(&proxy.run_id);
-    let traffic = state.proxy_metrics.get(&name).await
-        .map(|m| m.snapshot())
-        .unwrap_or_else(|| MetricsSnapshot {
-            bytes_in: 0, bytes_out: 0, current_conns: 0, total_conns: 0,
-        });
-
-    Ok(Json(ProxyDetail {
-        name: proxy.name.clone(),
-        proxy_type: proxy.proxy_type.clone(),
-        status: if online { "online".into() } else { "offline".into() },
-        run_id: Some(proxy.run_id.clone()),
-        remote_port: proxy.remote_port,
-        local_addr: proxy.local_addr.clone(),
-        use_encryption: proxy.use_encryption,
-        use_compression: proxy.use_compression,
-        custom_domains: proxy.custom_domains.clone(),
-        multiplexer: proxy.multiplexer.clone(),
-        group: proxy.group.unwrap_or_default(),
-        traffic,
-    }))
+    handle_proxy_detail(State(state), Path(name)).await
 }
 
 async fn handle_clients(State(state): State<Arc<AppState>>) -> Json<Vec<ClientEntry>> {
@@ -348,19 +315,14 @@ async fn handle_client_detail(
     let ctl = {
         let map = state.run_id_to_ctl_tx.read().await;
         map.get(&run_id).cloned()
-    }.ok_or_else(|| (
-        axum::http::StatusCode::NOT_FOUND,
-        Json(ErrorResponse { error: "client not found".into() }),
-    ))?;
+    }.ok_or_else(|| not_found("client not found"))?;
 
     let proxy_infos = state.proxy_manager.list_client(&run_id).await;
     let mut proxies = Vec::new();
     for p in &proxy_infos {
         let traffic = state.proxy_metrics.get(&p.name).await
             .map(|m| m.snapshot())
-            .unwrap_or_else(|| MetricsSnapshot {
-                bytes_in: 0, bytes_out: 0, current_conns: 0, total_conns: 0,
-            });
+            .unwrap_or_default();
         proxies.push(ProxyEntry {
             name: p.name.clone(),
             proxy_type: p.proxy_type.clone(),
@@ -518,9 +480,7 @@ async fn handle_store_proxy_delete(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let proxy = state.proxy_manager.get(&name).await
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse {
-            error: "proxy not found".into()
-        })))?;
+        .ok_or_else(|| not_found("proxy not found"))?;
 
     // Clean up port
     if let Some(port) = proxy.remote_port {

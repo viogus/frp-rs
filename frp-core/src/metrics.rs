@@ -34,7 +34,7 @@ impl ProxyMetrics {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct MetricsSnapshot {
     pub bytes_in: u64,
     pub bytes_out: u64,
