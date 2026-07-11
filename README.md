@@ -399,6 +399,14 @@ default stays at `0` for Go frp parity and to avoid holding idle connections;
 latency-sensitive deployments should set `pool_count` to a small positive
 value.
 
+`TCP_NODELAY` is enabled on every data-path TCP connection automatically
+(matching Go frp), so small request/response and interactive traffic is not
+delayed by Nagle's algorithm — no configuration needed.
+
+For memory-constrained or high-fan-out servers, the per-connection bridge
+buffer defaults to 32 KiB (matching Go frp) and can be tuned via the
+`FRP_BRIDGE_BUF_KB` environment variable (range 4–1024).
+
 #### Proxy entries (`[[proxies]]`)
 
 | Field | Default | Description |

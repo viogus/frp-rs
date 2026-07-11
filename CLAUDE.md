@@ -49,6 +49,8 @@ Feature flags across crates:
 
 All features default ON. `quic` implies `tls`. `oidc` implies `reqwest`. `ssh` implies `rand`.
 
+**Opt-in (NOT default):** `mem-profile` (frp-core → frp-server/client → frps/frpc) installs a `CountingAlloc<System>` global allocator + a 1 Hz `MEMPROFILE` stderr emitter for memory measurement. Off in every shipped build (full/tiny/micro) → production binaries are byte-identical. Enable only for the memory baseline: `cargo build -p frps -p frpc --features mem-profile`. std `GlobalAlloc` + `AtomicUsize`, no new dep.
+
 - No `cargo check` variation needed — use `cargo build` for the full workspace.
 - Tests live inline (`#[cfg(test)] mod tests`), no separate test crates.
 
@@ -143,6 +145,10 @@ Note: Go frp v0.69.1 golib source says salt `"crypto"` but the pre-built binary 
 
 `IoStream::into_split()` returns `Box<dyn AsyncRead>` / `Box<dyn AsyncWrite>` — the work connection bridge uses this to erase the concrete stream type.
 
+**TCP_NODELAY:** every raw-`TcpStream` on the data path (client control/work dials via `connect_direct`/`connect_via_proxy`, server control/work/visitor + user-proxy + vhost + tcpmux accepts, client local-service dials, SSH gateway, plugin forwarders) calls `frp_core::transport::set_nodelay` — matches Go frp's `net.TCPConn` default (`NoDelay(true)`). For TLS/mux/WS-wrapped streams it is set on the underlying `TcpStream` before wrapping. Errors are logged at debug and ignored (a failed socket option must not kill a connection). KCP sets its own nodelay; QUIC/UDP are excluded. Wire-invisible.
+
+**Bridge buffer size:** `frp_core::buffer_pool::BUFFER_SIZE` defaults to **32 KiB** (matches Go frp `io.Copy`; was 64 KiB — halved for per-connection footprint). Override with `FRP_BRIDGE_BUF_KB` (4–1024). Note the plain proxy path uses `tokio::io::copy_bidirectional` (its own internal buffers), so `BUFFER_SIZE` and the `PoolGuard` pool affect the **encrypted/compressed** bridge path, not plain.
+
 ### Config Normalization
 
 `frp-core/src/config.rs` includes a full Go→Rust config compatibility layer:
@@ -195,6 +201,7 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 - **Benchmarks**: `cargo bench -p frp-core` (9 groups: key derivation, compression, cipher stream, STUN, V1+V2 protocol all-types, bridge plain/encrypted/compressed, bandwidth limiter) + `cargo bench -p frp-server` (nathole classify + analysis). CI: `cargo bench --workspace --no-run` build-check in `ci.yml`.
 - **Property/fuzz tests**: proptest-based config normalization (`frp-core/src/config.rs`, 14 tests) and V1/V2 protocol frame fuzzing (`frp-core/src/protocol.rs`, 13 tests, 0 panics found).
 - **Stress tests**: `scripts/stress-test.sh` runs frps + frpc under load with connection churn, monitored via `scripts/frp-stress/`. Weekly CI run in `stress-test.yml`.
+- **Perf baselines** (4-axis program, host-specific JSONL committed under `scripts/frp-stress/baselines/`): `scripts/throughput-baseline.sh` (MB/s per cipher/transport config), `scripts/latency-baseline.sh` (steady-state RTT + connection-setup percentiles), `scripts/memory-baseline.sh` (idle-hold + churn footprint via the `mem-profile` counting allocator + `ps` RSS). Run manually before/after a data-plane change; not blocking CI gates. Gate rule: a change to one axis must not regress the others (>5% throughput/MB/s, or RTT p99).
 - **Cross-compat tests**: `scripts/compat-test.sh` — 40 default + 2 guarded (XTCP 16-test pairwise matrix, V2 `GO_FRP_V2=1`). Runs on every push via `compat.yml`. XTCP compat runs daily on VPS via `xtcp-compat.yml`.
 - **Security audit**: Run `cargo audit` and `cargo deny check` before each release to catch known vulnerabilities and license issues in the dependency tree.
 
