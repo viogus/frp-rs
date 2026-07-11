@@ -221,6 +221,10 @@ pub struct CipherWriter<W: AsyncWrite + Unpin> {
     encrypted_buf: Option<Vec<u8>>,
     /// Bytes already written from encrypted_buf.
     encrypted_write_pos: usize,
+    /// Reused encrypt scratch — avoids a per-chunk `Vec` allocation on the hot
+    /// write path. Moved out (via `mem::take`) only on the rare partial-write
+    /// branch, then regrown on the next call.
+    scratch: Vec<u8>,
 }
 
 impl<W: AsyncWrite + Unpin> CipherWriter<W> {
@@ -235,6 +239,7 @@ impl<W: AsyncWrite + Unpin> CipherWriter<W> {
             first_write_data_len: 0,
             encrypted_buf: None,
             encrypted_write_pos: 0,
+            scratch: Vec::new(),
         }
     }
 }
@@ -331,19 +336,22 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
         }
 
         let cfb = this.cfb.as_mut().expect("IV must be sent before encrypting");
-        let mut encrypted = buf.to_vec();
-        cfb.encrypt(&mut encrypted);
-        match Pin::new(&mut this.inner).poll_write(cx, &encrypted) {
-            Poll::Ready(Ok(n)) if n >= encrypted.len() => Poll::Ready(Ok(buf.len())),
+        this.scratch.clear();
+        this.scratch.extend_from_slice(buf);
+        cfb.encrypt(&mut this.scratch);
+        match Pin::new(&mut this.inner).poll_write(cx, &this.scratch) {
+            Poll::Ready(Ok(n)) if n >= this.scratch.len() => Poll::Ready(Ok(buf.len())),
             Poll::Ready(Ok(n)) => {
-                this.encrypted_buf = Some(encrypted);
+                // Partial write: hand the un-written remainder to the pending
+                // buffer (rare backpressure path — pays one alloc via take).
+                this.encrypted_buf = Some(std::mem::take(&mut this.scratch));
                 this.encrypted_write_pos = n;
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => {
-                this.encrypted_buf = Some(encrypted);
+                this.encrypted_buf = Some(std::mem::take(&mut this.scratch));
                 this.encrypted_write_pos = 0;
                 Poll::Pending
             }
@@ -1161,5 +1169,35 @@ mod tests {
             CfbState::new(&key, &iv).decrypt(&mut rt);
             assert_eq!(rt, plain, "round-trip mismatch for {:?}", chunks);
         }
+    }
+
+    /// Verify that the scratch buffer is reused across multiple sequential writes,
+    /// producing correct round-trip decryption for each chunk and the concatenated result.
+    #[tokio::test]
+    async fn cipher_writer_scratch_reuse_roundtrip() {
+        let (client, server) = duplex(128 * 1024);
+        let mut writer = CipherWriter::new(client, TEST_KEY);
+        let mut reader = CipherReader::new(server, TEST_KEY);
+
+        let chunks: &[&[u8]] = &[
+            b"first chunk of data ",
+            b"second chunk follows ",
+            b"third and final chunk",
+        ];
+
+        // Write all chunks sequentially through the same CipherWriter,
+        // exercising scratch reuse on every write after the first (which
+        // goes through first_write_buf).
+        for chunk in chunks {
+            writer.write_all(chunk).await.unwrap();
+        }
+        writer.shutdown().await.unwrap();
+
+        // Read and verify the concatenated plaintext.
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut buf = vec![0u8; total];
+        reader.read_exact(&mut buf).await.unwrap();
+        let expected: Vec<u8> = chunks.concat();
+        assert_eq!(buf, expected, "scratch-reuse round-trip mismatch");
     }
 }

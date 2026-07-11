@@ -1,6 +1,6 @@
-{"duration_s":10,"label":"plain","mbps":1106.8375,"streams":1,"total_bytes":11606032384}
-{"duration_s":10,"label":"encrypt","mbps":301.875,"streams":1,"total_bytes":3165388800}
-{"duration_s":10,"label":"compress","mbps":603.8,"streams":1,"total_bytes":6331301888}
-{"duration_s":10,"label":"encrypt_compress","mbps":557.2625,"streams":1,"total_bytes":5843320832}
-{"duration_s":10,"label":"mux","mbps":588.3125,"streams":1,"total_bytes":6168903680}
-{"duration_s":10,"label":"tls","mbps":719.35,"streams":1,"total_bytes":7542931456}
+{"duration_s":10,"label":"plain","mbps":1114.7125,"streams":1,"total_bytes":11688607744}
+{"duration_s":10,"label":"encrypt","mbps":305.9875,"streams":1,"total_bytes":3208511488}
+{"duration_s":10,"label":"compress","mbps":601.0375,"streams":1,"total_bytes":6302334976}
+{"duration_s":10,"label":"encrypt_compress","mbps":561.6,"streams":1,"total_bytes":5888802816}
+{"duration_s":10,"label":"mux","mbps":640.975,"streams":1,"total_bytes":6721110016}
+{"duration_s":10,"label":"tls","mbps":712.0375,"streams":1,"total_bytes":7466254336}
