@@ -53,25 +53,63 @@ impl CfbState {
     }
 
     fn encrypt(&mut self, data: &mut [u8]) {
-        for byte in data.iter_mut() {
+        let n = data.len();
+        let mut i = 0;
+        while i < n {
             if self.used >= 16 {
                 self.refill();
             }
-            *byte ^= self.keystream[self.used];
-            self.feedback[self.used] = *byte;
-            self.used += 1;
+            // Fast path: at a fresh block boundary with a full block available,
+            // XOR 16 keystream bytes against 16 data bytes (vectorizable) and
+            // set the feedback register to the ciphertext block in one copy.
+            if self.used == 0 && n - i >= 16 {
+                let blk = &mut data[i..i + 16];
+                for (b, k) in blk.iter_mut().zip(self.keystream.iter()) {
+                    *b ^= *k;
+                }
+                self.feedback.copy_from_slice(blk);
+                self.used = 16;
+                i += 16;
+            } else {
+                // Partial block (leading carry or trailing remainder): byte-wise.
+                let take = (16 - self.used).min(n - i);
+                for j in 0..take {
+                    let c = data[i + j] ^ self.keystream[self.used];
+                    data[i + j] = c;
+                    self.feedback[self.used] = c;
+                    self.used += 1;
+                }
+                i += take;
+            }
         }
     }
 
     fn decrypt(&mut self, data: &mut [u8]) {
-        for byte in data.iter_mut() {
+        let n = data.len();
+        let mut i = 0;
+        while i < n {
             if self.used >= 16 {
                 self.refill();
             }
-            let ct = *byte;
-            *byte ^= self.keystream[self.used];
-            self.feedback[self.used] = ct;
-            self.used += 1;
+            if self.used == 0 && n - i >= 16 {
+                let blk = &mut data[i..i + 16];
+                // feedback = ciphertext (input), then plaintext = ct ^ keystream.
+                self.feedback.copy_from_slice(blk);
+                for (b, k) in blk.iter_mut().zip(self.keystream.iter()) {
+                    *b ^= *k;
+                }
+                self.used = 16;
+                i += 16;
+            } else {
+                let take = (16 - self.used).min(n - i);
+                for j in 0..take {
+                    let ct = data[i + j];
+                    data[i + j] = ct ^ self.keystream[self.used];
+                    self.feedback[self.used] = ct;
+                    self.used += 1;
+                }
+                i += take;
+            }
         }
     }
 }
@@ -990,5 +1028,123 @@ mod tests {
         assert_eq!(&buf[first_expected.len()..], &second_expected[..], "second write corrupted");
 
         write_handle.await.unwrap();
+    }
+
+    // Reference byte-wise CFB (a copy of the pre-optimization algorithm).
+    // The optimized block-wise CfbState must produce identical output.
+    struct RefCfb {
+        aes: aes::Aes128,
+        feedback: [u8; 16],
+        keystream: [u8; 16],
+        used: usize,
+    }
+    impl RefCfb {
+        fn new(key: &[u8; 16], iv: &[u8; 16]) -> Self {
+            use aes::cipher::{BlockEncrypt, KeyInit};
+            let aes = aes::Aes128::new_from_slice(key).unwrap();
+            let mut s = RefCfb { aes, feedback: *iv, keystream: *iv, used: 0 };
+            s.aes.encrypt_block((&mut s.keystream).into());
+            s
+        }
+        fn refill(&mut self) {
+            use aes::cipher::BlockEncrypt;
+            self.keystream = self.feedback;
+            self.aes.encrypt_block((&mut self.keystream).into());
+            self.used = 0;
+        }
+        fn encrypt(&mut self, data: &mut [u8]) {
+            for byte in data.iter_mut() {
+                if self.used >= 16 { self.refill(); }
+                *byte ^= self.keystream[self.used];
+                self.feedback[self.used] = *byte;
+                self.used += 1;
+            }
+        }
+        fn decrypt(&mut self, data: &mut [u8]) {
+            for byte in data.iter_mut() {
+                if self.used >= 16 { self.refill(); }
+                let ct = *byte;
+                *byte ^= self.keystream[self.used];
+                self.feedback[self.used] = ct;
+                self.used += 1;
+            }
+        }
+    }
+
+    // Deterministic pseudo-random fill (no rand dep needed in test).
+    fn fill_pattern(buf: &mut [u8], seed: u64) {
+        let mut x = seed | 1;
+        for b in buf.iter_mut() {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+    }
+
+    #[test]
+    fn cfb_block_wise_matches_reference_encrypt() {
+        let key = [7u8; 16];
+        let iv = [0x11u8; 16];
+        // Single-shot sizes straddling block boundaries.
+        for size in [0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 255, 4096] {
+            let mut data = vec![0u8; size];
+            fill_pattern(&mut data, size as u64 + 1);
+            let mut got = data.clone();
+            let mut want = data.clone();
+            CfbState::new(&key, &iv).encrypt(&mut got);
+            RefCfb::new(&key, &iv).encrypt(&mut want);
+            assert_eq!(got, want, "encrypt mismatch at size {}", size);
+        }
+    }
+
+    #[test]
+    fn cfb_block_wise_matches_reference_decrypt() {
+        let key = [7u8; 16];
+        let iv = [0x11u8; 16];
+        for size in [0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 255, 4096] {
+            let mut data = vec![0u8; size];
+            fill_pattern(&mut data, size as u64 + 99);
+            let mut got = data.clone();
+            let mut want = data.clone();
+            CfbState::new(&key, &iv).decrypt(&mut got);
+            RefCfb::new(&key, &iv).decrypt(&mut want);
+            assert_eq!(got, want, "decrypt mismatch at size {}", size);
+        }
+    }
+
+    #[test]
+    fn cfb_block_wise_matches_reference_chunked() {
+        // Multi-chunk splits exercise cross-chunk `used` carry — the boundary
+        // case a naive block rewrite gets wrong.
+        let key = [42u8; 16];
+        let iv = [0xABu8; 16];
+        let splits: &[&[usize]] = &[
+            &[1, 31, 4096],
+            &[15, 1, 16, 17],
+            &[16, 16, 16],
+            &[7, 9, 100, 3, 4096],
+            &[33, 33, 33],
+        ];
+        for chunks in splits {
+            let total: usize = chunks.iter().sum();
+            let mut plain = vec![0u8; total];
+            fill_pattern(&mut plain, total as u64 + 7);
+
+            let mut got = plain.clone();
+            let mut want = plain.clone();
+            let mut got_cfb = CfbState::new(&key, &iv);
+            let mut want_cfb = RefCfb::new(&key, &iv);
+            let mut off = 0;
+            for &c in *chunks {
+                got_cfb.encrypt(&mut got[off..off + c]);
+                want_cfb.encrypt(&mut want[off..off + c]);
+                off += c;
+            }
+            assert_eq!(got, want, "chunked encrypt mismatch for {:?}", chunks);
+
+            // Round-trip: decrypting the ciphertext restores plaintext.
+            let mut rt = got.clone();
+            CfbState::new(&key, &iv).decrypt(&mut rt);
+            assert_eq!(rt, plain, "round-trip mismatch for {:?}", chunks);
+        }
     }
 }
