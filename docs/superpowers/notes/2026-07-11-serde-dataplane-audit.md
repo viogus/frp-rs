@@ -8,7 +8,7 @@
 
 ## 1. Enumerated serde_json call sites
 
-97 matches across 14 files (excluding `#[cfg(test)]`). Classified below.
+76 matches across 14 files (excluding `#[cfg(test)]`). Classified below.
 
 ### 1.1 Wire protocol dispatch layer (central)
 
