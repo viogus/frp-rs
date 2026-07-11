@@ -30,7 +30,7 @@ struct CfbState {
 
 impl CfbState {
     fn new(key: &[u8; 16], iv: &[u8; 16]) -> Self {
-        use aes::cipher::{BlockEncrypt, KeyInit};
+        use aes::cipher::{BlockCipherEncrypt, KeyInit};
         let aes = Aes128::new_from_slice(key).expect("AES-128 key must be 16 bytes");
         let mut state = CfbState {
             aes,
@@ -46,7 +46,7 @@ impl CfbState {
 
     /// Refill the keystream by encrypting the current feedback register.
     fn refill(&mut self) {
-        use aes::cipher::BlockEncrypt;
+        use aes::cipher::BlockCipherEncrypt;
         self.keystream = self.feedback;
         self.aes.encrypt_block((&mut self.keystream).into());
         self.used = 0;
@@ -1040,14 +1040,14 @@ mod tests {
     }
     impl RefCfb {
         fn new(key: &[u8; 16], iv: &[u8; 16]) -> Self {
-            use aes::cipher::{BlockEncrypt, KeyInit};
+            use aes::cipher::{BlockCipherEncrypt, KeyInit};
             let aes = aes::Aes128::new_from_slice(key).unwrap();
             let mut s = RefCfb { aes, feedback: *iv, keystream: *iv, used: 0 };
             s.aes.encrypt_block((&mut s.keystream).into());
             s
         }
         fn refill(&mut self) {
-            use aes::cipher::BlockEncrypt;
+            use aes::cipher::BlockCipherEncrypt;
             self.keystream = self.feedback;
             self.aes.encrypt_block((&mut self.keystream).into());
             self.used = 0;

@@ -1,4 +1,3 @@
-use cfb_mode::cipher::AsyncStreamCipher;
 use cfb_mode::cipher::KeyIvInit;
 use rand::RngCore;
 
@@ -36,7 +35,9 @@ pub fn decrypt(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
     if data.len() < 16 {
         return Err("data too short for AES-CFB (need at least 16-byte IV)".into());
     }
-    let iv = &data[..16];
+    let iv: &[u8; 16] = data[..16]
+        .try_into()
+        .map_err(|_| "data too short for AES-CFB (need at least 16-byte IV)")?;
     let ciphertext = &data[16..];
     let mut result = ciphertext.to_vec();
     let cipher = Aes128CfbDec::new(key.into(), iv.into());
