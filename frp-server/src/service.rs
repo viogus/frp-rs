@@ -68,6 +68,42 @@ async fn v2_handshake_and_read(
     Some((msg_payload, crypto_ctx))
 }
 
+/// Build an `AuthConfig` from a server config's `auth` sub-struct.
+/// Shared by `Service::new()` and `Service::reload()`.
+fn build_auth_config(auth: &frp_core::config::AuthServerConfig) -> AuthConfig {
+    AuthConfig {
+        method: match auth.method.to_lowercase().as_str() {
+            #[cfg(feature = "oidc")]
+            "oidc" => AuthMethod::Oidc,
+            _ => AuthMethod::Token,
+        },
+        token: frp_core::auth::resolve_dynamic_token_checked(&auth.token, &UnsafeFeatures::default()).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
+            String::new()
+        }),
+        oidc_issuer: auth.oidc_issuer.clone(),
+        oidc_audience: auth.oidc_audience.clone(),
+        oidc_skip_expiry: auth.oidc_skip_expiry,
+        oidc_skip_issuer: auth.oidc_skip_issuer,
+        additional_data: None,
+        oidc_proxy_url: auth.oidc_proxy_url.clone(),
+        additional_auth_scopes: auth.additional_auth_scopes.clone(),
+        authentication_timeout: auth.authentication_timeout,
+        use_encryption: auth.use_encryption,
+    }
+}
+
+/// Resolve the allow-ports ranges from a server config: explicit `allow_ports`
+/// spec if present, otherwise the `[allow_port_start, allow_port_end]` range.
+/// Shared by `Service::new()` and `Service::reload()`.
+fn resolve_allow_ports(cfg: &ServerConfig) -> Vec<(u16, u16)> {
+    if !cfg.allow_ports.is_empty() {
+        frp_core::config::parse_allow_ports(&cfg.allow_ports)
+    } else {
+        vec![(cfg.allow_port_start, cfg.allow_port_end)]
+    }
+}
+
 // ---------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------
@@ -76,34 +112,12 @@ pub struct Service {
     cfg: ServerConfig,
     state: Arc<AppState>,
     /// Path to config file for SIGUSR1 reload.
-    #[allow(dead_code)]
     config_file: Option<String>,
-    #[allow(dead_code)]
-    max_connections: usize,
 }
 
 impl Service {
     pub async fn new(cfg: ServerConfig, config_file: Option<String>) -> Result<Self, String> {
-        let auth_cfg = AuthConfig {
-            method: match cfg.auth.method.to_lowercase().as_str() {
-                #[cfg(feature = "oidc")]
-                "oidc" => AuthMethod::Oidc,
-                _ => AuthMethod::Token,
-            },
-            token: frp_core::auth::resolve_dynamic_token_checked(&cfg.auth.token, &UnsafeFeatures::default()).unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
-                String::new()
-            }),
-            oidc_issuer: cfg.auth.oidc_issuer.clone(),
-            oidc_audience: cfg.auth.oidc_audience.clone(),
-            oidc_skip_expiry: cfg.auth.oidc_skip_expiry,
-            oidc_skip_issuer: cfg.auth.oidc_skip_issuer,
-            additional_data: None,
-            oidc_proxy_url: cfg.auth.oidc_proxy_url.clone(),
-            additional_auth_scopes: cfg.auth.additional_auth_scopes.clone(),
-            authentication_timeout: cfg.auth.authentication_timeout,
-            use_encryption: cfg.auth.use_encryption,
-        };
+        let auth_cfg = build_auth_config(&cfg.auth);
         auth_cfg
             .check_startup()
             .map_err(|e| format!("security misconfiguration: {e}"))?;
@@ -135,11 +149,7 @@ impl Service {
         let oidc_verifier = None;
 
         let enc_key = frp_core::encryption::derive_key(&auth_cfg.token);
-        let allow_ports = if !cfg.allow_ports.is_empty() {
-            frp_core::config::parse_allow_ports(&cfg.allow_ports)
-        } else {
-            vec![(cfg.allow_port_start, cfg.allow_port_end)]
-        };
+        let allow_ports = resolve_allow_ports(&cfg);
         let sub_host = cfg.sub_domain_host.clone();
         let max_connections: usize = match cfg.max_connections {
             Some(0) => usize::MAX, // 0 = unlimited
@@ -197,7 +207,6 @@ impl Service {
             state: Arc::new(state),
             cfg,
             config_file,
-            max_connections,
         })
     }
 
@@ -2101,35 +2110,12 @@ impl Service {
         let mut changes: Vec<String> = Vec::new();
 
         // Build new reloadable state
-        let new_auth_cfg = AuthConfig {
-            method: match new_cfg.auth.method.to_lowercase().as_str() {
-                #[cfg(feature = "oidc")]
-                "oidc" => AuthMethod::Oidc,
-                _ => AuthMethod::Token,
-            },
-            token: frp_core::auth::resolve_dynamic_token_checked(&new_cfg.auth.token, &UnsafeFeatures::default()).unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
-                String::new()
-            }),
-            oidc_issuer: new_cfg.auth.oidc_issuer.clone(),
-            oidc_audience: new_cfg.auth.oidc_audience.clone(),
-            oidc_skip_expiry: new_cfg.auth.oidc_skip_expiry,
-            oidc_skip_issuer: new_cfg.auth.oidc_skip_issuer,
-            additional_data: None,
-            oidc_proxy_url: new_cfg.auth.oidc_proxy_url.clone(),
-            additional_auth_scopes: new_cfg.auth.additional_auth_scopes.clone(),
-            authentication_timeout: new_cfg.auth.authentication_timeout,
-            use_encryption: new_cfg.auth.use_encryption,
-        };
+        let new_auth_cfg = build_auth_config(&new_cfg.auth);
         new_auth_cfg
             .check_startup()
             .map_err(|e| format!("security misconfiguration: {e}"))?;
         let new_enc_key = frp_core::encryption::derive_key(&new_auth_cfg.token);
-        let new_allow_ports = if !new_cfg.allow_ports.is_empty() {
-            frp_core::config::parse_allow_ports(&new_cfg.allow_ports)
-        } else {
-            vec![(new_cfg.allow_port_start, new_cfg.allow_port_end)]
-        };
+        let new_allow_ports = resolve_allow_ports(&new_cfg);
 
         // Apply under write lock
         {
