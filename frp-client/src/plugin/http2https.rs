@@ -73,6 +73,7 @@ async fn handle_conn(
     let tcp = TcpStream::connect(format!("{host}:{port}"))
         .await
         .map_err(|e| format!("connect to {host}:{port}: {e}"))?;
+    frp_core::transport::set_nodelay(&tcp);
 
     let mut tls = tls_connector
         .connect(server_name, tcp)

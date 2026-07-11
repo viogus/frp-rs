@@ -51,6 +51,8 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
         };
         match TcpStream::connect(&target).await {
             Ok(tcp_stream) => {
+                // Interactive forwarded data path — disable Nagle before TLS-wrapping.
+                frp_core::transport::set_nodelay(&tcp_stream);
                 match connector.connect(server_name, tcp_stream).await {
                     Ok(mut tls_stream) => {
                         let mut tunnel = tunnel_stream;

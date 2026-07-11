@@ -47,6 +47,7 @@ async fn handle_conn(
     let mut remote = TcpStream::connect(target)
         .await
         .map_err(|e| format!("connect to {target}: {e}"))?;
+    frp_core::transport::set_nodelay(&remote);
 
     remote
         .write_all(fwd.as_bytes())

@@ -771,6 +771,9 @@ async fn handle_work_conn_requests(
             }
         };
 
+        // Interactive SSH-forwarded traffic — disable Nagle to cut latency.
+        frp_core::transport::set_nodelay(&stream);
+
         // Look up the control handler's internal_tx from the global map
         let ctl_tx = {
             let map = state.run_id_to_ctl_tx.read().await;
@@ -968,6 +971,9 @@ impl SshListener {
             };
 
             tracing::info!(peer_address = %peer_addr, "SSH connection from {}", peer_addr);
+
+            // SSH terminal traffic is the canonical small-message workload — disable Nagle.
+            frp_core::transport::set_nodelay(&stream);
 
             let run_id = uuid::Uuid::new_v4().to_string();
             let state = self.state.clone();

@@ -158,6 +158,7 @@ async fn handle_socks5_conn(
             return Err(format!("connect to {target}: failed"));
         }
     };
+    frp_core::transport::set_nodelay(&remote);
 
     // Send success reply
     let reply = make_socks5_reply(REP_SUCCEEDED, ATYP_IPV4, &[0, 0, 0, 0], 0);

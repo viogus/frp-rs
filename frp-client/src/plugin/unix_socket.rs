@@ -44,6 +44,8 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
                     match result {
                         Ok((mut tcp_stream, peer)) => {
                             debug!(peer = %peer, "unix_domain_socket plugin: new connection from {}", peer);
+                            // Forwarded interactive data path — disable Nagle.
+                            frp_core::transport::set_nodelay(&tcp_stream);
                             let path = path_clone.clone();
                             tokio::spawn(async move {
                                 match UnixStream::connect(&path).await {

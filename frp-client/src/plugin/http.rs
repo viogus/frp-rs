@@ -127,6 +127,7 @@ async fn handle_connect(mut client: TcpStream, target: &str) -> Result<(), Strin
     let mut remote = TcpStream::connect(&target)
         .await
         .map_err(|e| format!("connect to {target}: {e}"))?;
+    frp_core::transport::set_nodelay(&remote);
 
     // Tell client connection established
     let resp = b"HTTP/1.1 200 Connection Established\r\n\r\n";
@@ -149,6 +150,7 @@ async fn handle_http_forward(
     let mut remote = TcpStream::connect(format!("{host}:{port}"))
         .await
         .map_err(|e| format!("connect to {host}:{port}: {e}"))?;
+    frp_core::transport::set_nodelay(&remote);
 
     // Split buffer on first \r\n\r\n to separate headers from any pre-read body data.
     let header_end = raw_headers

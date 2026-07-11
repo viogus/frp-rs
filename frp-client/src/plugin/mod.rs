@@ -91,6 +91,8 @@ where
                 result = listener.accept() => {
                     match result {
                         Ok((stream, peer)) => {
+                            // Forwarded interactive data path — disable Nagle.
+                            frp_core::transport::set_nodelay(&stream);
                             let s = state.clone();
                             tokio::spawn(handler(stream, peer, s));
                         }
