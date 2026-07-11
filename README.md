@@ -280,6 +280,16 @@ tcp_mux_keepalive_interval = 30
 | `allow_port_end` | `50000` | End of auto-assigned port range |
 | `udp_packet_size` | `65535` | UDP packet buffer size in bytes |
 
+### Logging
+
+Log level resolves in this order (first match wins):
+
+1. **`RUST_LOG` env var** — overrides everything, accepts full [`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax (e.g. `RUST_LOG=frp_server=debug,info`).
+2. **`log.level` config** (or `--log-level` CLI flag) — one of `trace, debug, info, warn, error`.
+3. Default: `info`.
+
+Per-connection events (`Bridging user conn…`, `bridge completed`) log at **`debug`**, not `info` — a busy proxy would otherwise flood the default output with a line per connection. Enable them with `RUST_LOG=debug` or `log.level = "debug"`.
+
 ### Server Reload (SIGUSR1)
 
 Send `SIGUSR1` to the frps process to hot-reload these settings from the config file:
