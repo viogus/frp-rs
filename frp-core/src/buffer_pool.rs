@@ -1,6 +1,6 @@
 //! Simple buffer pool to reduce per-connection allocation pressure.
 //!
-//! The bridge module allocates 64KB read buffers per direction per bridge
+//! The bridge module allocates 32KB read buffers per direction per bridge
 //! call. Under high proxy connection churn, this creates sustained allocator
 //! pressure. This pool recycles those buffers.
 //!
@@ -11,15 +11,15 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::LazyLock;
 
-/// Pooled buffer size in bytes. Defaults to 64KB; override for experiments
-/// via FRP_BRIDGE_BUF_KB (e.g. 256). Read once at process start.
+/// Pooled buffer size in bytes. Defaults to 32KB (matches Go frp io.Copy); override
+/// for experiments via FRP_BRIDGE_BUF_KB (e.g. 256). Read once at process start.
 pub static BUFFER_SIZE: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("FRP_BRIDGE_BUF_KB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|kb| *kb >= 4 && *kb <= 1024)
         .map(|kb| kb * 1024)
-        .unwrap_or(65536)
+        .unwrap_or(32768)
 });
 
 /// Maximum number of buffers to retain in the pool.
