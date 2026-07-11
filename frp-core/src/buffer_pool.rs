@@ -40,7 +40,9 @@ impl Default for BufferPool {
 impl BufferPool {
     /// Acquire a buffer from the pool, or allocate a fresh one.
     ///
-    /// The returned buffer has capacity >= BUFFER_SIZE and length 0.
+    /// The returned buffer has capacity >= BUFFER_SIZE. A recycled buffer may
+    /// return at length BUFFER_SIZE (release preserves length); the miss path
+    /// allocates via `Vec::with_capacity`, returning length 0.
     pub fn acquire(&self) -> Vec<u8> {
         let mut inner = self.inner.lock().expect("buffer pool lock poisoned");
         inner.pop_front().unwrap_or_else(|| Vec::with_capacity(BUFFER_SIZE))
@@ -48,10 +50,12 @@ impl BufferPool {
 
     /// Return a buffer to the pool for reuse.
     ///
-    /// If the pool is full, the buffer is dropped. The buffer is cleared
-    /// before returning (preserving capacity).
-    pub fn release(&self, mut buf: Vec<u8>) {
-        buf.clear();
+    /// If the pool is full, the buffer is dropped. Buffers are recycled
+    /// preserving length and capacity — length is left untouched (PoolGuard
+    /// buffers are always full BUFFER_SIZE length). Contents are stale, but
+    /// callers always overwrite via read() before use and only read the
+    /// [..n] prefix, so stale bytes are never observed.
+    pub fn release(&self, buf: Vec<u8>) {
         let mut inner = self.inner.lock().expect("buffer pool lock poisoned");
         if inner.len() < MAX_POOLED_BUFFERS {
             inner.push_back(buf);
@@ -78,10 +82,12 @@ impl PoolGuard {
     /// non-empty and `read()` can actually read data into it.
     pub fn acquire() -> Self {
         let mut buf = BUFFER_POOL.acquire();
-        // Buffer from pool has capacity >= BUFFER_SIZE but may have length 0
-        // (Vec::with_capacity). Bridge code calls read(&mut buf) which needs
-        // a non-empty mutable slice — ensure length matches capacity.
-        buf.resize(BUFFER_SIZE, 0);
+        // Only zero-fill on a freshly allocated (len 0) buffer. Recycled buffers
+        // already have length BUFFER_SIZE, so skip the 64KB memset. read() fills
+        // the slice and callers use only the [..n] prefix, so stale bytes are safe.
+        if buf.len() < BUFFER_SIZE {
+            buf.resize(BUFFER_SIZE, 0);
+        }
         Self { buf }
     }
 
@@ -125,10 +131,29 @@ mod tests {
         buf.push(42);
         pool.release(buf);
 
+        // Recycling preserves length AND capacity; we no longer clear on
+        // release, so the pushed byte survives (a regression re-adding clear()
+        // would flip len back to 0).
         let buf2 = pool.acquire();
-        assert_eq!(buf2.len(), 0);
+        assert_eq!(buf2.len(), 1, "release must not clear: length is preserved");
         assert!(buf2.capacity() >= BUFFER_SIZE);
         pool.release(buf2);
+    }
+
+    /// PoolGuard reuse: a recycled buffer returns at full BUFFER_SIZE length,
+    /// so acquire() skips the 64KB zero-fill (the P2 optimization) and data()
+    /// still exposes a full-length slice.
+    #[test]
+    fn test_pool_guard_reuse_stays_full_length() {
+        // Prime the global pool with one full-length buffer via a dropped guard.
+        {
+            let mut g = PoolGuard::acquire();
+            assert_eq!(g.as_mut_slice().len(), BUFFER_SIZE);
+        } // dropped -> released at len BUFFER_SIZE (release no longer clears)
+
+        // Reacquire: buffer is still full length, so the resize guard is a no-op.
+        let g2 = PoolGuard::acquire();
+        assert_eq!(g2.data().len(), BUFFER_SIZE, "recycled buffer stays full length");
     }
 
     #[test]
