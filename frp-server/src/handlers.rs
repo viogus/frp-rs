@@ -531,6 +531,38 @@ pub(crate) async fn dispatch_v2_message(
     }
 }
 
+/// V1 mirror of `dispatch_v2_message`: read one V1 message off `io` and route
+/// it to the matching handler. `addr`/`incoming`/`visitor_addr` vary per call
+/// site; everything else is uniform (V1 => v2=false, no crypto context).
+pub(crate) async fn dispatch_v1_message(
+    mut io: IoStream,
+    state: std::sync::Arc<AppState>,
+    addr: Option<std::net::SocketAddr>,
+    incoming: Option<frp_core::mux::IncomingStreams>,
+    visitor_addr: Option<String>,
+) {
+    match frp_core::protocol::read_msg_v1(&mut io).await {
+        Ok(FrpMessage::Login(login)) => {
+            control::handle_control(io, login, state, addr, incoming, false, None).await;
+        }
+        Ok(FrpMessage::NewWorkConn(nwc)) => {
+            handle_work_conn_inner(io, nwc, state).await;
+        }
+        Ok(FrpMessage::NewVisitorConn(nvc)) => {
+            handle_visitor_conn_inner(io, nvc, state, false).await;
+        }
+        Ok(FrpMessage::NatHoleVisitor(nhv)) => {
+            handle_nat_hole_visitor(io, nhv, state, visitor_addr, false).await;
+        }
+        Ok(other) => {
+            warn!(other = ?other.v1_type_byte(), "Unexpected V1 first message: {:?}", other.v1_type_byte());
+        }
+        Err(e) => {
+            warn!(error = %e, "V1 read error: {}", e);
+        }
+    }
+}
+
 // ---------------------------------------------------------------
 // Work connection handler
 // ---------------------------------------------------------------

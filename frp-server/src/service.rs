@@ -12,8 +12,6 @@ use frp_core::auth::{AuthConfig, AuthMethod};
 use frp_core::unsafe_features::UnsafeFeatures;
 #[cfg(feature = "oidc")]
 use frp_core::auth::OidcVerifier;
-use frp_core::msg::FrpMessage;
-use frp_core::protocol::read_msg_v1;
 use frp_core::mux;
 use frp_core::transport::{IoStream, ConnectionType, detect_and_strip_magic, PreReadStream};
 #[cfg(feature = "tls")]
@@ -330,29 +328,10 @@ impl Service {
                                                                 crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, Some(incoming), None, crypto_ctx).await;
                                                             } else {
                                                                 // V1 over WS+TLS+yamux
-                                                                let mut io = frp_core::transport::IoStream::BufferedRead(
+                                                                let io = frp_core::transport::IoStream::BufferedRead(
                                                                     magic.to_vec(), 0, Box::new(io),
                                                                 );
-                                                                match read_msg_v1(&mut io).await {
-                                                                    Ok(FrpMessage::Login(login)) => {
-                                                                        control::handle_control(io, login, state.clone(), Some(addr), Some(incoming), false, None).await;
-                                                                    }
-                                                                    Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                                        crate::handlers::handle_work_conn_inner(io, nwc, state.clone()).await;
-                                                                    }
-                                                                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                                        crate::handlers::handle_visitor_conn_inner(io, nvc, state.clone(), false).await;
-                                                                    }
-                                                                    Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                                        crate::handlers::handle_nat_hole_visitor(io, nhv, state.clone(), None, false).await;
-                                                                    }
-                                                                    Ok(other) => {
-                                                                        tracing::warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 message after WS+TLS+yamux from {}: {:?}", addr, other.v1_type_byte());
-                                                                    }
-                                                                    Err(e) => {
-                                                                        tracing::warn!(addr = %addr, error = %e, "V1 read error after WS+TLS+yamux from {}: {}", addr, e);
-                                                                    }
-                                                                }
+                                                                crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None).await;
                                                             }
                                                         }
                                                         Err(e) => {
@@ -374,29 +353,10 @@ impl Service {
                                                         };
                                                         crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
                                                     } else {
-                                                        let mut io = frp_core::transport::IoStream::BufferedRead(
+                                                        let io = frp_core::transport::IoStream::BufferedRead(
                                                             chicken.to_vec(), 0, Box::new(io),
                                                         );
-                                                        match read_msg_v1(&mut io).await {
-                                                            Ok(FrpMessage::Login(login)) => {
-                                                                control::handle_control(io, login, state.clone(), Some(addr), None, false, None).await;
-                                                            }
-                                                            Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                                crate::handlers::handle_work_conn_inner(io, nwc, state.clone()).await;
-                                                            }
-                                                            Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                                crate::handlers::handle_visitor_conn_inner(io, nvc, state.clone(), false).await;
-                                                            }
-                                                            Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                                crate::handlers::handle_nat_hole_visitor(io, nhv, state.clone(), None, false).await;
-                                                            }
-                                                            Ok(other) => {
-                                                                tracing::warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 message after WS+TLS from {}: {:?}", addr, other.v1_type_byte());
-                                                            }
-                                                            Err(e) => {
-                                                                tracing::warn!(addr = %addr, error = %e, "V1 read error after WS+TLS from {}: {}", addr, e);
-                                                            }
-                                                        }
+                                                        crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), None, None).await;
                                                     }
                                                 }
                                             }
@@ -406,27 +366,8 @@ impl Service {
                                             }
                                         } else {
                                             // V1 fallback: replay consumed 7 bytes
-                                            let mut ws = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
-                                            match read_msg_v1(&mut ws).await {
-                                                Ok(FrpMessage::Login(login)) => {
-                                                    control::handle_control(ws, login, state.clone(), Some(addr), None, false, None).await;
-                                                }
-                                                Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                    crate::handlers::handle_work_conn_inner(ws, nwc, state.clone()).await;
-                                                }
-                                                Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                    crate::handlers::handle_visitor_conn_inner(ws, nvc, state.clone(), false).await;
-                                                }
-                                                Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                    crate::handlers::handle_nat_hole_visitor(ws, nhv, state.clone(), None, false).await;
-                                                }
-                                                Ok(other) => {
-                                                    warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
-                                                }
-                                                Err(e) => {
-                                                    warn!(addr = %addr, error = %e, "WS read error from {}: {}", addr, e);
-                                                }
-                                            }
+                                            let ws = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
+                                            crate::handlers::dispatch_v1_message(ws, state.clone(), Some(addr), None, None).await;
                                         }
                                     }
                                     Err(e) => {
@@ -1342,7 +1283,7 @@ impl Service {
                     }
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let (ct, mut stream_io) = match detect_and_strip_magic(stream).await {
+                        let (ct, stream_io) = match detect_and_strip_magic(stream).await {
                             Ok((c, s)) => (c, s),
                             Err(e) => {
                                 warn!(addr = %addr, error = %e, "Failed to detect connection type from {}: {}", addr, e);
@@ -1432,27 +1373,8 @@ impl Service {
                                             // sni_data contains the bytes after 0x17 (pre_read
                                             // minus 0x17 + SNI peek). Replay them via PreRead
                                             // and dispatch as V1.
-                                            let mut stream = IoStream::PreRead(sni_data, inner_stream);
-                                            match read_msg_v1(&mut stream).await {
-                                                Ok(FrpMessage::Login(login)) => {
-                                                    control::handle_control(stream, login, state, Some(addr), None, false, None).await;
-                                                }
-                                                Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                    crate::handlers::handle_work_conn_inner(stream, nwc, state).await;
-                                                }
-                                                Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                    crate::handlers::handle_visitor_conn_inner(stream, nvc, state, false).await;
-                                                }
-                                                Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                    crate::handlers::handle_nat_hole_visitor(stream, nhv, state, Some(addr.to_string()), false).await;
-                                                }
-                                                Ok(other) => {
-                                                    warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 message after 0x17 fallback from {}: {:?}", addr, other.v1_type_byte());
-                                                }
-                                                Err(e) => {
-                                                    warn!(addr = %addr, error = %e, "V1 read error after 0x17 fallback from {}: {}", addr, e);
-                                                }
-                                            }
+                                            let stream = IoStream::PreRead(sni_data, inner_stream);
+                                            crate::handlers::dispatch_v1_message(stream, state, Some(addr), None, Some(addr.to_string())).await;
                                             return;
                                         }
                                         // 0x16 (standard TLS ClientHello) — genuine TLS,
@@ -1604,27 +1526,8 @@ impl Service {
                                                             };
                                                             crate::handlers::dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None, crypto_ctx).await;
                                                         } else {
-                                                            let mut io = IoStream::BufferedRead(v2_magic.to_vec(), 0, Box::new(io));
-                                                            match read_msg_v1(&mut io).await {
-                                                                Ok(FrpMessage::Login(login)) => {
-                                                                    control::handle_control(io, login, state, Some(addr), Some(incoming), false, None).await;
-                                                                }
-                                                                Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                                    crate::handlers::handle_work_conn_inner(io, nwc, state).await;
-                                                                }
-                                                                Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                                    crate::handlers::handle_visitor_conn_inner(io, nvc, state, false).await;
-                                                                }
-                                                                Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                                    crate::handlers::handle_nat_hole_visitor(io, nhv, state, None, false).await;
-                                                                }
-                                                                Ok(other) => {
-                                                                    warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 after WS+TLS+yamux: {:?}", other.v1_type_byte());
-                                                                }
-                                                                Err(e) => {
-                                                                    warn!(addr = %addr, error = %e, "V1 read error after WS+TLS+yamux: {}", e);
-                                                                }
-                                                            }
+                                                            let io = IoStream::BufferedRead(v2_magic.to_vec(), 0, Box::new(io));
+                                                            crate::handlers::dispatch_v1_message(io, state, Some(addr), Some(incoming), None).await;
                                                         }
                                                     }
                                                     Err(e) => {
@@ -1632,27 +1535,8 @@ impl Service {
                                                     }
                                                 }
                                             } else {
-                                                let mut ws = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
-                                                match read_msg_v1(&mut ws).await {
-                                                    Ok(FrpMessage::Login(login)) => {
-                                                        control::handle_control(ws, login, state, Some(addr), None, false, None).await;
-                                                    }
-                                                    Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                        crate::handlers::handle_work_conn_inner(ws, nwc, state).await;
-                                                    }
-                                                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                        crate::handlers::handle_visitor_conn_inner(ws, nvc, state, false).await;
-                                                    }
-                                                    Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                        crate::handlers::handle_nat_hole_visitor(ws, nhv, state, None, false).await;
-                                                    }
-                                                    Ok(other) => {
-                                                        warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 after WS+TLS: {:?}", other.v1_type_byte());
-                                                    }
-                                                    Err(e) => {
-                                                        warn!(addr = %addr, error = %e, "V1 read error after WS+TLS: {}", e);
-                                                    }
-                                                }
+                                                let ws = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
+                                                crate::handlers::dispatch_v1_message(ws, state, Some(addr), None, None).await;
                                             }
                                         }
                                         Err(e) => {
@@ -1711,27 +1595,8 @@ impl Service {
                                                 crate::handlers::dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None, crypto_ctx).await;
                                             } else {
                                                 // Not V2. Replay consumed bytes for V1 processing.
-                                                let mut io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
-                                                match read_msg_v1(&mut io).await {
-                                                    Ok(FrpMessage::Login(login)) => {
-                                                        control::handle_control(io, login, state, Some(addr), Some(incoming), false, None).await;
-                                                    }
-                                                    Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                        crate::handlers::handle_work_conn_inner(io, nwc, state).await;
-                                                    }
-                                                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                        crate::handlers::handle_visitor_conn_inner(io, nvc, state, false).await;
-                                                    }
-                                                    Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                        crate::handlers::handle_nat_hole_visitor(io, nhv, state, None, false).await;
-                                                    }
-                                                    Ok(other) => {
-                                                        warn!(addr = ?addr, other = ?other.v1_type_byte(), "Unexpected TLS+yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
-                                                    }
-                                                    Err(e) => {
-                                                        warn!(addr = %addr, error = %e, "TLS+yamux read error from {}: {}", addr, e);
-                                                    }
-                                                }
+                                                let io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
+                                                crate::handlers::dispatch_v1_message(io, state, Some(addr), Some(incoming), None).await;
                                             }
                                         }
                                         Err(e) => {
@@ -1774,28 +1639,8 @@ impl Service {
                                         crate::handlers::dispatch_v2_message(io, msg_payload, state, addr, None, Some(addr.to_string()), crypto_ctx).await;
                                     } else {
                                         // V1 fallback: replay consumed 7 bytes
-                                        let mut io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
-                                        match read_msg_v1(&mut io).await {
-                                            Ok(FrpMessage::Login(login)) => {
-                                                control::handle_control(io, login, state, Some(addr), None, false, None).await;
-                                            }
-                                            Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                crate::handlers::handle_work_conn_inner(io, nwc, state).await;
-                                            }
-                                            Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                crate::handlers::handle_visitor_conn_inner(io, nvc, state, false).await;
-                                            }
-                                            Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                let visitor_addr = Some(addr.to_string());
-                                                crate::handlers::handle_nat_hole_visitor(io, nhv, state, visitor_addr, false).await;
-                                            }
-                                            Ok(other) => {
-                                                debug!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected TLS first message from {}: {:?}", addr, other.v1_type_byte());
-                                            }
-                                            Err(e) => {
-                                                debug!(addr = %addr, error = %e, "TLS read error from {}: {}", addr, e);
-                                            }
-                                        }
+                                        let io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
+                                        crate::handlers::dispatch_v1_message(io, state, Some(addr), None, Some(addr.to_string())).await;
                                     }
                                 }
                             }
@@ -1818,26 +1663,7 @@ impl Service {
                                     }
                                     info!(addr = %addr, "TLS head byte (0x17) but TLS feature not enabled, falling back to V1");
                                     let mut stream = IoStream::PreRead(pre_read_bytes, inner_stream);
-                                    match read_msg_v1(&mut stream).await {
-                                        Ok(FrpMessage::Login(login)) => {
-                                            control::handle_control(stream, login, state, Some(addr), None, false, None).await;
-                                        }
-                                        Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                            crate::handlers::handle_work_conn_inner(stream, nwc, state).await;
-                                        }
-                                        Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                            crate::handlers::handle_visitor_conn_inner(stream, nvc, state, false).await;
-                                        }
-                                        Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                            crate::handlers::handle_nat_hole_visitor(stream, nhv, state, Some(addr.to_string()), false).await;
-                                        }
-                                        Ok(other) => {
-                                            warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 message after 0x17 fallback from {}: {:?}", addr, other.v1_type_byte());
-                                        }
-                                        Err(e) => {
-                                            warn!(addr = %addr, error = %e, "V1 read error after 0x17 fallback from {}: {}", addr, e);
-                                        }
-                                    }
+                                    crate::handlers::dispatch_v1_message(stream, state, Some(addr), None, Some(addr.to_string())).await;
                                     return;
                                 }
                                 warn!(addr = %addr, "TLS connection from {} but TLS feature not enabled", addr);
@@ -1970,29 +1796,10 @@ impl Service {
                                                                 crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, Some(incoming), None, crypto_ctx).await;
                                                             } else {
                                                                 // V1 over WS+TLS+yamux
-                                                                let mut io = frp_core::transport::IoStream::BufferedRead(
+                                                                let io = frp_core::transport::IoStream::BufferedRead(
                                                                     magic.to_vec(), 0, Box::new(io),
                                                                 );
-                                                                match read_msg_v1(&mut io).await {
-                                                                    Ok(FrpMessage::Login(login)) => {
-                                                                        control::handle_control(io, login, state.clone(), Some(addr), Some(incoming), false, None).await;
-                                                                    }
-                                                                    Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                                        crate::handlers::handle_work_conn_inner(io, nwc, state.clone()).await;
-                                                                    }
-                                                                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                                        crate::handlers::handle_visitor_conn_inner(io, nvc, state.clone(), false).await;
-                                                                    }
-                                                                    Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                                        crate::handlers::handle_nat_hole_visitor(io, nhv, state.clone(), None, false).await;
-                                                                    }
-                                                                    Ok(other) => {
-                                                                        warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 message after WS+TLS+yamux from {}: {:?}", addr, other.v1_type_byte());
-                                                                    }
-                                                                    Err(e) => {
-                                                                        warn!(addr = %addr, error = %e, "V1 read error after WS+TLS+yamux from {}: {}", addr, e);
-                                                                    }
-                                                                }
+                                                                crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None).await;
                                                             }
                                                         }
                                                         Err(e) => {
@@ -2032,29 +1839,10 @@ impl Service {
                                                         crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
                                                     } else {
                                                         // V1 over TLS-over-WS
-                                                        let mut io = frp_core::transport::IoStream::BufferedRead(
+                                                        let io = frp_core::transport::IoStream::BufferedRead(
                                                             chicken.to_vec(), 0, Box::new(io),
                                                         );
-                                                        match read_msg_v1(&mut io).await {
-                                                            Ok(FrpMessage::Login(login)) => {
-                                                                control::handle_control(io, login, state.clone(), Some(addr), None, false, None).await;
-                                                            }
-                                                            Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                                crate::handlers::handle_work_conn_inner(io, nwc, state.clone()).await;
-                                                            }
-                                                            Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                                crate::handlers::handle_visitor_conn_inner(io, nvc, state.clone(), false).await;
-                                                            }
-                                                            Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                                crate::handlers::handle_nat_hole_visitor(io, nhv, state.clone(), None, false).await;
-                                                            }
-                                                            Ok(other) => {
-                                                                warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected V1 message after WS+TLS from {}: {:?}", addr, other.v1_type_byte());
-                                                            }
-                                                            Err(e) => {
-                                                                warn!(addr = %addr, error = %e, "V1 read error after WS+TLS from {}: {}", addr, e);
-                                                            }
-                                                        }
+                                                        crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), None, None).await;
                                                     }
                                                 }
                                             }
@@ -2064,27 +1852,8 @@ impl Service {
                                             }
                                         } else {
                                             // V1 fallback: replay consumed 7 bytes
-                                            let mut ws = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
-                                            match read_msg_v1(&mut ws).await {
-                                                Ok(FrpMessage::Login(login)) => {
-                                                    control::handle_control(ws, login, state.clone(), Some(addr), None, false, None).await;
-                                                }
-                                                Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                    crate::handlers::handle_work_conn_inner(ws, nwc, state.clone()).await;
-                                                }
-                                                Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                    crate::handlers::handle_visitor_conn_inner(ws, nvc, state.clone(), false).await;
-                                                }
-                                                Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                    crate::handlers::handle_nat_hole_visitor(ws, nhv, state.clone(), None, false).await;
-                                                }
-                                                Ok(other) => {
-                                                    warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected WS message from {}: {:?}", addr, other.v1_type_byte());
-                                                }
-                                                Err(e) => {
-                                                    warn!(addr = %addr, error = %e, "WS read error from {}: {}", addr, e);
-                                                }
-                                            }
+                                            let ws = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
+                                            crate::handlers::dispatch_v1_message(ws, state.clone(), Some(addr), None, None).await;
                                         }
                                     }
                                     Err(e) => {
@@ -2260,27 +2029,8 @@ impl Service {
                                                 crate::handlers::dispatch_v2_message(io, msg_payload, state, addr, Some(incoming), None, crypto_ctx).await;
                                             } else {
                                                 // Not V2. Replay consumed bytes and process as V1.
-                                                let mut io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
-                                                match read_msg_v1(&mut io).await {
-                                                    Ok(FrpMessage::Login(login)) => {
-                                                        control::handle_control(io, login, state, Some(addr), Some(incoming), false, None).await;
-                                                    }
-                                                    Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                                        crate::handlers::handle_work_conn_inner(io, nwc, state).await;
-                                                    }
-                                                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                                        crate::handlers::handle_visitor_conn_inner(io, nvc, state, false).await;
-                                                    }
-                                                    Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                                        crate::handlers::handle_nat_hole_visitor(io, nhv, state, None, false).await;
-                                                    }
-                                                    Ok(other) => {
-                                                        warn!(addr = ?addr, other = ?other.v1_type_byte(), "Unexpected yamux first message from {:?}: {:?}", addr, other.v1_type_byte());
-                                                    }
-                                                    Err(e) => {
-                                                        warn!(addr = %addr, error = %e, "Failed to read yamux first message from {}: {}", addr, e);
-                                                    }
-                                                }
+                                                let io = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(io));
+                                                crate::handlers::dispatch_v1_message(io, state, Some(addr), Some(incoming), None).await;
                                             }
                                         }
                                         Err(e) => {
@@ -2291,27 +2041,7 @@ impl Service {
                                     // stream_io is IoStream::PreRead — its AsyncRead replays
                                     // the consumed bytes (including type byte) before reading
                                     // the rest from the TcpStream.
-                                    match read_msg_v1(&mut stream_io).await {
-                                        Ok(FrpMessage::Login(login)) => {
-                                            control::handle_control(stream_io, login, state, Some(addr), None, false, None).await;
-                                        }
-                                        Ok(FrpMessage::NewWorkConn(nwc)) => {
-                                            crate::handlers::handle_work_conn_inner(stream_io, nwc, state).await;
-                                        }
-                                        Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                                            crate::handlers::handle_visitor_conn_inner(stream_io, nvc, state, false).await;
-                                        }
-                                        Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                                            let visitor_addr = Some(addr.to_string());
-                                            crate::handlers::handle_nat_hole_visitor(stream_io, nhv, state, visitor_addr, false).await;
-                                        }
-                                        Ok(other) => {
-                                            warn!(addr = %addr, other = ?other.v1_type_byte(), "Unexpected first message from {}: {:?}", addr, other.v1_type_byte());
-                                        }
-                                        Err(e) => {
-                                            warn!(addr = %addr, error = %e, "Failed to read first message from {}: {}", addr, e);
-                                        }
-                                    }
+                                    crate::handlers::dispatch_v1_message(stream_io, state, Some(addr), None, Some(addr.to_string())).await;
                                 }
                             }
                         }
