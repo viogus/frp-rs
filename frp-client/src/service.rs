@@ -1113,12 +1113,7 @@ impl Service {
 
         if visitor_addr.is_empty() {
             warn!(proxy_name = %proxy_name, "NatHoleClient without visitor_addr for '{}'", proxy_name);
-            let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
-                sid: Some(sid.clone()),
-            });
-            if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
-                debug!(error = %e, "Failed to send NatHoleReport (no visitor_addr)");
-            }
+            Self::send_nat_hole_report(writer, v2, sid.clone(), "no visitor_addr").await;
             return;
         }
 
@@ -1163,33 +1158,32 @@ impl Service {
                         }
                         Err(e) => {
                             warn!(proxy_name = %proxy_name, error = %e, "XTCP provider '{}': connect local failed: {}", proxy_name, e);
-                            let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
-                                sid: Some(sid),
-                            });
-                            if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
-                                debug!(error = %e, "Failed to send NatHoleReport (connect local failed)");
-                            }
+                            Self::send_nat_hole_report(writer, v2, sid, "connect local failed").await;
                         }
                     }
                 } else {
                     warn!(proxy_name = %proxy_name, "XTCP provider '{}': no local address", proxy_name);
-                    let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
-                        sid: Some(sid),
-                    });
-                    if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
-                        debug!(error = %e, "Failed to send NatHoleReport (no local addr)");
-                    }
+                    Self::send_nat_hole_report(writer, v2, sid, "no local addr").await;
                 }
             }
             Err(e) => {
                 warn!(proxy_name = %proxy_name, error = %e, "XTCP hole punch for '{}' failed: {}", proxy_name, e);
-                let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
-                    sid: Some(sid),
-                });
-                if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
-                    debug!(error = %e, "Failed to send NatHoleReport (hole punch failed)");
-                }
+                Self::send_nat_hole_report(writer, v2, sid, "hole punch failed").await;
             }
+        }
+    }
+
+    /// Build and send a NatHoleReport for `sid`; log at debug on failure.
+    /// `reason` labels the failure context in the log line.
+    async fn send_nat_hole_report(
+        writer: &Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>,
+        v2: bool,
+        sid: String,
+        reason: &str,
+    ) {
+        let report = FrpMessage::NatHoleReport(msg::NatHoleReport { sid: Some(sid) });
+        if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
+            debug!(error = %e, "Failed to send NatHoleReport ({reason})");
         }
     }
 
