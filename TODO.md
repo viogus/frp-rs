@@ -12,16 +12,17 @@
 
 Three issues were marked **CLOSED/COMPLETED** on GitHub but the feature was
 **absent from code** (verified 2026-07-12 — no deps, no `.proto`, no source).
-Each was reopened to correct the false label; disposition below:
+Each was reopened to correct the false label, then re-closed **not-planned**
+after a necessity review:
 
 | Issue | Feature | Reality | Disposition |
 |-------|---------|---------|-------------|
-| [#51](https://github.com/viogus/frp-rs/issues/51) | gRPC management API | no `tonic`/`.proto`/`AdminService` in tree | pending necessity review |
-| [#52](https://github.com/viogus/frp-rs/issues/52) | WASM/WASI plugin system | no `wasmtime`, no wasm loader | pending necessity review |
-| [#63](https://github.com/viogus/frp-rs/issues/63) | Traffic mirroring | no `mirror_to` field, no mirror logic | **CLOSED not-planned** (2026-07-12, out-of-scope — see 4.5) |
+| [#51](https://github.com/viogus/frp-rs/issues/51) | gRPC management API | no `tonic`/`.proto`/`AdminService` in tree | **CLOSED not-planned** (redundant with REST+WS) |
+| [#52](https://github.com/viogus/frp-rs/issues/52) | WASM/WASI plugin system | no `wasmtime`, no wasm loader | **CLOSED not-planned** (parked — dep size vs mission) |
+| [#63](https://github.com/viogus/frp-rs/issues/63) | Traffic mirroring | no `mirror_to` field, no mirror logic | **CLOSED not-planned** (out-of-scope — see 4.5) |
 
-Reopening corrected the mislabeling; closing #63 was a separate necessity
-judgment (off-mission, no demand, better solved by front-proxy mirroring).
+All three verified never-implemented (reopen corrected the false COMPLETED
+label); each close is a separate necessity judgment. 0 open issues remain.
 
 ---
 
@@ -78,10 +79,10 @@ Reconciliation confirmed all of these landed after the doc's original scan:
 - **5.6 Zero-copy encrypted bridge — DONE** (2026-07-12, `7be6aa7`). `CipherReader`/`CipherStream` `poll_read` now decrypt in-place into the caller's `ReadBuf` — drops one alloc + one copy per chunk on the encrypted `work_to_user` path. Reviewed (CFB partial-read hand-traced), compat 57/0. `frp-core/src/cipher_stream.rs`.
 - **5.7 `quinn` slim wrapper — REJECTED** (2026-07-12). Prototyped `quinn-proto` wrapper: measured only **~32KB (frps) / ~16KB (frpc)** saved, not the ~800KB estimate — quinn-proto (the bulk) still links; LTO already stripped quinn's async glue. Not worth +1349 loc of hand-rolled QUIC state machine on an untrusted-network transport. Prototype preserved in a git stash if the premise ever changes.
 
-### Innovation (not built — pending necessity review, see top)
+### Innovation — CLOSED not-planned (necessity review 2026-07-12)
 
-- **4.1 gRPC management API — GAP** ([#51](https://github.com/viogus/frp-rs/issues/51)). `tonic` + `.proto` `AdminService` side-by-side with REST. Note: earlier backlog notes called gRPC out-of-scope (Go frp has none). Decide: build or close as won't-do. Effort: 3d.
-- **4.2 WASM/WASI plugin system — GAP** ([#52](https://github.com/viogus/frp-rs/issues/52)). `wasmtime` sandboxed hot-loadable plugins. Effort: 5d.
+- **4.1 gRPC management API — CLOSED not-planned** ([#51](https://github.com/viogus/frp-rs/issues/51)). Redundant with the complete REST admin API + Admin WebSocket event stream (#59); off-mission (Go frp has no gRPC); `tonic`+`prost`+`.proto` codegen fights the tiny/micro size philosophy; no demand. Reopen only for a concrete consumer REST+WS cannot serve.
+- **4.2 WASM/WASI plugin system — CLOSED not-planned (parked)** ([#52](https://github.com/viogus/frp-rs/issues/52)). Genuine differentiator, but a `wasmtime` runtime is a multi-MB dependency that can never enter default/tiny/micro; ~5d+ speculative effort, no demand. Reopen with (a) a real use case AND (b) a size-acceptable host (e.g. `extism`, or a full-only build).
 - **4.5 Traffic mirroring — CLOSED not-planned** ([#63](https://github.com/viogus/frp-rs/issues/63), 2026-07-12). `mirror_to` byte-tee. Out-of-scope after necessity review: off Go-frp-parity mission, no real demand (auto-generated issue), better served by front-proxy mirroring (envoy/nginx/Istio at the correct layer), adds a permanent path to the data-plane bridge + a data-exfil footgun. Reopen only on a real use case the front-proxy alternatives can't serve.
 
 ### Declined
@@ -97,9 +98,9 @@ Reconciliation confirmed all of these landed after the doc's original scan:
 | Shipped (DONE) | 22 |
 | Open — polish (PARTIAL) | 3 |
 | Open — perf | 0 (5.6 shipped, 5.7 rejected) |
-| Open — innovation (pending review) | 2 (#51 gRPC, #52 WASM) |
-| Closed / declined | 3 (#63 mirror, #66 lz4, 5.7 quinn-slim) |
+| Open — innovation | 0 (#51/#52 closed not-planned) |
+| Closed / declined | 5 (#51 gRPC, #52 WASM, #63 mirror, #66 lz4, 5.7 quinn-slim) |
 
-No parity gaps remain. Perf follow-ups resolved (5.6 shipped, 5.7 rejected on
-measurement). Remaining optional work: observability polish (3.1/3.2/6.3) and a
-necessity decision on the two innovation issues #51 (gRPC) / #52 (WASM).
+**0 open issues.** No parity gaps. Perf follow-ups resolved (5.6 shipped, 5.7
+rejected on measurement). Innovation issues closed not-planned after necessity
+review. Only remaining optional work is observability polish (3.1/3.2/6.3).
