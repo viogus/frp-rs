@@ -354,6 +354,8 @@ pub struct FrpcRunArgs {
     pub strict_config: bool,
     pub allow_unsafe: Vec<String>,
     pub show_version: bool,
+    pub log_level: Option<String>,
+    pub disable_log_color: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -478,7 +480,15 @@ fn run_mode() -> impl Parser<FrpcRunArgs> {
         .map(|s| s.split(',').map(|x| x.trim().to_string()).collect::<Vec<_>>())
         .fallback(vec![]);
     let show_version = long("version").short('v').switch();
-    construct!(FrpcRunArgs { config, config_dir, strict_config, allow_unsafe, show_version })
+    let log_level = long("log-level")
+        .long("log_level")
+        .short('L')
+        .argument::<String>("LEVEL")
+        .optional();
+    let disable_log_color = long("disable-log-color")
+        .long("disable_log_color")
+        .switch();
+    construct!(FrpcRunArgs { config, config_dir, strict_config, allow_unsafe, show_version, log_level, disable_log_color })
 }
 
 // ─── Subcommand parsers (inlined — bpaf construct! doesn't support destructuring tuples from parser fns) ───

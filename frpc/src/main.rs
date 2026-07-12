@@ -14,6 +14,119 @@ use frp_core::config::{load_client_config, collect_config_files, ClientConfig, P
 use frp_core::{EXIT_AUTH, EXIT_BIND, EXIT_CONFIG, EXIT_RUNTIME};
 use frp_client::service::Service;
 
+use data_encoding::BASE64;
+
+// ── Admin HTTP client (raw TCP, zero deps) ─────────────────────────────────────
+
+struct AdminConnection {
+    addr: String,
+    user: String,
+    password: String,
+}
+
+/// Resolve admin server address, user, and password.
+/// Priority: CLI flags > config file [web_server] > defaults (127.0.0.1:7400, no auth).
+fn resolve_admin_connection(
+    cli_addr: Option<&str>,
+    cli_port: Option<u16>,
+    cli_user: Option<&str>,
+    cli_pwd: Option<&str>,
+    config_path: Option<&str>,
+) -> AdminConnection {
+    // Priority 1: CLI flags (need both addr AND port)
+    if let (Some(addr), Some(port)) = (cli_addr, cli_port) {
+        return AdminConnection {
+            addr: format!("{addr}:{port}"),
+            user: cli_user.unwrap_or("").into(),
+            password: cli_pwd.unwrap_or("").into(),
+        };
+    }
+    // Priority 2: Config file [web_server] section
+    if let Some(path) = config_path {
+        if let Ok(cfg) = frp_core::config::load_client_config(path, true) {
+            return AdminConnection {
+                addr: format!("{}:{}", cfg.web_server.addr, cfg.web_server.port),
+                user: cfg.web_server.user,
+                password: cfg.web_server.password,
+            };
+        }
+    }
+    // Priority 3: Defaults
+    AdminConnection {
+        addr: "127.0.0.1:7400".into(),
+        user: String::new(),
+        password: String::new(),
+    }
+}
+
+fn basic_auth_header(user: &str, password: &str) -> String {
+    if user.is_empty() {
+        return String::new();
+    }
+    let creds = format!("{user}:{password}");
+    format!("Authorization: Basic {}\r\n", BASE64.encode(creds.as_bytes()))
+}
+
+async fn admin_get(conn: &AdminConnection, path: &str) -> Result<String, String> {
+    let mut stream = tokio::net::TcpStream::connect(&conn.addr)
+        .await
+        .map_err(|e| format!("connect {}: {e}", conn.addr))?;
+
+    let auth = basic_auth_header(&conn.user, &conn.password);
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {}\r\n{}{}\r\n",
+        conn.addr, auth, "Connection: close\r\n",
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut stream, req.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+
+    let mut buf = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut buf)
+        .await
+        .map_err(|e| format!("read: {e}"))?;
+
+    let response = String::from_utf8_lossy(&buf);
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
+    let status_line = response.lines().next().unwrap_or("");
+
+    if status_line.contains("200") {
+        Ok(body.to_string())
+    } else {
+        Err(status_line.to_string())
+    }
+}
+
+async fn admin_post_json(conn: &AdminConnection, path: &str, json_body: &str) -> Result<String, String> {
+    let mut stream = tokio::net::TcpStream::connect(&conn.addr)
+        .await
+        .map_err(|e| format!("connect {}: {e}", conn.addr))?;
+
+    let auth = basic_auth_header(&conn.user, &conn.password);
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json_body}",
+        conn.addr, auth, json_body.len(),
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut stream, req.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+
+    let mut buf = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut buf)
+        .await
+        .map_err(|e| format!("read: {e}"))?;
+
+    let response = String::from_utf8_lossy(&buf);
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
+    let status_line = response.lines().next().unwrap_or("");
+
+    if status_line.contains("200") {
+        Ok(body.to_string())
+    } else {
+        Err(status_line.to_string())
+    }
+}
+
 #[cfg(feature = "mem-profile")]
 #[global_allocator]
 static GLOBAL: frp_core::mem_profile::CountingAlloc = frp_core::mem_profile::CountingAlloc;
@@ -63,26 +176,31 @@ async fn main() {
 
 // ── Logging / tracing init ────────────────────────────────────────────────────
 
-fn resolve_log_settings(_cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) -> (String, Option<String>) {
-    let level = cfg.map(|c| c.log.level.as_str()).unwrap_or(
-        #[cfg(feature = "debug-logs")]
-        "debug,yamux=trace",
-        #[cfg(not(feature = "debug-logs"))]
-        "info",
-    ).to_string();
+fn resolve_log_settings(cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) -> (String, Option<String>, bool) {
+    let level = cli.log_level.clone().unwrap_or_else(|| {
+        cfg.map(|c| c.log.level.as_str()).unwrap_or(
+            #[cfg(feature = "debug-logs")]
+            "debug,yamux=trace",
+            #[cfg(not(feature = "debug-logs"))]
+            "info",
+        ).to_string()
+    });
     let file = cfg.and_then(|c| if c.log.file.is_empty() { None } else { Some(c.log.file.clone()) });
-    (level, file)
+    let ansi = !cli.disable_log_color;
+    (level, file, ansi)
 }
 
 // ── Without `otel` feature: exact current behavior ────────────────────────────
 
 #[cfg(not(feature = "otel"))]
-fn init_logging(_cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
-    let (level, file) = resolve_log_settings(_cli, cfg);
+fn init_logging(cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
+    let (level, file, ansi) = resolve_log_settings(cli, cfg);
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(level));
 
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(ansi);
 
     if let Some(path) = file {
         let file_appender = tracing_appender::rolling::daily(
@@ -98,11 +216,11 @@ fn init_logging(_cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
 // ── With `otel` feature: Registry + Layer composition + optional OTLP export ──
 
 #[cfg(feature = "otel")]
-fn init_logging(_cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
+fn init_logging(cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    let (level, file) = resolve_log_settings(_cli, cfg);
+    let (level, file, ansi) = resolve_log_settings(cli, cfg);
 
     // OTel endpoint resolution: env var → config field → disabled
     let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -142,7 +260,7 @@ fn init_logging(_cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
                 .with(layer)
                 .with(EnvFilter::try_from_default_env()
                     .unwrap_or_else(|_| EnvFilter::new(&level)))
-                .with(tracing_subscriber::fmt::layer())
+                .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                 .with(
                     tracing_subscriber::fmt::layer()
                         .with_ansi(false)
@@ -153,7 +271,7 @@ fn init_logging(_cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
             tracing_subscriber::registry()
                 .with(EnvFilter::try_from_default_env()
                     .unwrap_or_else(|_| EnvFilter::new(&level)))
-                .with(tracing_subscriber::fmt::layer())
+                .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                 .with(
                     tracing_subscriber::fmt::layer()
                         .with_ansi(false)
@@ -170,13 +288,13 @@ fn init_logging(_cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
                 .with(layer)
                 .with(EnvFilter::try_from_default_env()
                     .unwrap_or_else(|_| EnvFilter::new(&level)))
-                .with(tracing_subscriber::fmt::layer())
+                .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                 .init();
         } else {
             tracing_subscriber::registry()
                 .with(EnvFilter::try_from_default_env()
                     .unwrap_or_else(|_| EnvFilter::new(&level)))
-                .with(tracing_subscriber::fmt::layer())
+                .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                 .init();
         }
     }
@@ -379,5 +497,68 @@ async fn run_verify(config_path: &str) {
             eprintln!("Config file {} is invalid: {}", config_path, e);
             process::exit(EXIT_CONFIG);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_auth_header_empty_creds() {
+        assert_eq!(basic_auth_header("", ""), "");
+        assert_eq!(basic_auth_header("", "secret"), "");
+    }
+
+    #[test]
+    fn test_basic_auth_header_encodes() {
+        let header = basic_auth_header("admin", "admin");
+        assert!(header.starts_with("Authorization: Basic "));
+        assert!(header.ends_with("\r\n"));
+        // "admin:admin" in base64 = "YWRtaW46YWRtaW4="
+        assert!(header.contains("YWRtaW46YWRtaW4="));
+    }
+
+    #[test]
+    fn test_resolve_admin_connection_cli_priority() {
+        let conn = resolve_admin_connection(
+            Some("10.0.0.1"), Some(1234),
+            Some("u"), Some("p"),
+            None, // no config file
+        );
+        assert_eq!(conn.addr, "10.0.0.1:1234");
+        assert_eq!(conn.user, "u");
+        assert_eq!(conn.password, "p");
+    }
+
+    #[test]
+    fn test_resolve_admin_connection_defaults() {
+        let conn = resolve_admin_connection(
+            None, None, None, None, None,
+        );
+        assert_eq!(conn.addr, "127.0.0.1:7400");
+        assert_eq!(conn.user, "");
+        assert_eq!(conn.password, "");
+    }
+
+    #[test]
+    fn test_resolve_admin_connection_cli_addr_only_falls_through() {
+        // addr without port is not enough — falls to defaults
+        let conn = resolve_admin_connection(
+            Some("10.0.0.1"), None,
+            Some("u"), Some("p"),
+            None,
+        );
+        assert_eq!(conn.addr, "127.0.0.1:7400");
+    }
+
+    #[test]
+    fn test_resolve_admin_connection_cli_port_only_falls_through() {
+        let conn = resolve_admin_connection(
+            None, Some(9999),
+            None, None,
+            None,
+        );
+        assert_eq!(conn.addr, "127.0.0.1:7400");
     }
 }
