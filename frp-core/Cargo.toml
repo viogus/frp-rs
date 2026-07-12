@@ -64,6 +64,7 @@ profiling = ["dep:pprof"]
 tower = "0.5"
 criterion.workspace = true
 proptest = "1.6"
+tempfile = "3"
 
 [[bench]]
 name = "crypto_bridge"
