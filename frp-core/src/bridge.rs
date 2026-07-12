@@ -694,8 +694,9 @@ pub async fn bridge_plain_zero_copy(
     };
 
     let w2u = {
+        let b = w2u_bytes.clone();
         tokio::task::spawn_blocking(move || {
-            splice_relay(work_fd, w2u_w, w2u_r, user_fd, &w2u_bytes)
+            splice_relay(work_fd, w2u_w, w2u_r, user_fd, &b)
         })
     };
 
