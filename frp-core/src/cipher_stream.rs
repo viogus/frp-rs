@@ -65,11 +65,14 @@ impl CfbState {
             // XOR 16 keystream bytes against 16 data bytes (vectorizable) and
             // set the feedback register to the ciphertext block in one copy.
             if self.used == 0 && n - i >= 16 {
-                let blk = &mut data[i..i + 16];
-                for (b, k) in blk.iter_mut().zip(self.keystream.iter()) {
-                    *b ^= *k;
-                }
-                self.feedback.copy_from_slice(blk);
+                // u128 single-instruction XOR on little-endian (pxor/veor).
+                let state_u128 = u128::from_le_bytes(self.keystream);
+                let data_u128 = u128::from_le_bytes(
+                    data[i..i + 16].try_into().unwrap(),
+                );
+                let result = (state_u128 ^ data_u128).to_le_bytes();
+                data[i..i + 16].copy_from_slice(&result);
+                self.feedback = result;
                 self.used = 16;
                 i += 16;
             } else {
@@ -95,12 +98,13 @@ impl CfbState {
                 self.refill();
             }
             if self.used == 0 && n - i >= 16 {
-                let blk = &mut data[i..i + 16];
                 // feedback = ciphertext (input), then plaintext = ct ^ keystream.
-                self.feedback.copy_from_slice(blk);
-                for (b, k) in blk.iter_mut().zip(self.keystream.iter()) {
-                    *b ^= *k;
-                }
+                self.feedback = data[i..i + 16].try_into().unwrap();
+                // u128 single-instruction XOR on little-endian (pxor/veor).
+                let state_u128 = u128::from_le_bytes(self.keystream);
+                let data_u128 = u128::from_le_bytes(self.feedback);
+                let result = (state_u128 ^ data_u128).to_le_bytes();
+                data[i..i + 16].copy_from_slice(&result);
                 self.used = 16;
                 i += 16;
             } else {
