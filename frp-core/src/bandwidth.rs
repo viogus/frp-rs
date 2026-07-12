@@ -39,11 +39,13 @@ impl BandwidthLimiter {
     }
 
     /// Whether this limiter applies any throttling.
+    #[inline]
     pub fn is_active(&self) -> bool {
         self.rate > 0
     }
 
     /// Refill tokens based on elapsed wall-clock time.
+    #[inline]
     fn refill(&mut self) {
         if self.rate == 0 {
             return;

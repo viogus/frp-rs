@@ -45,6 +45,7 @@ impl CfbState {
     }
 
     /// Refill the keystream by encrypting the current feedback register.
+    #[inline]
     fn refill(&mut self) {
         use aes::cipher::BlockCipherEncrypt;
         self.keystream = self.feedback;
@@ -52,6 +53,7 @@ impl CfbState {
         self.used = 0;
     }
 
+    #[inline]
     fn encrypt(&mut self, data: &mut [u8]) {
         let n = data.len();
         let mut i = 0;
@@ -84,6 +86,7 @@ impl CfbState {
         }
     }
 
+    #[inline]
     fn decrypt(&mut self, data: &mut [u8]) {
         let n = data.len();
         let mut i = 0;

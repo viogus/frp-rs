@@ -88,6 +88,7 @@ impl PoolGuard {
     ///
     /// Returned buffer has length == BUFFER_SIZE so `as_mut_slice()` is
     /// non-empty and `read()` can actually read data into it.
+    #[inline]
     pub fn acquire() -> Self {
         let mut buf = BUFFER_POOL.acquire();
         // Only zero-fill on a freshly allocated (len 0) buffer. Recycled buffers
@@ -100,11 +101,13 @@ impl PoolGuard {
     }
 
     /// Get a mutable byte slice for reading into.
+    #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.buf
     }
 
     /// Get an immutable slice over the buffered data.
+    #[inline]
     pub fn data(&self) -> &[u8] {
         &self.buf
     }
