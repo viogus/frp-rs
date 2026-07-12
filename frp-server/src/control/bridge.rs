@@ -248,6 +248,43 @@ pub(crate) async fn assign_udp_work_conn(
     });
 }
 
+/// Relay plain traffic between two IoStreams, preferring zero-copy splice
+/// on Linux when both sides are raw TCP.
+async fn relay_plain_fast(
+    mut user_conn: IoStream,
+    mut work_conn: IoStream,
+    metrics: &Arc<frp_core::metrics::ProxyMetrics>,
+) {
+    use std::sync::atomic::Ordering;
+
+    // On Linux, try zero-copy splice for Tcp-to-Tcp.
+    #[cfg(target_os = "linux")]
+    if let (IoStream::Tcp(user), IoStream::Tcp(work)) = (user_conn, work_conn) {
+        match frp_core::bridge::bridge_plain_zero_copy(user, work).await {
+            Ok((a, b)) => {
+                metrics.bytes_in.fetch_add(a, Ordering::Relaxed);
+                metrics.bytes_out.fetch_add(b, Ordering::Relaxed);
+                return;
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "zero-copy bridge failed: {}", e);
+                return;
+            }
+        }
+    }
+
+    // Fallback: standard copy_bidirectional.
+    match tokio::io::copy_bidirectional(&mut user_conn, &mut work_conn).await {
+        Ok((a, b)) => {
+            metrics.bytes_in.fetch_add(a, Ordering::Relaxed);
+            metrics.bytes_out.fetch_add(b, Ordering::Relaxed);
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "plain fast-path bridge closed: {}", e);
+        }
+    }
+}
+
 pub(crate) async fn assign_work_to_proxy(
     mut work_conn: IoStream,
     req: PendingRequest,
@@ -454,19 +491,9 @@ pub(crate) async fn assign_work_to_proxy(
                 && req.response_headers.is_empty()
             {
                 // Fast path: pure plain relay with no compression, no VHost
-                // pre-read, and no header injection. copy_bidirectional uses
-                // an internal buffer and avoids bridge_plain's per-chunk
-                // compress/flush indirection. Bytes relayed are identical.
-                let mut user_conn = req.user_conn;
-                match tokio::io::copy_bidirectional(&mut user_conn, &mut work_conn).await {
-                    Ok((a, b)) => {
-                        metrics.bytes_in.fetch_add(a, Ordering::Relaxed);
-                        metrics.bytes_out.fetch_add(b, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "plain fast-path bridge closed: {}", e);
-                    }
-                }
+                // pre-read, and no header injection. On Linux, try zero-copy
+                // splice for Tcp-to-Tcp; otherwise use copy_bidirectional.
+                relay_plain_fast(req.user_conn, work_conn, &metrics).await;
             } else {
                 // Slow path: compression, VHost pre-read, or header injection.
                 let (u_r, u_w) = req.user_conn.into_split();

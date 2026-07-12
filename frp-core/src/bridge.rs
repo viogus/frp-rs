@@ -644,3 +644,158 @@ pub async fn bridge_plain_rate_limited(
 
     let _ = tokio::join!(user_to_work, work_to_user);
 }
+
+// ── Zero-copy Linux splice bridge ──────────────────────────────────────────
+
+/// Pipe capacity used for splice relay (Linux default pipe size).
+#[cfg(target_os = "linux")]
+const PIPE_CAPACITY: usize = 65536;
+
+/// SPLICE_F_MOVE flag — hint that pages can be moved (not copied).
+#[cfg(target_os = "linux")]
+const SPLICE_F_MOVE: libc::c_uint = 1;
+
+/// Zero-copy bridge between two TcpStreams using `splice(2)`.
+///
+/// Data is relayed kernel-space via two pipe pairs (one per direction),
+/// avoiding userspace copies entirely. Only available on Linux.
+///
+/// Returns `(bytes_user_to_work, bytes_work_to_user)` on success.
+/// On failure, the TcpStreams are consumed (their fds are invalid after
+/// `into_std()`).
+#[cfg(target_os = "linux")]
+pub async fn bridge_plain_zero_copy(
+    user: tokio::net::TcpStream,
+    work: tokio::net::TcpStream,
+) -> std::io::Result<(u64, u64)> {
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let user_fd = user.as_raw_fd();
+    let work_fd = work.as_raw_fd();
+
+    // Convert to std to prevent tokio from closing fds on drop.
+    let _user = user.into_std()?;
+    let _work = work.into_std()?;
+
+    // Create two pipe pairs — one per direction.
+    let (u2w_r, u2w_w) = create_pipe()?;
+    let (w2u_r, w2u_w) = create_pipe()?;
+
+    let u2w_bytes = Arc::new(AtomicU64::new(0));
+    let w2u_bytes = Arc::new(AtomicU64::new(0));
+
+    let u2w = {
+        let b = u2w_bytes.clone();
+        tokio::task::spawn_blocking(move || {
+            splice_relay(user_fd, u2w_w, u2w_r, work_fd, &b)
+        })
+    };
+
+    let w2u = {
+        tokio::task::spawn_blocking(move || {
+            splice_relay(work_fd, w2u_w, w2u_r, user_fd, &w2u_bytes)
+        })
+    };
+
+    // Wait for both directions.
+    let (r1, r2) = tokio::join!(u2w, w2u);
+
+    // Clean up pipe fds.
+    unsafe {
+        libc::close(u2w_r);
+        libc::close(u2w_w);
+        libc::close(w2u_r);
+        libc::close(w2u_w);
+    }
+
+    // If both directions panicked, propagate error.
+    match (r1, r2) {
+        (Err(e), _) | (_, Err(e)) if e.is_panic() => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("splice panic: {e}"),
+            ))
+        }
+        _ => Ok((
+            u2w_bytes.load(Ordering::Relaxed),
+            w2u_bytes.load(Ordering::Relaxed),
+        )),
+    }
+}
+
+/// Relay loop: splice(fd_in → pipe_wr), then splice(pipe_rd → fd_out).
+/// Runs in spawn_blocking since splice may block.
+#[cfg(target_os = "linux")]
+fn splice_relay(
+    fd_in: i32,
+    pipe_wr: i32,
+    pipe_rd: i32,
+    fd_out: i32,
+    total: &std::sync::atomic::AtomicU64,
+) -> std::io::Result<()> {
+    use std::sync::atomic::Ordering;
+    loop {
+        // Move data from source socket into pipe.
+        let n = unsafe {
+            libc::splice(
+                fd_in,
+                std::ptr::null_mut::<libc::loff_t>(),
+                pipe_wr,
+                std::ptr::null_mut::<libc::loff_t>(),
+                PIPE_CAPACITY,
+                SPLICE_F_MOVE,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EAGAIN) | Some(libc::EINTR) => continue,
+                _ => return Err(err),
+            }
+        }
+        if n == 0 {
+            return Ok(());
+        }
+
+        // Move same bytes from pipe to destination socket (may need multiple
+        // calls if pipe write was shorter than the splice into it).
+        let mut remaining = n as usize;
+        while remaining > 0 {
+            let m = unsafe {
+                libc::splice(
+                    pipe_rd,
+                    std::ptr::null_mut::<libc::loff_t>(),
+                    fd_out,
+                    std::ptr::null_mut::<libc::loff_t>(),
+                    remaining,
+                    SPLICE_F_MOVE,
+                )
+            };
+            if m < 0 {
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EAGAIN) | Some(libc::EINTR) => continue,
+                    _ => return Err(err),
+                }
+            }
+            if m == 0 {
+                return Ok(());
+            }
+            remaining -= m as usize;
+            total.fetch_add(m as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Create a pipe pair with O_NONBLOCK.
+#[cfg(target_os = "linux")]
+fn create_pipe() -> std::io::Result<(i32, i32)> {
+    let mut fds = [-1i32; 2];
+    let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((fds[0], fds[1]))
+}
