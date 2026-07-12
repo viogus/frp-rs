@@ -77,7 +77,7 @@ Reconciliation confirmed all of these landed after the doc's original scan:
 ### Performance remaining (perf program follow-ups)
 
 - **5.6 Zero-copy encrypted bridge — DONE** (2026-07-12, `7be6aa7`). `CipherReader`/`CipherStream` `poll_read` now decrypt in-place into the caller's `ReadBuf` — drops one alloc + one copy per chunk on the encrypted `work_to_user` path. Reviewed (CFB partial-read hand-traced), compat 57/0. `frp-core/src/cipher_stream.rs`.
-- **5.7 `quinn` slim wrapper — REJECTED** (2026-07-12). Prototyped `quinn-proto` wrapper: measured only **~32KB (frps) / ~16KB (frpc)** saved, not the ~800KB estimate — quinn-proto (the bulk) still links; LTO already stripped quinn's async glue. Not worth +1349 loc of hand-rolled QUIC state machine on an untrusted-network transport. Prototype preserved in a git stash if the premise ever changes.
+- **5.7 `quinn` slim wrapper — REJECTED** (2026-07-12). Prototyped `quinn-proto` wrapper: measured only **~32KB (frps) / ~16KB (frpc)** saved, not the ~800KB estimate — quinn-proto (the bulk) still links; LTO already stripped quinn's async glue. Not worth +1349 loc of hand-rolled QUIC state machine on an untrusted-network transport. Prototype discarded; re-derive from `quinn-proto` if the premise ever changes.
 
 ### Innovation — CLOSED not-planned (necessity review 2026-07-12)
 
