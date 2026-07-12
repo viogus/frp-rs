@@ -56,6 +56,12 @@ impl ProxyManager {
         }
     }
 
+    /// Non-blocking readiness probe: true if the proxy registry lock is
+    /// acquirable right now (not held/deadlocked). Used by /healthz readiness.
+    pub fn is_responsive(&self) -> bool {
+        self.proxies.try_read().is_ok()
+    }
+
     pub async fn register(&self, run_id: String, info: ProxyInfo) -> Result<(), String> {
         let name = info.name.clone();
         // Register in group index

@@ -41,6 +41,20 @@ async fn test_dashboard_healthz() {
     assert_eq!(resp.text().await.unwrap(), "ok");
 }
 
+/// GET /healthz?probe=readiness returns 200 "ok" on a fresh (non-draining) server.
+#[tokio::test]
+async fn test_dashboard_healthz_readiness() {
+    let bind_port = common::allocate_port();
+    let dashboard_port = common::allocate_port();
+    let frps = FrpsHandle::start(&base_config(bind_port, dashboard_port)).await;
+
+    let resp = reqwest::get(&frps.dashboard_url("/healthz?probe=readiness"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "ok");
+}
+
 /// GET /api/status returns version, uptime, client_count, proxy_count
 #[tokio::test]
 async fn test_dashboard_status() {
