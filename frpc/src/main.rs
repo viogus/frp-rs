@@ -456,7 +456,7 @@ async fn run_normal(args: FrpcRunArgs) {
     //   FRP_PROFILE_SECS — profiling duration in seconds (default 30)
     //   FRP_PROFILE_DIR  — output directory (default ".")
     #[cfg(all(unix, feature = "profiling"))]
-    {
+    let profile_handle = {
         tokio::spawn(async move {
             #[cfg(target_os = "macos")]
             const SIGUSR2: std::os::raw::c_int = 31;
@@ -490,13 +490,16 @@ async fn run_normal(args: FrpcRunArgs) {
                     }
                 });
             }
-        });
-    }
+        })
+    };
 
     if let Err(e) = service.run().await {
         tracing::error!(error = %e, "frpc error: {}", e);
         process::exit(EXIT_RUNTIME);
     }
+
+    #[cfg(all(unix, feature = "profiling"))]
+    profile_handle.abort();
 }
 
 async fn run_single_proxy(server_addr: &str, server_port: u16, token: Option<&str>, proxy: ProxyConfig) {
