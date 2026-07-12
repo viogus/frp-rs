@@ -149,50 +149,58 @@ impl<R: AsyncRead + Unpin> AsyncRead for CipherReader<R> {
 
         // First, read the 16-byte IV sent by the peer's Writer.
         if this.iv_read < 16 {
-            let needed = 16 - this.iv_read;
-            let mut tmp = vec![0u8; needed];
-            let mut tmp_buf = ReadBuf::new(&mut tmp);
-            match Pin::new(&mut this.inner).poll_read(cx, &mut tmp_buf) {
-                Poll::Ready(Ok(())) => {
-                    let filled = tmp_buf.filled().len();
-                    if filled == 0 {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "CipherReader: EOF while reading IV",
-                        )));
+            let filled;
+            {
+                let iv_dest = &mut this.iv_buf[this.iv_read..];
+                let mut tmp_buf = ReadBuf::new(iv_dest);
+                match Pin::new(&mut this.inner).poll_read(cx, &mut tmp_buf) {
+                    Poll::Ready(Ok(())) => {
+                        filled = tmp_buf.filled().len();
+                        if filled == 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "CipherReader: EOF while reading IV",
+                            )));
+                        }
                     }
-                    this.iv_buf[this.iv_read..this.iv_read + filled]
-                        .copy_from_slice(&tmp[..filled]);
-                    this.iv_read += filled;
-                    if this.iv_read < 16 {
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
-                    }
-                    // IV complete — initialize CFB state.
-                    let mut iv = [0u8; 16];
-                    iv.copy_from_slice(&this.iv_buf);
-                    this.cfb = Some(CfbState::new(&this.key, &iv));
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
             }
+            this.iv_read += filled;
+            if this.iv_read < 16 {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            // IV complete — initialize CFB state.
+            let mut iv = [0u8; 16];
+            iv.copy_from_slice(&this.iv_buf);
+            this.cfb = Some(CfbState::new(&this.key, &iv));
         }
 
         let cfb = this.cfb.as_mut().expect("IV must be read before decrypting");
-        let needed = buf.remaining();
-        let mut tmp = vec![0u8; needed];
-        let mut tmp_buf = ReadBuf::new(&mut tmp);
-        match Pin::new(&mut this.inner).poll_read(cx, &mut tmp_buf) {
-            Poll::Ready(Ok(())) => {
-                let filled = tmp_buf.filled().len();
-                if filled > 0 {
-                    cfb.decrypt(&mut tmp[..filled]);
-                    buf.put_slice(&tmp[..filled]);
+
+        // Zero-copy: read encrypted data directly into the user's ReadBuf,
+        // decrypt in-place, then advance to commit the decrypted bytes.
+        let filled;
+        {
+            let inner_slice = buf.initialize_unfilled();
+            let mut inner_buf = ReadBuf::new(inner_slice);
+            match Pin::new(&mut this.inner).poll_read(cx, &mut inner_buf) {
+                Poll::Ready(Ok(())) => {
+                    filled = inner_buf.filled().len();
                 }
-                Poll::Ready(Ok(()))
+                other => return other,
             }
-            other => other,
+            // inner_buf is no longer used; NLL releases its borrow on inner_slice.
+            if filled > 0 {
+                cfb.decrypt(&mut inner_slice[..filled]);
+            }
         }
+        if filled > 0 {
+            buf.advance(filled);
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -534,57 +542,65 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for CipherStream<S> {
 
         // First, read the 16-byte IV sent by the peer's Writer.
         if this.iv_read < 16 {
-            let needed = 16 - this.iv_read;
-            tracing::debug!(iv_read = this.iv_read, needed, "CipherStream: reading IV");
-            let mut tmp = vec![0u8; needed];
-            let mut tmp_buf = ReadBuf::new(&mut tmp);
-            match Pin::new(&mut this.inner).poll_read(cx, &mut tmp_buf) {
-                Poll::Ready(Ok(())) => {
-                    let filled = tmp_buf.filled().len();
-                    tracing::debug!(filled, iv_read = this.iv_read, "CipherStream: IV read chunk");
-                    if filled == 0 {
-                        tracing::warn!("CipherStream: EOF while reading IV (got {} of 16)", this.iv_read);
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "CipherStream: EOF while reading IV",
-                        )));
+            let filled;
+            {
+                tracing::debug!(iv_read = this.iv_read, needed = 16 - this.iv_read, "CipherStream: reading IV");
+                let iv_dest = &mut this.iv_buf[this.iv_read..];
+                let mut tmp_buf = ReadBuf::new(iv_dest);
+                match Pin::new(&mut this.inner).poll_read(cx, &mut tmp_buf) {
+                    Poll::Ready(Ok(())) => {
+                        filled = tmp_buf.filled().len();
+                        tracing::debug!(filled, iv_read = this.iv_read, "CipherStream: IV read chunk");
+                        if filled == 0 {
+                            tracing::warn!("CipherStream: EOF while reading IV (got {} of 16)", this.iv_read);
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "CipherStream: EOF while reading IV",
+                            )));
+                        }
                     }
-                    this.iv_buf[this.iv_read..this.iv_read + filled]
-                        .copy_from_slice(&tmp[..filled]);
-                    this.iv_read += filled;
-                    if this.iv_read < 16 {
-                        tracing::debug!(iv_read = this.iv_read, "CipherStream: IV incomplete, waiting");
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
+                    Poll::Ready(Err(e)) => {
+                        tracing::warn!(error = %e, "CipherStream: error reading IV");
+                        return Poll::Ready(Err(e));
                     }
-                    let mut iv = [0u8; 16];
-                    iv.copy_from_slice(&this.iv_buf);
-                    this.read_cfb = Some(CfbState::new(&this.read_key, &iv));
-                    tracing::debug!(iv_hex = %hex::encode(iv), "CipherStream: IV read complete");
+                    Poll::Pending => return Poll::Pending,
                 }
-                Poll::Ready(Err(e)) => {
-                    tracing::warn!(error = %e, "CipherStream: error reading IV");
-                    return Poll::Ready(Err(e));
-                }
-                Poll::Pending => return Poll::Pending,
             }
+            this.iv_read += filled;
+            if this.iv_read < 16 {
+                tracing::debug!(iv_read = this.iv_read, "CipherStream: IV incomplete, waiting");
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let mut iv = [0u8; 16];
+            iv.copy_from_slice(&this.iv_buf);
+            this.read_cfb = Some(CfbState::new(&this.read_key, &iv));
+            tracing::debug!(iv_hex = %hex::encode(iv), "CipherStream: IV read complete");
         }
 
         let cfb = this.read_cfb.as_mut().expect("IV must be read before decrypting");
-        let needed = buf.remaining();
-        let mut tmp = vec![0u8; needed];
-        let mut tmp_buf = ReadBuf::new(&mut tmp);
-        match Pin::new(&mut this.inner).poll_read(cx, &mut tmp_buf) {
-            Poll::Ready(Ok(())) => {
-                let filled = tmp_buf.filled().len();
-                if filled > 0 {
-                    cfb.decrypt(&mut tmp[..filled]);
-                    buf.put_slice(&tmp[..filled]);
+
+        // Zero-copy: read encrypted data directly into the user's ReadBuf,
+        // decrypt in-place, then advance to commit the decrypted bytes.
+        let filled;
+        {
+            let inner_slice = buf.initialize_unfilled();
+            let mut inner_buf = ReadBuf::new(inner_slice);
+            match Pin::new(&mut this.inner).poll_read(cx, &mut inner_buf) {
+                Poll::Ready(Ok(())) => {
+                    filled = inner_buf.filled().len();
                 }
-                Poll::Ready(Ok(()))
+                other => return other,
             }
-            other => other,
+            // inner_buf is no longer used; NLL releases its borrow on inner_slice.
+            if filled > 0 {
+                cfb.decrypt(&mut inner_slice[..filled]);
+            }
         }
+        if filled > 0 {
+            buf.advance(filled);
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -1169,6 +1185,102 @@ mod tests {
             CfbState::new(&key, &iv).decrypt(&mut rt);
             assert_eq!(rt, plain, "round-trip mismatch for {:?}", chunks);
         }
+    }
+
+    /// Verify that CipherReader round-trips correctly when reading in small chunks
+    /// that force multiple poll_read calls, exercising the zero-copy decrypt path.
+    #[tokio::test]
+    async fn cipher_reader_zero_copy_small_chunks() {
+        let (client, server) = duplex(64 * 1024);
+        let mut writer = CipherWriter::new(client, TEST_KEY);
+        let mut reader = CipherReader::new(server, TEST_KEY);
+
+        // Varied (non-uniform) plaintext so any byte-reorder/CFB-offset bug in
+        // the in-place decrypt surfaces as a mismatch, not a silent pass.
+        let data: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let expected = data.clone();
+
+        let write_handle = tokio::spawn(async move {
+            writer.write_all(&data).await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+
+        // Read in very small chunks (1 byte at a time) to force multiple
+        // poll_read calls across the zero-copy decrypt path.
+        let mut buf = vec![0u8; expected.len()];
+        let mut off = 0;
+        while off < expected.len() {
+            let n = reader.read(&mut buf[off..off + 1]).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            off += n;
+        }
+        assert_eq!(off, expected.len(), "short read");
+        assert_eq!(buf, expected, "zero-copy small-chunk round-trip mismatch");
+
+        write_handle.await.unwrap();
+    }
+
+    /// Directly exercise the `filled < inner_slice.len()` partial-fill case:
+    /// the reader offers a large buffer while the writer flushes small chunks
+    /// with delays, so each poll_read fills only part of the initialized
+    /// unfilled region. Asserts `advance(filled)` commits exactly the decrypted
+    /// bytes in order across many partial polls.
+    #[tokio::test]
+    async fn cipher_reader_zero_copy_partial_fill() {
+        let (client, server) = duplex(64 * 1024);
+        let mut writer = CipherWriter::new(client, TEST_KEY);
+        let mut reader = CipherReader::new(server, TEST_KEY);
+
+        let total = 8192usize;
+        let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let expected = data.clone();
+
+        // Writer flushes in 137-byte chunks with a yield between each, so the
+        // reader's large-buffer reads observe short inner deliveries.
+        let write_handle = tokio::spawn(async move {
+            for chunk in data.chunks(137) {
+                writer.write_all(chunk).await.unwrap();
+                writer.flush().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            writer.shutdown().await.unwrap();
+        });
+
+        // Read into a large buffer each call; inner deliveries are short, so
+        // filled < buf.remaining() on essentially every poll.
+        let mut got = Vec::with_capacity(total);
+        let mut buf = vec![0u8; total];
+        loop {
+            let n = reader.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got.len(), total, "short read on partial-fill path");
+        assert_eq!(got, expected, "zero-copy partial-fill round-trip mismatch");
+
+        write_handle.await.unwrap();
+    }
+
+    /// Verify that CipherReader handles EOF correctly on the zero-copy path
+    /// (inner reader returns 0 bytes after IV).
+    #[tokio::test]
+    async fn cipher_reader_zero_copy_eof_after_iv() {
+        // Write IV only, then close — CipherReader should see 0 bytes from
+        // the inner reader on the first decrypt call.
+        let (client, server) = duplex(1024);
+        let mut writer = CipherWriter::new(client, TEST_KEY);
+        // Flush sends IV, then drop the writer closes the stream.
+        writer.flush().await.unwrap();
+        drop(writer);
+
+        let mut reader = CipherReader::new(server, TEST_KEY);
+        let mut buf = [0u8; 64];
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "should get EOF after IV with no data");
     }
 
     /// Verify that the scratch buffer is reused across multiple sequential writes,
