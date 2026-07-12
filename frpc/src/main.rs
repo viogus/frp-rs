@@ -11,6 +11,7 @@ use frp_core::cli::{
     build_single_proxy_config,
 };
 use frp_core::config::{load_client_config, collect_config_files, ClientConfig, ProxyConfig};
+use frp_core::{EXIT_AUTH, EXIT_BIND, EXIT_CONFIG, EXIT_RUNTIME};
 use frp_client::service::Service;
 
 #[cfg(feature = "mem-profile")]
@@ -230,12 +231,12 @@ async fn run_normal(args: FrpcRunArgs) {
             Ok(files) => files,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to read config directory: {}", e);
-                process::exit(1);
+                process::exit(frp_core::EXIT_CONFIG);
             }
         };
         if files.is_empty() {
             tracing::error!(dir = %dir, "No config files found in directory: {dir}");
-            process::exit(1);
+            process::exit(frp_core::EXIT_CONFIG);
         }
         tracing::info!(
             version = %frp_core::VERSION,
@@ -269,7 +270,7 @@ async fn run_normal(args: FrpcRunArgs) {
         }
         if handles.is_empty() {
             tracing::error!("No services started — all config files failed to load");
-            process::exit(1);
+            process::exit(EXIT_CONFIG);
         }
         for handle in handles {
             if let Err(e) = handle.await {
@@ -285,7 +286,7 @@ async fn run_normal(args: FrpcRunArgs) {
         Err(e) => {
             init_logging(&args, None);
             tracing::error!(error = %e, "Failed to load config: {}", e);
-            process::exit(1);
+            process::exit(EXIT_CONFIG);
         }
     };
 
@@ -295,8 +296,13 @@ async fn run_normal(args: FrpcRunArgs) {
     let service = Arc::new(match Service::new(cfg, Some(args.config.clone())).await {
         Ok(svc) => svc,
         Err(e) => {
+            let code = if e.to_string().contains("token") || e.to_string().contains("auth") {
+                EXIT_AUTH
+            } else {
+                EXIT_BIND
+            };
             tracing::error!(error = %e, "frpc init error: {}", e);
-            process::exit(1);
+            process::exit(code);
         }
     });
 
@@ -326,7 +332,7 @@ async fn run_normal(args: FrpcRunArgs) {
 
     if let Err(e) = service.run().await {
         tracing::error!(error = %e, "frpc error: {}", e);
-        process::exit(1);
+        process::exit(EXIT_RUNTIME);
     }
 }
 
@@ -341,14 +347,19 @@ async fn run_single_proxy(server_addr: &str, server_port: u16, token: Option<&st
     let service = match Service::new(cfg, None).await {
         Ok(svc) => svc,
         Err(e) => {
+            let code = if e.to_string().contains("token") || e.to_string().contains("auth") {
+                EXIT_AUTH
+            } else {
+                EXIT_BIND
+            };
             tracing::error!(error = %e, "frpc init error: {}", e);
-            process::exit(1);
+            process::exit(code);
         }
     };
 
     if let Err(e) = service.run().await {
         tracing::error!(error = %e, "frpc error: {}", e);
-        process::exit(1);
+        process::exit(EXIT_RUNTIME);
     }
 }
 
@@ -366,7 +377,7 @@ async fn run_verify(config_path: &str) {
         }
         Err(e) => {
             eprintln!("Config file {} is invalid: {}", config_path, e);
-            process::exit(1);
+            process::exit(EXIT_CONFIG);
         }
     }
 }

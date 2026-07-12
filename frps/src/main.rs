@@ -198,12 +198,12 @@ async fn run(cli: FrpsArgs) {
             Ok(files) => files,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to read config directory: {}", e);
-                process::exit(1);
+                process::exit(frp_core::EXIT_CONFIG);
             }
         };
         if files.is_empty() {
             tracing::error!(dir = %dir, "No config files found in directory: {dir}");
-            process::exit(1);
+            process::exit(frp_core::EXIT_CONFIG);
         }
         tracing::info!(
             version = %frp_core::VERSION,
@@ -238,7 +238,7 @@ async fn run(cli: FrpsArgs) {
         }
         if handles.is_empty() {
             tracing::error!("No services started — all config files failed to load");
-            process::exit(1);
+            process::exit(frp_core::EXIT_CONFIG);
         }
         for handle in handles {
             if let Err(e) = handle.await {
@@ -254,7 +254,7 @@ async fn run(cli: FrpsArgs) {
         Err(e) => {
             init_logging(&cli, None);
             tracing::error!(error = %e, "Failed to load config: {}", e);
-            process::exit(1);
+            process::exit(frp_core::EXIT_CONFIG);
         }
     };
 
@@ -266,7 +266,12 @@ async fn run(cli: FrpsArgs) {
     let service = std::sync::Arc::new(
         Service::new(cfg, config_path).await.unwrap_or_else(|e| {
             tracing::error!(error = %e, "frps init error: {}", e);
-            process::exit(1);
+            let code = if e.to_string().contains("token") || e.to_string().contains("auth") {
+                frp_core::EXIT_AUTH
+            } else {
+                frp_core::EXIT_BIND
+            };
+            process::exit(code);
         })
     );
 
@@ -293,7 +298,7 @@ async fn run(cli: FrpsArgs) {
 
     if let Err(e) = service.run().await {
         tracing::error!(error = %e, "frps error: {}", e);
-        process::exit(1);
+        process::exit(frp_core::EXIT_RUNTIME);
     }
 
     #[cfg(unix)]

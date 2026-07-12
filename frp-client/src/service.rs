@@ -347,8 +347,10 @@ impl Service {
         let protocol: TransportProtocol = match self.cfg.transport_protocol.parse() {
             Ok(p) => p,
             Err(_) => {
-                warn!(protocol = %self.cfg.transport_protocol, "Unknown transport protocol '{}', falling back to tcp", self.cfg.transport_protocol);
-                TransportProtocol::Tcp
+                return Err(format!(
+                    "unknown transport protocol '{}'. Valid transports: tcp, kcp, quic, websocket",
+                    self.cfg.transport_protocol
+                ).into());
             }
         };
         let pool_count = self.cfg.pool_count.max(0);
