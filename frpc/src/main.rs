@@ -450,6 +450,49 @@ async fn run_normal(args: FrpcRunArgs) {
         });
     }
 
+    // SIGUSR2 → CPU profiling (Unix + profiling) — kill -USR2 <pid>
+    // Runs a CPU profile for a configurable duration, writing a flamegraph SVG.
+    // Environment variables:
+    //   FRP_PROFILE_SECS — profiling duration in seconds (default 30)
+    //   FRP_PROFILE_DIR  — output directory (default ".")
+    #[cfg(all(unix, feature = "profiling"))]
+    {
+        tokio::spawn(async move {
+            #[cfg(target_os = "macos")]
+            const SIGUSR2: std::os::raw::c_int = 31;
+            #[cfg(not(target_os = "macos"))]
+            const SIGUSR2: std::os::raw::c_int = 12;
+
+            let mut sig = match signal::unix::signal(signal::unix::SignalKind::from_raw(SIGUSR2)) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "SIGUSR2 handler init failed: {}", e);
+                    return;
+                }
+            };
+            tracing::info!(pid = %std::process::id(), "SIGUSR2 profiling ready (pid={})", std::process::id());
+            loop {
+                sig.recv().await;
+                let duration_secs = std::env::var("FRP_PROFILE_SECS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(30);
+                let output_dir = std::env::var("FRP_PROFILE_DIR")
+                    .unwrap_or_else(|_| ".".to_string());
+                tokio::task::spawn_blocking(move || {
+                    match frp_core::profiling::dump_cpu_profile(
+                        std::time::Duration::from_secs(duration_secs),
+                        std::path::Path::new(&output_dir),
+                        "frpc",
+                    ) {
+                        Ok(path) => tracing::info!("SIGUSR2: CPU profile saved to {}", path.display()),
+                        Err(e) => tracing::error!(error = %e, "SIGUSR2: CPU profile failed: {}", e),
+                    }
+                });
+            }
+        });
+    }
+
     if let Err(e) = service.run().await {
         tracing::error!(error = %e, "frpc error: {}", e);
         process::exit(EXIT_RUNTIME);
