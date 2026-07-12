@@ -7,7 +7,7 @@
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use aes::Aes128;
 
@@ -249,6 +249,30 @@ impl<W: AsyncWrite + Unpin> CipherWriter<W> {
             encrypted_write_pos: 0,
             scratch: Vec::new(),
         }
+    }
+
+    /// Send the random IV to the peer. Must be called once before write_encrypted.
+    /// Idempotent — subsequent calls are no-ops.
+    async fn send_iv(&mut self) -> io::Result<()> {
+        if self.iv_sent {
+            return Ok(());
+        }
+        self.iv_sent = true;
+        let mut iv = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut iv);
+        self.cfb = Some(CfbState::new(&self.key, &iv));
+        self.inner.write_all(&iv).await
+    }
+
+    /// Encrypt `data` in-place (CFB) and write to the underlying transport.
+    /// `data` is overwritten with ciphertext — caller must not read it after.
+    /// IV must already be sent (via poll_write first write, poll_flush, or send_iv).
+    pub async fn write_encrypted(&mut self, data: &mut [u8]) -> io::Result<usize> {
+        self.send_iv().await?;
+        let cfb = self.cfb.as_mut().expect("IV must be set after send_iv");
+        cfb.encrypt(data);
+        self.inner.write_all(data).await?;
+        Ok(data.len())
     }
 }
 
@@ -1312,5 +1336,27 @@ mod tests {
         reader.read_exact(&mut buf).await.unwrap();
         let expected: Vec<u8> = chunks.concat();
         assert_eq!(buf, expected, "scratch-reuse round-trip mismatch");
+    }
+
+    #[tokio::test]
+    async fn cipher_writer_write_encrypted_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client, server) = tokio::io::duplex(4096);
+        let key = [0xABu8; 16];
+        let mut writer = CipherWriter::new(client, key);
+        let mut reader = CipherReader::new(server, key);
+
+        let mut plaintext = b"hello world encrypted in-place".to_vec();
+        let expected = plaintext.clone();
+
+        // write_encrypted sends IV then encrypts in-place
+        writer.write_encrypted(&mut plaintext).await.unwrap();
+        // plaintext is now ciphertext — verify it changed
+        assert_ne!(&plaintext, &expected, "plaintext should be encrypted in-place");
+        writer.inner.shutdown().await.unwrap();
+
+        let mut decrypted = vec![0u8; expected.len()];
+        reader.read_exact(&mut decrypted).await.unwrap();
+        assert_eq!(&decrypted, &expected, "roundtrip should recover original");
     }
 }
