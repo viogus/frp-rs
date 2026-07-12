@@ -31,6 +31,8 @@ pub mod unsafe_features;
 pub mod internal_listener;
 #[cfg(feature = "mem-profile")]
 pub mod mem_profile;
+#[cfg(feature = "profiling")]
+pub mod profiling;
 
 use thiserror::Error;
 
