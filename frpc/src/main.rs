@@ -515,7 +515,7 @@ async fn run_reload(args: ReloadArgs) {
         Ok(summary) => println!("reload success: {summary}"),
         Err(e) => {
             eprintln!("reload failed: {e}");
-            std::process::exit(1);
+            std::process::exit(frp_core::EXIT_RUNTIME);
         }
     }
 }
@@ -532,7 +532,7 @@ async fn run_status(args: StatusArgs) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("status query failed: {e}");
-            std::process::exit(1);
+            std::process::exit(frp_core::EXIT_RUNTIME);
         }
     };
 

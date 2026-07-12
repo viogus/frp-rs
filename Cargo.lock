@@ -1122,12 +1122,14 @@ name = "frpc"
 version = "0.69.1"
 dependencies = [
  "anyhow",
+ "data-encoding",
  "frp-client",
  "frp-core",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",
