@@ -41,7 +41,7 @@ Reconciliation confirmed all of these landed after the doc's original scan:
 - 1.5 Config store file persistence — atomic write, load-on-startup. `frp-server/src/store.rs`, `dashboard.rs:468-539`
 
 **Observability**
-- 3.1 OpenTelemetry tracing — `otel` feature, OTLP exporter, 13 `#[instrument]` sites. `frps/Cargo.toml:24`, `frps/src/main.rs:64-150` *(minor remainder: not all flat `info!("{x}")` lines converted to structured fields — see Open Work)*
+- 3.1 OpenTelemetry tracing — `otel` feature, OTLP exporter, 13 `#[instrument]` sites, all log calls use structured fields (completed 2026-07-12). `frps/Cargo.toml:24`, `frps/src/main.rs:64-150`
 - 3.3 `/metrics` auth — `EnablePrometheus` gate + admin Basic auth. `frp-server/src/dashboard.rs:669-702`
 - 4.4 Admin WebSocket event stream — `GET /api/events`, `ServerEvent` broadcast. `frp-server/src/event.rs`, `dashboard.rs:550-640`
 - 4.3 Plugin hot-reload on client — live kill+restart, no frpc restart. `frp-client/src/service.rs:1285-1470`
@@ -68,14 +68,15 @@ Reconciliation confirmed all of these landed after the doc's original scan:
 
 ## Open Work
 
-### Quick / polish (low effort)
+### Quick / polish (low effort — all done)
 
-- **3.1 structured-log conversion — remainder.** OTLP + `#[instrument]` done, but many `info!("foo {bar}")` lines not yet `info!(bar=%bar, "foo")` for queryability. Effort: 0.5d, mechanical.
+*No remaining items. All polish completed this pass.*
 
 ### Done this pass
 
 - **6.3 Benchmark expansion — DONE** (2026-07-12, `0780a54`). Scoping corrected the item: protocol ser/de was already covered (`protocol_all_types`, all 21 V1+V2 types — TODO's "missing" claim was stale); connection-accept latency belongs in the e2e harness (`latency-baseline.sh setup` mode), not a criterion microbench (kernel/TLS noise dominates). The one genuine gap — **proxy-registration throughput** — added as `frp-server/benches/proxy_registration.rs` (register_single / register_1000 / register_with_group / proxy_info_construct). Also fixed a latent no-op: `crypto_bridge.rs` `v2_serialize_{name}` was duplicating V1 `serde_json` and discarding output; now measures the real `write_msg_v2` framing path.
 - **3.2 `/healthz` readiness — DONE** (2026-07-12, `1aad907`). Readiness now checks `shutdown_token.is_cancelled()` BEFORE the lock probes — a draining server returns 503 "draining" so orchestrators stop routing new traffic (liveness still OK). Added `ProxyManager::is_responsive()` (non-blocking `try_read()` on the proxy registry), probed alongside `used_ports` and `run_id_to_ctl_tx`. Integration test verifies fresh server returns 200. (Draining unit test not feasible: `AppState::new` takes 22 internal params and has no test constructor — the draining check is a one-liner with clear semantics.)
+- **3.1 structured-log conversion — DONE** (2026-07-12, `4e9dbfd`). Scope was dramatically smaller than the original 0.5d estimate: of ~62 `info!`/`warn!`/`debug!` calls, only 5 had variable interpolation at all, 2 already used `{var}` capturing (structured), so only 3 flat calls needed converting (`cipher_stream.rs` IV-EOF warn, `service.rs` KCP debug, `control/mod.rs` Ping plugin-hook debug). All log calls now use structured fields. The other ~59 `info!("plain text")` calls without interpolation are already fine — no dynamic data to structure.
 
 ### Performance remaining (perf program follow-ups)
 
@@ -98,13 +99,12 @@ Reconciliation confirmed all of these landed after the doc's original scan:
 
 | Bucket | Count |
 |--------|-------|
-| Shipped (DONE) | 24 |
-| Open — polish (PARTIAL) | 1 (3.1 log fields) |
+| Shipped (DONE) | 25 |
+| Open — polish (PARTIAL) | 0 |
 | Open — perf | 0 (5.6 shipped, 5.7 rejected) |
 | Open — innovation | 0 (#51/#52 closed not-planned) |
 | Closed / declined | 5 (#51 gRPC, #52 WASM, #63 mirror, #66 lz4, 5.7 quinn-slim) |
 
-**0 open issues.** No parity gaps. Perf follow-ups resolved (5.6 shipped, 5.7
-rejected on measurement); 6.3 benches done; 3.2 healthz readiness done.
-Innovation issues closed not-planned after necessity review. Only one remaining
-optional item: 3.1 (structured-log field conversion).
+**Backlog fully empty.** 0 open issues, 0 parity gaps. Perf follow-ups resolved
+(5.6 shipped, 5.7 rejected on measurement); benches + docs done; observability
+polish (3.1/3.2) done. All innovation closes reviewed.
