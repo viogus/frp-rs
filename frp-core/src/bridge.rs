@@ -118,6 +118,7 @@ pub async fn bridge_encrypted(
 
     // User → Work: write pre_read first (through CipherWriter), then bridge
     let user_to_work = async {
+        // Pre-read bytes (VHost HTTP parsing): encrypt via normal write path.
         if !pre_read.is_empty()
             && enc_work_w.write_all(&pre_read).await.is_err()
         {
@@ -135,19 +136,25 @@ pub async fn bridge_encrypted(
                 }
                 Err(_) => break,
             };
-            let payload = &buf.data()[..n];
 
-            let processed = match compress_chunk(payload, use_compression) {
-                Some(p) => p,
-                None => break,
-            };
-
-            // Apply write bandwidth limit before send
-            if let Some(ref mut lim) = write_limiter {
-                lim.consume(processed.len()).await;
+            if use_compression {
+                // Compress into owned Vec, then encrypt in-place before write.
+                let mut compressed = match compress_chunk(&buf.data()[..n], true) {
+                    Some(p) => p.into_owned(),
+                    None => break,
+                };
+                if let Some(ref mut lim) = write_limiter {
+                    lim.consume(compressed.len()).await;
+                }
+                if enc_work_w.write_encrypted(&mut compressed).await.is_err() { break; }
+            } else {
+                // No compression: encrypt pool buffer slice in-place.
+                let slice = &mut buf.as_mut_slice()[..n];
+                if let Some(ref mut lim) = write_limiter {
+                    lim.consume(slice.len()).await;
+                }
+                if enc_work_w.write_encrypted(slice).await.is_err() { break; }
             }
-
-            if enc_work_w.write_all(processed.as_ref()).await.is_err() { break; }
             if enc_work_w.flush().await.is_err() { break; }
         }
         // Symmetric shutdown: signal EOF to work side (matching bridge_plain).
