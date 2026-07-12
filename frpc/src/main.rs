@@ -7,7 +7,7 @@ use tokio::signal;
 use tracing_subscriber::EnvFilter;
 
 use frp_core::cli::{
-    parse_frpc_args, FrpcCmd, FrpcRunArgs, ReloadArgs,
+    parse_frpc_args, FrpcCmd, FrpcRunArgs, ReloadArgs, StatusArgs,
     build_single_proxy_config,
 };
 use frp_core::config::{load_client_config, collect_config_files, ClientConfig, ProxyConfig};
@@ -172,6 +172,7 @@ async fn main() {
         ).await,
         FrpcCmd::Verify(args) => run_verify(&args.config).await,
         FrpcCmd::Reload(args) => run_reload(args).await,
+        FrpcCmd::Status(args) => run_status(args).await,
     }
 }
 
@@ -516,6 +517,90 @@ async fn run_reload(args: ReloadArgs) {
             eprintln!("reload failed: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+async fn run_status(args: StatusArgs) {
+    let conn = resolve_admin_connection(
+        args.admin_addr.as_deref(),
+        args.admin_port,
+        args.admin_user.as_deref(),
+        args.admin_pwd.as_deref(),
+        args.config.as_deref(),
+    );
+    let body = match admin_get(&conn, "/api/status").await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("status query failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if args.json {
+        println!("{body}");
+        return;
+    }
+
+    print_status_table(&body);
+}
+
+fn print_status_table(body: &str) {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => {
+            println!("Unable to parse status response:\n{body}");
+            return;
+        }
+    };
+
+    let mut rows: Vec<(String, String, String, String, String, String)> = Vec::new();
+    // parsed is {"tcp": [...], "http": [...], ...}
+    if let Some(obj) = parsed.as_object() {
+        for (_, entries) in obj {
+            if let Some(arr) = entries.as_array() {
+                for entry in arr {
+                    let name = entry["name"].as_str().unwrap_or("").to_string();
+                    let ptype = entry["type"].as_str().unwrap_or("").to_string();
+                    let status = entry["status"].as_str().unwrap_or("").to_string();
+                    let local = entry["local_addr"].as_str().unwrap_or("").to_string();
+                    let remote = entry["remote_addr"].as_str().unwrap_or("").to_string();
+                    let err = entry["err"].as_str().unwrap_or("").to_string();
+                    rows.push((name.clone(), ptype, status, local, remote, err));
+                }
+            }
+        }
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Compute column widths (minimum header width)
+    let mut name_w = 4;
+    let mut type_w = 4;
+    let mut status_w = 6;
+    let mut local_w = 10;
+    let mut remote_w = 11;
+    for (name, ptype, status, local, remote, _err) in &rows {
+        name_w = name_w.max(name.len());
+        type_w = type_w.max(ptype.len());
+        status_w = status_w.max(status.len());
+        local_w = local_w.max(local.len());
+        remote_w = remote_w.max(remote.len());
+    }
+
+    println!(
+        "{:name_w$}  {:type_w$}  {:status_w$}  {:local_w$}  {:remote_w$}  ERR",
+        "NAME", "TYPE", "STATUS", "LOCAL ADDR", "REMOTE ADDR",
+    );
+
+    for (name, ptype, status, local, remote, err) in &rows {
+        let truncated_err = if err.len() > 40 {
+            format!("{}...", &err[..37])
+        } else {
+            err.clone()
+        };
+        println!(
+            "{:name_w$}  {:type_w$}  {:status_w$}  {:local_w$}  {:remote_w$}  {truncated_err}",
+            name, ptype, status, local, remote,
+        );
     }
 }
 
