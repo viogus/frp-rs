@@ -513,7 +513,7 @@ impl Service {
                                         let _permit = permit;
                                         let peer = stream.peer_addr;
                                 let conv = stream.conv();
-                                tracing::debug!("KCP HANDLER: spawned peer={} conv={}", peer, conv);
+                                tracing::debug!(peer = %peer, conv = conv, "KCP HANDLER: spawned");
                                 tracing::info!(peer = %peer, conv = conv, "KCP handler: spawned for {} conv={}", peer, conv);
                                 let mut ctl = frp_core::transport::IoStream::Kcp(stream);
 

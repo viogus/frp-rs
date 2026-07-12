@@ -552,7 +552,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for CipherStream<S> {
                         filled = tmp_buf.filled().len();
                         tracing::debug!(filled, iv_read = this.iv_read, "CipherStream: IV read chunk");
                         if filled == 0 {
-                            tracing::warn!("CipherStream: EOF while reading IV (got {} of 16)", this.iv_read);
+                            let iv_read = this.iv_read;
+                            tracing::warn!(iv_read, "CipherStream: EOF while reading IV (got {iv_read} of 16)");
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::UnexpectedEof,
                                 "CipherStream: EOF while reading IV",

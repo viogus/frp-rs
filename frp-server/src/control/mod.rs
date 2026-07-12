@@ -1041,7 +1041,7 @@ pub async fn handle_control<S>(
                         let plugin_mgr = state.plugin_manager.clone();
                         tokio::spawn(async move {
                             if let Err(e) = plugin_mgr.notify("ping", ping_content).await {
-                                debug!("Ping plugin hook: {}", e);
+                                debug!(error = %e, "Ping plugin hook failed");
                             }
                         });
                         let pong = FrpMessage::Pong(msg::Pong { error: None });
