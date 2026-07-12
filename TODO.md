@@ -72,7 +72,10 @@ Reconciliation confirmed all of these landed after the doc's original scan:
 
 - **3.2 `/healthz` readiness — PARTIAL.** Liveness OK; readiness (`?probe=readiness`) only try-locks two RwLocks. Plan wanted "internal channels alive, proxy manager responsive". `frp-server/src/dashboard.rs:361-388`. Effort: 1h.
 - **3.1 structured-log conversion — remainder.** OTLP + `#[instrument]` done, but many `info!("foo {bar}")` lines not yet `info!(bar=%bar, "foo")` for queryability. Effort: 0.5d, mechanical.
-- **6.3 Benchmark expansion — PARTIAL.** Have `crypto_bridge.rs` + `nathole.rs` + perf-program baselines. Missing: protocol serialize/deserialize, connection-accept latency, proxy-registration throughput. Effort: 0.5d.
+
+### Done this pass
+
+- **6.3 Benchmark expansion — DONE** (2026-07-12, `0780a54`). Scoping corrected the item: protocol ser/de was already covered (`protocol_all_types`, all 21 V1+V2 types — TODO's "missing" claim was stale); connection-accept latency belongs in the e2e harness (`latency-baseline.sh setup` mode), not a criterion microbench (kernel/TLS noise dominates). The one genuine gap — **proxy-registration throughput** — added as `frp-server/benches/proxy_registration.rs` (register_single / register_1000 / register_with_group / proxy_info_construct). Also fixed a latent no-op: `crypto_bridge.rs` `v2_serialize_{name}` was duplicating V1 `serde_json` and discarding output; now measures the real `write_msg_v2` framing path.
 
 ### Performance remaining (perf program follow-ups)
 
@@ -95,12 +98,13 @@ Reconciliation confirmed all of these landed after the doc's original scan:
 
 | Bucket | Count |
 |--------|-------|
-| Shipped (DONE) | 22 |
-| Open — polish (PARTIAL) | 3 |
+| Shipped (DONE) | 23 |
+| Open — polish (PARTIAL) | 2 (3.1 log fields, 3.2 healthz readiness) |
 | Open — perf | 0 (5.6 shipped, 5.7 rejected) |
 | Open — innovation | 0 (#51/#52 closed not-planned) |
 | Closed / declined | 5 (#51 gRPC, #52 WASM, #63 mirror, #66 lz4, 5.7 quinn-slim) |
 
 **0 open issues.** No parity gaps. Perf follow-ups resolved (5.6 shipped, 5.7
-rejected on measurement). Innovation issues closed not-planned after necessity
-review. Only remaining optional work is observability polish (3.1/3.2/6.3).
+rejected on measurement); 6.3 benches done. Innovation issues closed not-planned
+after necessity review. Only remaining optional work is observability polish:
+3.1 (structured-log fields) and 3.2 (`/healthz` readiness).
