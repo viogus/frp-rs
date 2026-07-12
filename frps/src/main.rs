@@ -266,7 +266,12 @@ async fn run(cli: FrpsArgs) {
     let service = std::sync::Arc::new(
         Service::new(cfg, config_path).await.unwrap_or_else(|e| {
             tracing::error!(error = %e, "frps init error: {}", e);
-            process::exit(frp_core::EXIT_BIND);
+            let code = if e.to_string().contains("token") || e.to_string().contains("auth") {
+                frp_core::EXIT_AUTH
+            } else {
+                frp_core::EXIT_BIND
+            };
+            process::exit(code);
         })
     );
 
