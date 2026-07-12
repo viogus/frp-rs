@@ -1526,6 +1526,28 @@ fn run_strict_check(
     Ok(())
 }
 
+/// Compute Levenshtein distance between two strings.
+/// Used to suggest corrections for unknown config fields.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let n = a_chars.len();
+    let m = b_chars.len();
+    let mut prev = (0..=m).collect::<Vec<_>>();
+    let mut curr = vec![0; m + 1];
+    for i in 1..=n {
+        curr[0] = i;
+        for j in 1..=m {
+            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1)
+                .min(curr[j - 1] + 1)
+                .min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[m]
+}
+
 fn check_strict(
     table: &toml::Table,
     known: &std::collections::HashSet<&str>,
@@ -1546,9 +1568,21 @@ fn check_strict(
         if !known.contains(key.as_str()) {
             let parent_section = path.rsplit('.').next().unwrap_or("");
             if !wildcard_sections.contains(&parent_section) {
-                errors.push(format!(
+                let mut msg = format!(
                     "unknown field \"{}\" in config file {}", full_key, config_path
-                ));
+                );
+                // Suggest closest known key if within edit distance 3
+                let mut best: Option<(&str, usize)> = None;
+                for known_key in known.iter() {
+                    let d = levenshtein(key, known_key);
+                    if d <= 3 && (best.is_none() || d < best.unwrap().1) {
+                        best = Some((known_key, d));
+                    }
+                }
+                if let Some((suggestion, _)) = best {
+                    msg.push_str(&format!(" — did you mean '{}'?", suggestion));
+                }
+                errors.push(msg);
             }
         }
     }
@@ -1816,6 +1850,33 @@ token = "test-token"
 "#;
         let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
         assert!(cfg.tcp_mux);
+    }
+
+    #[test]
+    fn test_levenshtein() {
+        assert_eq!(levenshtein("server_addr", "serverAddr"), 2); // delete '_' + case change
+        assert_eq!(levenshtein("bind_port", "bindPort"), 2); // delete '_' + case change
+        assert_eq!(levenshtein("token", "tokens"), 1);
+        assert_eq!(levenshtein("abc", "xyz"), 3);
+        assert_eq!(levenshtein("", ""), 0);
+        assert_eq!(levenshtein("a", ""), 1);
+    }
+
+    #[test]
+    fn test_unknown_field_suggestion() {
+        // Build a simple toml table with an unknown key (flat, no sections)
+        let toml_str = "token = \"test\"\nserverAddr = \"1.2.3.4\"\n";
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let known: std::collections::HashSet<&str> =
+            ["token", "server_addr"].iter().copied().collect();
+        let errors = check_strict(
+            value.as_table().unwrap(),
+            &known,
+            "",
+            "test.toml",
+        );
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("did you mean 'server_addr'"));
     }
 
     #[test]
