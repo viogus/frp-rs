@@ -23,7 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(feature = "chacha20")]
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
 #[cfg(feature = "chacha20")]
-use chacha20poly1305::aead::Aead;
+use chacha20poly1305::aead::{Aead, AeadInPlace};
 use rand::RngCore;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::hkdf::{Salt, HKDF_SHA256};
@@ -117,14 +117,12 @@ impl AeadCipher {
         }
     }
 
-    fn encrypt(&self, nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
+    fn encrypt(&self, nonce: &[u8], mut in_out: Vec<u8>, aad: &[u8]) -> Result<Vec<u8>, String> {
         match self {
             Self::Aes256Gcm(key) => {
                 let nonce = Nonce::try_assume_unique_for_key(nonce)
                     .map_err(|e| format!("aes-gcm nonce: {e}"))?;
                 let aad = Aad::from(aad);
-                let mut in_out = plaintext.to_vec();
-                // Tag is appended by seal_in_place
                 key.seal_in_place_append_tag(nonce, aad, &mut in_out)
                     .map_err(|e| format!("aes-gcm encrypt: {e}"))?;
                 Ok(in_out)
@@ -132,28 +130,30 @@ impl AeadCipher {
             #[cfg(feature = "chacha20")]
             Self::XChaCha20Poly1305(c) => {
                 let nonce = chacha20poly1305::XNonce::from_slice(nonce);
-                let payload = chacha20poly1305::aead::Payload { msg: plaintext, aad };
-                c.encrypt(nonce, payload)
-                    .map_err(|e| format!("xchacha20 encrypt: {e}"))
+                let tag = c.encrypt_in_place_detached(nonce, aad, &mut in_out)
+                    .map_err(|e| format!("xchacha20 encrypt: {e}"))?;
+                in_out.extend_from_slice(&tag);
+                Ok(in_out)
             }
         }
     }
 
-    fn decrypt(&self, nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
+    fn decrypt(&self, nonce: &[u8], mut in_out: Vec<u8>, aad: &[u8]) -> Result<Vec<u8>, String> {
         match self {
             Self::Aes256Gcm(key) => {
                 let nonce = Nonce::try_assume_unique_for_key(nonce)
                     .map_err(|e| format!("aes-gcm nonce: {e}"))?;
                 let aad = Aad::from(aad);
-                let mut in_out = ciphertext.to_vec();
-                let plaintext = key.open_in_place(nonce, aad, &mut in_out)
-                    .map_err(|e| format!("aes-gcm decrypt: {e}"))?;
-                Ok(plaintext.to_vec())
+                let plaintext_len = key.open_in_place(nonce, aad, &mut in_out)
+                    .map_err(|e| format!("aes-gcm decrypt: {e}"))?
+                    .len();
+                in_out.truncate(plaintext_len);
+                Ok(in_out)
             }
             #[cfg(feature = "chacha20")]
             Self::XChaCha20Poly1305(c) => {
                 let nonce = chacha20poly1305::XNonce::from_slice(nonce);
-                let payload = chacha20poly1305::aead::Payload { msg: ciphertext, aad };
+                let payload = chacha20poly1305::aead::Payload { msg: &in_out, aad };
                 c.decrypt(nonce, payload)
                     .map_err(|e| format!("xchacha20 decrypt: {e}"))
             }
@@ -378,7 +378,7 @@ impl AeadStream {
         aad.extend_from_slice(stream_nonce);
         aad.extend_from_slice(&header);
 
-        let plaintext = match self.read_cipher.decrypt(&self.read_nonce, &ciphertext, &aad) {
+        let plaintext = match self.read_cipher.decrypt(&self.read_nonce, ciphertext, &aad) {
             Ok(p) => {
                 tracing::debug!(frame = %self.read_frame_count, plaintext_len = %p.len(), "[AEAD-READ] frame={} decrypt OK, plaintext_len={}", self.read_frame_count, p.len());
                 p
@@ -507,7 +507,7 @@ impl AsyncWrite for AeadStream {
             aad.extend_from_slice(&this.write_stream_nonce);
             aad.extend_from_slice(&header);
 
-            let sealed = match this.write_cipher.encrypt(&this.write_nonce, plaintext, &aad) {
+            let sealed = match this.write_cipher.encrypt(&this.write_nonce, plaintext.to_vec(), &aad) {
                 Ok(s) => s,
                 Err(e) => {
                     let io_err = io::Error::other(e);
@@ -538,7 +538,7 @@ impl AsyncWrite for AeadStream {
             aad.extend_from_slice(&this.write_stream_nonce);
             aad.extend_from_slice(&header);
 
-            let sealed = match this.write_cipher.encrypt(&this.write_nonce, plaintext, &aad) {
+            let sealed = match this.write_cipher.encrypt(&this.write_nonce, plaintext.to_vec(), &aad) {
                 Ok(s) => s,
                 Err(e) => {
                     let io_err = io::Error::other(e);
