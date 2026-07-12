@@ -7,7 +7,7 @@ use tokio::signal;
 use tracing_subscriber::EnvFilter;
 
 use frp_core::cli::{
-    parse_frpc_args, FrpcCmd, FrpcRunArgs,
+    parse_frpc_args, FrpcCmd, FrpcRunArgs, ReloadArgs,
     build_single_proxy_config,
 };
 use frp_core::config::{load_client_config, collect_config_files, ClientConfig, ProxyConfig};
@@ -171,6 +171,7 @@ async fn main() {
             args.to_proxy_config(),
         ).await,
         FrpcCmd::Verify(args) => run_verify(&args.config).await,
+        FrpcCmd::Reload(args) => run_reload(args).await,
     }
 }
 
@@ -496,6 +497,24 @@ async fn run_verify(config_path: &str) {
         Err(e) => {
             eprintln!("Config file {} is invalid: {}", config_path, e);
             process::exit(EXIT_CONFIG);
+        }
+    }
+}
+
+async fn run_reload(args: ReloadArgs) {
+    let conn = resolve_admin_connection(
+        args.admin_addr.as_deref(),
+        args.admin_port,
+        args.admin_user.as_deref(),
+        args.admin_pwd.as_deref(),
+        args.config.as_deref(),
+    );
+    let body = format!(r#"{{"strictConfig":{}}}"#, args.strict_config);
+    match admin_post_json(&conn, "/api/reload", &body).await {
+        Ok(summary) => println!("reload success: {summary}"),
+        Err(e) => {
+            eprintln!("reload failed: {e}");
+            std::process::exit(1);
         }
     }
 }

@@ -345,6 +345,8 @@ pub enum FrpcCmd {
     Tcpmux(TcpmuxArgs),
     /// Verify config file
     Verify(VerifyArgs),
+    /// Reload running frpc configuration via admin API
+    Reload(ReloadArgs),
 }
 
 #[derive(Debug, Clone)]
@@ -457,6 +459,16 @@ pub struct TcpmuxArgs {
 #[derive(Debug, Clone)]
 pub struct VerifyArgs {
     pub config: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReloadArgs {
+    pub config: Option<String>,
+    pub strict_config: bool,
+    pub admin_addr: Option<String>,
+    pub admin_port: Option<u16>,
+    pub admin_user: Option<String>,
+    pub admin_pwd: Option<String>,
 }
 
 // ─── frpc parser combinators ─────────────────────────────────────────
@@ -621,6 +633,17 @@ fn verify_cmd() -> impl Parser<FrpcCmd> {
     args.to_options().command("verify").help("Verify that the configuration is valid").map(FrpcCmd::Verify)
 }
 
+fn reload_cmd() -> impl Parser<FrpcCmd> {
+    let config = long("config").short('c').argument::<String>("FILE").optional();
+    let strict_config = long("strict-config").long("strict_config").switch();
+    let admin_addr = long("admin-addr").long("admin_addr").argument::<String>("IP").optional();
+    let admin_port = long("admin-port").long("admin_port").argument::<u16>("PORT").optional();
+    let admin_user = long("admin-user").long("admin_user").argument::<String>("USER").optional();
+    let admin_pwd = long("admin-pwd").long("admin_pwd").argument::<String>("PWD").optional();
+    let args = construct!(ReloadArgs { config, strict_config, admin_addr, admin_port, admin_user, admin_pwd });
+    args.to_options().command("reload").help("Reload running frpc configuration").map(FrpcCmd::Reload)
+}
+
 /// Compose all frpc subcommands + run-mode fallback.
 fn frpc_parser() -> impl Parser<FrpcCmd> {
     let run = run_mode().map(|args| {
@@ -641,6 +664,7 @@ fn frpc_parser() -> impl Parser<FrpcCmd> {
         sudp_cmd(),
         tcpmux_cmd(),
         verify_cmd(),
+        reload_cmd(),
         run,
     ])
 }
