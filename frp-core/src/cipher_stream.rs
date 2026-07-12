@@ -534,6 +534,10 @@ pub struct CipherStream<S: AsyncRead + AsyncWrite + Unpin> {
     encrypted_buf: Option<Vec<u8>>,
     /// Bytes already written from encrypted_buf.
     encrypted_write_pos: usize,
+    /// Reused encrypt scratch — avoids a per-write `Vec` allocation on the
+    /// hot write path. Moved out (via `mem::take`) only on rare partial-write
+    /// branch, then regrown on the next call.
+    scratch: Vec<u8>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> CipherStream<S> {
@@ -555,6 +559,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> CipherStream<S> {
             first_write_data_len: 0,
             encrypted_buf: None,
             encrypted_write_pos: 0,
+            scratch: Vec::new(),
         }
     }
 }
@@ -722,19 +727,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
         }
 
         let cfb = this.write_cfb.as_mut().expect("IV must be sent before encrypting");
-        let mut encrypted = buf.to_vec();
-        cfb.encrypt(&mut encrypted);
-        match Pin::new(&mut this.inner).poll_write(cx, &encrypted) {
-            Poll::Ready(Ok(n)) if n >= encrypted.len() => Poll::Ready(Ok(buf.len())),
+        this.scratch.clear();
+        this.scratch.extend_from_slice(buf);
+        cfb.encrypt(&mut this.scratch);
+        match Pin::new(&mut this.inner).poll_write(cx, &this.scratch) {
+            Poll::Ready(Ok(n)) if n >= this.scratch.len() => Poll::Ready(Ok(buf.len())),
             Poll::Ready(Ok(n)) => {
-                this.encrypted_buf = Some(encrypted);
+                this.encrypted_buf = Some(std::mem::take(&mut this.scratch));
                 this.encrypted_write_pos = n;
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => {
-                this.encrypted_buf = Some(encrypted);
+                this.encrypted_buf = Some(std::mem::take(&mut this.scratch));
                 this.encrypted_write_pos = 0;
                 Poll::Pending
             }
