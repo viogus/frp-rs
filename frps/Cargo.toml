@@ -24,6 +24,7 @@ debug-logs = []
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 # Measurement-only counting global allocator. OFF in all shipped builds.
 mem-profile = ["frp-server/mem-profile"]
+profiling = ["frp-server/profiling"]
 
 [dependencies]
 frp-core = { path = "../frp-core", default-features = false }

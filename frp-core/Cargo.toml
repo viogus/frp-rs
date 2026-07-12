@@ -42,6 +42,7 @@ jsonwebtoken = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true, optional = true }
 rcgen = { version = "0.13", optional = true, default-features = false, features = ["ring"] }
+pprof = { workspace = true, optional = true }
 
 [features]
 default = ["quic", "kcp", "websocket", "oidc", "tls", "compression", "chacha20", "vnet", "tcp-mux"]
@@ -56,12 +57,14 @@ websocket = ["dep:tokio-tungstenite"]
 oidc = ["dep:jsonwebtoken", "dep:reqwest"]
 vnet = []
 mem-profile = []
+profiling = ["dep:pprof"]
 
 
 [dev-dependencies]
 tower = "0.5"
 criterion.workspace = true
 proptest = "1.6"
+tempfile = "3"
 
 [[bench]]
 name = "crypto_bridge"

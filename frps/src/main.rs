@@ -296,6 +296,42 @@ async fn run(cli: FrpsArgs) {
         })
     };
 
+    // SIGUSR2 profiling handler (Unix + profiling) — kill -USR2 <pid>
+    // Runs a CPU profile for a configurable duration, writing a flamegraph SVG.
+    // Environment variables:
+    //   FRP_PROFILE_SECS — profiling duration in seconds (default 30)
+    //   FRP_PROFILE_DIR  — output directory (default ".")
+    #[cfg(all(unix, feature = "profiling"))]
+    let profile_handle = {
+        tokio::spawn(async move {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()) {
+                Ok(mut sig) => {
+                    tracing::info!(pid = %std::process::id(), "SIGUSR2 profiling ready (pid={})", std::process::id());
+                    loop {
+                        sig.recv().await;
+                        let duration_secs = std::env::var("FRP_PROFILE_SECS")
+                            .ok()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(30);
+                        let output_dir = std::env::var("FRP_PROFILE_DIR")
+                            .unwrap_or_else(|_| ".".to_string());
+                        tokio::task::spawn_blocking(move || {
+                            match frp_core::profiling::dump_cpu_profile(
+                                std::time::Duration::from_secs(duration_secs),
+                                std::path::Path::new(&output_dir),
+                                "frps",
+                            ) {
+                                Ok(path) => tracing::info!("SIGUSR2: CPU profile saved to {}", path.display()),
+                                Err(e) => tracing::error!(error = %e, "SIGUSR2: CPU profile failed: {}", e),
+                            }
+                        });
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "SIGUSR2 unavailable: {}", e),
+            }
+        })
+    };
+
     if let Err(e) = service.run().await {
         tracing::error!(error = %e, "frps error: {}", e);
         process::exit(frp_core::EXIT_RUNTIME);
@@ -303,4 +339,7 @@ async fn run(cli: FrpsArgs) {
 
     #[cfg(unix)]
     reload_handle.abort();
+
+    #[cfg(all(unix, feature = "profiling"))]
+    profile_handle.abort();
 }
