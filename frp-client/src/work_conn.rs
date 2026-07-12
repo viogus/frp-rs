@@ -549,11 +549,13 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     tokio::spawn(async move {
                         debug!(proxy_name = %pn_w, "UDP writer '{}' started", pn_w);
                         let mut buf = vec![0u8; 65535];
+                        let mut payload = Vec::with_capacity(65535);
                         loop {
                             match sock.recv_from(&mut buf).await {
                                 Ok((n, src)) => {
                                     debug!(proxy_name = %pn_w, byte_count = n, src_addr = %src, "UDP writer '{}': recv'd {} bytes from local {}", pn_w, n, src);
-                                    let mut payload = buf[..n].to_vec();
+                                    payload.clear();
+                                    payload.extend_from_slice(&buf[..n]);
                                     if use_comp {
                                         if let Ok(c) = encryption::compress(&payload) { payload = c; }
                                     }
@@ -562,8 +564,11 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                     }
                                     // Use saved remote_addr from server (the true remote user)
                                     let remote = last_remote_w.lock().await.clone();
+                                    // Take ownership of payload, leaving an empty Vec
+                                    // (capacity preserved) for the next iteration.
+                                    let taken = std::mem::take(&mut payload);
                                     let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
-                                        content: payload,
+                                        content: taken,
                                         local_addr: msg::UdpAddr::from_string(&local_addr_str),
                                         remote_addr: remote,
                                     });

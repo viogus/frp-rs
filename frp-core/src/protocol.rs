@@ -71,7 +71,15 @@ pub async fn read_v1_frame<R: AsyncReadExt + Unpin>(
         )));
     }
 
-    let mut payload = vec![0u8; length as usize];
+    let length = length as usize;
+    // Use set_len to skip zero-initialization; read_exact fills every byte
+    // on success. On error the Vec is dropped — uninitialized bytes never escape.
+    #[allow(clippy::uninit_vec)]
+    let mut payload = {
+        let mut v = Vec::with_capacity(length);
+        unsafe { v.set_len(length); }
+        v
+    };
     reader
         .read_exact(&mut payload)
         .await
@@ -473,7 +481,15 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
         )));
     }
 
-    let mut payload = vec![0u8; payload_len];
+    // Use set_len to skip zero-initialization; read_exact fills the entire
+    // buffer on success. If read_exact returns an error, the Vec is dropped
+    // immediately — uninitialized bytes never escape.
+    #[allow(clippy::uninit_vec)]
+    let mut payload = {
+        let mut v = Vec::with_capacity(payload_len);
+        unsafe { v.set_len(payload_len); }
+        v
+    };
     reader.read_exact(&mut payload).await
         .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}")))?;
 
