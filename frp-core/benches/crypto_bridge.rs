@@ -260,8 +260,13 @@ fn bench_protocol_all_types(c: &mut Criterion) {
 
         group.bench_function(format!("v2_serialize_{name}"), |b| {
             b.iter(|| {
-                let _ = serde_json::to_vec(black_box(&msg)).unwrap();
-                let _ = black_box(v2_id);
+                rt.block_on(async {
+                    let mut sink: Vec<u8> = Vec::with_capacity(256);
+                    frp_core::protocol::write_msg_v2(black_box(&mut sink), black_box(&msg))
+                        .await
+                        .unwrap();
+                    black_box(&sink);
+                });
             });
         });
 
