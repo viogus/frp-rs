@@ -34,6 +34,13 @@ pub mod mem_profile;
 
 use thiserror::Error;
 
+/// Exit codes for process termination.
+/// Mirrored in frps/frpc main.rs — keep in sync.
+pub const EXIT_RUNTIME: i32 = 1;   // connection lost, I/O error, unexpected
+pub const EXIT_CONFIG: i32 = 2;    // bad config file, unknown field, invalid value
+pub const EXIT_AUTH: i32 = 3;      // bad token, OIDC failure
+pub const EXIT_BIND: i32 = 4;      // port in use, permission denied
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Protocol error: {0}")]
@@ -50,6 +57,19 @@ pub enum Error {
     Serde(#[from] serde_json::Error),
     #[error("{0}")]
     Other(String),
+}
+
+impl Error {
+    /// Map each error variant to a process exit code.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Error::Config(_) => EXIT_CONFIG,
+            Error::Auth(_) => EXIT_AUTH,
+            Error::Io(e) if e.kind() == std::io::ErrorKind::AddrInUse
+                || e.kind() == std::io::ErrorKind::PermissionDenied => EXIT_BIND,
+            _ => EXIT_RUNTIME,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
