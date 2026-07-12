@@ -174,7 +174,7 @@ where
     let control = poll_fn(|cx| conn.poll_next_inbound(cx))
         .await
         .ok_or_else(|| crate::Error::Protocol("yamux: connection closed before control stream".into()))?
-        .map_err(|e| crate::Error::Protocol(format!("yamux: {e}")))?;
+        .map_err(|e| crate::Error::Protocol(format!("yamux: {e}").into()))?;
 
     let control_compat = control.compat();
 
@@ -274,7 +274,7 @@ where
     // Open the first stream — this is the control channel.
     let control = poll_fn(|cx| conn.poll_new_outbound(cx))
         .await
-        .map_err(|e| crate::Error::Protocol(format!("yamux: {e}")))?;
+        .map_err(|e| crate::Error::Protocol(format!("yamux: {e}").into()))?;
 
     let control_compat = control.compat();
 

@@ -61,7 +61,7 @@ pub async fn raw_login(
     token: &str,
 ) -> Result<(IoStream, LoginResp), frp_core::Error> {
     let stream = tokio::net::TcpStream::connect(addr).await.map_err(|e| {
-        frp_core::Error::Transport(format!("connect to {}: {}", addr, e))
+        frp_core::Error::Transport(format!("connect to {}: {}", addr, e).into())
     })?;
 
     let login = FrpMessage::Login(Login {
@@ -110,7 +110,7 @@ pub async fn raw_login(
         other => Err(frp_core::Error::Protocol(format!(
             "expected LoginResp, got type byte {:?}",
             other.v1_type_byte()
-        ))),
+        ).into())),
     }
 }
 

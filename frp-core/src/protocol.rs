@@ -11,7 +11,7 @@ pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
 ) -> Result<(), crate::Error> {
     let type_byte = msg.v1_type_byte();
     let payload = serde_json::to_vec(msg)
-        .map_err(|e| crate::Error::Protocol(format!("serialize V1 msg: {e}")))?;
+        .map_err(|e| crate::Error::Protocol(format!("serialize V1 msg: {e}").into()))?;
 
     if payload.len() as u64 > V1_MAX_MSG_LENGTH as u64 {
         return Err(crate::Error::Protocol("V1 message too large".into()));
@@ -35,7 +35,7 @@ pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
    writer
        .write_all(&buf)
        .await
-        .map_err(|e| crate::Error::Protocol(format!("write V1 frame: {e}")))?;
+        .map_err(|e| crate::Error::Protocol(format!("write V1 frame: {e}").into()))?;
     Ok(())
 }
 
@@ -46,7 +46,7 @@ pub async fn read_v1_frame<R: AsyncReadExt + Unpin>(
     reader
         .read_exact(&mut header)
         .await
-        .map_err(|e| crate::Error::Protocol(format!("read V1 header: {e}")))?;
+        .map_err(|e| crate::Error::Protocol(format!("read V1 header: {e}").into()))?;
 
     let type_byte = header[0];
     let length = u64::from_be_bytes([
@@ -68,7 +68,7 @@ pub async fn read_v1_frame<R: AsyncReadExt + Unpin>(
         return Err(crate::Error::Protocol(format!(
             "invalid V1 msg length: {length}, raw header: {}",
             hex::encode(header)
-        )));
+        ).into()));
     }
 
     let length = length as usize;
@@ -83,7 +83,7 @@ pub async fn read_v1_frame<R: AsyncReadExt + Unpin>(
     reader
         .read_exact(&mut payload)
         .await
-        .map_err(|e| crate::Error::Protocol(format!("read V1 payload: {e}")))?;
+        .map_err(|e| crate::Error::Protocol(format!("read V1 payload: {e}").into()))?;
 
     Ok((type_byte, payload))
 }
@@ -108,125 +108,125 @@ pub fn deserialize_v2(type_id: u16, json_bytes: &[u8]) -> Result<FrpMessage, cra
     let msg = match type_id {
         msg::V2_TYPE_LOGIN => {
             let v: msg::Login = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize Login (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize Login (v2): {e}").into()))?;
             FrpMessage::Login(v)
         }
         msg::V2_TYPE_LOGIN_RESP => {
             let v: msg::LoginResp = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize LoginResp (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize LoginResp (v2): {e}").into()))?;
             FrpMessage::LoginResp(v)
         }
         msg::V2_TYPE_NEW_PROXY => {
             let v: msg::NewProxy = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewProxy (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewProxy (v2): {e}").into()))?;
             FrpMessage::NewProxy(v)
         }
         msg::V2_TYPE_NEW_PROXY_RESP => {
             let v: msg::NewProxyResp = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewProxyResp (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewProxyResp (v2): {e}").into()))?;
             FrpMessage::NewProxyResp(v)
         }
         msg::V2_TYPE_CLOSE_PROXY => {
             let v: msg::CloseProxy = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize CloseProxy (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize CloseProxy (v2): {e}").into()))?;
             FrpMessage::CloseProxy(v)
         }
         msg::V2_TYPE_NEW_WORK_CONN => {
             let v: msg::NewWorkConn = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewWorkConn (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewWorkConn (v2): {e}").into()))?;
             FrpMessage::NewWorkConn(v)
         }
         msg::V2_TYPE_REQ_WORK_CONN => {
             let v: msg::ReqWorkConn = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize ReqWorkConn (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize ReqWorkConn (v2): {e}").into()))?;
             FrpMessage::ReqWorkConn(v)
         }
         msg::V2_TYPE_START_WORK_CONN => {
             let v: msg::StartWorkConn = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize StartWorkConn (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize StartWorkConn (v2): {e}").into()))?;
             FrpMessage::StartWorkConn(v)
         }
         msg::V2_TYPE_NEW_VISITOR_CONN => {
             let v: msg::NewVisitorConn = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConn (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConn (v2): {e}").into()))?;
             FrpMessage::NewVisitorConn(v)
         }
         msg::V2_TYPE_NEW_VISITOR_CONN_RESP => {
             let v: msg::NewVisitorConnResp = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConnResp (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConnResp (v2): {e}").into()))?;
             FrpMessage::NewVisitorConnResp(v)
         }
         msg::V2_TYPE_PING => {
             let v: msg::Ping = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize Ping (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize Ping (v2): {e}").into()))?;
             FrpMessage::Ping(v)
         }
         msg::V2_TYPE_PONG => {
             let v: msg::Pong = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize Pong (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize Pong (v2): {e}").into()))?;
             FrpMessage::Pong(v)
         }
         msg::V2_TYPE_UDP_PACKET => {
             let v: msg::UDPPacket = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize UDPPacket (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize UDPPacket (v2): {e}").into()))?;
             FrpMessage::UDPPacket(v)
         }
         msg::V2_TYPE_NAT_HOLE_VISITOR => {
             let v: msg::NatHoleVisitor = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleVisitor (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleVisitor (v2): {e}").into()))?;
             FrpMessage::NatHoleVisitor(v)
         }
         msg::V2_TYPE_NAT_HOLE_CLIENT => {
             let v: msg::NatHoleClient = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleClient (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleClient (v2): {e}").into()))?;
             FrpMessage::NatHoleClient(v)
         }
         msg::V2_TYPE_NAT_HOLE_RESP => {
             let v: msg::NatHoleResp = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleResp (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleResp (v2): {e}").into()))?;
             FrpMessage::NatHoleResp(v)
         }
         msg::V2_TYPE_NAT_HOLE_SID => {
             let v: msg::NatHoleSid = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleSid (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleSid (v2): {e}").into()))?;
             FrpMessage::NatHoleSid(v)
         }
         msg::V2_TYPE_NAT_HOLE_REPORT => {
             let v: msg::NatHoleReport = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleReport (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleReport (v2): {e}").into()))?;
             FrpMessage::NatHoleReport(v)
         }
         msg::V2_TYPE_CLOSE_PROXY_RESP => {
             let v: msg::CloseProxyResp = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize CloseProxyResp (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize CloseProxyResp (v2): {e}").into()))?;
             FrpMessage::CloseProxyResp(v)
         }
         msg::V2_TYPE_ERROR => {
             let v: msg::Error = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize Error (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize Error (v2): {e}").into()))?;
             FrpMessage::Error(v)
         }
         #[cfg(feature = "vnet")]
         msg::V2_TYPE_VNET_ROUTE_ADVERTISE => {
             let v: msg::VnetRouteAdvertise = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetRouteAdvertise (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetRouteAdvertise (v2): {e}").into()))?;
             FrpMessage::VnetRouteAdvertise(v)
         }
         #[cfg(feature = "vnet")]
         msg::V2_TYPE_VNET_PACKET => {
             let v: msg::VnetPacket = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetPacket (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetPacket (v2): {e}").into()))?;
             FrpMessage::VnetPacket(v)
         }
         #[cfg(feature = "vnet")]
         msg::V2_TYPE_VNET_ROUTE_REMOVE => {
             let v: msg::VnetRouteRemove = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetRouteRemove (v2): {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetRouteRemove (v2): {e}").into()))?;
             FrpMessage::VnetRouteRemove(v)
         }
         _ => return Err(crate::Error::Protocol(format!(
             "unknown V2 message type ID: {type_id}"
-        ))),
+        ).into())),
     };
     Ok(msg)
 }
@@ -235,77 +235,77 @@ pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate
     let msg = match type_byte {
         msg::TYPE_LOGIN => {
             let v: msg::Login = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize Login: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize Login: {e}").into()))?;
             FrpMessage::Login(v)
         }
         msg::TYPE_LOGIN_RESP => {
             let v: msg::LoginResp = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize LoginResp: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize LoginResp: {e}").into()))?;
             FrpMessage::LoginResp(v)
         }
         msg::TYPE_NEW_PROXY => {
             let v: msg::NewProxy = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewProxy: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewProxy: {e}").into()))?;
             FrpMessage::NewProxy(v)
         }
         msg::TYPE_NEW_PROXY_RESP => {
             let v: msg::NewProxyResp = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewProxyResp: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewProxyResp: {e}").into()))?;
             FrpMessage::NewProxyResp(v)
         }
         msg::TYPE_CLOSE_PROXY => {
             let v: msg::CloseProxy = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize CloseProxy: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize CloseProxy: {e}").into()))?;
             FrpMessage::CloseProxy(v)
         }
         msg::TYPE_CLOSE_PROXY_RESP => {
             let v: msg::CloseProxyResp = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize CloseProxyResp: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize CloseProxyResp: {e}").into()))?;
             FrpMessage::CloseProxyResp(v)
         }
         msg::TYPE_ERROR => {
             let v: msg::Error = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize Error: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize Error: {e}").into()))?;
             FrpMessage::Error(v)
         }
         msg::TYPE_NEW_WORK_CONN => {
             let v: msg::NewWorkConn = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewWorkConn: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewWorkConn: {e}").into()))?;
             FrpMessage::NewWorkConn(v)
         }
         msg::TYPE_REQ_WORK_CONN => {
             let v: msg::ReqWorkConn = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize ReqWorkConn: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize ReqWorkConn: {e}").into()))?;
             FrpMessage::ReqWorkConn(v)
         }
         msg::TYPE_START_WORK_CONN => {
             let v: msg::StartWorkConn = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize StartWorkConn: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize StartWorkConn: {e}").into()))?;
             FrpMessage::StartWorkConn(v)
         }
         msg::TYPE_PING => {
             let v: msg::Ping = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize Ping: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize Ping: {e}").into()))?;
             FrpMessage::Ping(v)
         }
         msg::TYPE_PONG => {
             let v: msg::Pong = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize Pong: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize Pong: {e}").into()))?;
             FrpMessage::Pong(v)
         }
         msg::TYPE_NEW_VISITOR_CONN => {
             let v: msg::NewVisitorConn = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConn: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConn: {e}").into()))?;
             FrpMessage::NewVisitorConn(v)
         }
         msg::TYPE_NEW_VISITOR_CONN_RESP => {
             let v: msg::NewVisitorConnResp = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConnResp: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConnResp: {e}").into()))?;
             FrpMessage::NewVisitorConnResp(v)
         }
         msg::TYPE_UDP_PACKET => {
             let v: msg::UDPPacket = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize UDPPacket: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize UDPPacket: {e}").into()))?;
             FrpMessage::UDPPacket(v)
         }
         msg::TYPE_NAT_HOLE_VISITOR => {
@@ -315,7 +315,7 @@ pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate
                 String::from_utf8_lossy(payload)
             );
             let v: msg::NatHoleVisitor = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleVisitor: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleVisitor: {e}").into()))?;
             tracing::debug!(
                 transaction_id = ?v.transaction_id,
                 proxy_name = %v.proxy_name,
@@ -329,43 +329,43 @@ pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate
         }
         msg::TYPE_NAT_HOLE_CLIENT => {
             let v: msg::NatHoleClient = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleClient: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleClient: {e}").into()))?;
             FrpMessage::NatHoleClient(v)
         }
         msg::TYPE_NAT_HOLE_RESP => {
             let v: msg::NatHoleResp = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleResp: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleResp: {e}").into()))?;
             FrpMessage::NatHoleResp(v)
         }
         msg::TYPE_NAT_HOLE_SID => {
             let v: msg::NatHoleSid = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleSid: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleSid: {e}").into()))?;
             FrpMessage::NatHoleSid(v)
         }
         msg::TYPE_NAT_HOLE_REPORT => {
             let v: msg::NatHoleReport = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleReport: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleReport: {e}").into()))?;
             FrpMessage::NatHoleReport(v)
         }
         #[cfg(feature = "vnet")]
         msg::TYPE_VNET_ROUTE_ADVERTISE => {
             let v: msg::VnetRouteAdvertise = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetRouteAdvertise: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetRouteAdvertise: {e}").into()))?;
             FrpMessage::VnetRouteAdvertise(v)
         }
         #[cfg(feature = "vnet")]
         msg::TYPE_VNET_PACKET => {
             let v: msg::VnetPacket = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetPacket: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetPacket: {e}").into()))?;
             FrpMessage::VnetPacket(v)
         }
         #[cfg(feature = "vnet")]
         msg::TYPE_VNET_ROUTE_REMOVE => {
             let v: msg::VnetRouteRemove = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetRouteRemove: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetRouteRemove: {e}").into()))?;
             FrpMessage::VnetRouteRemove(v)
         }
-        _ => return Err(crate::Error::Protocol(format!("unknown V1 type byte: 0x{type_byte:02x}"))),
+        _ => return Err(crate::Error::Protocol(format!("unknown V1 type byte: 0x{type_byte:02x}").into())),
     };
     Ok(msg)
 }
@@ -390,7 +390,7 @@ pub async fn write_v2_magic<W: AsyncWriteExt + Unpin>(
     writer
         .write_all(&V2_MAGIC_BYTES)
         .await
-        .map_err(|e| crate::Error::Protocol(format!("write V2 magic: {e}")))?;
+        .map_err(|e| crate::Error::Protocol(format!("write V2 magic: {e}").into()))?;
     Ok(())
 }
 
@@ -403,7 +403,7 @@ pub async fn read_v2_magic_or_replay<R: AsyncReadExt + Unpin>(
 ) -> Result<Option<Vec<u8>>, crate::Error> {
     let mut buf = [0u8; V2_MAGIC_LEN];
     reader.read_exact(&mut buf).await
-        .map_err(|e| crate::Error::Protocol(format!("read V2 magic: {e}")))?;
+        .map_err(|e| crate::Error::Protocol(format!("read V2 magic: {e}").into()))?;
     if buf == V2_MAGIC_BYTES {
         Ok(None)
     } else {
@@ -424,7 +424,7 @@ pub async fn write_v2_frame_raw<W: AsyncWriteExt + Unpin>(
             "V2 payload too large: {} > {}",
             payload.len(),
             V2_MAX_FRAME_PAYLOAD
-        )));
+        ).into()));
     }
     let mut header = [0u8; V2_FRAME_HEADER_LEN];
     header[0..2].copy_from_slice(&frame_type.to_be_bytes());
@@ -445,7 +445,7 @@ pub async fn write_v2_frame_raw<W: AsyncWriteExt + Unpin>(
     out.extend_from_slice(&header);
     out.extend_from_slice(payload);
     writer.write_all(&out).await
-        .map_err(|e| crate::Error::Protocol(format!("write V2 frame: {e}")))?;
+        .map_err(|e| crate::Error::Protocol(format!("write V2 frame: {e}").into()))?;
     Ok(())
 }
 
@@ -456,7 +456,7 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
 ) -> Result<(u16, u16, Vec<u8>), crate::Error> {
     let mut header = [0u8; V2_FRAME_HEADER_LEN];
     reader.read_exact(&mut header).await
-        .map_err(|e| crate::Error::Protocol(format!("read V2 frame: {e}")))?;
+        .map_err(|e| crate::Error::Protocol(format!("read V2 frame: {e}").into()))?;
 
     let frame_type = u16::from_be_bytes([header[0], header[1]]);
     let flags = u16::from_be_bytes([header[2], header[3]]);
@@ -478,7 +478,7 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
     if payload_len > V2_MAX_FRAME_PAYLOAD as usize {
         return Err(crate::Error::Protocol(format!(
             "V2 frame payload too large: {payload_len}"
-        )));
+        ).into()));
     }
 
     // Use set_len to skip zero-initialization; read_exact fills the entire
@@ -491,7 +491,7 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
         v
     };
     reader.read_exact(&mut payload).await
-        .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}")))?;
+        .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
 
     Ok((frame_type, flags, payload))
 }
@@ -504,14 +504,14 @@ pub async fn write_msg_v2<W: AsyncWriteExt + Unpin>(
 ) -> Result<(), crate::Error> {
     let type_id = msg.v2_type_id();
     let json_bytes = serde_json::to_vec(msg)
-        .map_err(|e| crate::Error::Protocol(format!("V2 JSON serialize: {e}")))?;
+        .map_err(|e| crate::Error::Protocol(format!("V2 JSON serialize: {e}").into()))?;
 
     let mut payload = Vec::with_capacity(2 + json_bytes.len());
     payload.extend_from_slice(&type_id.to_be_bytes());
     payload.extend_from_slice(&json_bytes);
 
     write_v2_frame_raw(writer, V2_FRAME_TYPE_MESSAGE, 0, &payload).await?;
-    writer.flush().await.map_err(|e| crate::Error::Protocol(format!("flush after write_msg_v2: {e}")))?;
+    writer.flush().await.map_err(|e| crate::Error::Protocol(format!("flush after write_msg_v2: {e}").into()))?;
     Ok(())
 }
 
@@ -525,7 +525,7 @@ pub async fn read_msg_v2<R: AsyncReadExt + Unpin>(
         return Err(crate::Error::Protocol(format!(
             "unexpected V2 frame type: {frame_type}, expected {} (Message)",
             V2_FRAME_TYPE_MESSAGE
-        )));
+        ).into()));
     }
     if payload.len() < 2 {
         return Err(crate::Error::Protocol("V2 message payload too short".into()));

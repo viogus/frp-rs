@@ -31,7 +31,7 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
     };
     // Build TLS connector once — fail fast if it can't be created.
     let tls_connector = build_tls_connector(None, None, None).map_err(|e| {
-        frp_core::Error::Transport(format!("tls2raw plugin: TLS connector: {e}"))
+        frp_core::Error::Transport(format!("tls2raw plugin: TLS connector: {e}").into())
     })?;
     debug!(%target_addr, "tls2raw plugin: target TLS service at {target_addr}");
 

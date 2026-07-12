@@ -107,7 +107,7 @@ pub fn create_new_proxy_msg(
 pub async fn connect_local(addr: &str) -> Result<TcpStream, frp_core::Error> {
     let stream = TcpStream::connect(addr)
         .await
-        .map_err(|e| frp_core::Error::Transport(format!("connect to local {}: {}", addr, e)))?;
+        .map_err(|e| frp_core::Error::Transport(format!("connect to local {}: {}", addr, e).into()))?;
     frp_core::transport::set_nodelay(&stream);
     Ok(stream)
 }

@@ -64,7 +64,7 @@ async fn dispatch_plugin_start(
         }
         other => Err(frp_core::Error::Config(
             format!("unknown plugin type: {other}")
-        )),
+        .into())),
     }
 }
 

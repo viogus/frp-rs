@@ -76,10 +76,10 @@ where
 {
     use tokio::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
-        frp_core::Error::Transport(format!("{plugin_name} plugin: bind: {e}"))
+        frp_core::Error::Transport(format!("{plugin_name} plugin: bind: {e}").into())
     })?;
     let local_addr = listener.local_addr().map_err(|e| {
-        frp_core::Error::Transport(format!("{plugin_name} plugin: local_addr: {e}"))
+        frp_core::Error::Transport(format!("{plugin_name} plugin: local_addr: {e}").into())
     })?;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();

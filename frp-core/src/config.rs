@@ -921,6 +921,7 @@ pub fn load_server_config_from_str(content: &str) -> Result<ServerConfig, Box<dy
     let json_value = toml_to_json(value);
     let cfg: ServerConfig = serde_json::from_value(json_value)
         .map_err(|e| format!("config validation error: {e}"))?;
+    validate_server_config(&cfg)?;
     Ok(cfg)
 }
 
@@ -930,7 +931,67 @@ pub fn load_client_config_from_str(content: &str) -> Result<ClientConfig, Box<dy
     normalize_client_config(&mut value);
     let cfg: ClientConfig = serde_json::from_value(toml_to_json(value))
         .map_err(|e| format!("config validation error: {e}"))?;
+    validate_client_config(&cfg)?;
     Ok(cfg)
+}
+
+/// Validate proxy configs after deserialization. Catches invalid bandwidth
+/// limits, CR/LF in response headers, and other semantic issues that serde
+/// cannot express.
+fn validate_proxy_configs(proxies: &[ProxyConfig]) -> Result<(), String> {
+    for p in proxies {
+        // Validate response headers: no CR or LF in names or values
+        for (name, value) in &p.response_headers {
+            if name.contains('\r') || name.contains('\n') {
+                return Err(format!(
+                    "proxy '{}': response header name contains CR/LF: {name:?}",
+                    p.name
+                ));
+            }
+            if value.contains('\r') || value.contains('\n') {
+                return Err(format!(
+                    "proxy '{}': response header value for {name:?} contains CR/LF",
+                    p.name
+                ));
+            }
+        }
+
+        // Validate health check HTTP headers too (same CR/LF risk)
+        for (name, value) in &p.health_check_http_headers {
+            if name.contains('\r') || name.contains('\n') {
+                return Err(format!(
+                    "proxy '{}': health check header name contains CR/LF: {name:?}",
+                    p.name
+                ));
+            }
+            if value.contains('\r') || value.contains('\n') {
+                return Err(format!(
+                    "proxy '{}': health check header value for {name:?} contains CR/LF",
+                    p.name
+                ));
+            }
+        }
+
+        // Validate bandwidth_limit: non-empty strings must parse
+        if !p.bandwidth_limit.is_empty() && parse_bandwidth_limit(&p.bandwidth_limit).is_none() {
+            return Err(format!(
+                "proxy '{}': invalid bandwidth_limit: {:?}",
+                p.name, p.bandwidth_limit
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_server_config(_cfg: &ServerConfig) -> Result<(), String> {
+    // ServerConfig has no inline proxy definitions — proxies are registered
+    // by clients at runtime. No proxy-level validation to do here.
+    Ok(())
+}
+
+fn validate_client_config(cfg: &ClientConfig) -> Result<(), String> {
+    validate_proxy_configs(&cfg.proxies)?;
+    Ok(())
 }
 
 
@@ -1003,6 +1064,7 @@ fn load_config_from_file<C: serde::de::DeserializeOwned>(
     strict_config: bool,
     known_keys: fn() -> std::collections::HashSet<&'static str>,
     normalize: fn(&mut toml::Value),
+    validate: fn(&C) -> Result<(), String>,
 ) -> Result<C, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("{path}: failed to read config file: {e}"))?;
@@ -1018,6 +1080,7 @@ fn load_config_from_file<C: serde::de::DeserializeOwned>(
     let json_value = toml_to_json(value);
     let cfg: C = serde_json::from_value(json_value)
         .map_err(|e| format!("{path}: config validation error: {e}"))?;
+    validate(&cfg).map_err(|e| format!("{path}: {e}"))?;
     Ok(cfg)
 }
 
@@ -1115,7 +1178,7 @@ pub fn load_server_config(
     path: &str,
     strict_config: bool,
 ) -> Result<ServerConfig, Box<dyn std::error::Error>> {
-    load_config_from_file::<ServerConfig>(path, strict_config, known_server_keys, normalize_server_config)
+    load_config_from_file::<ServerConfig>(path, strict_config, known_server_keys, normalize_server_config, validate_server_config)
 }
 
 /// Load a client configuration from a file path, auto-detecting format by extension.
@@ -1124,7 +1187,7 @@ pub fn load_client_config(
     path: &str,
     strict_config: bool,
 ) -> Result<ClientConfig, Box<dyn std::error::Error>> {
-    load_config_from_file::<ClientConfig>(path, strict_config, known_client_keys, normalize_client_config)
+    load_config_from_file::<ClientConfig>(path, strict_config, known_client_keys, normalize_client_config, validate_client_config)
 }
 
 /// Process `includes` directives in a TOML config: for each glob pattern,

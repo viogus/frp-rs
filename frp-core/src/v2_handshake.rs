@@ -340,7 +340,7 @@ pub async fn v2_handshake_client(
         ClientHello::new_without_crypto(transport, tls, tcp_mux)
     };
     let client_hello_json = serde_json::to_vec(&hello)
-        .map_err(|e| crate::Error::Protocol(format!("serialize ClientHello: {e}")))?;
+        .map_err(|e| crate::Error::Protocol(format!("serialize ClientHello: {e}").into()))?;
     stream.write_raw_v2_frame(V2_FRAME_TYPE_CLIENT_HELLO, 0, &client_hello_json).await?;
 
     let (frame_type, _flags, server_hello_json) = tokio::time::timeout(
@@ -350,15 +350,15 @@ pub async fn v2_handshake_client(
     match frame_type {
         V2_FRAME_TYPE_SERVER_HELLO => {
             let server_hello: ServerHello = serde_json::from_slice(&server_hello_json)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize ServerHello: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize ServerHello: {e}").into()))?;
             if let Some(err) = server_hello.error {
-                return Err(crate::Error::Protocol(format!("ServerHello error: {err}")));
+                return Err(crate::Error::Protocol(format!("ServerHello error: {err}").into()));
             }
             if server_hello.selected.message.codec != "json" {
                 return Err(crate::Error::Protocol(format!(
                     "server selected unsupported codec: {}",
                     server_hello.selected.message.codec
-                )));
+                ).into()));
             }
 
             // If server selected crypto, validate and build context
@@ -366,19 +366,19 @@ pub async fn v2_handshake_client(
                 let algorithm = AeadAlgorithm::from_str(&crypto_sel.algorithm)
                     .map_err(|_| crate::Error::Protocol(format!(
                         "server selected unknown algorithm: {}", crypto_sel.algorithm
-                    )))?;
+                    ).into()))?;
                 if crypto_sel.server_random.len() != CRYPTO_RANDOM_SIZE {
                     return Err(crate::Error::Protocol(format!(
                         "invalid server random length: {}",
                         crypto_sel.server_random.len()
-                    )));
+                    ).into()));
                 }
                 // Validate server selected algo was in our offer
                 let offered = &hello.capabilities.crypto.algorithms;
                 if !offered.iter().any(|a| AeadAlgorithm::from_str(a) == Ok(algorithm)) {
                     return Err(crate::Error::Protocol(format!(
                         "server selected algorithm not offered by client: {}", crypto_sel.algorithm
-                    )));
+                    ).into()));
                 }
 
                 let transcript_hash = compute_transcript_hash(&client_hello_json, &server_hello_json);
@@ -394,7 +394,7 @@ pub async fn v2_handshake_client(
         }
         other => Err(crate::Error::Protocol(format!(
             "unexpected V2 frame type during handshake: {other}"
-        ))),
+        ).into())),
     }
 }
 
@@ -420,12 +420,12 @@ pub async fn v2_handshake_server(
     match frame_type {
         V2_FRAME_TYPE_CLIENT_HELLO => {
             let client_hello: ClientHello = serde_json::from_slice(&payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize ClientHello: {e}")))?;
+                .map_err(|e| crate::Error::Protocol(format!("deserialize ClientHello: {e}").into()))?;
 
             if !client_hello.capabilities.message.codecs.iter().any(|c| c == "json") {
                 let err_hello = ServerHello::with_error("unsupported message codec");
                 let json = serde_json::to_vec(&err_hello)
-                    .map_err(|e| crate::Error::Protocol(format!("serialize ServerHello: {e}")))?;
+                    .map_err(|e| crate::Error::Protocol(format!("serialize ServerHello: {e}").into()))?;
                 stream.write_raw_v2_frame(V2_FRAME_TYPE_SERVER_HELLO, 0, &json).await?;
                 return Err(crate::Error::Protocol("ClientHello rejected: unsupported codec".into()));
             }
@@ -445,7 +445,7 @@ pub async fn v2_handshake_server(
                 if client_random.len() != CRYPTO_RANDOM_SIZE {
                     return Err(crate::Error::Protocol(format!(
                         "invalid client random length: {}", client_random.len()
-                    )));
+                    ).into()));
                 }
 
                 let mut server_random = vec![0u8; CRYPTO_RANDOM_SIZE];
@@ -453,7 +453,7 @@ pub async fn v2_handshake_server(
                 let server_hello = ServerHello::with_crypto(algorithm, server_random);
 
                 let server_hello_json = serde_json::to_vec(&server_hello)
-                    .map_err(|e| crate::Error::Protocol(format!("serialize ServerHello: {e}")))?;
+                    .map_err(|e| crate::Error::Protocol(format!("serialize ServerHello: {e}").into()))?;
                 stream.write_raw_v2_frame(V2_FRAME_TYPE_SERVER_HELLO, 0, &server_hello_json).await?;
 
                 let transcript_hash = compute_transcript_hash(&payload, &server_hello_json);
@@ -463,7 +463,7 @@ pub async fn v2_handshake_server(
                 tracing::debug!(client_algorithms = ?client_algorithms, "[V2-HS] No crypto negotiated (client offered {:?})", client_algorithms);
                 let server_hello = ServerHello::default_ok();
                 let json = serde_json::to_vec(&server_hello)
-                    .map_err(|e| crate::Error::Protocol(format!("serialize ServerHello: {e}")))?;
+                    .map_err(|e| crate::Error::Protocol(format!("serialize ServerHello: {e}").into()))?;
                 stream.write_raw_v2_frame(V2_FRAME_TYPE_SERVER_HELLO, 0, &json).await?;
                 Ok((None, None))
             }
@@ -473,7 +473,7 @@ pub async fn v2_handshake_server(
         }
         other => Err(crate::Error::Protocol(format!(
             "unexpected V2 frame type on accept: {other}"
-        ))),
+        ).into())),
     }
 }
 

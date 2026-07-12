@@ -41,22 +41,134 @@ pub const EXIT_CONFIG: i32 = 2;    // bad config file, unknown field, invalid va
 pub const EXIT_AUTH: i32 = 3;      // bad token, OIDC failure
 pub const EXIT_BIND: i32 = 4;      // port in use, permission denied
 
+// ── Sub-error types with structured context ──────────────────────────
+
 #[derive(Error, Debug)]
-pub enum Error {
-    #[error("Protocol error: {0}")]
-    Protocol(String),
-    #[error("Transport error: {0}")]
-    Transport(String),
-    #[error("Auth error: {0}")]
-    Auth(String),
-    #[error("Config error: {0}")]
-    Config(String),
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Serde error: {0}")]
-    Serde(#[from] serde_json::Error),
+pub enum ProtocolError {
+    #[error("invalid V1 message length {length}, raw header: {header}")]
+    InvalidV1Length { length: u64, header: String },
+    #[error("V1 frame too large: {length} (max {max})")]
+    V1FrameTooLarge { length: u64, max: u64 },
+    #[error("V2 frame payload too large: {payload_len}")]
+    V2PayloadTooLarge { payload_len: usize },
+    #[error("read V1 payload: {source}")]
+    ReadV1Payload { #[source] source: std::io::Error },
+    #[error("read V2 payload: {source}")]
+    ReadV2Payload { #[source] source: std::io::Error },
+    #[error("deserialize {msg_type} (v1): {source}")]
+    DeserializeV1 { msg_type: &'static str, #[source] source: serde_json::Error },
+    #[error("deserialize {msg_type} (v2): {source}")]
+    DeserializeV2 { msg_type: &'static str, #[source] source: serde_json::Error },
+    #[error("write V1 frame: {source}")]
+    WriteV1Frame { #[source] source: std::io::Error },
+    #[error("write V2 frame: {source}")]
+    WriteV2Frame { #[source] source: std::io::Error },
+    #[error("serialize V1 msg: {source}")]
+    SerializeV1 { #[source] source: serde_json::Error },
     #[error("{0}")]
     Other(String),
+}
+
+impl From<String> for ProtocolError {
+    fn from(s: String) -> Self { ProtocolError::Other(s) }
+}
+
+impl From<&str> for ProtocolError {
+    fn from(s: &str) -> Self { ProtocolError::Other(s.to_string()) }
+}
+
+#[derive(Error, Debug)]
+pub enum TransportError {
+    #[error("TCP connect to {addr}: {source}")]
+    TcpConnect { addr: String, #[source] source: std::io::Error },
+    #[error("TLS handshake: {source}")]
+    TlsHandshake { #[source] source: std::io::Error },
+    #[error("KCP connect to {addr}: {source}")]
+    KcpConnect { addr: String, #[source] source: Box<dyn std::error::Error + Send + Sync> },
+    #[error("QUIC: {0}")]
+    Quic(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("WebSocket: {0}")]
+    WebSocket(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("TLS config: {source}")]
+    TlsConfig { #[source] source: std::io::Error },
+    #[error("plugin TLS connector: {source}")]
+    PluginTls { #[source] source: Box<dyn std::error::Error + Send + Sync> },
+    #[error("WebSocket upgrade: {0}")]
+    WebSocketUpgrade(String),
+    #[error("WebSocket TLS: {0}")]
+    WebSocketTls(String),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<String> for TransportError {
+    fn from(s: String) -> Self { TransportError::Other(s) }
+}
+
+impl From<&str> for TransportError {
+    fn from(s: &str) -> Self { TransportError::Other(s.to_string()) }
+}
+
+#[derive(Error, Debug)]
+pub enum AuthError {
+    #[error("timestamp required for authentication")]
+    TimestampRequired,
+    #[error("timestamp outside acceptable window")]
+    TimestampOutsideWindow,
+    #[error("invalid authentication token")]
+    InvalidToken,
+    #[error("OIDC auth requires server-side verifier (not configured)")]
+    OidcNotConfigured,
+    #[error("authentication token must not be empty with token auth method")]
+    EmptyToken,
+    #[error("login failed: {0}")]
+    LoginFailed(String),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<String> for AuthError {
+    fn from(s: String) -> Self { AuthError::Other(s) }
+}
+
+impl From<&str> for AuthError {
+    fn from(s: &str) -> Self { AuthError::Other(s.to_string()) }
+}
+
+#[derive(Error, Debug)]
+pub enum ConfigError {
+    #[error("{0}")]
+    Parse(String),
+    #[error("{0}")]
+    Validation(String),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<String> for ConfigError {
+    fn from(s: String) -> Self { ConfigError::Other(s) }
+}
+
+impl From<&str> for ConfigError {
+    fn from(s: &str) -> Self { ConfigError::Other(s.to_string()) }
+}
+
+// ── Parent Error ────────────────────────────────────────────────────
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("protocol error: {0}")]
+    Protocol(#[source] ProtocolError),
+    #[error("transport error: {0}")]
+    Transport(#[source] TransportError),
+    #[error("auth error: {0}")]
+    Auth(#[source] AuthError),
+    #[error("config error: {0}")]
+    Config(#[source] ConfigError),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
 }
 
 impl Error {

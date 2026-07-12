@@ -56,10 +56,10 @@ pub async fn start_visitor_plugin(
     }
 
     let listener = TcpListener::bind(&bind_addr).await.map_err(|e| {
-        frp_core::Error::Transport(format!("visitor plugin bind {}: {}", bind_addr, e))
+        frp_core::Error::Transport(format!("visitor plugin bind {}: {}", bind_addr, e).into())
     })?;
     let local_addr = listener.local_addr().map_err(|e| {
-        frp_core::Error::Transport(format!("visitor plugin local_addr: {}", e))
+        frp_core::Error::Transport(format!("visitor plugin local_addr: {}", e).into())
     })?;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();

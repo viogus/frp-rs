@@ -47,7 +47,7 @@ pub async fn start_https2https_plugin(cfg: &PluginConfig) -> Result<PluginHandle
     let host_rewrite = cfg.host_header_rewrite.clone();
     let tls_acceptor = build_tls_acceptor(&cfg.crt_file, &cfg.key_file, None)?;
     let tls_connector = build_tls_connector(None, None, None).map_err(|e| {
-        frp_core::Error::Transport(format!("https2https plugin: TLS connector: {e}"))
+        frp_core::Error::Transport(format!("https2https plugin: TLS connector: {e}").into())
     })?;
     serve_plugin("https2https", (target_addr, host_rewrite, tls_acceptor, tls_connector), |tcp, peer, (target, rewrite, acceptor, connector)| async move {
         match acceptor.accept(tcp).await {

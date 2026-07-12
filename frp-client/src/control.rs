@@ -8,6 +8,7 @@ use frp_core::protocol::write_msg_v1;
 use frp_core::auth::{AuthConfig, OidcClient};
 use frp_core::mux::{self, YamuxSession};
 use frp_core::transport::{IoStream, TransportProtocol, DialOptions, dial_server};
+use frp_core::TransportError;
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
 use frp_core::VERSION;
@@ -145,7 +146,7 @@ impl ControlConnection {
                 };
                 let ca_file = self.tls_ca_file.as_deref();
                 let (stream, qc) = frp_core::quic::dial_quic(&addr, server_name, ca_file).await
-                    .map_err(|e| frp_core::Error::Transport(format!("QUIC dial: {e}")))?;
+                    .map_err(|e| frp_core::Error::Transport(format!("QUIC dial: {e}").into()))?;
                 (IoStream::Quic(stream), None, Some(qc))
             } else {
                 let raw_stream = dial_server(&opts).await?;
@@ -279,7 +280,7 @@ impl ControlConnection {
         // Set auth: OIDC path or token path
         if let Some(ref oidc) = self.oidc_client {
             oidc.set_login(&mut login).await
-                .map_err(|e| frp_core::Error::Auth(format!("OIDC login: {e}")))?;
+                .map_err(|e| frp_core::Error::Auth(format!("OIDC login: {e}").into()))?;
         } else {
             login.privilege_key = self.auth_cfg.generate_login_key(timestamp);
         }
@@ -307,19 +308,19 @@ impl ControlConnection {
                 // derive_aead_control_keys returns (client_to_server, server_to_client)
                 let (write_key, read_key) = frp_core::crypto::derive_aead_control_keys(
                     token.as_bytes(), ctx.algorithm, &ctx.transcript_hash,
-                ).map_err(frp_core::Error::Protocol)?;
+                ).map_err(|e| frp_core::Error::Protocol(e.into()))?;
                 // Client reads from server → server_to_client
                 // Client writes to server → client_to_server
                 let aead = frp_core::crypto::AeadStream::new(
                     Box::new(io_stream), ctx.algorithm, &read_key, &write_key,
-                ).map_err(frp_core::Error::Protocol)?;
+                ).map_err(|e| frp_core::Error::Protocol(e.into()))?;
                 io_stream = IoStream::Aead(Box::new(aead));
             }
         }
         match resp_msg {
             FrpMessage::LoginResp(resp) => {
                 if let Some(err) = resp.error {
-                    return Err(frp_core::Error::Auth(format!("Login failed: {}", err)));
+                    return Err(frp_core::Error::Auth(format!("Login failed: {}", err).into()));
                 }
                 self.run_id = resp.run_id.clone().unwrap_or_default();
                 self.server_auth_scopes = resp.server_additional_auth_scopes.unwrap_or_default();
@@ -358,9 +359,9 @@ impl ControlConnection {
         let mut iterations = 0u32;
         loop {
             if iterations >= 100 {
-                return Err(frp_core::Error::Other(format!(
+                return Err(frp_core::Error::Transport(TransportError::Other(format!(
                     "Proxy '{}' registration failed: too many non-response messages", p.name
-                )));
+                ))));
             }
             iterations += 1;
             let resp_msg = if self.v2 {
@@ -371,9 +372,9 @@ impl ControlConnection {
             match resp_msg {
                 FrpMessage::NewProxyResp(resp) => {
                     if let Some(err) = resp.error {
-                        return Err(frp_core::Error::Other(format!(
+                        return Err(frp_core::Error::Transport(TransportError::Other(format!(
                             "Proxy '{}' registration failed: {err}", p.name
-                        )));
+                        ))));
                     }
                     info!(name = %p.name, remote_addr = ?resp.remote_addr, "Proxy '{}' registered on remote port {:?}", p.name, resp.remote_addr);
                     return Ok(resp);
@@ -414,9 +415,9 @@ impl ControlConnection {
         let mut iterations = 0u32;
         loop {
             if iterations >= 100 {
-                return Err(frp_core::Error::Other(format!(
+                return Err(frp_core::Error::Transport(TransportError::Other(format!(
                     "Visitor '{}' registration failed: too many non-response messages", v.name
-                )));
+                ))));
             }
             iterations += 1;
             let resp_msg = if self.v2 {
@@ -427,9 +428,9 @@ impl ControlConnection {
             match resp_msg {
                 FrpMessage::NewVisitorConnResp(resp) => {
                     if let Some(err) = resp.error {
-                        return Err(frp_core::Error::Other(format!(
+                        return Err(frp_core::Error::Transport(TransportError::Other(format!(
                             "Visitor '{}' registration failed: {err}", v.name
-                        )));
+                        ))));
                     }
                     info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}'", v.name, v.server_name);
                     return Ok(resp);

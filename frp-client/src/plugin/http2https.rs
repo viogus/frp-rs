@@ -39,7 +39,7 @@ pub async fn start_http2https_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
     };
     let host_rewrite = cfg.host_header_rewrite.clone();
     let tls_connector = build_tls_connector(None, None, None).map_err(|e| {
-        frp_core::Error::Transport(format!("http2https plugin: TLS connector: {e}"))
+        frp_core::Error::Transport(format!("http2https plugin: TLS connector: {e}").into())
     })?;
     serve_plugin("http2https", (target_addr, host_rewrite, tls_connector), |client, peer, (target, rewrite, connector)| async move {
         if let Err(e) = handle_conn(client, &target, &rewrite, &connector).await {
