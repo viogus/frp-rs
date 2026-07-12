@@ -915,17 +915,21 @@ fn default_vnet_mtu() -> u16 {
 /// - Flat auth_*, log_*, web_server_*, transport_* → nested structs
 /// - Field name differences (protocol → transport_protocol, etc.)
 pub fn load_server_config_from_str(content: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
-    let mut value: toml::Value = toml::from_str(content)?;
+    let mut value: toml::Value = toml::from_str(content)
+        .map_err(|e| format!("TOML parse error: {e}"))?;
     normalize_server_config(&mut value);
     let json_value = toml_to_json(value);
-    let cfg: ServerConfig = serde_json::from_value(json_value)?;
+    let cfg: ServerConfig = serde_json::from_value(json_value)
+        .map_err(|e| format!("config validation error: {e}"))?;
     Ok(cfg)
 }
 
 pub fn load_client_config_from_str(content: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
-    let mut value: toml::Value = toml::from_str(content)?;
+    let mut value: toml::Value = toml::from_str(content)
+        .map_err(|e| format!("TOML parse error: {e}"))?;
     normalize_client_config(&mut value);
-    let cfg: ClientConfig = serde_json::from_value(toml_to_json(value))?;
+    let cfg: ClientConfig = serde_json::from_value(toml_to_json(value))
+        .map_err(|e| format!("config validation error: {e}"))?;
     Ok(cfg)
 }
 
@@ -1000,9 +1004,11 @@ fn load_config_from_file<C: serde::de::DeserializeOwned>(
     known_keys: fn() -> std::collections::HashSet<&'static str>,
     normalize: fn(&mut toml::Value),
 ) -> Result<C, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("{path}: failed to read config file: {e}"))?;
     let format = detect_format(path);
-    let mut value: toml::Value = parse_to_toml_value(&content, format)?;
+    let mut value: toml::Value = parse_to_toml_value(&content, format)
+        .map_err(|e| format!("{path}: parse error: {e}"))?;
     let base_dir = Path::new(path).parent().unwrap_or(Path::new("."));
     process_includes(&mut value, base_dir)?;
     normalize(&mut value);
@@ -1010,7 +1016,8 @@ fn load_config_from_file<C: serde::de::DeserializeOwned>(
         run_strict_check(&value, &known_keys(), path)?;
     }
     let json_value = toml_to_json(value);
-    let cfg: C = serde_json::from_value(json_value)?;
+    let cfg: C = serde_json::from_value(json_value)
+        .map_err(|e| format!("{path}: config validation error: {e}"))?;
     Ok(cfg)
 }
 
