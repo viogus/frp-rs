@@ -565,7 +565,7 @@ fn print_status_table(body: &str) {
                     let local = entry["local_addr"].as_str().unwrap_or("").to_string();
                     let remote = entry["remote_addr"].as_str().unwrap_or("").to_string();
                     let err = entry["err"].as_str().unwrap_or("").to_string();
-                    rows.push((name.clone(), ptype, status, local, remote, err));
+                    rows.push((name, ptype, status, local, remote, err));
                 }
             }
         }
@@ -593,7 +593,7 @@ fn print_status_table(body: &str) {
 
     for (name, ptype, status, local, remote, err) in &rows {
         let truncated_err = if err.len() > 40 {
-            format!("{}...", &err[..37])
+            format!("{}...", err.chars().take(37).collect::<String>())
         } else {
             err.clone()
         };
