@@ -70,12 +70,12 @@ Reconciliation confirmed all of these landed after the doc's original scan:
 
 ### Quick / polish (low effort)
 
-- **3.2 `/healthz` readiness — PARTIAL.** Liveness OK; readiness (`?probe=readiness`) only try-locks two RwLocks. Plan wanted "internal channels alive, proxy manager responsive". `frp-server/src/dashboard.rs:361-388`. Effort: 1h.
 - **3.1 structured-log conversion — remainder.** OTLP + `#[instrument]` done, but many `info!("foo {bar}")` lines not yet `info!(bar=%bar, "foo")` for queryability. Effort: 0.5d, mechanical.
 
 ### Done this pass
 
 - **6.3 Benchmark expansion — DONE** (2026-07-12, `0780a54`). Scoping corrected the item: protocol ser/de was already covered (`protocol_all_types`, all 21 V1+V2 types — TODO's "missing" claim was stale); connection-accept latency belongs in the e2e harness (`latency-baseline.sh setup` mode), not a criterion microbench (kernel/TLS noise dominates). The one genuine gap — **proxy-registration throughput** — added as `frp-server/benches/proxy_registration.rs` (register_single / register_1000 / register_with_group / proxy_info_construct). Also fixed a latent no-op: `crypto_bridge.rs` `v2_serialize_{name}` was duplicating V1 `serde_json` and discarding output; now measures the real `write_msg_v2` framing path.
+- **3.2 `/healthz` readiness — DONE** (2026-07-12, `1aad907`). Readiness now checks `shutdown_token.is_cancelled()` BEFORE the lock probes — a draining server returns 503 "draining" so orchestrators stop routing new traffic (liveness still OK). Added `ProxyManager::is_responsive()` (non-blocking `try_read()` on the proxy registry), probed alongside `used_ports` and `run_id_to_ctl_tx`. Integration test verifies fresh server returns 200. (Draining unit test not feasible: `AppState::new` takes 22 internal params and has no test constructor — the draining check is a one-liner with clear semantics.)
 
 ### Performance remaining (perf program follow-ups)
 
@@ -98,13 +98,13 @@ Reconciliation confirmed all of these landed after the doc's original scan:
 
 | Bucket | Count |
 |--------|-------|
-| Shipped (DONE) | 23 |
-| Open — polish (PARTIAL) | 2 (3.1 log fields, 3.2 healthz readiness) |
+| Shipped (DONE) | 24 |
+| Open — polish (PARTIAL) | 1 (3.1 log fields) |
 | Open — perf | 0 (5.6 shipped, 5.7 rejected) |
 | Open — innovation | 0 (#51/#52 closed not-planned) |
 | Closed / declined | 5 (#51 gRPC, #52 WASM, #63 mirror, #66 lz4, 5.7 quinn-slim) |
 
 **0 open issues.** No parity gaps. Perf follow-ups resolved (5.6 shipped, 5.7
-rejected on measurement); 6.3 benches done. Innovation issues closed not-planned
-after necessity review. Only remaining optional work is observability polish:
-3.1 (structured-log fields) and 3.2 (`/healthz` readiness).
+rejected on measurement); 6.3 benches done; 3.2 healthz readiness done.
+Innovation issues closed not-planned after necessity review. Only one remaining
+optional item: 3.1 (structured-log field conversion).
