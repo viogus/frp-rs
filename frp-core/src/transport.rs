@@ -74,7 +74,8 @@ impl std::str::FromStr for TransportProtocol {
             "wss" => TransportProtocol::Wss,
             #[cfg(feature = "quic")]
             "quic" => TransportProtocol::Quic,
-            _ => TransportProtocol::Tcp,
+            "tcp" => TransportProtocol::Tcp,
+            _ => return Err(()),
         })
     }
 }
