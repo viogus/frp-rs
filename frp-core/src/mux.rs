@@ -188,6 +188,10 @@ where
     // poll picks up queued stream writes into pending_frames; the second
     // poll actually sends them on the wire.
     let keepalive = mux_cfg.keepalive_interval;
+    debug_assert!(
+        !keepalive.is_zero(),
+        "tcp_mux_keepalive_interval must be > 0; zero causes immediate timeout Elapsed"
+    );
     tokio::task::spawn(async move {
         loop {
             let result = tokio::time::timeout(
@@ -284,6 +288,10 @@ where
     let conn = Arc::new(Mutex::new(conn));
     let bg_conn = conn.clone();
     let keepalive = mux_cfg.keepalive_interval;
+    debug_assert!(
+        !keepalive.is_zero(),
+        "tcp_mux_keepalive_interval must be > 0; zero causes tight select! spin"
+    );
 
     tokio::task::spawn(async move {
         loop {

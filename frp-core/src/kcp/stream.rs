@@ -1,16 +1,17 @@
 //! KCP stream — AsyncRead + AsyncWrite over a KCP session.
 
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
-use super::socket::WriteRequest;
+use super::socket::{WriteRequest, KCP_WRITE_BACKLOG_THRESHOLD};
 
 static KCP_READ_BYTES: AtomicU64 = AtomicU64::new(0);
 #[cfg(debug_assertions)]
@@ -31,6 +32,14 @@ pub struct KcpStream {
     shutdown: bool,
     /// Pending flush confirmation — set by poll_flush, cleared on receipt.
     flush_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Shared write backlog counter with KcpSocket. poll_write gates on this
+    /// to prevent unbounded write_rx channel growth under high packet loss.
+    write_backlog: Arc<AtomicUsize>,
+    /// Woken by KcpSocket when backlog drains below threshold.
+    write_notify: Arc<Notify>,
+    /// Pending backpressure wait future. Created when write backlog is full;
+    /// resolved when KcpSocket drains enough backlog and calls notify_waiters().
+    backpressure_fut: Option<Pin<Box<tokio::sync::futures::Notified<'static>>>>,
 }
 
 impl KcpStream {
@@ -39,6 +48,8 @@ impl KcpStream {
         peer_addr: SocketAddr,
         write_tx: mpsc::UnboundedSender<(u32, WriteRequest)>,
         read_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        write_backlog: Arc<AtomicUsize>,
+        write_notify: Arc<Notify>,
     ) -> Self {
         Self {
             conv,
@@ -51,6 +62,9 @@ impl KcpStream {
             write_count: 0,
             shutdown: false,
             flush_rx: None,
+            write_backlog,
+            write_notify,
+            backpressure_fut: None,
         }
     }
 
@@ -134,7 +148,7 @@ impl AsyncRead for KcpStream {
 impl AsyncWrite for KcpStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         if self.shutdown {
@@ -142,6 +156,43 @@ impl AsyncWrite for KcpStream {
                 io::ErrorKind::NotConnected,
                 "KCP stream shut down",
             )));
+        }
+
+        // If we were blocked on write backpressure, poll the Notified future
+        // to see if KcpSocket has drained enough backlog.
+        if let Some(ref mut fut) = self.backpressure_fut {
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    self.backpressure_fut = None;
+                    // Fall through to re-check backlog and try send.
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        // Gate: if write_rx channel backlog is too high, apply backpressure.
+        // This prevents unbounded memory growth in the mpsc channel when
+        // KCP send window is full (high packet loss / slow peer).
+        let backlog = self.write_backlog.load(Ordering::Relaxed);
+        if backlog >= KCP_WRITE_BACKLOG_THRESHOLD {
+            // Create a Notified future to wait for KcpSocket to drain backlog.
+            // SAFETY: write_notify is Arc<Notify>; the Notify lives as long as
+            // KcpStream. The Notified future borrows from this stable allocation.
+            let notified: tokio::sync::futures::Notified<'static> = unsafe {
+                std::mem::transmute(self.write_notify.notified())
+            };
+            self.backpressure_fut = Some(Box::pin(notified));
+            // Re-poll the newly created future with the current waker.
+            if let Some(ref mut fut) = self.backpressure_fut {
+                match fut.as_mut().poll(cx) {
+                    Poll::Ready(()) => {
+                        self.backpressure_fut = None;
+                        // Backlog drained between check and notify registration.
+                        // Fall through to send.
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
         }
 
         tracing::trace!(
@@ -160,6 +211,7 @@ impl AsyncWrite for KcpStream {
         }
 
         // Fire-and-forget: KCP's send window handles backpressure.
+        // Channel backpressure is handled by the backlog gate above.
         // Write errors surface via the driver's debug log.
 
         let n = buf.len();
