@@ -75,5 +75,12 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
 
     tokio::spawn(async move { kcp_socket.run().await });
 
-    Ok(KcpStream::new(conv, remote, handle.write_tx, read_rx))
+    Ok(KcpStream::new(
+        conv,
+        remote,
+        handle.write_tx,
+        read_rx,
+        handle.write_backlog.clone(),
+        handle.write_notify.clone(),
+    ))
 }

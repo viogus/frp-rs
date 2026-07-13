@@ -3,16 +3,22 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::time::{interval, Duration};
 
 use super::config::KcpConfig;
 use super::session::KcpSession;
 use super::stream::KcpStream;
+
+/// Max unprocessed write requests before KcpStream::poll_write applies
+/// backpressure (returns Poll::Pending). Prevents unbounded memory growth
+/// in the write_rx mpsc channel under high packet loss.
+pub(crate) const KCP_WRITE_BACKLOG_THRESHOLD: usize = 1024;
 
 pub(crate) enum WriteRequest {
     Data(Vec<u8>),
@@ -25,16 +31,27 @@ pub(crate) struct KcpSocketHandle {
     /// Channel to send newly accepted streams back to KcpListener::accept().
     #[allow(dead_code)]
     pub accept_tx: mpsc::UnboundedSender<KcpStream>,
+    /// Shared write backlog counter: incremented by KcpSocket on recv from
+    /// write_rx, decremented after processing. KcpStream reads this to gate
+    /// poll_write before sending.
+    pub write_backlog: Arc<AtomicUsize>,
+    /// Wakes KcpStream poll_write tasks blocked on write backpressure.
+    pub write_notify: Arc<Notify>,
 }
 
 pub(crate) struct KcpSocket {
     socket: Arc<UdpSocket>,
     config: KcpConfig,
     sessions: HashMap<(u32, SocketAddr), KcpSession>,
+    /// conv → peer addr index for O(1) write-path lookups.
+    /// Avoids O(n) `iter().find()` on `sessions` in Data/Flush handlers.
+    conv_index: HashMap<u32, SocketAddr>,
     write_tx: mpsc::UnboundedSender<(u32, WriteRequest)>,
     write_rx: mpsc::UnboundedReceiver<(u32, WriteRequest)>,
     register_rx: mpsc::UnboundedReceiver<(u32, SocketAddr, KcpSession)>,
     accept_tx: mpsc::UnboundedSender<KcpStream>,
+    write_backlog: Arc<AtomicUsize>,
+    write_notify: Arc<Notify>,
     start: Instant,
 }
 
@@ -46,20 +63,27 @@ impl KcpSocket {
         let (write_tx, write_rx) = mpsc::unbounded_channel();
         let (register_tx, register_rx) = mpsc::unbounded_channel();
         let (accept_tx, accept_rx) = mpsc::unbounded_channel();
+        let write_backlog = Arc::new(AtomicUsize::new(0));
+        let write_notify = Arc::new(Notify::new());
         let this = Self {
             socket,
             config,
             sessions: HashMap::new(),
+            conv_index: HashMap::new(),
             write_tx: write_tx.clone(),
             write_rx,
             register_rx,
             accept_tx: accept_tx.clone(),
+            write_backlog: write_backlog.clone(),
+            write_notify: write_notify.clone(),
             start: Instant::now(),
         };
         let handle = KcpSocketHandle {
             write_tx,
             register_tx,
             accept_tx,
+            write_backlog,
+            write_notify,
         };
         (this, handle, accept_rx)
     }
@@ -69,6 +93,7 @@ impl KcpSocket {
         // This prevents a race where recv_from fires before register_tx is processed,
         // causing FEC fallback to create a duplicate session with wrong conv.
         while let Ok((conv, addr, session)) = self.register_rx.try_recv() {
+            self.conv_index.insert(conv, addr);
             self.sessions.insert((conv, addr), session);
         }
 
@@ -102,16 +127,19 @@ impl KcpSocket {
                     }
                     for key in to_remove {
                         self.sessions.remove(&key);
+                        self.conv_index.remove(&key.0);
                     }
                 }
 
                 Some((conv, req)) = self.write_rx.recv() => {
+                    self.write_backlog.fetch_add(1, Ordering::Relaxed);
                     match req {
                         WriteRequest::Data(data) => {
                             let len = data.len();
-                            let _result = self.sessions.iter_mut()
-                                .find(|((c, _), _)| *c == conv)
-                                .map(|(_, s)| s.send(&data))
+                            // O(1) lookup via conv_index instead of O(n) iter().find().
+                            let _result = self.conv_index.get(&conv)
+                                .and_then(|addr| self.sessions.get_mut(&(conv, *addr)))
+                                .map(|s| s.send(&data))
                                 .unwrap_or_else(|| Err(io::Error::new(io::ErrorKind::NotConnected, "session not found")));
                             if let Err(ref e) = _result {
                                 tracing::error!(conv, len, error = %e, "KCP SOCKET: write failed — session not found");
@@ -126,9 +154,9 @@ impl KcpSocket {
                             // before bridge data so Go frpc can process them as
                             // separate messages.
                             tracing::trace!(conv, "KCP SOCKET: flush");
-                            let packets = if let Some(session) = self.sessions.iter_mut()
-                                .find(|((c, _), _)| *c == conv)
-                                .map(|(_, s)| s)
+                            let addr = self.conv_index.get(&conv).copied();
+                            let packets = if let Some(session) = addr
+                                .and_then(|a| self.sessions.get_mut(&(conv, a)))
                             {
                                 let now_ms = self.start.elapsed().as_millis() as u32;
                                 match session.force_flush(now_ms) {
@@ -142,19 +170,21 @@ impl KcpSocket {
                                 Vec::new()
                             };
                             // Send all output packets immediately.
-                            let peer = self.sessions.iter()
-                                .find(|((c, _), _)| *c == conv)
-                                .map(|((_, a), _)| *a);
-                            if let Some(addr) = peer {
+                            if let Some(peer_addr) = addr {
                                 for pkt in &packets {
-                                    if let Err(e) = self.socket.send_to(pkt, addr).await {
-                                        tracing::debug!(conv, peer = %addr, error = %e, "KCP SOCKET: flush send error");
+                                    if let Err(e) = self.socket.send_to(pkt, peer_addr).await {
+                                        tracing::debug!(conv, peer = %peer_addr, error = %e, "KCP SOCKET: flush send error");
                                     }
                                 }
                             }
                             tracing::trace!(conv, npkts = packets.len(), "KCP SOCKET: flush sent {} packets", packets.len());
                             let _ = tx.send(());
                         }
+                    }
+                    let prev = self.write_backlog.fetch_sub(1, Ordering::Release);
+                    // Wake blocked KcpStream writers when backlog drops below threshold.
+                    if prev == KCP_WRITE_BACKLOG_THRESHOLD {
+                        self.write_notify.notify_waiters();
                     }
                 }
 
@@ -180,6 +210,9 @@ impl KcpSocket {
                                     && (u16::from_le_bytes([data[4], data[5]]) == 0xf1
                                         || u16::from_le_bytes([data[4], data[5]]) == 0xf2);
                                 let fec_key = if is_fec {
+                                    // Find the session matching this peer addr.
+                                    // .copied() converts Option<&(u32, SocketAddr)>
+                                    // to Option<(u32, SocketAddr)>.
                                     self.sessions.keys()
                                         .find(|(_, a)| *a == src)
                                         .copied()
@@ -205,8 +238,11 @@ impl KcpSocket {
                                         key.0, src,
                                         self.write_tx.clone(),
                                         read_rx,
+                                        self.write_backlog.clone(),
+                                        self.write_notify.clone(),
                                     );
                                     let _ = self.accept_tx.send(stream);
+                                    self.conv_index.insert(key.0, key.1);
                                     self.sessions.insert(key, session);
                                 }
                             }
@@ -219,6 +255,7 @@ impl KcpSocket {
 
                 Some((conv, addr, session)) = self.register_rx.recv() => {
                     let key = (conv, addr);
+                    self.conv_index.insert(conv, addr);
                     self.sessions.insert(key, session);
                 }
             }
