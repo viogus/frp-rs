@@ -135,6 +135,8 @@ pub async fn run_tcpmux_listener(
             let first_line = match request_text.lines().next() {
                 Some(line) => line,
                 None => {
+                    // Client disconnected or sent garbage — write failure is
+                    // expected and there is no recovery path.
                     let _ = stream
                         .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
                         .await;
