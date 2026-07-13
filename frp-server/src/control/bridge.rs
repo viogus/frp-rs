@@ -258,8 +258,12 @@ async fn relay_plain_fast(
     use std::sync::atomic::Ordering;
 
     // On Linux, try zero-copy splice for Tcp-to-Tcp.
+    // Check with references first to avoid consuming streams on mismatch.
     #[cfg(target_os = "linux")]
-    if let (IoStream::Tcp(user), IoStream::Tcp(work)) = (user_conn, work_conn) {
+    if let (IoStream::Tcp(_), IoStream::Tcp(_)) = (&user_conn, &work_conn) {
+        let (IoStream::Tcp(user), IoStream::Tcp(work)) = (user_conn, work_conn) else {
+            unreachable!()
+        };
         match frp_core::bridge::bridge_plain_zero_copy(user, work).await {
             Ok((a, b)) => {
                 metrics.bytes_in.fetch_add(a, Ordering::Relaxed);
