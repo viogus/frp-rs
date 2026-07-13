@@ -171,6 +171,8 @@ pub(crate) async fn write_http_error(
     status_line: &str,
     custom_body: &str,
 ) {
+    // Write failures here mean the client disconnected before receiving the
+    // error response — there is no recovery path, so we silently drop them.
     if custom_body.is_empty() {
         let _ = stream.write_all(
             format!("{status_line}\r\nContent-Length: 0\r\n\r\n").as_bytes(),

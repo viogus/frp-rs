@@ -32,3 +32,58 @@ pub fn default_kcp_config() -> KcpConfig {
         flush_write: true,
     }
 }
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::{timeout, Duration};
+
+    /// Full KCP roundtrip over real UDP: bind → dial → accept → send both ways.
+    #[tokio::test]
+    async fn kcp_roundtrip_udp_socket() {
+        let config = KcpConfig {
+            // Disable FEC for simplicity; FEC encode/decode tested in session.rs.
+            data_shards: 0,
+            parity_shards: 0,
+            ..default_kcp_config()
+        };
+
+        // Bind on random port. Port 0 guarantees no conflict.
+        let mut listener = KcpListener::bind("127.0.0.1:0", config.clone())
+            .await
+            .expect("bind KCP listener");
+        let addr = listener.local_addr().expect("local_addr");
+
+        // Dial from client; write data immediately so the server's driver
+        // detects the new peer and pushes a stream through accept_tx.
+        let mut client = dial_kcp(&addr.to_string(), config).await.expect("dial");
+        client.write_all(b"hello from client").await.unwrap();
+        client.flush().await.unwrap();
+
+        // Now the server can accept — the driver has already created a session
+        // from the incoming UDP data.
+        let mut server = timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("accept timeout")
+            .expect("accept");
+
+        // Read what the client sent.
+        let mut buf = vec![0u8; 64];
+        let n = timeout(Duration::from_secs(5), server.read(&mut buf))
+            .await
+            .expect("read timeout")
+            .expect("server read");
+        assert_eq!(&buf[..n], b"hello from client");
+
+        // Server → Client: write back and read on client side.
+        server.write_all(b"hello from server").await.unwrap();
+        server.flush().await.unwrap();
+
+        let n = timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("read timeout")
+            .expect("client read");
+        assert_eq!(&buf[..n], b"hello from server");
+    }
+}

@@ -26,19 +26,29 @@ struct ShardGroup {
 }
 
 /// Writer that collects each `write_all` call as a separate packet.
+///
+/// `drain()` replaces the internal Vec with a fresh pre-allocated one so that
+/// `write()` calls between drains don't reallocate the outer Vec on every push.
 struct KcpWriter {
     packets: Vec<Vec<u8>>,
 }
 
+/// Typical number of KCP output packets per tick. Pre-allocating avoids
+/// repeated reallocation of the outer Vec during the `write()` flush loop.
+const PACKET_POOL_CAPACITY: usize = 64;
+
 impl KcpWriter {
     fn new() -> Self {
         Self {
-            packets: Vec::new(),
+            packets: Vec::with_capacity(PACKET_POOL_CAPACITY),
         }
     }
 
     fn drain(&mut self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut self.packets)
+        // Replace current batch with a fresh pre-allocated Vec.
+        // The old batch is returned; the new Vec starts with capacity 64,
+        // ready for the next KCP tick's output without reallocation.
+        std::mem::replace(&mut self.packets, Vec::with_capacity(PACKET_POOL_CAPACITY))
     }
 }
 
@@ -108,7 +118,7 @@ impl KcpSession {
             config,
             fec_seqid: 0,
             shard_groups: HashMap::new(),
-            recv_buf: vec![0u8; 16384],
+            recv_buf: Vec::new(), // lazily allocated on first recv_and_push
             read_tx,
             shutdown: false,
             pending_shards: Vec::new(),
@@ -319,6 +329,20 @@ impl KcpSession {
 
             // Attempt FEC recovery when we have enough shards.
             if group.received_count >= self.config.data_shards {
+                // Track which data shards were already received (to avoid double-feed).
+                let mut had_data = vec![false; self.config.data_shards];
+                for (i, s) in group.shards.iter().enumerate().take(self.config.data_shards) {
+                    had_data[i] = s.is_some();
+                }
+
+                // Fast path: all data shards present, no recovery needed.
+                // Skip the expensive pad+decode+feed_recovered steps.
+                let all_present = had_data.iter().all(|&b| b);
+                if all_present {
+                    self.shard_groups.remove(&shard_begin);
+                    return Ok(());
+                }
+
                 // Normalize shard lengths to max (Go: zero-extend shorter shards).
                 let max_len = group
                     .shards
@@ -327,12 +351,6 @@ impl KcpSession {
                     .map(|s| s.len())
                     .max()
                     .unwrap_or(0);
-
-                // Track which data shards were already received (to avoid double-feed).
-                let mut had_data = vec![false; self.config.data_shards];
-                for (i, s) in group.shards.iter().enumerate().take(self.config.data_shards) {
-                    had_data[i] = s.is_some();
-                }
 
                 let mut decode_shards: Vec<Option<Vec<u8>>> = group
                     .shards
