@@ -75,9 +75,14 @@ impl MockOidcProvider {
             .route("/jwks", get(oidc_jwks))
             .with_state(state.clone());
 
-        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
-            .await
+        let socket = tokio::net::TcpSocket::new_v4().expect("create mock OIDC socket");
+        socket
+            .set_reuseaddr(true)
+            .expect("set SO_REUSEADDR on mock OIDC socket");
+        socket
+            .bind(format!("127.0.0.1:{}", port).parse().unwrap())
             .expect("bind mock OIDC provider");
+        let listener = socket.listen(128).expect("listen mock OIDC");
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
