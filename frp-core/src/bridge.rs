@@ -714,10 +714,7 @@ pub async fn bridge_plain_zero_copy(
     // If both directions panicked, propagate error.
     match (r1, r2) {
         (Err(e), _) | (_, Err(e)) if e.is_panic() => {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("splice panic: {e}"),
-            ))
+            Err(std::io::Error::other(format!("splice panic: {e}")))
         }
         _ => Ok((
             u2w_bytes.load(Ordering::Relaxed),
