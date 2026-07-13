@@ -9,6 +9,21 @@ use crate::encryption;
 use crate::transport::IoStream;
 use tracing::instrument;
 
+/// Emit a TRACE-level event with a hex-encoded field.
+///
+/// In release builds (`debug_assertions` off), the entire call is compiled
+/// away so `hex::encode` is never evaluated.  In debug builds the standard
+/// `tracing::trace!` static-filter guard still applies.
+macro_rules! trace_hex {
+    ($($arg:tt)*) => {
+        if cfg!(debug_assertions) {
+            if tracing::level_enabled!(tracing::Level::TRACE) {
+                tracing::trace!($($arg)*);
+            }
+        }
+    };
+}
+
 /// Compress a plaintext chunk into a reusable buffer, or return a reference
 /// to the original data when compression is disabled.
 ///
@@ -272,7 +287,7 @@ pub async fn bridge_plain(
                     break;
                 }
                 Ok(n) => {
-                    tracing::trace!(n, first_hex = %hex::encode(&buf.data()[..n.min(32)]), "bridge_plain: user_r read {} bytes", n);
+                    trace_hex!(n, first_hex = %hex::encode(&buf.data()[..n.min(32)]), "bridge_plain: user_r read {} bytes", n);
                     if let Some(ref m) = metrics {
                         m.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
                     }
@@ -327,7 +342,7 @@ pub async fn bridge_plain(
                     break;
                 }
                 Ok(n) => {
-                    tracing::trace!(n, first_hex = %hex::encode(&buf.data()[..n.min(32)]), "bridge_plain: work_r read {} bytes", n);
+                    trace_hex!(n, first_hex = %hex::encode(&buf.data()[..n.min(32)]), "bridge_plain: work_r read {} bytes", n);
                     n
                 }
                 Err(e) => {
@@ -599,26 +614,39 @@ mod tests {
     }
 }
 
-/// Plain (unencrypted) bidirectional bridge with optional bandwidth limiting.
+/// Plain (unencrypted) bidirectional bridge with optional bandwidth limiting
+/// and compression.
 ///
 /// Uses the same `join!`-of-two-halves pattern as `bridge_encrypted` so that
-/// both directions run to completion independently. When neither limiter is
-/// active this is equivalent to `tokio::io::copy_bidirectional`.
+/// both directions run to completion independently. Supports compression
+/// (Snappy) with reusable buffers, matching `bridge_plain`.
 ///
 /// `read_limiter` throttles work→user (download).
 /// `write_limiter` throttles user→work (upload).
+#[allow(clippy::too_many_arguments)]
 pub async fn bridge_plain_rate_limited(
     mut user_r: impl AsyncReadExt + Unpin,
     mut user_w: impl AsyncWriteExt + Unpin,
     mut work_r: impl AsyncReadExt + Unpin,
     mut work_w: impl AsyncWriteExt + Unpin,
+    use_compression: bool,
+    pre_read: Vec<u8>,
     mut read_limiter: Option<&mut BandwidthLimiter>,
     mut write_limiter: Option<&mut BandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
+    let had_pre_read = !pre_read.is_empty();
+
     // User → Work
     let user_to_work = async {
+        if !pre_read.is_empty()
+            && work_w.write_all(&pre_read).await.is_err()
+        {
+            return;
+        }
         let mut buf = PoolGuard::acquire();
+        let cap = buf.as_mut_slice().len();
+        let mut comp_buf = Vec::new(); // reusable compression buffer
         loop {
             let n = match user_r.read(buf.as_mut_slice()).await {
                 Ok(0) => break,
@@ -630,33 +658,77 @@ pub async fn bridge_plain_rate_limited(
                 }
                 Err(_) => break,
             };
-            if let Some(ref mut lim) = write_limiter {
-                lim.consume(n).await;
+
+            if use_compression {
+                if compress_chunk_into(&buf.data()[..n], true, &mut comp_buf).is_none() {
+                    break;
+                }
+                if let Some(ref mut lim) = write_limiter {
+                    lim.consume(comp_buf.len()).await;
+                }
+                if work_w.write_all(&comp_buf).await.is_err() { break; }
+            } else {
+                let slice = &buf.data()[..n];
+                if let Some(ref mut lim) = write_limiter {
+                    lim.consume(slice.len()).await;
+                }
+                if work_w.write_all(slice).await.is_err() { break; }
             }
-            if work_w.write_all(&buf.data()[..n]).await.is_err() { break; }
-            if work_w.flush().await.is_err() { break; }
+            // Conditional flush: batch on full reads unless compressing
+            // (matching bridge_plain behavior).
+            if (use_compression || n < cap) && work_w.flush().await.is_err() { break; }
         }
-        // Signal EOF to work side so the peer knows we're done writing
-        let _ = work_w.shutdown().await;
+        let _ = work_w.flush().await;
+        if !had_pre_read {
+            let _ = work_w.shutdown().await;
+        }
     };
 
     // Work → User
     let work_to_user = async {
         let mut buf = PoolGuard::acquire();
+        let cap = buf.as_mut_slice().len();
+        let mut decomp_buf = Vec::new(); // reusable decompression buffer
+        let mut decompressor = make_decompressor(use_compression);
         loop {
             let n = match work_r.read(buf.as_mut_slice()).await {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(_) => break,
             };
-            if let Some(ref mut lim) = read_limiter {
-                lim.consume(n).await;
+            let plaintext = match decompress_chunk_into(
+                &mut decompressor, &buf.data()[..n], &mut decomp_buf,
+            ) {
+                Some(p) => p,
+                None => break,
+            };
+            if !plaintext.is_empty() {
+                if let Some(ref mut lim) = read_limiter {
+                    lim.consume(plaintext.len()).await;
+                }
+                if user_w.write_all(plaintext).await.is_err() { break; }
+                if let Some(ref m) = metrics {
+                    m.bytes_out.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
+                }
+                if (use_compression || n < cap) && user_w.flush().await.is_err() { break; }
             }
-            if user_w.write_all(&buf.data()[..n]).await.is_err() { break; }
-            if let Some(ref m) = metrics {
-                m.bytes_out.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        // Flush remaining buffered compressed data
+        if let Some(ref mut dec) = decompressor {
+            match dec.flush() {
+                Ok(plaintext) if !plaintext.is_empty() => {
+                    let _ = user_w.write_all(&plaintext).await;
+                    if let Some(ref m) = metrics {
+                        m.bytes_out.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
+                    }
+                    let _ = user_w.flush().await;
+                }
+                #[cfg(feature = "compression")]
+                Err(e) => {
+                    tracing::warn!(error = %e, "snappy flush error in rate-limited bridge: {}", e);
+                }
+                _ => {}
             }
-            if user_w.flush().await.is_err() { break; }
         }
         let _ = user_w.shutdown().await;
     };
@@ -722,7 +794,9 @@ pub async fn bridge_plain_zero_copy(
     // Wait for both directions.
     let (r1, r2) = tokio::join!(u2w, w2u);
 
-    // Clean up pipe fds.
+    // SAFETY: pipe fds were created by create_pipe() above and are valid.
+    // close() is safe to call on valid file descriptors; errors are ignored
+    // since these are cleanup fds and we cannot recover anyway.
     unsafe {
         libc::close(u2w_r);
         libc::close(u2w_w);
@@ -754,7 +828,10 @@ fn splice_relay(
 ) -> std::io::Result<()> {
     use std::sync::atomic::Ordering;
     loop {
-        // Move data from source socket into pipe.
+        // SAFETY: fd_in and pipe_wr are valid file descriptors (fd_in is
+        // a kernel socket fd, pipe_wr was created by create_pipe). null
+        // off_out/off_in pointers tell the kernel to use the current file
+        // offset. PIPE_CAPACITY is a safe upper bound.
         let n = unsafe {
             libc::splice(
                 fd_in,
@@ -779,6 +856,9 @@ fn splice_relay(
         // Move same bytes from pipe to destination socket (may need multiple
         // calls if pipe write was shorter than the splice into it).
         let mut remaining = n as usize;
+        // SAFETY: pipe_rd and fd_out are valid file descriptors (pipe_rd
+        // was created by create_pipe; fd_out is a kernel socket fd).
+        // Same null-offset contract as the fd_in→pipe splice above.
         while remaining > 0 {
             let m = unsafe {
                 libc::splice(
@@ -810,6 +890,9 @@ fn splice_relay(
 #[cfg(target_os = "linux")]
 fn create_pipe() -> std::io::Result<(i32, i32)> {
     let mut fds = [-1i32; 2];
+    // SAFETY: pipe2 writes two file descriptors into `fds`, which is a
+    // valid 2-element i32 array on the stack. O_NONBLOCK is the only flag.
+    // Errors are checked by the return value below.
     let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) };
     if ret < 0 {
         return Err(std::io::Error::last_os_error());
