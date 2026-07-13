@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,14 +9,22 @@ use crate::encryption;
 use crate::transport::IoStream;
 use tracing::instrument;
 
-/// Compress a plaintext chunk when compression is enabled, else copy it.
+/// Compress a plaintext chunk into a reusable buffer, or return a reference
+/// to the original data when compression is disabled.
+///
 /// Returns `None` on compression failure — the caller should break its loop.
+/// On success returns `Some(true)` (compressed into buf) or `Some(false)` (passthrough).
 #[inline]
-fn compress_chunk(payload: &[u8], use_compression: bool) -> Option<Cow<'_, [u8]>> {
+fn compress_chunk_into(
+    payload: &[u8],
+    use_compression: bool,
+    buf: &mut Vec<u8>,
+) -> Option<bool> {
     if use_compression {
-        encryption::compress(payload).ok().map(Cow::Owned)
+        encryption::compress_into(payload, buf).ok()?;
+        Some(true)
     } else {
-        Some(Cow::Borrowed(payload))
+        Some(false)
     }
 }
 
@@ -40,19 +47,23 @@ fn make_decompressor(use_compression: bool) -> Option<encryption::SnappyDecompre
     }
 }
 
-/// Feed a chunk through the decompressor if present, else copy it.
+/// Feed a chunk through the decompressor into a reusable buffer.
 /// Returns `None` on decompress error — the caller should break its loop.
 #[inline]
-fn decompress_chunk<'a>(
+fn decompress_chunk_into<'a>(
     dec: &mut Option<encryption::SnappyDecompressor>,
     data: &'a [u8],
-) -> Option<Cow<'a, [u8]>> {
+    buf: &'a mut Vec<u8>,
+) -> Option<&'a [u8]> {
     match dec {
-        Some(d) => d.feed(data).inspect_err(|e| {
-            #[cfg(feature = "compression")]
-            tracing::warn!(error = %e, "snappy decompress error in bridge: {}", e);
-        }).ok().map(Cow::Owned),
-        None => Some(Cow::Borrowed(data)),
+        Some(d) => {
+            d.feed_into(data, buf).inspect_err(|e| {
+                #[cfg(feature = "compression")]
+                tracing::warn!(error = %e, "snappy decompress error in bridge: {}", e);
+            }).ok()?;
+            Some(buf.as_slice())
+        }
+        None => Some(data),
     }
 }
 
@@ -125,6 +136,7 @@ pub async fn bridge_encrypted(
             return;
         }
         let mut buf = PoolGuard::acquire();
+        let mut comp_buf = Vec::new(); // reusable compression buffer
         loop {
             let n = match user_r.read(buf.as_mut_slice()).await {
                 Ok(0) => break,
@@ -138,15 +150,15 @@ pub async fn bridge_encrypted(
             };
 
             if use_compression {
-                // Compress into owned Vec, then encrypt in-place before write.
-                let mut compressed = match compress_chunk(&buf.data()[..n], true) {
-                    Some(p) => p.into_owned(),
-                    None => break,
-                };
-                if let Some(ref mut lim) = write_limiter {
-                    lim.consume(compressed.len()).await;
+                // Compress into reusable buffer, then encrypt in-place.
+                if compress_chunk_into(&buf.data()[..n], true, &mut comp_buf).is_none() {
+                    break;
                 }
-                if enc_work_w.write_encrypted(&mut compressed).await.is_err() { break; }
+                if let Some(ref mut lim) = write_limiter {
+                    lim.consume(comp_buf.len()).await;
+                }
+                if enc_work_w.write_encrypted(&mut comp_buf).await.is_err() { break; }
+                // comp_buf is cleared on next compress_chunk_into call
             } else {
                 // No compression: encrypt pool buffer slice in-place.
                 let slice = &mut buf.as_mut_slice()[..n];
@@ -170,6 +182,7 @@ pub async fn bridge_encrypted(
     // Work → User: read from work (decrypted), decompress, write to user
     let work_to_user = async {
         let mut buf = PoolGuard::acquire();
+        let mut decomp_buf = Vec::new(); // reusable decompression buffer
         let mut decompressor = make_decompressor(use_compression);
         loop {
             let n = match enc_work_r.read(buf.as_mut_slice()).await {
@@ -179,7 +192,7 @@ pub async fn bridge_encrypted(
             };
             let decrypted = &buf.data()[..n];
 
-            let plaintext = match decompress_chunk(&mut decompressor, decrypted) {
+            let plaintext = match decompress_chunk_into(&mut decompressor, decrypted, &mut decomp_buf) {
                 Some(p) => p,
                 None => break,
             };
@@ -190,7 +203,7 @@ pub async fn bridge_encrypted(
                     lim.consume(plaintext.len()).await;
                 }
 
-                if user_w.write_all(plaintext.as_ref()).await.is_err() { break; }
+                if user_w.write_all(plaintext).await.is_err() { break; }
                 // Count bytes written to user (download)
                 if let Some(ref m) = metrics {
                     m.bytes_out.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
@@ -251,6 +264,7 @@ pub async fn bridge_plain(
         let mut buf = PoolGuard::acquire();
         // cap is constant: PoolGuard::acquire() always yields a *BUFFER_SIZE buffer.
         let cap = buf.as_mut_slice().len();
+        let mut comp_buf = Vec::new(); // reusable compression buffer
         loop {
             let n = match user_r.read(buf.as_mut_slice()).await {
                 Ok(0) => {
@@ -270,12 +284,12 @@ pub async fn bridge_plain(
                 }
             };
             let payload = &buf.data()[..n];
-            let processed = match compress_chunk(payload, use_compression) {
-                Some(p) => p,
-                None => break,
-            };
-            if work_w.write_all(processed.as_ref()).await.is_err() {
-                tracing::warn!(len = processed.len(), "bridge_plain: work_w write_all failed");
+            if compress_chunk_into(payload, use_compression, &mut comp_buf).is_none() {
+                break;
+            }
+            let out: &[u8] = if use_compression { &comp_buf } else { payload };
+            if work_w.write_all(out).await.is_err() {
+                tracing::warn!(len = out.len(), "bridge_plain: work_w write_all failed");
                 break;
             }
             // Flush when compressing (strict req/resp clients need each echo
@@ -304,6 +318,7 @@ pub async fn bridge_plain(
         let mut buf = PoolGuard::acquire();
         // cap is constant: PoolGuard::acquire() always yields a *BUFFER_SIZE buffer.
         let cap = buf.as_mut_slice().len();
+        let mut decomp_buf = Vec::new(); // reusable decompression buffer
         let mut decompressor = make_decompressor(use_compression);
         loop {
             let n = match work_r.read(buf.as_mut_slice()).await {
@@ -320,12 +335,12 @@ pub async fn bridge_plain(
                     break;
                 }
             };
-            let plaintext = match decompress_chunk(&mut decompressor, &buf.data()[..n]) {
+            let plaintext = match decompress_chunk_into(&mut decompressor, &buf.data()[..n], &mut decomp_buf) {
                 Some(p) => p,
                 None => break,
             };
             if !plaintext.is_empty() {
-                if user_w.write_all(plaintext.as_ref()).await.is_err() {
+                if user_w.write_all(plaintext).await.is_err() {
                     tracing::warn!(len = plaintext.len(), "bridge_plain: user_w write_all failed");
                     break;
                 }
@@ -559,24 +574,28 @@ mod tests {
 
     #[test]
     fn test_compress_chunk_identity_when_disabled() {
-        let out = compress_chunk(b"hello", false).unwrap();
-        assert_eq!(out.as_ref(), b"hello");
+        let mut buf = Vec::new();
+        let compressed = compress_chunk_into(b"hello", false, &mut buf).unwrap();
+        assert!(!compressed); // false = passthrough (no compression)
     }
 
     #[test]
     fn test_compress_decompress_roundtrip() {
         let original = b"AAAA".repeat(64);
-        let compressed = compress_chunk(&original, true).expect("compress ok");
+        let mut comp_buf = Vec::new();
+        compress_chunk_into(&original, true, &mut comp_buf).expect("compress ok");
         let mut dec = make_decompressor(true);
-        let out = decompress_chunk(&mut dec, compressed.as_ref()).expect("decompress ok");
-        assert_eq!(out.as_ref(), original);
+        let mut decomp_buf = Vec::new();
+        let out = decompress_chunk_into(&mut dec, &comp_buf, &mut decomp_buf).expect("decompress ok");
+        assert_eq!(out, original);
     }
 
     #[test]
     fn test_decompress_chunk_identity_when_none() {
         let mut dec: Option<encryption::SnappyDecompressor> = None;
-        let out = decompress_chunk(&mut dec, b"raw").unwrap();
-        assert_eq!(out.as_ref(), b"raw");
+        let mut buf = Vec::new();
+        let out = decompress_chunk_into(&mut dec, b"raw", &mut buf).unwrap();
+        assert_eq!(out, b"raw");
     }
 }
 

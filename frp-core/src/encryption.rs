@@ -48,26 +48,36 @@ pub fn decrypt(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
 /// Compress data using Snappy (matching Go frp v0.69.1).
 #[cfg(feature = "compression")]
 pub fn compress(data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    compress_into(data, &mut buf)?;
+    Ok(buf)
+}
+
+/// Compress data into an existing buffer, reusing its allocation.
+/// The buffer is cleared before writing; its capacity grows to accommodate
+/// the maximum compressed size and stabilizes after the first few chunks.
+#[cfg(feature = "compression")]
+pub fn compress_into(data: &[u8], buf: &mut Vec<u8>) -> Result<(), String> {
     use snap::write::FrameEncoder;
     use std::io::Write;
-    // Pre-size the sink with an approximate capacity hint: raw max-compress-len
-    // plus per-64KiB-block frame overhead (8-byte chunk header) and the stream
-    // identifier. Exact for single-block (<=64 KiB) inputs, which is all the
-    // bridge produces; larger multi-block inputs may take one tail realloc.
-    // Vec::with_capacity is advisory — emitted frame bytes are identical either way.
-    let cap = snap::raw::max_compress_len(data.len())
-        .saturating_add(data.len() / 65_536 * 8 + 24);
-    let mut encoder = FrameEncoder::new(Vec::with_capacity(cap));
+    buf.clear();
+    let mut encoder = FrameEncoder::new(&mut *buf);
     encoder
         .write_all(data)
         .map_err(|e| format!("snappy compress: {e}"))?;
     encoder
         .into_inner()
-        .map_err(|e| format!("snappy finalize: {e}"))
+        .map_err(|e| format!("snappy finalize: {e}"))?;
+    Ok(())
 }
 
 #[cfg(not(feature = "compression"))]
 pub fn compress(_data: &[u8]) -> Result<Vec<u8>, String> {
+    Err("compression not compiled".into())
+}
+
+#[cfg(not(feature = "compression"))]
+pub fn compress_into(_data: &[u8], _buf: &mut Vec<u8>) -> Result<(), String> {
     Err("compression not compiled".into())
 }
 
@@ -122,13 +132,21 @@ impl SnappyDecompressor {
     /// Returns an error only for truly corrupt input (bad magic, bad CRC);
     /// partial frames are silently buffered, not treated as errors.
     pub fn feed(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        self.feed_into(data, &mut out)?;
+        Ok(out)
+    }
+
+    /// Like [`feed`], but writes decompressed output into an existing buffer,
+    /// reusing its allocation.
+    pub fn feed_into(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
         const MAX_SNAPPY_BUFFER: usize = 16 * 1024 * 1024; // 16 MB
         if self.buf.len() + data.len() > MAX_SNAPPY_BUFFER {
             return Err("snappy decompression buffer exhausted".into());
         }
         self.buf.extend_from_slice(data);
 
-        let mut output = Vec::new();
+        out.clear();
         let mut pos = 0;
         let stream_body = b"sNaPpY";
 
@@ -158,7 +176,7 @@ impl SnappyDecompressor {
                     let decompressed = decoder
                         .decompress_vec(compressed)
                         .map_err(|e| format!("snappy decompress: {e}"))?;
-                    output.extend_from_slice(&decompressed);
+                    out.extend_from_slice(&decompressed);
                     pos += total;
                 }
                 0x01 => {
@@ -172,7 +190,7 @@ impl SnappyDecompressor {
                     }
                     let data_start = pos + 8; // skip header + CRC
                     let data = &self.buf[data_start..pos + total];
-                    output.extend_from_slice(data);
+                    out.extend_from_slice(data);
                     pos += total;
                 }
                 0xFF => {
@@ -209,7 +227,7 @@ impl SnappyDecompressor {
         }
 
         self.buf.drain(..pos);
-        Ok(output)
+        Ok(())
     }
 
     /// Flush any remaining buffered data, returning decompressed output.
@@ -240,6 +258,9 @@ impl SnappyDecompressor {
         Self
     }
     pub fn feed(&mut self, _data: &[u8]) -> Result<Vec<u8>, String> {
+        Err("compression not compiled".into())
+    }
+    pub fn feed_into(&mut self, _data: &[u8], _out: &mut Vec<u8>) -> Result<(), String> {
         Err("compression not compiled".into())
     }
     pub fn flush(&mut self) -> Result<Vec<u8>, String> {
