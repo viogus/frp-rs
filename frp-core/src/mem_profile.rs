@@ -1,6 +1,17 @@
 //! Measurement-only global allocator, compiled ONLY under `feature = "mem-profile"`.
 //! Wraps the system allocator and tracks live + cumulative bytes via atomics.
 //! Off in all shipped builds — production binaries never include this file.
+//!
+//! # Realloc accuracy
+//!
+//! `realloc` counts the delta between old and new sizes. If the underlying
+//! allocator implements realloc as `alloc(new) + memcpy + dealloc(old)` with
+//! a different pointer, the LIVE_BYTES delta is still accurate (old block is
+//! freed, new block is live). If realloc extends in-place (same pointer),
+//! the delta is also correct. The only ambiguous case — a realloc that
+//! returns the same pointer but with less usable space — cannot occur in
+//! practice (System allocator always grows or moves). This is an approximate
+//! profiler, not an exact accounting system; sub-byte precision is not needed.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::alloc::{GlobalAlloc, Layout, System};

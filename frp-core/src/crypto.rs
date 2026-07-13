@@ -167,6 +167,38 @@ impl AeadCipher {
 
 use crate::cipher_stream::AsyncReadWriteUnpin;
 
+/// Read-half state for an AEAD stream.
+struct AeadReadState {
+    cipher: AeadCipher,
+    nonce: Vec<u8>,
+    stream_nonce: Option<Vec<u8>>,
+    header_read: bool,
+    frame_count: u64,
+    max_frame_count: Option<u64>,
+    buf: Vec<u8>,
+    buf_pos: usize,
+    err: Option<io::Error>,
+    scratch: Vec<u8>,
+    scratch_filled: usize,
+    /// Per-frame header persisted across polls so a mid-ciphertext `Pending`
+    /// does not re-read (and re-consume) the 4-byte length header.
+    header_buf: [u8; AEAD_FRAME_HEADER_SIZE],
+    header_have: bool,
+}
+
+/// Write-half state for an AEAD stream.
+struct AeadWriteState {
+    cipher: AeadCipher,
+    nonce: Vec<u8>,
+    stream_nonce: Vec<u8>,
+    header_sent: bool,
+    frame_count: u64,
+    max_frame_count: Option<u64>,
+    pending: Vec<u8>,
+    pending_pos: usize,
+    err: Option<io::Error>,
+}
+
 /// Combined AEAD stream wrapping a bidirectional byte transport.
 ///
 /// Internally manages independent read and write states, each with their own
@@ -175,32 +207,8 @@ use crate::cipher_stream::AsyncReadWriteUnpin;
 pub struct AeadStream {
     inner: Box<dyn AsyncReadWriteUnpin>,
     algorithm: AeadAlgorithm,
-    // Read state
-    read_cipher: AeadCipher,
-    read_nonce: Vec<u8>,
-    read_stream_nonce: Option<Vec<u8>>,
-    read_header_read: bool,
-    read_frame_count: u64,
-    read_max_frame_count: Option<u64>,
-    read_buf: Vec<u8>,
-    read_buf_pos: usize,
-    read_err: Option<io::Error>,
-    read_scratch: Vec<u8>,
-    read_scratch_filled: usize,
-    // Per-frame header persisted across polls so a mid-ciphertext `Pending`
-    // does not re-read (and re-consume) the 4-byte length header.
-    read_header_buf: [u8; AEAD_FRAME_HEADER_SIZE],
-    read_header_have: bool,
-    // Write state
-    write_cipher: AeadCipher,
-    write_nonce: Vec<u8>,
-    write_stream_nonce: Vec<u8>,
-    write_header_sent: bool,
-    write_frame_count: u64,
-    write_max_frame_count: Option<u64>,
-    write_pending: Vec<u8>,
-    write_pending_pos: usize,
-    write_err: Option<io::Error>,
+    read: AeadReadState,
+    write: AeadWriteState,
 }
 
 impl AeadStream {
@@ -219,31 +227,39 @@ impl AeadStream {
         let nonce_size = algorithm.nonce_size();
         let write_nonce = generate_random(nonce_size)?;
 
+        // Pre-allocate read scratch to max frame size so per-frame read_exact
+        // calls reuse the same allocation (split_off preserves capacity).
+        let max_ciphertext = DEFAULT_MAX_PAYLOAD_SIZE + algorithm.overhead();
+
         Ok(Self {
             inner,
             algorithm,
-            read_cipher,
-            read_nonce: vec![0u8; nonce_size],
-            read_stream_nonce: None,
-            read_header_read: false,
-            read_frame_count: 0,
-            read_max_frame_count: algorithm.max_frame_count(),
-            read_buf: Vec::new(),
-            read_buf_pos: 0,
-            read_err: None,
-            read_scratch: Vec::new(),
-            read_scratch_filled: 0,
-            read_header_buf: [0u8; AEAD_FRAME_HEADER_SIZE],
-            read_header_have: false,
-            write_cipher,
-            write_nonce: write_nonce.clone(),
-            write_stream_nonce: write_nonce,
-            write_header_sent: false,
-            write_frame_count: 0,
-            write_max_frame_count: algorithm.max_frame_count(),
-            write_pending: Vec::new(),
-            write_pending_pos: 0,
-            write_err: None,
+            read: AeadReadState {
+                cipher: read_cipher,
+                nonce: vec![0u8; nonce_size],
+                stream_nonce: None,
+                header_read: false,
+                frame_count: 0,
+                max_frame_count: algorithm.max_frame_count(),
+                buf: Vec::new(),
+                buf_pos: 0,
+                err: None,
+                scratch: Vec::with_capacity(max_ciphertext),
+                scratch_filled: 0,
+                header_buf: [0u8; AEAD_FRAME_HEADER_SIZE],
+                header_have: false,
+            },
+            write: AeadWriteState {
+                cipher: write_cipher,
+                nonce: write_nonce.clone(),
+                stream_nonce: write_nonce,
+                header_sent: false,
+                frame_count: 0,
+                max_frame_count: algorithm.max_frame_count(),
+                pending: Vec::new(),
+                pending_pos: 0,
+                err: None,
+            },
         })
     }
 
@@ -257,7 +273,7 @@ impl AsyncRead for AeadStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.read_err.is_some() {
+        if self.read.err.is_some() {
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "previous read error")));
         }
         if buf.remaining() == 0 {
@@ -265,14 +281,14 @@ impl AsyncRead for AeadStream {
         }
 
         // Serve from buffered plaintext
-        if self.read_buf_pos < self.read_buf.len() {
-            let available = self.read_buf.len() - self.read_buf_pos;
+        if self.read.buf_pos < self.read.buf.len() {
+            let available = self.read.buf.len() - self.read.buf_pos;
             let to_copy = available.min(buf.remaining());
-            buf.put_slice(&self.read_buf[self.read_buf_pos..self.read_buf_pos + to_copy]);
-            self.read_buf_pos += to_copy;
-            if self.read_buf_pos >= self.read_buf.len() {
-                self.read_buf.clear();
-                self.read_buf_pos = 0;
+            buf.put_slice(&self.read.buf[self.read.buf_pos..self.read.buf_pos + to_copy]);
+            self.read.buf_pos += to_copy;
+            if self.read.buf_pos >= self.read.buf.len() {
+                self.read.buf.clear();
+                self.read.buf_pos = 0;
             }
             return Poll::Ready(Ok(()));
         }
@@ -282,13 +298,13 @@ impl AsyncRead for AeadStream {
         match this.poll_read_frame(cx) {
             Poll::Ready(Ok(true)) => {
                 // Serve from new buffer
-                let available = this.read_buf.len() - this.read_buf_pos;
+                let available = this.read.buf.len() - this.read.buf_pos;
                 let to_copy = available.min(buf.remaining());
-                buf.put_slice(&this.read_buf[this.read_buf_pos..this.read_buf_pos + to_copy]);
-                this.read_buf_pos += to_copy;
-                if this.read_buf_pos >= this.read_buf.len() {
-                    this.read_buf.clear();
-                    this.read_buf_pos = 0;
+                buf.put_slice(&this.read.buf[this.read.buf_pos..this.read.buf_pos + to_copy]);
+                this.read.buf_pos += to_copy;
+                if this.read.buf_pos >= this.read.buf.len() {
+                    this.read.buf.clear();
+                    this.read.buf_pos = 0;
                 }
                 Poll::Ready(Ok(()))
             }
@@ -297,7 +313,7 @@ impl AsyncRead for AeadStream {
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(e)) => {
-                this.read_err = Some(io::Error::new(e.kind(), e.to_string()));
+                this.read.err = Some(io::Error::new(e.kind(), e.to_string()));
                 Poll::Ready(Err(e))
             }
             Poll::Pending => Poll::Pending,
@@ -309,15 +325,15 @@ impl AeadStream {
     /// Read one AEAD frame. Returns `Ok(true)` when a frame was decoded,
     /// `Ok(false)` on clean EOF at frame boundary.
     fn poll_read_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        tracing::debug!(read_header_read = %self.read_header_read, read_frame_count = %self.read_frame_count, "[AEAD-READ] poll_read_frame called, read_header_read={}, read_frame_count={}",
-            self.read_header_read, self.read_frame_count);
+        tracing::debug!(read_header_read = %self.read.header_read, read_frame_count = %self.read.frame_count, "[AEAD-READ] poll_read_frame called, read_header_read={}, read_frame_count={}",
+            self.read.header_read, self.read.frame_count);
         // Read stream nonce on first frame
-        if !self.read_header_read {
-            match self.read_exact(self.read_nonce.len(), cx) {
+        if !self.read.header_read {
+            match self.read_exact(self.read.nonce.len(), cx) {
                 Poll::Ready(Ok(data)) => {
-                    self.read_nonce.copy_from_slice(&data);
-                    self.read_stream_nonce = Some(data.to_vec());
-                    self.read_header_read = true;
+                    self.read.nonce.copy_from_slice(&data);
+                    self.read.stream_nonce = Some(data.to_vec());
+                    self.read.header_read = true;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -327,18 +343,18 @@ impl AeadStream {
         // Read 4-byte header. EOF here = clean end of stream. Persisted across
         // polls: once obtained, a mid-ciphertext `Pending` re-enters this fn but
         // must not re-read the header (those bytes are already consumed).
-        if !self.read_header_have {
+        if !self.read.header_have {
             match self.read_exact(AEAD_FRAME_HEADER_SIZE, cx) {
                 Poll::Ready(Ok(data)) => {
-                    self.read_header_buf.copy_from_slice(&data);
-                    self.read_header_have = true;
+                    self.read.header_buf.copy_from_slice(&data);
+                    self.read.header_have = true;
                 }
                 // Clean EOF only when the header read consumed ZERO bytes (we are
                 // exactly at a frame boundary). A partial header followed by EOF is
                 // a truncated stream and must surface as an error, not a clean end.
                 Poll::Ready(Err(ref e))
                     if e.kind() == io::ErrorKind::UnexpectedEof
-                        && self.read_scratch_filled == 0 =>
+                        && self.read.scratch_filled == 0 =>
                 {
                     return Poll::Ready(Ok(false)); // clean EOF at frame boundary
                 }
@@ -346,10 +362,10 @@ impl AeadStream {
                 Poll::Pending => return Poll::Pending,
             }
         }
-        let header = self.read_header_buf;
+        let header = self.read.header_buf;
 
-        if let Some(ref max) = self.read_max_frame_count {
-            if self.read_frame_count >= *max {
+        if let Some(ref max) = self.read.max_frame_count {
+            if self.read.frame_count >= *max {
                 return Poll::Ready(Err(io::Error::other("AEAD read frame count limit exceeded")));
             }
         }
@@ -372,39 +388,39 @@ impl AeadStream {
             Poll::Pending => return Poll::Pending,
         };
 
-        let stream_nonce = self.read_stream_nonce.as_ref()
+        let stream_nonce = self.read.stream_nonce.as_ref()
             .expect("stream_nonce must be set");
         let mut aad = Vec::with_capacity(stream_nonce.len() + AEAD_FRAME_HEADER_SIZE);
         aad.extend_from_slice(stream_nonce);
         aad.extend_from_slice(&header);
 
-        let plaintext = match self.read_cipher.decrypt(&self.read_nonce, ciphertext, &aad) {
+        let plaintext = match self.read.cipher.decrypt(&self.read.nonce, ciphertext, &aad) {
             Ok(p) => {
-                tracing::debug!(frame = %self.read_frame_count, plaintext_len = %p.len(), "[AEAD-READ] frame={} decrypt OK, plaintext_len={}", self.read_frame_count, p.len());
+                tracing::debug!(frame = %self.read.frame_count, plaintext_len = %p.len(), "[AEAD-READ] frame={} decrypt OK, plaintext_len={}", self.read.frame_count, p.len());
                 p
             }
             Err(e) => {
                 #[cfg(debug_assertions)]
-                tracing::warn!(frame = %self.read_frame_count, error = %e, nonce = %hex::encode(&self.read_nonce), stream_nonce = %hex::encode(stream_nonce), "[AEAD-READ] frame={} decrypt FAILED: {} (nonce={}, stream_nonce={})",
-                    self.read_frame_count, e,
-                    hex::encode(&self.read_nonce),
+                tracing::warn!(frame = %self.read.frame_count, error = %e, nonce = %hex::encode(&self.read.nonce), stream_nonce = %hex::encode(stream_nonce), "[AEAD-READ] frame={} decrypt FAILED: {} (nonce={}, stream_nonce={})",
+                    self.read.frame_count, e,
+                    hex::encode(&self.read.nonce),
                     hex::encode(stream_nonce));
                 #[cfg(not(debug_assertions))]
-                tracing::warn!(frame = %self.read_frame_count, error = %e, "[AEAD-READ] frame={} decrypt FAILED: {}", self.read_frame_count, e);
+                tracing::warn!(frame = %self.read.frame_count, error = %e, "[AEAD-READ] frame={} decrypt FAILED: {}", self.read.frame_count, e);
                 return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData,
                     format!("AEAD decrypt: {e}"))));
             }
         };
 
-        if !increment_nonce(&mut self.read_nonce) {
+        if !increment_nonce(&mut self.read.nonce) {
             return Poll::Ready(Err(io::Error::other("AEAD read nonce exhausted")));
         }
-        self.read_frame_count += 1;
+        self.read.frame_count += 1;
 
         // Frame consumed: allow the next frame to read its own header.
-        self.read_header_have = false;
-        self.read_buf = plaintext;
-        self.read_buf_pos = 0;
+        self.read.header_have = false;
+        self.read.buf = plaintext;
+        self.read.buf_pos = 0;
         Poll::Ready(Ok(true))
     }
 
@@ -416,19 +432,19 @@ impl AeadStream {
         // reset state and the resize guard below would treat stale bytes as freshly
         // read (silent frame corruption).
         debug_assert!(
-            self.read_scratch_filled == 0 || self.read_scratch.len() == len,
+            self.read.scratch_filled == 0 || self.read.scratch.len() == len,
             "read_exact state leak: filled={} scratch_len={} len={}",
-            self.read_scratch_filled,
-            self.read_scratch.len(),
+            self.read.scratch_filled,
+            self.read.scratch.len(),
             len,
         );
-        if self.read_scratch.len() != len {
-            self.read_scratch.clear();
-            self.read_scratch.resize(len, 0);
-            self.read_scratch_filled = 0;
+        if self.read.scratch.len() != len {
+            self.read.scratch.clear();
+            self.read.scratch.resize(len, 0);
+            self.read.scratch_filled = 0;
         }
-        while self.read_scratch_filled < len {
-            let mut rb = ReadBuf::new(&mut self.read_scratch[self.read_scratch_filled..]);
+        while self.read.scratch_filled < len {
+            let mut rb = ReadBuf::new(&mut self.read.scratch[self.read.scratch_filled..]);
             let pin = Pin::new(&mut *self.inner);
             match pin.poll_read(cx, &mut rb) {
                 Poll::Ready(Ok(())) => {
@@ -437,17 +453,20 @@ impl AeadStream {
                         // No progress on a Ready poll => inner reached EOF before `len` bytes.
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
-                            format!("AEAD stream: unexpected EOF (need {len}, got {})", self.read_scratch_filled),
+                            format!("AEAD stream: unexpected EOF (need {len}, got {})", self.read.scratch_filled),
                         )));
                     }
-                    self.read_scratch_filled += n;
+                    self.read.scratch_filled += n;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending, // progress saved in read_scratch_filled
             }
         }
-        let data = std::mem::take(&mut self.read_scratch);
-        self.read_scratch_filled = 0;
+        // split_off(0) returns the data while preserving self.read.scratch's
+        // capacity — next read_exact with same or smaller len reuses the
+        // allocation (resize only zero-fills, no heap alloc).
+        let data = self.read.scratch.split_off(0);
+        self.read.scratch_filled = 0;
         Poll::Ready(Ok(data))
     }
 }
@@ -460,7 +479,7 @@ impl AsyncWrite for AeadStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.write_err.is_some() {
+        if self.write.err.is_some() {
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "previous write error")));
         }
         if buf.is_empty() {
@@ -470,7 +489,7 @@ impl AsyncWrite for AeadStream {
         let this = &mut *self;
 
         // If we have pending data to flush, try flushing first
-        if this.write_pending_pos < this.write_pending.len() {
+        if this.write.pending_pos < this.write.pending.len() {
             match this.poll_flush_pending(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -479,10 +498,10 @@ impl AsyncWrite for AeadStream {
         }
 
         // Build a new frame
-        if let Some(ref max) = this.write_max_frame_count {
-            if this.write_frame_count >= *max {
+        if let Some(ref max) = this.write.max_frame_count {
+            if this.write.frame_count >= *max {
                 let e = io::Error::other("AEAD write frame count limit exceeded");
-                this.write_err = Some(e);
+                this.write.err = Some(e);
                 return Poll::Ready(Err(io::Error::other("frame count exceeded")));
             }
         }
@@ -491,27 +510,27 @@ impl AsyncWrite for AeadStream {
         let plaintext = &buf[..chunk_size];
 
         // Send stream nonce first if needed
-        if !this.write_header_sent {
+        if !this.write.header_sent {
             #[cfg(debug_assertions)]
-            tracing::debug!(nonce = %hex::encode(&this.write_nonce), "[AEAD-WRITE] first write: nonce={}", hex::encode(&this.write_nonce));
+            tracing::debug!(nonce = %hex::encode(&this.write.nonce), "[AEAD-WRITE] first write: nonce={}", hex::encode(&this.write.nonce));
             #[cfg(not(debug_assertions))]
             tracing::debug!("[AEAD-WRITE] first write");
             // Queue the nonce write
-            let mut pending = this.write_stream_nonce.clone();
+            let mut pending = this.write.stream_nonce.clone();
             let overhead = this.algorithm.overhead();
             let ciphertext_len = (plaintext.len() + overhead) as u32;
             let mut header = [0u8; AEAD_FRAME_HEADER_SIZE];
             header.copy_from_slice(&ciphertext_len.to_be_bytes());
 
-            let mut aad = Vec::with_capacity(this.write_stream_nonce.len() + AEAD_FRAME_HEADER_SIZE);
-            aad.extend_from_slice(&this.write_stream_nonce);
+            let mut aad = Vec::with_capacity(this.write.stream_nonce.len() + AEAD_FRAME_HEADER_SIZE);
+            aad.extend_from_slice(&this.write.stream_nonce);
             aad.extend_from_slice(&header);
 
-            let sealed = match this.write_cipher.encrypt(&this.write_nonce, plaintext.to_vec(), &aad) {
+            let sealed = match this.write.cipher.encrypt(&this.write.nonce, plaintext.to_vec(), &aad) {
                 Ok(s) => s,
                 Err(e) => {
                     let io_err = io::Error::other(e);
-                    this.write_err = Some(io_err);
+                    this.write.err = Some(io_err);
                     return Poll::Ready(Err(io::Error::other("encrypt failed")));
                 }
             };
@@ -519,44 +538,44 @@ impl AsyncWrite for AeadStream {
             pending.extend_from_slice(&header);
             pending.extend_from_slice(&sealed);
 
-            if !increment_nonce(&mut this.write_nonce) {
+            if !increment_nonce(&mut this.write.nonce) {
                 return Poll::Ready(Err(io::Error::other("AEAD write nonce exhausted")));
             }
-            this.write_frame_count += 1;
-            this.write_header_sent = true;
-            tracing::debug!(frame = %this.write_frame_count, pending_len = %this.write_pending.len(), "[AEAD-WRITE] frame={} encrypted, pending_len={}", this.write_frame_count, this.write_pending.len());
+            this.write.frame_count += 1;
+            this.write.header_sent = true;
+            tracing::debug!(frame = %this.write.frame_count, pending_len = %this.write.pending.len(), "[AEAD-WRITE] frame={} encrypted, pending_len={}", this.write.frame_count, this.write.pending.len());
 
-            this.write_pending = pending;
-            this.write_pending_pos = 0;
+            this.write.pending = pending;
+            this.write.pending_pos = 0;
         } else {
             let overhead = this.algorithm.overhead();
             let ciphertext_len = (plaintext.len() + overhead) as u32;
             let mut header = [0u8; AEAD_FRAME_HEADER_SIZE];
             header.copy_from_slice(&ciphertext_len.to_be_bytes());
 
-            let mut aad = Vec::with_capacity(this.write_stream_nonce.len() + AEAD_FRAME_HEADER_SIZE);
-            aad.extend_from_slice(&this.write_stream_nonce);
+            let mut aad = Vec::with_capacity(this.write.stream_nonce.len() + AEAD_FRAME_HEADER_SIZE);
+            aad.extend_from_slice(&this.write.stream_nonce);
             aad.extend_from_slice(&header);
 
-            let sealed = match this.write_cipher.encrypt(&this.write_nonce, plaintext.to_vec(), &aad) {
+            let sealed = match this.write.cipher.encrypt(&this.write.nonce, plaintext.to_vec(), &aad) {
                 Ok(s) => s,
                 Err(e) => {
                     let io_err = io::Error::other(e);
-                    this.write_err = Some(io_err);
+                    this.write.err = Some(io_err);
                     return Poll::Ready(Err(io::Error::other("encrypt failed")));
                 }
             };
 
-            if !increment_nonce(&mut this.write_nonce) {
+            if !increment_nonce(&mut this.write.nonce) {
                 return Poll::Ready(Err(io::Error::other("AEAD write nonce exhausted")));
             }
-            this.write_frame_count += 1;
+            this.write.frame_count += 1;
 
             let mut pending = Vec::with_capacity(AEAD_FRAME_HEADER_SIZE + sealed.len());
             pending.extend_from_slice(&header);
             pending.extend_from_slice(&sealed);
-            this.write_pending = pending;
-            this.write_pending_pos = 0;
+            this.write.pending = pending;
+            this.write.pending_pos = 0;
         }
 
         // Flush the pending data
@@ -592,21 +611,21 @@ impl AsyncWrite for AeadStream {
 
 impl AeadStream {
     fn poll_flush_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while self.write_pending_pos < self.write_pending.len() {
+        while self.write.pending_pos < self.write.pending.len() {
             let pin = Pin::new(&mut *self.inner);
-            match pin.poll_write(cx, &self.write_pending[self.write_pending_pos..]) {
+            match pin.poll_write(cx, &self.write.pending[self.write.pending_pos..]) {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")));
                 }
                 Poll::Ready(Ok(n)) => {
-                    self.write_pending_pos += n;
+                    self.write.pending_pos += n;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
         }
-        self.write_pending.clear();
-        self.write_pending_pos = 0;
+        self.write.pending.clear();
+        self.write.pending_pos = 0;
         Poll::Ready(Ok(()))
     }
 }

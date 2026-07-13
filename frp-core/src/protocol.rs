@@ -73,7 +73,10 @@ pub async fn read_v1_frame<R: AsyncReadExt + Unpin>(
 
     let length = length as usize;
     // Use set_len to skip zero-initialization; read_exact fills every byte
-    // on success. On error the Vec is dropped — uninitialized bytes never escape.
+    // SAFETY: `length` bytes are allocated via `with_capacity`. `set_len`
+    // exposes them as initialized — they will be overwritten by `read_exact`
+    // before any read. On error the Vec is dropped; uninitialized bytes
+    // never escape. `u8` has no invalid bit patterns.
     #[allow(clippy::uninit_vec)]
     let mut payload = {
         let mut v = Vec::with_capacity(length);
@@ -481,9 +484,10 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
         ).into()));
     }
 
-    // Use set_len to skip zero-initialization; read_exact fills the entire
-    // buffer on success. If read_exact returns an error, the Vec is dropped
-    // immediately — uninitialized bytes never escape.
+    // SAFETY: `payload_len` bytes are allocated via `with_capacity`. `set_len`
+    // marks them initialized; `read_exact` fills them before any read. On error
+    // the Vec is dropped; uninitialized bytes never escape. `u8` has no
+    // invalid bit patterns so any bit pattern is a valid u8.
     #[allow(clippy::uninit_vec)]
     let mut payload = {
         let mut v = Vec::with_capacity(payload_len);

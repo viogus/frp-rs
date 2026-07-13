@@ -258,9 +258,9 @@ async fn relay_plain_fast(
     use std::sync::atomic::Ordering;
 
     // On Linux, try zero-copy splice for Tcp-to-Tcp.
-    // Check with references first to avoid consuming streams on mismatch.
+    // Use try_tcp() to check without enumerating all IoStream variants.
     #[cfg(target_os = "linux")]
-    if let (IoStream::Tcp(_), IoStream::Tcp(_)) = (&user_conn, &work_conn) {
+    if user_conn.try_tcp().is_some() && work_conn.try_tcp().is_some() {
         let (IoStream::Tcp(user), IoStream::Tcp(work)) = (user_conn, work_conn) else {
             unreachable!()
         };

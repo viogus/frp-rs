@@ -164,19 +164,14 @@ pub async fn bridge_streams(
         warn!(name = %name, "Proxy {}: encryption requested but no key available, falling back to plain", name);
     }
 
-    // Plain path: use compression-aware bridge when compression is on,
-    // rate-limited bridge when bandwidth limiting is active,
-    // otherwise use the fast copy_bidirectional path.
-    if use_compression {
-        let (l_r, l_w) = tokio::io::split(local);
-        let (w_r, w_w) = work.into_split();
-        bridge::bridge_plain(l_r, l_w, w_r, w_w, true, Vec::new(), Some(proxy_metrics.clone())).await;
-        debug!(name = %name, "Proxy {} compressed plain bridge closed", name);
-    } else if read_lim.is_some() || write_lim.is_some() {
+    // Plain path: use rate-limited bridge when bandwidth limiting or compression
+    // is active, otherwise use the fast copy_bidirectional path.
+    if use_compression || read_lim.is_some() || write_lim.is_some() {
         let (l_r, l_w) = tokio::io::split(local);
         let (w_r, w_w) = work.into_split();
         bridge::bridge_plain_rate_limited(
             l_r, l_w, w_r, w_w,
+            use_compression, Vec::new(),
             read_lim.as_mut(), write_lim.as_mut(), Some(proxy_metrics.clone()),
         ).await;
         debug!(name = %name, "Proxy {} rate-limited bridge closed", name);

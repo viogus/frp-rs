@@ -13,8 +13,10 @@ use tokio::sync::mpsc;
 use super::socket::WriteRequest;
 
 static KCP_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(debug_assertions)]
 static KCP_READ_CALLS: AtomicU64 = AtomicU64::new(0);
 static KCP_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(debug_assertions)]
 static KCP_WRITE_CALLS: AtomicU64 = AtomicU64::new(0);
 
 pub struct KcpStream {
@@ -77,6 +79,7 @@ impl AsyncRead for KcpStream {
             self.read_pos += n;
             self.read_count += n as u64;
             KCP_READ_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+            #[cfg(debug_assertions)]
             KCP_READ_CALLS.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
                 conv = self.conv,
@@ -92,10 +95,12 @@ impl AsyncRead for KcpStream {
         match self.read_rx.poll_recv(cx) {
             Poll::Ready(Some(data)) => {
                 let n = data.len().min(buf.remaining());
+                // Capture hex preview before data may be moved into read_buffer.
+                #[cfg(debug_assertions)]
                 let hex_preview = if n > 0 {
-                    hex::encode(&data[..n.min(16)])
+                    Some(hex::encode(&data[..n.min(16)]))
                 } else {
-                    String::new()
+                    None
                 };
                 buf.put_slice(&data[..n]);
                 if n < data.len() {
@@ -104,16 +109,20 @@ impl AsyncRead for KcpStream {
                 }
                 self.read_count += n as u64;
                 KCP_READ_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                #[cfg(debug_assertions)]
                 KCP_READ_CALLS.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(
-                    conv = self.conv,
-                    n = n,
-                    total = self.read_count,
-                    first_hex = hex_preview,
-                    "KCP read: {} bytes (total={})",
-                    n,
-                    self.read_count,
-                );
+                #[cfg(debug_assertions)]
+                if tracing::level_enabled!(tracing::Level::DEBUG) {
+                    tracing::debug!(
+                        conv = self.conv,
+                        n = n,
+                        total = self.read_count,
+                        first_hex = hex_preview.unwrap_or_default(),
+                        "KCP read: {} bytes (total={})",
+                        n,
+                        self.read_count,
+                    );
+                }
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(None) => Poll::Ready(Ok(())), // EOF
@@ -156,19 +165,23 @@ impl AsyncWrite for KcpStream {
         let n = buf.len();
         self.write_count += n as u64;
         KCP_WRITE_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+        #[cfg(debug_assertions)]
         KCP_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
-        if self.write_count <= 80 || self.write_count.is_multiple_of(1024) {
+        #[cfg(debug_assertions)]
+        if (self.write_count <= 80 || self.write_count.is_multiple_of(1024))
+            && tracing::level_enabled!(tracing::Level::DEBUG)
+        {
             tracing::debug!(
-                conv = self.conv,
-                n = n,
-                total = self.write_count,
-                global_total = KCP_WRITE_BYTES.load(Ordering::Relaxed),
-                first_hex = %hex::encode(&buf[..n.min(32)]),
-                "KCP write: {} bytes (stream total={}, global total={})",
-                n,
-                self.write_count,
-                KCP_WRITE_BYTES.load(Ordering::Relaxed),
-            );
+                    conv = self.conv,
+                    n = n,
+                    total = self.write_count,
+                    global_total = KCP_WRITE_BYTES.load(Ordering::Relaxed),
+                    first_hex = %hex::encode(&buf[..n.min(32)]),
+                    "KCP write: {} bytes (stream total={}, global total={})",
+                    n,
+                    self.write_count,
+                    KCP_WRITE_BYTES.load(Ordering::Relaxed),
+                );
         }
         Poll::Ready(Ok(n))
     }

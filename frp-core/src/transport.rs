@@ -1165,6 +1165,28 @@ impl IoStream {
         }
     }
 
+    /// Return a reference to the underlying `TcpStream` if this variant is
+    /// raw TCP. Returns `None` for `PreRead` (has unconsumed bytes that
+    /// cannot be spliced), TLS, KCP, WebSocket, yamux, cipher, and other
+    /// wrapped variants.
+    ///
+    /// Useful for zero-copy fast paths (e.g. `splice(2)`) that only work
+    /// with raw kernel TCP sockets.
+    pub fn try_tcp(&self) -> Option<&TcpStream> {
+        match self {
+            IoStream::Tcp(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Mutable variant of [`try_tcp`].
+    pub fn try_tcp_mut(&mut self) -> Option<&mut TcpStream> {
+        match self {
+            IoStream::Tcp(s) => Some(s),
+            _ => None,
+        }
+    }
+
     /// Wrap this stream in AES-128-CFB encryption for control messages.
     /// Must be called after login (the Login message is NOT encrypted).
     pub fn into_encrypted(self, key: [u8; 16]) -> Self {

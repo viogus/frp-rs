@@ -67,6 +67,11 @@ pub fn dump_cpu_profile(
 // ---------------------------------------------------------------------------
 
 /// Format a `SystemTime` as `YYYYMMDD_HHMMSS` (UTC).
+///
+/// Assumes every day has exactly 86400 seconds (no leap seconds).
+/// `SystemTime` is not guaranteed to be monotonic across leap seconds,
+/// but for profiling file names the resulting timestamp is always unique
+/// and chronologically ordered, which is sufficient.
 fn format_timestamp(now: SystemTime) -> String {
     let secs = now
         .duration_since(UNIX_EPOCH)
