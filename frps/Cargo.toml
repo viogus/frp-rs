@@ -25,6 +25,9 @@ otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", 
 # Measurement-only counting global allocator. OFF in all shipped builds.
 mem-profile = ["frp-server/mem-profile"]
 profiling = ["frp-server/profiling"]
+# Use mimalloc global allocator (~10-20% throughput gain for network workloads).
+# Mutually exclusive with mem-profile (only one #[global_allocator] allowed).
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 frp-core = { path = "../frp-core", default-features = false }
@@ -38,6 +41,7 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
+mimalloc = { workspace = true, optional = true }
 toml.workspace = true
 serde.workspace = true
 

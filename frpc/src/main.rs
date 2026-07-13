@@ -127,7 +127,11 @@ async fn admin_post_json(conn: &AdminConnection, path: &str, json_body: &str) ->
     }
 }
 
-#[cfg(feature = "mem-profile")]
+#[cfg(all(feature = "mimalloc", not(feature = "mem-profile")))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(all(feature = "mem-profile", not(feature = "mimalloc")))]
 #[global_allocator]
 static GLOBAL: frp_core::mem_profile::CountingAlloc = frp_core::mem_profile::CountingAlloc;
 
