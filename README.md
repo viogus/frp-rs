@@ -60,9 +60,9 @@ Client plugins: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `ht
 
 ### Go frp Compatibility Notes
 
-frp-rs targets protocol compatibility with Go frp v0.69.1. **100% feature parity.**
-40/40 cross-compatibility tests pass on every commit, with 2 additional guarded tests
-for specific environments (XTCP 16-test pairwise matrix on VPS, V2 auto-detected locally).
+frp-rs targets protocol compatibility with Go frp v0.70.0. **100% feature parity.**
+73/73 cross-compatibility tests pass on every commit (including XTCP 16-test pairwise
+matrix on VPS and V2 TCP source-built Go frp).
 
 - **V1 wire protocol**: Fully compatible. All message types, authentication, encryption (AES-128-CFB),
   compression (Snappy) — wire-compatible with Go frp v0.69.1.
