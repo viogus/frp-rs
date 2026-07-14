@@ -17,6 +17,7 @@ fn make_info(name: &str, run_id: &str, group: Option<&str>) -> ProxyInfo {
         name: name.to_string(),
         proxy_type: "tcp".to_string(),
         run_id: run_id.to_string(),
+        user: String::new(),
         remote_port: Some(6000),
         sk: None,
         group: group.map(|g| g.to_string()),

@@ -33,4 +33,5 @@ pub(crate) fn constant_time_eq_str(a: &str, b: &str) -> bool {
     }
     acc == 0
 }
+#[cfg(feature = "dashboard")]
 pub mod dashboard_v2;
