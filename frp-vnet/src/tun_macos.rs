@@ -35,6 +35,8 @@ impl MacOSTun {
             0
         };
 
+        // SAFETY: socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL) is the
+        // standard macOS path to open a kernel control socket for utun.
         let fd = unsafe { libc::socket(libc::PF_SYSTEM, libc::SOCK_DGRAM, libc::SYSPROTO_CONTROL) };
         if fd < 0 {
             return Err(anyhow::anyhow!(
@@ -44,6 +46,8 @@ impl MacOSTun {
         }
 
         // Connect to the utun kernel control
+        // SAFETY: zeroed ctl_info is valid — all-zeroes is a well-defined
+        // representation; CTLIOCGINFO fills ctl_id on success.
         let mut ctl_info: libc::ctl_info = unsafe { std::mem::zeroed() };
         let name_bytes = UTUN_CONTROL_NAME.as_bytes();
         let copy_len = name_bytes.len().min(ctl_info.ctl_name.len() - 1);
@@ -54,8 +58,12 @@ impl MacOSTun {
             *dst = *src as libc::c_char;
         }
 
+        // SAFETY: fd is a valid kernel control socket; ctl_info has been
+        // zero-initialized with the utun control name; CTLIOCGINFO is the
+        // correct ioctl for resolving a kernel control ID.
         let ret = unsafe { libc::ioctl(fd, libc::CTLIOCGINFO, &mut ctl_info) };
         if ret < 0 {
+            // SAFETY: fd is a valid fd we own; closing on error path.
             unsafe {
                 libc::close(fd);
             }
@@ -65,6 +73,8 @@ impl MacOSTun {
             ));
         }
 
+        // SAFETY: zeroed sockaddr_ctl is valid — all fields are set
+        // explicitly below before the connect call.
         let mut addr: libc::sockaddr_ctl = unsafe { std::mem::zeroed() };
         addr.sc_len = std::mem::size_of::<libc::sockaddr_ctl>() as u8;
         addr.sc_family = libc::AF_SYSTEM as u8;
@@ -72,6 +82,9 @@ impl MacOSTun {
         addr.sc_id = ctl_info.ctl_id;
         addr.sc_unit = unit;
 
+        // SAFETY: fd is a valid kernel control socket; addr is a correctly
+        // populated sockaddr_ctl with the resolved ctl_id; connect() binds
+        // the socket to the specific utun unit.
         let ret = unsafe {
             libc::connect(
                 fd,
@@ -80,6 +93,7 @@ impl MacOSTun {
             )
         };
         if ret < 0 {
+            // SAFETY: fd is a valid fd we own; closing on error path.
             unsafe {
                 libc::close(fd);
             }
@@ -92,6 +106,9 @@ impl MacOSTun {
         // Get the actual interface name assigned by the kernel
         let mut ifname = [0u8; 64];
         let mut ifname_len = ifname.len() as u32;
+        // SAFETY: fd is a valid connected utun socket; SYSPROTO_CONTROL +
+        // UTUN_OPT_IFNAME gets the kernel-assigned interface name; ifname
+        // buffer is correctly sized (64 bytes, matching XNU max).
         let ret = unsafe {
             libc::getsockopt(
                 fd,
@@ -108,9 +125,12 @@ impl MacOSTun {
             format!("utun{}", unit)
         };
 
-        // Set non-blocking
+        // Set non-blocking.
+        // SAFETY: fd is a valid utun fd; F_GETFL is a standard fcntl
+        // operation with no memory side effects.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
         if flags < 0 {
+            // SAFETY: fd is a valid fd we own; closing on error path.
             unsafe {
                 libc::close(fd);
             }
@@ -119,8 +139,11 @@ impl MacOSTun {
                 io::Error::last_os_error()
             ));
         }
+        // SAFETY: fd is valid; F_SETFL with O_NONBLOCK is standard; flags
+        // value came from successful F_GETFL above.
         let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
         if ret < 0 {
+            // SAFETY: fd is a valid fd we own; closing on error path.
             unsafe {
                 libc::close(fd);
             }
@@ -130,6 +153,8 @@ impl MacOSTun {
             ));
         }
 
+        // SAFETY: fd was obtained from socket() above and is now configured
+        // as non-blocking; we are transferring ownership to OwnedFd.
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
         let async_fd = AsyncFd::new(owned)?;
 
@@ -223,6 +248,9 @@ impl AsyncRead for MacOSTun {
             let dst = buf.initialize_unfilled();
             match guard.try_io(|fd| {
                 let fd = fd.as_raw_fd();
+                // SAFETY: fd is the utun fd registered with AsyncFd for
+                // readiness; dst is initialized_unfilled with correct
+                // length; read() is a standard POSIX call.
                 let n = unsafe { libc::read(fd, dst.as_mut_ptr() as *mut _, dst.len()) };
                 if n < 0 {
                     Err(io::Error::last_os_error())
@@ -269,6 +297,9 @@ impl AsyncWrite for MacOSTun {
                 let mut packet = Vec::with_capacity(4 + buf.len());
                 packet.extend_from_slice(&header);
                 packet.extend_from_slice(buf);
+                // SAFETY: fd is the utun fd registered with AsyncFd for
+                // readiness; packet is a Vec with correct length including
+                // the 4-byte AF header; write() is standard POSIX.
                 let n = unsafe { libc::write(fd, packet.as_ptr() as *const _, packet.len()) };
                 if n < 0 {
                     Err(io::Error::last_os_error())

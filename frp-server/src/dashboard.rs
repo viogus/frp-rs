@@ -670,7 +670,9 @@ pub async fn run_dashboard(
         .route("/api/clients/{run_id}", get(handle_client_detail))
         .route("/api/store/proxies", get(handle_store_proxies).post(handle_store_proxy_create))
         .route("/api/store/proxy/{name}", delete(handle_store_proxy_delete))
-        .route("/api/events", get(handle_events));
+        .route("/api/events", get(handle_events))
+        // v2 API (Go frp v0.70.0 compat): paginated, filterable, searchable endpoints
+        .merge(crate::dashboard_v2::v2_routes());
 
     let api_routes = apply_admin_auth(api_routes, &auth_user, &auth_password);
 

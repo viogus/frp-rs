@@ -132,11 +132,56 @@ pub struct ServerConfig {
     pub max_connections: Option<u32>,
 }
 
+/// Immutable snapshot of server config fields exposed via the dashboard v2
+/// `/api/v2/system/info` endpoint. Captured at startup; not affected by reload.
+/// Go frp v0.70.0 compat.
+#[derive(Debug, Clone)]
+pub struct ServerConfigSnapshot {
+    pub bind_port: u16,
+    pub vhost_http_port: u16,
+    pub vhost_https_port: u16,
+    pub tcpmux_httpconnect_port: u16,
+    #[cfg(feature = "kcp")]
+    pub kcp_bind_port: u16,
+    #[cfg(feature = "quic")]
+    pub quic_bind_port: u16,
+    pub subdomain_host: String,
+    pub max_pool_count: i64,
+    pub max_ports_per_client: i64,
+    pub heartbeat_timeout: i64,
+    pub allow_ports_str: String,
+    pub tls_force: bool,
+}
+
+impl ServerConfigSnapshot {
+    /// Build from a server config. Fields that don't have a direct Rust
+    /// equivalent default to 0 / empty (Go frp compat shape, populated as
+    /// the corresponding config fields are added).
+    pub fn from_config(cfg: &ServerConfig) -> Self {
+        Self {
+            bind_port: cfg.bind_port,
+            vhost_http_port: cfg.vhost_http_port,
+            vhost_https_port: cfg.vhost_https_port,
+            tcpmux_httpconnect_port: cfg.tcpmux_httpconnect_port,
+            #[cfg(feature = "kcp")]
+            kcp_bind_port: cfg.kcp_bind_port,
+            #[cfg(feature = "quic")]
+            quic_bind_port: cfg.quic_bind_port,
+            subdomain_host: cfg.sub_domain_host.clone(),
+            max_pool_count: cfg.transport.max_pool_count,
+            max_ports_per_client: cfg.max_ports_per_client as i64,
+            heartbeat_timeout: cfg.transport.heartbeat_timeout,
+            allow_ports_str: cfg.allow_ports.clone(),
+            tls_force: cfg.tls_only,
+        }
+    }
+}
+
 fn default_allow_port_start() -> u16 { 10000 }
 fn default_allow_port_end() -> u16 { 50000 }
 fn default_vhost_http_timeout() -> u64 { 60 }
 fn default_user_conn_timeout() -> u64 { 10 }
-fn default_udp_packet_size() -> usize { 65535 }
+fn default_udp_packet_size() -> usize { 1500 }
 fn default_nathole_analysis_data_reserve_hours() -> u64 { 1 }
 fn default_graceful_timeout() -> u64 { 30 }
 fn default_authentication_timeout() -> i64 { 15 }
@@ -241,7 +286,7 @@ impl Default for ServerConfig {
             vhost_http_timeout: default_vhost_http_timeout(),
             user_conn_timeout: default_user_conn_timeout(),
             tcp_mux_passthrough: false,
-            detailed_errors_to_client: false,
+            detailed_errors_to_client: true,
             udp_packet_size: default_udp_packet_size(),
             http_plugins: Vec::new(),
             feature: FeatureConfig::default(),
@@ -464,6 +509,12 @@ pub struct ServerTransportConfig {
     /// Go frp compat: transport.heartbeatTimeout.
     #[serde(default = "default_heartbeat_timeout", alias = "heartbeatTimeout")]
     pub heartbeat_timeout: i64,
+    /// Max work-connection pool count per client. The server caps the
+    /// client-requested pool_count at this value. 0 = no server-side
+    /// cap (the client's pool_count is used as-is). Default: 5.
+    /// Go frp compat: transport.maxPoolCount.
+    #[serde(default = "default_max_pool_count", alias = "maxPoolCount")]
+    pub max_pool_count: i64,
 }
 
 impl Default for ServerTransportConfig {
@@ -472,11 +523,31 @@ impl Default for ServerTransportConfig {
             tcp_mux: true,
             tcp_mux_keepalive_interval: 30,
             heartbeat_timeout: default_heartbeat_timeout(),
+            max_pool_count: default_max_pool_count(),
         }
     }
 }
 
 fn default_heartbeat_timeout() -> i64 { 90 }
+fn default_max_pool_count() -> i64 { 5 }
+
+impl ServerTransportConfig {
+    /// Apply conditional defaults matching Go frp v0.70.0
+    /// `ServerTransportConfig.Complete()`. Call after deserialization,
+    /// before consuming the config.
+    pub fn complete(&mut self) {
+        if self.tcp_mux {
+            // When tcpMux is enabled, heartbeat of application layer is
+            // unnecessary — rely on yamux keepalive instead (Go compat).
+            if self.heartbeat_timeout == default_heartbeat_timeout()
+                || self.heartbeat_timeout == 0
+            {
+                self.heartbeat_timeout = -1;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------
 // Plugin Configuration
 // ---------------------------------------------------------------
@@ -522,6 +593,13 @@ pub struct PluginConfig {
     /// Go frp compat: bindPort.
     #[serde(default, alias = "bindPort")]
     pub bind_port: i32,
+    /// PROXY protocol version for the tls2raw plugin ("v1", "v2", or "").
+    /// When set, the plugin reads the proxy protocol header from the tunnel
+    /// stream and writes it to the local raw TCP connection before TLS
+    /// handshake, so the local TLS service sees the real client IP/port.
+    /// Go frp compat: proxyProtocolVersion.
+    #[serde(default, alias = "proxyProtocolVersion")]
+    pub proxy_protocol_version: String,
 }
 
 /// Feature gate configuration ([feature] section in frps.toml / frpc.toml).
@@ -991,6 +1069,34 @@ fn validate_server_config(_cfg: &ServerConfig) -> Result<(), String> {
 
 fn validate_client_config(cfg: &ClientConfig) -> Result<(), String> {
     validate_proxy_configs(&cfg.proxies)?;
+    validate_no_duplicate_names(&cfg.proxies, &cfg.visitors)?;
+    Ok(())
+}
+
+/// Reject duplicate proxy or visitor names. Go frp v0.70.0 compat:
+/// proxies and visitors are keyed by name, and duplicates would otherwise
+/// be silently overwritten with no error (Go) or logged as a warning (Rust).
+///
+/// Cross-type duplicates (same name used for a proxy AND a visitor) are
+/// allowed because they live in separate namespaces (Go frp behavior).
+fn validate_no_duplicate_names(
+    proxies: &[ProxyConfig],
+    visitors: &[VisitorConfig],
+) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::with_capacity(proxies.len());
+    for p in proxies {
+        if !seen.insert(&p.name) {
+            return Err(format!("proxy name [{}] is duplicated", p.name));
+        }
+    }
+
+    seen.clear();
+    for v in visitors {
+        if !seen.insert(&v.name) {
+            return Err(format!("visitor name [{}] is duplicated", v.name));
+        }
+    }
+
     Ok(())
 }
 
@@ -1178,7 +1284,9 @@ pub fn load_server_config(
     path: &str,
     strict_config: bool,
 ) -> Result<ServerConfig, Box<dyn std::error::Error>> {
-    load_config_from_file::<ServerConfig>(path, strict_config, known_server_keys, normalize_server_config, validate_server_config)
+    let mut cfg = load_config_from_file::<ServerConfig>(path, strict_config, known_server_keys, normalize_server_config, validate_server_config)?;
+    cfg.transport.complete();
+    Ok(cfg)
 }
 
 /// Load a client configuration from a file path, auto-detecting format by extension.
@@ -2297,5 +2405,104 @@ bindPort = 2200
             assert!(norm.contains("v2 = true"),
                 "wireProtocol=v2 not converted to v2=true: {norm}");
         }
+    }
+
+    // --- validate_no_duplicate_names tests (Go frp v0.70.0 compat) ---
+
+    #[test]
+    fn duplicate_proxy_names_rejected() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+
+            [[proxies]]
+            name = "dup"
+            type = "tcp"
+            local_ip = "127.0.0.1"
+            local_port = 22
+            remote_port = 6000
+
+            [[proxies]]
+            name = "dup"
+            type = "tcp"
+            local_ip = "127.0.0.1"
+            local_port = 3306
+            remote_port = 6001
+        "#;
+        let err = super::load_client_config_from_str(toml).unwrap_err();
+        assert!(err.to_string().contains("proxy name [dup] is duplicated"),
+            "expected duplicate proxy error, got: {err}");
+    }
+
+    #[test]
+    fn duplicate_visitor_names_rejected() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+
+            [[visitors]]
+            name = "dup"
+            type = "stcp"
+            server_name = "a"
+            secret_key = "secret"
+            bind_port = 9001
+
+            [[visitors]]
+            name = "dup"
+            type = "stcp"
+            server_name = "b"
+            secret_key = "secret"
+            bind_port = 9002
+        "#;
+        let err = super::load_client_config_from_str(toml).unwrap_err();
+        assert!(err.to_string().contains("visitor name [dup] is duplicated"),
+            "expected duplicate visitor error, got: {err}");
+    }
+
+    #[test]
+    fn unique_proxy_names_accepted() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+
+            [[proxies]]
+            name = "p1"
+            type = "tcp"
+            local_ip = "127.0.0.1"
+            local_port = 22
+            remote_port = 6000
+
+            [[proxies]]
+            name = "p2"
+            type = "tcp"
+            local_ip = "127.0.0.1"
+            local_port = 3306
+            remote_port = 6001
+        "#;
+        super::load_client_config_from_str(toml).unwrap();
+    }
+
+    #[test]
+    fn same_name_across_proxy_and_visitor_allowed() {
+        // Go frp v0.70.0: proxies and visitors are separate namespaces.
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+
+            [[proxies]]
+            name = "same"
+            type = "tcp"
+            local_ip = "127.0.0.1"
+            local_port = 22
+            remote_port = 6000
+
+            [[visitors]]
+            name = "same"
+            type = "stcp"
+            server_name = "a"
+            secret_key = "secret"
+            bind_port = 9001
+        "#;
+        super::load_client_config_from_str(toml).unwrap();
     }
 }

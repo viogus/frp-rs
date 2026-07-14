@@ -200,7 +200,20 @@ impl Service {
 
         for p in &cfg.proxies {
             if let Some(ref plugin_cfg) = p.plugin {
-                let result = if plugin_cfg.plugin_type == "visitor_plugin" {
+                let result = if plugin_cfg.plugin_type == "tls2raw" {
+                    // Propagate proxy-level proxyProtocolVersion into the
+                    // plugin config so the tls2raw handler can read+strip
+                    // the proxy protocol header from the tunnel stream
+                    // and write it to the local raw TCP before TLS.
+                    let mut effective = plugin_cfg.clone();
+                    if effective.proxy_protocol_version.is_empty()
+                        && !p.proxy_protocol_version.is_empty()
+                    {
+                        effective.proxy_protocol_version =
+                            p.proxy_protocol_version.clone();
+                    }
+                    plugin::start_tls2raw_plugin(&effective).await
+                } else if plugin_cfg.plugin_type == "visitor_plugin" {
                     let plugin_ctx = PluginContext {
                         server_addr: cfg.server_addr.clone(),
                         server_port: cfg.server_port,
@@ -222,12 +235,10 @@ impl Service {
             }
         }
 
+        // NOTE: Duplicate proxy/visitor names are caught at config parse time
+        // by validate_no_duplicate_names(). No runtime dedup needed.
         let mut map: HashMap<String, ProxyRuntimeInfo> = HashMap::new();
         for p in &cfg.proxies {
-            if map.contains_key(&p.name) {
-                warn!(proxy_name = %p.name, "Duplicate proxy name '{}' — only the first entry will be used", p.name);
-                continue;
-            }
             let bw_limit = frp_core::config::parse_bandwidth_limit(&p.bandwidth_limit).unwrap_or(0);
             // Use plugin address if available, otherwise use configured local_ip:local_port
             let local_addr = plugin_addrs

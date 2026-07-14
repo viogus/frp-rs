@@ -94,7 +94,10 @@ pub struct ControlTx {
     pub tx: mpsc::UnboundedSender<InternalMsg>,
     pub client_addr: Option<SocketAddr>,
     pub login_time: Instant,
+    /// Absolute Unix epoch timestamp of login, for dashboard v2 API.
+    pub login_time_unix: i64,
     pub pool_stats: Arc<PoolStats>,
+    pub user: String,
 }
 
 /// Hot-reloadable server configuration subset, updated atomically on SIGUSR1.
@@ -190,6 +193,9 @@ pub struct AppState {
     /// Aggregate work-conn pool metrics (hits/misses/drops/idle_timeout).
     /// Updated atomically from control handlers, read by Prometheus /admin API.
     pub pool: PoolMetrics,
+    /// Immutable snapshot of server config fields exposed via dashboard v2 API.
+    /// Captured at startup; not affected by reload. Go frp v0.70.0 compat.
+    pub server_config_snapshot: frp_core::config::ServerConfigSnapshot,
     /// Virtual network routing table: (virtual_net, subnet) → (run_id, proxy_name).
     /// Populated by VnetRouteAdvertise messages, used to forward VnetPacket.
     #[cfg(feature = "vnet")]
@@ -202,7 +208,7 @@ pub struct AppState {
 
 impl AppState {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, heartbeat_timeout: i64, udp_packet_size: usize, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16, vhost_http_timeout: u64, user_conn_timeout: u64, tcp_mux_passthrough: bool, custom_404_page: String, plugin_manager: Arc<crate::plugin::HttpPluginManager>, max_ports_per_client: u64, nat_hole_analysis_data_reserve_hours: u64, detailed_errors_to_client: bool, max_connections: usize) -> Self {
+    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, heartbeat_timeout: i64, udp_packet_size: usize, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16, vhost_http_timeout: u64, user_conn_timeout: u64, tcp_mux_passthrough: bool, custom_404_page: String, plugin_manager: Arc<crate::plugin::HttpPluginManager>, max_ports_per_client: u64, nat_hole_analysis_data_reserve_hours: u64, detailed_errors_to_client: bool, max_connections: usize, server_config_snapshot: frp_core::config::ServerConfigSnapshot) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             reloadable: Arc::new(std::sync::RwLock::new(ReloadableState {
@@ -258,6 +264,7 @@ impl AppState {
             pool: PoolMetrics::default(),
             #[cfg(feature = "vnet")]
             vnet_routes: Arc::new(RwLock::new(HashMap::new())),
+            server_config_snapshot,
             #[cfg(feature = "dashboard")]
             event_tx: broadcast::channel(256).0,
         }

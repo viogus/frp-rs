@@ -269,7 +269,12 @@ pub async fn handle_control<S>(
             tx: internal_tx.clone(),
             client_addr: peer,
             login_time: std::time::Instant::now(),
+            login_time_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
             pool_stats: pool_stats.clone(),
+            user: login.user.clone().unwrap_or_default(),
         });
     }
 
@@ -369,8 +374,10 @@ pub async fn handle_control<S>(
         // immediately after LoginResp. This triggers our first encrypted write
         // (IV + ReqWorkConn), unblocking Go frpc's crypto.Reader.Read().
         {
-            let pool_count = login.pool_count.unwrap_or(1).max(1) as usize;
-            info!(peer = ?peer, pool_count = pool_count, "Sending ReqWorkConn x{} through cipher (before split)", pool_count);
+            let max_pool = state.server_config_snapshot.max_pool_count;
+            let raw_pool = login.pool_count.unwrap_or(1).max(1) as i64;
+            let pool_count = if max_pool > 0 { raw_pool.min(max_pool) } else { raw_pool } as usize;
+            info!(peer = ?peer, pool_count = pool_count, max_pool_count = max_pool, "Sending ReqWorkConn x{} through cipher (before split)", pool_count);
             for i in 0..pool_count {
                 if let Err(e) = write_ctl_msg(&mut cipher, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
                     warn!(peer = ?peer, error = %e, i = i, "Failed to send ReqWorkConn #{}/{}: {}", i, pool_count, e);
@@ -391,7 +398,10 @@ pub async fn handle_control<S>(
     info!(peer = ?peer, run_id = %run_id, "Control stream encrypted, entering message loop");
 
     // --- Per-client state ---
-    let pool_cap = login.pool_count.unwrap_or(1).max(0) as usize + WORK_POOL_EXTRA;
+    let max_pool = state.server_config_snapshot.max_pool_count;
+    let raw_pool = login.pool_count.unwrap_or(1).max(0) as i64;
+    let capped_pool = if max_pool > 0 { raw_pool.min(max_pool) } else { raw_pool } as usize;
+    let pool_cap = capped_pool + WORK_POOL_EXTRA;
     let mut work_pool: VecDeque<PoolEntry> = VecDeque::new();
     let mut pending_requests: VecDeque<PendingRequest> = VecDeque::new();
     let mut pending_udp: VecDeque<(String, Instant)> = VecDeque::new();
@@ -438,11 +448,15 @@ pub async fn handle_control<S>(
             }
         }
 
-        // Heartbeat check: if no ping in heartbeat_timeout, disconnect
-        let hb_timeout = Duration::from_secs(state.heartbeat_timeout.max(1) as u64);
-        if last_ping.elapsed() > hb_timeout {
-            warn!(peer = ?peer, hb_timeout = ?hb_timeout, "Heartbeat timeout for {:?} (no ping in {:?}), disconnecting", peer, hb_timeout);
-            break;
+        // Heartbeat check: if no ping in heartbeat_timeout, disconnect.
+        // When heartbeat_timeout <= 0, heartbeat checking is disabled
+        // (matching Go frp v0.70.0 behaviour when tcpMux is enabled).
+        if state.heartbeat_timeout > 0 {
+            let hb_timeout = Duration::from_secs(state.heartbeat_timeout as u64);
+            if last_ping.elapsed() > hb_timeout {
+                warn!(peer = ?peer, hb_timeout = ?hb_timeout, "Heartbeat timeout for {:?} (no ping in {:?}), disconnecting", peer, hb_timeout);
+                break;
+            }
         }
 
         tokio::select! {

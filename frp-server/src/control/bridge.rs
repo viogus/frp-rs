@@ -266,8 +266,7 @@ async fn relay_plain_fast(
         };
         match frp_core::bridge::bridge_plain_zero_copy(user, work).await {
             Ok((a, b)) => {
-                metrics.bytes_in.fetch_add(a, Ordering::Relaxed);
-                metrics.bytes_out.fetch_add(b, Ordering::Relaxed);
+                metrics.record_traffic(a, b);
                 return;
             }
             Err(e) => {

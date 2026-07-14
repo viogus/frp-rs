@@ -195,6 +195,7 @@ impl Service {
             cfg.nat_hole_analysis_data_reserve_hours,
             cfg.detailed_errors_to_client,
             max_connections,
+            frp_core::config::ServerConfigSnapshot::from_config(&cfg),
         );
 
         // Initialize prometheus registry when enabled
