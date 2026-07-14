@@ -69,7 +69,13 @@ pub(crate) async fn handle_visitor_conn_inner(
         Some(pn) => pn,
         None => {
             // Fall back to raw sk lookup for old Rust clients that send raw sk as sign_key
-            let pn = state.xtcp.sk_index.read().await.get(&sign_key).cloned();
+            let pn = state
+                .xtcp
+                .sk_index
+                .read()
+                .await
+                .get(&sign_key)
+                .map(|(pn, _)| pn.clone());
             match pn {
                 Some(pn) => {
                     debug!(proxy_name = %pn, "STCP visitor auth OK (raw sk_index lookup) for proxy '{}'", pn);

@@ -34,24 +34,16 @@ pub struct ProxyInfo {
 impl ProxyInfo {
     /// Compute the composite key used in `sk_index`.
     ///
-    /// When `virtual_net` is set, the key is `"{virtual_net}:{sk}"`;
-    /// otherwise it is just `sk`. Returns `None` when `sk` is empty/missing.
+    /// When `virtual_net` is set, the key is `"{virtual_net}\0{sk}"`;
+    /// otherwise it is just `sk`. The `\0` separator is unambiguous because
+    /// null bytes cannot appear in TOML/JSON config strings.
+    /// Returns `None` when `sk` is empty/missing.
     pub fn sk_index_key(&self) -> Option<String> {
         let sk = self.sk.as_deref().filter(|s| !s.is_empty())?;
         match self.virtual_net.as_deref().filter(|v| !v.is_empty()) {
-            Some(vn) => Some(format!("{}:{}", vn, sk)),
+            Some(vn) => Some(format!("{}\0{}", vn, sk)),
             None => Some(sk.to_string()),
         }
-    }
-
-    /// Extract the raw `sk` from a composite `sk_index` key.
-    ///
-    /// The key format is `"{virtual_net}:{sk}"` (when virtual_net is non-empty)
-    /// or just `"{sk}"`. Uses `splitn(2, ':')` to handle `sk` values that
-    /// themselves contain colons.
-    pub fn sk_from_index_key(key: &str) -> &str {
-        // split_once → at most 1 split. If no colon, returns the full key.
-        key.split_once(':').map(|(_, sk)| sk).unwrap_or(key)
     }
 }
 

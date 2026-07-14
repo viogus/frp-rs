@@ -3,7 +3,7 @@ mod proxy_ops;
 
 use crate::lock::RwLockExt;
 use crate::nathole::NAT_HOLE_TIMEOUT;
-use crate::proxy::ProxyInfo;
+
 use proxy_ops::err_msg;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -1161,9 +1161,8 @@ pub async fn handle_control<S>(
                             // Race: NewVisitorConn may arrive before proxy_manager
                             // registration completes. Fall back to pre-populated sk_index.
                             let sk_map = state.xtcp.sk_index.read().await;
-                            sk_map.iter().any(|(sk_key, pn)| {
+                            sk_map.iter().any(|(_sk_key, (pn, sk_raw))| {
                                 if pn == &nvc.proxy_name {
-                                    let sk_raw = ProxyInfo::sk_from_index_key(sk_key);
                                     let expected = frp_core::auth::generate_token(sk_raw, timestamp);
                                     expected == sign_key
                                 } else {
