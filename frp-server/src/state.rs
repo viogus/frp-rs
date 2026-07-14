@@ -128,7 +128,10 @@ pub struct OidcState {
 /// XTCP NAT-hole-punch coordination state.
 pub struct XtcpState {
     pub nat_hole: Arc<Controller>,
-    pub sk_index: Arc<RwLock<HashMap<String, String>>>,
+    /// Key: composite `virtual_net\0sk` or just `sk` (no virtual_net).
+    /// Value: `(proxy_name, raw_sk)` — raw_sk stored so reverse-parsing
+    /// the key is never needed.
+    pub sk_index: Arc<RwLock<HashMap<String, (String, String)>>>,
 }
 
 pub struct AppState {
