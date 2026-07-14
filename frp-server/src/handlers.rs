@@ -2,17 +2,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::oneshot;
-use tracing::{info, instrument, warn, debug};
+use tracing::{debug, info, instrument, warn};
 
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::write_msg;
 use frp_core::transport::IoStream;
 
-use crate::lock::RwLockExt;
-use crate::state::{AppState, InternalMsg};
 use crate::control;
+use crate::lock::RwLockExt;
 use crate::nathole::controller as nathole_ctrl;
 use crate::nathole::{classify, NAT_HOLE_TIMEOUT};
+use crate::state::{AppState, InternalMsg};
 
 // ---------------------------------------------------------------
 // STCP visitor connection handler
@@ -96,13 +96,13 @@ pub(crate) async fn handle_visitor_conn_inner(
         Some(id) => id,
         None => {
             warn!(proxy_name = %proxy_name, "NewVisitorConn: no run_id found for proxy '{}'", proxy_name);
-     // Send error response to visitor
-     let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
-         proxy_name: proxy_name.clone(),
-         error: Some("provider not found".into()),
-     });
-     let _ = write_msg(&mut stream, &resp, v2).await;
-     return;
+            // Send error response to visitor
+            let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
+                proxy_name: proxy_name.clone(),
+                error: Some("provider not found".into()),
+            });
+            let _ = write_msg(&mut stream, &resp, v2).await;
+            return;
         }
     };
 
@@ -130,31 +130,35 @@ pub(crate) async fn handle_visitor_conn_inner(
     match ctl_tx {
         Some(ctl) => {
             info!(proxy_name = %proxy_name, run_id = %run_id, "STCP visitor for proxy '{}' routed to provider {}", proxy_name, run_id);
-       // Send success response to visitor BEFORE forwarding the stream
-       // (Go frp visitor expects NewVisitorConnResp on the same connection)
-       let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
-           proxy_name: proxy_name.clone(),
-           error: None,
-       });
-       if let Err(e) = write_msg(&mut stream, &resp, v2).await {
-           warn!(proxy_name = %proxy_name, error = %e, "Failed to send NewVisitorConnResp for proxy '{}': {}", proxy_name, e);
-           return;
-       }
-            if ctl.tx.send(InternalMsg::VisitorConn {
-                proxy_name,
-                visitor_conn: stream,
-            }).is_err() {
+            // Send success response to visitor BEFORE forwarding the stream
+            // (Go frp visitor expects NewVisitorConnResp on the same connection)
+            let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
+                proxy_name: proxy_name.clone(),
+                error: None,
+            });
+            if let Err(e) = write_msg(&mut stream, &resp, v2).await {
+                warn!(proxy_name = %proxy_name, error = %e, "Failed to send NewVisitorConnResp for proxy '{}': {}", proxy_name, e);
+                return;
+            }
+            if ctl
+                .tx
+                .send(InternalMsg::VisitorConn {
+                    proxy_name,
+                    visitor_conn: stream,
+                })
+                .is_err()
+            {
                 warn!(run_id = %run_id, "Provider for run_id {} has gone away", run_id);
             }
         }
         None => {
             warn!(run_id = %run_id, "No provider found for run_id {}", run_id);
-       // Send error response to visitor
-       let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
-           proxy_name: proxy_name.clone(),
-           error: Some("provider disconnected".into()),
-       });
-       let _ = write_msg(&mut stream, &resp, v2).await;
+            // Send error response to visitor
+            let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
+                proxy_name: proxy_name.clone(),
+                error: Some("provider disconnected".into()),
+            });
+            let _ = write_msg(&mut stream, &resp, v2).await;
         }
     }
 }
@@ -261,13 +265,9 @@ pub(crate) async fn handle_nat_hole_visitor(
 
     // --- Step 1: Create session and notify provider ---
     let (session, report_rx) = match state
-        .xtcp.nat_hole
-        .create_session_with_writer(
-            sid.clone(),
-            proxy_name.clone(),
-            msg.clone(),
-            writer,
-        )
+        .xtcp
+        .nat_hole
+        .create_session_with_writer(sid.clone(), proxy_name.clone(), msg.clone(), writer)
         .await
     {
         Ok(s) => s,
@@ -317,11 +317,8 @@ pub(crate) async fn handle_nat_hole_visitor(
     // Go frp v0.69.1 compat: server is a pure relay.
     // handle_client() signals notify_ch when the message arrives.
 
-    let client_msg_received = tokio::time::timeout(
-        Duration::from_secs(NAT_HOLE_TIMEOUT),
-        notify_rx,
-    )
-    .await;
+    let client_msg_received =
+        tokio::time::timeout(Duration::from_secs(NAT_HOLE_TIMEOUT), notify_rx).await;
 
     if client_msg_received.is_err() {
         warn!(
@@ -383,8 +380,11 @@ pub(crate) async fn handle_nat_hole_visitor(
     // --- Step 5: Run analysis and build responses ---
     let (v_resp, c_resp) = if let (Some(ref vf), Some(ref cf)) = (&v_feature, &c_feature) {
         let key = nathole_ctrl::gen_analysis_key(cf, vf);
-        let (mode, index, c_behavior, v_behavior) =
-            state.xtcp.nat_hole.analyzer.get_recommend_behaviors(&key, cf, vf);
+        let (mode, index, c_behavior, v_behavior) = state
+            .xtcp
+            .nat_hole
+            .analyzer
+            .get_recommend_behaviors(&key, cf, vf);
         *session.selected_index.lock().await = Some(index);
 
         let timeout_ms = c_behavior.send_delay_ms.max(v_behavior.send_delay_ms) + 5000;
@@ -398,7 +398,7 @@ pub(crate) async fn handle_nat_hole_visitor(
             &sid,
             msg.protocol.clone(),
             mode,
-            client_mapped.clone(),  // visitor gets PROVIDER's addresses
+            client_mapped.clone(), // visitor gets PROVIDER's addresses
             client_assisted.clone(),
             v_behavior,
             v_read_timeout,
@@ -410,7 +410,7 @@ pub(crate) async fn handle_nat_hole_visitor(
             &sid,
             client_msg.protocol.clone(),
             mode,
-            visitor_mapped.clone(),  // provider gets VISITOR's addresses
+            visitor_mapped.clone(), // provider gets VISITOR's addresses
             visitor_assisted.clone(),
             c_behavior,
             c_read_timeout,
@@ -425,8 +425,16 @@ pub(crate) async fn handle_nat_hole_visitor(
             error: None,
             sid: Some(sid.clone()),
             protocol: msg.protocol.clone(),
-            candidate_addrs: if client_mapped.is_empty() { None } else { Some(client_mapped) },
-            assisted_addrs: if client_assisted.is_empty() { None } else { Some(client_assisted) },
+            candidate_addrs: if client_mapped.is_empty() {
+                None
+            } else {
+                Some(client_mapped)
+            },
+            assisted_addrs: if client_assisted.is_empty() {
+                None
+            } else {
+                Some(client_assisted)
+            },
             ..Default::default()
         };
         let c_resp = msg::NatHoleResp {
@@ -434,8 +442,16 @@ pub(crate) async fn handle_nat_hole_visitor(
             error: None,
             sid: Some(sid.clone()),
             protocol: client_msg.protocol.clone(),
-            candidate_addrs: if visitor_mapped.is_empty() { None } else { Some(visitor_mapped) },
-            assisted_addrs: if visitor_assisted.is_empty() { None } else { Some(visitor_assisted) },
+            candidate_addrs: if visitor_mapped.is_empty() {
+                None
+            } else {
+                Some(visitor_mapped)
+            },
+            assisted_addrs: if visitor_assisted.is_empty() {
+                None
+            } else {
+                Some(visitor_assisted)
+            },
             ..Default::default()
         };
         (v_resp, Some(c_resp))
@@ -585,22 +601,33 @@ pub(crate) async fn handle_work_conn_inner(
 
     // Verify work connection auth (Go frp v0.69.1 compat).
     // Only validate when "NewWorkConns" is in additional_auth_scopes.
-    let requires_nwc_auth = state.reloadable.read_ok()
-        .additional_auth_scopes.iter().any(|s| s == "NewWorkConns");
+    let requires_nwc_auth = state
+        .reloadable
+        .read_ok()
+        .additional_auth_scopes
+        .iter()
+        .any(|s| s == "NewWorkConns");
     let nwc_auth_result = if !requires_nwc_auth {
         Ok(())
     } else if let Some(ref verifier) = state.oidc.verifier {
-        let expected_sub = state.oidc.subjects.read().await
-            .get(&run_id).cloned().unwrap_or_default();
-        verifier.verify_new_work_conn(
-            msg.privilege_key.as_deref().unwrap_or(""),
-            &expected_sub,
-        ).await
+        let expected_sub = state
+            .oidc
+            .subjects
+            .read()
+            .await
+            .get(&run_id)
+            .cloned()
+            .unwrap_or_default();
+        verifier
+            .verify_new_work_conn(msg.privilege_key.as_deref().unwrap_or(""), &expected_sub)
+            .await
     } else {
-        state.reloadable.read_ok().auth_cfg.validate_login(
-            msg.privilege_key.as_deref(),
-            msg.timestamp,
-        ).map(|_| ())
+        state
+            .reloadable
+            .read_ok()
+            .auth_cfg
+            .validate_login(msg.privilege_key.as_deref(), msg.timestamp)
+            .map(|_| ())
     };
     if let Err(e) = nwc_auth_result {
         warn!(run_id = %run_id, error = %e, "Work conn auth failed for run_id {}: {}", run_id, e);
@@ -611,7 +638,11 @@ pub(crate) async fn handle_work_conn_inner(
     let nwc_content = serde_json::json!({
         "run_id": run_id,
     });
-    if let Err(reason) = state.plugin_manager.notify("new_work_conn", nwc_content).await {
+    if let Err(reason) = state
+        .plugin_manager
+        .notify("new_work_conn", nwc_content)
+        .await
+    {
         warn!(run_id = %run_id, reason = %reason, "NewWorkConn plugin hook rejected: {}", reason);
         return;
     }
