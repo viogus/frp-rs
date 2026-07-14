@@ -270,6 +270,7 @@ pub async fn handle_control<S>(
             client_addr: peer,
             login_time: std::time::Instant::now(),
             pool_stats: pool_stats.clone(),
+            user: login.user.clone().unwrap_or_default(),
         });
     }
 

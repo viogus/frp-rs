@@ -28,6 +28,7 @@ pub struct ProxyInfo {
     pub custom_domains: Vec<String>,
     /// Multiplexer type (e.g., "yamux").
     pub multiplexer: String,
+    pub user: String,
 }
 
 /// Manages all proxy registrations on the server.

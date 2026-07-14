@@ -172,6 +172,10 @@ pub(crate) async fn handle_new_proxy(
                 response_headers: np.response_headers.clone().unwrap_or_default(),
                 custom_domains: np.custom_domains.clone().unwrap_or_default(),
                 multiplexer: np.multiplexer.clone().unwrap_or_default(),
+                user: state.run_id_to_ctl_tx.read().await
+                    .get(run_id)
+                    .map(|c| c.user.clone())
+                    .unwrap_or_default(),
             };
 
             if let Err(e) = state.proxy_manager.register(run_id.to_string(), info.clone()).await {
