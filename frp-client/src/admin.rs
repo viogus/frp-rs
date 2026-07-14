@@ -192,7 +192,7 @@ async fn handle_put_config(
         })?;
     // Trigger reload after config update
     let (tx, rx) = oneshot::channel();
-    let req = ReloadRequest { strict: false, reply: tx };
+    let req = ReloadRequest { strict: true, reply: tx };
     state.reload_tx.send(req).map_err(|_| {
         (StatusCode::INTERNAL_SERVER_ERROR, "reload channel closed".into())
     })?;
@@ -288,25 +288,44 @@ pub async fn run_admin_server(
     let app = apply_admin_auth(app, &auth_user, &auth_password);
     let app = app.with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    // Security: when no admin auth is configured, force binding to localhost
+    // to prevent unauthenticated access to the admin API (which exposes
+    // config with tokens, reload, and stop).
+    let bind_addr = if auth_user.is_empty() || auth_password.is_empty() {
+        let localhost_addr = format!(
+            "127.0.0.1:{}",
+            addr.rsplit(':').next().unwrap_or("7400")
+        );
+        tracing::warn!(
+            original = %addr,
+            bind = %localhost_addr,
+            "frpc admin: no admin auth configured — binding to {} (localhost only) to prevent unauthenticated public access. Set admin_user and admin_password.",
+            localhost_addr
+        );
+        localhost_addr
+    } else {
+        addr.clone()
+    };
+
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
     #[cfg(feature = "tls")]
     match (tls_cert_file, tls_key_file) {
         (Some(cert), Some(key)) if !cert.is_empty() && !key.is_empty() => {
             let acceptor = frp_core::transport::build_tls_acceptor(&cert, &key, None)?;
-            tracing::info!(addr = %addr, "frpc admin server listening on {} (TLS)", addr);
+            tracing::info!(addr = %bind_addr, "frpc admin server listening on {} (TLS)", bind_addr);
             let tls_listener = TlsListener::new(listener, acceptor);
             axum::serve(tls_listener, app).await?;
         }
         _ => {
-            tracing::info!(addr = %addr, "frpc admin server listening on {}", addr);
+            tracing::info!(addr = %bind_addr, "frpc admin server listening on {}", bind_addr);
             axum::serve(listener, app).await?;
         }
     }
     #[cfg(not(feature = "tls"))]
     {
         let _ = (&tls_cert_file, &tls_key_file);
-        tracing::info!(addr = %addr, "frpc admin server listening on {}", addr);
+        tracing::info!(addr = %bind_addr, "frpc admin server listening on {}", bind_addr);
         axum::serve(listener, app).await?;
     }
     Ok(())
@@ -316,7 +335,7 @@ pub async fn run_admin_server(
 
 /// Sensitive keys that should be redacted from config responses.
 const SENSITIVE_KEYS: &[&str] = &[
-    "token", "privilege_token",
+    "token", "auth_token", "privilege_token",
     "http_pwd", "http_password",
     "sk", "group_key",
     "oidc_client_secret",

@@ -5,6 +5,7 @@ use tracing_subscriber::EnvFilter;
 
 use frp_core::cli::{parse_frps_args, FrpsArgs};
 use frp_core::config::{load_server_config, collect_config_files, ServerConfig};
+use frp_core::unsafe_features::UnsafeFeatures;
 use frp_server::service::Service;
 
 #[cfg(all(feature = "mimalloc", not(feature = "mem-profile")))]
@@ -188,11 +189,16 @@ fn build_otel_layer(
     Ok((layer, provider))
 }
 
-async fn run(cli: FrpsArgs) {
+async fn run(mut cli: FrpsArgs) {
     if cli.show_version {
         println!("frps {}", frp_core::VERSION);
         process::exit(0);
     }
+
+    // Build UnsafeFeatures from CLI --allow-unsafe flag
+    let allow_unsafe = std::mem::take(&mut cli.allow_unsafe);
+    let refs: Vec<&str> = allow_unsafe.iter().map(|s| s.as_str()).collect();
+    let unsafe_features = UnsafeFeatures::new(&refs);
 
     // Config directory mode: init logging from CLI only
     if let Some(ref dir) = cli.config_dir {
@@ -222,8 +228,9 @@ async fn run(cli: FrpsArgs) {
             match load_server_config(&path_str, cli.strict_config) {
                 Ok(mut cfg) => {
                     cli.override_server_config(&mut cfg);
+                    let uf = unsafe_features.clone();
                     handles.push(tokio::spawn(async move {
-                        let service = match Service::new(cfg, Some(path_str.clone())).await {
+                        let service = match Service::with_unsafe_features(cfg, Some(path_str.clone()), uf).await {
                             Ok(s) => s,
                             Err(e) => {
                                 tracing::error!(path = %path_str, error = %e, "frps service init failed for [{}]: {}", path_str, e);
@@ -268,7 +275,7 @@ async fn run(cli: FrpsArgs) {
     tracing::info!(version = %frp_core::VERSION, "frps (Rust) v{} starting...", frp_core::VERSION);
     let config_path = Some(cli.config.clone());
     let service = std::sync::Arc::new(
-        Service::new(cfg, config_path).await.unwrap_or_else(|e| {
+        Service::with_unsafe_features(cfg, config_path, unsafe_features).await.unwrap_or_else(|e| {
             tracing::error!(error = %e, "frps init error: {}", e);
             let code = if e.to_string().contains("token") || e.to_string().contains("auth") {
                 frp_core::EXIT_AUTH

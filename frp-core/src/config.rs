@@ -286,7 +286,7 @@ impl Default for ServerConfig {
             vhost_http_timeout: default_vhost_http_timeout(),
             user_conn_timeout: default_user_conn_timeout(),
             tcp_mux_passthrough: false,
-            detailed_errors_to_client: true,
+            detailed_errors_to_client: false,
             udp_packet_size: default_udp_packet_size(),
             http_plugins: Vec::new(),
             feature: FeatureConfig::default(),
@@ -1048,6 +1048,30 @@ fn validate_proxy_configs(proxies: &[ProxyConfig]) -> Result<(), String> {
                     p.name
                 ));
             }
+        }
+
+        // Validate proxy headers field (injected into forwarded requests)
+        for (name, value) in &p.headers {
+            if name.contains('\r') || name.contains('\n') {
+                return Err(format!(
+                    "proxy '{}': header name in 'headers' contains CR/LF: {name:?}",
+                    p.name
+                ));
+            }
+            if value.contains('\r') || value.contains('\n') {
+                return Err(format!(
+                    "proxy '{}': header value in 'headers' for {name:?} contains CR/LF",
+                    p.name
+                ));
+            }
+        }
+
+        // Validate host_header_rewrite (injected into Host header)
+        if p.host_header_rewrite.contains('\r') || p.host_header_rewrite.contains('\n') {
+            return Err(format!(
+                "proxy '{}': host_header_rewrite contains CR/LF",
+                p.name
+            ));
         }
 
         // Validate bandwidth_limit: non-empty strings must parse

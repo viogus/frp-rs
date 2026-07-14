@@ -878,6 +878,17 @@ pub async fn handle_control<S>(
                         info!(proxy_name = %rem.proxy_name, "vnet route removed: {}", rem.proxy_name);
                     }
                     Ok(FrpMessage::CloseProxy(cp)) => {
+                        // Verify the proxy belongs to this client
+                        let owner_run_id = state.proxy_manager.get_run_id(&cp.proxy_name).await;
+                        if owner_run_id.as_ref() != Some(&run_id) {
+                            warn!(
+                                proxy_name = %cp.proxy_name,
+                                run_id = %run_id,
+                                owner = ?owner_run_id,
+                                "CloseProxy rejected: proxy belongs to different client"
+                            );
+                            continue;
+                        }
                         if let Some(info) = state.proxy_manager.get(&cp.proxy_name).await {
                             if let Some(port) = info.remote_port {
                                 state.used_ports.write().await.remove(&port);

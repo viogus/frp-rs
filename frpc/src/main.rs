@@ -11,6 +11,7 @@ use frp_core::cli::{
     build_single_proxy_config,
 };
 use frp_core::config::{load_client_config, collect_config_files, ClientConfig, ProxyConfig};
+use frp_core::unsafe_features::UnsafeFeatures;
 use frp_core::{EXIT_AUTH, EXIT_BIND, EXIT_CONFIG, EXIT_RUNTIME};
 use frp_client::service::Service;
 
@@ -341,11 +342,16 @@ fn build_otel_layer(
     Ok((layer, provider))
 }
 
-async fn run_normal(args: FrpcRunArgs) {
+async fn run_normal(mut args: FrpcRunArgs) {
     if args.show_version {
         println!("frpc {}", frp_core::VERSION);
         process::exit(0);
     }
+
+    // Build UnsafeFeatures from CLI --allow-unsafe flag
+    let allow_unsafe = std::mem::take(&mut args.allow_unsafe);
+    let refs: Vec<&str> = allow_unsafe.iter().map(|s| s.as_str()).collect();
+    let unsafe_features = UnsafeFeatures::new(&refs);
 
     // Config directory mode
     if let Some(ref dir) = args.config_dir {
@@ -374,8 +380,9 @@ async fn run_normal(args: FrpcRunArgs) {
             let path_str = path.display().to_string();
             match load_client_config(&path_str, args.strict_config) {
                 Ok(cfg) => {
+                    let uf = unsafe_features.clone();
                     handles.push(tokio::spawn(async move {
-                        let service = match Service::new(cfg, Some(path_str.clone())).await {
+                        let service = match Service::with_unsafe_features(cfg, Some(path_str.clone()), uf).await {
                             Ok(svc) => svc,
                             Err(e) => {
                                 tracing::error!(config_file = %path_str, error = %e, "frpc service init error for config file [{}]: {}", path_str, e);
@@ -417,7 +424,7 @@ async fn run_normal(args: FrpcRunArgs) {
     init_logging(&args, Some(&cfg));
 
     tracing::info!(version = %frp_core::VERSION, "frpc (Rust) v{} connecting...", frp_core::VERSION);
-    let service = Arc::new(match Service::new(cfg, Some(args.config.clone())).await {
+    let service = Arc::new(match Service::with_unsafe_features(cfg, Some(args.config.clone()), unsafe_features.clone()).await {
         Ok(svc) => svc,
         Err(e) => {
             let code = if e.to_string().contains("token") || e.to_string().contains("auth") {

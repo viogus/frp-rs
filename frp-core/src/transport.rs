@@ -1898,6 +1898,9 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
 
     let mut reader = BufReader::new(stream);
     let mut key = String::new();
+    let mut is_upgrade = false;
+    let mut first_line = true;
+    let mut valid_path = false;
 
     // Read HTTP upgrade request line by line.
     loop {
@@ -1907,16 +1910,43 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
         if line == "\r\n" || line.is_empty() {
             break;
         }
+        if first_line {
+            // Validate request line: GET /~!frp HTTP/1.x
+            first_line = false;
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 2 || !parts[0].eq_ignore_ascii_case("GET") {
+                return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(format!(
+                    "expected GET request, got: {}",
+                    line.trim()
+                ))));
+            }
+            if parts[1] == FRP_WEBSOCKET_PATH {
+                valid_path = true;
+            }
+        }
         if line.len() > 1 {
-            let lower = line[..1].to_lowercase() + &line[1..].to_lowercase();
+            let lower = line.to_lowercase();
             if lower.starts_with("sec-websocket-key:") {
                 key = line.split_once(':').map(|x| x.1).unwrap_or("").trim().to_string();
+            } else if lower.starts_with("upgrade:") && lower.contains("websocket") {
+                is_upgrade = true;
             }
         }
     }
 
     if key.is_empty() {
         return Err(crate::Error::Transport("Missing Sec-WebSocket-Key".into()));
+    }
+    if !is_upgrade {
+        return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
+            "missing Upgrade: websocket header".into()
+        )));
+    }
+    if !valid_path {
+        return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(format!(
+            "unexpected path (expected {})",
+            FRP_WEBSOCKET_PATH
+        ))));
     }
 
     // Compute accept key: base64(sha1(key + magic GUID))
@@ -2022,17 +2052,47 @@ pub async fn accept_websocket_from_peeked(
 
     let headers_str = String::from_utf8_lossy(&buf);
     let mut key = String::new();
+    let mut is_upgrade = false;
+    let mut first_line = true;
+    let mut valid_path = false;
     for line in headers_str.lines() {
+        if first_line {
+            first_line = false;
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if !parts[0].eq_ignore_ascii_case("GET") {
+                    return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
+                        format!("expected GET request, got: {}", line)
+                    )));
+                }
+                if parts[1] == FRP_WEBSOCKET_PATH {
+                    valid_path = true;
+                }
+            }
+        }
         if line.len() > 1 {
             let lower = line.to_lowercase();
             if lower.starts_with("sec-websocket-key:") {
                 key = line.split_once(':').map(|x| x.1).unwrap_or("").trim().to_string();
+            } else if lower.starts_with("upgrade:") && lower.contains("websocket") {
+                is_upgrade = true;
             }
         }
     }
 
     if key.is_empty() {
         return Err(crate::Error::Transport("Missing Sec-WebSocket-Key".into()));
+    }
+    if !is_upgrade {
+        return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
+            "missing Upgrade: websocket header".into()
+        )));
+    }
+    if !valid_path {
+        return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(format!(
+            "unexpected path (expected {})",
+            FRP_WEBSOCKET_PATH
+        ))));
     }
 
     // Compute accept key: base64(sha1(key + magic GUID))

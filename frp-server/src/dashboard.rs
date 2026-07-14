@@ -487,6 +487,7 @@ async fn handle_store_proxy_delete(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::warn!(proxy_name = %name, "Dashboard: single proxy delete");
     let proxy = state.proxy_manager.get(&name).await
         .ok_or_else(|| not_found("proxy not found"))?;
 
@@ -523,6 +524,7 @@ async fn handle_proxies_delete(
     State(state): State<Arc<AppState>>,
     Json(body): Json<DeleteProxiesBody>,
 ) -> Json<serde_json::Value> {
+    tracing::warn!(count = body.proxies.len(), names = ?body.proxies, "Dashboard: bulk proxy delete");
     let mut deleted = Vec::new();
     for name in &body.proxies {
         if let Some(proxy) = state.proxy_manager.get(name).await {
@@ -708,7 +710,7 @@ pub async fn run_dashboard(
 
     // Security: when no admin auth is configured, force binding to localhost
     // to prevent unauthenticated access to the dashboard and /metrics endpoint.
-    let bind_addr = if auth_user.is_empty() && auth_password.is_empty() {
+    let bind_addr = if auth_user.is_empty() || auth_password.is_empty() {
         let localhost_addr = format!(
             "127.0.0.1:{}",
             addr.rsplit(':').next().unwrap_or("7500")

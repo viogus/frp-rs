@@ -351,23 +351,21 @@ fn extract_path(request: &str) -> Option<&str> {
 /// Byte-oriented to avoid mangling non-UTF-8 request data.
 /// Returns a new Vec<u8> with the rewritten header.
 fn rewrite_host_header(data: &[u8], new_host: &str) -> Vec<u8> {
-    // Search for \r\nHost: or \nHost: (HTTP allows both)
-    let host_pos = data
-        .windows(2)
-        .position(|w| w == b"\r\n")
-        .and_then(|pos| {
-            let rest = &data[pos + 2..];
-            if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case(b"host:") {
-                Some(pos + 2)
-            } else {
-                // Also check first-line Host: (no leading \r\n)
-                if data.len() >= 5 && data[..5].eq_ignore_ascii_case(b"host:") {
-                    Some(0)
-                } else {
-                    None
-                }
-            }
-        });
+    // Search for \r\nHost: anywhere in the request data, plus first-line Host:
+    let host_pos = {
+        // First check if Host: is the very first header (no leading \r\n)
+        let first_line = if data.len() >= 5 && data[..5].eq_ignore_ascii_case(b"host:") {
+            Some(0)
+        } else {
+            None
+        };
+        // Then scan for \r\n followed by Host: anywhere
+        first_line.or_else(|| {
+            data.windows(7)
+                .position(|w| w[..2] == *b"\r\n" && w[2..].eq_ignore_ascii_case(b"host:"))
+                .map(|p| p + 2)
+        })
+    };
 
     let Some(host_start) = host_pos else {
         return data.to_vec();
@@ -412,7 +410,7 @@ fn extract_host_header(request: &str) -> Option<&str> {
         if value.starts_with('[') {
             return value.find(']').map(|end| &value[1..end]);
         }
-        return Some(value.rsplit(':').next().unwrap_or(value));
+        return Some(value.split(':').next().unwrap_or(value));
     }
     None
 }
