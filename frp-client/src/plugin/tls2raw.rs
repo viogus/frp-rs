@@ -1,9 +1,9 @@
 #[cfg(feature = "tls")]
-use tokio::net::TcpStream;
+use rustls::pki_types::ServerName;
 #[cfg(feature = "tls")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(feature = "tls")]
-use rustls::pki_types::ServerName;
+use tokio::net::TcpStream;
 #[cfg(feature = "tls")]
 use tracing::{debug, warn};
 
@@ -11,7 +11,7 @@ use frp_core::config::PluginConfig;
 #[cfg(feature = "tls")]
 use frp_core::transport::build_tls_connector;
 
-use super::{PluginHandle, serve_plugin};
+use super::{serve_plugin, PluginHandle};
 
 /// Start a TLS-to-raw plugin.
 ///
@@ -127,9 +127,7 @@ pub async fn start_tls2raw_plugin(_cfg: &PluginConfig) -> Result<PluginHandle, f
 /// v1 format: "PROXY TCP4 src dst sport dport\r\n" (variable length).
 /// Returns (header_bytes, remaining_bytes_after_header).
 #[cfg(feature = "tls")]
-async fn read_proxy_header_v1(
-    stream: &mut TcpStream,
-) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+async fn read_proxy_header_v1(stream: &mut TcpStream) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     let mut buf = Vec::with_capacity(128);
     let mut chunk = [0u8; 128];
     loop {
@@ -168,9 +166,7 @@ async fn read_proxy_header_v1(
 /// v2 format: 12-byte sig + 4-byte hdr + variable address block.
 /// Returns (header_bytes, remaining_bytes_after_header).
 #[cfg(feature = "tls")]
-async fn read_proxy_header_v2(
-    stream: &mut TcpStream,
-) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+async fn read_proxy_header_v2(stream: &mut TcpStream) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     // Read fixed 16-byte prefix: 12 sig + 1 version|cmd + 1 transport + 2 addr_len.
     let mut fixed = [0u8; 16];
     stream.read_exact(&mut fixed).await?;

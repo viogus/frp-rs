@@ -1,6 +1,6 @@
 use std::sync::Arc;
-use tokio::net::TcpListener;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tracing::{debug, warn};
 
 use frp_core::auth::{AuthConfig, AuthMethod};
@@ -10,7 +10,7 @@ use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::{self, DialOptions, TransportProtocol};
 use frp_core::VERSION;
 
-use super::{PluginHandle, PluginContext};
+use super::{PluginContext, PluginHandle};
 
 /// Start a visitor plugin that tunnels connections to a remote STCP/XTCP proxy.
 ///
@@ -26,7 +26,7 @@ pub async fn start_visitor_plugin(
 
     if server_name.is_empty() {
         return Err(frp_core::Error::Config(
-            "visitor_plugin: serverName is required".into()
+            "visitor_plugin: serverName is required".into(),
         ));
     }
 
@@ -162,7 +162,8 @@ async fn handle_visitor_conn(
         tls_ca_file: tls_ca_file.map(|s| s.to_string()),
         ..Default::default()
     };
-    let mut server_stream = transport::dial_server(&opts).await
+    let mut server_stream = transport::dial_server(&opts)
+        .await
         .map_err(|e| format!("dial server: {e}"))?;
 
     // 2. Login
@@ -199,14 +200,20 @@ async fn handle_visitor_conn(
         multiplexer: None,
     };
     if let Some(ref oidc) = oidc_client {
-        oidc.set_login(&mut login).await.map_err(|e| format!("OIDC: {e}"))?;
+        oidc.set_login(&mut login)
+            .await
+            .map_err(|e| format!("OIDC: {e}"))?;
     } else {
         login.privilege_key = auth_cfg.generate_login_key(timestamp);
     }
-    write_msg_v1(&mut server_stream, &FrpMessage::Login(login)).await
+    write_msg_v1(&mut server_stream, &FrpMessage::Login(login))
+        .await
         .map_err(|e| format!("write login: {e}"))?;
 
-    match read_msg_v1(&mut server_stream).await.map_err(|e| format!("read login resp: {e}"))? {
+    match read_msg_v1(&mut server_stream)
+        .await
+        .map_err(|e| format!("read login resp: {e}"))?
+    {
         FrpMessage::LoginResp(resp) => {
             if let Some(err) = resp.error {
                 return Err(format!("login rejected: {err}"));
@@ -217,13 +224,20 @@ async fn handle_visitor_conn(
 
     // 3. Send NewVisitorConn
     let nvc = crate::proxy::create_visitor_conn_msg(
-        server_name, secret_key, use_encryption, use_compression,
+        server_name,
+        secret_key,
+        use_encryption,
+        use_compression,
     );
-    write_msg_v1(&mut server_stream, &nvc).await
+    write_msg_v1(&mut server_stream, &nvc)
+        .await
         .map_err(|e| format!("write NewVisitorConn: {e}"))?;
 
     // 4. Read NewVisitorConnResp
-    match read_msg_v1(&mut server_stream).await.map_err(|e| format!("read NewVisitorConnResp: {e}"))? {
+    match read_msg_v1(&mut server_stream)
+        .await
+        .map_err(|e| format!("read NewVisitorConnResp: {e}"))?
+    {
         FrpMessage::NewVisitorConnResp(resp) => {
             if let Some(err) = resp.error {
                 return Err(format!("visitor conn rejected: {err}"));
@@ -248,7 +262,9 @@ async fn handle_visitor_conn(
     });
 
     match tokio::join!(a, b) {
-        (Ok(n1), Ok(n2)) => debug!(n1 = ?n1, n2 = ?n2, "visitor plugin: bridge done ({:?}B→server, {:?}B→user)", n1, n2),
+        (Ok(n1), Ok(n2)) => {
+            debug!(n1 = ?n1, n2 = ?n2, "visitor plugin: bridge done ({:?}B→server, {:?}B→user)", n1, n2)
+        }
         (Err(e), _) | (_, Err(e)) => debug!(error = %e, "visitor plugin: bridge closed: {}", e),
     }
 

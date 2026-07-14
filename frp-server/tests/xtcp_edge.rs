@@ -8,7 +8,7 @@ use frp_core::msg::{self, FrpMessage, NatHoleVisitor, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
 
-use common::{allocate_port, login_with_test_token, raw_login, start_test_server, test_auth_cfg};
+use common::{allocate_port, login_with_test_token, start_test_server, test_auth_cfg};
 
 /// Helper: build a minimal `NewProxy` for XTCP with only the required fields set.
 fn xtcp_proxy(name: &str, sk: &str, local_str: &str) -> NewProxy {
@@ -99,18 +99,13 @@ async fn test_xtcp_concurrent_3_sessions() {
             ));
             write_msg_v1(&mut provider_ctl, &np)
                 .await
-                .expect(&format!("[{}] send NewProxy", i));
+                .unwrap_or_else(|_| panic!("[{}] send NewProxy", i));
             match read_msg_v1(&mut provider_ctl)
                 .await
-                .expect(&format!("[{}] read NewProxyResp", i))
+                .unwrap_or_else(|_| panic!("[{}] read NewProxyResp", i))
             {
                 FrpMessage::NewProxyResp(ref r) => {
-                    assert!(
-                        r.error.is_none(),
-                        "[{}] proxy reg error: {:?}",
-                        i,
-                        r.error
-                    );
+                    assert!(r.error.is_none(), "[{}] proxy reg error: {:?}", i, r.error);
                 }
                 other => panic!(
                     "[{}] expected NewProxyResp, got: {:?}",
@@ -123,7 +118,7 @@ async fn test_xtcp_concurrent_3_sessions() {
             let mut work_conn = IoStream::Tcp(
                 tokio::net::TcpStream::connect(*addr)
                     .await
-                    .expect(&format!("[{}] work conn connect", i)),
+                    .unwrap_or_else(|_| panic!("[{}] work conn connect", i)),
             );
             let nwc = FrpMessage::NewWorkConn(msg::NewWorkConn {
                 run_id: Some(run_id.clone()),
@@ -132,7 +127,7 @@ async fn test_xtcp_concurrent_3_sessions() {
             });
             write_msg_v1(&mut work_conn, &nwc)
                 .await
-                .expect(&format!("[{}] send NewWorkConn", i));
+                .unwrap_or_else(|_| panic!("[{}] send NewWorkConn", i));
 
             // Give server time to pool the work connection
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -141,7 +136,7 @@ async fn test_xtcp_concurrent_3_sessions() {
             let mut precheck_conn = IoStream::Tcp(
                 tokio::net::TcpStream::connect(*addr)
                     .await
-                    .expect(&format!("[{}] precheck connect", i)),
+                    .unwrap_or_else(|_| panic!("[{}] precheck connect", i)),
             );
             let precheck_msg = FrpMessage::NatHoleVisitor(NatHoleVisitor {
                 transaction_id: format!("precheck-{}", txn_id),
@@ -151,11 +146,11 @@ async fn test_xtcp_concurrent_3_sessions() {
             });
             write_msg_v1(&mut precheck_conn, &precheck_msg)
                 .await
-                .expect(&format!("[{}] send precheck", i));
+                .unwrap_or_else(|_| panic!("[{}] send precheck", i));
 
             match read_msg_v1(&mut precheck_conn)
                 .await
-                .expect(&format!("[{}] read precheck resp", i))
+                .unwrap_or_else(|_| panic!("[{}] read precheck resp", i))
             {
                 FrpMessage::NatHoleResp(resp) => {
                     assert!(
@@ -164,11 +159,7 @@ async fn test_xtcp_concurrent_3_sessions() {
                         i,
                         resp.error
                     );
-                    assert!(
-                        resp.sid.is_none(),
-                        "[{}] precheck should not have sid",
-                        i
-                    );
+                    assert!(resp.sid.is_none(), "[{}] precheck should not have sid", i);
                 }
                 other => panic!(
                     "[{}] expected NatHoleResp for precheck, got: {:?}",
@@ -182,7 +173,7 @@ async fn test_xtcp_concurrent_3_sessions() {
             let mut visitor_conn = IoStream::Tcp(
                 tokio::net::TcpStream::connect(*addr)
                     .await
-                    .expect(&format!("[{}] visitor connect", i)),
+                    .unwrap_or_else(|_| panic!("[{}] visitor connect", i)),
             );
             let nhv = FrpMessage::NatHoleVisitor(NatHoleVisitor {
                 transaction_id: txn_id.clone(),
@@ -196,12 +187,12 @@ async fn test_xtcp_concurrent_3_sessions() {
             });
             write_msg_v1(&mut visitor_conn, &nhv)
                 .await
-                .expect(&format!("[{}] send full NatHoleVisitor", i));
+                .unwrap_or_else(|_| panic!("[{}] send full NatHoleVisitor", i));
 
             // --- Read StartWorkConn + NatHoleSid from work conn ---
             match read_msg_v1(&mut work_conn)
                 .await
-                .expect(&format!("[{}] read StartWorkConn from work conn", i))
+                .unwrap_or_else(|_| panic!("[{}] read StartWorkConn from work conn", i))
             {
                 FrpMessage::StartWorkConn(swc) => {
                     assert_eq!(
@@ -210,15 +201,10 @@ async fn test_xtcp_concurrent_3_sessions() {
                         i
                     );
                     // NatHoleSid embedded in StartWorkConn (Rust frp extension).
-                    let sid = swc
-                        .nat_hole_sid
-                        .clone()
-                        .expect(&format!("[{}] StartWorkConn should have nat_hole_sid", i));
-                    assert!(
-                        !sid.is_empty(),
-                        "[{}] sid should be non-empty",
-                        i
-                    );
+                    let sid = swc.nat_hole_sid.clone().unwrap_or_else(|| {
+                        panic!("[{}] StartWorkConn should have nat_hole_sid", i)
+                    });
+                    assert!(!sid.is_empty(), "[{}] sid should be non-empty", i);
                 }
                 other => panic!(
                     "[{}] expected StartWorkConn on work conn, got: {:?}",
@@ -238,7 +224,7 @@ async fn test_xtcp_concurrent_3_sessions() {
     for (i, handle) in handles.into_iter().enumerate() {
         handle
             .await
-            .expect(&format!("session {} panicked", i));
+            .unwrap_or_else(|_| panic!("session {} panicked", i));
     }
 }
 
@@ -258,15 +244,10 @@ async fn test_xtcp_multiple_providers_same_server() {
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // --- Provider A: login + register proxy A ---
-    let (mut provider_a_ctl, resp_a) =
-        login_with_test_token(addr).await.expect("provider A login");
+    let (mut provider_a_ctl, resp_a) = login_with_test_token(addr).await.expect("provider A login");
     let run_id_a = resp_a.run_id.expect("provider A run_id");
 
-    let np_a = FrpMessage::NewProxy(xtcp_proxy(
-        "xtcp-prov-a",
-        "sk-prov-a",
-        "127.0.0.1:9001",
-    ));
+    let np_a = FrpMessage::NewProxy(xtcp_proxy("xtcp-prov-a", "sk-prov-a", "127.0.0.1:9001"));
     write_msg_v1(&mut provider_a_ctl, &np_a)
         .await
         .expect("send NewProxy A");
@@ -296,15 +277,10 @@ async fn test_xtcp_multiple_providers_same_server() {
         .expect("send NewWorkConn A");
 
     // --- Provider B: login + register proxy B ---
-    let (mut provider_b_ctl, resp_b) =
-        login_with_test_token(addr).await.expect("provider B login");
+    let (mut provider_b_ctl, resp_b) = login_with_test_token(addr).await.expect("provider B login");
     let run_id_b = resp_b.run_id.expect("provider B run_id");
 
-    let np_b = FrpMessage::NewProxy(xtcp_proxy(
-        "xtcp-prov-b",
-        "sk-prov-b",
-        "127.0.0.1:9002",
-    ));
+    let np_b = FrpMessage::NewProxy(xtcp_proxy("xtcp-prov-b", "sk-prov-b", "127.0.0.1:9002"));
     write_msg_v1(&mut provider_b_ctl, &np_b)
         .await
         .expect("send NewProxy B");
@@ -493,10 +469,7 @@ async fn test_xtcp_multiple_providers_same_server() {
         Ok(Err(e)) => {
             // Connection error is acceptable (may have been closed by server)
             // as long as no valid XTCP message was received.
-            eprintln!(
-                "work_conn_B read error (expected, no leakage): {:?}",
-                e
-            );
+            eprintln!("work_conn_B read error (expected, no leakage): {:?}", e);
         }
         Err(_elapsed) => {
             // Timeout = no message received = correct behavior
@@ -505,11 +478,7 @@ async fn test_xtcp_multiple_providers_same_server() {
     }
 
     // --- Provider B's control channel must still be usable ---
-    let np_b2 = FrpMessage::NewProxy(xtcp_proxy(
-        "xtcp-prov-b-2",
-        "sk-prov-b-2",
-        "127.0.0.1:9003",
-    ));
+    let np_b2 = FrpMessage::NewProxy(xtcp_proxy("xtcp-prov-b-2", "sk-prov-b-2", "127.0.0.1:9003"));
     write_msg_v1(&mut provider_b_ctl, &np_b2)
         .await
         .expect("send NewProxy B2");
@@ -524,10 +493,7 @@ async fn test_xtcp_multiple_providers_same_server() {
                 r.error
             );
         }
-        other => panic!(
-            "expected NewProxyResp B2, got: {:?}",
-            other.v1_type_byte()
-        ),
+        other => panic!("expected NewProxyResp B2, got: {:?}", other.v1_type_byte()),
     }
 
     // --- Send NatHoleReport for cleanup ---
@@ -561,8 +527,7 @@ async fn test_xtcp_encrypted_proxy_registration() {
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // --- Provider login + register XTCP proxy with encryption/compression ---
-    let (mut provider_ctl, resp) =
-        login_with_test_token(addr).await.expect("provider login");
+    let (mut provider_ctl, resp) = login_with_test_token(addr).await.expect("provider login");
     let run_id = resp.run_id.expect("provider should get run_id");
 
     let np = FrpMessage::NewProxy(xtcp_proxy_encrypted(
@@ -660,12 +625,14 @@ async fn test_xtcp_encrypted_proxy_registration() {
         FrpMessage::StartWorkConn(swc) => {
             assert_eq!(swc.proxy_name, "xtcp-encrypted");
             assert_eq!(
-                swc.use_encryption, Some(true),
+                swc.use_encryption,
+                Some(true),
                 "StartWorkConn.use_encryption should be Some(true), got: {:?}",
                 swc.use_encryption
             );
             assert_eq!(
-                swc.use_compression, Some(true),
+                swc.use_compression,
+                Some(true),
                 "StartWorkConn.use_compression should be Some(true), got: {:?}",
                 swc.use_compression
             );

@@ -4,7 +4,7 @@ use std::process;
 use tracing_subscriber::EnvFilter;
 
 use frp_core::cli::{parse_frps_args, FrpsArgs};
-use frp_core::config::{load_server_config, collect_config_files, ServerConfig};
+use frp_core::config::{collect_config_files, load_server_config, ServerConfig};
 use frp_core::unsafe_features::UnsafeFeatures;
 use frp_server::service::Service;
 
@@ -28,15 +28,23 @@ async fn main() {
 
 fn resolve_log_settings(cli: &FrpsArgs, cfg: Option<&ServerConfig>) -> (String, Option<String>) {
     let level = cli.log_level.clone().unwrap_or_else(|| {
-        cfg.map(|c| c.log.level.as_str()).unwrap_or(
-            #[cfg(feature = "debug-logs")]
-            "debug",
-            #[cfg(not(feature = "debug-logs"))]
-            "info",
-        ).to_string()
+        cfg.map(|c| c.log.level.as_str())
+            .unwrap_or(
+                #[cfg(feature = "debug-logs")]
+                "debug",
+                #[cfg(not(feature = "debug-logs"))]
+                "info",
+            )
+            .to_string()
     });
     let file = cli.log_file.clone().or_else(|| {
-        cfg.and_then(|c| if c.log.file.is_empty() { None } else { Some(c.log.file.clone()) })
+        cfg.and_then(|c| {
+            if c.log.file.is_empty() {
+                None
+            } else {
+                Some(c.log.file.clone())
+            }
+        })
     });
     (level, file)
 }
@@ -46,8 +54,7 @@ fn resolve_log_settings(cli: &FrpsArgs, cfg: Option<&ServerConfig>) -> (String, 
 #[cfg(not(feature = "otel"))]
 fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     let (level, file) = resolve_log_settings(cli, cfg);
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&level));
 
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -56,7 +63,9 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     if let Some(path) = file {
         let file_appender = tracing_appender::rolling::daily(
             Path::new(&path).parent().unwrap_or(Path::new(".")),
-            Path::new(&path).file_name().unwrap_or(std::ffi::OsStr::new("frps.log")),
+            Path::new(&path)
+                .file_name()
+                .unwrap_or(std::ffi::OsStr::new("frps.log")),
         );
         builder.with_writer(file_appender).init();
     } else {
@@ -76,20 +85,33 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     // OTel endpoint resolution: env var → config field → disabled
     let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .ok()
-        .or_else(|| cfg.and_then(|c| {
-            if c.observability.otlp_endpoint.is_empty() { None }
-            else { Some(c.observability.otlp_endpoint.clone()) }
-        }));
+        .or_else(|| {
+            cfg.and_then(|c| {
+                if c.observability.otlp_endpoint.is_empty() {
+                    None
+                } else {
+                    Some(c.observability.otlp_endpoint.clone())
+                }
+            })
+        });
 
     let svc_name = cfg
-        .and_then(|c| if c.observability.service_name.is_empty() { None } else { Some(c.observability.service_name.clone()) })
+        .and_then(|c| {
+            if c.observability.service_name.is_empty() {
+                None
+            } else {
+                Some(c.observability.service_name.clone())
+            }
+        })
         .unwrap_or_else(|| "frps".to_string());
 
     let (otel_layer, _provider) = if let Some(ref ep) = otlp_endpoint {
         match build_otel_layer(ep, &svc_name) {
             Ok((layer, provider)) => (Some(layer), Some(provider)),
             Err(e) => {
-                eprintln!("WARNING: OTel init failed (endpoint={ep}): {e}. Tracing without OTLP export.");
+                eprintln!(
+                    "WARNING: OTel init failed (endpoint={ep}): {e}. Tracing without OTLP export."
+                );
                 (None, None)
             }
         }
@@ -104,7 +126,9 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     if let Some(path) = file {
         let file_appender = tracing_appender::rolling::daily(
             Path::new(&path).parent().unwrap_or(Path::new(".")),
-            Path::new(&path).file_name().unwrap_or(std::ffi::OsStr::new("frps.log")),
+            Path::new(&path)
+                .file_name()
+                .unwrap_or(std::ffi::OsStr::new("frps.log")),
         );
         if let Some(layer) = otel_layer {
             if let Some(p) = _provider {
@@ -112,8 +136,7 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
             }
             tracing_subscriber::registry()
                 .with(layer)
-                .with(EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new(&level)))
+                .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&level)))
                 .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                 .with(
                     tracing_subscriber::fmt::layer()
@@ -123,8 +146,7 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
                 .init();
         } else {
             tracing_subscriber::registry()
-                .with(EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new(&level)))
+                .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&level)))
                 .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                 .with(
                     tracing_subscriber::fmt::layer()
@@ -140,14 +162,12 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
             }
             tracing_subscriber::registry()
                 .with(layer)
-                .with(EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new(&level)))
+                .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&level)))
                 .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                 .init();
         } else {
             tracing_subscriber::registry()
-                .with(EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new(&level)))
+                .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&level)))
                 .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                 .init();
         }
@@ -159,17 +179,20 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
 fn build_otel_layer(
     endpoint: &str,
     service_name: &str,
-) -> Result<(
-    tracing_opentelemetry::OpenTelemetryLayer<
-        tracing_subscriber::Registry,
-        opentelemetry_sdk::trace::Tracer,
-    >,
-    opentelemetry_sdk::trace::TracerProvider,
-), Box<dyn std::error::Error>> {
-    use opentelemetry::KeyValue;
+) -> Result<
+    (
+        tracing_opentelemetry::OpenTelemetryLayer<
+            tracing_subscriber::Registry,
+            opentelemetry_sdk::trace::Tracer,
+        >,
+        opentelemetry_sdk::trace::TracerProvider,
+    ),
+    Box<dyn std::error::Error>,
+> {
     use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::Resource;
+    use opentelemetry::KeyValue;
     use opentelemetry_otlp::WithExportConfig as _;
+    use opentelemetry_sdk::Resource;
 
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
@@ -178,9 +201,10 @@ fn build_otel_layer(
 
     let provider = opentelemetry_sdk::trace::TracerProvider::builder()
         .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-        .with_resource(Resource::new(vec![
-            KeyValue::new("service.name", service_name.to_string()),
-        ]))
+        .with_resource(Resource::new(vec![KeyValue::new(
+            "service.name",
+            service_name.to_string(),
+        )]))
         .build();
 
     let tracer = provider.tracer("frp-rs");
@@ -275,15 +299,17 @@ async fn run(mut cli: FrpsArgs) {
     tracing::info!(version = %frp_core::VERSION, "frps (Rust) v{} starting...", frp_core::VERSION);
     let config_path = Some(cli.config.clone());
     let service = std::sync::Arc::new(
-        Service::with_unsafe_features(cfg, config_path, unsafe_features).await.unwrap_or_else(|e| {
-            tracing::error!(error = %e, "frps init error: {}", e);
-            let code = if e.to_string().contains("token") || e.to_string().contains("auth") {
-                frp_core::EXIT_AUTH
-            } else {
-                frp_core::EXIT_BIND
-            };
-            process::exit(code);
-        })
+        Service::with_unsafe_features(cfg, config_path, unsafe_features)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "frps init error: {}", e);
+                let code = if e.to_string().contains("token") || e.to_string().contains("auth") {
+                    frp_core::EXIT_AUTH
+                } else {
+                    frp_core::EXIT_BIND
+                };
+                process::exit(code);
+            }),
     );
 
     // SIGUSR1 reload handler (Unix only) — kill -USR1 <pid>
@@ -297,7 +323,9 @@ async fn run(mut cli: FrpsArgs) {
                     loop {
                         sig.recv().await;
                         match svc.reload().await {
-                            Ok(summary) => tracing::info!(summary = %summary, "SIGUSR1: {}", summary),
+                            Ok(summary) => {
+                                tracing::info!(summary = %summary, "SIGUSR1: {}", summary)
+                            }
                             Err(e) => tracing::error!(error = %e, "SIGUSR1 reload: {}", e),
                         }
                     }
@@ -324,16 +352,21 @@ async fn run(mut cli: FrpsArgs) {
                             .ok()
                             .and_then(|s| s.parse::<u64>().ok())
                             .unwrap_or(30);
-                        let output_dir = std::env::var("FRP_PROFILE_DIR")
-                            .unwrap_or_else(|_| ".".to_string());
+                        let output_dir =
+                            std::env::var("FRP_PROFILE_DIR").unwrap_or_else(|_| ".".to_string());
                         tokio::task::spawn_blocking(move || {
                             match frp_core::profiling::dump_cpu_profile(
                                 std::time::Duration::from_secs(duration_secs),
                                 std::path::Path::new(&output_dir),
                                 "frps",
                             ) {
-                                Ok(path) => tracing::info!("SIGUSR2: CPU profile saved to {}", path.display()),
-                                Err(e) => tracing::error!(error = %e, "SIGUSR2: CPU profile failed: {}", e),
+                                Ok(path) => tracing::info!(
+                                    "SIGUSR2: CPU profile saved to {}",
+                                    path.display()
+                                ),
+                                Err(e) => {
+                                    tracing::error!(error = %e, "SIGUSR2: CPU profile failed: {}", e)
+                                }
                             }
                         });
                     }

@@ -16,15 +16,12 @@ use frp_server::service::Service;
 /// Falls back to a random ephemeral port on sandboxed environments where
 /// explicit binding is disallowed.
 pub fn allocate_port() -> u16 {
-    match TcpSocket::new_v4() {
-        Ok(socket) => {
-            if socket.bind("127.0.0.1:0".parse().unwrap()).is_ok() {
-                if let Ok(addr) = socket.local_addr() {
-                    return addr.port();
-                }
+    if let Ok(socket) = TcpSocket::new_v4() {
+        if socket.bind("127.0.0.1:0".parse().unwrap()).is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                return addr.port();
             }
         }
-        Err(_) => {}
     }
     // Sandbox fallback: return an ephemeral port (49152-65535 range).
     // Tests that need the port will bind to 0 and read the actual port.
@@ -60,9 +57,9 @@ pub async fn raw_login(
     timestamp: Option<i64>,
     token: &str,
 ) -> Result<(IoStream, LoginResp), frp_core::Error> {
-    let stream = tokio::net::TcpStream::connect(addr).await.map_err(|e| {
-        frp_core::Error::Transport(format!("connect to {}: {}", addr, e).into())
-    })?;
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| frp_core::Error::Transport(format!("connect to {}: {}", addr, e).into()))?;
 
     let login = FrpMessage::Login(Login {
         version: Some(frp_core::VERSION.into()),
@@ -78,7 +75,6 @@ pub async fn raw_login(
         metas: None,
         client_spec: None,
         multiplexer: None,
-        
     });
 
     let mut io = IoStream::Tcp(stream);
@@ -107,10 +103,13 @@ pub async fn raw_login(
             }
             Ok((encrypted, resp))
         }
-        other => Err(frp_core::Error::Protocol(format!(
-            "expected LoginResp, got type byte {:?}",
-            other.v1_type_byte()
-        ).into())),
+        other => Err(frp_core::Error::Protocol(
+            format!(
+                "expected LoginResp, got type byte {:?}",
+                other.v1_type_byte()
+            )
+            .into(),
+        )),
     }
 }
 
@@ -127,9 +126,11 @@ pub async fn raw_login_resp(
 }
 
 /// Default test token used for authentication in integration tests.
+#[allow(dead_code)]
 pub const TEST_TOKEN: &str = "test-token";
 
 /// Create a default `AuthServerConfig` with a test token for integration tests.
+#[allow(dead_code)]
 pub fn test_auth_cfg() -> frp_core::config::AuthServerConfig {
     frp_core::config::AuthServerConfig {
         method: "token".into(),
@@ -140,6 +141,7 @@ pub fn test_auth_cfg() -> frp_core::config::AuthServerConfig {
 
 /// Convenience: log in with the default test token.
 /// Generates a fresh timestamp and privilege_key on every call.
+#[allow(dead_code)]
 pub async fn login_with_test_token(
     addr: SocketAddr,
 ) -> Result<(IoStream, LoginResp), frp_core::Error> {
@@ -153,8 +155,10 @@ pub async fn login_with_test_token(
 
 /// Handle to a running frps child process with dashboard.
 /// Kills the process on drop.
+#[allow(dead_code)]
 pub struct FrpsHandle {
     child: Child,
+    #[allow(dead_code)]
     pub bind_port: u16,
     pub dashboard_port: u16,
     _config_dir: tempfile::TempDir,
@@ -163,6 +167,7 @@ pub struct FrpsHandle {
 impl FrpsHandle {
     /// Start frps with the given TOML config content.
     /// Returns handle after both bind_port and dashboard_port are accepting connections.
+    #[allow(dead_code)]
     pub async fn start(config_content: &str) -> Self {
         let config_dir = tempfile::TempDir::new().unwrap();
         let config_path = config_dir.path().join("frps.toml");
@@ -239,6 +244,7 @@ impl FrpsHandle {
         }
     }
 
+    #[allow(dead_code)]
     pub fn dashboard_url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{}", self.dashboard_port, path)
     }
@@ -252,10 +258,14 @@ impl Drop for FrpsHandle {
 }
 
 /// Wait for a TCP port to accept connections.
+#[allow(dead_code)]
 pub async fn wait_tcp_port(port: u16, timeout: Duration) -> Result<(), String> {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

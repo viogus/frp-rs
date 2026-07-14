@@ -5,8 +5,10 @@ use frp_core::config::ServerConfig;
 use frp_core::msg::{self, FrpMessage, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 
-use common::{allocate_port, login_with_test_token, raw_login, raw_login_resp, start_test_server, test_auth_cfg};
-use frp_core::transport::{DialOptions, IoStream, TransportProtocol, dial_server};
+use common::{
+    allocate_port, login_with_test_token, raw_login_resp, start_test_server, test_auth_cfg,
+};
+use frp_core::transport::{dial_server, DialOptions, IoStream, TransportProtocol};
 use frp_server::service::Service;
 use std::path::PathBuf;
 
@@ -39,7 +41,9 @@ async fn test_login_empty_token_rejected() {
         Err(e) => e,
     };
     assert!(
-        err.contains("security misconfiguration") || err.contains("CRITICAL") || err.contains("token"),
+        err.contains("security misconfiguration")
+            || err.contains("CRITICAL")
+            || err.contains("token"),
         "Expected startup rejection with security message, got: {err}"
     );
 }
@@ -104,7 +108,11 @@ async fn test_login_correct_token_succeeds() {
         .await
         .expect("login should succeed");
 
-    assert!(resp.error.is_none(), "expected no error, got: {:?}", resp.error);
+    assert!(
+        resp.error.is_none(),
+        "expected no error, got: {:?}",
+        resp.error
+    );
     assert!(resp.run_id.is_some(), "expected run_id");
 }
 
@@ -131,14 +139,16 @@ async fn test_ping_pong_no_auth() {
         privilege_key: None,
         timestamp: None,
     });
-    write_msg_v1(&mut stream, &ping)
-        .await
-        .expect("send ping");
+    write_msg_v1(&mut stream, &ping).await.expect("send ping");
 
     // Read Pong
     match read_msg_v1(&mut stream).await.expect("read pong") {
         FrpMessage::Pong(pong) => {
-            assert!(pong.error.is_none(), "expected pong without error, got: {:?}", pong.error);
+            assert!(
+                pong.error.is_none(),
+                "expected pong without error, got: {:?}",
+                pong.error
+            );
         }
         other => panic!("expected Pong, got type byte: {:?}", other.v1_type_byte()),
     }
@@ -189,17 +199,21 @@ async fn test_new_proxy_registration_auto_port() {
         metas: None,
         multiplexer: None,
         virtual_net: None,
-                    proxy_protocol_version: None,
-                    advertise_subnet: None,
-                    vnet_ip: None,
-                    vnet_netmask: None,
-                    vnet_mtu: None,
+        proxy_protocol_version: None,
+        advertise_subnet: None,
+        vnet_ip: None,
+        vnet_netmask: None,
+        vnet_mtu: None,
     });
     write_msg_v1(&mut stream, &np).await.expect("send NewProxy");
 
     match read_msg_v1(&mut stream).await.expect("read NewProxyResp") {
         FrpMessage::NewProxyResp(resp) => {
-            assert!(resp.error.is_none(), "expected no error, got: {:?}", resp.error);
+            assert!(
+                resp.error.is_none(),
+                "expected no error, got: {:?}",
+                resp.error
+            );
             assert!(resp.remote_addr.is_some(), "expected remote_addr");
             let remote_addr = resp.remote_addr.unwrap();
             // remote_addr is something like ":10000" — parse the port
@@ -208,12 +222,15 @@ async fn test_new_proxy_registration_auto_port() {
                 .parse()
                 .expect("remote_addr should contain a port number");
             assert!(
-                assigned_port >= 10000 && assigned_port <= 50000,
+                (10000..=50000).contains(&assigned_port),
                 "assigned port {} out of range 10000-50000",
                 assigned_port
             );
         }
-        other => panic!("expected NewProxyResp, got type byte: {:?}", other.v1_type_byte()),
+        other => panic!(
+            "expected NewProxyResp, got type byte: {:?}",
+            other.v1_type_byte()
+        ),
     }
 }
 
@@ -231,51 +248,67 @@ async fn test_new_proxy_duplicate_name_fails() {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     let (mut stream, _resp) = login_with_test_token(addr).await.expect("login");
 
-    let mk_proxy = || FrpMessage::NewProxy(msg::NewProxy {
-        proxy_name: "dup-tcp".into(),
-        proxy_type: "tcp".into(),
-        local_str: Some("127.0.0.1:9876".into()),
-        remote_port: Some(0),
-        use_encryption: None,
-        use_compression: None,
-        group: None,
-        group_key: None,
-        sk: None,
-        custom_domains: None,
-        subdomain: None,
-        locations: None,
-        http_user: None,
-        http_pwd: None,
-        host_header_rewrite: None,
-        headers: None,
-        response_headers: None,
-        route_by_http_user: None,
-        allow_users: None,
-        bandwidth_limit: None,
-        bandwidth_limit_mode: None,
-        annotations: None,
-        metas: None,
-        multiplexer: None,
-        virtual_net: None,
-                    proxy_protocol_version: None,
-                    advertise_subnet: None,
-                    vnet_ip: None,
-                    vnet_netmask: None,
-                    vnet_mtu: None,
-    });
+    let mk_proxy = || {
+        FrpMessage::NewProxy(msg::NewProxy {
+            proxy_name: "dup-tcp".into(),
+            proxy_type: "tcp".into(),
+            local_str: Some("127.0.0.1:9876".into()),
+            remote_port: Some(0),
+            use_encryption: None,
+            use_compression: None,
+            group: None,
+            group_key: None,
+            sk: None,
+            custom_domains: None,
+            subdomain: None,
+            locations: None,
+            http_user: None,
+            http_pwd: None,
+            host_header_rewrite: None,
+            headers: None,
+            response_headers: None,
+            route_by_http_user: None,
+            allow_users: None,
+            bandwidth_limit: None,
+            bandwidth_limit_mode: None,
+            annotations: None,
+            metas: None,
+            multiplexer: None,
+            virtual_net: None,
+            proxy_protocol_version: None,
+            advertise_subnet: None,
+            vnet_ip: None,
+            vnet_netmask: None,
+            vnet_mtu: None,
+        })
+    };
 
     // First registration — should succeed
-    write_msg_v1(&mut stream, &mk_proxy()).await.expect("send first NewProxy");
-    match read_msg_v1(&mut stream).await.expect("read first NewProxyResp") {
+    write_msg_v1(&mut stream, &mk_proxy())
+        .await
+        .expect("send first NewProxy");
+    match read_msg_v1(&mut stream)
+        .await
+        .expect("read first NewProxyResp")
+    {
         FrpMessage::NewProxyResp(ref resp) => {
-            assert!(resp.error.is_none(), "first proxy should succeed, got: {:?}", resp.error);
+            assert!(
+                resp.error.is_none(),
+                "first proxy should succeed, got: {:?}",
+                resp.error
+            );
         }
         other => panic!("expected NewProxyResp, got: {:?}", other.v1_type_byte()),
     }
 
     // Second registration with same name — should fail
-    write_msg_v1(&mut stream, &mk_proxy()).await.expect("send second NewProxy");
-    match read_msg_v1(&mut stream).await.expect("read second NewProxyResp") {
+    write_msg_v1(&mut stream, &mk_proxy())
+        .await
+        .expect("send second NewProxy");
+    match read_msg_v1(&mut stream)
+        .await
+        .expect("read second NewProxyResp")
+    {
         FrpMessage::NewProxyResp(ref resp) => {
             assert!(
                 resp.error.is_some(),
@@ -351,46 +384,74 @@ async fn test_vhost_location_routing() {
         metas: None,
         multiplexer: None,
         virtual_net: None,
-                    proxy_protocol_version: None,
-                    advertise_subnet: None,
-                    vnet_ip: None,
-                    vnet_netmask: None,
-                    vnet_mtu: None,
+        proxy_protocol_version: None,
+        advertise_subnet: None,
+        vnet_ip: None,
+        vnet_netmask: None,
+        vnet_mtu: None,
     });
-    write_msg_v1(&mut provider, &np).await.expect("send NewProxy");
+    write_msg_v1(&mut provider, &np)
+        .await
+        .expect("send NewProxy");
     match read_msg_v1(&mut provider).await.expect("read NewProxyResp") {
         FrpMessage::NewProxyResp(ref resp) => {
-            assert!(resp.error.is_none(), "HTTP proxy with locations should register: {:?}", resp.error);
+            assert!(
+                resp.error.is_none(),
+                "HTTP proxy with locations should register: {:?}",
+                resp.error
+            );
         }
         other => panic!("expected NewProxyResp, got: {:?}", other.v1_type_byte()),
     }
 
     // Provider sends pooled work connection
-    let mut work_conn = tokio::net::TcpStream::connect(addr).await.expect("work conn connect");
+    let mut work_conn = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("work conn connect");
     let nwc = FrpMessage::NewWorkConn(msg::NewWorkConn {
         run_id: Some(run_id.clone()),
         timestamp: None,
         privilege_key: None,
     });
-    write_msg_v1(&mut work_conn, &nwc).await.expect("send NewWorkConn");
+    write_msg_v1(&mut work_conn, &nwc)
+        .await
+        .expect("send NewWorkConn");
 
     // Connect to VHost HTTP port and send a request matching domain + location
-    let mut http_conn = tokio::net::TcpStream::connect(vhost_addr).await.expect("connect to vhost");
+    let mut http_conn = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("connect to vhost");
     let request = "\
 GET /api/users HTTP/1.1\r\n\
 Host: test.local\r\n\
 Connection: close\r\n\
 \r\n";
-    tokio::io::AsyncWriteExt::write_all(&mut http_conn, request.as_bytes()).await.expect("send HTTP request");
+    tokio::io::AsyncWriteExt::write_all(&mut http_conn, request.as_bytes())
+        .await
+        .expect("send HTTP request");
 
     // Verify StartWorkConn is received on the work connection
-    match read_msg_v1(&mut work_conn).await.expect("read StartWorkConn on work conn") {
+    match read_msg_v1(&mut work_conn)
+        .await
+        .expect("read StartWorkConn on work conn")
+    {
         FrpMessage::StartWorkConn(swc) => {
-            assert_eq!(swc.proxy_name, "http-loc-test", "expected http-loc-test, got {}", swc.proxy_name);
-            assert!(swc.error.is_none(), "StartWorkConn should not have error: {:?}", swc.error);
+            assert_eq!(
+                swc.proxy_name, "http-loc-test",
+                "expected http-loc-test, got {}",
+                swc.proxy_name
+            );
+            assert!(
+                swc.error.is_none(),
+                "StartWorkConn should not have error: {:?}",
+                swc.error
+            );
         }
         other => {
-            panic!("expected StartWorkConn, got type byte: {:?}", other.v1_type_byte());
+            panic!(
+                "expected StartWorkConn, got type byte: {:?}",
+                other.v1_type_byte()
+            );
         }
     }
 }
@@ -456,13 +517,15 @@ async fn test_vhost_location_path_mismatch_404() {
         metas: None,
         multiplexer: None,
         virtual_net: None,
-                    proxy_protocol_version: None,
-                    advertise_subnet: None,
-                    vnet_ip: None,
-                    vnet_netmask: None,
-                    vnet_mtu: None,
+        proxy_protocol_version: None,
+        advertise_subnet: None,
+        vnet_ip: None,
+        vnet_netmask: None,
+        vnet_mtu: None,
     });
-    write_msg_v1(&mut provider, &np).await.expect("send NewProxy");
+    write_msg_v1(&mut provider, &np)
+        .await
+        .expect("send NewProxy");
     match read_msg_v1(&mut provider).await.expect("read NewProxyResp") {
         FrpMessage::NewProxyResp(ref resp) => {
             assert!(resp.error.is_none(), "register ok: {:?}", resp.error);
@@ -471,20 +534,28 @@ async fn test_vhost_location_path_mismatch_404() {
     }
 
     // Connect to VHost and send request to NON-matching path
-    let mut http_conn = tokio::net::TcpStream::connect(vhost_addr).await.expect("connect to vhost");
+    let mut http_conn = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("connect to vhost");
     let request = "\
 GET /other/path HTTP/1.1\r\n\
 Host: test.local\r\n\
 Connection: close\r\n\
 \r\n";
-    tokio::io::AsyncWriteExt::write_all(&mut http_conn, request.as_bytes()).await.expect("send HTTP request");
+    tokio::io::AsyncWriteExt::write_all(&mut http_conn, request.as_bytes())
+        .await
+        .expect("send HTTP request");
 
     // Should get 404
     let mut buf = vec![0u8; 1024];
     let n = tokio::time::timeout(
         std::time::Duration::from_secs(3),
         tokio::io::AsyncReadExt::read(&mut http_conn, &mut buf),
-    ).await.ok().and_then(|r| r.ok()).unwrap_or(0);
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .unwrap_or(0);
     let response = String::from_utf8_lossy(&buf[..n]);
     assert!(response.contains("404"), "expected 404, got: {}", response);
 }
@@ -539,14 +610,17 @@ async fn test_login_via_websocket() {
         metas: None,
         client_spec: None,
         multiplexer: None,
-
     });
     io.write_v1_frame(&login).await.expect("send login over WS");
 
     let resp = io.read_v1_frame().await.expect("read LoginResp over WS");
     match resp {
         FrpMessage::LoginResp(r) => {
-            assert!(r.error.is_none(), "WS login should succeed, got: {:?}", r.error);
+            assert!(
+                r.error.is_none(),
+                "WS login should succeed, got: {:?}",
+                r.error
+            );
             assert!(r.run_id.is_some(), "expected run_id");
         }
         other => panic!("expected LoginResp, got: {:?}", other.v1_type_byte()),
@@ -610,14 +684,19 @@ async fn test_login_via_tls() {
         metas: None,
         client_spec: None,
         multiplexer: None,
-
     });
-    io.write_v1_frame(&login).await.expect("send login over TLS");
+    io.write_v1_frame(&login)
+        .await
+        .expect("send login over TLS");
 
     let resp = io.read_v1_frame().await.expect("read LoginResp over TLS");
     match resp {
         FrpMessage::LoginResp(r) => {
-            assert!(r.error.is_none(), "TLS login should succeed, got: {:?}", r.error);
+            assert!(
+                r.error.is_none(),
+                "TLS login should succeed, got: {:?}",
+                r.error
+            );
             assert!(r.run_id.is_some(), "expected run_id");
         }
         other => panic!("expected LoginResp, got: {:?}", other.v1_type_byte()),

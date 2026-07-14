@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use frp_core::config::{ClientConfig, ProxyConfig, VisitorConfig};
 use frp_client::service::Service as ClientService;
+use frp_core::config::{ClientConfig, ProxyConfig, VisitorConfig};
 
 use common::{allocate_port, start_echo_server, start_frps, wait_for_port};
 
@@ -104,7 +104,9 @@ async fn test_stcp_e2e_relay() {
         ..Default::default()
     };
 
-    let provider_service = ClientService::new(provider_cfg, None).await.expect("create client");
+    let provider_service = ClientService::new(provider_cfg, None)
+        .await
+        .expect("create client");
     let _client_handle = tokio::spawn(async move {
         let _ = provider_service.run().await;
     });

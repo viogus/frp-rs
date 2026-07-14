@@ -4,7 +4,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, unix::AsyncFd};
+use tokio::io::{unix::AsyncFd, AsyncRead, AsyncWrite, ReadBuf};
 
 use super::tun::TunDevice;
 
@@ -70,7 +70,10 @@ impl LinuxTun {
         // is a standard fcntl operation with no memory side effects.
         let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL, 0) };
         if flags < 0 {
-            return Err(anyhow::anyhow!("fcntl F_GETFL failed: {}", io::Error::last_os_error()));
+            return Err(anyhow::anyhow!(
+                "fcntl F_GETFL failed: {}",
+                io::Error::last_os_error()
+            ));
         }
         // SAFETY: raw_fd is valid; F_SETFL with O_NONBLOCK is a standard
         // operation; the flags value came from a successful F_GETFL above.
@@ -104,7 +107,10 @@ impl TunDevice for LinuxTun {
         // the only valid fds returned are >= 0.
         let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
         if sock < 0 {
-            return Err(anyhow::anyhow!("socket failed: {}", io::Error::last_os_error()));
+            return Err(anyhow::anyhow!(
+                "socket failed: {}",
+                io::Error::last_os_error()
+            ));
         }
 
         // Helper to set sockaddr via ioctl.
@@ -155,18 +161,11 @@ impl TunDevice for LinuxTun {
 
         // SAFETY: sock and ifr are valid; set_sockaddr requires the fd to be
         // open and ifr to hold a valid interface name (copied above).
-        unsafe {
-            set_sockaddr(
-                &mut ifr,
-                sock,
-                libc::SIOCSIFADDR,
-                u32::from(addr).to_be(),
-            )
-        }
-        .inspect_err(|_| {
-            // SAFETY: sock is a valid fd we own; closing on error path.
-            unsafe { libc::close(sock) };
-        })?;
+        unsafe { set_sockaddr(&mut ifr, sock, libc::SIOCSIFADDR, u32::from(addr).to_be()) }
+            .inspect_err(|_| {
+                // SAFETY: sock is a valid fd we own; closing on error path.
+                unsafe { libc::close(sock) };
+            })?;
         // SAFETY: same preconditions as SIOCSIFADDR call above.
         unsafe {
             set_sockaddr(

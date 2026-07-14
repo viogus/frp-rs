@@ -19,8 +19,8 @@ pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
 
     let mut buf = Vec::with_capacity(V1_HEADER_LEN + payload.len());
     buf.push(type_byte);
-   buf.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-   buf.extend_from_slice(&payload);
+    buf.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    buf.extend_from_slice(&payload);
 
     tracing::trace!(
         type_byte = %type_byte,
@@ -32,9 +32,9 @@ pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
         String::from_utf8_lossy(&payload)
     );
 
-   writer
-       .write_all(&buf)
-       .await
+    writer
+        .write_all(&buf)
+        .await
         .map_err(|e| crate::Error::Protocol(format!("write V1 frame: {e}").into()))?;
     Ok(())
 }
@@ -50,8 +50,7 @@ pub async fn read_v1_frame<R: AsyncReadExt + Unpin>(
 
     let type_byte = header[0];
     let length = u64::from_be_bytes([
-        header[1], header[2], header[3], header[4],
-        header[5], header[6], header[7], header[8],
+        header[1], header[2], header[3], header[4], header[5], header[6], header[7], header[8],
     ]);
 
     tracing::debug!(
@@ -65,10 +64,13 @@ pub async fn read_v1_frame<R: AsyncReadExt + Unpin>(
     );
 
     if length > V1_MAX_MSG_LENGTH as u64 {
-        return Err(crate::Error::Protocol(format!(
-            "invalid V1 msg length: {length}, raw header: {}",
-            hex::encode(header)
-        ).into()));
+        return Err(crate::Error::Protocol(
+            format!(
+                "invalid V1 msg length: {length}, raw header: {}",
+                hex::encode(header)
+            )
+            .into(),
+        ));
     }
 
     let length = length as usize;
@@ -80,7 +82,9 @@ pub async fn read_v1_frame<R: AsyncReadExt + Unpin>(
     #[allow(clippy::uninit_vec)]
     let mut payload = {
         let mut v = Vec::with_capacity(length);
-        unsafe { v.set_len(length); }
+        unsafe {
+            v.set_len(length);
+        }
         v
     };
     reader
@@ -110,126 +114,151 @@ pub async fn write_msg_v1<W: AsyncWriteExt + Unpin>(
 pub fn deserialize_v2(type_id: u16, json_bytes: &[u8]) -> Result<FrpMessage, crate::Error> {
     let msg = match type_id {
         msg::V2_TYPE_LOGIN => {
-            let v: msg::Login = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize Login (v2): {e}").into()))?;
+            let v: msg::Login = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize Login (v2): {e}").into())
+            })?;
             FrpMessage::Login(v)
         }
         msg::V2_TYPE_LOGIN_RESP => {
-            let v: msg::LoginResp = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize LoginResp (v2): {e}").into()))?;
+            let v: msg::LoginResp = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize LoginResp (v2): {e}").into())
+            })?;
             FrpMessage::LoginResp(v)
         }
         msg::V2_TYPE_NEW_PROXY => {
-            let v: msg::NewProxy = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewProxy (v2): {e}").into()))?;
+            let v: msg::NewProxy = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NewProxy (v2): {e}").into())
+            })?;
             FrpMessage::NewProxy(v)
         }
         msg::V2_TYPE_NEW_PROXY_RESP => {
-            let v: msg::NewProxyResp = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewProxyResp (v2): {e}").into()))?;
+            let v: msg::NewProxyResp = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NewProxyResp (v2): {e}").into())
+            })?;
             FrpMessage::NewProxyResp(v)
         }
         msg::V2_TYPE_CLOSE_PROXY => {
-            let v: msg::CloseProxy = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize CloseProxy (v2): {e}").into()))?;
+            let v: msg::CloseProxy = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize CloseProxy (v2): {e}").into())
+            })?;
             FrpMessage::CloseProxy(v)
         }
         msg::V2_TYPE_NEW_WORK_CONN => {
-            let v: msg::NewWorkConn = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewWorkConn (v2): {e}").into()))?;
+            let v: msg::NewWorkConn = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NewWorkConn (v2): {e}").into())
+            })?;
             FrpMessage::NewWorkConn(v)
         }
         msg::V2_TYPE_REQ_WORK_CONN => {
-            let v: msg::ReqWorkConn = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize ReqWorkConn (v2): {e}").into()))?;
+            let v: msg::ReqWorkConn = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize ReqWorkConn (v2): {e}").into())
+            })?;
             FrpMessage::ReqWorkConn(v)
         }
         msg::V2_TYPE_START_WORK_CONN => {
-            let v: msg::StartWorkConn = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize StartWorkConn (v2): {e}").into()))?;
+            let v: msg::StartWorkConn = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize StartWorkConn (v2): {e}").into())
+            })?;
             FrpMessage::StartWorkConn(v)
         }
         msg::V2_TYPE_NEW_VISITOR_CONN => {
-            let v: msg::NewVisitorConn = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConn (v2): {e}").into()))?;
+            let v: msg::NewVisitorConn = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NewVisitorConn (v2): {e}").into())
+            })?;
             FrpMessage::NewVisitorConn(v)
         }
         msg::V2_TYPE_NEW_VISITOR_CONN_RESP => {
-            let v: msg::NewVisitorConnResp = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConnResp (v2): {e}").into()))?;
+            let v: msg::NewVisitorConnResp = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NewVisitorConnResp (v2): {e}").into())
+            })?;
             FrpMessage::NewVisitorConnResp(v)
         }
         msg::V2_TYPE_PING => {
-            let v: msg::Ping = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize Ping (v2): {e}").into()))?;
+            let v: msg::Ping = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize Ping (v2): {e}").into())
+            })?;
             FrpMessage::Ping(v)
         }
         msg::V2_TYPE_PONG => {
-            let v: msg::Pong = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize Pong (v2): {e}").into()))?;
+            let v: msg::Pong = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize Pong (v2): {e}").into())
+            })?;
             FrpMessage::Pong(v)
         }
         msg::V2_TYPE_UDP_PACKET => {
-            let v: msg::UDPPacket = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize UDPPacket (v2): {e}").into()))?;
+            let v: msg::UDPPacket = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize UDPPacket (v2): {e}").into())
+            })?;
             FrpMessage::UDPPacket(v)
         }
         msg::V2_TYPE_NAT_HOLE_VISITOR => {
-            let v: msg::NatHoleVisitor = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleVisitor (v2): {e}").into()))?;
+            let v: msg::NatHoleVisitor = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NatHoleVisitor (v2): {e}").into())
+            })?;
             FrpMessage::NatHoleVisitor(v)
         }
         msg::V2_TYPE_NAT_HOLE_CLIENT => {
-            let v: msg::NatHoleClient = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleClient (v2): {e}").into()))?;
+            let v: msg::NatHoleClient = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NatHoleClient (v2): {e}").into())
+            })?;
             FrpMessage::NatHoleClient(v)
         }
         msg::V2_TYPE_NAT_HOLE_RESP => {
-            let v: msg::NatHoleResp = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleResp (v2): {e}").into()))?;
+            let v: msg::NatHoleResp = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NatHoleResp (v2): {e}").into())
+            })?;
             FrpMessage::NatHoleResp(v)
         }
         msg::V2_TYPE_NAT_HOLE_SID => {
-            let v: msg::NatHoleSid = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleSid (v2): {e}").into()))?;
+            let v: msg::NatHoleSid = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NatHoleSid (v2): {e}").into())
+            })?;
             FrpMessage::NatHoleSid(v)
         }
         msg::V2_TYPE_NAT_HOLE_REPORT => {
-            let v: msg::NatHoleReport = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleReport (v2): {e}").into()))?;
+            let v: msg::NatHoleReport = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NatHoleReport (v2): {e}").into())
+            })?;
             FrpMessage::NatHoleReport(v)
         }
         msg::V2_TYPE_CLOSE_PROXY_RESP => {
-            let v: msg::CloseProxyResp = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize CloseProxyResp (v2): {e}").into()))?;
+            let v: msg::CloseProxyResp = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize CloseProxyResp (v2): {e}").into())
+            })?;
             FrpMessage::CloseProxyResp(v)
         }
         msg::V2_TYPE_ERROR => {
-            let v: msg::Error = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize Error (v2): {e}").into()))?;
+            let v: msg::Error = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize Error (v2): {e}").into())
+            })?;
             FrpMessage::Error(v)
         }
         #[cfg(feature = "vnet")]
         msg::V2_TYPE_VNET_ROUTE_ADVERTISE => {
-            let v: msg::VnetRouteAdvertise = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetRouteAdvertise (v2): {e}").into()))?;
+            let v: msg::VnetRouteAdvertise = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize VnetRouteAdvertise (v2): {e}").into())
+            })?;
             FrpMessage::VnetRouteAdvertise(v)
         }
         #[cfg(feature = "vnet")]
         msg::V2_TYPE_VNET_PACKET => {
-            let v: msg::VnetPacket = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetPacket (v2): {e}").into()))?;
+            let v: msg::VnetPacket = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize VnetPacket (v2): {e}").into())
+            })?;
             FrpMessage::VnetPacket(v)
         }
         #[cfg(feature = "vnet")]
         msg::V2_TYPE_VNET_ROUTE_REMOVE => {
-            let v: msg::VnetRouteRemove = serde_json::from_slice(json_bytes)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetRouteRemove (v2): {e}").into()))?;
+            let v: msg::VnetRouteRemove = serde_json::from_slice(json_bytes).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize VnetRouteRemove (v2): {e}").into())
+            })?;
             FrpMessage::VnetRouteRemove(v)
         }
-        _ => return Err(crate::Error::Protocol(format!(
-            "unknown V2 message type ID: {type_id}"
-        ).into())),
+        _ => {
+            return Err(crate::Error::Protocol(
+                format!("unknown V2 message type ID: {type_id}").into(),
+            ))
+        }
     };
     Ok(msg)
 }
@@ -242,8 +271,9 @@ pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate
             FrpMessage::Login(v)
         }
         msg::TYPE_LOGIN_RESP => {
-            let v: msg::LoginResp = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize LoginResp: {e}").into()))?;
+            let v: msg::LoginResp = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize LoginResp: {e}").into())
+            })?;
             FrpMessage::LoginResp(v)
         }
         msg::TYPE_NEW_PROXY => {
@@ -252,18 +282,21 @@ pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate
             FrpMessage::NewProxy(v)
         }
         msg::TYPE_NEW_PROXY_RESP => {
-            let v: msg::NewProxyResp = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewProxyResp: {e}").into()))?;
+            let v: msg::NewProxyResp = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NewProxyResp: {e}").into())
+            })?;
             FrpMessage::NewProxyResp(v)
         }
         msg::TYPE_CLOSE_PROXY => {
-            let v: msg::CloseProxy = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize CloseProxy: {e}").into()))?;
+            let v: msg::CloseProxy = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize CloseProxy: {e}").into())
+            })?;
             FrpMessage::CloseProxy(v)
         }
         msg::TYPE_CLOSE_PROXY_RESP => {
-            let v: msg::CloseProxyResp = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize CloseProxyResp: {e}").into()))?;
+            let v: msg::CloseProxyResp = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize CloseProxyResp: {e}").into())
+            })?;
             FrpMessage::CloseProxyResp(v)
         }
         msg::TYPE_ERROR => {
@@ -272,18 +305,21 @@ pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate
             FrpMessage::Error(v)
         }
         msg::TYPE_NEW_WORK_CONN => {
-            let v: msg::NewWorkConn = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewWorkConn: {e}").into()))?;
+            let v: msg::NewWorkConn = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NewWorkConn: {e}").into())
+            })?;
             FrpMessage::NewWorkConn(v)
         }
         msg::TYPE_REQ_WORK_CONN => {
-            let v: msg::ReqWorkConn = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize ReqWorkConn: {e}").into()))?;
+            let v: msg::ReqWorkConn = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize ReqWorkConn: {e}").into())
+            })?;
             FrpMessage::ReqWorkConn(v)
         }
         msg::TYPE_START_WORK_CONN => {
-            let v: msg::StartWorkConn = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize StartWorkConn: {e}").into()))?;
+            let v: msg::StartWorkConn = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize StartWorkConn: {e}").into())
+            })?;
             FrpMessage::StartWorkConn(v)
         }
         msg::TYPE_PING => {
@@ -297,18 +333,21 @@ pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate
             FrpMessage::Pong(v)
         }
         msg::TYPE_NEW_VISITOR_CONN => {
-            let v: msg::NewVisitorConn = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConn: {e}").into()))?;
+            let v: msg::NewVisitorConn = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NewVisitorConn: {e}").into())
+            })?;
             FrpMessage::NewVisitorConn(v)
         }
         msg::TYPE_NEW_VISITOR_CONN_RESP => {
-            let v: msg::NewVisitorConnResp = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewVisitorConnResp: {e}").into()))?;
+            let v: msg::NewVisitorConnResp = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NewVisitorConnResp: {e}").into())
+            })?;
             FrpMessage::NewVisitorConnResp(v)
         }
         msg::TYPE_UDP_PACKET => {
-            let v: msg::UDPPacket = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize UDPPacket: {e}").into()))?;
+            let v: msg::UDPPacket = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize UDPPacket: {e}").into())
+            })?;
             FrpMessage::UDPPacket(v)
         }
         msg::TYPE_NAT_HOLE_VISITOR => {
@@ -317,8 +356,9 @@ pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate
                 "NatHoleVisitor raw payload: {}",
                 String::from_utf8_lossy(payload)
             );
-            let v: msg::NatHoleVisitor = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleVisitor: {e}").into()))?;
+            let v: msg::NatHoleVisitor = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NatHoleVisitor: {e}").into())
+            })?;
             tracing::debug!(
                 transaction_id = ?v.transaction_id,
                 proxy_name = %v.proxy_name,
@@ -331,44 +371,55 @@ pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate
             FrpMessage::NatHoleVisitor(v)
         }
         msg::TYPE_NAT_HOLE_CLIENT => {
-            let v: msg::NatHoleClient = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleClient: {e}").into()))?;
+            let v: msg::NatHoleClient = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NatHoleClient: {e}").into())
+            })?;
             FrpMessage::NatHoleClient(v)
         }
         msg::TYPE_NAT_HOLE_RESP => {
-            let v: msg::NatHoleResp = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleResp: {e}").into()))?;
+            let v: msg::NatHoleResp = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NatHoleResp: {e}").into())
+            })?;
             FrpMessage::NatHoleResp(v)
         }
         msg::TYPE_NAT_HOLE_SID => {
-            let v: msg::NatHoleSid = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleSid: {e}").into()))?;
+            let v: msg::NatHoleSid = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NatHoleSid: {e}").into())
+            })?;
             FrpMessage::NatHoleSid(v)
         }
         msg::TYPE_NAT_HOLE_REPORT => {
-            let v: msg::NatHoleReport = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NatHoleReport: {e}").into()))?;
+            let v: msg::NatHoleReport = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize NatHoleReport: {e}").into())
+            })?;
             FrpMessage::NatHoleReport(v)
         }
         #[cfg(feature = "vnet")]
         msg::TYPE_VNET_ROUTE_ADVERTISE => {
-            let v: msg::VnetRouteAdvertise = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetRouteAdvertise: {e}").into()))?;
+            let v: msg::VnetRouteAdvertise = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize VnetRouteAdvertise: {e}").into())
+            })?;
             FrpMessage::VnetRouteAdvertise(v)
         }
         #[cfg(feature = "vnet")]
         msg::TYPE_VNET_PACKET => {
-            let v: msg::VnetPacket = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetPacket: {e}").into()))?;
+            let v: msg::VnetPacket = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize VnetPacket: {e}").into())
+            })?;
             FrpMessage::VnetPacket(v)
         }
         #[cfg(feature = "vnet")]
         msg::TYPE_VNET_ROUTE_REMOVE => {
-            let v: msg::VnetRouteRemove = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize VnetRouteRemove: {e}").into()))?;
+            let v: msg::VnetRouteRemove = serde_json::from_slice(payload).map_err(|e| {
+                crate::Error::Protocol(format!("deserialize VnetRouteRemove: {e}").into())
+            })?;
             FrpMessage::VnetRouteRemove(v)
         }
-        _ => return Err(crate::Error::Protocol(format!("unknown V1 type byte: 0x{type_byte:02x}").into())),
+        _ => {
+            return Err(crate::Error::Protocol(
+                format!("unknown V1 type byte: 0x{type_byte:02x}").into(),
+            ))
+        }
     };
     Ok(msg)
 }
@@ -387,9 +438,7 @@ pub const V2_FRAME_TYPE_CLIENT_HELLO: u16 = 1;
 pub const V2_FRAME_TYPE_SERVER_HELLO: u16 = 2;
 // V2_FRAME_TYPE_MESSAGE = 16 already exists above.
 
-pub async fn write_v2_magic<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
-) -> Result<(), crate::Error> {
+pub async fn write_v2_magic<W: AsyncWriteExt + Unpin>(writer: &mut W) -> Result<(), crate::Error> {
     writer
         .write_all(&V2_MAGIC_BYTES)
         .await
@@ -405,7 +454,9 @@ pub async fn read_v2_magic_or_replay<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> Result<Option<Vec<u8>>, crate::Error> {
     let mut buf = [0u8; V2_MAGIC_LEN];
-    reader.read_exact(&mut buf).await
+    reader
+        .read_exact(&mut buf)
+        .await
         .map_err(|e| crate::Error::Protocol(format!("read V2 magic: {e}").into()))?;
     if buf == V2_MAGIC_BYTES {
         Ok(None)
@@ -423,11 +474,14 @@ pub async fn write_v2_frame_raw<W: AsyncWriteExt + Unpin>(
     payload: &[u8],
 ) -> Result<(), crate::Error> {
     if payload.len() > V2_MAX_FRAME_PAYLOAD as usize {
-        return Err(crate::Error::Protocol(format!(
-            "V2 payload too large: {} > {}",
-            payload.len(),
-            V2_MAX_FRAME_PAYLOAD
-        ).into()));
+        return Err(crate::Error::Protocol(
+            format!(
+                "V2 payload too large: {} > {}",
+                payload.len(),
+                V2_MAX_FRAME_PAYLOAD
+            )
+            .into(),
+        ));
     }
     let mut header = [0u8; V2_FRAME_HEADER_LEN];
     header[0..2].copy_from_slice(&frame_type.to_be_bytes());
@@ -447,7 +501,9 @@ pub async fn write_v2_frame_raw<W: AsyncWriteExt + Unpin>(
     let mut out = Vec::with_capacity(V2_FRAME_HEADER_LEN + payload.len());
     out.extend_from_slice(&header);
     out.extend_from_slice(payload);
-    writer.write_all(&out).await
+    writer
+        .write_all(&out)
+        .await
         .map_err(|e| crate::Error::Protocol(format!("write V2 frame: {e}").into()))?;
     Ok(())
 }
@@ -458,7 +514,9 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> Result<(u16, u16, Vec<u8>), crate::Error> {
     let mut header = [0u8; V2_FRAME_HEADER_LEN];
-    reader.read_exact(&mut header).await
+    reader
+        .read_exact(&mut header)
+        .await
         .map_err(|e| crate::Error::Protocol(format!("read V2 frame: {e}").into()))?;
 
     let frame_type = u16::from_be_bytes([header[0], header[1]]);
@@ -479,9 +537,9 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
         tracing::trace!(flags = %flags, "V2 frame with non-zero flags: {flags}");
     }
     if payload_len > V2_MAX_FRAME_PAYLOAD as usize {
-        return Err(crate::Error::Protocol(format!(
-            "V2 frame payload too large: {payload_len}"
-        ).into()));
+        return Err(crate::Error::Protocol(
+            format!("V2 frame payload too large: {payload_len}").into(),
+        ));
     }
 
     // SAFETY: `payload_len` bytes are allocated via `with_capacity`. `set_len`
@@ -491,10 +549,14 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
     #[allow(clippy::uninit_vec)]
     let mut payload = {
         let mut v = Vec::with_capacity(payload_len);
-        unsafe { v.set_len(payload_len); }
+        unsafe {
+            v.set_len(payload_len);
+        }
         v
     };
-    reader.read_exact(&mut payload).await
+    reader
+        .read_exact(&mut payload)
+        .await
         .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
 
     Ok((frame_type, flags, payload))
@@ -515,7 +577,10 @@ pub async fn write_msg_v2<W: AsyncWriteExt + Unpin>(
     payload.extend_from_slice(&json_bytes);
 
     write_v2_frame_raw(writer, V2_FRAME_TYPE_MESSAGE, 0, &payload).await?;
-    writer.flush().await.map_err(|e| crate::Error::Protocol(format!("flush after write_msg_v2: {e}").into()))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| crate::Error::Protocol(format!("flush after write_msg_v2: {e}").into()))?;
     Ok(())
 }
 
@@ -526,13 +591,18 @@ pub async fn read_msg_v2<R: AsyncReadExt + Unpin>(
 ) -> Result<FrpMessage, crate::Error> {
     let (frame_type, _flags, payload) = read_v2_frame_raw(reader).await?;
     if frame_type != V2_FRAME_TYPE_MESSAGE {
-        return Err(crate::Error::Protocol(format!(
-            "unexpected V2 frame type: {frame_type}, expected {} (Message)",
-            V2_FRAME_TYPE_MESSAGE
-        ).into()));
+        return Err(crate::Error::Protocol(
+            format!(
+                "unexpected V2 frame type: {frame_type}, expected {} (Message)",
+                V2_FRAME_TYPE_MESSAGE
+            )
+            .into(),
+        ));
     }
     if payload.len() < 2 {
-        return Err(crate::Error::Protocol("V2 message payload too short".into()));
+        return Err(crate::Error::Protocol(
+            "V2 message payload too short".into(),
+        ));
     }
     let type_id = u16::from_be_bytes([payload[0], payload[1]]);
     deserialize_v2(type_id, &payload[2..])
@@ -619,7 +689,10 @@ mod tests {
     async fn test_v1_frame_truncated_header() {
         let (mut client, mut server) = duplex(1024);
         // Write only 3 bytes (incomplete header)
-        client.write_all(&[msg::TYPE_PING, 0x00, 0x00]).await.expect("write partial");
+        client
+            .write_all(&[msg::TYPE_PING, 0x00, 0x00])
+            .await
+            .expect("write partial");
         drop(client); // close write side
         let result = read_v1_frame(&mut server).await;
         assert!(result.is_err(), "truncated header should error");
@@ -632,7 +705,10 @@ mod tests {
         let mut header = vec![msg::TYPE_PING];
         header.extend_from_slice(&100i64.to_be_bytes());
         client.write_all(&header).await.expect("write header");
-        client.write_all(&vec![0u8; 50]).await.expect("write partial payload");
+        client
+            .write_all(&[0u8; 50])
+            .await
+            .expect("write partial payload");
         drop(client);
         let result = read_v1_frame(&mut server).await;
         assert!(result.is_err(), "truncated payload should error");
@@ -680,7 +756,9 @@ mod tests {
     async fn test_v2_frame_read_write() {
         let (mut client, mut server) = duplex(65536);
         let payload = b"hello v2 world";
-        write_v2_frame_raw(&mut client, 16, 0, payload).await.expect("write V2 frame");
+        write_v2_frame_raw(&mut client, 16, 0, payload)
+            .await
+            .expect("write V2 frame");
         let (ft, flags, data) = read_v2_frame_raw(&mut server).await.expect("read V2 frame");
         assert_eq!(ft, 16);
         assert_eq!(flags, 0);
@@ -723,19 +801,32 @@ mod tests {
         let (mut client, mut server) = duplex(65536);
 
         let messages = vec![
-            FrpMessage::Ping(msg::Ping { privilege_key: None, timestamp: Some(42) }),
+            FrpMessage::Ping(msg::Ping {
+                privilege_key: None,
+                timestamp: Some(42),
+            }),
             FrpMessage::Pong(msg::Pong { error: None }),
-            FrpMessage::CloseProxy(msg::CloseProxy { proxy_name: "test".into() }),
-            FrpMessage::CloseProxyResp(msg::CloseProxyResp { proxy_name: "test".into() }),
-            FrpMessage::Error(msg::Error { error: "test error".into() }),
+            FrpMessage::CloseProxy(msg::CloseProxy {
+                proxy_name: "test".into(),
+            }),
+            FrpMessage::CloseProxyResp(msg::CloseProxyResp {
+                proxy_name: "test".into(),
+            }),
+            FrpMessage::Error(msg::Error {
+                error: "test error".into(),
+            }),
             FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
         ];
 
         for msg in &messages {
             write_msg_v2(&mut client, msg).await.expect("write V2");
             let back = read_msg_v2(&mut server).await.expect("read V2");
-            assert_eq!(back.v2_type_id(), msg.v2_type_id(),
-                "roundtrip type mismatch for {:?}", msg.v2_type_id());
+            assert_eq!(
+                back.v2_type_id(),
+                msg.v2_type_id(),
+                "roundtrip type mismatch for {:?}",
+                msg.v2_type_id()
+            );
         }
     }
 
@@ -744,7 +835,9 @@ mod tests {
         // Go-compatible V2: read_msg_v2 expects frame_type == 16 (Message).
         // Write a frame with frame_type=1 (ClientHello) — should be rejected.
         let (mut client, mut server) = duplex(256);
-        write_v2_frame_raw(&mut client, 1, 0, b"hello").await.expect("write frame");
+        write_v2_frame_raw(&mut client, 1, 0, b"hello")
+            .await
+            .expect("write frame");
         let result = read_msg_v2(&mut server).await;
         assert!(result.is_err(), "should reject non-Message frame type");
     }
@@ -770,7 +863,10 @@ mod tests {
         drop(client);
 
         let result = read_v2_frame_raw(&mut server).await;
-        assert!(result.is_ok(), "non-zero flags should be accepted (Go frp compat)");
+        assert!(
+            result.is_ok(),
+            "non-zero flags should be accepted (Go frp compat)"
+        );
         let (_, flags, payload) = result.unwrap();
         assert_eq!(flags, 1);
         assert_eq!(payload, b"data");
@@ -790,29 +886,61 @@ mod tests {
         // Test all 20 V2 message types survive encode -> decode roundtrip.
         // Construct each message with minimal valid fields (no Default on most).
         fn test_addr() -> msg::UdpAddr {
-            msg::UdpAddr { ip: "0.0.0.0".into(), port: 0, zone: String::new() }
+            msg::UdpAddr {
+                ip: "0.0.0.0".into(),
+                port: 0,
+                zone: String::new(),
+            }
         }
 
         let messages: Vec<FrpMessage> = vec![
             FrpMessage::Login(msg::Login {
-                version: Some("1.0".into()), hostname: Some("h".into()),
-                os: None, arch: None, user: None, run_id: None, client_id: None,
-                pool_count: None, timestamp: None, privilege_key: None,
-                metas: None, client_spec: None, multiplexer: None,
+                version: Some("1.0".into()),
+                hostname: Some("h".into()),
+                os: None,
+                arch: None,
+                user: None,
+                run_id: None,
+                client_id: None,
+                pool_count: None,
+                timestamp: None,
+                privilege_key: None,
+                metas: None,
+                client_spec: None,
+                multiplexer: None,
             }),
             FrpMessage::LoginResp(msg::LoginResp {
-                version: None, run_id: None, error: None,
+                version: None,
+                run_id: None,
+                error: None,
                 server_additional_auth_scopes: None,
             }),
             FrpMessage::NewProxy(msg::NewProxy {
-                proxy_name: "p".into(), proxy_type: "tcp".into(),
-                use_encryption: None, use_compression: None, group: None,
-                group_key: None, local_str: None, remote_port: None, sk: None,
-                custom_domains: None, subdomain: None, locations: None,
-                http_user: None, http_pwd: None, host_header_rewrite: None,
-                headers: None, response_headers: None, route_by_http_user: None,
-                allow_users: None, bandwidth_limit: None, bandwidth_limit_mode: None,
-                annotations: None, metas: None, multiplexer: None, virtual_net: None,
+                proxy_name: "p".into(),
+                proxy_type: "tcp".into(),
+                use_encryption: None,
+                use_compression: None,
+                group: None,
+                group_key: None,
+                local_str: None,
+                remote_port: None,
+                sk: None,
+                custom_domains: None,
+                subdomain: None,
+                locations: None,
+                http_user: None,
+                http_pwd: None,
+                host_header_rewrite: None,
+                headers: None,
+                response_headers: None,
+                route_by_http_user: None,
+                allow_users: None,
+                bandwidth_limit: None,
+                bandwidth_limit_mode: None,
+                annotations: None,
+                metas: None,
+                multiplexer: None,
+                virtual_net: None,
                 proxy_protocol_version: None,
                 advertise_subnet: None,
                 vnet_ip: None,
@@ -820,27 +948,47 @@ mod tests {
                 vnet_mtu: None,
             }),
             FrpMessage::NewProxyResp(msg::NewProxyResp {
-                proxy_name: "p".into(), remote_addr: None, error: None,
+                proxy_name: "p".into(),
+                remote_addr: None,
+                error: None,
             }),
-            FrpMessage::CloseProxy(msg::CloseProxy { proxy_name: "p".into() }),
+            FrpMessage::CloseProxy(msg::CloseProxy {
+                proxy_name: "p".into(),
+            }),
             FrpMessage::NewWorkConn(msg::NewWorkConn {
-                run_id: None, timestamp: None, privilege_key: None,
+                run_id: None,
+                timestamp: None,
+                privilege_key: None,
             }),
             FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
             FrpMessage::StartWorkConn(msg::StartWorkConn {
-                proxy_name: "p".into(), src_addr: None, src_port: None,
-                dst_addr: None, dst_port: None, error: None,
-                use_encryption: None, use_compression: None,
-                nat_hole_sid: None, nat_hole_visitor_addr: None,
+                proxy_name: "p".into(),
+                src_addr: None,
+                src_port: None,
+                dst_addr: None,
+                dst_port: None,
+                error: None,
+                use_encryption: None,
+                use_compression: None,
+                nat_hole_sid: None,
+                nat_hole_visitor_addr: None,
             }),
             FrpMessage::NewVisitorConn(msg::NewVisitorConn {
-                proxy_name: "p".into(), sign_key: None, timestamp: None,
-                run_id: None, use_encryption: None, use_compression: None,
+                proxy_name: "p".into(),
+                sign_key: None,
+                timestamp: None,
+                run_id: None,
+                use_encryption: None,
+                use_compression: None,
             }),
             FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
-                proxy_name: "p".into(), error: None,
+                proxy_name: "p".into(),
+                error: None,
             }),
-            FrpMessage::Ping(msg::Ping { privilege_key: None, timestamp: Some(42) }),
+            FrpMessage::Ping(msg::Ping {
+                privilege_key: None,
+                timestamp: Some(42),
+            }),
             FrpMessage::Pong(msg::Pong { error: None }),
             FrpMessage::UDPPacket(msg::UDPPacket {
                 content: b"hello".to_vec(),
@@ -850,18 +998,29 @@ mod tests {
             FrpMessage::NatHoleVisitor(msg::NatHoleVisitor::default()),
             FrpMessage::NatHoleClient(msg::NatHoleClient::default()),
             FrpMessage::NatHoleResp(msg::NatHoleResp::default()),
-            FrpMessage::NatHoleSid(msg::NatHoleSid { sid: None, provider_addr: None }),
+            FrpMessage::NatHoleSid(msg::NatHoleSid {
+                sid: None,
+                provider_addr: None,
+            }),
             FrpMessage::NatHoleReport(msg::NatHoleReport { sid: None }),
-            FrpMessage::CloseProxyResp(msg::CloseProxyResp { proxy_name: "p".into() }),
-            FrpMessage::Error(msg::Error { error: "test error".into() }),
+            FrpMessage::CloseProxyResp(msg::CloseProxyResp {
+                proxy_name: "p".into(),
+            }),
+            FrpMessage::Error(msg::Error {
+                error: "test error".into(),
+            }),
         ];
 
         for msg in &messages {
             let (mut client, mut server) = duplex(65536);
             write_msg_v2(&mut client, msg).await.expect("write v2");
             let back = read_msg_v2(&mut server).await.expect("read v2");
-            assert_eq!(back.v2_type_id(), msg.v2_type_id(),
-                "roundtrip type mismatch for {:?}", msg.v2_type_id());
+            assert_eq!(
+                back.v2_type_id(),
+                msg.v2_type_id(),
+                "roundtrip type mismatch for {:?}",
+                msg.v2_type_id()
+            );
         }
     }
 
@@ -871,19 +1030,26 @@ mod tests {
         // Write frame type=Message with type_id=99 and empty JSON payload
         let mut payload = vec![0u8; 2];
         payload[0..2].copy_from_slice(&99u16.to_be_bytes());
-        write_v2_frame_raw(&mut client, V2_FRAME_TYPE_MESSAGE, 0, &payload).await.unwrap();
+        write_v2_frame_raw(&mut client, V2_FRAME_TYPE_MESSAGE, 0, &payload)
+            .await
+            .unwrap();
         drop(client);
 
         let result = read_msg_v2(&mut server).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown V2 message type ID: 99"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unknown V2 message type ID: 99"));
     }
 
     #[tokio::test]
     async fn test_v2_msg_payload_too_short() {
         let (mut client, mut server) = duplex(65536);
         // Write frame type=Message with only 1 byte payload (need 2 for type_id)
-        write_v2_frame_raw(&mut client, V2_FRAME_TYPE_MESSAGE, 0, b"x").await.unwrap();
+        write_v2_frame_raw(&mut client, V2_FRAME_TYPE_MESSAGE, 0, b"x")
+            .await
+            .unwrap();
         drop(client);
 
         let result = read_msg_v2(&mut server).await;
@@ -895,12 +1061,17 @@ mod tests {
     async fn test_v2_msg_wrong_frame_type() {
         let (mut client, mut server) = duplex(65536);
         // Write frame with type=ClientHello(1) — read_msg_v2 should reject
-        write_v2_frame_raw(&mut client, V2_FRAME_TYPE_CLIENT_HELLO, 0, b"{}").await.unwrap();
+        write_v2_frame_raw(&mut client, V2_FRAME_TYPE_CLIENT_HELLO, 0, b"{}")
+            .await
+            .unwrap();
         drop(client);
 
         let result = read_msg_v2(&mut server).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unexpected V2 frame type: 1"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected V2 frame type: 1"));
     }
 
     #[tokio::test]
@@ -964,8 +1135,8 @@ mod tests {
     }
 
     mod proptest_fuzz {
-        use proptest::prelude::*;
         use super::*;
+        use proptest::prelude::*;
 
         // ── V1 deserialize fuzz ─────────────────────────────────────
 
@@ -1178,8 +1349,10 @@ mod tests {
             for &tb in V1_TYPE_BYTES {
                 let result = deserialize_v1(tb, b"");
                 // Empty payload is invalid JSON — must return Err, never panic
-                assert!(result.is_err(),
-                    "deserialize_v1({tb}, \"\") should fail on empty payload");
+                assert!(
+                    result.is_err(),
+                    "deserialize_v1({tb}, \"\") should fail on empty payload"
+                );
             }
         }
 
@@ -1189,8 +1362,10 @@ mod tests {
             let garbage: Vec<u8> = (0..=255).collect();
             for &tb in V1_TYPE_BYTES {
                 let result = deserialize_v1(tb, &garbage);
-                assert!(result.is_err(),
-                    "deserialize_v1({tb}, binary_garbage) should fail");
+                assert!(
+                    result.is_err(),
+                    "deserialize_v1({tb}, binary_garbage) should fail"
+                );
             }
         }
 
@@ -1209,8 +1384,10 @@ mod tests {
         fn v2_deserialize_empty_payload() {
             for type_id in 0u16..30 {
                 let result = crate::protocol::deserialize_v2(type_id, b"");
-                assert!(result.is_err(),
-                    "deserialize_v2({type_id}, \"\") should fail on empty payload");
+                assert!(
+                    result.is_err(),
+                    "deserialize_v2({type_id}, \"\") should fail on empty payload"
+                );
             }
         }
 
@@ -1219,8 +1396,10 @@ mod tests {
             let garbage: Vec<u8> = (0..=255).collect();
             for type_id in 0u16..30 {
                 let result = crate::protocol::deserialize_v2(type_id, &garbage);
-                assert!(result.is_err(),
-                    "deserialize_v2({type_id}, binary_garbage) should fail");
+                assert!(
+                    result.is_err(),
+                    "deserialize_v2({type_id}, binary_garbage) should fail"
+                );
             }
         }
 
@@ -1271,7 +1450,10 @@ mod tests {
                 read_v2_magic_or_replay(&mut r).await
             });
             assert!(result.is_ok());
-            assert!(result.unwrap().is_none(), "V2 magic should be detected and consumed");
+            assert!(
+                result.unwrap().is_none(),
+                "V2 magic should be detected and consumed"
+            );
         }
 
         #[test]
@@ -1290,7 +1472,10 @@ mod tests {
             });
             assert!(result.is_ok());
             let replay = result.unwrap();
-            assert!(replay.is_some(), "near-magic should be replayed, not consumed");
+            assert!(
+                replay.is_some(),
+                "near-magic should be replayed, not consumed"
+            );
             assert_eq!(replay.unwrap(), bytes.to_vec());
         }
     }

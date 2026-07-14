@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 /// Run a health check for a proxy.
 /// Supports "tcp" (connect only) and "http" (GET + check 2xx status).
@@ -80,7 +80,12 @@ pub(crate) async fn run_tcp_check(addr: &str, timeout: Duration) -> Result<(), S
 
 /// HTTP health check: connect, send GET, verify 2xx status code.
 /// Uses raw TCP to avoid adding an HTTP client dependency.
-pub(crate) async fn run_http_check(addr: &str, url: &str, timeout: Duration, headers: &HashMap<String, String>) -> Result<(), String> {
+pub(crate) async fn run_http_check(
+    addr: &str,
+    url: &str,
+    timeout: Duration,
+    headers: &HashMap<String, String>,
+) -> Result<(), String> {
     let mut stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
         .await
         .map_err(|_| "connect timeout".to_string())?

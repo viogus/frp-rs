@@ -1,22 +1,22 @@
-pub mod state;
-pub mod store;
-pub mod service;
 pub mod control;
-pub mod proxy;
-pub mod vhost;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
 #[cfg(feature = "dashboard")]
 pub mod event;
-pub mod nathole;
-pub mod tcpmux;
-pub mod metrics;
-pub mod plugin;
-#[cfg(feature = "ssh")]
-pub mod ssh_gateway;
 pub mod handlers;
 pub mod lock;
+pub mod metrics;
+pub mod nathole;
+pub mod plugin;
+pub mod proxy;
 pub mod registry;
+pub mod service;
+#[cfg(feature = "ssh")]
+pub mod ssh_gateway;
+pub mod state;
+pub mod store;
+pub mod tcpmux;
+pub mod vhost;
 
 /// Constant-time string comparison for credential verification.
 /// Prevents timing side-channel attacks on HTTP Basic Auth and

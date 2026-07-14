@@ -39,9 +39,16 @@ async fn test_ssh_gateway_startup_and_banner() {
 
     let (_handle, _port) = start_test_server(cfg).await;
 
-    let mut ssh_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", ssh_port))
-        .await
-        .expect("SSH port should accept connections");
+    // Retry: SSH gateway may not be listening immediately after server start.
+    let mut ssh_stream = None;
+    for _ in 0..20 {
+        if let Ok(s) = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", ssh_port)).await {
+            ssh_stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut ssh_stream = ssh_stream.expect("SSH port should accept connections");
 
     let banner = read_ssh_banner(&mut ssh_stream).await;
     println!("SSH banner received: {:?}", banner.trim_end());

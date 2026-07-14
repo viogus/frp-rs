@@ -1,13 +1,13 @@
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tracing::{debug, warn};
 
 use frp_core::metrics::ConnGuard;
 use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::{read_msg_v1, write_msg_v1, read_msg_v2, write_msg_v2};
+use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1, write_msg_v2};
 use frp_core::transport::IoStream;
 
 use crate::service::AppState;
@@ -297,27 +297,52 @@ pub(crate) async fn assign_work_to_proxy(
 ) {
     // Extract peer address from user connection for PROXY protocol support
     let (src_addr, src_port) = match &req.user_conn {
-        IoStream::Tcp(s) => {
-            s.peer_addr().map(|a| (a.ip().to_string(), a.port() as i32)).ok()
-        }
+        IoStream::Tcp(s) => s
+            .peer_addr()
+            .map(|a| (a.ip().to_string(), a.port() as i32))
+            .ok(),
         _ => None,
-    }.map_or((String::new(), 0), |(ip, port)| (ip, port));
+    }
+    .map_or((String::new(), 0), |(ip, port)| (ip, port));
 
     // Look up proxy info for dst address and proxy protocol version
     let proxy_info = state.proxy_manager.get(&req.proxy_name).await;
-    let proxy_protocol_version = proxy_info.as_ref()
-        .map(|p| p.proxy_protocol_version.clone()).unwrap_or_default();
-    let dst_addr = proxy_info.as_ref()
-        .and_then(|p| p.local_addr.clone()).unwrap_or_default();
-    let dst_port = proxy_info.as_ref()
-        .and_then(|p| p.remote_port).map(|p| p as i32).unwrap_or(0);
+    let proxy_protocol_version = proxy_info
+        .as_ref()
+        .map(|p| p.proxy_protocol_version.clone())
+        .unwrap_or_default();
+    let dst_addr = proxy_info
+        .as_ref()
+        .and_then(|p| p.local_addr.clone())
+        .unwrap_or_default();
+    let dst_port = proxy_info
+        .as_ref()
+        .and_then(|p| p.remote_port)
+        .map(|p| p as i32)
+        .unwrap_or(0);
 
     let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
         proxy_name: req.proxy_name.clone(),
-        src_addr: if !proxy_protocol_version.is_empty() && !src_addr.is_empty() { Some(src_addr) } else { None },
-        src_port: if !proxy_protocol_version.is_empty() && src_port != 0 { Some(src_port) } else { None },
-        dst_addr: if !proxy_protocol_version.is_empty() && !dst_addr.is_empty() { Some(dst_addr) } else { None },
-        dst_port: if !proxy_protocol_version.is_empty() && dst_port != 0 { Some(dst_port) } else { None },
+        src_addr: if !proxy_protocol_version.is_empty() && !src_addr.is_empty() {
+            Some(src_addr)
+        } else {
+            None
+        },
+        src_port: if !proxy_protocol_version.is_empty() && src_port != 0 {
+            Some(src_port)
+        } else {
+            None
+        },
+        dst_addr: if !proxy_protocol_version.is_empty() && !dst_addr.is_empty() {
+            Some(dst_addr)
+        } else {
+            None
+        },
+        dst_port: if !proxy_protocol_version.is_empty() && dst_port != 0 {
+            Some(dst_port)
+        } else {
+            None
+        },
         error: None,
         // use_encryption/use_compression: propagate proxy config settings.
         // Go frpc v0.69.1 ignores these fields (not in its StartWorkConn struct)
@@ -328,10 +353,18 @@ pub(crate) async fn assign_work_to_proxy(
         // CipherWriter now eagerly flushes IV on first poll_flush, preventing the
         // dual-CipherWriter deadlock that previously forced plain bridge for XTCP.
         use_encryption: if req.use_encryption { Some(true) } else { None },
-        use_compression: if req.use_compression { Some(true) } else { None },
+        use_compression: if req.use_compression {
+            Some(true)
+        } else {
+            None
+        },
         // For XTCP STCP fallback: set empty nat_hole_sid marker so Rust frpc
         // knows this work conn is for STCP bridging, not XTCP notification.
-        nat_hole_sid: if req.proxy_type == "xtcp" { Some(String::new()) } else { None },
+        nat_hole_sid: if req.proxy_type == "xtcp" {
+            Some(String::new())
+        } else {
+            None
+        },
         nat_hole_visitor_addr: None,
     });
 
@@ -406,36 +439,108 @@ pub(crate) async fn assign_work_to_proxy(
                 IoStream::Tcp(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
+                    frp_core::bridge::bridge_encrypted(
+                        u_r,
+                        u_w,
+                        w_r,
+                        w_w,
+                        &key,
+                        comp_key,
+                        pre_read,
+                        None,
+                        None,
+                        Some(metrics.clone()),
+                    )
+                    .await;
                 }
                 #[cfg(feature = "tls")]
                 IoStream::Tls(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
+                    frp_core::bridge::bridge_encrypted(
+                        u_r,
+                        u_w,
+                        w_r,
+                        w_w,
+                        &key,
+                        comp_key,
+                        pre_read,
+                        None,
+                        None,
+                        Some(metrics.clone()),
+                    )
+                    .await;
                 }
                 #[cfg(feature = "kcp")]
                 IoStream::Kcp(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
+                    frp_core::bridge::bridge_encrypted(
+                        u_r,
+                        u_w,
+                        w_r,
+                        w_w,
+                        &key,
+                        comp_key,
+                        pre_read,
+                        None,
+                        None,
+                        Some(metrics.clone()),
+                    )
+                    .await;
                 }
                 #[cfg(feature = "websocket")]
                 IoStream::WebSocket(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
+                    frp_core::bridge::bridge_encrypted(
+                        u_r,
+                        u_w,
+                        w_r,
+                        w_w,
+                        &key,
+                        comp_key,
+                        pre_read,
+                        None,
+                        None,
+                        Some(metrics.clone()),
+                    )
+                    .await;
                 }
                 #[cfg(feature = "quic")]
                 IoStream::Quic(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = work.into_split();
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
+                    frp_core::bridge::bridge_encrypted(
+                        u_r,
+                        u_w,
+                        w_r,
+                        w_w,
+                        &key,
+                        comp_key,
+                        pre_read,
+                        None,
+                        None,
+                        Some(metrics.clone()),
+                    )
+                    .await;
                 }
                 IoStream::Yamux(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
+                    frp_core::bridge::bridge_encrypted(
+                        u_r,
+                        u_w,
+                        w_r,
+                        w_w,
+                        &key,
+                        comp_key,
+                        pre_read,
+                        None,
+                        None,
+                        Some(metrics.clone()),
+                    )
+                    .await;
                 }
                 IoStream::Cipher(_) => {
                     warn!("Cipher stream unexpected in server bridge");
@@ -448,17 +553,53 @@ pub(crate) async fn assign_work_to_proxy(
                 IoStream::SshChannel(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
+                    frp_core::bridge::bridge_encrypted(
+                        u_r,
+                        u_w,
+                        w_r,
+                        w_w,
+                        &key,
+                        comp_key,
+                        pre_read,
+                        None,
+                        None,
+                        Some(metrics.clone()),
+                    )
+                    .await;
                 }
                 IoStream::PreRead(_, work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = tokio::io::split(work);
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
+                    frp_core::bridge::bridge_encrypted(
+                        u_r,
+                        u_w,
+                        w_r,
+                        w_w,
+                        &key,
+                        comp_key,
+                        pre_read,
+                        None,
+                        None,
+                        Some(metrics.clone()),
+                    )
+                    .await;
                 }
                 IoStream::BufferedRead(_, _, inner) => {
                     let (u_r, u_w) = req.user_conn.into_split();
                     let (w_r, w_w) = inner.into_split();
-                    frp_core::bridge::bridge_encrypted(u_r, u_w, w_r, w_w, &key, comp_key, pre_read, None, None, Some(metrics.clone())).await;
+                    frp_core::bridge::bridge_encrypted(
+                        u_r,
+                        u_w,
+                        w_r,
+                        w_w,
+                        &key,
+                        comp_key,
+                        pre_read,
+                        None,
+                        None,
+                        Some(metrics.clone()),
+                    )
+                    .await;
                 }
             }
         } else {
@@ -489,10 +630,7 @@ pub(crate) async fn assign_work_to_proxy(
                         debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
                     }
                 }
-            } else if !comp_key
-                && bridge_pre_read.is_empty()
-                && req.response_headers.is_empty()
-            {
+            } else if !comp_key && bridge_pre_read.is_empty() && req.response_headers.is_empty() {
                 // Fast path: pure plain relay with no compression, no VHost
                 // pre-read, and no header injection. On Linux, try zero-copy
                 // splice for Tcp-to-Tcp; otherwise use copy_bidirectional.
@@ -503,9 +641,27 @@ pub(crate) async fn assign_work_to_proxy(
                 let (w_r, w_w) = work_conn.into_split();
                 if !req.response_headers.is_empty() && req.proxy_type.starts_with("http") {
                     let injector = ResponseHeaderInjector::new(w_r, req.response_headers);
-                    frp_core::bridge::bridge_plain(u_r, u_w, injector, w_w, comp_key, bridge_pre_read, Some(metrics.clone())).await;
+                    frp_core::bridge::bridge_plain(
+                        u_r,
+                        u_w,
+                        injector,
+                        w_w,
+                        comp_key,
+                        bridge_pre_read,
+                        Some(metrics.clone()),
+                    )
+                    .await;
                 } else {
-                    frp_core::bridge::bridge_plain(u_r, u_w, w_r, w_w, comp_key, bridge_pre_read, Some(metrics.clone())).await;
+                    frp_core::bridge::bridge_plain(
+                        u_r,
+                        u_w,
+                        w_r,
+                        w_w,
+                        comp_key,
+                        bridge_pre_read,
+                        Some(metrics.clone()),
+                    )
+                    .await;
                 }
             }
         }

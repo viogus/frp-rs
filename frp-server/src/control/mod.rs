@@ -1,22 +1,22 @@
 mod bridge;
 mod proxy_ops;
 
-use proxy_ops::err_msg;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::net::SocketAddr;
-use std::collections::VecDeque;
-use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Duration, Instant};
-use tracing::{info, warn, debug, instrument};
 use crate::lock::RwLockExt;
 use crate::nathole::NAT_HOLE_TIMEOUT;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use proxy_ops::err_msg;
+use std::collections::VecDeque;
+use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{Duration, Instant};
+use tracing::{debug, info, instrument, warn};
 
 use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::IncomingStreams;
-use frp_core::protocol::{read_msg_v1, write_msg_v1, read_msg_v2, write_msg_v2};
+use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1, write_msg_v2};
 
 /// Protocol-aware read: dispatches to V1 or V2 framing based on the `v2` flag.
 async fn read_ctl_msg<R: AsyncReadExt + Unpin>(
@@ -44,7 +44,7 @@ async fn write_ctl_msg<W: AsyncWriteExt + Unpin>(
 }
 use frp_core::transport::IoStream;
 
-use crate::service::{AppState, InternalMsg, ControlTx};
+use crate::service::{AppState, ControlTx, InternalMsg};
 
 /// Max age of a pending request before it is dropped (Go frp: 10s default).
 pub(super) const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -89,16 +89,22 @@ where
 {
     if let Some(entry) = work_pool.pop_front() {
         state.pool.hits.fetch_add(1, Ordering::Relaxed);
-        pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
+        pool_stats
+            .pool_size
+            .store(work_pool.len() as i64, Ordering::Relaxed);
         bridge::assign_work_to_proxy(entry.conn, req, enc_key, state.clone(), v2).await;
     } else {
         state.pool.misses.fetch_add(1, Ordering::Relaxed);
-        if let Err(e) = write_ctl_msg(writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
+        if let Err(e) =
+            write_ctl_msg(writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await
+        {
             warn!(error = %e, "Failed to send ReqWorkConn: {}", e);
             return Err(());
         }
         pending_requests.push_back(req);
-        pool_stats.pending_requests.store(pending_requests.len() as i64, Ordering::Relaxed);
+        pool_stats
+            .pending_requests
+            .store(pending_requests.len() as i64, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -117,8 +123,11 @@ async fn write_start_work_conn_with_nat_hole_sid<W: tokio::io::AsyncWriteExt + U
 ) {
     let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
         proxy_name: proxy_name.to_string(),
-        src_addr: None, src_port: None,
-        dst_addr: None, dst_port: None, error: None,
+        src_addr: None,
+        src_port: None,
+        dst_addr: None,
+        dst_port: None,
+        error: None,
         use_encryption: if use_enc { Some(true) } else { None },
         use_compression: if use_comp { Some(true) } else { None },
         nat_hole_sid: Some(sid.to_string()),
@@ -181,7 +190,11 @@ pub async fn handle_control<S>(
                 let resp = FrpMessage::LoginResp(msg::LoginResp {
                     version: Some(frp_core::VERSION.into()),
                     run_id: None,
-                    error: Some(err_msg(state.detailed_errors_to_client, format!("OIDC authentication failed: {e}"), "OIDC authentication failed")),
+                    error: Some(err_msg(
+                        state.detailed_errors_to_client,
+                        format!("OIDC authentication failed: {e}"),
+                        "OIDC authentication failed",
+                    )),
                     server_additional_auth_scopes: None,
                 });
                 let _ = write_ctl_msg(&mut writer, &resp, v2).await;
@@ -190,10 +203,7 @@ pub async fn handle_control<S>(
         }
     } else {
         let auth_cfg = state.reloadable.read_ok().auth_cfg.clone();
-        if let Err(e) = auth_cfg.validate_login(
-            login.privilege_key.as_deref(),
-            login.timestamp,
-        ) {
+        if let Err(e) = auth_cfg.validate_login(login.privilege_key.as_deref(), login.timestamp) {
             warn!(peer = ?peer, error = %e, "Authentication failed for {:?}: {}", peer, e);
             if let Some(ref peer_addr) = peer {
                 state.record_login_failure(*peer_addr).await;
@@ -210,7 +220,11 @@ pub async fn handle_control<S>(
             let resp = FrpMessage::LoginResp(msg::LoginResp {
                 version: Some(frp_core::VERSION.into()),
                 run_id: None,
-                error: Some(err_msg(state.detailed_errors_to_client, e, "token authentication failed")),
+                error: Some(err_msg(
+                    state.detailed_errors_to_client,
+                    e,
+                    "token authentication failed",
+                )),
                 server_additional_auth_scopes: None,
             });
             let _ = write_ctl_msg(&mut writer, &resp, v2).await;
@@ -221,13 +235,20 @@ pub async fn handle_control<S>(
 
     let reloadable = state.reloadable.read_ok().clone();
 
-    let run_id = login.run_id.clone()
+    let run_id = login
+        .run_id
+        .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     info!(peer = ?peer, run_id = %run_id, "Client {:?} logged in with run_id: {}", peer, run_id);
 
     // Store OIDC subject for ping/NWC verification
     if let Some(ref sub) = oidc_subject {
-        state.oidc.subjects.write().await.insert(run_id.clone(), sub.clone());
+        state
+            .oidc
+            .subjects
+            .write()
+            .await
+            .insert(run_id.clone(), sub.clone());
     }
 
     // --- Server plugin: login hook ---
@@ -269,17 +290,20 @@ pub async fn handle_control<S>(
             warn!(run_id = %run_id, "Duplicate run_id {}: shutting down old control handler", run_id);
             let _ = old_ctl.tx.send(InternalMsg::Shutdown);
         }
-        map.insert(run_id.clone(), ControlTx {
-            tx: internal_tx.clone(),
-            client_addr: peer,
-            login_time: std::time::Instant::now(),
-            login_time_unix: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
-            pool_stats: pool_stats.clone(),
-            user: login.user.clone().unwrap_or_default(),
-        });
+        map.insert(
+            run_id.clone(),
+            ControlTx {
+                tx: internal_tx.clone(),
+                client_addr: peer,
+                login_time: std::time::Instant::now(),
+                login_time_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+                pool_stats: pool_stats.clone(),
+                user: login.user.clone().unwrap_or_default(),
+            },
+        );
     }
 
     // --- Send login response (plain, before encryption) ---
@@ -289,7 +313,11 @@ pub async fn handle_control<S>(
             version: Some(frp_core::VERSION.into()),
             run_id: Some(run_id.clone()),
             error: None,
-            server_additional_auth_scopes: if additional_auth_scopes.is_empty() { None } else { Some(additional_auth_scopes) },
+            server_additional_auth_scopes: if additional_auth_scopes.is_empty() {
+                None
+            } else {
+                Some(additional_auth_scopes)
+            },
         });
         // Hex-dump the raw LoginResp V1 frame for Go compat debugging
         let type_byte = resp.v1_type_byte();
@@ -318,10 +346,12 @@ pub async fn handle_control<S>(
         // Emit WebSocket event for dashboard subscribers
         #[cfg(feature = "dashboard")]
         {
-            let _ = state.event_tx.send(crate::event::ServerEvent::ClientConnected {
-                run_id: run_id.clone(),
-                client_addr: peer.map(|a| a.to_string()),
-            });
+            let _ = state
+                .event_tx
+                .send(crate::event::ServerEvent::ClientConnected {
+                    run_id: run_id.clone(),
+                    client_addr: peer.map(|a| a.to_string()),
+                });
         }
     }
 
@@ -336,14 +366,19 @@ pub async fn handle_control<S>(
     ) = if let (true, Some(ctx)) = (v2, crypto_ctx.as_ref()) {
         let token = reloadable.auth_cfg.token.clone();
         match frp_core::crypto::derive_aead_control_keys(
-            token.as_bytes(), ctx.algorithm, &ctx.transcript_hash,
+            token.as_bytes(),
+            ctx.algorithm,
+            &ctx.transcript_hash,
         ) {
             Ok((read_key, write_key)) => {
                 // derive_aead_control_keys returns (client_to_server, server_to_client).
                 // Server reads from client → client_to_server (= read_key).
                 // Server writes to client → server_to_client (= write_key).
                 match frp_core::crypto::AeadStream::new(
-                    Box::new(stream), ctx.algorithm, &read_key, &write_key,
+                    Box::new(stream),
+                    ctx.algorithm,
+                    &read_key,
+                    &write_key,
                 ) {
                     Ok(aead) => {
                         let (r, w) = tokio::io::split(aead);
@@ -380,10 +415,20 @@ pub async fn handle_control<S>(
         {
             let max_pool = state.server_config_snapshot.max_pool_count;
             let raw_pool = login.pool_count.unwrap_or(1).max(1) as i64;
-            let pool_count = if max_pool > 0 { raw_pool.min(max_pool) } else { raw_pool } as usize;
+            let pool_count = if max_pool > 0 {
+                raw_pool.min(max_pool)
+            } else {
+                raw_pool
+            } as usize;
             info!(peer = ?peer, pool_count = pool_count, max_pool_count = max_pool, "Sending ReqWorkConn x{} through cipher (before split)", pool_count);
             for i in 0..pool_count {
-                if let Err(e) = write_ctl_msg(&mut cipher, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await {
+                if let Err(e) = write_ctl_msg(
+                    &mut cipher,
+                    &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
+                    v2,
+                )
+                .await
+                {
                     warn!(peer = ?peer, error = %e, i = i, "Failed to send ReqWorkConn #{}/{}: {}", i, pool_count, e);
                     proxy_ops::unregister_control(&state, &run_id, false).await;
                     return;
@@ -404,7 +449,11 @@ pub async fn handle_control<S>(
     // --- Per-client state ---
     let max_pool = state.server_config_snapshot.max_pool_count;
     let raw_pool = login.pool_count.unwrap_or(1).max(0) as i64;
-    let capped_pool = if max_pool > 0 { raw_pool.min(max_pool) } else { raw_pool } as usize;
+    let capped_pool = if max_pool > 0 {
+        raw_pool.min(max_pool)
+    } else {
+        raw_pool
+    } as usize;
     let pool_cap = capped_pool + WORK_POOL_EXTRA;
     let mut work_pool: VecDeque<PoolEntry> = VecDeque::new();
     let mut pending_requests: VecDeque<PendingRequest> = VecDeque::new();
@@ -412,10 +461,13 @@ pub async fn handle_control<S>(
     let mut pending_nat_hole_sids: VecDeque<(String, String, Instant)> = VecDeque::new();
     // TCP/HTTP/STCP listener handles. UDP listeners are managed via the work-connection
     // mechanism (UdpNeedsWorkConn → ReqWorkConn → assign_udp_work_conn).
-    let mut listener_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> = std::collections::HashMap::new();
-    let mut udp_sockets: std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>> = std::collections::HashMap::new();
+    let mut listener_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+        std::collections::HashMap::new();
+    let mut udp_sockets: std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>> =
+        std::collections::HashMap::new();
     // Reverse mapping: local_addr → proxy_name for routing UDPPacket responses
-    let mut udp_local_to_proxy: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut udp_local_to_proxy: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut shutting_down = false;
     let mut last_ping = Instant::now();
     // Ping interval: max 10s to stay well within Go frpc's heartbeat timeout
@@ -431,7 +483,9 @@ pub async fn handle_control<S>(
         while let Some(req) = pending_requests.front() {
             if req.created_at.elapsed() > PENDING_REQUEST_TIMEOUT {
                 let expired = pending_requests.pop_front().unwrap();
-                pool_stats.pending_requests.store(pending_requests.len() as i64, Ordering::Relaxed);
+                pool_stats
+                    .pending_requests
+                    .store(pending_requests.len() as i64, Ordering::Relaxed);
                 debug!(proxy_name = %expired.proxy_name, timeout = ?PENDING_REQUEST_TIMEOUT, "Pending request for proxy '{}' timed out after {:?}", expired.proxy_name, PENDING_REQUEST_TIMEOUT);
             } else {
                 break;
@@ -444,7 +498,9 @@ pub async fn handle_control<S>(
             while let Some(entry) = work_pool.front() {
                 if entry.pooled_at.elapsed() >= pool_idle_timeout {
                     work_pool.pop_front();
-                    pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
+                    pool_stats
+                        .pool_size
+                        .store(work_pool.len() as i64, Ordering::Relaxed);
                     debug!(run_id = %run_id, idle_timeout = ?pool_idle_timeout, "Idle work conn expired after {:?}", pool_idle_timeout);
                 } else {
                     break;
@@ -1103,7 +1159,18 @@ pub async fn handle_control<S>(
                                 true // No sk configured
                             }
                         } else {
-                            false // Proxy not found
+                            // Race: NewVisitorConn may arrive before proxy_manager
+                            // registration completes. Fall back to pre-populated sk_index.
+                            let sk_map = state.xtcp.sk_index.read().await;
+                            sk_map.iter().any(|(sk_key, pn)| {
+                                if pn == &nvc.proxy_name {
+                                    let sk_raw = sk_key.rsplit(':').next().unwrap_or(sk_key);
+                                    let expected = frp_core::auth::generate_token(sk_raw, timestamp);
+                                    expected == sign_key
+                                } else {
+                                    false
+                                }
+                            })
                         };
 
                         if ok {
@@ -1419,9 +1486,11 @@ pub async fn handle_control<S>(
     // Emit ClientDisconnected
     #[cfg(feature = "dashboard")]
     {
-        let _ = state.event_tx.send(crate::event::ServerEvent::ClientDisconnected {
-            run_id: run_id.clone(),
-        });
+        let _ = state
+            .event_tx
+            .send(crate::event::ServerEvent::ClientDisconnected {
+                run_id: run_id.clone(),
+            });
     }
     proxy_ops::unregister_control(&state, &run_id, shutting_down).await;
     state.proxy_manager.remove_client(&run_id).await;

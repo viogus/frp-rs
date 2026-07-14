@@ -1,13 +1,17 @@
 //! Dashboard API v2 — paginated, filterable, searchable endpoints.
 //! Go frp v0.70.0 compat: /api/v2/* routes.
 
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::collections::HashMap;
-use axum::{Router, Json, extract::{State, Path, Query}, routing::{get, post}};
-use axum::http::StatusCode;
-use serde::Serialize;
 use crate::service::AppState;
+use axum::http::StatusCode;
+use axum::{
+    extract::{Path, Query, State},
+    routing::{get, post},
+    Json, Router,
+};
+use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 // ── Generic page response ──────────────────────────────────────────
 
@@ -261,7 +265,9 @@ struct V2ProxyStatus {
     last_close_at: i64,
 }
 
-fn is_zero(v: &i64) -> bool { *v == 0 }
+fn is_zero(v: &i64) -> bool {
+    *v == 0
+}
 
 // ── Traffic ──────────────────────────────────────────────────────────
 
@@ -288,13 +294,18 @@ const DEFAULT_PAGE: u32 = 1;
 const DEFAULT_PAGE_SIZE: u32 = 50;
 const MAX_PAGE_SIZE: u32 = 200;
 
-const VALID_TYPES: &[&str] = &["tcp", "udp", "http", "https", "tcpmux", "stcp", "xtcp", "sudp"];
+const VALID_TYPES: &[&str] = &[
+    "tcp", "udp", "http", "https", "tcpmux", "stcp", "xtcp", "sudp",
+];
 
 fn parse_page(p: Option<u32>, ps: Option<u32>) -> Result<(u32, u32), (StatusCode, Json<V2Error>)> {
     let page = p.unwrap_or(DEFAULT_PAGE).max(1);
     let size = ps.unwrap_or(DEFAULT_PAGE_SIZE).max(1);
     if size > MAX_PAGE_SIZE {
-        return Err(v2_err(StatusCode::BAD_REQUEST, format!("pageSize must be <= {MAX_PAGE_SIZE}")));
+        return Err(v2_err(
+            StatusCode::BAD_REQUEST,
+            format!("pageSize must be <= {MAX_PAGE_SIZE}"),
+        ));
     }
     Ok((page, size))
 }
@@ -308,7 +319,12 @@ fn paginate<T: Serialize>(mut items: Vec<T>, page: u32, page_size: u32) -> V2Pag
         let end = (start + page_size as usize).min(total);
         items.drain(start..end).collect()
     };
-    V2PageResp { total, page, page_size, items }
+    V2PageResp {
+        total,
+        page,
+        page_size,
+        items,
+    }
 }
 
 fn match_status(online: bool, filter: &str) -> bool {
@@ -321,7 +337,9 @@ fn match_status(online: bool, filter: &str) -> bool {
 }
 
 fn match_search(q: &str, values: &[&str]) -> bool {
-    if q.is_empty() { return true; }
+    if q.is_empty() {
+        return true;
+    }
     let q = q.to_lowercase();
     values.iter().any(|v| v.to_lowercase().contains(&q))
 }
@@ -330,14 +348,20 @@ fn validate_type(t: &str) -> Result<(), (StatusCode, Json<V2Error>)> {
     if t.is_empty() || VALID_TYPES.contains(&t) {
         Ok(())
     } else {
-        Err(v2_err(StatusCode::BAD_REQUEST, "type must be one of tcp, udp, http, https, tcpmux, stcp, xtcp, sudp"))
+        Err(v2_err(
+            StatusCode::BAD_REQUEST,
+            "type must be one of tcp, udp, http, https, tcpmux, stcp, xtcp, sudp",
+        ))
     }
 }
 
 fn validate_status(s: &str) -> Result<(), (StatusCode, Json<V2Error>)> {
     match s {
         "" | "all" | "online" | "offline" => Ok(()),
-        _ => Err(v2_err(StatusCode::BAD_REQUEST, "status must be all, online, or offline")),
+        _ => Err(v2_err(
+            StatusCode::BAD_REQUEST,
+            "status must be all, online, or offline",
+        )),
     }
 }
 
@@ -359,8 +383,14 @@ fn percent_decode_path(s: &str) -> Result<String, (StatusCode, Json<V2Error>)> {
                     return Err(v2_err(StatusCode::BAD_REQUEST, "invalid percent-encoding"));
                 }
             }
-            b'+' => { out.push(' '); i += 1; }
-            b => { out.push(b as char); i += 1; }
+            b'+' => {
+                out.push(' ');
+                i += 1;
+            }
+            b => {
+                out.push(b as char);
+                i += 1;
+            }
         }
     }
     Ok(out)
@@ -404,7 +434,10 @@ fn proxy_base_spec(info: &crate::proxy::ProxyInfo) -> V2ProxyBaseSpec {
             bandwidth_limit: String::new(),
             bandwidth_limit_mode: String::new(),
         }),
-        load_balancer: info.group.as_ref().map(|g| V2LoadBalancer { group: g.clone() }),
+        load_balancer: info
+            .group
+            .as_ref()
+            .map(|g| V2LoadBalancer { group: g.clone() }),
     }
 }
 
@@ -420,8 +453,14 @@ fn proxy_spec(info: &crate::proxy::ProxyInfo) -> V2ProxySpec {
         }};
     }
     match info.proxy_type.as_str() {
-        "tcp" => spec!(tcp, |base| V2TcpUdpSpec { base, remote_port: info.remote_port }),
-        "udp" => spec!(udp, |base| V2TcpUdpSpec { base, remote_port: info.remote_port }),
+        "tcp" => spec!(tcp, |base| V2TcpUdpSpec {
+            base,
+            remote_port: info.remote_port
+        }),
+        "udp" => spec!(udp, |base| V2TcpUdpSpec {
+            base,
+            remote_port: info.remote_port
+        }),
         "http" => spec!(http, |base| V2HttpSpec {
             base,
             custom_domains: info.custom_domains.clone(),
@@ -442,7 +481,10 @@ fn proxy_spec(info: &crate::proxy::ProxyInfo) -> V2ProxySpec {
         "stcp" => spec!(stcp, |base| V2BaseOnlySpec { base }),
         "sudp" => spec!(sudp, |base| V2BaseOnlySpec { base }),
         "xtcp" => spec!(xtcp, |base| V2BaseOnlySpec { base }),
-        _ => V2ProxySpec { proxy_type: info.proxy_type.clone(), ..Default::default() },
+        _ => V2ProxySpec {
+            proxy_type: info.proxy_type.clone(),
+            ..Default::default()
+        },
     }
 }
 
@@ -451,27 +493,46 @@ fn proxy_spec(info: &crate::proxy::ProxyInfo) -> V2ProxySpec {
 use serde::Deserialize;
 
 #[derive(Deserialize, Default)]
-struct UserQuery { page: Option<u32>, #[serde(rename = "pageSize")] page_size: Option<u32>, q: Option<String> }
+struct UserQuery {
+    page: Option<u32>,
+    #[serde(rename = "pageSize")]
+    page_size: Option<u32>,
+    q: Option<String>,
+}
 
 #[derive(Deserialize, Default)]
 struct ClientQuery {
-    page: Option<u32>, #[serde(rename = "pageSize")] page_size: Option<u32>,
-    status: Option<String>, user: Option<String>,
-    #[serde(rename = "clientID")] client_id: Option<String>,
-    #[serde(rename = "runID")] run_id: Option<String>,
+    page: Option<u32>,
+    #[serde(rename = "pageSize")]
+    page_size: Option<u32>,
+    status: Option<String>,
+    user: Option<String>,
+    #[serde(rename = "clientID")]
+    client_id: Option<String>,
+    #[serde(rename = "runID")]
+    run_id: Option<String>,
     q: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
 struct ProxyQuery {
-    page: Option<u32>, #[serde(rename = "pageSize")] page_size: Option<u32>,
-    status: Option<String>, #[serde(rename = "type")] proxy_type: Option<String>,
-    user: Option<String>, #[serde(rename = "clientID")] client_id: Option<String>,
+    page: Option<u32>,
+    #[serde(rename = "pageSize")]
+    page_size: Option<u32>,
+    status: Option<String>,
+    #[serde(rename = "type")]
+    proxy_type: Option<String>,
+    user: Option<String>,
+    #[serde(rename = "clientID")]
+    client_id: Option<String>,
     q: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct PruneQuery { #[serde(rename = "type")] prune_type: String }
+struct PruneQuery {
+    #[serde(rename = "type")]
+    prune_type: String,
+}
 
 // ── Handlers ─────────────────────────────────────────────────────────
 
@@ -518,8 +579,14 @@ async fn handle_v2_system_info(State(state): State<Arc<AppState>>) -> Json<V2Sys
         tls_force: snap.tls_force,
     };
     // Ensure the struct has all fields when features are off
-    #[cfg(not(feature = "kcp"))] { let _ = &mut config; }
-    #[cfg(not(feature = "quic"))] { let _ = &mut config; }
+    #[cfg(not(feature = "kcp"))]
+    {
+        let _ = &mut config;
+    }
+    #[cfg(not(feature = "quic"))]
+    {
+        let _ = &mut config;
+    }
 
     Json(V2SystemInfoResp {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -539,7 +606,10 @@ async fn handle_v2_system_prune(
     Query(q): Query<PruneQuery>,
 ) -> Result<Json<V2SystemPruneResp>, (StatusCode, Json<V2Error>)> {
     if q.prune_type != "offline_proxies" {
-        return Err(v2_err(StatusCode::BAD_REQUEST, "type must be offline_proxies"));
+        return Err(v2_err(
+            StatusCode::BAD_REQUEST,
+            "type must be offline_proxies",
+        ));
     }
 
     let all = state.proxy_manager.list().await;
@@ -556,7 +626,11 @@ async fn handle_v2_system_prune(
     }
     drop(ctl_map);
 
-    Ok(Json(V2SystemPruneResp { prune_type: q.prune_type, cleared, total: before }))
+    Ok(Json(V2SystemPruneResp {
+        prune_type: q.prune_type,
+        cleared,
+        total: before,
+    }))
 }
 
 async fn handle_v2_users(
@@ -571,7 +645,11 @@ async fn handle_v2_users(
     // Build per-user stats from proxy data.
     let mut user_map: HashMap<String, V2UserResp> = HashMap::new();
     for p in &proxies {
-        let user = if p.user.is_empty() { String::new() } else { p.user.clone() };
+        let user = if p.user.is_empty() {
+            String::new()
+        } else {
+            p.user.clone()
+        };
         let entry = user_map.entry(user.clone()).or_insert_with(|| V2UserResp {
             user: user.clone(),
             client_count: 0,
@@ -584,7 +662,11 @@ async fn handle_v2_users(
     for (run_id, _ctl) in ctl_map.iter() {
         let proxies = state.proxy_manager.list_client(run_id).await;
         if let Some(first_proxy) = proxies.first() {
-            let user = if first_proxy.user.is_empty() { String::new() } else { first_proxy.user.clone() };
+            let user = if first_proxy.user.is_empty() {
+                String::new()
+            } else {
+                first_proxy.user.clone()
+            };
             let entry = user_map.entry(user.clone()).or_insert_with(|| V2UserResp {
                 user: user.clone(),
                 client_count: 0,
@@ -629,14 +711,27 @@ async fn handle_v2_clients(
         // User filter: match against proxies registered by this client.
         if let Some(ref user_filter) = q.user {
             if !user_filter.is_empty() {
-                let has_matching = state.proxy_manager.list_client(run_id).await
+                let has_matching = state
+                    .proxy_manager
+                    .list_client(run_id)
+                    .await
                     .iter()
                     .any(|p| p.user == *user_filter);
-                if !has_matching { continue; }
+                if !has_matching {
+                    continue;
+                }
             }
         }
-        if let Some(ref rid) = q.run_id { if *rid != *run_id { continue; } }
-        if let Some(ref cid) = q.client_id { if *cid != *run_id { continue; } }
+        if let Some(ref rid) = q.run_id {
+            if *rid != *run_id {
+                continue;
+            }
+        }
+        if let Some(ref cid) = q.client_id {
+            if *cid != *run_id {
+                continue;
+            }
+        }
 
         let proxy_count = proxies.len();
         let entry = V2ClientEntry {
@@ -651,7 +746,10 @@ async fn handle_v2_clients(
         };
 
         if let Some(ref search) = q.q {
-            if !match_search(search, &[&entry.run_id, entry.client_addr.as_deref().unwrap_or("")]) {
+            if !match_search(
+                search,
+                &[&entry.run_id, entry.client_addr.as_deref().unwrap_or("")],
+            ) {
                 continue;
             }
         }
@@ -675,12 +773,16 @@ async fn handle_v2_client_detail(
     // Find by run_id first, then by client_addr
     let (run_id, ctl) = if let Some(ctl) = ctl_map.get(&key) {
         (key.clone(), ctl.clone())
-    } else if let Some((rid, ctl)) = ctl_map.iter().find(|(_, c)| {
-        c.client_addr.map(|a| a.to_string()) == Some(key.clone())
-    }) {
+    } else if let Some((rid, ctl)) = ctl_map
+        .iter()
+        .find(|(_, c)| c.client_addr.map(|a| a.to_string()) == Some(key.clone()))
+    {
         (rid.clone(), ctl.clone())
     } else {
-        return Err(v2_err(StatusCode::NOT_FOUND, format!("client {key} not found")));
+        return Err(v2_err(
+            StatusCode::NOT_FOUND,
+            format!("client {key} not found"),
+        ));
     };
 
     let proxies = state.proxy_manager.list_client_proxy_names(&run_id).await;
@@ -727,10 +829,16 @@ async fn handle_v2_proxies(
     let mut items = Vec::new();
 
     for p in &all {
-        if let Some(ref pt) = q.proxy_type { if p.proxy_type != *pt { continue; } }
+        if let Some(ref pt) = q.proxy_type {
+            if p.proxy_type != *pt {
+                continue;
+            }
+        }
 
         let online = ctl_map.contains_key(&p.run_id);
-        if !match_status(online, q.status.as_deref().unwrap_or("")) { continue; }
+        if !match_status(online, q.status.as_deref().unwrap_or("")) {
+            continue;
+        }
 
         // User filter
         if let Some(ref u) = q.user {
@@ -739,10 +847,17 @@ async fn handle_v2_proxies(
             }
         }
 
-        if let Some(ref cid) = q.client_id { if p.run_id != *cid { continue; } }
+        if let Some(ref cid) = q.client_id {
+            if p.run_id != *cid {
+                continue;
+            }
+        }
 
         let spec = proxy_spec(p);
-        let (today_in, today_out, cur_conns) = state.proxy_metrics.get(&p.name).await
+        let (today_in, today_out, cur_conns) = state
+            .proxy_metrics
+            .get(&p.name)
+            .await
             .map(|m| {
                 let s = m.snapshot();
                 let (tin, tout) = m.daily.snapshot();
@@ -766,7 +881,15 @@ async fn handle_v2_proxies(
         };
 
         if let Some(ref search) = q.q {
-            if !match_search(search, &[&resp.name, &resp.spec.proxy_type, &resp.client_id, &resp.status.phase]) {
+            if !match_search(
+                search,
+                &[
+                    &resp.name,
+                    &resp.spec.proxy_type,
+                    &resp.client_id,
+                    &resp.status.phase,
+                ],
+            ) {
                 continue;
             }
         }
@@ -775,7 +898,12 @@ async fn handle_v2_proxies(
     }
     drop(ctl_map);
 
-    items.sort_by(|a, b| a.spec.proxy_type.cmp(&b.spec.proxy_type).then_with(|| a.name.cmp(&b.name)));
+    items.sort_by(|a, b| {
+        a.spec
+            .proxy_type
+            .cmp(&b.spec.proxy_type)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     Ok(Json(paginate(items, page, size)))
 }
 
@@ -785,12 +913,18 @@ async fn handle_v2_proxy_detail(
 ) -> Result<Json<V2ProxyResp>, (StatusCode, Json<V2Error>)> {
     let name = percent_decode_path(&name)?;
 
-    let p = state.proxy_manager.get(&name).await
+    let p = state
+        .proxy_manager
+        .get(&name)
+        .await
         .ok_or_else(|| v2_err(StatusCode::NOT_FOUND, "no proxy info found"))?;
 
     let online = state.run_id_to_ctl_tx.read().await.contains_key(&p.run_id);
 
-    let (today_in, today_out, cur_conns) = state.proxy_metrics.get(&p.name).await
+    let (today_in, today_out, cur_conns) = state
+        .proxy_metrics
+        .get(&p.name)
+        .await
         .map(|m| {
             let s = m.snapshot();
             let (tin, tout) = m.daily.snapshot();
@@ -820,7 +954,10 @@ async fn handle_v2_proxy_traffic(
 ) -> Result<Json<V2ProxyTrafficResp>, (StatusCode, Json<V2Error>)> {
     let name = percent_decode_path(&name)?;
 
-    let p = state.proxy_manager.get(&name).await
+    let p = state
+        .proxy_manager
+        .get(&name)
+        .await
         .ok_or_else(|| v2_err(StatusCode::NOT_FOUND, "no proxy info found"))?;
 
     let history = if let Some(m) = state.proxy_metrics.get(&p.name).await {
@@ -829,14 +966,16 @@ async fn handle_v2_proxy_traffic(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        (0..7).map(|age| {
-            let date = format_date_ymd(today_secs - (age as i64) * 86400);
-            V2TrafficPoint {
-                date,
-                traffic_in: tin[age as usize] as i64,
-                traffic_out: tout[age as usize] as i64,
-            }
-        }).collect()
+        (0..7)
+            .map(|age| {
+                let date = format_date_ymd(today_secs - (age as i64) * 86400);
+                V2TrafficPoint {
+                    date,
+                    traffic_in: tin[age as usize] as i64,
+                    traffic_out: tout[age as usize] as i64,
+                }
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -861,5 +1000,8 @@ pub fn v2_routes() -> Router<Arc<AppState>> {
         .route("/api/v2/clients/{key}", get(handle_v2_client_detail))
         .route("/api/v2/proxies", get(handle_v2_proxies))
         .route("/api/v2/proxies/{name}", get(handle_v2_proxy_detail))
-        .route("/api/v2/proxies/{name}/traffic", get(handle_v2_proxy_traffic))
+        .route(
+            "/api/v2/proxies/{name}/traffic",
+            get(handle_v2_proxy_traffic),
+        )
 }

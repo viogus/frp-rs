@@ -51,11 +51,7 @@ pub trait ConfigManager: Send + Sync {
     /// Create a store-managed proxy. Returns the created config.
     async fn create_store_proxy(&self, cfg: Value) -> Result<Value, ConfigStoreError>;
     /// Update a store-managed proxy. Returns the updated config.
-    async fn update_store_proxy(
-        &self,
-        name: &str,
-        cfg: Value,
-    ) -> Result<Value, ConfigStoreError>;
+    async fn update_store_proxy(&self, name: &str, cfg: Value) -> Result<Value, ConfigStoreError>;
     /// Delete a store-managed proxy.
     async fn delete_store_proxy(&self, name: &str) -> Result<(), ConfigStoreError>;
 
@@ -68,11 +64,8 @@ pub trait ConfigManager: Send + Sync {
     /// Create a store-managed visitor. Returns the created config.
     async fn create_store_visitor(&self, cfg: Value) -> Result<Value, ConfigStoreError>;
     /// Update a store-managed visitor. Returns the updated config.
-    async fn update_store_visitor(
-        &self,
-        name: &str,
-        cfg: Value,
-    ) -> Result<Value, ConfigStoreError>;
+    async fn update_store_visitor(&self, name: &str, cfg: Value)
+        -> Result<Value, ConfigStoreError>;
     /// Delete a store-managed visitor.
     async fn delete_store_visitor(&self, name: &str) -> Result<(), ConfigStoreError>;
 
@@ -86,10 +79,16 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        assert_eq!(ConfigStoreError::InvalidArgument.to_string(), "invalid argument");
+        assert_eq!(
+            ConfigStoreError::InvalidArgument.to_string(),
+            "invalid argument"
+        );
         assert_eq!(ConfigStoreError::NotFound.to_string(), "not found");
         assert_eq!(ConfigStoreError::Conflict.to_string(), "conflict");
-        assert_eq!(ConfigStoreError::StoreDisabled.to_string(), "store disabled");
+        assert_eq!(
+            ConfigStoreError::StoreDisabled.to_string(),
+            "store disabled"
+        );
         assert_eq!(
             ConfigStoreError::ApplyConfig("bad yaml".into()).to_string(),
             "apply config failed: bad yaml"

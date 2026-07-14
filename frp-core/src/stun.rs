@@ -2,9 +2,9 @@
 //! Only implements Binding Request/Response and XOR-MAPPED-ADDRESS parsing.
 //! Go frp v0.69.1 compat: pkg/util/stun/stun.go
 
-use std::net::{SocketAddr, Ipv4Addr, Ipv6Addr};
-use tokio::net::UdpSocket;
 use rand::Rng;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use tokio::net::UdpSocket;
 use tracing::debug;
 
 /// RFC 5389 magic cookie.
@@ -26,7 +26,9 @@ pub async fn stun_binding(stun_addr: &str) -> Result<String, String> {
         let addrs = tokio::net::lookup_host(addr_str.to_string())
             .await
             .map_err(|e| format!("STUN DNS lookup failed for '{}': {}", addr_str, e))?;
-        addrs.into_iter().next()
+        addrs
+            .into_iter()
+            .next()
             .ok_or_else(|| format!("STUN DNS: no addresses found for '{}'", addr_str))?
     };
 
@@ -178,12 +180,17 @@ mod tests {
 
     #[test]
     fn test_build_binding_request() {
-        let tx_id = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c];
+        let tx_id = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+        ];
         let pkt = build_binding_request(&tx_id);
         assert_eq!(pkt.len(), 20);
         assert_eq!(u16::from_be_bytes([pkt[0], pkt[1]]), 0x0001);
         assert_eq!(u16::from_be_bytes([pkt[2], pkt[3]]), 0);
-        assert_eq!(u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]), MAGIC_COOKIE);
+        assert_eq!(
+            u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]),
+            MAGIC_COOKIE
+        );
         assert_eq!(&pkt[8..20], &tx_id);
     }
 
@@ -197,7 +204,9 @@ mod tests {
     #[test]
     fn test_parse_mapped_address_ipv6() {
         let mut data = vec![0x00, 0x02, 0x1F, 0x90];
-        data.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]);
+        data.extend_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ]);
         let result = parse_mapped_address(&data);
         assert_eq!(result, Some("[2001:db8::1]:8080".to_string()));
     }
@@ -205,7 +214,10 @@ mod tests {
     #[test]
     fn test_parse_mapped_address_too_short() {
         assert_eq!(parse_mapped_address(&[0x00, 0x01, 0x1F]), None);
-        assert_eq!(parse_mapped_address(&[0x00, 0x01, 0x1F, 0x90, 192, 168]), None);
+        assert_eq!(
+            parse_mapped_address(&[0x00, 0x01, 0x1F, 0x90, 192, 168]),
+            None
+        );
         assert_eq!(parse_mapped_address(&[0x00, 0x02, 0x1F, 0x90]), None);
     }
 
@@ -235,8 +247,14 @@ mod tests {
 
     #[test]
     fn test_parse_xor_mapped_address_too_short() {
-        assert_eq!(parse_xor_mapped_address(&[0x00, 0x01, 0x1F], MAGIC_COOKIE), None);
-        assert_eq!(parse_xor_mapped_address(&[0x00, 0x01, 0x1F, 0x90, 10, 0], MAGIC_COOKIE), None);
+        assert_eq!(
+            parse_xor_mapped_address(&[0x00, 0x01, 0x1F], MAGIC_COOKIE),
+            None
+        );
+        assert_eq!(
+            parse_xor_mapped_address(&[0x00, 0x01, 0x1F, 0x90, 10, 0], MAGIC_COOKIE),
+            None
+        );
     }
 
     #[test]

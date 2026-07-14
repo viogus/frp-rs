@@ -5,9 +5,9 @@
 //!
 //! The remote command string is parsed into a ProxyConfig.
 
-use std::sync::Arc;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use frp_core::msg::{FrpMessage, NewProxy};
@@ -68,7 +68,8 @@ fn parse_ssh_args(cmd: &str) -> Result<ParsedProxyArgs, String> {
     if !VALID_PROXY_TYPES.contains(&proxy_type.as_str()) {
         return Err(format!(
             "unsupported proxy type '{}', supported: {}",
-            proxy_type, VALID_PROXY_TYPES.join(", ")
+            proxy_type,
+            VALID_PROXY_TYPES.join(", ")
         ));
     }
 
@@ -97,24 +98,90 @@ fn parse_ssh_args(cmd: &str) -> Result<ParsedProxyArgs, String> {
     let mut i = 1;
     while i < parts.len() {
         match parts[i].as_str() {
-            "--proxy_name" => { i += 1; args.proxy_name = parts.get(i).cloned().unwrap_or_default(); }
-            "--remote_port" => { i += 1; args.remote_port = parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(0); }
-            "--local_ip" => { i += 1; args.local_ip = parts.get(i).cloned().unwrap_or_default(); }
-            "--local_port" => { i += 1; args.local_port = parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(0); }
-            "--custom_domains" | "--custom_domain" => { i += 1; args.custom_domains = parts.get(i).map(|s| s.split(',').map(|d| d.trim().to_string()).collect()).unwrap_or_default(); }
-            "--subdomain" => { i += 1; args.subdomain = parts.get(i).cloned().unwrap_or_default(); }
-            "--sk" => { i += 1; args.sk = parts.get(i).cloned().unwrap_or_default(); }
-            "--multiplexer" => { i += 1; args.multiplexer = parts.get(i).cloned().unwrap_or_default(); }
-            "--use_encryption" => { i += 1; args.use_encryption = parts.get(i).map(|s| s == "true" || s == "1").unwrap_or(false); }
-            "--use_compression" => { i += 1; args.use_compression = parts.get(i).map(|s| s == "true" || s == "1").unwrap_or(false); }
-            "--group" => { i += 1; args.group = parts.get(i).cloned().unwrap_or_default(); }
-            "--group_key" => { i += 1; args.group_key = parts.get(i).cloned().unwrap_or_default(); }
-            "--http_user" => { i += 1; args.http_user = parts.get(i).cloned().unwrap_or_default(); }
-            "--http_pwd" => { i += 1; args.http_pwd = parts.get(i).cloned().unwrap_or_default(); }
-            "--host_header_rewrite" => { i += 1; args.host_header_rewrite = parts.get(i).cloned().unwrap_or_default(); }
-            "--locations" => { i += 1; args.locations = parts.get(i).map(|s| s.split(',').map(|d| d.trim().to_string()).collect()).unwrap_or_default(); }
-            "--bandwidth_limit" => { i += 1; args.bandwidth_limit = parts.get(i).cloned().unwrap_or_default(); }
-            "--bandwidth_limit_mode" => { i += 1; args.bandwidth_limit_mode = parts.get(i).cloned().unwrap_or_default(); }
+            "--proxy_name" => {
+                i += 1;
+                args.proxy_name = parts.get(i).cloned().unwrap_or_default();
+            }
+            "--remote_port" => {
+                i += 1;
+                args.remote_port = parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "--local_ip" => {
+                i += 1;
+                args.local_ip = parts.get(i).cloned().unwrap_or_default();
+            }
+            "--local_port" => {
+                i += 1;
+                args.local_port = parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "--custom_domains" | "--custom_domain" => {
+                i += 1;
+                args.custom_domains = parts
+                    .get(i)
+                    .map(|s| s.split(',').map(|d| d.trim().to_string()).collect())
+                    .unwrap_or_default();
+            }
+            "--subdomain" => {
+                i += 1;
+                args.subdomain = parts.get(i).cloned().unwrap_or_default();
+            }
+            "--sk" => {
+                i += 1;
+                args.sk = parts.get(i).cloned().unwrap_or_default();
+            }
+            "--multiplexer" => {
+                i += 1;
+                args.multiplexer = parts.get(i).cloned().unwrap_or_default();
+            }
+            "--use_encryption" => {
+                i += 1;
+                args.use_encryption = parts
+                    .get(i)
+                    .map(|s| s == "true" || s == "1")
+                    .unwrap_or(false);
+            }
+            "--use_compression" => {
+                i += 1;
+                args.use_compression = parts
+                    .get(i)
+                    .map(|s| s == "true" || s == "1")
+                    .unwrap_or(false);
+            }
+            "--group" => {
+                i += 1;
+                args.group = parts.get(i).cloned().unwrap_or_default();
+            }
+            "--group_key" => {
+                i += 1;
+                args.group_key = parts.get(i).cloned().unwrap_or_default();
+            }
+            "--http_user" => {
+                i += 1;
+                args.http_user = parts.get(i).cloned().unwrap_or_default();
+            }
+            "--http_pwd" => {
+                i += 1;
+                args.http_pwd = parts.get(i).cloned().unwrap_or_default();
+            }
+            "--host_header_rewrite" => {
+                i += 1;
+                args.host_header_rewrite = parts.get(i).cloned().unwrap_or_default();
+            }
+            "--locations" => {
+                i += 1;
+                args.locations = parts
+                    .get(i)
+                    .map(|s| s.split(',').map(|d| d.trim().to_string()).collect())
+                    .unwrap_or_default();
+            }
+            "--bandwidth_limit" => {
+                i += 1;
+                args.bandwidth_limit = parts.get(i).cloned().unwrap_or_default();
+            }
+            "--bandwidth_limit_mode" => {
+                i += 1;
+                args.bandwidth_limit_mode = parts.get(i).cloned().unwrap_or_default();
+            }
             other => {
                 // Skip unknown flags or positional args after type
                 if !other.starts_with("--") {
@@ -218,16 +285,15 @@ impl VirtualControl {
                     Ok(n) => {
                         accumulated.extend_from_slice(&buf[..n]);
                         if accumulated.len() >= V1_HDR {
-                            let plen = u64::from_be_bytes(
-                                accumulated[1..V1_HDR].try_into().unwrap(),
-                            ) as usize;
+                            let plen =
+                                u64::from_be_bytes(accumulated[1..V1_HDR].try_into().unwrap())
+                                    as usize;
                             if plen > 65536 {
                                 return;
                             }
                             if accumulated.len() >= V1_HDR + plen {
                                 // Drop LoginResp; keep extra bytes (unlikely, see below)
-                                let extra =
-                                    accumulated[V1_HDR + plen..].to_vec();
+                                let extra = accumulated[V1_HDR + plen..].to_vec();
                                 accumulated = extra;
                                 break;
                             }
@@ -252,10 +318,7 @@ impl VirtualControl {
 
             // ---- Phase 2: wrap in CipherStream, split for concurrent r/w ----
             let _ = phase2_tx.send(());
-            let encrypted = frp_core::cipher_stream::CipherStream::new(
-                Box::new(from_ssh),
-                enc_key,
-            );
+            let encrypted = frp_core::cipher_stream::CipherStream::new(Box::new(from_ssh), enc_key);
             let (mut enc_reader, mut enc_writer) = tokio::io::split(encrypted);
             let read_work_tx = work_tx;
             drop(accumulated); // free the LoginResp-phase buffer
@@ -368,7 +431,9 @@ impl SshSession {
             ssh_handle: None,
             frame_tx,
             work_conn_rx: Some(work_conn_rx),
-            listen_ports: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
+            listen_ports: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
             server_token,
             authorized_keys,
             state,
@@ -381,7 +446,10 @@ impl SshSession {
 }
 
 /// Build a V1 frame from a parsed SSH command and allocated port.
-fn build_v1_frame_from_args(args: &ParsedProxyArgs, allocated_port: u16) -> Result<Vec<u8>, anyhow::Error> {
+fn build_v1_frame_from_args(
+    args: &ParsedProxyArgs,
+    allocated_port: u16,
+) -> Result<Vec<u8>, anyhow::Error> {
     let remote_port = if allocated_port > 0 {
         Some(allocated_port as i32)
     } else {
@@ -428,8 +496,7 @@ fn build_v1_frame_from_args(args: &ParsedProxyArgs, allocated_port: u16) -> Resu
     });
 
     let type_byte = msg.v1_type_byte();
-    let payload = serde_json::to_vec(&msg)
-        .map_err(|e| anyhow!("serialize NewProxy: {}", e))?;
+    let payload = serde_json::to_vec(&msg).map_err(|e| anyhow!("serialize NewProxy: {}", e))?;
 
     let mut buf = Vec::with_capacity(9 + payload.len());
     buf.push(type_byte);
@@ -462,11 +529,7 @@ impl Handler for SshSession {
 
     // ── Authentication ──────────────────────────────────────
 
-    async fn auth_password(
-        &mut self,
-        _user: &str,
-        password: &str,
-    ) -> Result<Auth, Self::Error> {
+    async fn auth_password(&mut self, _user: &str, password: &str) -> Result<Auth, Self::Error> {
         // No token configured → disable password auth per spec
         if self.server_token.is_empty() {
             return Ok(Auth::Reject {
@@ -501,10 +564,7 @@ impl Handler for SshSession {
         }
     }
 
-    async fn auth_succeeded(
-        &mut self,
-        session: &mut Session,
-    ) -> Result<(), Self::Error> {
+    async fn auth_succeeded(&mut self, session: &mut Session) -> Result<(), Self::Error> {
         self.ssh_handle = Some(session.handle());
         self.authenticated = true;
         tracing::info!(run_id = %self.run_id, "SSH session {} authenticated", self.run_id);
@@ -516,9 +576,10 @@ impl Handler for SshSession {
         // the SSH listen port (which traverses the SSH reverse tunnel
         // back to the client's local service), and sends the resulting
         // stream as InternalMsg::NewWorkConn to the control handler.
-        let work_rx = self.work_conn_rx.take().ok_or_else(|| {
-            anyhow!("work_conn_rx already taken")
-        })?;
+        let work_rx = self
+            .work_conn_rx
+            .take()
+            .ok_or_else(|| anyhow!("work_conn_rx already taken"))?;
         let listen_ports = self.listen_ports.clone();
         let state = self.state.clone();
         let run_id = self.run_id.clone();
@@ -577,7 +638,12 @@ impl Handler for SshSession {
 
         // Check per-client proxy limit
         if self.state.max_ports_per_client > 0 {
-            let count = self.state.proxy_manager.list_client_proxy_names(&self.run_id).await.len();
+            let count = self
+                .state
+                .proxy_manager
+                .list_client_proxy_names(&self.run_id)
+                .await
+                .len();
             if count >= self.state.max_ports_per_client as usize {
                 return Err(anyhow!(
                     "maximum number of proxies ({}) reached for this client",
@@ -825,7 +891,10 @@ mod tests {
 
     #[test]
     fn test_parse_ssh_args_http() {
-        let args = parse_ssh_args(r#"http --proxy_name "blog" --custom_domains "a.example.com,b.example.com""#).unwrap();
+        let args = parse_ssh_args(
+            r#"http --proxy_name "blog" --custom_domains "a.example.com,b.example.com""#,
+        )
+        .unwrap();
         assert_eq!(args.proxy_type, "http");
         assert_eq!(args.proxy_name, "blog");
         assert_eq!(args.custom_domains, vec!["a.example.com", "b.example.com"]);
@@ -853,7 +922,8 @@ mod tests {
 
     #[test]
     fn test_parse_ssh_args_tcpmux() {
-        let args = parse_ssh_args(r#"tcpmux --proxy_name "mux" --multiplexer "httpconnect""#).unwrap();
+        let args =
+            parse_ssh_args(r#"tcpmux --proxy_name "mux" --multiplexer "httpconnect""#).unwrap();
         assert_eq!(args.proxy_type, "tcpmux");
         assert_eq!(args.multiplexer, "httpconnect");
     }
@@ -867,7 +937,10 @@ mod tests {
     #[test]
     fn test_shell_split_simple() {
         let tokens = shell_split("tcp --proxy_name web --remote_port 9090");
-        assert_eq!(tokens, vec!["tcp", "--proxy_name", "web", "--remote_port", "9090"]);
+        assert_eq!(
+            tokens,
+            vec!["tcp", "--proxy_name", "web", "--remote_port", "9090"]
+        );
     }
 
     #[test]
@@ -880,8 +953,8 @@ mod tests {
 use std::borrow::Cow;
 use std::path::Path;
 
-use tokio::net::TcpListener;
 use russh::server::Config;
+use tokio::net::TcpListener;
 
 /// SSH tunnel gateway listener. Binds a TCP port and accepts SSH connections.
 pub struct SshListener {
@@ -907,7 +980,8 @@ impl SshListener {
         let host_key = load_or_generate_host_key(
             &ssh_cfg.private_key_file,
             &ssh_cfg.auto_gen_private_key_path,
-        ).await?;
+        )
+        .await?;
 
         let authorized_keys = if !ssh_cfg.authorized_keys_file.is_empty() {
             let path = std::path::Path::new(&ssh_cfg.authorized_keys_file);
@@ -1037,15 +1111,12 @@ impl SshListener {
                         None,  // no incoming streams (not mux)
                         false, // V1 protocol
                         None,  // no crypto context (V1)
-                    ).await;
+                    )
+                    .await;
                 });
 
                 // Run SSH session with russh
-                let running = match russh::server::run_stream(
-                    russh_config,
-                    stream,
-                    session,
-                ).await {
+                let running = match russh::server::run_stream(russh_config, stream, session).await {
                     Ok(running) => running,
                     Err(e) => {
                         tracing::error!(
@@ -1061,8 +1132,12 @@ impl SshListener {
                 };
 
                 match running.await {
-                    Ok(()) => tracing::info!(run_id = %ctrl_run_id, "SSH session {} ended normally", ctrl_run_id),
-                    Err(e) => tracing::error!(run_id = %ctrl_run_id, error = ?e, "SSH session {} error: {:#}", ctrl_run_id, e),
+                    Ok(()) => {
+                        tracing::info!(run_id = %ctrl_run_id, "SSH session {} ended normally", ctrl_run_id)
+                    }
+                    Err(e) => {
+                        tracing::error!(run_id = %ctrl_run_id, error = ?e, "SSH session {} error: {:#}", ctrl_run_id, e)
+                    }
                 }
 
                 // Cleanup all proxies registered by this session
@@ -1104,8 +1179,7 @@ async fn load_or_generate_host_key(
 
     // Write to auto-gen path (pem is Zeroizing<String>, derefs to String)
     if let Some(parent) = Path::new(auto_gen_path).parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create dir for key: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create dir for key: {}", e))?;
     }
     std::fs::write(auto_gen_path, pem.as_bytes())
         .map_err(|e| format!("write auto-gen key {}: {}", auto_gen_path, e))?;
@@ -1184,23 +1258,18 @@ mod key_tests {
         // Create explicit key
         let explicit_path = dir.path().join("explicit_key");
         let mut rng = rand010::rng();
-        let explicit = russh::keys::PrivateKey::random(
-            &mut rng,
-            russh::keys::Algorithm::Ed25519,
-        )
-        .unwrap();
+        let explicit =
+            russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap();
         let pem = explicit
             .to_openssh(russh::keys::ssh_key::LineEnding::default())
             .unwrap();
         std::fs::write(&explicit_path, pem.as_bytes()).unwrap();
 
         // Load with explicit path set -- should use explicit, not auto
-        let loaded = load_or_generate_host_key(
-            explicit_path.to_str().unwrap(),
-            auto_path.to_str().unwrap(),
-        )
-        .await
-        .unwrap();
+        let loaded =
+            load_or_generate_host_key(explicit_path.to_str().unwrap(), auto_path.to_str().unwrap())
+                .await
+                .unwrap();
 
         // Both are Ed25519 -- verify they're different keys
         use russh::keys::ssh_key::HashAlg;

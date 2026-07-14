@@ -11,11 +11,11 @@
 //! - host_header_rewrite: optional Host header override
 
 #[cfg(feature = "tls")]
+use rustls::pki_types::ServerName;
+#[cfg(feature = "tls")]
 use tokio::io::AsyncWriteExt;
 #[cfg(feature = "tls")]
 use tokio::net::TcpStream;
-#[cfg(feature = "tls")]
-use rustls::pki_types::ServerName;
 #[cfg(feature = "tls")]
 use tracing::debug;
 
@@ -23,9 +23,9 @@ use frp_core::config::PluginConfig;
 #[cfg(feature = "tls")]
 use frp_core::transport::build_tls_connector;
 
-use super::{PluginHandle, serve_plugin};
 #[cfg(feature = "tls")]
 use super::split_host_port;
+use super::{serve_plugin, PluginHandle};
 
 /// Start an http2https plugin server.
 #[cfg(feature = "tls")]
@@ -41,11 +41,16 @@ pub async fn start_http2https_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
     let tls_connector = build_tls_connector(None, None, None).map_err(|e| {
         frp_core::Error::Transport(format!("http2https plugin: TLS connector: {e}").into())
     })?;
-    serve_plugin("http2https", (target_addr, host_rewrite, tls_connector), |client, peer, (target, rewrite, connector)| async move {
-        if let Err(e) = handle_conn(client, &target, &rewrite, &connector).await {
-            debug!(%peer, error = %e, "http2https: {peer} error: {e}");
-        }
-    }).await
+    serve_plugin(
+        "http2https",
+        (target_addr, host_rewrite, tls_connector),
+        |client, peer, (target, rewrite, connector)| async move {
+            if let Err(e) = handle_conn(client, &target, &rewrite, &connector).await {
+                debug!(%peer, error = %e, "http2https: {peer} error: {e}");
+            }
+        },
+    )
+    .await
 }
 
 #[cfg(not(feature = "tls"))]

@@ -18,9 +18,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 #[cfg(feature = "tcp-mux")]
-use std::sync::{Arc, Mutex};
-#[cfg(feature = "tcp-mux")]
 use futures_util::future::poll_fn;
+#[cfg(feature = "tcp-mux")]
+use std::sync::{Arc, Mutex};
 #[cfg(feature = "tcp-mux")]
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 #[cfg(feature = "tcp-mux")]
@@ -55,7 +55,9 @@ impl tokio::io::AsyncRead for YamuxStream {
         _cx: &mut std::task::Context<'_>,
         _buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Err(std::io::Error::other("tcp-mux disabled at compile time")))
+        std::task::Poll::Ready(Err(std::io::Error::other(
+            "tcp-mux disabled at compile time",
+        )))
     }
 }
 
@@ -66,14 +68,18 @@ impl tokio::io::AsyncWrite for YamuxStream {
         _cx: &mut std::task::Context<'_>,
         _buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        std::task::Poll::Ready(Err(std::io::Error::other("tcp-mux disabled at compile time")))
+        std::task::Poll::Ready(Err(std::io::Error::other(
+            "tcp-mux disabled at compile time",
+        )))
     }
 
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::task::Poll::Ready(Err(std::io::Error::other("tcp-mux disabled at compile time")))
+        std::task::Poll::Ready(Err(std::io::Error::other(
+            "tcp-mux disabled at compile time",
+        )))
     }
 
     fn poll_shutdown(
@@ -173,7 +179,9 @@ where
     // Accept the first stream — this is the control channel.
     let control = poll_fn(|cx| conn.poll_next_inbound(cx))
         .await
-        .ok_or_else(|| crate::Error::Protocol("yamux: connection closed before control stream".into()))?
+        .ok_or_else(|| {
+            crate::Error::Protocol("yamux: connection closed before control stream".into())
+        })?
         .map_err(|e| crate::Error::Protocol(format!("yamux: {e}").into()))?;
 
     let control_compat = control.compat();
@@ -205,7 +213,8 @@ where
                         }
                     }
                 }),
-            ).await;
+            )
+            .await;
 
             let stream = match result {
                 Ok(r) => r,

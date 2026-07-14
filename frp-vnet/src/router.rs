@@ -32,7 +32,11 @@ impl Ipv4Net {
         if prefix_len > 32 {
             return None;
         }
-        let mask = if prefix_len == 0 { 0 } else { !0u32 << (32 - prefix_len) };
+        let mask = if prefix_len == 0 {
+            0
+        } else {
+            !0u32 << (32 - prefix_len)
+        };
         Some(Ipv4Net {
             addr: u32::from(addr) & mask,
             prefix_len,
@@ -41,21 +45,27 @@ impl Ipv4Net {
 
     fn contains(&self, ip: &Ipv4Addr) -> bool {
         let ip_u32 = u32::from(*ip);
-        let mask = if self.prefix_len == 0 { 0 } else { !0u32 << (32 - self.prefix_len) };
+        let mask = if self.prefix_len == 0 {
+            0
+        } else {
+            !0u32 << (32 - self.prefix_len)
+        };
         (ip_u32 & mask) == self.addr
     }
 }
 
 impl RouteTable {
     pub fn new() -> Self {
-        Self { routes: Vec::new(), by_name: HashMap::new() }
+        Self {
+            routes: Vec::new(),
+            by_name: HashMap::new(),
+        }
     }
 
     /// Insert or update a route. Returns Err if subnet conflicts with an existing route
     /// from a different proxy.
     pub fn insert(&mut self, name: &str, cidr: &str) -> anyhow::Result<()> {
-        let net = Ipv4Net::parse(cidr)
-            .ok_or_else(|| anyhow::anyhow!("invalid CIDR: {}", cidr))?;
+        let net = Ipv4Net::parse(cidr).ok_or_else(|| anyhow::anyhow!("invalid CIDR: {}", cidr))?;
 
         // Check for subnet conflict (overlapping with different proxy)
         for (existing, existing_name) in &self.routes {
@@ -89,7 +99,8 @@ impl RouteTable {
         self.by_name.insert(name.to_string(), net.clone());
         self.routes.push((net, name.to_string()));
         // Sort by prefix length descending for longest-prefix match
-        self.routes.sort_by_key(|item| std::cmp::Reverse(item.0.prefix_len));
+        self.routes
+            .sort_by_key(|item| std::cmp::Reverse(item.0.prefix_len));
 
         Ok(())
     }
@@ -112,7 +123,10 @@ impl RouteTable {
 
     /// Return all route entries as (cidr, proxy_name) pairs.
     pub fn list(&self) -> Vec<(String, String)> {
-        self.routes.iter().map(|(net, name)| (net.to_string(), name.clone())).collect()
+        self.routes
+            .iter()
+            .map(|(net, name)| (net.to_string(), name.clone()))
+            .collect()
     }
 
     /// Return number of routes.

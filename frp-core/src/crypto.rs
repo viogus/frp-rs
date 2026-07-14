@@ -21,9 +21,9 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 #[cfg(feature = "chacha20")]
-use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
-#[cfg(feature = "chacha20")]
 use chacha20poly1305::aead::{Aead, AeadInPlace};
+#[cfg(feature = "chacha20")]
+use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
 use rand::RngCore;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::hkdf::{Salt, HKDF_SHA256};
@@ -67,7 +67,7 @@ impl AeadAlgorithm {
 
     fn nonce_size(&self) -> usize {
         match self {
-            Self::Aes256Gcm => 12,   // AES-256-GCM standard nonce
+            Self::Aes256Gcm => 12, // AES-256-GCM standard nonce
             #[cfg(feature = "chacha20")]
             Self::XChaCha20Poly1305 => 24, // XChaCha20-Poly1305 extended nonce
         }
@@ -100,7 +100,11 @@ enum AeadCipher {
 impl AeadCipher {
     fn new(algorithm: AeadAlgorithm, key: &[u8]) -> Result<Self, String> {
         if key.len() != AEAD_KEY_SIZE {
-            return Err(format!("AEAD key must be {} bytes, got {}", AEAD_KEY_SIZE, key.len()));
+            return Err(format!(
+                "AEAD key must be {} bytes, got {}",
+                AEAD_KEY_SIZE,
+                key.len()
+            ));
         }
         match algorithm {
             AeadAlgorithm::Aes256Gcm => {
@@ -130,7 +134,8 @@ impl AeadCipher {
             #[cfg(feature = "chacha20")]
             Self::XChaCha20Poly1305(c) => {
                 let nonce = chacha20poly1305::XNonce::from_slice(nonce);
-                let tag = c.encrypt_in_place_detached(nonce, aad, &mut in_out)
+                let tag = c
+                    .encrypt_in_place_detached(nonce, aad, &mut in_out)
                     .map_err(|e| format!("xchacha20 encrypt: {e}"))?;
                 in_out.extend_from_slice(&tag);
                 Ok(in_out)
@@ -144,7 +149,8 @@ impl AeadCipher {
                 let nonce = Nonce::try_assume_unique_for_key(nonce)
                     .map_err(|e| format!("aes-gcm nonce: {e}"))?;
                 let aad = Aad::from(aad);
-                let plaintext_len = key.open_in_place(nonce, aad, &mut in_out)
+                let plaintext_len = key
+                    .open_in_place(nonce, aad, &mut in_out)
                     .map_err(|e| format!("aes-gcm decrypt: {e}"))?
                     .len();
                 in_out.truncate(plaintext_len);
@@ -262,7 +268,6 @@ impl AeadStream {
             },
         })
     }
-
 }
 
 // --- AsyncRead impl ---
@@ -274,7 +279,10 @@ impl AsyncRead for AeadStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         if self.read.err.is_some() {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "previous read error")));
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "previous read error",
+            )));
         }
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
@@ -366,20 +374,26 @@ impl AeadStream {
 
         if let Some(ref max) = self.read.max_frame_count {
             if self.read.frame_count >= *max {
-                return Poll::Ready(Err(io::Error::other("AEAD read frame count limit exceeded")));
+                return Poll::Ready(Err(io::Error::other(
+                    "AEAD read frame count limit exceeded",
+                )));
             }
         }
 
         let ciphertext_len = u32::from_be_bytes(header) as usize;
         let overhead = self.algorithm.overhead();
         if ciphertext_len < overhead {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData,
-                format!("AEAD ciphertext length {ciphertext_len} < overhead {overhead}"))));
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("AEAD ciphertext length {ciphertext_len} < overhead {overhead}"),
+            )));
         }
         let max_ciphertext = DEFAULT_MAX_PAYLOAD_SIZE + overhead;
         if ciphertext_len > max_ciphertext {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData,
-                format!("AEAD ciphertext length {ciphertext_len} exceeds limit {max_ciphertext}"))));
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("AEAD ciphertext length {ciphertext_len} exceeds limit {max_ciphertext}"),
+            )));
         }
 
         let ciphertext = match self.read_exact(ciphertext_len, cx) {
@@ -388,7 +402,10 @@ impl AeadStream {
             Poll::Pending => return Poll::Pending,
         };
 
-        let stream_nonce = self.read.stream_nonce.as_ref()
+        let stream_nonce = self
+            .read
+            .stream_nonce
+            .as_ref()
             .expect("stream_nonce must be set");
         let mut aad = Vec::with_capacity(stream_nonce.len() + AEAD_FRAME_HEADER_SIZE);
         aad.extend_from_slice(stream_nonce);
@@ -407,8 +424,10 @@ impl AeadStream {
                     hex::encode(stream_nonce));
                 #[cfg(not(debug_assertions))]
                 tracing::warn!(frame = %self.read.frame_count, error = %e, "[AEAD-READ] frame={} decrypt FAILED: {}", self.read.frame_count, e);
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData,
-                    format!("AEAD decrypt: {e}"))));
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("AEAD decrypt: {e}"),
+                )));
             }
         };
 
@@ -444,7 +463,9 @@ impl AeadStream {
                 // SAFETY: capacity is sufficient; the loop below reads exactly
                 // `len` bytes via poll_read before any data is observed (guarded
                 // by scratch_filled). No uninitialized bytes are ever exposed.
-                unsafe { self.read.scratch.set_len(len); }
+                unsafe {
+                    self.read.scratch.set_len(len);
+                }
             } else {
                 self.read.scratch.resize(len, 0);
             }
@@ -460,7 +481,10 @@ impl AeadStream {
                         // No progress on a Ready poll => inner reached EOF before `len` bytes.
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
-                            format!("AEAD stream: unexpected EOF (need {len}, got {})", self.read.scratch_filled),
+                            format!(
+                                "AEAD stream: unexpected EOF (need {len}, got {})",
+                                self.read.scratch_filled
+                            ),
                         )));
                     }
                     self.read.scratch_filled += n;
@@ -487,7 +511,10 @@ impl AsyncWrite for AeadStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         if self.write.err.is_some() {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "previous write error")));
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "previous write error",
+            )));
         }
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
@@ -529,18 +556,24 @@ impl AsyncWrite for AeadStream {
             let mut header = [0u8; AEAD_FRAME_HEADER_SIZE];
             header.copy_from_slice(&ciphertext_len.to_be_bytes());
 
-            let mut aad = Vec::with_capacity(this.write.stream_nonce.len() + AEAD_FRAME_HEADER_SIZE);
+            let mut aad =
+                Vec::with_capacity(this.write.stream_nonce.len() + AEAD_FRAME_HEADER_SIZE);
             aad.extend_from_slice(&this.write.stream_nonce);
             aad.extend_from_slice(&header);
 
-            let sealed = match this.write.cipher.encrypt(&this.write.nonce, plaintext.to_vec(), &aad) {
-                Ok(s) => s,
-                Err(e) => {
-                    let io_err = io::Error::other(e);
-                    this.write.err = Some(io_err);
-                    return Poll::Ready(Err(io::Error::other("encrypt failed")));
-                }
-            };
+            let sealed =
+                match this
+                    .write
+                    .cipher
+                    .encrypt(&this.write.nonce, plaintext.to_vec(), &aad)
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let io_err = io::Error::other(e);
+                        this.write.err = Some(io_err);
+                        return Poll::Ready(Err(io::Error::other("encrypt failed")));
+                    }
+                };
 
             pending.extend_from_slice(&header);
             pending.extend_from_slice(&sealed);
@@ -560,18 +593,24 @@ impl AsyncWrite for AeadStream {
             let mut header = [0u8; AEAD_FRAME_HEADER_SIZE];
             header.copy_from_slice(&ciphertext_len.to_be_bytes());
 
-            let mut aad = Vec::with_capacity(this.write.stream_nonce.len() + AEAD_FRAME_HEADER_SIZE);
+            let mut aad =
+                Vec::with_capacity(this.write.stream_nonce.len() + AEAD_FRAME_HEADER_SIZE);
             aad.extend_from_slice(&this.write.stream_nonce);
             aad.extend_from_slice(&header);
 
-            let sealed = match this.write.cipher.encrypt(&this.write.nonce, plaintext.to_vec(), &aad) {
-                Ok(s) => s,
-                Err(e) => {
-                    let io_err = io::Error::other(e);
-                    this.write.err = Some(io_err);
-                    return Poll::Ready(Err(io::Error::other("encrypt failed")));
-                }
-            };
+            let sealed =
+                match this
+                    .write
+                    .cipher
+                    .encrypt(&this.write.nonce, plaintext.to_vec(), &aad)
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let io_err = io::Error::other(e);
+                        this.write.err = Some(io_err);
+                        return Poll::Ready(Err(io::Error::other("encrypt failed")));
+                    }
+                };
 
             if !increment_nonce(&mut this.write.nonce) {
                 return Poll::Ready(Err(io::Error::other("AEAD write nonce exhausted")));
@@ -622,7 +661,10 @@ impl AeadStream {
             let pin = Pin::new(&mut *self.inner);
             match pin.poll_write(cx, &self.write.pending[self.write.pending_pos..]) {
                 Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")));
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
                 }
                 Poll::Ready(Ok(n)) => {
                     self.write.pending_pos += n;
@@ -653,8 +695,10 @@ pub fn derive_aead_control_keys(
     algorithm: AeadAlgorithm,
     transcript_hash: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let client_to_server = derive_aead_control_key(token, algorithm, transcript_hash, "client-to-server")?;
-    let server_to_client = derive_aead_control_key(token, algorithm, transcript_hash, "server-to-client")?;
+    let client_to_server =
+        derive_aead_control_key(token, algorithm, transcript_hash, "client-to-server")?;
+    let server_to_client =
+        derive_aead_control_key(token, algorithm, transcript_hash, "server-to-client")?;
     Ok((client_to_server, server_to_client))
 }
 
@@ -664,14 +708,20 @@ fn derive_aead_control_key(
     transcript_hash: &[u8],
     direction: &str,
 ) -> Result<Vec<u8>, String> {
-    let info = format!("frp wire v2 control aead {} {}", algorithm.as_str(), direction);
+    let info = format!(
+        "frp wire v2 control aead {} {}",
+        algorithm.as_str(),
+        direction
+    );
     let salt = Salt::new(HKDF_SHA256, transcript_hash);
     let prk = salt.extract(token);
     let mut okm = vec![0u8; AEAD_KEY_SIZE];
     let info_refs = [info.as_bytes()];
-    let okm_result = prk.expand(&info_refs, HKDF_SHA256)
+    let okm_result = prk
+        .expand(&info_refs, HKDF_SHA256)
         .map_err(|e| format!("HKDF expand: {e}"))?;
-    okm_result.fill(&mut okm)
+    okm_result
+        .fill(&mut okm)
         .map_err(|e| format!("HKDF fill: {e}"))?;
     Ok(okm)
 }
@@ -723,9 +773,15 @@ mod tests {
 
     #[test]
     fn test_aead_algorithm_from_str() {
-        assert_eq!(AeadAlgorithm::from_str("aes-256-gcm"), Ok(AeadAlgorithm::Aes256Gcm));
+        assert_eq!(
+            AeadAlgorithm::from_str("aes-256-gcm"),
+            Ok(AeadAlgorithm::Aes256Gcm)
+        );
         #[cfg(feature = "chacha20")]
-        assert_eq!(AeadAlgorithm::from_str("xchacha20-poly1305"), Ok(AeadAlgorithm::XChaCha20Poly1305));
+        assert_eq!(
+            AeadAlgorithm::from_str("xchacha20-poly1305"),
+            Ok(AeadAlgorithm::XChaCha20Poly1305)
+        );
         assert_eq!(AeadAlgorithm::from_str("unknown"), Err(()));
     }
 
@@ -733,12 +789,10 @@ mod tests {
     fn test_key_derivation_deterministic() {
         let token = b"test-token";
         let transcript = b"test-transcript-hash-32bytes!!";
-        let (c2s1, s2c1) = derive_aead_control_keys(
-            token, AeadAlgorithm::Aes256Gcm, transcript
-        ).unwrap();
-        let (c2s2, s2c2) = derive_aead_control_keys(
-            token, AeadAlgorithm::Aes256Gcm, transcript
-        ).unwrap();
+        let (c2s1, s2c1) =
+            derive_aead_control_keys(token, AeadAlgorithm::Aes256Gcm, transcript).unwrap();
+        let (c2s2, s2c2) =
+            derive_aead_control_keys(token, AeadAlgorithm::Aes256Gcm, transcript).unwrap();
         assert_eq!(c2s1, c2s2);
         assert_eq!(s2c1, s2c2);
         assert_ne!(c2s1, s2c1); // different directions should give different keys
@@ -774,19 +828,26 @@ mod tests {
 
         let (client, server) = tokio::io::duplex(65536);
 
-        let mut client_aead = AeadStream::new(Box::new(client), alg, &read_key, &write_key).unwrap();
+        let mut client_aead =
+            AeadStream::new(Box::new(client), alg, &read_key, &write_key).unwrap();
 
         let write_task = tokio::spawn(async move {
-            client_aead.write_all(b"hello world this is a test of AEAD").await.unwrap();
+            client_aead
+                .write_all(b"hello world this is a test of AEAD")
+                .await
+                .unwrap();
             client_aead.flush().await.unwrap();
         });
 
-        let mut server_aead = AeadStream::new(Box::new(server), alg, &read_key, &write_key).unwrap();
+        let mut server_aead =
+            AeadStream::new(Box::new(server), alg, &read_key, &write_key).unwrap();
         let mut buf = vec![0u8; 1024];
         let mut total = 0;
         loop {
             let n = server_aead.read(&mut buf[total..]).await.unwrap();
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             total += n;
         }
         assert_eq!(&buf[..total], b"hello world this is a test of AEAD");
@@ -844,7 +905,11 @@ mod tests {
 
         impl ChunkedPendingReader {
             fn new(ciphertext: Vec<u8>) -> Self {
-                Self { ciphertext, pos: 0, toggle: false }
+                Self {
+                    ciphertext,
+                    pos: 0,
+                    toggle: false,
+                }
             }
         }
 
@@ -867,7 +932,9 @@ mod tests {
                     return Poll::Pending;
                 }
                 // "Deliver turn": hand over a tiny chunk.
-                let n = (this.ciphertext.len() - this.pos).min(3).min(buf.remaining());
+                let n = (this.ciphertext.len() - this.pos)
+                    .min(3)
+                    .min(buf.remaining());
                 let start = this.pos;
                 buf.put_slice(&this.ciphertext[start..start + n]);
                 this.pos += n;

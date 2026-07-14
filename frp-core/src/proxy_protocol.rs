@@ -30,8 +30,12 @@ pub fn build_proxy_protocol_v2(
     src_port: u16,
     dst_port: u16,
 ) -> Result<Vec<u8>, String> {
-    let src_ip: IpAddr = src_addr.parse().map_err(|e| format!("v2 src_addr parse: {e}"))?;
-    let dst_ip: IpAddr = dst_addr.parse().map_err(|e| format!("v2 dst_addr parse: {e}"))?;
+    let src_ip: IpAddr = src_addr
+        .parse()
+        .map_err(|e| format!("v2 src_addr parse: {e}"))?;
+    let dst_ip: IpAddr = dst_addr
+        .parse()
+        .map_err(|e| format!("v2 dst_addr parse: {e}"))?;
 
     let (transport_byte, addr_len) = match (&src_ip, &dst_ip) {
         (IpAddr::V4(_), IpAddr::V4(_)) => (0x11u8, 12u16),
@@ -104,7 +108,10 @@ mod tests {
         // 12 sig + 4 hdr + 12 addr = 28 bytes
         assert_eq!(h.len(), 28);
         // Check signature
-        assert_eq!(&h[..12], b"\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A");
+        assert_eq!(
+            &h[..12],
+            b"\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A"
+        );
         // Version+command byte
         assert_eq!(h[12], 0x21);
         // Transport byte (TCPv4)

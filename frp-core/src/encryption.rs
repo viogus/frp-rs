@@ -152,12 +152,9 @@ impl SnappyDecompressor {
 
         while pos + 4 <= self.buf.len() {
             let chunk_type = self.buf[pos];
-            let chunk_len = u32::from_le_bytes([
-                self.buf[pos + 1],
-                self.buf[pos + 2],
-                self.buf[pos + 3],
-                0,
-            ]) as usize;
+            let chunk_len =
+                u32::from_le_bytes([self.buf[pos + 1], self.buf[pos + 2], self.buf[pos + 3], 0])
+                    as usize;
 
             match chunk_type {
                 0x00 => {
@@ -201,18 +198,13 @@ impl SnappyDecompressor {
                     }
                     let body = &self.buf[pos + 4..pos + total];
                     if body != stream_body {
-                        return Err(format!(
-                            "snappy: bad stream identifier: {:?}",
-                            body
-                        ));
+                        return Err(format!("snappy: bad stream identifier: {:?}", body));
                     }
                     pos += total;
                 }
                 t if (0x02..=0x7F).contains(&t) => {
                     // Reserved unskippable chunk — spec says return error.
-                    return Err(format!(
-                        "snappy: reserved unskippable chunk type 0x{t:02x}"
-                    ));
+                    return Err(format!("snappy: reserved unskippable chunk type 0x{t:02x}"));
                 }
                 _ => {
                     // Padding (0xFE) and reserved skippable (0x80-0xFD).
@@ -318,7 +310,10 @@ mod tests {
 
         let mut dec = SnappyDecompressor::new();
         let out1 = dec.feed(part1).unwrap();
-        assert!(out1.is_empty(), "partial stream ID should produce no output");
+        assert!(
+            out1.is_empty(),
+            "partial stream ID should produce no output"
+        );
 
         let out2 = dec.feed(part2).unwrap();
         assert_eq!(out2, plaintext, "second feed should produce full output");

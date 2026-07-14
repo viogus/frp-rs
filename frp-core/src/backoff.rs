@@ -94,7 +94,10 @@ impl BackoffManager for FastBackoff {
             self.counts_in_fast_retry_window += 1;
             if self.counts_in_fast_retry_window <= self.options.fast_retry_count {
                 let d = if self.options.fast_retry_jitter > 0.0 {
-                    jitter(self.options.fast_retry_delay, self.options.fast_retry_jitter)
+                    jitter(
+                        self.options.fast_retry_delay,
+                        self.options.fast_retry_jitter,
+                    )
                 } else {
                     self.options.fast_retry_delay
                 };
@@ -113,7 +116,9 @@ impl BackoffManager for FastBackoff {
 
         if previous_condition_error {
             let mut duration = if self.consecutive_err_count == 1 {
-                self.options.init_duration_if_fail.unwrap_or(previous_duration)
+                self.options
+                    .init_duration_if_fail
+                    .unwrap_or(previous_duration)
             } else {
                 previous_duration
             };
@@ -212,7 +217,10 @@ mod tests {
         for _ in 0..100 {
             let j = jitter(base, 0.2);
             assert!(j >= base, "jittered {j:?} < base {base:?}");
-            assert!(j < base + base / 5 + Duration::from_millis(1), "jittered {j:?} too large");
+            assert!(
+                j < base + base / 5 + Duration::from_millis(1),
+                "jittered {j:?} too large"
+            );
         }
     }
 

@@ -76,7 +76,10 @@ pub const VIRTUAL_NET: Feature = "VirtualNet";
 
 fn default_features() -> HashMap<String, FeatureSpec> {
     let mut m = HashMap::new();
-    m.insert(VIRTUAL_NET.to_string(), FeatureSpec::new(false, FeatureStage::Alpha));
+    m.insert(
+        VIRTUAL_NET.to_string(),
+        FeatureSpec::new(false, FeatureStage::Alpha),
+    );
     m
 }
 
@@ -179,8 +182,7 @@ impl FeatureGate {
             .map(|(name, spec)| {
                 format!(
                     "{name}=true|false ({} - default={})",
-                    spec.stage,
-                    spec.default
+                    spec.stage, spec.default
                 )
             })
             .collect();
@@ -194,10 +196,7 @@ impl FeatureGate {
             Ok(e) => e,
             Err(_) => return String::new(),
         };
-        let mut pairs: Vec<String> = enabled
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect();
+        let mut pairs: Vec<String> = enabled.iter().map(|(k, v)| format!("{k}={v}")).collect();
         pairs.sort();
         pairs.join(",")
     }

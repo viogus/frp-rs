@@ -74,8 +74,11 @@ Every feature, fix, and test change follows three rules:
 | Metric | Value |
 |--------|-------|
 | `cargo clippy` (default) | zero warnings |
-| `cargo clippy -D warnings` | zero warnings |
-| `cargo test --workspace` | 419 passed, 0 failed (27 suites) |
+| `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
+| `cargo fmt --all -- --check` | zero diffs |
+| `cargo test --workspace --all-features` | 447 passed, 2 ignored (31 suites) |
+| `cargo build --release` | passes (frps ~4.8MB, frpc ~3.7MB) |
+| `compat-test.sh` (Go frp v0.70.0) | 73/73 passed (incl. XTCP 16, V2 TCP) |
 | `unsafe` blocks | 9 (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
 | `let _ =` error discards | all commented (`vhost.rs`, `tcpmux.rs`) |
@@ -219,6 +222,9 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 - `#[serde(untagged)]` on `FrpMessage` enum — ordering matters for serde matching, but V1 protocol dispatches by type byte first via `deserialize_v1()`, so untagged matching is not involved in wire deserialization
 - `ProxyRuntimeInfo` must include `sk: String` field — XTCP P2P encryption derives its AES-128 key from the proxy's SecretKey via `derive_key(&sk)`. Adding new fields to `ProxyRuntimeInfo` requires updating all construction sites: `Service::new()`, `do_reload()` in `reload.rs`, and any other future sites.
 - **KCP handler dispatch order** (`service.rs:520-826`): MUST match Go frps `service.go:670-710` exactly — TLS detection before yamux wrapping before V2/V1. Order: read bytes → V2 magic? → TLS detect → TLS accept → (tcpMux? yamux : direct) → V2/V1. Getting this wrong was root cause of both "invalid V1 message length" (yamux SYN interpreted as FRP) and TLS rejection bugs.
+- **NewVisitorConn race**: STCP/XTCP visitors may send `NewVisitorConn` before the server's `proxy_manager.register()` completes. Go frp handles this via `startVisitorListener()` — the listener is pre-registered during `proxy.Run()` before registration returns. frp-rs equivalent: pre-populate `sk_index` in `proxy_ops.rs` BEFORE calling `proxy_manager.register()`, and use `sk_index` as fallback in both `handlers.rs` (accept loop) and `control/mod.rs` (control channel) when `proxy_manager.get()` returns `None`. Without this, visitor auth fails with "proxy not found" when the visitor connects before registration is visible.
+- **Wire field naming**: NewProxy JSON fields MUST use snake_case for Go frp v0.70.0 wire compatibility (`http_user`, `http_pwd`, `host_header_rewrite`, `response_headers`, `route_by_http_user`, `bandwidth_limit_mode`, `proxy_protocol_version`). CamelCase variants are silently ignored by Go frp, causing silent config loss. Contract test in `msg.rs` verifies both serialize and deserialize paths.
+- **V1 type bytes 7/8, V2 types 19/20**: Rust-only extensions. Must NOT be sent to Go frp peers — Go frp v0.70.0 treats unknown message types as errors. Only send on Rust↔Rust connections after capability negotiation.
 
 ### Testing & Tooling
 
@@ -227,7 +233,7 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 - **Integration tests**: KCP real-UDP-socket test (`frp-core/tests/kcp_integration.rs`), XTCP hole-punch e2e (`frp-server/tests/xtcp_hole_punch.rs`), plus 13+ server integration tests covering control handler, vhost, proxy registration, OIDC, reload, graceful drain.
 - **Stress tests**: `scripts/stress-test.sh` runs frps + frpc under load with connection churn, monitored via `scripts/frp-stress/`. Weekly CI run in `stress-test.yml`.
 - **Perf baselines** (4-axis program, host-specific JSONL committed under `scripts/frp-stress/baselines/`): `scripts/throughput-baseline.sh` (MB/s per cipher/transport config), `scripts/latency-baseline.sh` (steady-state RTT + connection-setup percentiles), `scripts/memory-baseline.sh` (idle-hold + churn footprint via the `mem-profile` counting allocator + `ps` RSS). Run manually before/after a data-plane change; not blocking CI gates. Gate rule: a change to one axis must not regress the others (>5% throughput/MB/s, or RTT p99).
-- **Cross-compat tests**: `scripts/compat-test.sh` — 31 default + 2 guarded (XTCP 16-test pairwise matrix, V2 `GO_FRP_V2=1`). Runs on every push via `compat.yml`. XTCP compat runs daily on VPS via `xtcp-compat.yml`.
+- **Cross-compat tests**: `scripts/compat-test.sh` — 55 default + 18 guarded (XTCP 16-test pairwise matrix + V2 TCP `GO_FRP_V2=1`). Runs on every push via `compat.yml`. XTCP compat runs daily on VPS via `xtcp-compat.yml`.
 - **Security audit**: Run `cargo audit` and `cargo deny check` before each release to catch known vulnerabilities and license issues in the dependency tree.
 
 ### Dependency Policy (mandatory)

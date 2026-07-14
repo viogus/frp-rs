@@ -129,14 +129,17 @@ mod tests {
     fn save_and_load_roundtrip() {
         let tmp = std::env::temp_dir().join(format!("frps_test_store_{}.json", std::process::id()));
         let mut map = HashMap::new();
-        map.insert("test-proxy".into(), ProxyConfig {
-            name: "test-proxy".into(),
-            proxy_type: "tcp".into(),
-            remote_port: 8080,
-            local_ip: "127.0.0.1".into(),
-            local_port: 80,
-            ..Default::default()
-        });
+        map.insert(
+            "test-proxy".into(),
+            ProxyConfig {
+                name: "test-proxy".into(),
+                proxy_type: "tcp".into(),
+                remote_port: 8080,
+                local_ip: "127.0.0.1".into(),
+                local_port: 80,
+                ..Default::default()
+            },
+        );
 
         save_store(&tmp, &map);
         assert!(tmp.exists());

@@ -5,8 +5,8 @@
 
 #![allow(clippy::collapsible_match)]
 
-use bpaf::*;
 use bpaf::Parser;
+use bpaf::*;
 
 // ──────────────────────────────────────────────────────────────────────
 // frps CLI — 30+ flags matching Go frp v0.69.1
@@ -161,7 +161,12 @@ fn svr_meta() -> impl Parser<SvrMeta> {
         .switch()
         .fallback(true);
     let show_version = long("version").short('v').switch();
-    construct!(SvrMeta { config, config_dir, strict_config, show_version })
+    construct!(SvrMeta {
+        config,
+        config_dir,
+        strict_config,
+        show_version
+    })
 }
 
 fn svr_bind() -> impl Parser<SvrBind> {
@@ -178,11 +183,18 @@ fn svr_bind() -> impl Parser<SvrBind> {
         .long("proxy_bind_addr")
         .argument::<String>("IP")
         .optional();
-    construct!(SvrBind { bind_addr, bind_port, proxy_bind_addr })
+    construct!(SvrBind {
+        bind_addr,
+        bind_port,
+        proxy_bind_addr
+    })
 }
 
 fn svr_auth() -> impl Parser<SvrAuth> {
-    let token = long("token").short('t').argument::<String>("TOKEN").optional();
+    let token = long("token")
+        .short('t')
+        .argument::<String>("TOKEN")
+        .optional();
     let allow_ports = long("allow-ports")
         .long("allow_ports")
         .argument::<String>("RANGES")
@@ -190,9 +202,17 @@ fn svr_auth() -> impl Parser<SvrAuth> {
     let allow_unsafe = long("allow-unsafe")
         .long("allow_unsafe")
         .argument::<String>("FEATURES")
-        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect::<Vec<_>>())
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .collect::<Vec<_>>()
+        })
         .fallback(vec![]);
-    construct!(SvrAuth { token, allow_ports, allow_unsafe })
+    construct!(SvrAuth {
+        token,
+        allow_ports,
+        allow_unsafe
+    })
 }
 
 fn svr_dashboard() -> impl Parser<SvrDashboard> {
@@ -223,12 +243,15 @@ fn svr_dashboard() -> impl Parser<SvrDashboard> {
     let dashboard_tls_mode = long("dashboard-tls-mode")
         .long("dashboard_tls_mode")
         .switch();
-    let enable_prometheus = long("enable-prometheus")
-        .long("enable_prometheus")
-        .switch();
+    let enable_prometheus = long("enable-prometheus").long("enable_prometheus").switch();
     construct!(SvrDashboard {
-        dashboard_addr, dashboard_port, dashboard_user, dashboard_pwd,
-        dashboard_tls_cert_file, dashboard_tls_key_file, dashboard_tls_mode,
+        dashboard_addr,
+        dashboard_port,
+        dashboard_user,
+        dashboard_pwd,
+        dashboard_tls_cert_file,
+        dashboard_tls_key_file,
+        dashboard_tls_mode,
         enable_prometheus,
     })
 }
@@ -246,10 +269,13 @@ fn svr_log() -> impl Parser<SvrLog> {
         .long("log_max_days")
         .argument::<i32>("DAYS")
         .optional();
-    let disable_log_color = long("disable-log-color")
-        .long("disable_log_color")
-        .switch();
-    construct!(SvrLog { log_file, log_level, log_max_days, disable_log_color })
+    let disable_log_color = long("disable-log-color").long("disable_log_color").switch();
+    construct!(SvrLog {
+        log_file,
+        log_level,
+        log_max_days,
+        disable_log_color
+    })
 }
 
 fn svr_transport() -> impl Parser<SvrTransport> {
@@ -285,8 +311,13 @@ fn svr_transport() -> impl Parser<SvrTransport> {
         .optional();
     let tls_only = long("tls-only").long("tls_only").switch();
     construct!(SvrTransport {
-        kcp_bind_port, quic_bind_port, vhost_http_port, vhost_https_port,
-        subdomain_host, max_ports_per_client, tls_only,
+        kcp_bind_port,
+        quic_bind_port,
+        vhost_http_port,
+        vhost_https_port,
+        subdomain_host,
+        max_ports_per_client,
+        tls_only,
     })
 }
 
@@ -297,7 +328,14 @@ fn frps_build() -> impl Parser<FrpsBuild> {
     let dash = svr_dashboard();
     let log = svr_log();
     let transport = svr_transport();
-    construct!(FrpsBuild { meta, bind, auth, dash, log, transport })
+    construct!(FrpsBuild {
+        meta,
+        bind,
+        auth,
+        dash,
+        log,
+        transport
+    })
 }
 
 /// Raw parser for frps CLI. Returns the parser, doesn't run it.
@@ -501,7 +539,11 @@ fn run_mode() -> impl Parser<FrpcRunArgs> {
     let allow_unsafe = long("allow-unsafe")
         .long("allow_unsafe")
         .argument::<String>("FEATURES")
-        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect::<Vec<_>>())
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .collect::<Vec<_>>()
+        })
         .fallback(vec![]);
     let show_version = long("version").short('v').switch();
     let log_level = long("log-level")
@@ -509,162 +551,454 @@ fn run_mode() -> impl Parser<FrpcRunArgs> {
         .short('L')
         .argument::<String>("LEVEL")
         .optional();
-    let disable_log_color = long("disable-log-color")
-        .long("disable_log_color")
-        .switch();
-    construct!(FrpcRunArgs { config, config_dir, strict_config, allow_unsafe, show_version, log_level, disable_log_color })
+    let disable_log_color = long("disable-log-color").long("disable_log_color").switch();
+    construct!(FrpcRunArgs {
+        config,
+        config_dir,
+        strict_config,
+        allow_unsafe,
+        show_version,
+        log_level,
+        disable_log_color
+    })
 }
 
 // ─── Subcommand parsers (inlined — bpaf construct! doesn't support destructuring tuples from parser fns) ───
 
 fn tcp_cmd() -> impl Parser<FrpcCmd> {
-    let local_ip = long("local-ip").long("local_ip").argument::<String>("IP").fallback("127.0.0.1".into());
-    let local_port = long("local-port").long("local_port").argument::<u16>("PORT");
-    let remote_port = long("remote-port").long("remote_port").argument::<u16>("PORT");
-    let server_addr = long("server-addr").long("server_addr").argument::<String>("HOST").fallback("127.0.0.1".into());
-    let server_port = long("server-port").long("server_port").argument::<u16>("PORT").fallback(7000);
-    let token = long("token").short('t').argument::<String>("TOKEN").optional();
+    let local_ip = long("local-ip")
+        .long("local_ip")
+        .argument::<String>("IP")
+        .fallback("127.0.0.1".into());
+    let local_port = long("local-port")
+        .long("local_port")
+        .argument::<u16>("PORT");
+    let remote_port = long("remote-port")
+        .long("remote_port")
+        .argument::<u16>("PORT");
+    let server_addr = long("server-addr")
+        .long("server_addr")
+        .argument::<String>("HOST")
+        .fallback("127.0.0.1".into());
+    let server_port = long("server-port")
+        .long("server_port")
+        .argument::<u16>("PORT")
+        .fallback(7000);
+    let token = long("token")
+        .short('t')
+        .argument::<String>("TOKEN")
+        .optional();
     let use_encryption = long("use-encryption").long("use_encryption").switch();
     let use_compression = long("use-compression").long("use_compression").switch();
-    let proxy_name = long("proxy-name").long("proxy_name").argument::<String>("NAME").optional();
+    let proxy_name = long("proxy-name")
+        .long("proxy_name")
+        .argument::<String>("NAME")
+        .optional();
     let args = construct!(TcpArgs {
-        local_ip, local_port, remote_port, server_addr, server_port, token,
-        use_encryption, use_compression, proxy_name,
+        local_ip,
+        local_port,
+        remote_port,
+        server_addr,
+        server_port,
+        token,
+        use_encryption,
+        use_compression,
+        proxy_name,
     });
-    args.to_options().command("tcp").help("Run frpc with a single tcp proxy").map(FrpcCmd::Tcp)
+    args.to_options()
+        .command("tcp")
+        .help("Run frpc with a single tcp proxy")
+        .map(FrpcCmd::Tcp)
 }
 
 fn udp_cmd() -> impl Parser<FrpcCmd> {
-    let local_ip = long("local-ip").long("local_ip").argument::<String>("IP").fallback("127.0.0.1".into());
-    let local_port = long("local-port").long("local_port").argument::<u16>("PORT");
-    let remote_port = long("remote-port").long("remote_port").argument::<u16>("PORT");
-    let server_addr = long("server-addr").long("server_addr").argument::<String>("HOST").fallback("127.0.0.1".into());
-    let server_port = long("server-port").long("server_port").argument::<u16>("PORT").fallback(7000);
-    let token = long("token").short('t').argument::<String>("TOKEN").optional();
-    let proxy_name = long("proxy-name").long("proxy_name").argument::<String>("NAME").optional();
+    let local_ip = long("local-ip")
+        .long("local_ip")
+        .argument::<String>("IP")
+        .fallback("127.0.0.1".into());
+    let local_port = long("local-port")
+        .long("local_port")
+        .argument::<u16>("PORT");
+    let remote_port = long("remote-port")
+        .long("remote_port")
+        .argument::<u16>("PORT");
+    let server_addr = long("server-addr")
+        .long("server_addr")
+        .argument::<String>("HOST")
+        .fallback("127.0.0.1".into());
+    let server_port = long("server-port")
+        .long("server_port")
+        .argument::<u16>("PORT")
+        .fallback(7000);
+    let token = long("token")
+        .short('t')
+        .argument::<String>("TOKEN")
+        .optional();
+    let proxy_name = long("proxy-name")
+        .long("proxy_name")
+        .argument::<String>("NAME")
+        .optional();
     let args = construct!(UdpArgs {
-        local_ip, local_port, remote_port, server_addr, server_port, token, proxy_name,
+        local_ip,
+        local_port,
+        remote_port,
+        server_addr,
+        server_port,
+        token,
+        proxy_name,
     });
-    args.to_options().command("udp").help("Run frpc with a single udp proxy").map(FrpcCmd::Udp)
+    args.to_options()
+        .command("udp")
+        .help("Run frpc with a single udp proxy")
+        .map(FrpcCmd::Udp)
 }
 
 fn http_cmd() -> impl Parser<FrpcCmd> {
-    let local_ip = long("local-ip").long("local_ip").argument::<String>("IP").fallback("127.0.0.1".into());
-    let local_port = long("local-port").long("local_port").argument::<u16>("PORT");
-    let custom_domains = long("custom-domains").long("custom_domains").argument::<String>("DOMAINS");
-    let server_addr = long("server-addr").long("server_addr").argument::<String>("HOST").fallback("127.0.0.1".into());
-    let server_port = long("server-port").long("server_port").argument::<u16>("PORT").fallback(7000);
-    let token = long("token").short('t').argument::<String>("TOKEN").optional();
+    let local_ip = long("local-ip")
+        .long("local_ip")
+        .argument::<String>("IP")
+        .fallback("127.0.0.1".into());
+    let local_port = long("local-port")
+        .long("local_port")
+        .argument::<u16>("PORT");
+    let custom_domains = long("custom-domains")
+        .long("custom_domains")
+        .argument::<String>("DOMAINS");
+    let server_addr = long("server-addr")
+        .long("server_addr")
+        .argument::<String>("HOST")
+        .fallback("127.0.0.1".into());
+    let server_port = long("server-port")
+        .long("server_port")
+        .argument::<u16>("PORT")
+        .fallback(7000);
+    let token = long("token")
+        .short('t')
+        .argument::<String>("TOKEN")
+        .optional();
     let subdomain = long("subdomain").argument::<String>("SUB").optional();
     let locations = long("locations").argument::<String>("LOCS").optional();
-    let http_user = long("http-user").long("http_user").argument::<String>("USER").optional();
-    let http_pwd = long("http-pwd").long("http_pwd").argument::<String>("PWD").optional();
-    let host_header_rewrite = long("host-header-rewrite").long("host_header_rewrite").argument::<String>("HOST").optional();
-    let proxy_name = long("proxy-name").long("proxy_name").argument::<String>("NAME").optional();
+    let http_user = long("http-user")
+        .long("http_user")
+        .argument::<String>("USER")
+        .optional();
+    let http_pwd = long("http-pwd")
+        .long("http_pwd")
+        .argument::<String>("PWD")
+        .optional();
+    let host_header_rewrite = long("host-header-rewrite")
+        .long("host_header_rewrite")
+        .argument::<String>("HOST")
+        .optional();
+    let proxy_name = long("proxy-name")
+        .long("proxy_name")
+        .argument::<String>("NAME")
+        .optional();
     let args = construct!(HttpArgs {
-        local_ip, local_port, custom_domains, server_addr, server_port, token,
-        subdomain, locations, http_user, http_pwd, host_header_rewrite, proxy_name,
+        local_ip,
+        local_port,
+        custom_domains,
+        server_addr,
+        server_port,
+        token,
+        subdomain,
+        locations,
+        http_user,
+        http_pwd,
+        host_header_rewrite,
+        proxy_name,
     });
-    args.to_options().command("http").help("Run frpc with a single http proxy").map(FrpcCmd::Http)
+    args.to_options()
+        .command("http")
+        .help("Run frpc with a single http proxy")
+        .map(FrpcCmd::Http)
 }
 
 fn https_cmd() -> impl Parser<FrpcCmd> {
-    let local_ip = long("local-ip").long("local_ip").argument::<String>("IP").fallback("127.0.0.1".into());
-    let local_port = long("local-port").long("local_port").argument::<u16>("PORT");
-    let custom_domains = long("custom-domains").long("custom_domains").argument::<String>("DOMAINS");
-    let server_addr = long("server-addr").long("server_addr").argument::<String>("HOST").fallback("127.0.0.1".into());
-    let server_port = long("server-port").long("server_port").argument::<u16>("PORT").fallback(7000);
-    let token = long("token").short('t').argument::<String>("TOKEN").optional();
+    let local_ip = long("local-ip")
+        .long("local_ip")
+        .argument::<String>("IP")
+        .fallback("127.0.0.1".into());
+    let local_port = long("local-port")
+        .long("local_port")
+        .argument::<u16>("PORT");
+    let custom_domains = long("custom-domains")
+        .long("custom_domains")
+        .argument::<String>("DOMAINS");
+    let server_addr = long("server-addr")
+        .long("server_addr")
+        .argument::<String>("HOST")
+        .fallback("127.0.0.1".into());
+    let server_port = long("server-port")
+        .long("server_port")
+        .argument::<u16>("PORT")
+        .fallback(7000);
+    let token = long("token")
+        .short('t')
+        .argument::<String>("TOKEN")
+        .optional();
     let subdomain = long("subdomain").argument::<String>("SUB").optional();
-    let proxy_name = long("proxy-name").long("proxy_name").argument::<String>("NAME").optional();
+    let proxy_name = long("proxy-name")
+        .long("proxy_name")
+        .argument::<String>("NAME")
+        .optional();
     let args = construct!(HttpsArgs {
-        local_ip, local_port, custom_domains, server_addr, server_port, token, subdomain, proxy_name,
+        local_ip,
+        local_port,
+        custom_domains,
+        server_addr,
+        server_port,
+        token,
+        subdomain,
+        proxy_name,
     });
-    args.to_options().command("https").help("Run frpc with a single https proxy").map(FrpcCmd::Https)
+    args.to_options()
+        .command("https")
+        .help("Run frpc with a single https proxy")
+        .map(FrpcCmd::Https)
 }
 
 fn stcp_cmd() -> impl Parser<FrpcCmd> {
-    let local_ip = long("local-ip").long("local_ip").argument::<String>("IP").fallback("127.0.0.1".into());
-    let local_port = long("local-port").long("local_port").argument::<u16>("PORT");
+    let local_ip = long("local-ip")
+        .long("local_ip")
+        .argument::<String>("IP")
+        .fallback("127.0.0.1".into());
+    let local_port = long("local-port")
+        .long("local_port")
+        .argument::<u16>("PORT");
     let sk = long("sk").argument::<String>("SECRET");
-    let server_name = long("server-name").long("server_name").argument::<String>("NAME").optional();
-    let server_addr = long("server-addr").long("server_addr").argument::<String>("HOST").fallback("127.0.0.1".into());
-    let server_port = long("server-port").long("server_port").argument::<u16>("PORT").fallback(7000);
-    let token = long("token").short('t').argument::<String>("TOKEN").optional();
+    let server_name = long("server-name")
+        .long("server_name")
+        .argument::<String>("NAME")
+        .optional();
+    let server_addr = long("server-addr")
+        .long("server_addr")
+        .argument::<String>("HOST")
+        .fallback("127.0.0.1".into());
+    let server_port = long("server-port")
+        .long("server_port")
+        .argument::<u16>("PORT")
+        .fallback(7000);
+    let token = long("token")
+        .short('t')
+        .argument::<String>("TOKEN")
+        .optional();
     let args = construct!(StcpArgs {
-        sk, server_name, local_ip, local_port, server_addr, server_port, token,
+        sk,
+        server_name,
+        local_ip,
+        local_port,
+        server_addr,
+        server_port,
+        token,
     });
-    args.to_options().command("stcp").help("Run frpc with a single stcp proxy").map(FrpcCmd::Stcp)
+    args.to_options()
+        .command("stcp")
+        .help("Run frpc with a single stcp proxy")
+        .map(FrpcCmd::Stcp)
 }
 
 fn xtcp_cmd() -> impl Parser<FrpcCmd> {
-    let local_ip = long("local-ip").long("local_ip").argument::<String>("IP").fallback("127.0.0.1".into());
-    let local_port = long("local-port").long("local_port").argument::<u16>("PORT");
+    let local_ip = long("local-ip")
+        .long("local_ip")
+        .argument::<String>("IP")
+        .fallback("127.0.0.1".into());
+    let local_port = long("local-port")
+        .long("local_port")
+        .argument::<u16>("PORT");
     let sk = long("sk").argument::<String>("SECRET");
-    let server_name = long("server-name").long("server_name").argument::<String>("NAME").optional();
-    let server_addr = long("server-addr").long("server_addr").argument::<String>("HOST").fallback("127.0.0.1".into());
-    let server_port = long("server-port").long("server_port").argument::<u16>("PORT").fallback(7000);
-    let token = long("token").short('t').argument::<String>("TOKEN").optional();
+    let server_name = long("server-name")
+        .long("server_name")
+        .argument::<String>("NAME")
+        .optional();
+    let server_addr = long("server-addr")
+        .long("server_addr")
+        .argument::<String>("HOST")
+        .fallback("127.0.0.1".into());
+    let server_port = long("server-port")
+        .long("server_port")
+        .argument::<u16>("PORT")
+        .fallback(7000);
+    let token = long("token")
+        .short('t')
+        .argument::<String>("TOKEN")
+        .optional();
     let args = construct!(XtcpArgs {
-        sk, server_name, local_ip, local_port, server_addr, server_port, token,
+        sk,
+        server_name,
+        local_ip,
+        local_port,
+        server_addr,
+        server_port,
+        token,
     });
-    args.to_options().command("xtcp").help("Run frpc with a single xtcp proxy").map(FrpcCmd::Xtcp)
+    args.to_options()
+        .command("xtcp")
+        .help("Run frpc with a single xtcp proxy")
+        .map(FrpcCmd::Xtcp)
 }
 
 fn sudp_cmd() -> impl Parser<FrpcCmd> {
-    let local_ip = long("local-ip").long("local_ip").argument::<String>("IP").fallback("127.0.0.1".into());
-    let local_port = long("local-port").long("local_port").argument::<u16>("PORT");
-    let remote_port = long("remote-port").long("remote_port").argument::<u16>("PORT");
-    let server_addr = long("server-addr").long("server_addr").argument::<String>("HOST").fallback("127.0.0.1".into());
-    let server_port = long("server-port").long("server_port").argument::<u16>("PORT").fallback(7000);
-    let token = long("token").short('t').argument::<String>("TOKEN").optional();
-    let proxy_name = long("proxy-name").long("proxy_name").argument::<String>("NAME").optional();
+    let local_ip = long("local-ip")
+        .long("local_ip")
+        .argument::<String>("IP")
+        .fallback("127.0.0.1".into());
+    let local_port = long("local-port")
+        .long("local_port")
+        .argument::<u16>("PORT");
+    let remote_port = long("remote-port")
+        .long("remote_port")
+        .argument::<u16>("PORT");
+    let server_addr = long("server-addr")
+        .long("server_addr")
+        .argument::<String>("HOST")
+        .fallback("127.0.0.1".into());
+    let server_port = long("server-port")
+        .long("server_port")
+        .argument::<u16>("PORT")
+        .fallback(7000);
+    let token = long("token")
+        .short('t')
+        .argument::<String>("TOKEN")
+        .optional();
+    let proxy_name = long("proxy-name")
+        .long("proxy_name")
+        .argument::<String>("NAME")
+        .optional();
     let args = construct!(SudpArgs {
-        local_ip, local_port, remote_port, server_addr, server_port, token, proxy_name,
+        local_ip,
+        local_port,
+        remote_port,
+        server_addr,
+        server_port,
+        token,
+        proxy_name,
     });
-    args.to_options().command("sudp").help("Run frpc with a single sudp proxy").map(FrpcCmd::Sudp)
+    args.to_options()
+        .command("sudp")
+        .help("Run frpc with a single sudp proxy")
+        .map(FrpcCmd::Sudp)
 }
 
 fn tcpmux_cmd() -> impl Parser<FrpcCmd> {
-    let local_ip = long("local-ip").long("local_ip").argument::<String>("IP").fallback("127.0.0.1".into());
-    let local_port = long("local-port").long("local_port").argument::<u16>("PORT");
+    let local_ip = long("local-ip")
+        .long("local_ip")
+        .argument::<String>("IP")
+        .fallback("127.0.0.1".into());
+    let local_port = long("local-port")
+        .long("local_port")
+        .argument::<u16>("PORT");
     let mux_port = long("mux-port").long("mux_port").argument::<u16>("PORT");
-    let server_addr = long("server-addr").long("server_addr").argument::<String>("HOST").fallback("127.0.0.1".into());
-    let server_port = long("server-port").long("server_port").argument::<u16>("PORT").fallback(7000);
-    let token = long("token").short('t').argument::<String>("TOKEN").optional();
-    let proxy_name = long("proxy-name").long("proxy_name").argument::<String>("NAME").optional();
+    let server_addr = long("server-addr")
+        .long("server_addr")
+        .argument::<String>("HOST")
+        .fallback("127.0.0.1".into());
+    let server_port = long("server-port")
+        .long("server_port")
+        .argument::<u16>("PORT")
+        .fallback(7000);
+    let token = long("token")
+        .short('t')
+        .argument::<String>("TOKEN")
+        .optional();
+    let proxy_name = long("proxy-name")
+        .long("proxy_name")
+        .argument::<String>("NAME")
+        .optional();
     let args = construct!(TcpmuxArgs {
-        local_ip, local_port, mux_port, server_addr, server_port, token, proxy_name,
+        local_ip,
+        local_port,
+        mux_port,
+        server_addr,
+        server_port,
+        token,
+        proxy_name,
     });
-    args.to_options().command("tcpmux").help("Run frpc with a single tcpmux proxy").map(FrpcCmd::Tcpmux)
+    args.to_options()
+        .command("tcpmux")
+        .help("Run frpc with a single tcpmux proxy")
+        .map(FrpcCmd::Tcpmux)
 }
 
 fn verify_cmd() -> impl Parser<FrpcCmd> {
     let config = long("config").short('c').argument::<String>("FILE");
     let args = construct!(VerifyArgs { config });
-    args.to_options().command("verify").help("Verify that the configuration is valid").map(FrpcCmd::Verify)
+    args.to_options()
+        .command("verify")
+        .help("Verify that the configuration is valid")
+        .map(FrpcCmd::Verify)
 }
 
 fn reload_cmd() -> impl Parser<FrpcCmd> {
-    let config = long("config").short('c').argument::<String>("FILE").optional();
+    let config = long("config")
+        .short('c')
+        .argument::<String>("FILE")
+        .optional();
     let strict_config = long("strict-config").long("strict_config").switch();
-    let admin_addr = long("admin-addr").long("admin_addr").argument::<String>("IP").optional();
-    let admin_port = long("admin-port").long("admin_port").argument::<u16>("PORT").optional();
-    let admin_user = long("admin-user").long("admin_user").argument::<String>("USER").optional();
-    let admin_pwd = long("admin-pwd").long("admin_pwd").argument::<String>("PWD").optional();
-    let args = construct!(ReloadArgs { config, strict_config, admin_addr, admin_port, admin_user, admin_pwd });
-    args.to_options().command("reload").help("Reload running frpc configuration").map(FrpcCmd::Reload)
+    let admin_addr = long("admin-addr")
+        .long("admin_addr")
+        .argument::<String>("IP")
+        .optional();
+    let admin_port = long("admin-port")
+        .long("admin_port")
+        .argument::<u16>("PORT")
+        .optional();
+    let admin_user = long("admin-user")
+        .long("admin_user")
+        .argument::<String>("USER")
+        .optional();
+    let admin_pwd = long("admin-pwd")
+        .long("admin_pwd")
+        .argument::<String>("PWD")
+        .optional();
+    let args = construct!(ReloadArgs {
+        config,
+        strict_config,
+        admin_addr,
+        admin_port,
+        admin_user,
+        admin_pwd
+    });
+    args.to_options()
+        .command("reload")
+        .help("Reload running frpc configuration")
+        .map(FrpcCmd::Reload)
 }
 
 fn status_cmd() -> impl Parser<FrpcCmd> {
-    let config = long("config").short('c').argument::<String>("FILE").optional();
+    let config = long("config")
+        .short('c')
+        .argument::<String>("FILE")
+        .optional();
     let json = long("json").switch();
-    let admin_addr = long("admin-addr").long("admin_addr").argument::<String>("IP").optional();
-    let admin_port = long("admin-port").long("admin_port").argument::<u16>("PORT").optional();
-    let admin_user = long("admin-user").long("admin_user").argument::<String>("USER").optional();
-    let admin_pwd = long("admin-pwd").long("admin_pwd").argument::<String>("PWD").optional();
-    let args = construct!(StatusArgs { config, json, admin_addr, admin_port, admin_user, admin_pwd });
-    args.to_options().command("status").help("Query running frpc proxy status").map(FrpcCmd::Status)
+    let admin_addr = long("admin-addr")
+        .long("admin_addr")
+        .argument::<String>("IP")
+        .optional();
+    let admin_port = long("admin-port")
+        .long("admin_port")
+        .argument::<u16>("PORT")
+        .optional();
+    let admin_user = long("admin-user")
+        .long("admin_user")
+        .argument::<String>("USER")
+        .optional();
+    let admin_pwd = long("admin-pwd")
+        .long("admin_pwd")
+        .argument::<String>("PWD")
+        .optional();
+    let args = construct!(StatusArgs {
+        config,
+        json,
+        admin_addr,
+        admin_port,
+        admin_user,
+        admin_pwd
+    });
+    args.to_options()
+        .command("status")
+        .help("Query running frpc proxy status")
+        .map(FrpcCmd::Status)
 }
 
 /// Compose all frpc subcommands + run-mode fallback.
@@ -709,35 +1043,77 @@ impl FrpsArgs {
     /// Override ServerConfig fields with CLI values. Only fields explicitly
     /// set on the command line (`Some`) override config file values.
     pub fn override_server_config(&self, cfg: &mut crate::config::ServerConfig) {
-        if let Some(ref v) = self.token { cfg.auth.token = v.clone(); }
-        if let Some(ref v) = self.allow_ports { cfg.allow_ports = v.clone(); }
-        if let Some(ref v) = self.bind_addr { cfg.bind_addr = v.clone(); }
-        if let Some(v) = self.bind_port { cfg.bind_port = v; }
-        if let Some(ref v) = self.proxy_bind_addr { cfg.proxy_bind_addr = v.clone(); }
+        if let Some(ref v) = self.token {
+            cfg.auth.token = v.clone();
+        }
+        if let Some(ref v) = self.allow_ports {
+            cfg.allow_ports = v.clone();
+        }
+        if let Some(ref v) = self.bind_addr {
+            cfg.bind_addr = v.clone();
+        }
+        if let Some(v) = self.bind_port {
+            cfg.bind_port = v;
+        }
+        if let Some(ref v) = self.proxy_bind_addr {
+            cfg.proxy_bind_addr = v.clone();
+        }
 
         // Log
-        if let Some(ref v) = self.log_file { cfg.log.file = v.clone(); }
-        if let Some(ref v) = self.log_level { cfg.log.level = v.clone(); }
-        if let Some(v) = self.log_max_days { cfg.log.max_days = v; }
+        if let Some(ref v) = self.log_file {
+            cfg.log.file = v.clone();
+        }
+        if let Some(ref v) = self.log_level {
+            cfg.log.level = v.clone();
+        }
+        if let Some(v) = self.log_max_days {
+            cfg.log.max_days = v;
+        }
 
         // Transport / ports
         #[cfg(feature = "kcp")]
-        if let Some(v) = self.kcp_bind_port { cfg.kcp_bind_port = v; }
+        if let Some(v) = self.kcp_bind_port {
+            cfg.kcp_bind_port = v;
+        }
         #[cfg(feature = "quic")]
-        if let Some(v) = self.quic_bind_port { cfg.quic_bind_port = v; }
-        if let Some(v) = self.vhost_http_port { cfg.vhost_http_port = v; }
-        if let Some(v) = self.vhost_https_port { cfg.vhost_https_port = v; }
-        if let Some(ref v) = self.subdomain_host { cfg.sub_domain_host = v.clone(); }
-        if let Some(v) = self.max_ports_per_client { cfg.max_ports_per_client = v; }
-        if self.tls_only { cfg.tls_only = true; }
+        if let Some(v) = self.quic_bind_port {
+            cfg.quic_bind_port = v;
+        }
+        if let Some(v) = self.vhost_http_port {
+            cfg.vhost_http_port = v;
+        }
+        if let Some(v) = self.vhost_https_port {
+            cfg.vhost_https_port = v;
+        }
+        if let Some(ref v) = self.subdomain_host {
+            cfg.sub_domain_host = v.clone();
+        }
+        if let Some(v) = self.max_ports_per_client {
+            cfg.max_ports_per_client = v;
+        }
+        if self.tls_only {
+            cfg.tls_only = true;
+        }
 
         // Dashboard
-        if let Some(v) = self.dashboard_port { cfg.web_server.port = v; }
-        if let Some(ref v) = self.dashboard_user { cfg.web_server.user = v.clone(); }
-        if let Some(ref v) = self.dashboard_pwd { cfg.web_server.password = v.clone(); }
-        if self.enable_prometheus { cfg.web_server.enable_prometheus = true; }
-        if let Some(ref v) = self.dashboard_tls_cert_file { cfg.web_server.tls_cert_file = v.clone(); }
-        if let Some(ref v) = self.dashboard_tls_key_file { cfg.web_server.tls_key_file = v.clone(); }
+        if let Some(v) = self.dashboard_port {
+            cfg.web_server.port = v;
+        }
+        if let Some(ref v) = self.dashboard_user {
+            cfg.web_server.user = v.clone();
+        }
+        if let Some(ref v) = self.dashboard_pwd {
+            cfg.web_server.password = v.clone();
+        }
+        if self.enable_prometheus {
+            cfg.web_server.enable_prometheus = true;
+        }
+        if let Some(ref v) = self.dashboard_tls_cert_file {
+            cfg.web_server.tls_cert_file = v.clone();
+        }
+        if let Some(ref v) = self.dashboard_tls_key_file {
+            cfg.web_server.tls_key_file = v.clone();
+        }
         // dashboard_tls_mode: no config field needed — TLS activates when both
         // cert_file and key_file are non-empty (implicit detection, matching Go frp).
     }
@@ -765,9 +1141,10 @@ pub fn build_single_proxy_config(
 impl TcpArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
         crate::config::ProxyConfig {
-            name: self.proxy_name.clone().unwrap_or_else(|| {
-                format!("tcp-{}->{}", self.local_port, self.remote_port)
-            }),
+            name: self
+                .proxy_name
+                .clone()
+                .unwrap_or_else(|| format!("tcp-{}->{}", self.local_port, self.remote_port)),
             proxy_type: "tcp".into(),
             local_ip: self.local_ip.clone(),
             local_port: self.local_port,
@@ -782,9 +1159,10 @@ impl TcpArgs {
 impl UdpArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
         crate::config::ProxyConfig {
-            name: self.proxy_name.clone().unwrap_or_else(|| {
-                format!("udp-{}->{}", self.local_port, self.remote_port)
-            }),
+            name: self
+                .proxy_name
+                .clone()
+                .unwrap_or_else(|| format!("udp-{}->{}", self.local_port, self.remote_port)),
             proxy_type: "udp".into(),
             local_ip: self.local_ip.clone(),
             local_port: self.local_port,
@@ -796,22 +1174,26 @@ impl UdpArgs {
 
 impl HttpArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
-        let domains: Vec<String> = self.custom_domains
+        let domains: Vec<String> = self
+            .custom_domains
             .split(',')
             .map(|s| s.trim().to_string())
             .collect();
         crate::config::ProxyConfig {
-            name: self.proxy_name.clone().unwrap_or_else(|| {
-                format!("http-{}", self.local_port)
-            }),
+            name: self
+                .proxy_name
+                .clone()
+                .unwrap_or_else(|| format!("http-{}", self.local_port)),
             proxy_type: "http".into(),
             local_ip: self.local_ip.clone(),
             local_port: self.local_port,
             custom_domains: domains,
             subdomain: self.subdomain.clone().unwrap_or_default(),
-            locations: self.locations.clone().map(|l| {
-                l.split(',').map(|s| s.trim().to_string()).collect()
-            }).unwrap_or_default(),
+            locations: self
+                .locations
+                .clone()
+                .map(|l| l.split(',').map(|s| s.trim().to_string()).collect())
+                .unwrap_or_default(),
             http_user: self.http_user.clone().unwrap_or_default(),
             http_pwd: self.http_pwd.clone().unwrap_or_default(),
             host_header_rewrite: self.host_header_rewrite.clone().unwrap_or_default(),
@@ -822,14 +1204,16 @@ impl HttpArgs {
 
 impl HttpsArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
-        let domains: Vec<String> = self.custom_domains
+        let domains: Vec<String> = self
+            .custom_domains
             .split(',')
             .map(|s| s.trim().to_string())
             .collect();
         crate::config::ProxyConfig {
-            name: self.proxy_name.clone().unwrap_or_else(|| {
-                format!("https-{}", self.local_port)
-            }),
+            name: self
+                .proxy_name
+                .clone()
+                .unwrap_or_else(|| format!("https-{}", self.local_port)),
             proxy_type: "https".into(),
             local_ip: self.local_ip.clone(),
             local_port: self.local_port,
@@ -843,7 +1227,10 @@ impl HttpsArgs {
 impl StcpArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
         crate::config::ProxyConfig {
-            name: self.server_name.clone().unwrap_or_else(|| "stcp-proxy".into()),
+            name: self
+                .server_name
+                .clone()
+                .unwrap_or_else(|| "stcp-proxy".into()),
             proxy_type: "stcp".into(),
             local_ip: self.local_ip.clone(),
             local_port: self.local_port,
@@ -856,7 +1243,10 @@ impl StcpArgs {
 impl XtcpArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
         crate::config::ProxyConfig {
-            name: self.server_name.clone().unwrap_or_else(|| "xtcp-proxy".into()),
+            name: self
+                .server_name
+                .clone()
+                .unwrap_or_else(|| "xtcp-proxy".into()),
             proxy_type: "xtcp".into(),
             local_ip: self.local_ip.clone(),
             local_port: self.local_port,
@@ -869,9 +1259,10 @@ impl XtcpArgs {
 impl SudpArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
         crate::config::ProxyConfig {
-            name: self.proxy_name.clone().unwrap_or_else(|| {
-                format!("sudp-{}->{}", self.local_port, self.remote_port)
-            }),
+            name: self
+                .proxy_name
+                .clone()
+                .unwrap_or_else(|| format!("sudp-{}->{}", self.local_port, self.remote_port)),
             proxy_type: "sudp".into(),
             local_ip: self.local_ip.clone(),
             local_port: self.local_port,
@@ -884,9 +1275,10 @@ impl SudpArgs {
 impl TcpmuxArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
         crate::config::ProxyConfig {
-            name: self.proxy_name.clone().unwrap_or_else(|| {
-                format!("tcpmux-{}", self.local_port)
-            }),
+            name: self
+                .proxy_name
+                .clone()
+                .unwrap_or_else(|| format!("tcpmux-{}", self.local_port)),
             proxy_type: "tcpmux".into(),
             local_ip: self.local_ip.clone(),
             local_port: self.local_port,

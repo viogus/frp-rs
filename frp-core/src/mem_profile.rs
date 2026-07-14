@@ -93,7 +93,10 @@ mod tests {
             let p = CountingAlloc.alloc(layout);
             assert!(!p.is_null());
             let (_, t1, _) = snapshot();
-            assert!(t1 >= t0 + 4096, "total_alloc must increase by >= alloc size: {t1} >= {t0}");
+            assert!(
+                t1 >= t0 + 4096,
+                "total_alloc must increase by >= alloc size: {t1} >= {t0}"
+            );
             CountingAlloc.dealloc(p, layout);
         }
     }

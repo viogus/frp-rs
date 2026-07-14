@@ -23,9 +23,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWriteUnpin for T {}
 /// with 16 bytes of ciphertext) is re-encrypted to produce the next keystream.
 struct CfbState {
     aes: Aes128,
-    feedback: [u8; 16],       // feedback register (IV initially, then ciphertext)
-    keystream: [u8; 16],      // current 16-byte keystream block
-    used: usize,              // how many keystream bytes consumed (0..16)
+    feedback: [u8; 16],  // feedback register (IV initially, then ciphertext)
+    keystream: [u8; 16], // current 16-byte keystream block
+    used: usize,         // how many keystream bytes consumed (0..16)
 }
 
 impl CfbState {
@@ -67,9 +67,7 @@ impl CfbState {
             if self.used == 0 && n - i >= 16 {
                 // u128 single-instruction XOR on little-endian (pxor/veor).
                 let state_u128 = u128::from_le_bytes(self.keystream);
-                let data_u128 = u128::from_le_bytes(
-                    data[i..i + 16].try_into().unwrap(),
-                );
+                let data_u128 = u128::from_le_bytes(data[i..i + 16].try_into().unwrap());
                 let result = (state_u128 ^ data_u128).to_le_bytes();
                 data[i..i + 16].copy_from_slice(&result);
                 self.feedback = result;
@@ -185,7 +183,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for CipherReader<R> {
             this.cfb = Some(CfbState::new(&this.key, &iv));
         }
 
-        let cfb = this.cfb.as_mut().expect("IV must be read before decrypting");
+        let cfb = this
+            .cfb
+            .as_mut()
+            .expect("IV must be read before decrypting");
 
         // Zero-copy: read encrypted data directly into the user's ReadBuf,
         // decrypt in-place, then advance to commit the decrypted bytes.
@@ -376,7 +377,10 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
             }
         }
 
-        let cfb = this.cfb.as_mut().expect("IV must be sent before encrypting");
+        let cfb = this
+            .cfb
+            .as_mut()
+            .expect("IV must be sent before encrypting");
         this.scratch.clear();
         this.scratch.extend_from_slice(buf);
         cfb.encrypt(&mut this.scratch);
@@ -582,16 +586,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for CipherStream<S> {
         if this.iv_read < 16 {
             let filled;
             {
-                tracing::debug!(iv_read = this.iv_read, needed = 16 - this.iv_read, "CipherStream: reading IV");
+                tracing::debug!(
+                    iv_read = this.iv_read,
+                    needed = 16 - this.iv_read,
+                    "CipherStream: reading IV"
+                );
                 let iv_dest = &mut this.iv_buf[this.iv_read..];
                 let mut tmp_buf = ReadBuf::new(iv_dest);
                 match Pin::new(&mut this.inner).poll_read(cx, &mut tmp_buf) {
                     Poll::Ready(Ok(())) => {
                         filled = tmp_buf.filled().len();
-                        tracing::debug!(filled, iv_read = this.iv_read, "CipherStream: IV read chunk");
+                        tracing::debug!(
+                            filled,
+                            iv_read = this.iv_read,
+                            "CipherStream: IV read chunk"
+                        );
                         if filled == 0 {
                             let iv_read = this.iv_read;
-                            tracing::warn!(iv_read, "CipherStream: EOF while reading IV (got {iv_read} of 16)");
+                            tracing::warn!(
+                                iv_read,
+                                "CipherStream: EOF while reading IV (got {iv_read} of 16)"
+                            );
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::UnexpectedEof,
                                 "CipherStream: EOF while reading IV",
@@ -607,7 +622,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for CipherStream<S> {
             }
             this.iv_read += filled;
             if this.iv_read < 16 {
-                tracing::debug!(iv_read = this.iv_read, "CipherStream: IV incomplete, waiting");
+                tracing::debug!(
+                    iv_read = this.iv_read,
+                    "CipherStream: IV incomplete, waiting"
+                );
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
@@ -617,7 +635,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for CipherStream<S> {
             tracing::debug!(iv_hex = %hex::encode(iv), "CipherStream: IV read complete");
         }
 
-        let cfb = this.read_cfb.as_mut().expect("IV must be read before decrypting");
+        let cfb = this
+            .read_cfb
+            .as_mut()
+            .expect("IV must be read before decrypting");
 
         // Zero-copy: read encrypted data directly into the user's ReadBuf,
         // decrypt in-place, then advance to commit the decrypted bytes.
@@ -734,7 +755,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
             }
         }
 
-        let cfb = this.write_cfb.as_mut().expect("IV must be sent before encrypting");
+        let cfb = this
+            .write_cfb
+            .as_mut()
+            .expect("IV must be sent before encrypting");
         this.scratch.clear();
         this.scratch.extend_from_slice(buf);
         cfb.encrypt(&mut this.scratch);
@@ -926,8 +950,11 @@ mod tests {
         reader.read_to_end(&mut decoded).await.unwrap();
 
         // CFB corruption: altered ciphertext produces different plaintext
-        assert_ne!(decoded.as_slice(), data.as_slice(),
-            "corrupted ciphertext must not decrypt to original plaintext");
+        assert_ne!(
+            decoded.as_slice(),
+            data.as_slice(),
+            "corrupted ciphertext must not decrypt to original plaintext"
+        );
     }
 
     #[tokio::test]
@@ -1061,8 +1088,16 @@ mod tests {
         let mut buf = vec![0u8; total];
         reader.read_exact(&mut buf).await.unwrap();
 
-        assert_eq!(&buf[..first_expected.len()], &first_expected[..], "first write corrupted");
-        assert_eq!(&buf[first_expected.len()..], &second_expected[..], "second write corrupted");
+        assert_eq!(
+            &buf[..first_expected.len()],
+            &first_expected[..],
+            "first write corrupted"
+        );
+        assert_eq!(
+            &buf[first_expected.len()..],
+            &second_expected[..],
+            "second write corrupted"
+        );
 
         write_handle.await.unwrap();
     }
@@ -1090,8 +1125,16 @@ mod tests {
         let mut buf = vec![0u8; total];
         cs2.read_exact(&mut buf).await.unwrap();
 
-        assert_eq!(&buf[..first_expected.len()], &first_expected[..], "first write corrupted");
-        assert_eq!(&buf[first_expected.len()..], &second_expected[..], "second write corrupted");
+        assert_eq!(
+            &buf[..first_expected.len()],
+            &first_expected[..],
+            "first write corrupted"
+        );
+        assert_eq!(
+            &buf[first_expected.len()..],
+            &second_expected[..],
+            "second write corrupted"
+        );
 
         write_handle.await.unwrap();
     }
@@ -1108,7 +1151,12 @@ mod tests {
         fn new(key: &[u8; 16], iv: &[u8; 16]) -> Self {
             use aes::cipher::{BlockCipherEncrypt, KeyInit};
             let aes = aes::Aes128::new_from_slice(key).unwrap();
-            let mut s = RefCfb { aes, feedback: *iv, keystream: *iv, used: 0 };
+            let mut s = RefCfb {
+                aes,
+                feedback: *iv,
+                keystream: *iv,
+                used: 0,
+            };
             s.aes.encrypt_block((&mut s.keystream).into());
             s
         }
@@ -1120,7 +1168,9 @@ mod tests {
         }
         fn encrypt(&mut self, data: &mut [u8]) {
             for byte in data.iter_mut() {
-                if self.used >= 16 { self.refill(); }
+                if self.used >= 16 {
+                    self.refill();
+                }
                 *byte ^= self.keystream[self.used];
                 self.feedback[self.used] = *byte;
                 self.used += 1;
@@ -1128,7 +1178,9 @@ mod tests {
         }
         fn decrypt(&mut self, data: &mut [u8]) {
             for byte in data.iter_mut() {
-                if self.used >= 16 { self.refill(); }
+                if self.used >= 16 {
+                    self.refill();
+                }
                 let ct = *byte;
                 *byte ^= self.keystream[self.used];
                 self.feedback[self.used] = ct;
@@ -1141,7 +1193,9 @@ mod tests {
     fn fill_pattern(buf: &mut [u8], seed: u64) {
         let mut x = seed | 1;
         for b in buf.iter_mut() {
-            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
             *b = (x & 0xff) as u8;
         }
     }
@@ -1220,7 +1274,11 @@ mod tests {
                 want_dec_cfb.decrypt(&mut want_dec[doff..doff + c]);
                 doff += c;
             }
-            assert_eq!(got_dec, want_dec, "chunked decrypt mismatch for {:?}", chunks);
+            assert_eq!(
+                got_dec, want_dec,
+                "chunked decrypt mismatch for {:?}",
+                chunks
+            );
 
             // Round-trip: decrypting the ciphertext restores plaintext.
             let mut rt = got.clone();
@@ -1369,7 +1427,10 @@ mod tests {
         // write_encrypted sends IV then encrypts in-place
         writer.write_encrypted(&mut plaintext).await.unwrap();
         // plaintext is now ciphertext — verify it changed
-        assert_ne!(&plaintext, &expected, "plaintext should be encrypted in-place");
+        assert_ne!(
+            &plaintext, &expected,
+            "plaintext should be encrypted in-place"
+        );
         writer.inner.shutdown().await.unwrap();
 
         let mut decrypted = vec![0u8; expected.len()];

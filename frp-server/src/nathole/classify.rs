@@ -60,7 +60,10 @@ fn split_host_port(addr: &str) -> Result<(&str, i32), String> {
 /// `local_ips` — known local IPs; if found in addresses, marks public_network.
 ///
 /// Returns error if `addresses.len() <= 1` (need at least 2 for classification).
-pub fn classify_nat_feature(addresses: &[String], local_ips: &[String]) -> Result<NatFeature, String> {
+pub fn classify_nat_feature(
+    addresses: &[String],
+    local_ips: &[String],
+) -> Result<NatFeature, String> {
     if addresses.len() <= 1 {
         return Err("insufficient addresses for NAT classification".into());
     }
@@ -117,8 +120,8 @@ pub fn classify_nat_feature(addresses: &[String], local_ips: &[String]) -> Resul
     };
 
     let ports_difference = port_max - port_min;
-    let regular_ports_change = behavior == BEHAVIOR_PORT_CHANGED
-        && (1..=5).contains(&ports_difference);
+    let regular_ports_change =
+        behavior == BEHAVIOR_PORT_CHANGED && (1..=5).contains(&ports_difference);
 
     Ok(NatFeature {
         nat_type,
@@ -212,16 +215,25 @@ mod tests {
     fn test_classify_feature_count() {
         let features = vec![
             NatFeature {
-                nat_type: EASY_NAT.into(), behavior: BEHAVIOR_NO_CHANGE.into(),
-                ports_difference: 0, regular_ports_change: false, public_network: false,
+                nat_type: EASY_NAT.into(),
+                behavior: BEHAVIOR_NO_CHANGE.into(),
+                ports_difference: 0,
+                regular_ports_change: false,
+                public_network: false,
             },
             NatFeature {
-                nat_type: HARD_NAT.into(), behavior: BEHAVIOR_PORT_CHANGED.into(),
-                ports_difference: 3, regular_ports_change: true, public_network: false,
+                nat_type: HARD_NAT.into(),
+                behavior: BEHAVIOR_PORT_CHANGED.into(),
+                ports_difference: 3,
+                regular_ports_change: true,
+                public_network: false,
             },
             NatFeature {
-                nat_type: HARD_NAT.into(), behavior: BEHAVIOR_BOTH_CHANGED.into(),
-                ports_difference: 0, regular_ports_change: false, public_network: false,
+                nat_type: HARD_NAT.into(),
+                behavior: BEHAVIOR_BOTH_CHANGED.into(),
+                ports_difference: 0,
+                regular_ports_change: false,
+                public_network: false,
             },
         ];
         let (easy, hard, regular) = classify_feature_count(&features);

@@ -23,7 +23,7 @@
 //! The Rust VNet already uses the existing control/work connection protocol
 //! for VnetPacket messages, so a full in-process frpc is not required.
 
-use frp_core::internal_listener::{InternalListener, DuplexPair, pipe};
+use frp_core::internal_listener::{pipe, DuplexPair, InternalListener};
 
 /// Virtual in-process client for VNet integration.
 ///

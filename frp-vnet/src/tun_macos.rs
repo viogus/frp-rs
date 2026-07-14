@@ -4,7 +4,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, unix::AsyncFd};
+use tokio::io::{unix::AsyncFd, AsyncRead, AsyncWrite, ReadBuf};
 
 use super::tun::TunDevice;
 

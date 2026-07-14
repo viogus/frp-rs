@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use std::collections::HashMap;
-use tokio::sync::RwLock;
-use tokio::net::TcpListener;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, warn, debug};
+use tokio::net::TcpListener;
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
 
 use crate::service::{AppState, InternalMsg};
 
@@ -137,9 +137,7 @@ pub async fn run_tcpmux_listener(
                 None => {
                     // Client disconnected or sent garbage — write failure is
                     // expected and there is no recovery path.
-                    let _ = stream
-                        .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                        .await;
+                    let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
                     return;
                 }
             };
@@ -165,9 +163,7 @@ pub async fn run_tcpmux_listener(
                 Some(h) => h.to_string(),
                 None => {
                     warn!(peer = %peer, "TCPMux: no Host header from {}", peer);
-                    let _ = stream
-                        .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                        .await;
+                    let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
                     return;
                 }
             };
@@ -191,7 +187,8 @@ pub async fn run_tcpmux_listener(
                         &mut stream,
                         "HTTP/1.1 404 Not Found",
                         &state.custom_404_page,
-                    ).await;
+                    )
+                    .await;
                     return;
                 }
             };
@@ -199,13 +196,18 @@ pub async fn run_tcpmux_listener(
             // Check Proxy-Authorization if configured
             if !route.http_user.is_empty() {
                 let auth_ok = extract_proxy_auth(&request_text)
-                    .map(|(u, p)| crate::constant_time_eq_str(&u, &route.http_user) && crate::constant_time_eq_str(&p, &route.http_pwd))
+                    .map(|(u, p)| {
+                        crate::constant_time_eq_str(&u, &route.http_user)
+                            && crate::constant_time_eq_str(&p, &route.http_pwd)
+                    })
                     .unwrap_or(false);
                 if !auth_ok {
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 407 Proxy Authentication Required\r\n\
                           Proxy-Authenticate: Basic realm=\"frp\"\r\n\r\n",
-                    ).await;
+                        )
+                        .await;
                     return;
                 }
             }
@@ -241,9 +243,7 @@ pub async fn run_tcpmux_listener(
                     "TCPMux: route for '{}' found but control handler gone",
                     host
                 );
-                let _ = stream
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                    .await;
+                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
             }
         });
     }
@@ -304,9 +304,9 @@ fn extract_host_header(request: &str) -> Option<&str> {
 
 /// Extract Proxy-Authorization Basic credentials.
 fn extract_proxy_auth(request: &str) -> Option<(String, String)> {
-    let auth_line = request.lines().find(|line| {
-        line.len() >= 20 && line[..20].eq_ignore_ascii_case("proxy-authorization:")
-    })?;
+    let auth_line = request
+        .lines()
+        .find(|line| line.len() >= 20 && line[..20].eq_ignore_ascii_case("proxy-authorization:"))?;
     let value = auth_line[20..].trim();
     let encoded = if value.len() > 6 && value[..6].eq_ignore_ascii_case("Basic ") {
         value[6..].trim()
@@ -344,7 +344,8 @@ mod tests {
     #[test]
     fn test_extract_proxy_auth() {
         // "user:pass" in base64 = dXNlcjpwYXNz
-        let req = "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n";
+        let req =
+            "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n";
         let (user, pwd) = extract_proxy_auth(req).unwrap();
         assert_eq!(user, "user");
         assert_eq!(pwd, "pass");

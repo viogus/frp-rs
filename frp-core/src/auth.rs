@@ -1,4 +1,4 @@
-use md5::{Md5, Digest};
+use md5::{Digest, Md5};
 
 /// Constant-time slice comparison for auth token verification.
 /// XOR-accumulates every byte pair so execution time depends only on
@@ -121,7 +121,11 @@ pub enum AuthMethod {
 impl AuthConfig {
     /// Validate a login attempt. Returns the subject string (empty for token
     /// auth, populated from JWT 'sub' claim for OIDC). Returns Err if invalid.
-    pub fn validate_login(&self, privilege_key: Option<&str>, timestamp: Option<i64>) -> Result<String, String> {
+    pub fn validate_login(
+        &self,
+        privilege_key: Option<&str>,
+        timestamp: Option<i64>,
+    ) -> Result<String, String> {
         if self.token.is_empty() && self.method == AuthMethod::Token {
             return Err(
                 "authentication token is empty. When auth.method = 'token', \
@@ -225,8 +229,8 @@ mod oidc_impl {
             skip_issuer: bool,
             proxy_url: Option<String>,
         ) -> Result<Self, String> {
-            let mut client_builder = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10));
+            let mut client_builder =
+                reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
             if let Some(ref url) = proxy_url.filter(|u| !u.is_empty()) {
                 let proxy = reqwest::Proxy::all(url)
                     .map_err(|e| format!("OIDC: invalid proxy URL '{url}': {e}"))?;
@@ -236,17 +240,24 @@ mod oidc_impl {
                 .build()
                 .map_err(|e| format!("OIDC: failed to create HTTP client: {e}"))?;
 
-            let config_url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
-            let resp = http.get(&config_url)
-                .send()
-                .await
-                .map_err(|e| format!("OIDC: failed to fetch openid-configuration from {config_url}: {e}"))?;
+            let config_url = format!(
+                "{}/.well-known/openid-configuration",
+                issuer.trim_end_matches('/')
+            );
+            let resp = http.get(&config_url).send().await.map_err(|e| {
+                format!("OIDC: failed to fetch openid-configuration from {config_url}: {e}")
+            })?;
 
             if !resp.status().is_success() {
-                return Err(format!("OIDC: openid-configuration returned {}", resp.status()));
+                return Err(format!(
+                    "OIDC: openid-configuration returned {}",
+                    resp.status()
+                ));
             }
 
-            let body = resp.text().await
+            let body = resp
+                .text()
+                .await
                 .map_err(|e| format!("OIDC: failed to read openid-configuration: {e}"))?;
             let config: serde_json::Value = serde_json::from_str(&body)
                 .map_err(|e| format!("OIDC: failed to parse openid-configuration: {e}"))?;
@@ -294,16 +305,18 @@ mod oidc_impl {
         }
 
         async fn refresh_jwks(&self) -> Result<(), String> {
-            let resp = self.http.get(&self.jwks_uri)
-                .send()
-                .await
-                .map_err(|e| format!("OIDC: failed to fetch JWKS from {}: {e}", self.jwks_uri))?;
+            let resp =
+                self.http.get(&self.jwks_uri).send().await.map_err(|e| {
+                    format!("OIDC: failed to fetch JWKS from {}: {e}", self.jwks_uri)
+                })?;
 
             if !resp.status().is_success() {
                 return Err(format!("OIDC: JWKS endpoint returned {}", resp.status()));
             }
 
-            let body = resp.text().await
+            let body = resp
+                .text()
+                .await
                 .map_err(|e| format!("OIDC: failed to read JWKS: {e}"))?;
             let jwks_json: serde_json::Value = serde_json::from_str(&body)
                 .map_err(|e| format!("OIDC: failed to parse JWKS: {e}"))?;
@@ -319,7 +332,9 @@ mod oidc_impl {
         }
 
         /// Build a jsonwebtoken::DecodingKey from a JWKS key JSON value.
-        pub(crate) fn decoding_key_from_jwk(key: &serde_json::Value) -> Result<jsonwebtoken::DecodingKey, String> {
+        pub(crate) fn decoding_key_from_jwk(
+            key: &serde_json::Value,
+        ) -> Result<jsonwebtoken::DecodingKey, String> {
             let kty = key["kty"].as_str().unwrap_or("");
             match kty {
                 "RSA" => {
@@ -373,14 +388,17 @@ mod oidc_impl {
             validation.set_audience(&[&self.audience]);
 
             // First attempt with cached JWKS
-            let first_result = self.try_verify_token(token, &validation, kid.as_deref()).await;
+            let first_result = self
+                .try_verify_token(token, &validation, kid.as_deref())
+                .await;
 
             match first_result {
                 Ok(tok) => Ok(tok),
                 Err(first_err) => {
                     // Refresh JWKS and retry once
                     self.refresh_jwks().await?;
-                    self.try_verify_token(token, &validation, kid.as_deref()).await
+                    self.try_verify_token(token, &validation, kid.as_deref())
+                        .await
                         .map_err(|_| first_err)
                 }
             }
@@ -394,7 +412,9 @@ mod oidc_impl {
             kid: Option<&str>,
         ) -> Result<LoginOidcToken, String> {
             let cache = self.jwks.read().await;
-            let jwks = cache.as_ref().ok_or_else(|| "OIDC: no JWKS cached".to_string())?;
+            let jwks = cache
+                .as_ref()
+                .ok_or_else(|| "OIDC: no JWKS cached".to_string())?;
             let keys = jwks.keys["keys"]
                 .as_array()
                 .ok_or_else(|| "OIDC: JWKS has no 'keys' array".to_string())?;
@@ -421,7 +441,10 @@ mod oidc_impl {
                     Ok(data) => {
                         let sub = data.claims["sub"].as_str().unwrap_or("").to_string();
                         let exp = data.claims["exp"].as_i64().unwrap_or(0);
-                        return Ok(LoginOidcToken { subject: sub, expiry: exp });
+                        return Ok(LoginOidcToken {
+                            subject: sub,
+                            expiry: exp,
+                        });
                     }
                     Err(e) => {
                         last_err = e.to_string();
@@ -445,7 +468,11 @@ mod oidc_impl {
         }
 
         /// Verify a NewWorkConn JWT — same as verify_ping.
-        pub async fn verify_new_work_conn(&self, token: &str, expected_sub: &str) -> Result<(), String> {
+        pub async fn verify_new_work_conn(
+            &self,
+            token: &str,
+            expected_sub: &str,
+        ) -> Result<(), String> {
             self.verify_ping(token, expected_sub).await
         }
     }
@@ -494,8 +521,8 @@ mod oidc_impl {
             tls_insecure_skip_verify: bool,
             proxy_url: Option<String>,
         ) -> Result<Self, String> {
-            let mut client_builder = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10));
+            let mut client_builder =
+                reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
 
             if let Some(ref url) = proxy_url.filter(|u| !u.is_empty()) {
                 let proxy = reqwest::Proxy::all(url)
@@ -523,30 +550,45 @@ mod oidc_impl {
             let endpoint = if let Some(ep) = token_endpoint.filter(|s| !s.is_empty()) {
                 ep
             } else if let Some(iss) = issuer.filter(|s| !s.is_empty()) {
-                let config_url = format!("{}/.well-known/openid-configuration", iss.trim_end_matches('/'));
-                let resp = http.get(&config_url)
-                    .send()
-                    .await
-                    .map_err(|e| format!("OIDC client: failed to fetch openid-configuration from {config_url}: {e}"))?;
+                let config_url = format!(
+                    "{}/.well-known/openid-configuration",
+                    iss.trim_end_matches('/')
+                );
+                let resp = http.get(&config_url).send().await.map_err(|e| {
+                    format!(
+                        "OIDC client: failed to fetch openid-configuration from {config_url}: {e}"
+                    )
+                })?;
 
                 if !resp.status().is_success() {
-                    return Err(format!("OIDC client: openid-configuration returned {}", resp.status()));
+                    return Err(format!(
+                        "OIDC client: openid-configuration returned {}",
+                        resp.status()
+                    ));
                 }
 
-                let body = resp.text().await
-                    .map_err(|e| format!("OIDC client: failed to read openid-configuration: {e}"))?;
-                let config: serde_json::Value = serde_json::from_str(&body)
-                    .map_err(|e| format!("OIDC client: failed to parse openid-configuration: {e}"))?;
+                let body = resp.text().await.map_err(|e| {
+                    format!("OIDC client: failed to read openid-configuration: {e}")
+                })?;
+                let config: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+                    format!("OIDC client: failed to parse openid-configuration: {e}")
+                })?;
 
                 config["token_endpoint"]
                     .as_str()
-                    .ok_or_else(|| "OIDC client: token_endpoint not found in openid-configuration".to_string())?
+                    .ok_or_else(|| {
+                        "OIDC client: token_endpoint not found in openid-configuration".to_string()
+                    })?
                     .to_string()
             } else {
                 return Err("OIDC client: token_endpoint or issuer is required".into());
             };
 
-            let scope = if scope.is_empty() { "openid".to_string() } else { scope };
+            let scope = if scope.is_empty() {
+                "openid".to_string()
+            } else {
+                scope
+            };
 
             // Parse additional endpoint params: "key1=val1&key2=val2" → Vec of (key, val) pairs
             let additional_params: Vec<(String, String)> = additional_endpoint_params
@@ -556,7 +598,11 @@ mod oidc_impl {
                     let mut parts = pair.splitn(2, '=');
                     let key = parts.next().unwrap_or("").trim().to_string();
                     let val = parts.next().unwrap_or("").trim().to_string();
-                    if key.is_empty() { None } else { Some((key, val)) }
+                    if key.is_empty() {
+                        None
+                    } else {
+                        Some((key, val))
+                    }
                 })
                 .collect();
 
@@ -580,23 +626,36 @@ mod oidc_impl {
                 ("scope", self.scope.as_str()),
                 ("audience", self.audience.as_str()),
             ];
-            let extra: Vec<(&str, &str)> = self.additional_params.iter()
+            let extra: Vec<(&str, &str)> = self
+                .additional_params
+                .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
             params.extend_from_slice(&extra);
 
-            let resp = self.http.post(&self.token_endpoint)
+            let resp = self
+                .http
+                .post(&self.token_endpoint)
                 .form(&params)
                 .send()
                 .await
-                .map_err(|e| format!("OIDC client: token request to {} failed: {e}", self.token_endpoint))?;
+                .map_err(|e| {
+                    format!(
+                        "OIDC client: token request to {} failed: {e}",
+                        self.token_endpoint
+                    )
+                })?;
 
             if !resp.status().is_success() {
                 let body = resp.text().await.unwrap_or_default();
-                return Err(format!("OIDC client: token endpoint returned error: {body}"));
+                return Err(format!(
+                    "OIDC client: token endpoint returned error: {body}"
+                ));
             }
 
-            let resp_text = resp.text().await
+            let resp_text = resp
+                .text()
+                .await
                 .map_err(|e| format!("OIDC client: failed to read token response: {e}"))?;
             let body: serde_json::Value = serde_json::from_str(&resp_text)
                 .map_err(|e| format!("OIDC client: failed to parse token response: {e}"))?;
@@ -655,7 +714,10 @@ mod oidc_impl {
         }
 
         /// Set privilege_key on a NewWorkConn message using an OIDC token.
-        pub async fn set_new_work_conn(&self, nwc: &mut crate::msg::NewWorkConn) -> Result<(), String> {
+        pub async fn set_new_work_conn(
+            &self,
+            nwc: &mut crate::msg::NewWorkConn,
+        ) -> Result<(), String> {
             let token = self.get_token().await?;
             nwc.privilege_key = Some(token);
             nwc.timestamp = None;
@@ -665,7 +727,7 @@ mod oidc_impl {
 }
 
 #[cfg(feature = "oidc")]
-pub use oidc_impl::{LoginOidcToken, OidcVerifier, OidcClient};
+pub use oidc_impl::{LoginOidcToken, OidcClient, OidcVerifier};
 
 // Stub types for when the oidc feature is disabled. These exist so that
 // type-level references (struct fields, function parameters, Option<Arc<...>>)
@@ -691,7 +753,10 @@ impl OidcClient {
         Err("OIDC feature disabled at compile time".into())
     }
     /// Stub.
-    pub async fn set_new_work_conn(&self, _nwc: &mut crate::msg::NewWorkConn) -> Result<(), String> {
+    pub async fn set_new_work_conn(
+        &self,
+        _nwc: &mut crate::msg::NewWorkConn,
+    ) -> Result<(), String> {
         Err("OIDC feature disabled at compile time".into())
     }
 }
@@ -706,7 +771,11 @@ impl OidcVerifier {
         Err("OIDC feature disabled at compile time".into())
     }
     /// Stub.
-    pub async fn verify_new_work_conn(&self, _token: &str, _expected_sub: &str) -> Result<(), String> {
+    pub async fn verify_new_work_conn(
+        &self,
+        _token: &str,
+        _expected_sub: &str,
+    ) -> Result<(), String> {
         Err("OIDC feature disabled at compile time".into())
     }
 }
@@ -794,7 +863,8 @@ fn resolve_dynamic_token_inner(
             )),
         }
     } else if let Some(cmd) = token.strip_prefix("exec://") {
-        if unsafe_features.is_some_and(|uf| !uf.is_enabled(crate::unsafe_features::TOKEN_SOURCE_EXEC))
+        if unsafe_features
+            .is_some_and(|uf| !uf.is_enabled(crate::unsafe_features::TOKEN_SOURCE_EXEC))
         {
             return Err(
                 "exec:// token source blocked: TokenSourceExec not in UnsafeFeatures allowlist. \
@@ -1013,7 +1083,9 @@ mod tests {
     #[test]
     fn test_resolve_dynamic_token_exec() {
         // Use /bin/echo on Unix — portable across macOS and Linux
-        let uf = crate::unsafe_features::UnsafeFeatures::new(crate::unsafe_features::CLIENT_UNSAFE_FEATURES);
+        let uf = crate::unsafe_features::UnsafeFeatures::new(
+            crate::unsafe_features::CLIENT_UNSAFE_FEATURES,
+        );
         let result = resolve_dynamic_token_checked("exec:///bin/echo dynamic-token-value", &uf);
         assert_eq!(result.unwrap(), "dynamic-token-value");
     }

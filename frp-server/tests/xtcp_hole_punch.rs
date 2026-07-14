@@ -5,7 +5,7 @@ use frp_core::msg::{self, FrpMessage, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
 
-use common::{allocate_port, login_with_test_token, raw_login, start_test_server, test_auth_cfg};
+use common::{allocate_port, login_with_test_token, start_test_server, test_auth_cfg};
 
 /// Server-side XTCP message routing test — Go frp v0.69.1 compat flow.
 ///
@@ -80,7 +80,10 @@ async fn test_xtcp_nat_hole_message_routing() {
     write_msg_v1(&mut provider_ctl, &np)
         .await
         .expect("send NewProxy");
-    match read_msg_v1(&mut provider_ctl).await.expect("read NewProxyResp") {
+    match read_msg_v1(&mut provider_ctl)
+        .await
+        .expect("read NewProxyResp")
+    {
         FrpMessage::NewProxyResp(ref resp) => {
             assert!(
                 resp.error.is_none(),
@@ -138,7 +141,10 @@ async fn test_xtcp_nat_hole_message_routing() {
             assert!(resp.sid.is_none(), "precheck should NOT have sid");
             println!("PreCheck passed — NatHoleResp OK (no sid)");
         }
-        other => panic!("expected NatHoleResp for precheck, got: {:?}", other.v1_type_byte()),
+        other => panic!(
+            "expected NatHoleResp for precheck, got: {:?}",
+            other.v1_type_byte()
+        ),
     }
     drop(precheck_conn);
 
@@ -156,12 +162,8 @@ async fn test_xtcp_nat_hole_message_routing() {
         protocol: Some("tcp".to_string()),
         sign_key: None, // no auth needed for test
         timestamp: None,
-        mapped_addrs: Some(vec![
-            "1.2.3.4:5678".to_string(),
-            "1.2.3.4:5680".to_string(),
-        ]),
+        mapped_addrs: Some(vec!["1.2.3.4:5678".to_string(), "1.2.3.4:5680".to_string()]),
         assisted_addrs: Some(vec!["192.168.1.5:5678".to_string()]),
-        ..Default::default()
     });
     write_msg_v1(&mut visitor_conn, &nhv)
         .await
@@ -171,17 +173,29 @@ async fn test_xtcp_nat_hole_message_routing() {
     // --- Provider reads StartWorkConn from WORK CONNECTION ---
     // NatHoleSid is embedded in StartWorkConn JSON (Rust frp extension).
     // Go frp sends a separate NatHoleSid frame after; Rust frp embeds it.
-    let sid = match read_msg_v1(&mut work_conn).await.expect("read StartWorkConn from work conn") {
+    let sid = match read_msg_v1(&mut work_conn)
+        .await
+        .expect("read StartWorkConn from work conn")
+    {
         FrpMessage::StartWorkConn(swc) => {
             assert_eq!(swc.proxy_name, "xtcp-test");
-            println!("Provider received StartWorkConn for proxy '{}'", swc.proxy_name);
+            println!(
+                "Provider received StartWorkConn for proxy '{}'",
+                swc.proxy_name
+            );
             // NatHoleSid embedded in StartWorkConn
-            let s = swc.nat_hole_sid.clone().expect("StartWorkConn should have nat_hole_sid");
+            let s = swc
+                .nat_hole_sid
+                .clone()
+                .expect("StartWorkConn should have nat_hole_sid");
             assert!(!s.is_empty(), "sid should be non-empty");
             println!("Provider received NatHoleSid in StartWorkConn: sid={}", s);
             s
         }
-        other => panic!("expected StartWorkConn on work conn, got: {:?}", other.v1_type_byte()),
+        other => panic!(
+            "expected StartWorkConn on work conn, got: {:?}",
+            other.v1_type_byte()
+        ),
     };
 
     // --- Provider does "STUN" → sends NatHoleClient on CONTROL conn ---
@@ -208,7 +222,11 @@ async fn test_xtcp_nat_hole_message_routing() {
         .expect("read NatHoleResp from provider control")
     {
         FrpMessage::NatHoleResp(resp) => {
-            assert!(resp.error.is_none(), "provider NatHoleResp error: {:?}", resp.error);
+            assert!(
+                resp.error.is_none(),
+                "provider NatHoleResp error: {:?}",
+                resp.error
+            );
             assert_eq!(resp.sid.as_deref(), Some(sid.as_str()));
             // Provider should get VISITOR's mapped addresses as candidates
             if let Some(ref candidates) = resp.candidate_addrs {
@@ -223,7 +241,10 @@ async fn test_xtcp_nat_hole_message_routing() {
                 resp.detect_behavior
             );
         }
-        other => panic!("expected NatHoleResp on provider control, got: {:?}", other.v1_type_byte()),
+        other => panic!(
+            "expected NatHoleResp on provider control, got: {:?}",
+            other.v1_type_byte()
+        ),
     }
 
     // --- Visitor reads NatHoleResp with provider's candidate addresses ---
@@ -232,7 +253,11 @@ async fn test_xtcp_nat_hole_message_routing() {
         .expect("read NatHoleResp from visitor")
     {
         FrpMessage::NatHoleResp(resp) => {
-            assert!(resp.error.is_none(), "visitor NatHoleResp error: {:?}", resp.error);
+            assert!(
+                resp.error.is_none(),
+                "visitor NatHoleResp error: {:?}",
+                resp.error
+            );
             let resp_sid = resp.sid.clone();
             assert!(resp_sid.is_some(), "visitor NatHoleResp should have sid");
             // KEY: candidate_addrs should contain PROVIDER's addresses
@@ -250,7 +275,10 @@ async fn test_xtcp_nat_hole_message_routing() {
                 resp.detect_behavior
             );
         }
-        other => panic!("expected NatHoleResp on visitor, got: {:?}", other.v1_type_byte()),
+        other => panic!(
+            "expected NatHoleResp on visitor, got: {:?}",
+            other.v1_type_byte()
+        ),
     }
 
     // --- Provider sends NatHoleReport (hole punch complete) ---
@@ -380,7 +408,9 @@ async fn test_xtcp_ignore_nat_hole_client_no_sid() {
         #[cfg(feature = "vnet")]
         vnet_mtu: None,
     });
-    write_msg_v1(&mut provider_ctl, &np).await.expect("send NewProxy");
+    write_msg_v1(&mut provider_ctl, &np)
+        .await
+        .expect("send NewProxy");
     match read_msg_v1(&mut provider_ctl).await.expect("NewProxyResp") {
         FrpMessage::NewProxyResp(ref resp) => {
             assert!(resp.error.is_none(), "reg error: {:?}", resp.error);
@@ -438,8 +468,13 @@ async fn test_xtcp_ignore_nat_hole_client_no_sid() {
         #[cfg(feature = "vnet")]
         vnet_mtu: None,
     });
-    write_msg_v1(&mut provider_ctl, &np2).await.expect("send NewProxy 2");
-    match read_msg_v1(&mut provider_ctl).await.expect("NewProxyResp 2") {
+    write_msg_v1(&mut provider_ctl, &np2)
+        .await
+        .expect("send NewProxy 2");
+    match read_msg_v1(&mut provider_ctl)
+        .await
+        .expect("NewProxyResp 2")
+    {
         FrpMessage::NewProxyResp(ref resp) => {
             assert!(
                 resp.error.is_none(),

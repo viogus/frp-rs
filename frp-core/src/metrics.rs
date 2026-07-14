@@ -1,7 +1,7 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
-use std::sync::Mutex;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::sync::RwLock;
 
 /// Per-proxy traffic counters using atomics for lock-free reads.
@@ -137,7 +137,9 @@ pub struct ProxyMetricsRegistry {
 
 impl ProxyMetricsRegistry {
     pub fn new() -> Self {
-        Self { metrics: RwLock::new(HashMap::new()) }
+        Self {
+            metrics: RwLock::new(HashMap::new()),
+        }
     }
 
     pub async fn get_or_create(&self, name: &str) -> Arc<ProxyMetrics> {

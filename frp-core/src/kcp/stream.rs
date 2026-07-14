@@ -178,9 +178,8 @@ impl AsyncWrite for KcpStream {
             // Create a Notified future to wait for KcpSocket to drain backlog.
             // SAFETY: write_notify is Arc<Notify>; the Notify lives as long as
             // KcpStream. The Notified future borrows from this stable allocation.
-            let notified: tokio::sync::futures::Notified<'static> = unsafe {
-                std::mem::transmute(self.write_notify.notified())
-            };
+            let notified: tokio::sync::futures::Notified<'static> =
+                unsafe { std::mem::transmute(self.write_notify.notified()) };
             self.backpressure_fut = Some(Box::pin(notified));
             // Re-poll the newly created future with the current waker.
             if let Some(ref mut fut) = self.backpressure_fut {
@@ -224,16 +223,16 @@ impl AsyncWrite for KcpStream {
             && tracing::level_enabled!(tracing::Level::DEBUG)
         {
             tracing::debug!(
-                    conv = self.conv,
-                    n = n,
-                    total = self.write_count,
-                    global_total = KCP_WRITE_BYTES.load(Ordering::Relaxed),
-                    first_hex = %hex::encode(&buf[..n.min(32)]),
-                    "KCP write: {} bytes (stream total={}, global total={})",
-                    n,
-                    self.write_count,
-                    KCP_WRITE_BYTES.load(Ordering::Relaxed),
-                );
+                conv = self.conv,
+                n = n,
+                total = self.write_count,
+                global_total = KCP_WRITE_BYTES.load(Ordering::Relaxed),
+                first_hex = %hex::encode(&buf[..n.min(32)]),
+                "KCP write: {} bytes (stream total={}, global total={})",
+                n,
+                self.write_count,
+                KCP_WRITE_BYTES.load(Ordering::Relaxed),
+            );
         }
         Poll::Ready(Ok(n))
     }
@@ -242,7 +241,11 @@ impl AsyncWrite for KcpStream {
         // Send a flush request if we don't have one pending.
         if self.flush_rx.is_none() {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            if self.write_tx.send((self.conv, WriteRequest::Flush(tx))).is_err() {
+            if self
+                .write_tx
+                .send((self.conv, WriteRequest::Flush(tx)))
+                .is_err()
+            {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "KCP driver closed",

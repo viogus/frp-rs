@@ -13,11 +13,11 @@
 //! - host_header_rewrite: optional Host header override
 
 #[cfg(feature = "tls")]
+use rustls::pki_types::ServerName;
+#[cfg(feature = "tls")]
 use tokio::io::AsyncWriteExt;
 #[cfg(feature = "tls")]
 use tokio::net::TcpStream;
-#[cfg(feature = "tls")]
-use rustls::pki_types::ServerName;
 #[cfg(feature = "tls")]
 use tracing::debug;
 
@@ -25,9 +25,9 @@ use frp_core::config::PluginConfig;
 #[cfg(feature = "tls")]
 use frp_core::transport::{build_tls_acceptor, build_tls_connector};
 
-use super::{PluginHandle, serve_plugin};
 #[cfg(feature = "tls")]
 use super::split_host_port;
+use super::{serve_plugin, PluginHandle};
 
 /// Start an https2https plugin server.
 #[cfg(feature = "tls")]
@@ -49,20 +49,27 @@ pub async fn start_https2https_plugin(cfg: &PluginConfig) -> Result<PluginHandle
     let tls_connector = build_tls_connector(None, None, None).map_err(|e| {
         frp_core::Error::Transport(format!("https2https plugin: TLS connector: {e}").into())
     })?;
-    serve_plugin("https2https", (target_addr, host_rewrite, tls_acceptor, tls_connector), |tcp, peer, (target, rewrite, acceptor, connector)| async move {
-        match acceptor.accept(tcp).await {
-            Ok(client_tls) => {
-                if let Err(e) = handle_conn(client_tls, &target, &rewrite, &connector).await {
-                    debug!(%peer, error = %e, "https2https: {peer} error: {e}");
+    serve_plugin(
+        "https2https",
+        (target_addr, host_rewrite, tls_acceptor, tls_connector),
+        |tcp, peer, (target, rewrite, acceptor, connector)| async move {
+            match acceptor.accept(tcp).await {
+                Ok(client_tls) => {
+                    if let Err(e) = handle_conn(client_tls, &target, &rewrite, &connector).await {
+                        debug!(%peer, error = %e, "https2https: {peer} error: {e}");
+                    }
                 }
+                Err(e) => debug!(%peer, %e, "https2https: {peer} TLS accept error: {e}"),
             }
-            Err(e) => debug!(%peer, %e, "https2https: {peer} TLS accept error: {e}"),
-        }
-    }).await
+        },
+    )
+    .await
 }
 
 #[cfg(not(feature = "tls"))]
-pub async fn start_https2https_plugin(_cfg: &PluginConfig) -> Result<PluginHandle, frp_core::Error> {
+pub async fn start_https2https_plugin(
+    _cfg: &PluginConfig,
+) -> Result<PluginHandle, frp_core::Error> {
     Err(frp_core::Error::Transport(
         "https2https plugin: TLS support not compiled in".into(),
     ))

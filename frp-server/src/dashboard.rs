@@ -1,19 +1,30 @@
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
-use std::collections::HashMap;
-use axum::{Router, Json, extract::{State, Path, Query, ws::{WebSocketUpgrade, WebSocket, Message}}, response::Html, routing::{get, delete}};
-use axum::http::StatusCode;
-use serde::{Serialize, Deserialize};
-use crate::service::AppState;
 #[cfg(feature = "tls")]
 use crate::lock::RwLockExt;
+use crate::service::AppState;
+use axum::http::StatusCode;
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
+    response::Html,
+    routing::{delete, get},
+    Json, Router,
+};
 use frp_core::admin_auth::apply_admin_auth;
 use frp_core::metrics::MetricsSnapshot;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Build a 404 Not Found response tuple with the given error message.
 fn not_found(msg: &str) -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::NOT_FOUND, Json(ErrorResponse { error: msg.into() }))
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse { error: msg.into() }),
+    )
 }
 
 // --- Local TlsListener (moved from frp-core to avoid axum in core) ---
@@ -59,11 +70,7 @@ impl axum::serve::Listener for TlsListener {
                     continue;
                 }
             };
-            let tls_acceptor = match self
-                .acceptor
-                .read_ok()
-                .clone()
-            {
+            let tls_acceptor = match self.acceptor.read_ok().clone() {
                 Some(acceptor) => acceptor,
                 None => {
                     tracing::warn!("TLS acceptor not initialized, skipping connection");
@@ -180,8 +187,10 @@ async fn build_status_response(state: &Arc<AppState>) -> StatusResponse {
     let proxies = state.proxy_manager.list().await;
 
     let (total_pool_size, total_pending) = ctl_map.values().fold((0i64, 0i64), |(s, p), ctl| {
-        (s + ctl.pool_stats.pool_size.load(Ordering::Relaxed),
-         p + ctl.pool_stats.pending_requests.load(Ordering::Relaxed))
+        (
+            s + ctl.pool_stats.pool_size.load(Ordering::Relaxed),
+            p + ctl.pool_stats.pending_requests.load(Ordering::Relaxed),
+        )
     });
     drop(ctl_map);
 
@@ -221,13 +230,20 @@ async fn handle_proxies(
             continue;
         }
         let online = ctl_map.contains_key(&p.run_id);
-        let traffic = state.proxy_metrics.get(&p.name).await
+        let traffic = state
+            .proxy_metrics
+            .get(&p.name)
+            .await
             .map(|m| m.snapshot())
             .unwrap_or_default();
         entries.push(ProxyEntry {
             name: p.name.clone(),
             proxy_type: p.proxy_type.clone(),
-            status: if online { "online".into() } else { "offline".into() },
+            status: if online {
+                "online".into()
+            } else {
+                "offline".into()
+            },
             remote_port: p.remote_port,
             local_addr: p.local_addr.clone(),
             traffic_in: traffic.bytes_in,
@@ -242,18 +258,32 @@ async fn handle_proxy_detail(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<ProxyDetail>, (axum::http::StatusCode, Json<ErrorResponse>)> {
-    let proxy = state.proxy_manager.get(&name).await
+    let proxy = state
+        .proxy_manager
+        .get(&name)
+        .await
         .ok_or_else(|| not_found("proxy not found"))?;
 
-    let online = state.run_id_to_ctl_tx.read().await.contains_key(&proxy.run_id);
-    let traffic = state.proxy_metrics.get(&name).await
+    let online = state
+        .run_id_to_ctl_tx
+        .read()
+        .await
+        .contains_key(&proxy.run_id);
+    let traffic = state
+        .proxy_metrics
+        .get(&name)
+        .await
         .map(|m| m.snapshot())
         .unwrap_or_default();
 
     Ok(Json(ProxyDetail {
         name: proxy.name.clone(),
         proxy_type: proxy.proxy_type.clone(),
-        status: if online { "online".into() } else { "offline".into() },
+        status: if online {
+            "online".into()
+        } else {
+            "offline".into()
+        },
         run_id: Some(proxy.run_id.clone()),
         remote_port: proxy.remote_port,
         local_addr: proxy.local_addr.clone(),
@@ -271,10 +301,16 @@ async fn handle_proxy_traffic(
     Path(name): Path<String>,
 ) -> Result<Json<MetricsSnapshot>, (axum::http::StatusCode, Json<ErrorResponse>)> {
     // Verify proxy exists
-    let _proxy = state.proxy_manager.get(&name).await
+    let _proxy = state
+        .proxy_manager
+        .get(&name)
+        .await
         .ok_or_else(|| not_found("proxy not found"))?;
 
-    let traffic = state.proxy_metrics.get(&name).await
+    let traffic = state
+        .proxy_metrics
+        .get(&name)
+        .await
         .map(|m| m.snapshot())
         .unwrap_or_default();
 
@@ -315,12 +351,16 @@ async fn handle_client_detail(
     let ctl = {
         let map = state.run_id_to_ctl_tx.read().await;
         map.get(&run_id).cloned()
-    }.ok_or_else(|| not_found("client not found"))?;
+    }
+    .ok_or_else(|| not_found("client not found"))?;
 
     let proxy_infos = state.proxy_manager.list_client(&run_id).await;
     let mut proxies = Vec::new();
     for p in &proxy_infos {
-        let traffic = state.proxy_metrics.get(&p.name).await
+        let traffic = state
+            .proxy_metrics
+            .get(&p.name)
+            .await
             .map(|m| m.snapshot())
             .unwrap_or_default();
         proxies.push(ProxyEntry {
@@ -415,18 +455,21 @@ struct StoreProxyConfig {
 /// GET /api/store/proxies — list all active proxies with extended config.
 async fn handle_store_proxies(State(state): State<Arc<AppState>>) -> Json<Vec<serde_json::Value>> {
     let proxies = state.proxy_manager.list().await;
-    let result: Vec<serde_json::Value> = proxies.iter().map(|p| {
-        serde_json::json!({
-            "name": p.name,
-            "type": p.proxy_type,
-            "run_id": p.run_id,
-            "remote_port": p.remote_port,
-            "local_addr": p.local_addr,
-            "use_encryption": p.use_encryption,
-            "use_compression": p.use_compression,
-            "group": p.group,
+    let result: Vec<serde_json::Value> = proxies
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "name": p.name,
+                "type": p.proxy_type,
+                "run_id": p.run_id,
+                "remote_port": p.remote_port,
+                "local_addr": p.local_addr,
+                "use_encryption": p.use_encryption,
+                "use_compression": p.use_compression,
+                "group": p.group,
+            })
         })
-    }).collect();
+        .collect();
     Json(result)
 }
 
@@ -436,23 +479,32 @@ async fn handle_store_proxy_create(
     Json(config): Json<StoreProxyConfig>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     if config.name.is_empty() || config.proxy_type.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse {
-            error: "name and type are required".into()
-        })));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "name and type are required".into(),
+            }),
+        ));
     }
     let exists = state.proxy_manager.get(&config.name).await.is_some();
     if exists {
-        return Err((StatusCode::CONFLICT, Json(ErrorResponse {
-            error: "proxy already exists".into()
-        })));
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "proxy already exists".into(),
+            }),
+        ));
     }
     let name = config.name.clone();
     {
         let mut store = state.proxy_config_store.write().await;
         if store.contains_key(&config.name) {
-            return Err((StatusCode::CONFLICT, Json(ErrorResponse {
-                error: "proxy config already in store".into()
-            })));
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: "proxy config already in store".into(),
+                }),
+            ));
         }
         let (local_ip, local_port) = if config.local_addr.is_empty() {
             (String::new(), 0u16)
@@ -461,16 +513,19 @@ async fn handle_store_proxy_create(
         } else {
             (config.local_addr.clone(), 0u16)
         };
-        store.insert(config.name.clone(), frp_core::config::ProxyConfig {
-            name: config.name.clone(),
-            proxy_type: config.proxy_type.clone(),
-            remote_port: config.remote_port.unwrap_or(0),
-            local_ip,
-            local_port,
-            custom_domains: config.custom_domains.clone(),
-            group: config.group.clone(),
-            ..Default::default()
-        });
+        store.insert(
+            config.name.clone(),
+            frp_core::config::ProxyConfig {
+                name: config.name.clone(),
+                proxy_type: config.proxy_type.clone(),
+                remote_port: config.remote_port.unwrap_or(0),
+                local_ip,
+                local_port,
+                custom_domains: config.custom_domains.clone(),
+                group: config.group.clone(),
+                ..Default::default()
+            },
+        );
     } // write lock released before persist
 
     // Persist to disk
@@ -488,7 +543,10 @@ async fn handle_store_proxy_delete(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     tracing::warn!(proxy_name = %name, "Dashboard: single proxy delete");
-    let proxy = state.proxy_manager.get(&name).await
+    let proxy = state
+        .proxy_manager
+        .get(&name)
+        .await
         .ok_or_else(|| not_found("proxy not found"))?;
 
     // Clean up port
@@ -664,13 +722,19 @@ pub async fn run_dashboard(
     let api_routes = Router::new()
         .route("/api/status", get(handle_status))
         .route("/api/serverinfo", get(handle_serverinfo))
-        .route("/api/proxies", get(handle_proxies).delete(handle_proxies_delete))
+        .route(
+            "/api/proxies",
+            get(handle_proxies).delete(handle_proxies_delete),
+        )
         .route("/api/proxies/{name}", get(handle_proxy_by_name))
         .route("/api/proxy/{name}", get(handle_proxy_detail))
         .route("/api/proxy/{name}/traffic", get(handle_proxy_traffic))
         .route("/api/clients", get(handle_clients))
         .route("/api/clients/{run_id}", get(handle_client_detail))
-        .route("/api/store/proxies", get(handle_store_proxies).post(handle_store_proxy_create))
+        .route(
+            "/api/store/proxies",
+            get(handle_store_proxies).post(handle_store_proxy_create),
+        )
         .route("/api/store/proxy/{name}", delete(handle_store_proxy_delete))
         .route("/api/events", get(handle_events))
         // v2 API (Go frp v0.70.0 compat): paginated, filterable, searchable endpoints
@@ -682,14 +746,16 @@ pub async fn run_dashboard(
     // Returns 404 when disabled. When dashboard auth is configured,
     // /metrics also requires Basic auth.
     let state_for_metrics = state.clone();
-    let metrics_route = Router::new()
-        .route("/metrics", get(move || {
+    let metrics_route = Router::new().route(
+        "/metrics",
+        get(move || {
             let state = state_for_metrics.clone();
             async move {
                 crate::metrics::prom::sync_from_state(&state).await;
                 crate::metrics::prom::render_metrics_text()
             }
-        }));
+        }),
+    );
     let metrics_route = apply_admin_auth(metrics_route, &auth_user, &auth_password);
 
     let mut app = Router::new()
@@ -711,10 +777,7 @@ pub async fn run_dashboard(
     // Security: when no admin auth is configured, force binding to localhost
     // to prevent unauthenticated access to the dashboard and /metrics endpoint.
     let bind_addr = if auth_user.is_empty() || auth_password.is_empty() {
-        let localhost_addr = format!(
-            "127.0.0.1:{}",
-            addr.rsplit(':').next().unwrap_or("7500")
-        );
+        let localhost_addr = format!("127.0.0.1:{}", addr.rsplit(':').next().unwrap_or("7500"));
         tracing::warn!(
             original = %addr,
             bind = %localhost_addr,

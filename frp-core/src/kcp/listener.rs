@@ -57,7 +57,9 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
     let remote: SocketAddr = addr.parse().map_err(io::Error::other)?;
     let conv: u32 = loop {
         let c = rand::random();
-        if c != 0 { break c; } // conv=0 is FEC parity sentinel
+        if c != 0 {
+            break c;
+        } // conv=0 is FEC parity sentinel
     };
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;

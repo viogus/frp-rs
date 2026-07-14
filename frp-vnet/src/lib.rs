@@ -1,10 +1,10 @@
 //! Virtual network (L3 VPN) for frp-rs.
 //! Provides TUN device abstraction, CIDR routing, and packet controller.
 
-pub mod tun;
-pub mod router;
 pub mod controller;
 pub mod msg;
+pub mod router;
+pub mod tun;
 pub mod virtual_client;
 
 #[cfg(target_os = "linux")]

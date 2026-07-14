@@ -5,8 +5,8 @@ use tracing::debug;
 
 use frp_core::config::PluginConfig;
 
-use super::{PluginHandle, serve_plugin, urlencoding_decode};
 use super::http::HttpProxyAuth;
+use super::{serve_plugin, urlencoding_decode, PluginHandle};
 
 // ---------------------------------------------------------------
 // static_file plugin
@@ -20,7 +20,7 @@ use super::http::HttpProxyAuth;
 pub async fn start_static_file_proxy(cfg: &PluginConfig) -> Result<PluginHandle, frp_core::Error> {
     if cfg.local_path.is_empty() {
         return Err(frp_core::Error::Config(
-            "static_file plugin requires local_path".into()
+            "static_file plugin requires local_path".into(),
         ));
     }
     let auth = HttpProxyAuth::from_config(cfg);
@@ -31,11 +31,16 @@ pub async fn start_static_file_proxy(cfg: &PluginConfig) -> Result<PluginHandle,
         Some(cfg.strip_prefix.trim_matches('/').to_string())
     };
     let state = (auth, local_path, strip_prefix);
-    serve_plugin("static_file", state, |stream, peer, (a, lp, sp)| async move {
-        if let Err(e) = handle_static_file_conn(stream, a, &lp, sp.as_deref()).await {
-            debug!(%peer, error = %e, "static_file: {peer} error: {e}");
-        }
-    }).await
+    serve_plugin(
+        "static_file",
+        state,
+        |stream, peer, (a, lp, sp)| async move {
+            if let Err(e) = handle_static_file_conn(stream, a, &lp, sp.as_deref()).await {
+                debug!(%peer, error = %e, "static_file: {peer} error: {e}");
+            }
+        },
+    )
+    .await
 }
 
 async fn handle_static_file_conn(
@@ -48,7 +53,10 @@ async fn handle_static_file_conn(
     let mut buf = Vec::new();
     let mut chunk = [0u8; 512];
     loop {
-        let n = client.read(&mut chunk).await.map_err(|e| format!("read: {e}"))?;
+        let n = client
+            .read(&mut chunk)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
         if n == 0 {
             return Err("connection closed".into());
         }
@@ -74,7 +82,8 @@ async fn handle_static_file_conn(
     let url_path = parts[1];
 
     if method != "GET" {
-        let resp = b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let resp =
+            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let _ = client.write_all(resp).await;
         return Err(format!("method not allowed: {method}"));
     }
@@ -139,8 +148,8 @@ async fn handle_static_file_conn(
     // Canonicalize the open file path via /proc/self/fd or by canonicalizing
     // the path directly. On most platforms, canonicalize after open is safe
     // because the file descriptor pins the inode.
-    let resolved = std::fs::canonicalize(&full_path)
-        .map_err(|e| format!("failed to resolve path: {e}"))?;
+    let resolved =
+        std::fs::canonicalize(&full_path).map_err(|e| format!("failed to resolve path: {e}"))?;
     if !resolved.starts_with(&base) {
         let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let _ = client.write_all(resp).await;
@@ -158,8 +167,14 @@ async fn handle_static_file_conn(
         "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         content.len()
     );
-    client.write_all(resp.as_bytes()).await.map_err(|e| format!("write headers: {e}"))?;
-    client.write_all(&content).await.map_err(|e| format!("write body: {e}"))?;
+    client
+        .write_all(resp.as_bytes())
+        .await
+        .map_err(|e| format!("write headers: {e}"))?;
+    client
+        .write_all(&content)
+        .await
+        .map_err(|e| format!("write body: {e}"))?;
 
     Ok(())
 }
@@ -175,7 +190,10 @@ fn resolve_static_path(url_path: &str, strip_prefix: Option<&str>) -> Result<Str
         match decoded.strip_prefix(&prefix_slash) {
             Some(rest) => rest,
             None => {
-                return Err(format!("prefix '{}' not found in path '{}'", prefix, decoded));
+                return Err(format!(
+                    "prefix '{}' not found in path '{}'",
+                    prefix, decoded
+                ));
             }
         }
     } else {
@@ -214,6 +232,16 @@ fn mime_from_path(path: &std::path::Path) -> &'static str {
     }
 }
 
+/// Validate a relative path for path traversal attempts.
+/// Returns true if the path is safe to use (no empty components, no `.`, no `..`).
+fn validate_rel_path(path: &str) -> bool {
+    if path.is_empty() {
+        return true;
+    }
+    !path
+        .split('/')
+        .any(|c| c.is_empty() || c == "." || c == "..")
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,17 +249,32 @@ mod tests {
     #[test]
     fn test_resolve_static_path_no_prefix() {
         assert_eq!(resolve_static_path("/", None).unwrap(), "");
-        assert_eq!(resolve_static_path("/index.html", None).unwrap(), "index.html");
-        assert_eq!(resolve_static_path("/css/style.css", None).unwrap(), "css/style.css");
-        assert_eq!(resolve_static_path("/a/b/c.html", None).unwrap(), "a/b/c.html");
+        assert_eq!(
+            resolve_static_path("/index.html", None).unwrap(),
+            "index.html"
+        );
+        assert_eq!(
+            resolve_static_path("/css/style.css", None).unwrap(),
+            "css/style.css"
+        );
+        assert_eq!(
+            resolve_static_path("/a/b/c.html", None).unwrap(),
+            "a/b/c.html"
+        );
     }
 
     #[test]
     fn test_resolve_static_path_with_prefix() {
         let sp = Some("static");
         assert_eq!(resolve_static_path("/static/", sp).unwrap(), "");
-        assert_eq!(resolve_static_path("/static/index.html", sp).unwrap(), "index.html");
-        assert_eq!(resolve_static_path("/static/css/style.css", sp).unwrap(), "css/style.css");
+        assert_eq!(
+            resolve_static_path("/static/index.html", sp).unwrap(),
+            "index.html"
+        );
+        assert_eq!(
+            resolve_static_path("/static/css/style.css", sp).unwrap(),
+            "css/style.css"
+        );
     }
 
     #[test]
@@ -243,19 +286,34 @@ mod tests {
     #[test]
     fn test_mime_from_path() {
         use std::path::Path;
-        assert_eq!(mime_from_path(Path::new("index.html")), "text/html; charset=utf-8");
-        assert_eq!(mime_from_path(Path::new("style.css")), "text/css; charset=utf-8");
-        assert_eq!(mime_from_path(Path::new("app.js")), "application/javascript; charset=utf-8");
+        assert_eq!(
+            mime_from_path(Path::new("index.html")),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            mime_from_path(Path::new("style.css")),
+            "text/css; charset=utf-8"
+        );
+        assert_eq!(
+            mime_from_path(Path::new("app.js")),
+            "application/javascript; charset=utf-8"
+        );
         assert_eq!(mime_from_path(Path::new("image.png")), "image/png");
         assert_eq!(mime_from_path(Path::new("photo.jpg")), "image/jpeg");
-        assert_eq!(mime_from_path(Path::new("unknown.xyz")), "application/octet-stream");
+        assert_eq!(
+            mime_from_path(Path::new("unknown.xyz")),
+            "application/octet-stream"
+        );
     }
 
     #[test]
     fn test_resolve_static_path_rejects_traversal() {
         // resolve_static_path itself doesn't reject .. — caller does.
         // Verify that .. passes through (caller's responsibility to check).
-        assert_eq!(resolve_static_path("/../etc/passwd", None).unwrap(), "../etc/passwd");
+        assert_eq!(
+            resolve_static_path("/../etc/passwd", None).unwrap(),
+            "../etc/passwd"
+        );
     }
 
     #[test]
@@ -282,13 +340,4 @@ mod tests {
         assert!(validate_rel_path("file.with..dots"));
         assert!(validate_rel_path("something..test"));
     }
-}
-
-/// Validate a relative path for path traversal attempts.
-/// Returns true if the path is safe to use (no empty components, no `.`, no `..`).
-fn validate_rel_path(path: &str) -> bool {
-    if path.is_empty() {
-        return true;
-    }
-    !path.split('/').any(|c| c.is_empty() || c == "." || c == "..")
 }

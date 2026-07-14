@@ -1,12 +1,12 @@
-# Go frp v0.69.1 → frp-rs Compatibility Audit
+# Go frp v0.70.0 → frp-rs Compatibility Audit
 
-> Source-level comparison. Updated 2026-06-28.
+> Source-level comparison. Updated 2026-07-14.
 
 ## Summary
 
-frp-rs achieves **100% feature parity** with Go frp v0.69.1. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 9 client plugins, config coverage, SSH tunnel gateway, V2 AEAD protocol, and XTCP Go↔Rust cross-compat all match Go frp behavior. No remaining gaps.
+frp-rs targets Go frp v0.70.0 wire compatibility. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 9 client plugins, config coverage, SSH tunnel gateway, V2 AEAD protocol, and XTCP Go↔Rust cross-compat all match Go frp behavior.
 
-**40/40 cross-compatibility tests pass (2 additional guarded tests: XTCP 16-test pairwise matrix on VPS, V2 auto-detected locally).**
+**73/73 cross-compatibility tests pass (including XTCP 16-test pairwise matrix and V2 TCP).**
 
 ---
 

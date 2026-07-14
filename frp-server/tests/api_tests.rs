@@ -1,5 +1,5 @@
+use frp_core::metrics::{ConnGuard, ProxyMetricsRegistry};
 use std::sync::atomic::Ordering;
-use frp_core::metrics::{ProxyMetricsRegistry, ConnGuard};
 
 #[tokio::test]
 async fn test_metrics_snapshot_after_counting() {

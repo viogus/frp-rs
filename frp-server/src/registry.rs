@@ -210,8 +210,21 @@ mod tests {
         ClientRegistry::new()
     }
 
-    fn register_test_client(r: &ClientRegistry, user: &str, raw_id: &str, run_id: &str) -> (String, bool) {
-        r.register(user, raw_id, run_id, "testhost", "0.69.1", "1.2.3.4:5678", "v1")
+    fn register_test_client(
+        r: &ClientRegistry,
+        user: &str,
+        raw_id: &str,
+        run_id: &str,
+    ) -> (String, bool) {
+        r.register(
+            user,
+            raw_id,
+            run_id,
+            "testhost",
+            "0.69.1",
+            "1.2.3.4:5678",
+            "v1",
+        )
     }
 
     #[test]

@@ -36,9 +36,7 @@ fn bench_key_derivation(c: &mut Criterion) {
     let mut group = c.benchmark_group("key_derivation");
     group.bench_function("pbkdf2_sha1", |b| {
         let token = "my-test-token-42";
-        b.iter(|| {
-            frp_core::encryption::derive_key(black_box(token))
-        });
+        b.iter(|| frp_core::encryption::derive_key(black_box(token)));
     });
     group.finish();
 }
@@ -112,7 +110,9 @@ fn bench_cipher_stream(c: &mut Criterion) {
                 AsyncWriteExt::write_all(&mut w, &plaintext).await.unwrap();
                 AsyncWriteExt::flush(&mut w).await.unwrap();
             });
-            AsyncReadExt::read_to_end(&mut rx, &mut enc_buf).await.unwrap();
+            AsyncReadExt::read_to_end(&mut rx, &mut enc_buf)
+                .await
+                .unwrap();
             h.await.unwrap();
         });
 
@@ -158,10 +158,7 @@ fn bench_stun_parse(c: &mut Criterion) {
 
     group.bench_function("parse_binding_response", |b| {
         b.iter(|| {
-            let _ = frp_core::stun::parse_binding_response(
-                black_box(&pkt),
-                black_box(&tx_id),
-            );
+            let _ = frp_core::stun::parse_binding_response(black_box(&pkt), black_box(&tx_id));
         });
     });
     group.finish();
@@ -183,14 +180,13 @@ fn bench_protocol(c: &mut Criterion) {
             rt.block_on(async {
                 let (mut a_tx, mut a_rx) = tokio::io::duplex(65536);
 
-                frp_core::protocol::write_msg_v1(
-                    black_box(&mut a_tx),
-                    black_box(&msg),
-                ).await.unwrap();
+                frp_core::protocol::write_msg_v1(black_box(&mut a_tx), black_box(&msg))
+                    .await
+                    .unwrap();
 
-                let _ = frp_core::protocol::read_msg_v1(
-                    black_box(&mut a_rx),
-                ).await.unwrap();
+                let _ = frp_core::protocol::read_msg_v1(black_box(&mut a_rx))
+                    .await
+                    .unwrap();
             });
         });
     });
@@ -203,26 +199,106 @@ fn bench_protocol(c: &mut Criterion) {
 fn bench_protocol_all_types(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let all_types: &[(u8, u16, &str)] = &[
-        (frp_core::msg::TYPE_LOGIN, frp_core::msg::V2_TYPE_LOGIN, "login"),
-        (frp_core::msg::TYPE_LOGIN_RESP, frp_core::msg::V2_TYPE_LOGIN_RESP, "login_resp"),
-        (frp_core::msg::TYPE_NEW_PROXY, frp_core::msg::V2_TYPE_NEW_PROXY, "new_proxy"),
-        (frp_core::msg::TYPE_NEW_PROXY_RESP, frp_core::msg::V2_TYPE_NEW_PROXY_RESP, "new_proxy_resp"),
-        (frp_core::msg::TYPE_CLOSE_PROXY, frp_core::msg::V2_TYPE_CLOSE_PROXY, "close_proxy"),
-        (frp_core::msg::TYPE_NEW_WORK_CONN, frp_core::msg::V2_TYPE_NEW_WORK_CONN, "new_work_conn"),
-        (frp_core::msg::TYPE_REQ_WORK_CONN, frp_core::msg::V2_TYPE_REQ_WORK_CONN, "req_work_conn"),
-        (frp_core::msg::TYPE_START_WORK_CONN, frp_core::msg::V2_TYPE_START_WORK_CONN, "start_work_conn"),
-        (frp_core::msg::TYPE_PING, frp_core::msg::V2_TYPE_PING, "ping"),
-        (frp_core::msg::TYPE_PONG, frp_core::msg::V2_TYPE_PONG, "pong"),
-        (frp_core::msg::TYPE_NEW_VISITOR_CONN, frp_core::msg::V2_TYPE_NEW_VISITOR_CONN, "new_visitor_conn"),
-        (frp_core::msg::TYPE_NEW_VISITOR_CONN_RESP, frp_core::msg::V2_TYPE_NEW_VISITOR_CONN_RESP, "new_visitor_conn_resp"),
-        (frp_core::msg::TYPE_UDP_PACKET, frp_core::msg::V2_TYPE_UDP_PACKET, "udp_packet"),
-        (frp_core::msg::TYPE_NAT_HOLE_VISITOR, frp_core::msg::V2_TYPE_NAT_HOLE_VISITOR, "nat_hole_visitor"),
-        (frp_core::msg::TYPE_NAT_HOLE_CLIENT, frp_core::msg::V2_TYPE_NAT_HOLE_CLIENT, "nat_hole_client"),
-        (frp_core::msg::TYPE_NAT_HOLE_RESP, frp_core::msg::V2_TYPE_NAT_HOLE_RESP, "nat_hole_resp"),
-        (frp_core::msg::TYPE_NAT_HOLE_SID, frp_core::msg::V2_TYPE_NAT_HOLE_SID, "nat_hole_sid"),
-        (frp_core::msg::TYPE_NAT_HOLE_REPORT, frp_core::msg::V2_TYPE_NAT_HOLE_REPORT, "nat_hole_report"),
-        (frp_core::msg::TYPE_CLOSE_PROXY_RESP, frp_core::msg::V2_TYPE_CLOSE_PROXY_RESP, "close_proxy_resp"),
-        (frp_core::msg::TYPE_ERROR, frp_core::msg::V2_TYPE_ERROR, "error"),
+        (
+            frp_core::msg::TYPE_LOGIN,
+            frp_core::msg::V2_TYPE_LOGIN,
+            "login",
+        ),
+        (
+            frp_core::msg::TYPE_LOGIN_RESP,
+            frp_core::msg::V2_TYPE_LOGIN_RESP,
+            "login_resp",
+        ),
+        (
+            frp_core::msg::TYPE_NEW_PROXY,
+            frp_core::msg::V2_TYPE_NEW_PROXY,
+            "new_proxy",
+        ),
+        (
+            frp_core::msg::TYPE_NEW_PROXY_RESP,
+            frp_core::msg::V2_TYPE_NEW_PROXY_RESP,
+            "new_proxy_resp",
+        ),
+        (
+            frp_core::msg::TYPE_CLOSE_PROXY,
+            frp_core::msg::V2_TYPE_CLOSE_PROXY,
+            "close_proxy",
+        ),
+        (
+            frp_core::msg::TYPE_NEW_WORK_CONN,
+            frp_core::msg::V2_TYPE_NEW_WORK_CONN,
+            "new_work_conn",
+        ),
+        (
+            frp_core::msg::TYPE_REQ_WORK_CONN,
+            frp_core::msg::V2_TYPE_REQ_WORK_CONN,
+            "req_work_conn",
+        ),
+        (
+            frp_core::msg::TYPE_START_WORK_CONN,
+            frp_core::msg::V2_TYPE_START_WORK_CONN,
+            "start_work_conn",
+        ),
+        (
+            frp_core::msg::TYPE_PING,
+            frp_core::msg::V2_TYPE_PING,
+            "ping",
+        ),
+        (
+            frp_core::msg::TYPE_PONG,
+            frp_core::msg::V2_TYPE_PONG,
+            "pong",
+        ),
+        (
+            frp_core::msg::TYPE_NEW_VISITOR_CONN,
+            frp_core::msg::V2_TYPE_NEW_VISITOR_CONN,
+            "new_visitor_conn",
+        ),
+        (
+            frp_core::msg::TYPE_NEW_VISITOR_CONN_RESP,
+            frp_core::msg::V2_TYPE_NEW_VISITOR_CONN_RESP,
+            "new_visitor_conn_resp",
+        ),
+        (
+            frp_core::msg::TYPE_UDP_PACKET,
+            frp_core::msg::V2_TYPE_UDP_PACKET,
+            "udp_packet",
+        ),
+        (
+            frp_core::msg::TYPE_NAT_HOLE_VISITOR,
+            frp_core::msg::V2_TYPE_NAT_HOLE_VISITOR,
+            "nat_hole_visitor",
+        ),
+        (
+            frp_core::msg::TYPE_NAT_HOLE_CLIENT,
+            frp_core::msg::V2_TYPE_NAT_HOLE_CLIENT,
+            "nat_hole_client",
+        ),
+        (
+            frp_core::msg::TYPE_NAT_HOLE_RESP,
+            frp_core::msg::V2_TYPE_NAT_HOLE_RESP,
+            "nat_hole_resp",
+        ),
+        (
+            frp_core::msg::TYPE_NAT_HOLE_SID,
+            frp_core::msg::V2_TYPE_NAT_HOLE_SID,
+            "nat_hole_sid",
+        ),
+        (
+            frp_core::msg::TYPE_NAT_HOLE_REPORT,
+            frp_core::msg::V2_TYPE_NAT_HOLE_REPORT,
+            "nat_hole_report",
+        ),
+        (
+            frp_core::msg::TYPE_CLOSE_PROXY_RESP,
+            frp_core::msg::V2_TYPE_CLOSE_PROXY_RESP,
+            "close_proxy_resp",
+        ),
+        (
+            frp_core::msg::TYPE_ERROR,
+            frp_core::msg::V2_TYPE_ERROR,
+            "error",
+        ),
     ];
 
     let mut group = c.benchmark_group("protocol_all_types");
@@ -303,12 +379,20 @@ fn bench_bridge_pipeline(c: &mut Criterion) {
 
                     let h = tokio::spawn(async move {
                         frp_core::bridge::bridge_plain(
-                            u_r_bridge, u_w_bridge, w_r_bridge, w_w_bridge,
-                            false, vec![], None,
-                        ).await;
+                            u_r_bridge,
+                            u_w_bridge,
+                            w_r_bridge,
+                            w_w_bridge,
+                            false,
+                            vec![],
+                            None,
+                        )
+                        .await;
                     });
 
-                    AsyncWriteExt::write_all(&mut u_w_test, &data).await.unwrap();
+                    AsyncWriteExt::write_all(&mut u_w_test, &data)
+                        .await
+                        .unwrap();
                     drop(u_w_test);
                     drop(w_w_test);
 
@@ -328,12 +412,23 @@ fn bench_bridge_pipeline(c: &mut Criterion) {
 
                     let h = tokio::spawn(async move {
                         frp_core::bridge::bridge_encrypted(
-                            u_r_bridge, u_w_bridge, w_r_bridge, w_w_bridge,
-                            &key, false, vec![], None, None, None,
-                        ).await;
+                            u_r_bridge,
+                            u_w_bridge,
+                            w_r_bridge,
+                            w_w_bridge,
+                            &key,
+                            false,
+                            vec![],
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
                     });
 
-                    AsyncWriteExt::write_all(&mut u_w_test, &data).await.unwrap();
+                    AsyncWriteExt::write_all(&mut u_w_test, &data)
+                        .await
+                        .unwrap();
                     drop(u_w_test);
                     drop(w_w_test);
 
@@ -353,12 +448,23 @@ fn bench_bridge_pipeline(c: &mut Criterion) {
 
                     let h = tokio::spawn(async move {
                         frp_core::bridge::bridge_encrypted(
-                            u_r_bridge, u_w_bridge, w_r_bridge, w_w_bridge,
-                            &key, true, vec![], None, None, None,
-                        ).await;
+                            u_r_bridge,
+                            u_w_bridge,
+                            w_r_bridge,
+                            w_w_bridge,
+                            &key,
+                            true,
+                            vec![],
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
                     });
 
-                    AsyncWriteExt::write_all(&mut u_w_test, &data).await.unwrap();
+                    AsyncWriteExt::write_all(&mut u_w_test, &data)
+                        .await
+                        .unwrap();
                     drop(u_w_test);
                     drop(w_w_test);
 

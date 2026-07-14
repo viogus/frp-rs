@@ -73,10 +73,7 @@ pub fn dump_cpu_profile(
 /// but for profiling file names the resulting timestamp is always unique
 /// and chronologically ordered, which is sufficient.
 fn format_timestamp(now: SystemTime) -> String {
-    let secs = now
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
     let days = secs / 86400;
     let time_secs = secs % 86400;
@@ -86,7 +83,10 @@ fn format_timestamp(now: SystemTime) -> String {
     let sec = time_secs % 60;
 
     let (year, month, day) = days_to_date(days);
-    format!("{:04}{:02}{:02}_{:02}{:02}{:02}", year, month, day, hour, min, sec)
+    format!(
+        "{:04}{:02}{:02}_{:02}{:02}{:02}",
+        year, month, day, hour, min, sec
+    )
 }
 
 fn is_leap_year(year: u64) -> bool {
@@ -179,19 +179,11 @@ mod tests {
                 }
             });
 
-            let path = dump_cpu_profile(
-                Duration::from_millis(200),
-                dir.path(),
-                "test_profile",
-            )
-            .expect("dump_cpu_profile should succeed");
+            let path = dump_cpu_profile(Duration::from_millis(200), dir.path(), "test_profile")
+                .expect("dump_cpu_profile should succeed");
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
 
-            assert!(
-                path.exists(),
-                "output SVG should exist at {:?}",
-                path
-            );
+            assert!(path.exists(), "output SVG should exist at {:?}", path);
             assert_eq!(
                 path.extension().and_then(|e| e.to_str()),
                 Some("svg"),
