@@ -240,12 +240,45 @@ pub(crate) async fn handle_new_proxy(
                     .unwrap_or_default(),
             };
 
+            // Pre-populate sk_index BEFORE proxy_manager.register()
+            // so that NewVisitorConn arriving during the registration
+            // race window can fall back to sk_index for auth.
+            // (Go frp startVisitorListener pattern equivalent.)
+            let sk_key: Option<String> = if np.proxy_type == "stcp" || np.proxy_type == "xtcp" {
+                np.sk.as_ref().filter(|s| !s.is_empty()).map(|sk| {
+                    let vn = np.virtual_net.as_deref().unwrap_or("");
+                    if vn.is_empty() {
+                        sk.clone()
+                    } else {
+                        format!("{}:{}", vn, sk)
+                    }
+                })
+            } else {
+                None
+            };
+            if let Some(ref key) = sk_key {
+                state
+                    .xtcp
+                    .sk_index
+                    .write()
+                    .await
+                    .insert(key.clone(), np.proxy_name.clone());
+                let vn = np.virtual_net.as_deref().unwrap_or("");
+                info!(proxy_name = %np.proxy_name, vn = %vn, "STCP/XTCP sk_index pre-populated for '{}'{}",
+                    np.proxy_name,
+                    if vn.is_empty() { String::new() } else { format!(" (virtual_net: {vn})") });
+            }
+
             if let Err(e) = state
                 .proxy_manager
                 .register(run_id.to_string(), info.clone())
                 .await
             {
                 state.used_ports.write().await.remove(&port);
+                // Clean up pre-populated sk_index on registration failure
+                if let Some(ref key) = sk_key {
+                    state.xtcp.sk_index.write().await.remove(key);
+                }
                 reject_new_proxy(
                     writer,
                     &np.proxy_name,
@@ -278,28 +311,8 @@ pub(crate) async fn handle_new_proxy(
                 }
             }
 
-            // Register STCP/XTCP proxies in sk_index (scoped by virtual_net)
-            if np.proxy_type == "stcp" || np.proxy_type == "xtcp" {
-                if let Some(ref sk) = np.sk {
-                    if !sk.is_empty() {
-                        let vn = np.virtual_net.as_deref().unwrap_or("");
-                        let sk_key = if vn.is_empty() {
-                            sk.clone()
-                        } else {
-                            format!("{}:{}", vn, sk)
-                        };
-                        state
-                            .xtcp
-                            .sk_index
-                            .write()
-                            .await
-                            .insert(sk_key, np.proxy_name.clone());
-                        info!(proxy_name = %np.proxy_name, vn = %vn, "STCP/XTCP proxy '{}' registered with sk{}",
-                            np.proxy_name,
-                            if vn.is_empty() { String::new() } else { format!(" (virtual_net: {vn})") });
-                    }
-                }
-            }
+            // sk_index was pre-populated before proxy_manager.register() above
+            // to close the NewVisitorConn race window.
 
             // Register HTTP proxies with VhostManager
             if np.proxy_type == "http" {

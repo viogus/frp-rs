@@ -3,6 +3,7 @@ mod proxy_ops;
 
 use crate::lock::RwLockExt;
 use crate::nathole::NAT_HOLE_TIMEOUT;
+use crate::proxy::ProxyInfo;
 use proxy_ops::err_msg;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -949,11 +950,9 @@ pub async fn handle_control<S>(
                             if let Some(port) = info.remote_port {
                                 state.used_ports.write().await.remove(&port);
                             }
-                            // Clean up STCP sk_index
-                            if let Some(ref sk) = info.sk {
-                                if !sk.is_empty() {
-                                    state.xtcp.sk_index.write().await.remove(sk);
-                                }
+                            // Clean up STCP sk_index (use composite key for virtual_net)
+                            if let Some(ref key) = info.sk_index_key() {
+                                state.xtcp.sk_index.write().await.remove(key);
                             }
                             // Clean up VHost routes
                             state.vhost_manager.unregister(&cp.proxy_name).await;
@@ -988,11 +987,11 @@ pub async fn handle_control<S>(
                                 serde_json::json!({ "proxy_name": pn, "run_id": rid }),
                             ).await;
                         });
-                        // Send CloseProxyResp back to client (Go frp compat)
-                        let cpr = FrpMessage::CloseProxyResp(msg::CloseProxyResp {
-                            proxy_name: cp.proxy_name.clone(),
-                        });
-                        let _ = write_ctl_msg(&mut writer, &cpr, v2).await;
+                        // Note: Go frp does not send CloseProxyResp (type 7/19 is
+                        // Rust-only). frp-rs client handles both CloseProxy
+                        // and CloseProxyResp identically and already cleans up
+                        // health_cancels immediately after sending CloseProxy,
+                        // so no response is needed here.
                     }
                     Ok(FrpMessage::NatHoleClient(ref client_msg)) => {
                         debug!(
@@ -1164,7 +1163,7 @@ pub async fn handle_control<S>(
                             let sk_map = state.xtcp.sk_index.read().await;
                             sk_map.iter().any(|(sk_key, pn)| {
                                 if pn == &nvc.proxy_name {
-                                    let sk_raw = sk_key.rsplit(':').next().unwrap_or(sk_key);
+                                    let sk_raw = ProxyInfo::sk_from_index_key(sk_key);
                                     let expected = frp_core::auth::generate_token(sk_raw, timestamp);
                                     expected == sign_key
                                 } else {
