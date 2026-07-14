@@ -70,14 +70,14 @@ async fn v2_handshake_and_read(
 
 /// Build an `AuthConfig` from a server config's `auth` sub-struct.
 /// Shared by `Service::new()` and `Service::reload()`.
-fn build_auth_config(auth: &frp_core::config::AuthServerConfig) -> AuthConfig {
+fn build_auth_config(auth: &frp_core::config::AuthServerConfig, unsafe_features: &UnsafeFeatures) -> AuthConfig {
     AuthConfig {
         method: match auth.method.to_lowercase().as_str() {
             #[cfg(feature = "oidc")]
             "oidc" => AuthMethod::Oidc,
             _ => AuthMethod::Token,
         },
-        token: frp_core::auth::resolve_dynamic_token_checked(&auth.token, &UnsafeFeatures::default()).unwrap_or_else(|e| {
+        token: frp_core::auth::resolve_dynamic_token_checked(&auth.token, unsafe_features).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
             String::new()
         }),
@@ -126,11 +126,19 @@ pub struct Service {
     state: Arc<AppState>,
     /// Path to config file for SIGUSR1 reload.
     config_file: Option<String>,
+    unsafe_features: UnsafeFeatures,
 }
 
 impl Service {
+    /// Create a new Service with default unsafe features (all blocked).
     pub async fn new(cfg: ServerConfig, config_file: Option<String>) -> Result<Self, String> {
-        let auth_cfg = build_auth_config(&cfg.auth);
+        Self::with_unsafe_features(cfg, config_file, UnsafeFeatures::default()).await
+    }
+
+    /// Create a new Service with a custom unsafe features allowlist.
+    /// Use this when `--allow-unsafe` CLI flag is provided.
+    pub async fn with_unsafe_features(cfg: ServerConfig, config_file: Option<String>, unsafe_features: UnsafeFeatures) -> Result<Self, String> {
+        let auth_cfg = build_auth_config(&cfg.auth, &unsafe_features);
         auth_cfg
             .check_startup()
             .map_err(|e| format!("security misconfiguration: {e}"))?;
@@ -221,6 +229,7 @@ impl Service {
             state: Arc::new(state),
             cfg,
             config_file,
+            unsafe_features,
         })
     }
 
@@ -804,7 +813,13 @@ impl Service {
                                         {
                                             tracing::warn!("KCP TLS connection requires TLS feature (disabled in this build)");
                                         }
-                                    } else if state.tcp_mux {
+                                    } else {
+                                        // Reject plain KCP when tls_only is set
+                                        if state.tls_only {
+                                            warn!(peer = %peer, "TLS-only mode: rejected plain KCP from {}", peer);
+                                            return;
+                                        }
+                                        if state.tcp_mux {
                                         // tcp_mux enabled: Go frpc wraps KCP conn in yamux
                                         // before sending Login (matching Go frps flow).
                                         // Replay the 7 bytes consumed by magic check —
@@ -909,6 +924,7 @@ impl Service {
                                             }
                                         }
                                     }
+                                }
                                 }
                             });
                         }
@@ -2125,7 +2141,7 @@ impl Service {
         let mut changes: Vec<String> = Vec::new();
 
         // Build new reloadable state
-        let new_auth_cfg = build_auth_config(&new_cfg.auth);
+        let new_auth_cfg = build_auth_config(&new_cfg.auth, &self.unsafe_features);
         new_auth_cfg
             .check_startup()
             .map_err(|e| format!("security misconfiguration: {e}"))?;

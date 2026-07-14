@@ -119,7 +119,13 @@ pub struct Service {
 }
 
 impl Service {
+    /// Create a new client Service with default unsafe features (all blocked).
     pub async fn new(cfg: ClientConfig, config_file: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_unsafe_features(cfg, config_file, UnsafeFeatures::default()).await
+    }
+
+    /// Create a new client Service with a custom unsafe features allowlist.
+    pub async fn with_unsafe_features(cfg: ClientConfig, config_file: Option<String>, unsafe_features: UnsafeFeatures) -> Result<Self, Box<dyn std::error::Error>> {
         // Determine auth method from [auth] section if present, otherwise token
         #[cfg(feature = "oidc")]
         let auth_method = if let Some(ref ac) = cfg.auth {
@@ -132,7 +138,7 @@ impl Service {
 
         let auth_cfg = AuthConfig {
             method: auth_method.clone(),
-            token: frp_core::auth::resolve_dynamic_token_checked(&cfg.token, &UnsafeFeatures::default()).unwrap_or_else(|e| {
+            token: frp_core::auth::resolve_dynamic_token_checked(&cfg.token, &unsafe_features).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
                 String::new()
             }),

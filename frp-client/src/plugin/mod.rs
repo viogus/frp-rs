@@ -219,13 +219,22 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     let method = parts[0];
     let path = parts[1];
 
-    // Build forwarded request with optional Host rewrite
+    // Build forwarded request with optional Host rewrite.
+    // Strip hop-by-hop headers per RFC 2616 Section 13.5.1.
+    let hop_by_hop: &[&str] = &[
+        "transfer-encoding:", "proxy-authorization:", "proxy-authenticate:",
+        "te:", "trailer:", "upgrade:", "connection:",
+    ];
     let mut fwd = format!("{method} {path} HTTP/1.0\r\n");
     for line in lines {
         if line.is_empty() {
             continue;
         }
-        if !host_rewrite.is_empty() && line.to_lowercase().starts_with("host:") {
+        let lower = line.to_lowercase();
+        if hop_by_hop.iter().any(|h| lower.starts_with(h)) {
+            continue;
+        }
+        if !host_rewrite.is_empty() && lower.starts_with("host:") {
             fwd.push_str(&format!("Host: {host_rewrite}\r\n"));
         } else {
             fwd.push_str(line);

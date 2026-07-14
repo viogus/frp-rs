@@ -43,20 +43,24 @@ impl HttpProxyAuth {
     }
 
     pub fn check(&self, header: &str) -> bool {
-        if self.user.is_none() && self.password.is_none() {
-            return true;
-        }
-        // Parse "Basic base64(user:pass)"
-        if let Some(credentials) = header.strip_prefix("Basic ") {
-            if let Ok(decoded) = base64_decode(credentials) {
-                if let Some((user, pass)) = decoded.split_once(':') {
-                    let user_ok = self.user.as_deref().is_none_or(|u| u == user);
-                    let pass_ok = self.password.as_deref().is_none_or(|p| p == pass);
-                    return user_ok && pass_ok;
+        match (self.user.as_deref(), self.password.as_deref()) {
+            // No auth configured — accept all connections
+            (None, None) => true,
+            // Both configured — require both to match
+            (Some(expected_user), Some(expected_pass)) => {
+                if let Some(credentials) = header.strip_prefix("Basic ") {
+                    if let Ok(decoded) = base64_decode(credentials) {
+                        if let Some((user, pass)) = decoded.split_once(':') {
+                            return user == expected_user && pass == expected_pass;
+                        }
+                    }
                 }
+                false
             }
+            // Partially configured (only user or only password) — reject all.
+            // This is a config error; logging happens once at config load.
+            (Some(_), None) | (None, Some(_)) => false,
         }
-        false
     }
 }
 
