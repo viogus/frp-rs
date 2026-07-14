@@ -94,6 +94,8 @@ pub struct ControlTx {
     pub tx: mpsc::UnboundedSender<InternalMsg>,
     pub client_addr: Option<SocketAddr>,
     pub login_time: Instant,
+    /// Absolute Unix epoch timestamp of login, for dashboard v2 API.
+    pub login_time_unix: i64,
     pub pool_stats: Arc<PoolStats>,
     pub user: String,
 }

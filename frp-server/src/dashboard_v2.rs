@@ -558,9 +558,7 @@ async fn handle_v2_users(
         entry.proxy_count += 1;
     }
     // Count clients per user. Each control connection maps to one client.
-    // Since ControlTx doesn't track user, attribute each client to all
-    // users that have at least one proxy registered by that client.
-    // For now, clients are attributed to the user of their first proxy.
+    // Clients are attributed to their login user (ControlTx.user).
     for (run_id, _ctl) in ctl_map.iter() {
         let proxies = state.proxy_manager.list_client(run_id).await;
         if let Some(first_proxy) = proxies.first() {
@@ -604,7 +602,7 @@ async fn handle_v2_clients(
 
         let proxies = state.proxy_manager.list_client_proxy_names(run_id).await;
         let client_addr = ctl.client_addr.map(|a| a.to_string());
-        let login_secs = ctl.login_time.elapsed().as_secs();
+        let login_secs = ctl.login_time_unix as u64;
 
         // User filter: match against proxies registered by this client.
         if let Some(ref user_filter) = q.user {
@@ -676,7 +674,7 @@ async fn handle_v2_client_detail(
         run_id: run_id.clone(),
         client_addr,
         online: true,
-        login_time_secs: ctl.login_time.elapsed().as_secs(),
+        login_time_secs: ctl.login_time_unix as u64,
         proxy_count: proxies.len(),
         proxies: proxies.clone(),
         pool_size: ctl.pool_stats.pool_size.load(Ordering::Relaxed),
@@ -721,10 +719,11 @@ async fn handle_v2_proxies(
         if let Some(ref cid) = q.client_id { if p.run_id != *cid { continue; } }
 
         let spec = proxy_spec(p);
-        let (traffic_in, traffic_out, cur_conns) = state.proxy_metrics.get(&p.name).await
+        let (today_in, today_out, cur_conns) = state.proxy_metrics.get(&p.name).await
             .map(|m| {
                 let s = m.snapshot();
-                (s.bytes_in, s.bytes_out, s.current_conns)
+                let (tin, tout) = m.daily.snapshot();
+                (tin[0], tout[0], s.current_conns)
             })
             .unwrap_or((0, 0, 0));
 
@@ -735,8 +734,8 @@ async fn handle_v2_proxies(
             spec,
             status: V2ProxyStatus {
                 phase: if online { "online" } else { "offline" }.into(),
-                today_traffic_in: traffic_in,
-                today_traffic_out: traffic_out,
+                today_traffic_in: today_in,
+                today_traffic_out: today_out,
                 cur_conns,
                 last_start_at: 0,
                 last_close_at: 0,
@@ -768,10 +767,11 @@ async fn handle_v2_proxy_detail(
 
     let online = state.run_id_to_ctl_tx.read().await.contains_key(&p.run_id);
 
-    let (traffic_in, traffic_out, cur_conns) = state.proxy_metrics.get(&p.name).await
+    let (today_in, today_out, cur_conns) = state.proxy_metrics.get(&p.name).await
         .map(|m| {
             let s = m.snapshot();
-            (s.bytes_in, s.bytes_out, s.current_conns)
+            let (tin, tout) = m.daily.snapshot();
+            (tin[0], tout[0], s.current_conns)
         })
         .unwrap_or((0, 0, 0));
 
@@ -782,8 +782,8 @@ async fn handle_v2_proxy_detail(
         spec: proxy_spec(&p),
         status: V2ProxyStatus {
             phase: if online { "online" } else { "offline" }.into(),
-            today_traffic_in: traffic_in,
-            today_traffic_out: traffic_out,
+            today_traffic_in: today_in,
+            today_traffic_out: today_out,
             cur_conns,
             last_start_at: 0,
             last_close_at: 0,

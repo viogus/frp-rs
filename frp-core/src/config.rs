@@ -181,7 +181,7 @@ fn default_allow_port_start() -> u16 { 10000 }
 fn default_allow_port_end() -> u16 { 50000 }
 fn default_vhost_http_timeout() -> u64 { 60 }
 fn default_user_conn_timeout() -> u64 { 10 }
-fn default_udp_packet_size() -> usize { 65535 }
+fn default_udp_packet_size() -> usize { 1500 }
 fn default_nathole_analysis_data_reserve_hours() -> u64 { 1 }
 fn default_graceful_timeout() -> u64 { 30 }
 fn default_authentication_timeout() -> i64 { 15 }
@@ -286,7 +286,7 @@ impl Default for ServerConfig {
             vhost_http_timeout: default_vhost_http_timeout(),
             user_conn_timeout: default_user_conn_timeout(),
             tcp_mux_passthrough: false,
-            detailed_errors_to_client: false,
+            detailed_errors_to_client: true,
             udp_packet_size: default_udp_packet_size(),
             http_plugins: Vec::new(),
             feature: FeatureConfig::default(),
@@ -511,9 +511,9 @@ pub struct ServerTransportConfig {
     pub heartbeat_timeout: i64,
     /// Max work-connection pool count per client. The server caps the
     /// client-requested pool_count at this value. 0 = no server-side
-    /// cap (the client's pool_count is used as-is). Default: 0.
+    /// cap (the client's pool_count is used as-is). Default: 5.
     /// Go frp compat: transport.maxPoolCount.
-    #[serde(default, alias = "maxPoolCount")]
+    #[serde(default = "default_max_pool_count", alias = "maxPoolCount")]
     pub max_pool_count: i64,
 }
 
@@ -523,12 +523,31 @@ impl Default for ServerTransportConfig {
             tcp_mux: true,
             tcp_mux_keepalive_interval: 30,
             heartbeat_timeout: default_heartbeat_timeout(),
-            max_pool_count: 0,
+            max_pool_count: default_max_pool_count(),
         }
     }
 }
 
 fn default_heartbeat_timeout() -> i64 { 90 }
+fn default_max_pool_count() -> i64 { 5 }
+
+impl ServerTransportConfig {
+    /// Apply conditional defaults matching Go frp v0.70.0
+    /// `ServerTransportConfig.Complete()`. Call after deserialization,
+    /// before consuming the config.
+    pub fn complete(&mut self) {
+        if self.tcp_mux {
+            // When tcpMux is enabled, heartbeat of application layer is
+            // unnecessary — rely on yamux keepalive instead (Go compat).
+            if self.heartbeat_timeout == default_heartbeat_timeout()
+                || self.heartbeat_timeout == 0
+            {
+                self.heartbeat_timeout = -1;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------
 // Plugin Configuration
 // ---------------------------------------------------------------
@@ -1265,7 +1284,9 @@ pub fn load_server_config(
     path: &str,
     strict_config: bool,
 ) -> Result<ServerConfig, Box<dyn std::error::Error>> {
-    load_config_from_file::<ServerConfig>(path, strict_config, known_server_keys, normalize_server_config, validate_server_config)
+    let mut cfg = load_config_from_file::<ServerConfig>(path, strict_config, known_server_keys, normalize_server_config, validate_server_config)?;
+    cfg.transport.complete();
+    Ok(cfg)
 }
 
 /// Load a client configuration from a file path, auto-detecting format by extension.
