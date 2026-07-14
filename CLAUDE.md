@@ -69,6 +69,30 @@ Every feature, fix, and test change follows three rules:
    bash scripts/download-go-frp.sh
    ```
 
+## Current Health (2026-07-14)
+
+| Metric | Value |
+|--------|-------|
+| `cargo clippy` (default) | zero warnings |
+| `cargo clippy -D warnings` | zero warnings |
+| `cargo test --workspace` | 419 passed, 0 failed (27 suites) |
+| `unsafe` blocks | 9 (all with `// SAFETY:` comment) |
+| `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
+| `let _ =` error discards | all commented (`vhost.rs`, `tcpmux.rs`) |
+| `exec://` token source | always blocked by `UnsafeFeatures::default()` |
+| Security audit | `cargo audit` + `cargo deny check` before release |
+
+Key perf optimizations (3 audit cycles):
+- Bridge: `compress_chunk`/`decompress_chunk` reuse buffers (zero alloc per iteration)
+- CFB cipher: u128 XOR block path (~16x encrypt throughput)
+- Linux TCP bridge: `splice(2)` zero-copy relay
+- CipherWriter: shared `scratch` buffer reuse
+- AEAD read: pre-allocated `scratch` retained across frames
+- KCP: packet pool, FEC fast-path (skip 6 allocs when no loss), lazy `recv_buf`, O(1) write-path `conv_index`, write backpressure
+- BandwidthLimiter: `f64` token bucket, zero alloc per check
+
+Deep-dive architecture docs live in Claude memory files: `frp-core-deep-dive`, `frp-server-deep-dive`, `frp-client-deep-dive`, `frp-test-coverage`, `frp-vnet-architecture`.
+
 ## Architecture: Beyond the README
 
 The README gives a solid overview. The sections below cover details that reading a single file won't reveal.
@@ -183,9 +207,9 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 
 - **TCP**: fully implemented (control + work connections, TLS, WebSocket upgrade)
 - **WebSocket**: fully implemented — dial, accept, message dispatch (control + work connections)
-- **KCP**: fully implemented — dial, accept, TLS, yamux, message dispatch. Go frps dispatch order (service.go:670-710): read 1 byte → TLS detect (0x17=strip, 0x16=replay) → TLS accept → if tcpMux: yamux wrap → V2/V1 detection. Our KCP handler follows same order. Verified with Go frpc v0.69.1: KCP+TLS+tcpMux+CipherStream all working (RTT ~76ms).
+- **KCP**: fully implemented — dial, accept, TLS, yamux, message dispatch. Architecture: `KcpSocket` driver (UDP event loop), `KcpSession` per-peer (kcp crate + FEC), `KcpStream` (AsyncRead/AsyncWrite). `conv_index: HashMap<u32, SocketAddr>` provides O(1) write-path lookup. Write backpressure via `Arc<AtomicUsize>` shared between `KcpSocket` and `KcpStream` (gates `poll_write` at 1024 unprocessed messages). Go frps dispatch order (service.go:670-710): read 1 byte → TLS detect (0x17=strip, 0x16=replay) → TLS accept → if tcpMux: yamux wrap → V2/V1 detection. Our KCP handler follows same order. Verified with Go frpc v0.69.1: KCP+TLS+tcpMux+CipherStream all working (RTT ~76ms). Integration test in `frp-core/tests/kcp_integration.rs` (real UDP sockets).
 - **QUIC**: fully implemented — dial, accept, message dispatch (requires TLS cert on server)
-- **TcpMux** (`frp-core/src/mux.rs`, 258 lines): full yamux implementation — server and client mode, keepalive, stream accept/spawn
+- **TcpMux** (`frp-core/src/mux.rs`, 382 lines): full yamux implementation — server and client mode, keepalive, stream accept/spawn via `server_mux`/`client_mux`. Double-poll pattern flushes pending frames to socket. `debug_assert!` guards `keepalive_interval > 0` (zero causes immediate timeout Elapsed in server, tight `select!` spin in client).
 - **Dashboard** (`frp-server/src/dashboard.rs`, 86 lines): basic status API with axum (version, uptime, client/proxy counts)
 - **VHost** (`frp-server/src/vhost.rs`, 394 lines): HTTP/HTTPS VHost routing with Host header parsing, SNI, pre-read byte forwarding
 
@@ -200,9 +224,10 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 
 - **Benchmarks**: `cargo bench -p frp-core` (9 groups: key derivation, compression, cipher stream, STUN, V1+V2 protocol all-types, bridge plain/encrypted/compressed, bandwidth limiter) + `cargo bench -p frp-server` (`nathole` classify + analysis; `proxy_registration` register throughput + ProxyInfo construct). CI: `cargo bench --workspace --no-run` build-check in `ci.yml`. Note: connection-accept/setup latency is measured e2e by `scripts/latency-baseline.sh` (setup mode), NOT criterion — a real TCP+TLS+yamux accept is dominated by kernel/handshake noise, not code-path cost.
 - **Property/fuzz tests**: proptest-based config normalization (`frp-core/src/config.rs`, 14 tests) and V1/V2 protocol frame fuzzing (`frp-core/src/protocol.rs`, 13 tests, 0 panics found).
+- **Integration tests**: KCP real-UDP-socket test (`frp-core/tests/kcp_integration.rs`), XTCP hole-punch e2e (`frp-server/tests/xtcp_hole_punch.rs`), plus 13+ server integration tests covering control handler, vhost, proxy registration, OIDC, reload, graceful drain.
 - **Stress tests**: `scripts/stress-test.sh` runs frps + frpc under load with connection churn, monitored via `scripts/frp-stress/`. Weekly CI run in `stress-test.yml`.
 - **Perf baselines** (4-axis program, host-specific JSONL committed under `scripts/frp-stress/baselines/`): `scripts/throughput-baseline.sh` (MB/s per cipher/transport config), `scripts/latency-baseline.sh` (steady-state RTT + connection-setup percentiles), `scripts/memory-baseline.sh` (idle-hold + churn footprint via the `mem-profile` counting allocator + `ps` RSS). Run manually before/after a data-plane change; not blocking CI gates. Gate rule: a change to one axis must not regress the others (>5% throughput/MB/s, or RTT p99).
-- **Cross-compat tests**: `scripts/compat-test.sh` — 40 default + 2 guarded (XTCP 16-test pairwise matrix, V2 `GO_FRP_V2=1`). Runs on every push via `compat.yml`. XTCP compat runs daily on VPS via `xtcp-compat.yml`.
+- **Cross-compat tests**: `scripts/compat-test.sh` — 31 default + 2 guarded (XTCP 16-test pairwise matrix, V2 `GO_FRP_V2=1`). Runs on every push via `compat.yml`. XTCP compat runs daily on VPS via `xtcp-compat.yml`.
 - **Security audit**: Run `cargo audit` and `cargo deny check` before each release to catch known vulnerabilities and license issues in the dependency tree.
 
 ### Dependency Policy (mandatory)
