@@ -1,47 +1,47 @@
-pub mod msg;
-pub mod proxy_protocol;
-pub mod backoff;
-pub mod config_store;
-pub mod system;
-pub mod protocol;
-pub mod transport;
-pub mod auth;
-pub mod config;
-pub mod encryption;
-pub mod cipher_stream;
-pub mod mux;
-pub mod buffer_pool;
-pub mod bridge;
-pub mod bandwidth;
-pub mod metrics;
 #[cfg(feature = "admin-auth")]
 pub mod admin_auth;
+pub mod auth;
+pub mod backoff;
+pub mod bandwidth;
+pub mod bridge;
+pub mod buffer_pool;
+pub mod cipher_stream;
 pub mod cli;
+pub mod config;
+pub mod config_store;
+pub mod crypto;
+pub mod encryption;
+pub mod feature_gate;
+pub mod internal_listener;
 #[cfg(feature = "kcp")]
 pub mod kcp;
 #[cfg(feature = "kcp")]
 pub mod kcp_compat;
-#[cfg(feature = "quic")]
-pub mod quic;
-pub mod v2_handshake;
-pub mod crypto;
-pub mod stun;
-pub mod feature_gate;
-pub mod unsafe_features;
-pub mod internal_listener;
 #[cfg(feature = "mem-profile")]
 pub mod mem_profile;
+pub mod metrics;
+pub mod msg;
+pub mod mux;
 #[cfg(feature = "profiling")]
 pub mod profiling;
+pub mod protocol;
+pub mod proxy_protocol;
+#[cfg(feature = "quic")]
+pub mod quic;
+pub mod stun;
+pub mod system;
+pub mod transport;
+pub mod unsafe_features;
+pub mod v2_handshake;
 
 use thiserror::Error;
 
 /// Exit codes for process termination.
 /// Mirrored in frps/frpc main.rs — keep in sync.
-pub const EXIT_RUNTIME: i32 = 1;   // connection lost, I/O error, unexpected
-pub const EXIT_CONFIG: i32 = 2;    // bad config file, unknown field, invalid value
-pub const EXIT_AUTH: i32 = 3;      // bad token, OIDC failure
-pub const EXIT_BIND: i32 = 4;      // port in use, permission denied
+pub const EXIT_RUNTIME: i32 = 1; // connection lost, I/O error, unexpected
+pub const EXIT_CONFIG: i32 = 2; // bad config file, unknown field, invalid value
+pub const EXIT_AUTH: i32 = 3; // bad token, OIDC failure
+pub const EXIT_BIND: i32 = 4; // port in use, permission denied
 
 // ── Sub-error types with structured context ──────────────────────────
 
@@ -54,47 +54,91 @@ pub enum ProtocolError {
     #[error("V2 frame payload too large: {payload_len}")]
     V2PayloadTooLarge { payload_len: usize },
     #[error("read V1 payload: {source}")]
-    ReadV1Payload { #[source] source: std::io::Error },
+    ReadV1Payload {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("read V2 payload: {source}")]
-    ReadV2Payload { #[source] source: std::io::Error },
+    ReadV2Payload {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("deserialize {msg_type} (v1): {source}")]
-    DeserializeV1 { msg_type: &'static str, #[source] source: serde_json::Error },
+    DeserializeV1 {
+        msg_type: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("deserialize {msg_type} (v2): {source}")]
-    DeserializeV2 { msg_type: &'static str, #[source] source: serde_json::Error },
+    DeserializeV2 {
+        msg_type: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("write V1 frame: {source}")]
-    WriteV1Frame { #[source] source: std::io::Error },
+    WriteV1Frame {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("write V2 frame: {source}")]
-    WriteV2Frame { #[source] source: std::io::Error },
+    WriteV2Frame {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("serialize V1 msg: {source}")]
-    SerializeV1 { #[source] source: serde_json::Error },
+    SerializeV1 {
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("{0}")]
     Other(String),
 }
 
 impl From<String> for ProtocolError {
-    fn from(s: String) -> Self { ProtocolError::Other(s) }
+    fn from(s: String) -> Self {
+        ProtocolError::Other(s)
+    }
 }
 
 impl From<&str> for ProtocolError {
-    fn from(s: &str) -> Self { ProtocolError::Other(s.to_string()) }
+    fn from(s: &str) -> Self {
+        ProtocolError::Other(s.to_string())
+    }
 }
 
 #[derive(Error, Debug)]
 pub enum TransportError {
     #[error("TCP connect to {addr}: {source}")]
-    TcpConnect { addr: String, #[source] source: std::io::Error },
+    TcpConnect {
+        addr: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("TLS handshake: {source}")]
-    TlsHandshake { #[source] source: std::io::Error },
+    TlsHandshake {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("KCP connect to {addr}: {source}")]
-    KcpConnect { addr: String, #[source] source: Box<dyn std::error::Error + Send + Sync> },
+    KcpConnect {
+        addr: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("QUIC: {0}")]
     Quic(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("WebSocket: {0}")]
     WebSocket(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("TLS config: {source}")]
-    TlsConfig { #[source] source: std::io::Error },
+    TlsConfig {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("plugin TLS connector: {source}")]
-    PluginTls { #[source] source: Box<dyn std::error::Error + Send + Sync> },
+    PluginTls {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("WebSocket upgrade: {0}")]
     WebSocketUpgrade(String),
     #[error("WebSocket TLS: {0}")]
@@ -104,11 +148,15 @@ pub enum TransportError {
 }
 
 impl From<String> for TransportError {
-    fn from(s: String) -> Self { TransportError::Other(s) }
+    fn from(s: String) -> Self {
+        TransportError::Other(s)
+    }
 }
 
 impl From<&str> for TransportError {
-    fn from(s: &str) -> Self { TransportError::Other(s.to_string()) }
+    fn from(s: &str) -> Self {
+        TransportError::Other(s.to_string())
+    }
 }
 
 #[derive(Error, Debug)]
@@ -130,11 +178,15 @@ pub enum AuthError {
 }
 
 impl From<String> for AuthError {
-    fn from(s: String) -> Self { AuthError::Other(s) }
+    fn from(s: String) -> Self {
+        AuthError::Other(s)
+    }
 }
 
 impl From<&str> for AuthError {
-    fn from(s: &str) -> Self { AuthError::Other(s.to_string()) }
+    fn from(s: &str) -> Self {
+        AuthError::Other(s.to_string())
+    }
 }
 
 #[derive(Error, Debug)]
@@ -148,11 +200,15 @@ pub enum ConfigError {
 }
 
 impl From<String> for ConfigError {
-    fn from(s: String) -> Self { ConfigError::Other(s) }
+    fn from(s: String) -> Self {
+        ConfigError::Other(s)
+    }
 }
 
 impl From<&str> for ConfigError {
-    fn from(s: &str) -> Self { ConfigError::Other(s.to_string()) }
+    fn from(s: &str) -> Self {
+        ConfigError::Other(s.to_string())
+    }
 }
 
 // ── Parent Error ────────────────────────────────────────────────────
@@ -179,8 +235,12 @@ impl Error {
         match self {
             Error::Config(_) => EXIT_CONFIG,
             Error::Auth(_) => EXIT_AUTH,
-            Error::Io(e) if e.kind() == std::io::ErrorKind::AddrInUse
-                || e.kind() == std::io::ErrorKind::PermissionDenied => EXIT_BIND,
+            Error::Io(e)
+                if e.kind() == std::io::ErrorKind::AddrInUse
+                    || e.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                EXIT_BIND
+            }
             _ => EXIT_RUNTIME,
         }
     }
@@ -189,7 +249,7 @@ impl Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// frp version string.
-pub const VERSION: &str = "0.69.1";
+pub const VERSION: &str = "0.7.0";
 
 /// Return the user agent string used in login.
 pub fn version_str() -> String {

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use frp_core::kcp::{dial_kcp, default_kcp_config, KcpConfig, KcpListener};
+use frp_core::kcp::{default_kcp_config, dial_kcp, KcpConfig, KcpListener};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout};
 

@@ -1,5 +1,5 @@
-use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
 
 // ---------------------------------------------------------------
 // V1 message type bytes (matching Go frp v0.69.1 protocol)
@@ -23,7 +23,9 @@ pub const TYPE_NAT_HOLE_CLIENT: u8 = b'n';
 pub const TYPE_NAT_HOLE_RESP: u8 = b'm';
 pub const TYPE_NAT_HOLE_SID: u8 = b'5';
 pub const TYPE_NAT_HOLE_REPORT: u8 = b'6';
+/// Rust-only V1 extension — Go frp v0.70.0 does NOT recognize type 7.
 pub const TYPE_CLOSE_PROXY_RESP: u8 = b'7';
+/// Rust-only V1 extension — Go frp v0.70.0 does NOT recognize type 8.
 pub const TYPE_ERROR: u8 = b'8';
 // VNet (L3 VPN) message types
 #[cfg(feature = "vnet")]
@@ -54,7 +56,9 @@ pub const V2_TYPE_NAT_HOLE_CLIENT: u16 = 15;
 pub const V2_TYPE_NAT_HOLE_RESP: u16 = 16;
 pub const V2_TYPE_NAT_HOLE_SID: u16 = 17;
 pub const V2_TYPE_NAT_HOLE_REPORT: u16 = 18;
+/// Rust-only V2 extension — Go frp v0.70.0 does NOT recognize type 19.
 pub const V2_TYPE_CLOSE_PROXY_RESP: u16 = 19;
+/// Rust-only V2 extension — Go frp v0.70.0 does NOT recognize type 20.
 pub const V2_TYPE_ERROR: u16 = 20;
 // VNet (L3 VPN) message types
 #[cfg(feature = "vnet")]
@@ -74,7 +78,9 @@ fn b64_ser<S: Serializer>(data: &[u8], s: S) -> Result<S::Ok, S::Error> {
 
 fn b64_de<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
     let s: String = Deserialize::deserialize(d)?;
-    data_encoding::BASE64.decode(s.as_bytes()).map_err(serde::de::Error::custom)
+    data_encoding::BASE64
+        .decode(s.as_bytes())
+        .map_err(serde::de::Error::custom)
 }
 
 // ---------------------------------------------------------------
@@ -133,7 +139,10 @@ pub struct LoginResp {
     /// Server's additional auth scopes (union with client's to decide
     /// which messages need authentication).
     /// Go frp compat: serverAdditionalAuthScopes.
-    #[serde(rename = "serverAdditionalAuthScopes", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "serverAdditionalAuthScopes",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub server_additional_auth_scopes: Option<Vec<String>>,
 }
 
@@ -163,23 +172,29 @@ pub struct NewProxy {
     pub subdomain: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub locations: Option<Vec<String>>,
-    #[serde(rename = "httpUser", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "http_user", skip_serializing_if = "Option::is_none")]
     pub http_user: Option<String>,
-    #[serde(rename = "httpPwd", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "http_pwd", skip_serializing_if = "Option::is_none")]
     pub http_pwd: Option<String>,
-    #[serde(rename = "hostHeaderRewrite", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "host_header_rewrite",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub host_header_rewrite: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<std::collections::HashMap<String, String>>,
-    #[serde(rename = "responseHeaders", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "response_headers", skip_serializing_if = "Option::is_none")]
     pub response_headers: Option<std::collections::HashMap<String, String>>,
-    #[serde(rename = "routeByHTTPUser", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "route_by_http_user", skip_serializing_if = "Option::is_none")]
     pub route_by_http_user: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_users: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bandwidth_limit: Option<String>,
-    #[serde(rename = "bandwidthLimitMode", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "bandwidth_limit_mode",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub bandwidth_limit_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<std::collections::HashMap<String, String>>,
@@ -189,7 +204,10 @@ pub struct NewProxy {
     pub multiplexer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub virtual_net: Option<String>,
-    #[serde(rename = "proxyProtocolVersion", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "proxy_protocol_version",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub proxy_protocol_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub advertise_subnet: Option<String>,
@@ -354,7 +372,6 @@ impl UdpAddr {
             zone: String::new(),
         })
     }
-
 }
 
 impl fmt::Display for UdpAddr {
@@ -535,26 +552,26 @@ pub enum FrpMessage {
 impl FrpMessage {
     pub fn v1_type_byte(&self) -> u8 {
         match self {
-            FrpMessage::Login(_)              => TYPE_LOGIN,
-            FrpMessage::LoginResp(_)          => TYPE_LOGIN_RESP,
-            FrpMessage::NewProxy(_)           => TYPE_NEW_PROXY,
-            FrpMessage::NewProxyResp(_)       => TYPE_NEW_PROXY_RESP,
-            FrpMessage::CloseProxy(_)         => TYPE_CLOSE_PROXY,
-            FrpMessage::NewWorkConn(_)        => TYPE_NEW_WORK_CONN,
-            FrpMessage::ReqWorkConn(_)        => TYPE_REQ_WORK_CONN,
-            FrpMessage::StartWorkConn(_)      => TYPE_START_WORK_CONN,
-            FrpMessage::Ping(_)               => TYPE_PING,
-            FrpMessage::Pong(_)               => TYPE_PONG,
-            FrpMessage::NewVisitorConn(_)     => TYPE_NEW_VISITOR_CONN,
+            FrpMessage::Login(_) => TYPE_LOGIN,
+            FrpMessage::LoginResp(_) => TYPE_LOGIN_RESP,
+            FrpMessage::NewProxy(_) => TYPE_NEW_PROXY,
+            FrpMessage::NewProxyResp(_) => TYPE_NEW_PROXY_RESP,
+            FrpMessage::CloseProxy(_) => TYPE_CLOSE_PROXY,
+            FrpMessage::NewWorkConn(_) => TYPE_NEW_WORK_CONN,
+            FrpMessage::ReqWorkConn(_) => TYPE_REQ_WORK_CONN,
+            FrpMessage::StartWorkConn(_) => TYPE_START_WORK_CONN,
+            FrpMessage::Ping(_) => TYPE_PING,
+            FrpMessage::Pong(_) => TYPE_PONG,
+            FrpMessage::NewVisitorConn(_) => TYPE_NEW_VISITOR_CONN,
             FrpMessage::NewVisitorConnResp(_) => TYPE_NEW_VISITOR_CONN_RESP,
-            FrpMessage::UDPPacket(_)          => TYPE_UDP_PACKET,
-            FrpMessage::NatHoleVisitor(_)     => TYPE_NAT_HOLE_VISITOR,
-            FrpMessage::NatHoleClient(_)      => TYPE_NAT_HOLE_CLIENT,
-            FrpMessage::NatHoleResp(_)        => TYPE_NAT_HOLE_RESP,
-            FrpMessage::NatHoleSid(_)         => TYPE_NAT_HOLE_SID,
-            FrpMessage::NatHoleReport(_)      => TYPE_NAT_HOLE_REPORT,
-            FrpMessage::CloseProxyResp(_)   => TYPE_CLOSE_PROXY_RESP,
-            FrpMessage::Error(_)            => TYPE_ERROR,
+            FrpMessage::UDPPacket(_) => TYPE_UDP_PACKET,
+            FrpMessage::NatHoleVisitor(_) => TYPE_NAT_HOLE_VISITOR,
+            FrpMessage::NatHoleClient(_) => TYPE_NAT_HOLE_CLIENT,
+            FrpMessage::NatHoleResp(_) => TYPE_NAT_HOLE_RESP,
+            FrpMessage::NatHoleSid(_) => TYPE_NAT_HOLE_SID,
+            FrpMessage::NatHoleReport(_) => TYPE_NAT_HOLE_REPORT,
+            FrpMessage::CloseProxyResp(_) => TYPE_CLOSE_PROXY_RESP,
+            FrpMessage::Error(_) => TYPE_ERROR,
             #[cfg(feature = "vnet")]
             FrpMessage::VnetRouteAdvertise(_) => TYPE_VNET_ROUTE_ADVERTISE,
             #[cfg(feature = "vnet")]
@@ -566,26 +583,26 @@ impl FrpMessage {
 
     pub fn v2_type_id(&self) -> u16 {
         match self {
-            FrpMessage::Login(_)              => V2_TYPE_LOGIN,
-            FrpMessage::LoginResp(_)          => V2_TYPE_LOGIN_RESP,
-            FrpMessage::NewProxy(_)           => V2_TYPE_NEW_PROXY,
-            FrpMessage::NewProxyResp(_)       => V2_TYPE_NEW_PROXY_RESP,
-            FrpMessage::CloseProxy(_)         => V2_TYPE_CLOSE_PROXY,
-            FrpMessage::NewWorkConn(_)        => V2_TYPE_NEW_WORK_CONN,
-            FrpMessage::ReqWorkConn(_)        => V2_TYPE_REQ_WORK_CONN,
-            FrpMessage::StartWorkConn(_)      => V2_TYPE_START_WORK_CONN,
-            FrpMessage::NewVisitorConn(_)     => V2_TYPE_NEW_VISITOR_CONN,
+            FrpMessage::Login(_) => V2_TYPE_LOGIN,
+            FrpMessage::LoginResp(_) => V2_TYPE_LOGIN_RESP,
+            FrpMessage::NewProxy(_) => V2_TYPE_NEW_PROXY,
+            FrpMessage::NewProxyResp(_) => V2_TYPE_NEW_PROXY_RESP,
+            FrpMessage::CloseProxy(_) => V2_TYPE_CLOSE_PROXY,
+            FrpMessage::NewWorkConn(_) => V2_TYPE_NEW_WORK_CONN,
+            FrpMessage::ReqWorkConn(_) => V2_TYPE_REQ_WORK_CONN,
+            FrpMessage::StartWorkConn(_) => V2_TYPE_START_WORK_CONN,
+            FrpMessage::NewVisitorConn(_) => V2_TYPE_NEW_VISITOR_CONN,
             FrpMessage::NewVisitorConnResp(_) => V2_TYPE_NEW_VISITOR_CONN_RESP,
-            FrpMessage::Ping(_)               => V2_TYPE_PING,
-            FrpMessage::Pong(_)               => V2_TYPE_PONG,
-            FrpMessage::UDPPacket(_)          => V2_TYPE_UDP_PACKET,
-            FrpMessage::NatHoleVisitor(_)     => V2_TYPE_NAT_HOLE_VISITOR,
-            FrpMessage::NatHoleClient(_)      => V2_TYPE_NAT_HOLE_CLIENT,
-            FrpMessage::NatHoleResp(_)        => V2_TYPE_NAT_HOLE_RESP,
-            FrpMessage::NatHoleSid(_)         => V2_TYPE_NAT_HOLE_SID,
-            FrpMessage::NatHoleReport(_)      => V2_TYPE_NAT_HOLE_REPORT,
+            FrpMessage::Ping(_) => V2_TYPE_PING,
+            FrpMessage::Pong(_) => V2_TYPE_PONG,
+            FrpMessage::UDPPacket(_) => V2_TYPE_UDP_PACKET,
+            FrpMessage::NatHoleVisitor(_) => V2_TYPE_NAT_HOLE_VISITOR,
+            FrpMessage::NatHoleClient(_) => V2_TYPE_NAT_HOLE_CLIENT,
+            FrpMessage::NatHoleResp(_) => V2_TYPE_NAT_HOLE_RESP,
+            FrpMessage::NatHoleSid(_) => V2_TYPE_NAT_HOLE_SID,
+            FrpMessage::NatHoleReport(_) => V2_TYPE_NAT_HOLE_REPORT,
             FrpMessage::CloseProxyResp(_) => V2_TYPE_CLOSE_PROXY_RESP,
-            FrpMessage::Error(_)          => V2_TYPE_ERROR,
+            FrpMessage::Error(_) => V2_TYPE_ERROR,
             #[cfg(feature = "vnet")]
             FrpMessage::VnetRouteAdvertise(_) => V2_TYPE_VNET_ROUTE_ADVERTISE,
             #[cfg(feature = "vnet")]
@@ -596,44 +613,134 @@ impl FrpMessage {
     }
 
     // Accessor helpers
-    pub fn as_login(&self) -> &Login { match self { FrpMessage::Login(v) => v, _ => panic!("not a Login") } }
-    pub fn as_login_resp(&self) -> &LoginResp { match self { FrpMessage::LoginResp(v) => v, _ => panic!("not a LoginResp") } }
-    pub fn as_new_proxy(&self) -> &NewProxy { match self { FrpMessage::NewProxy(v) => v, _ => panic!("not a NewProxy") } }
-    pub fn as_new_proxy_resp(&self) -> &NewProxyResp { match self { FrpMessage::NewProxyResp(v) => v, _ => panic!("not a NewProxyResp") } }
-    pub fn as_close_proxy(&self) -> &CloseProxy { match self { FrpMessage::CloseProxy(v) => v, _ => panic!("not a CloseProxy") } }
-    pub fn as_new_work_conn(&self) -> &NewWorkConn { match self { FrpMessage::NewWorkConn(v) => v, _ => panic!("not a NewWorkConn") } }
-    pub fn as_start_work_conn(&self) -> &StartWorkConn { match self { FrpMessage::StartWorkConn(v) => v, _ => panic!("not a StartWorkConn") } }
-    pub fn as_ping(&self) -> &Ping { match self { FrpMessage::Ping(v) => v, _ => panic!("not a Ping") } }
-    pub fn as_new_visitor_conn(&self) -> &NewVisitorConn { match self { FrpMessage::NewVisitorConn(v) => v, _ => panic!("not a NewVisitorConn") } }
-    pub fn as_new_visitor_conn_resp(&self) -> &NewVisitorConnResp { match self { FrpMessage::NewVisitorConnResp(v) => v, _ => panic!("not a NewVisitorConnResp") } }
-    pub fn as_close_proxy_resp(&self) -> &CloseProxyResp { match self { FrpMessage::CloseProxyResp(v) => v, _ => panic!("not a CloseProxyResp") } }
-    pub fn as_pong(&self) -> &Pong { match self { FrpMessage::Pong(v) => v, _ => panic!("not a Pong") } }
-    pub fn as_error(&self) -> &Error { match self { FrpMessage::Error(v) => v, _ => panic!("not an Error") } }
+    pub fn as_login(&self) -> &Login {
+        match self {
+            FrpMessage::Login(v) => v,
+            _ => panic!("not a Login"),
+        }
+    }
+    pub fn as_login_resp(&self) -> &LoginResp {
+        match self {
+            FrpMessage::LoginResp(v) => v,
+            _ => panic!("not a LoginResp"),
+        }
+    }
+    pub fn as_new_proxy(&self) -> &NewProxy {
+        match self {
+            FrpMessage::NewProxy(v) => v,
+            _ => panic!("not a NewProxy"),
+        }
+    }
+    pub fn as_new_proxy_resp(&self) -> &NewProxyResp {
+        match self {
+            FrpMessage::NewProxyResp(v) => v,
+            _ => panic!("not a NewProxyResp"),
+        }
+    }
+    pub fn as_close_proxy(&self) -> &CloseProxy {
+        match self {
+            FrpMessage::CloseProxy(v) => v,
+            _ => panic!("not a CloseProxy"),
+        }
+    }
+    pub fn as_new_work_conn(&self) -> &NewWorkConn {
+        match self {
+            FrpMessage::NewWorkConn(v) => v,
+            _ => panic!("not a NewWorkConn"),
+        }
+    }
+    pub fn as_start_work_conn(&self) -> &StartWorkConn {
+        match self {
+            FrpMessage::StartWorkConn(v) => v,
+            _ => panic!("not a StartWorkConn"),
+        }
+    }
+    pub fn as_ping(&self) -> &Ping {
+        match self {
+            FrpMessage::Ping(v) => v,
+            _ => panic!("not a Ping"),
+        }
+    }
+    pub fn as_new_visitor_conn(&self) -> &NewVisitorConn {
+        match self {
+            FrpMessage::NewVisitorConn(v) => v,
+            _ => panic!("not a NewVisitorConn"),
+        }
+    }
+    pub fn as_new_visitor_conn_resp(&self) -> &NewVisitorConnResp {
+        match self {
+            FrpMessage::NewVisitorConnResp(v) => v,
+            _ => panic!("not a NewVisitorConnResp"),
+        }
+    }
+    pub fn as_close_proxy_resp(&self) -> &CloseProxyResp {
+        match self {
+            FrpMessage::CloseProxyResp(v) => v,
+            _ => panic!("not a CloseProxyResp"),
+        }
+    }
+    pub fn as_pong(&self) -> &Pong {
+        match self {
+            FrpMessage::Pong(v) => v,
+            _ => panic!("not a Pong"),
+        }
+    }
+    pub fn as_error(&self) -> &Error {
+        match self {
+            FrpMessage::Error(v) => v,
+            _ => panic!("not an Error"),
+        }
+    }
 
     /// Construct an empty FrpMessage from a V1 type byte (for deserialization).
     pub fn from_v1_type_byte(ty: u8) -> Option<FrpMessage> {
         match ty {
-            TYPE_LOGIN         => Some(FrpMessage::Login(Login {
-                version: None, hostname: None, os: None, arch: None,
-                user: None, run_id: None, client_id: None, pool_count: None,
-                timestamp: None, privilege_key: None, metas: None, client_spec: None,
+            TYPE_LOGIN => Some(FrpMessage::Login(Login {
+                version: None,
+                hostname: None,
+                os: None,
+                arch: None,
+                user: None,
+                run_id: None,
+                client_id: None,
+                pool_count: None,
+                timestamp: None,
+                privilege_key: None,
+                metas: None,
+                client_spec: None,
                 multiplexer: None,
             })),
-            TYPE_LOGIN_RESP    => Some(FrpMessage::LoginResp(LoginResp {
-                version: None, run_id: None, error: None,
+            TYPE_LOGIN_RESP => Some(FrpMessage::LoginResp(LoginResp {
+                version: None,
+                run_id: None,
+                error: None,
                 server_additional_auth_scopes: None,
             })),
-            TYPE_NEW_PROXY     => Some(FrpMessage::NewProxy(NewProxy {
-                proxy_name: String::new(), proxy_type: String::new(),
-                use_encryption: None, use_compression: None,
-                group: None, group_key: None, local_str: None,
-                remote_port: None, sk: None, custom_domains: None,
-                subdomain: None, locations: None, http_user: None,
-                http_pwd: None, host_header_rewrite: None, headers: None,
-                response_headers: None, route_by_http_user: None,
-                allow_users: None, bandwidth_limit: None,
-                bandwidth_limit_mode: None, annotations: None,
-                metas: None, multiplexer: None,
+            TYPE_NEW_PROXY => Some(FrpMessage::NewProxy(NewProxy {
+                proxy_name: String::new(),
+                proxy_type: String::new(),
+                use_encryption: None,
+                use_compression: None,
+                group: None,
+                group_key: None,
+                local_str: None,
+                remote_port: None,
+                sk: None,
+                custom_domains: None,
+                subdomain: None,
+                locations: None,
+                http_user: None,
+                http_pwd: None,
+                host_header_rewrite: None,
+                headers: None,
+                response_headers: None,
+                route_by_http_user: None,
+                allow_users: None,
+                bandwidth_limit: None,
+                bandwidth_limit_mode: None,
+                annotations: None,
+                metas: None,
+                multiplexer: None,
                 virtual_net: None,
                 proxy_protocol_version: None,
                 advertise_subnet: None,
@@ -642,32 +749,54 @@ impl FrpMessage {
                 vnet_mtu: None,
             })),
             TYPE_NEW_PROXY_RESP => Some(FrpMessage::NewProxyResp(NewProxyResp {
-                proxy_name: String::new(), remote_addr: None, error: None,
+                proxy_name: String::new(),
+                remote_addr: None,
+                error: None,
             })),
-            TYPE_CLOSE_PROXY   => Some(FrpMessage::CloseProxy(CloseProxy {
+            TYPE_CLOSE_PROXY => Some(FrpMessage::CloseProxy(CloseProxy {
                 proxy_name: String::new(),
             })),
             TYPE_NEW_WORK_CONN => Some(FrpMessage::NewWorkConn(NewWorkConn {
-                run_id: None, timestamp: None, privilege_key: None,
+                run_id: None,
+                timestamp: None,
+                privilege_key: None,
             })),
             TYPE_REQ_WORK_CONN => Some(FrpMessage::ReqWorkConn(ReqWorkConn {})),
             TYPE_START_WORK_CONN => Some(FrpMessage::StartWorkConn(StartWorkConn {
-                proxy_name: String::new(), src_addr: None, src_port: None,
-                dst_addr: None, dst_port: None, error: None,
-                use_encryption: None, use_compression: None,
-                nat_hole_sid: None, nat_hole_visitor_addr: None,
+                proxy_name: String::new(),
+                src_addr: None,
+                src_port: None,
+                dst_addr: None,
+                dst_port: None,
+                error: None,
+                use_encryption: None,
+                use_compression: None,
+                nat_hole_sid: None,
+                nat_hole_visitor_addr: None,
             })),
-            TYPE_PING          => Some(FrpMessage::Ping(Ping { privilege_key: None, timestamp: None })),
-            TYPE_PONG          => Some(FrpMessage::Pong(Pong { error: None })),
+            TYPE_PING => Some(FrpMessage::Ping(Ping {
+                privilege_key: None,
+                timestamp: None,
+            })),
+            TYPE_PONG => Some(FrpMessage::Pong(Pong { error: None })),
             TYPE_NEW_VISITOR_CONN => Some(FrpMessage::NewVisitorConn(NewVisitorConn {
-                proxy_name: String::new(), sign_key: None, timestamp: None,
-                run_id: None, use_encryption: None, use_compression: None,
+                proxy_name: String::new(),
+                sign_key: None,
+                timestamp: None,
+                run_id: None,
+                use_encryption: None,
+                use_compression: None,
             })),
-            TYPE_NEW_VISITOR_CONN_RESP => Some(FrpMessage::NewVisitorConnResp(NewVisitorConnResp {
-                proxy_name: String::new(), error: None,
-            })),
-            TYPE_UDP_PACKET    => Some(FrpMessage::UDPPacket(UDPPacket {
-                content: vec![], local_addr: None, remote_addr: None,
+            TYPE_NEW_VISITOR_CONN_RESP => {
+                Some(FrpMessage::NewVisitorConnResp(NewVisitorConnResp {
+                    proxy_name: String::new(),
+                    error: None,
+                }))
+            }
+            TYPE_UDP_PACKET => Some(FrpMessage::UDPPacket(UDPPacket {
+                content: vec![],
+                local_addr: None,
+                remote_addr: None,
             })),
             TYPE_NAT_HOLE_VISITOR => Some(FrpMessage::NatHoleVisitor(NatHoleVisitor::default())),
             TYPE_NAT_HOLE_CLIENT => Some(FrpMessage::NatHoleClient(NatHoleClient::default())),
@@ -676,9 +805,7 @@ impl FrpMessage {
                 sid: None,
                 provider_addr: None,
             })),
-            TYPE_NAT_HOLE_REPORT => Some(FrpMessage::NatHoleReport(NatHoleReport {
-                sid: None,
-            })),
+            TYPE_NAT_HOLE_REPORT => Some(FrpMessage::NatHoleReport(NatHoleReport { sid: None })),
             TYPE_CLOSE_PROXY_RESP => Some(FrpMessage::CloseProxyResp(CloseProxyResp {
                 proxy_name: String::new(),
             })),
@@ -717,7 +844,8 @@ mod tests {
         let json = serde_json::to_string(val).expect("serialize");
         // Verify JSON matches expected (ignoring field ordering)
         let v: serde_json::Value = serde_json::from_str(&json).expect("parse serialized");
-        let expected: serde_json::Value = serde_json::from_str(expected_json).expect("parse expected");
+        let expected: serde_json::Value =
+            serde_json::from_str(expected_json).expect("parse expected");
         assert_eq!(v, expected, "serialized JSON mismatch");
         let _back: T = serde_json::from_str(&json).expect("deserialize");
     }
@@ -725,9 +853,18 @@ mod tests {
     #[test]
     fn test_login_roundtrip_minimal() {
         let login = Login {
-            version: None, hostname: None, os: None, arch: None,
-            user: None, run_id: None, client_id: None, pool_count: None,
-            timestamp: None, privilege_key: None, metas: None, client_spec: None,
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: None,
+            client_id: None,
+            pool_count: None,
+            timestamp: None,
+            privilege_key: None,
+            metas: None,
+            client_spec: None,
             multiplexer: None,
         };
         roundtrip(&login, r#"{}"#);
@@ -788,7 +925,10 @@ mod tests {
             error: None,
             server_additional_auth_scopes: Some(vec!["HeartBeats".into(), "NewWorkConns".into()]),
         };
-        roundtrip(&scoped_resp, r#"{"version":"0.69.1","run_id":"rid2","serverAdditionalAuthScopes":["HeartBeats","NewWorkConns"]}"#);
+        roundtrip(
+            &scoped_resp,
+            r#"{"version":"0.69.1","run_id":"rid2","serverAdditionalAuthScopes":["HeartBeats","NewWorkConns"]}"#,
+        );
     }
 
     #[test]
@@ -849,17 +989,32 @@ mod tests {
 
     #[test]
     fn test_close_proxy_roundtrip() {
-        roundtrip(&CloseProxy { proxy_name: "p1".into() }, r#"{"proxy_name":"p1"}"#);
+        roundtrip(
+            &CloseProxy {
+                proxy_name: "p1".into(),
+            },
+            r#"{"proxy_name":"p1"}"#,
+        );
     }
 
     #[test]
     fn test_close_proxy_resp_roundtrip() {
-        roundtrip(&CloseProxyResp { proxy_name: "p1".into() }, r#"{"proxy_name":"p1"}"#);
+        roundtrip(
+            &CloseProxyResp {
+                proxy_name: "p1".into(),
+            },
+            r#"{"proxy_name":"p1"}"#,
+        );
     }
 
     #[test]
     fn test_error_msg_roundtrip() {
-        roundtrip(&Error { error: "something broke".into() }, r#"{"error":"something broke"}"#);
+        roundtrip(
+            &Error {
+                error: "something broke".into(),
+            },
+            r#"{"error":"something broke"}"#,
+        );
     }
 
     #[test]
@@ -869,7 +1024,10 @@ mod tests {
             timestamp: Some(9999),
             privilege_key: Some("priv".into()),
         };
-        roundtrip(&nwc, r#"{"run_id":"rid1","timestamp":9999,"privilege_key":"priv"}"#);
+        roundtrip(
+            &nwc,
+            r#"{"run_id":"rid1","timestamp":9999,"privilege_key":"priv"}"#,
+        );
     }
 
     #[test]
@@ -891,19 +1049,30 @@ mod tests {
             nat_hole_sid: None,
             nat_hole_visitor_addr: None,
         };
-        roundtrip(&swc, r#"{"proxy_name":"p1","src_addr":"1.2.3.4","src_port":12345}"#);
+        roundtrip(
+            &swc,
+            r#"{"proxy_name":"p1","src_addr":"1.2.3.4","src_port":12345}"#,
+        );
     }
 
     #[test]
     fn test_ping_roundtrip() {
-        let ping = Ping { privilege_key: Some("pk".into()), timestamp: Some(42) };
+        let ping = Ping {
+            privilege_key: Some("pk".into()),
+            timestamp: Some(42),
+        };
         roundtrip(&ping, r#"{"privilege_key":"pk","timestamp":42}"#);
     }
 
     #[test]
     fn test_pong_roundtrip() {
         roundtrip(&Pong { error: None }, r#"{}"#);
-        roundtrip(&Pong { error: Some("err".into()) }, r#"{"error":"err"}"#);
+        roundtrip(
+            &Pong {
+                error: Some("err".into()),
+            },
+            r#"{"error":"err"}"#,
+        );
     }
 
     #[test]
@@ -916,7 +1085,10 @@ mod tests {
             use_encryption: Some(true),
             use_compression: Some(false),
         };
-        roundtrip(&nvc, r#"{"proxy_name":"stcp1","sign_key":"sk","timestamp":99,"run_id":"rid","use_encryption":true,"use_compression":false}"#);
+        roundtrip(
+            &nvc,
+            r#"{"proxy_name":"stcp1","sign_key":"sk","timestamp":99,"run_id":"rid","use_encryption":true,"use_compression":false}"#,
+        );
     }
 
     #[test]
@@ -924,8 +1096,16 @@ mod tests {
         let data = vec![0, 1, 2, 255, 100];
         let pkt = UDPPacket {
             content: data.clone(),
-            local_addr: Some(UdpAddr { ip: "127.0.0.1".into(), port: 53, zone: String::new() }),
-            remote_addr: Some(UdpAddr { ip: "10.0.0.1".into(), port: 9999, zone: String::new() }),
+            local_addr: Some(UdpAddr {
+                ip: "127.0.0.1".into(),
+                port: 53,
+                zone: String::new(),
+            }),
+            remote_addr: Some(UdpAddr {
+                ip: "10.0.0.1".into(),
+                port: 9999,
+                zone: String::new(),
+            }),
         };
         let json = serde_json::to_string(&pkt).expect("serialize");
         // content field should be base64 encoded
@@ -966,8 +1146,14 @@ mod tests {
             (TYPE_ERROR, "Error"),
         ];
         for (ty, label) in cases {
-            let msg = FrpMessage::from_v1_type_byte(ty).expect(&format!("from_v1_type_byte({})", ty));
-            assert_eq!(msg.v1_type_byte(), ty, "v1_type_byte roundtrip for {}", label);
+            let msg = FrpMessage::from_v1_type_byte(ty)
+                .unwrap_or_else(|| panic!("from_v1_type_byte({})", ty));
+            assert_eq!(
+                msg.v1_type_byte(),
+                ty,
+                "v1_type_byte roundtrip for {}",
+                label
+            );
         }
     }
 
@@ -987,7 +1173,8 @@ mod tests {
 
         // CloseProxyResp
         let cpr_json = r#"{"proxy_name":"my-proxy"}"#;
-        let cpr: CloseProxyResp = serde_json::from_str(cpr_json).expect("deserialize CloseProxyResp struct");
+        let cpr: CloseProxyResp =
+            serde_json::from_str(cpr_json).expect("deserialize CloseProxyResp struct");
         assert_eq!(cpr.proxy_name, "my-proxy");
     }
 
@@ -1070,5 +1257,136 @@ mod tests {
             zone: String::new(),
         };
         assert_eq!(addr.to_string(), "192.168.1.1:3000");
+    }
+
+    /// Verify NewProxy fields serialize to Go frp v0.70.0 snake_case wire format.
+    /// Go frp ignores camelCase keys; this test guards against regression.
+    #[test]
+    fn test_new_proxy_wire_format_snake_case() {
+        let mut resp_headers = std::collections::HashMap::new();
+        resp_headers.insert("X-Custom".into(), "value".into());
+
+        let np = NewProxy {
+            proxy_name: "wire-test".into(),
+            proxy_type: "http".into(),
+            use_encryption: None,
+            use_compression: None,
+            group: None,
+            group_key: None,
+            local_str: None,
+            remote_port: None,
+            sk: None,
+            custom_domains: None,
+            subdomain: None,
+            locations: None,
+            http_user: Some("alice".into()),
+            http_pwd: Some("secret".into()),
+            host_header_rewrite: Some("internal.example.com".into()),
+            headers: None,
+            response_headers: Some(resp_headers),
+            route_by_http_user: Some("alice".into()),
+            allow_users: None,
+            bandwidth_limit: None,
+            bandwidth_limit_mode: Some("server".into()),
+            annotations: None,
+            metas: None,
+            multiplexer: None,
+            virtual_net: None,
+            proxy_protocol_version: Some("v2".into()),
+            advertise_subnet: None,
+            vnet_ip: None,
+            vnet_netmask: None,
+            vnet_mtu: None,
+        };
+        let json = serde_json::to_string(&np).expect("serialize");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse JSON");
+
+        // Wire keys MUST be snake_case for Go frp v0.70.0 compat.
+        assert_eq!(v["http_user"].as_str(), Some("alice"), "http_user wire key");
+        assert_eq!(v["http_pwd"].as_str(), Some("secret"), "http_pwd wire key");
+        assert_eq!(
+            v["host_header_rewrite"].as_str(),
+            Some("internal.example.com"),
+            "host_header_rewrite wire key"
+        );
+        assert_eq!(
+            v["response_headers"]["X-Custom"].as_str(),
+            Some("value"),
+            "response_headers wire key"
+        );
+        assert_eq!(
+            v["route_by_http_user"].as_str(),
+            Some("alice"),
+            "route_by_http_user wire key"
+        );
+        assert_eq!(
+            v["bandwidth_limit_mode"].as_str(),
+            Some("server"),
+            "bandwidth_limit_mode wire key"
+        );
+        assert_eq!(
+            v["proxy_protocol_version"].as_str(),
+            Some("v2"),
+            "proxy_protocol_version wire key"
+        );
+
+        // camelCase keys MUST NOT appear on the wire.
+        assert!(
+            v.get("httpUser").is_none(),
+            "camelCase httpUser must NOT appear on wire"
+        );
+        assert!(
+            v.get("httpPwd").is_none(),
+            "camelCase httpPwd must NOT appear on wire"
+        );
+        assert!(
+            v.get("hostHeaderRewrite").is_none(),
+            "camelCase hostHeaderRewrite must NOT appear"
+        );
+        assert!(
+            v.get("responseHeaders").is_none(),
+            "camelCase responseHeaders must NOT appear"
+        );
+        assert!(
+            v.get("routeByHTTPUser").is_none(),
+            "camelCase routeByHTTPUser must NOT appear"
+        );
+        assert!(
+            v.get("bandwidthLimitMode").is_none(),
+            "camelCase bandwidthLimitMode must NOT appear"
+        );
+        assert!(
+            v.get("proxyProtocolVersion").is_none(),
+            "camelCase proxyProtocolVersion must NOT appear"
+        );
+
+        // Deserialize from Go-format JSON (snake_case only).
+        let go_json = r#"{
+            "proxy_name": "go-proxy",
+            "proxy_type": "http",
+            "http_user": "bob",
+            "http_pwd": "bobpass",
+            "host_header_rewrite": "go.internal",
+            "response_headers": {"X-Go": "1"},
+            "route_by_http_user": "bob",
+            "bandwidth_limit_mode": "client",
+            "proxy_protocol_version": "v1"
+        }"#;
+        let from_go: NewProxy = serde_json::from_str(go_json).expect("deserialize Go format");
+        assert_eq!(from_go.proxy_name, "go-proxy");
+        assert_eq!(from_go.http_user.as_deref(), Some("bob"));
+        assert_eq!(from_go.http_pwd.as_deref(), Some("bobpass"));
+        assert_eq!(from_go.host_header_rewrite.as_deref(), Some("go.internal"));
+        assert_eq!(
+            from_go
+                .response_headers
+                .as_ref()
+                .and_then(|m| m.get("X-Go"))
+                .map(|v| v.as_str()),
+            Some("1")
+        );
+        assert_eq!(from_go.route_by_http_user.as_deref(), Some("bob"));
+        assert_eq!(from_go.bandwidth_limit_mode.as_deref(), Some("client"));
+        assert_eq!(from_go.proxy_protocol_version.as_deref(), Some("v1"));
     }
 }

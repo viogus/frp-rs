@@ -177,14 +177,30 @@ impl ServerConfigSnapshot {
     }
 }
 
-fn default_allow_port_start() -> u16 { 10000 }
-fn default_allow_port_end() -> u16 { 50000 }
-fn default_vhost_http_timeout() -> u64 { 60 }
-fn default_user_conn_timeout() -> u64 { 10 }
-fn default_udp_packet_size() -> usize { 1500 }
-fn default_nathole_analysis_data_reserve_hours() -> u64 { 1 }
-fn default_graceful_timeout() -> u64 { 30 }
-fn default_authentication_timeout() -> i64 { 15 }
+fn default_allow_port_start() -> u16 {
+    10000
+}
+fn default_allow_port_end() -> u16 {
+    50000
+}
+fn default_vhost_http_timeout() -> u64 {
+    60
+}
+fn default_user_conn_timeout() -> u64 {
+    10
+}
+fn default_udp_packet_size() -> usize {
+    1500
+}
+fn default_nathole_analysis_data_reserve_hours() -> u64 {
+    1
+}
+fn default_graceful_timeout() -> u64 {
+    30
+}
+fn default_authentication_timeout() -> i64 {
+    15
+}
 
 /// Parse a bandwidth limit string like "1MB", "500KB", "100K".
 /// Returns bytes per second, or None if unparseable.
@@ -248,9 +264,12 @@ pub fn parse_allow_ports(s: &str) -> Vec<(u16, u16)> {
 
 /// Compute the total number of ports across all ranges.
 pub fn count_ports(ranges: &[(u16, u16)]) -> u16 {
-    ranges.iter().fold(0u32, |acc, (s, e)| {
-        acc.saturating_add(e.saturating_sub(*s) as u32 + 1)
-    }).min(u16::MAX as u32) as u16
+    ranges
+        .iter()
+        .fold(0u32, |acc, (s, e)| {
+            acc.saturating_add(e.saturating_sub(*s) as u32 + 1)
+        })
+        .min(u16::MAX as u32) as u16
 }
 
 impl Default for ServerConfig {
@@ -300,9 +319,15 @@ impl Default for ServerConfig {
     }
 }
 
-fn default_bind_addr() -> String { "0.0.0.0".into() }
-fn default_bind_port() -> u16 { 7000 }
-fn default_fallback_timeout_ms() -> u64 { 5000 }
+fn default_bind_addr() -> String {
+    "0.0.0.0".into()
+}
+fn default_bind_port() -> u16 {
+    7000
+}
+fn default_fallback_timeout_ms() -> u64 {
+    5000
+}
 
 // ---------------------------------------------------------------
 // SSH Tunnel Gateway Configuration
@@ -325,7 +350,10 @@ pub struct SshTunnelGatewayConfig {
 
     /// Path where auto-generated SSH host key is written.
     /// Default: "./.autogen_ssh_key".
-    #[serde(default = "default_autogen_ssh_key_path", alias = "autoGenPrivateKeyPath")]
+    #[serde(
+        default = "default_autogen_ssh_key_path",
+        alias = "autoGenPrivateKeyPath"
+    )]
     pub auto_gen_private_key_path: String,
 
     /// Path to SSH authorized_keys for optional public key auth.
@@ -334,7 +362,9 @@ pub struct SshTunnelGatewayConfig {
     pub authorized_keys_file: String,
 }
 
-fn default_autogen_ssh_key_path() -> String { "./.autogen_ssh_key".into() }
+fn default_autogen_ssh_key_path() -> String {
+    "./.autogen_ssh_key".into()
+}
 
 impl Default for SshTunnelGatewayConfig {
     fn default() -> Self {
@@ -378,7 +408,10 @@ pub struct AuthServerConfig {
     /// Go frp v0.69.1 default: 900. This implementation defaults to 15
     /// for tighter replay protection.
     /// Go frp compat: authentication_timeout.
-    #[serde(default = "default_authentication_timeout", alias = "authenticationTimeout")]
+    #[serde(
+        default = "default_authentication_timeout",
+        alias = "authenticationTimeout"
+    )]
     pub authentication_timeout: i64,
     /// Whether to encrypt proxy data-plane bridges (AES-128-CFB).
     /// Go frp compat: use_encryption. Default: false (TLS alone is sufficient).
@@ -427,16 +460,21 @@ impl Default for LogConfig {
     }
 }
 
-fn default_log_level() -> String { "info".into() }
-fn default_health_check_url() -> String { "/".into() }
-fn default_max_days() -> i32 { 3 }
+fn default_log_level() -> String {
+    "info".into()
+}
+fn default_health_check_url() -> String {
+    "/".into()
+}
+fn default_max_days() -> i32 {
+    3
+}
 
 /// OpenTelemetry / observability configuration.
 /// When `otlp_endpoint` is empty (default), OTel export is disabled even when
 /// the `otel` feature is compiled in. The `OTEL_EXPORTER_OTLP_ENDPOINT`
 /// environment variable takes precedence over this config field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ObservabilityConfig {
     #[serde(default)]
     pub otlp_endpoint: String,
@@ -444,9 +482,7 @@ pub struct ObservabilityConfig {
     pub service_name: String,
 }
 
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WebServerConfig {
     #[serde(default)]
     pub addr: String,
@@ -496,7 +532,9 @@ pub struct HttpPluginConfig {
     pub enable_control: bool,
 }
 
-fn default_plugin_timeout() -> u64 { 5 }
+fn default_plugin_timeout() -> u64 {
+    5
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerTransportConfig {
@@ -528,8 +566,12 @@ impl Default for ServerTransportConfig {
     }
 }
 
-fn default_heartbeat_timeout() -> i64 { 90 }
-fn default_max_pool_count() -> i64 { 5 }
+fn default_heartbeat_timeout() -> i64 {
+    90
+}
+fn default_max_pool_count() -> i64 {
+    5
+}
 
 impl ServerTransportConfig {
     /// Apply conditional defaults matching Go frp v0.70.0
@@ -539,8 +581,7 @@ impl ServerTransportConfig {
         if self.tcp_mux {
             // When tcpMux is enabled, heartbeat of application layer is
             // unnecessary — rely on yamux keepalive instead (Go compat).
-            if self.heartbeat_timeout == default_heartbeat_timeout()
-                || self.heartbeat_timeout == 0
+            if self.heartbeat_timeout == default_heartbeat_timeout() || self.heartbeat_timeout == 0
             {
                 self.heartbeat_timeout = -1;
             }
@@ -552,8 +593,7 @@ impl ServerTransportConfig {
 // Plugin Configuration
 // ---------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PluginConfig {
     #[serde(rename = "type")]
     pub plugin_type: String,
@@ -611,7 +651,6 @@ pub struct FeatureConfig {
     pub gates: std::collections::HashMap<String, bool>,
 }
 
-
 // ---------------------------------------------------------------
 // Client Configuration
 // ---------------------------------------------------------------
@@ -659,7 +698,10 @@ pub struct AuthClientConfig {
     /// Maximum allowed clock skew for timestamp-based replay protection
     /// (server-side only; client ignores this field). 0 disables the check.
     /// Go frp compat: authentication_timeout.
-    #[serde(default = "default_authentication_timeout", alias = "authenticationTimeout")]
+    #[serde(
+        default = "default_authentication_timeout",
+        alias = "authenticationTimeout"
+    )]
     pub authentication_timeout: i64,
 }
 
@@ -818,10 +860,18 @@ impl Default for ClientConfig {
     }
 }
 
-fn default_server_port() -> u16 { 7000 }
-fn default_transport_protocol() -> String { "tcp".into() }
-fn default_true() -> bool { true }
-fn default_heartbeat_interval() -> i64 { 30 }
+fn default_server_port() -> u16 {
+    7000
+}
+fn default_transport_protocol() -> String {
+    "tcp".into()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_heartbeat_interval() -> i64 {
+    30
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProxyConfig {
@@ -977,9 +1027,12 @@ pub struct VisitorConfig {
     pub min_retry_interval: i64,
 }
 
-
-fn default_max_retries_an_hour() -> i32 { 8 }
-fn default_min_retry_interval() -> i64 { 30 }
+fn default_max_retries_an_hour() -> i32 {
+    8
+}
+fn default_min_retry_interval() -> i64 {
+    30
+}
 fn default_vnet_netmask() -> String {
     "255.255.255.0".to_string()
 }
@@ -992,20 +1045,24 @@ fn default_vnet_mtu() -> u16 {
 /// - `[common]` section → flatten to top level
 /// - Flat auth_*, log_*, web_server_*, transport_* → nested structs
 /// - Field name differences (protocol → transport_protocol, etc.)
-pub fn load_server_config_from_str(content: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
-    let mut value: toml::Value = toml::from_str(content)
-        .map_err(|e| format!("TOML parse error: {e}"))?;
+pub fn load_server_config_from_str(
+    content: &str,
+) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+    let mut value: toml::Value =
+        toml::from_str(content).map_err(|e| format!("TOML parse error: {e}"))?;
     normalize_server_config(&mut value);
     let json_value = toml_to_json(value);
-    let cfg: ServerConfig = serde_json::from_value(json_value)
-        .map_err(|e| format!("config validation error: {e}"))?;
+    let cfg: ServerConfig =
+        serde_json::from_value(json_value).map_err(|e| format!("config validation error: {e}"))?;
     validate_server_config(&cfg)?;
     Ok(cfg)
 }
 
-pub fn load_client_config_from_str(content: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
-    let mut value: toml::Value = toml::from_str(content)
-        .map_err(|e| format!("TOML parse error: {e}"))?;
+pub fn load_client_config_from_str(
+    content: &str,
+) -> Result<ClientConfig, Box<dyn std::error::Error>> {
+    let mut value: toml::Value =
+        toml::from_str(content).map_err(|e| format!("TOML parse error: {e}"))?;
     normalize_client_config(&mut value);
     let cfg: ClientConfig = serde_json::from_value(toml_to_json(value))
         .map_err(|e| format!("config validation error: {e}"))?;
@@ -1124,7 +1181,6 @@ fn validate_no_duplicate_names(
     Ok(())
 }
 
-
 /// Convert a toml::Value to a serde_json::Value for deserialization.
 /// This is needed because toml::Value can't be directly deserialized into
 /// arbitrary Rust types (the round-trip through toml::to_string produces
@@ -1133,15 +1189,13 @@ fn toml_to_json(v: toml::Value) -> serde_json::Value {
     match v {
         toml::Value::String(s) => serde_json::Value::String(s),
         toml::Value::Integer(i) => serde_json::Value::Number(i.into()),
-        toml::Value::Float(f) => {
-            serde_json::Number::from_f64(f).map_or_else(
-                || {
-                    tracing::warn!(float = %f, "NaN/Inf float value in TOML config replaced with null");
-                    serde_json::Value::Null
-                },
-                serde_json::Value::Number,
-            )
-        }
+        toml::Value::Float(f) => serde_json::Number::from_f64(f).map_or_else(
+            || {
+                tracing::warn!(float = %f, "NaN/Inf float value in TOML config replaced with null");
+                serde_json::Value::Null
+            },
+            serde_json::Value::Number,
+        ),
         toml::Value::Boolean(b) => serde_json::Value::Bool(b),
         toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
         toml::Value::Array(arr) => {
@@ -1159,12 +1213,7 @@ fn toml_to_json(v: toml::Value) -> serde_json::Value {
 
 /// Move matching top-level keys into a sub-table, optionally stripping known prefixes.
 /// e.g. `flatten_to_table(t, &["log_file","log_level"], "log", &["log_"])`
-fn flatten_to_table(
-    table: &mut toml::Table,
-    keys: &[&str],
-    target: &str,
-    strip_prefixes: &[&str],
-) {
+fn flatten_to_table(table: &mut toml::Table, keys: &[&str], target: &str, strip_prefixes: &[&str]) {
     let mut items: Vec<(String, toml::Value)> = Vec::new();
     for &key in keys {
         if let Some(v) = table.remove(key) {
@@ -1199,8 +1248,8 @@ fn load_config_from_file<C: serde::de::DeserializeOwned>(
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("{path}: failed to read config file: {e}"))?;
     let format = detect_format(path);
-    let mut value: toml::Value = parse_to_toml_value(&content, format)
-        .map_err(|e| format!("{path}: parse error: {e}"))?;
+    let mut value: toml::Value =
+        parse_to_toml_value(&content, format).map_err(|e| format!("{path}: parse error: {e}"))?;
     let base_dir = Path::new(path).parent().unwrap_or(Path::new("."));
     process_includes(&mut value, base_dir)?;
     normalize(&mut value);
@@ -1229,16 +1278,54 @@ fn normalize_server_config(value: &mut toml::Value) {
 
         // Move bare `token` into [auth] table as well
         if let Some(v) = table.remove("token") {
-            let auth_table = table.entry("auth").or_insert_with(|| toml::Value::Table(Default::default()));
+            let auth_table = table
+                .entry("auth")
+                .or_insert_with(|| toml::Value::Table(Default::default()));
             if let toml::Value::Table(ref mut t) = auth_table {
                 t.entry("token".to_string()).or_insert(v);
             }
         }
 
-        flatten_to_table(table, &["auth_method", "auth_token", "token", "oidc_issuer", "oidc_audience", "oidc_token_endpoint"], "auth", &["auth_", "oidc_"]);
-        flatten_to_table(table, &["log_file", "log_level", "log_max_days"], "log", &["log_"]);
-        flatten_to_table(table, &["web_server_addr", "web_server_port", "web_server_user", "web_server_password", "web_server_enable_prometheus", "enable_prometheus", "web_server_tls_cert_file", "web_server_tls_key_file"], "web_server", &["web_server_"]);
-        flatten_to_table(table, &["tcp_mux", "tcp_mux_keepalive_interval"], "transport", &[]);
+        flatten_to_table(
+            table,
+            &[
+                "auth_method",
+                "auth_token",
+                "token",
+                "oidc_issuer",
+                "oidc_audience",
+                "oidc_token_endpoint",
+            ],
+            "auth",
+            &["auth_", "oidc_"],
+        );
+        flatten_to_table(
+            table,
+            &["log_file", "log_level", "log_max_days"],
+            "log",
+            &["log_"],
+        );
+        flatten_to_table(
+            table,
+            &[
+                "web_server_addr",
+                "web_server_port",
+                "web_server_user",
+                "web_server_password",
+                "web_server_enable_prometheus",
+                "enable_prometheus",
+                "web_server_tls_cert_file",
+                "web_server_tls_key_file",
+            ],
+            "web_server",
+            &["web_server_"],
+        );
+        flatten_to_table(
+            table,
+            &["tcp_mux", "tcp_mux_keepalive_interval"],
+            "transport",
+            &[],
+        );
 
         // Normalize camelCase section names to snake_case
         if let Some(ssh_section) = table.remove("sshTunnelGateway") {
@@ -1298,7 +1385,12 @@ fn normalize_client_config(value: &mut toml::Value) {
         }
 
         // Flatten log_* fields into log table (client side)
-        flatten_to_table(table, &["log_file", "log_level", "log_max_days"], "log", &["log_"]);
+        flatten_to_table(
+            table,
+            &["log_file", "log_level", "log_max_days"],
+            "log",
+            &["log_"],
+        );
     }
 }
 
@@ -1308,7 +1400,13 @@ pub fn load_server_config(
     path: &str,
     strict_config: bool,
 ) -> Result<ServerConfig, Box<dyn std::error::Error>> {
-    let mut cfg = load_config_from_file::<ServerConfig>(path, strict_config, known_server_keys, normalize_server_config, validate_server_config)?;
+    let mut cfg = load_config_from_file::<ServerConfig>(
+        path,
+        strict_config,
+        known_server_keys,
+        normalize_server_config,
+        validate_server_config,
+    )?;
     cfg.transport.complete();
     Ok(cfg)
 }
@@ -1319,7 +1417,13 @@ pub fn load_client_config(
     path: &str,
     strict_config: bool,
 ) -> Result<ClientConfig, Box<dyn std::error::Error>> {
-    load_config_from_file::<ClientConfig>(path, strict_config, known_client_keys, normalize_client_config, validate_client_config)
+    load_config_from_file::<ClientConfig>(
+        path,
+        strict_config,
+        known_client_keys,
+        normalize_client_config,
+        validate_client_config,
+    )
 }
 
 /// Process `includes` directives in a TOML config: for each glob pattern,
@@ -1337,9 +1441,7 @@ fn process_includes(
     };
 
     // Extract includes list (support both "includes" and "include" keys)
-    let patterns: Vec<String> = match table.remove("includes")
-        .or_else(|| table.remove("include"))
-    {
+    let patterns: Vec<String> = match table.remove("includes").or_else(|| table.remove("include")) {
         Some(Value::Array(arr)) => arr
             .into_iter()
             .filter_map(|v| match v {
@@ -1479,17 +1581,21 @@ fn deep_merge_toml(base: &mut toml::Value, overlay: &toml::Value) {
     }
 }
 
-
 /// Collect all non-directory entries from a directory tree (recursive walk).
 /// Returns file paths in sorted order. Used for `--config-dir` mode.
-pub fn collect_config_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
+pub fn collect_config_files(
+    dir: &Path,
+) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
     let mut files = Vec::new();
     collect_config_files_inner(dir, &mut files)?;
     files.sort();
     Ok(files)
 }
 
-fn collect_config_files_inner(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+fn collect_config_files_inner(
+    dir: &Path,
+    files: &mut Vec<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if !dir.is_dir() {
         return Err(format!("not a directory: {}", dir.display()).into());
     }
@@ -1498,7 +1604,10 @@ fn collect_config_files_inner(dir: &Path, files: &mut Vec<std::path::PathBuf>) -
         let path = entry.path();
         if path.is_dir() {
             collect_config_files_inner(&path, files)?;
-        } else if path.extension().is_some_and(|ext| ext == "toml" || ext == "ini" || ext == "json") {
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext == "toml" || ext == "ini" || ext == "json")
+        {
             files.push(path);
         }
     }
@@ -1525,7 +1634,10 @@ fn detect_format(path: &str) -> ConfigFormat {
     }
 }
 
-fn parse_to_toml_value(content: &str, format: ConfigFormat) -> Result<toml::Value, Box<dyn std::error::Error>> {
+fn parse_to_toml_value(
+    content: &str,
+    format: ConfigFormat,
+) -> Result<toml::Value, Box<dyn std::error::Error>> {
     match format {
         ConfigFormat::Toml => Ok(toml::from_str(content)?),
         ConfigFormat::Ini => ini_to_toml(content),
@@ -1555,9 +1667,7 @@ fn json_to_toml(v: serde_json::Value) -> toml::Value {
             toml::Value::Array(arr.into_iter().map(json_to_toml).collect())
         }
         serde_json::Value::Object(map) => {
-            let table: toml::Table = map.into_iter()
-                .map(|(k, v)| (k, json_to_toml(v)))
-                .collect();
+            let table: toml::Table = map.into_iter().map(|(k, v)| (k, json_to_toml(v))).collect();
             toml::Value::Table(table)
         }
     }
@@ -1634,9 +1744,7 @@ fn infer_ini_value(s: &str) -> toml::Value {
 
     // Comma-separated → Array (type-infer each element)
     if s.contains(',') {
-        let parts: Vec<toml::Value> = s.split(',')
-            .map(|p| infer_ini_value(p.trim()))
-            .collect();
+        let parts: Vec<toml::Value> = s.split(',').map(|p| infer_ini_value(p.trim())).collect();
         return toml::Value::Array(parts);
     }
 
@@ -1664,46 +1772,127 @@ fn known_set_from(keys: &[&'static str]) -> std::collections::HashSet<&'static s
 
 fn known_server_keys() -> std::collections::HashSet<&'static str> {
     known_set_from(&[
-        "bind_addr", "bind_port", "proxy_bind_addr", "vhost_http_port",
-        "vhost_https_port", "kcp_bind_port", "quic_bind_port", "sudp_port",
-        "tcpmux_httpconnect_port", "sub_domain_host", "websocket_port",
-        "tls_enable", "tls_cert_file", "tls_key_file", "tls_ca_file",
-        "tls_only", "auth", "log", "web_server", "transport",
-        "allow_port_start", "allow_port_end", "allow_ports",
-        "max_ports_per_client", "vhost_http_timeout", "user_conn_timeout",
-        "detailed_errors_to_client", "tcp_mux_passthrough", "udp_packet_size",
-        "http_plugins", "feature", "includes", "ssh_tunnel_gateway",
-        "nat_hole_analysis_data_reserve_hours", "observability",
+        "bind_addr",
+        "bind_port",
+        "proxy_bind_addr",
+        "vhost_http_port",
+        "vhost_https_port",
+        "kcp_bind_port",
+        "quic_bind_port",
+        "sudp_port",
+        "tcpmux_httpconnect_port",
+        "sub_domain_host",
+        "websocket_port",
+        "tls_enable",
+        "tls_cert_file",
+        "tls_key_file",
+        "tls_ca_file",
+        "tls_only",
+        "auth",
+        "log",
+        "web_server",
+        "transport",
+        "allow_port_start",
+        "allow_port_end",
+        "allow_ports",
+        "max_ports_per_client",
+        "vhost_http_timeout",
+        "user_conn_timeout",
+        "detailed_errors_to_client",
+        "tcp_mux_passthrough",
+        "udp_packet_size",
+        "http_plugins",
+        "feature",
+        "includes",
+        "ssh_tunnel_gateway",
+        "nat_hole_analysis_data_reserve_hours",
+        "observability",
         // Go compat normalization aliases
-        "common", "auth_method", "auth_token", "token", "oidc_issuer",
-        "oidc_audience", "oidc_token_endpoint", "log_file", "log_level",
-        "log_max_days", "web_server_addr", "web_server_port",
-        "web_server_user", "web_server_password", "web_server_enable_prometheus",
-        "web_server_tls_cert_file", "web_server_tls_key_file",
-        "enable_prometheus", "tcp_mux", "tcp_mux_keepalive_interval",
-        "sshTunnelGateway", "bindPort", "bindAddr",
-        "vhostHTTPPort", "vhostHTTPSPort", "kcpBindPort", "quicBindPort",
-        "sudpPort", "tcpmuxHTTPConnectPort", "proxyBindAddr",
+        "common",
+        "auth_method",
+        "auth_token",
+        "token",
+        "oidc_issuer",
+        "oidc_audience",
+        "oidc_token_endpoint",
+        "log_file",
+        "log_level",
+        "log_max_days",
+        "web_server_addr",
+        "web_server_port",
+        "web_server_user",
+        "web_server_password",
+        "web_server_enable_prometheus",
+        "web_server_tls_cert_file",
+        "web_server_tls_key_file",
+        "enable_prometheus",
+        "tcp_mux",
+        "tcp_mux_keepalive_interval",
+        "sshTunnelGateway",
+        "bindPort",
+        "bindAddr",
+        "vhostHTTPPort",
+        "vhostHTTPSPort",
+        "kcpBindPort",
+        "quicBindPort",
+        "sudpPort",
+        "tcpmuxHTTPConnectPort",
+        "proxyBindAddr",
         "websocketPort",
     ])
 }
 
 fn known_client_keys() -> std::collections::HashSet<&'static str> {
     known_set_from(&[
-        "server_addr", "server_port", "transport_protocol", "token",
-        "auth", "user", "client_id", "metas", "metadatas",
-        "proxy_url", "proxyURL", "nat_hole_stun_server", "natHoleStunServer",
-        "start", "includes", "include",
-        "tls_enable", "tls_cert_file", "tls_key_file", "tls_ca_file",
-        "tls_server_name", "disable_custom_tls_first_byte",
-        "disableCustomTLSFirstByte", "log", "login_fail_exit",
-        "pool_count", "heartbeat_interval", "heartbeatInterval",
-        "dns_server", "dial_server_keepalive", "dialServerKeepalive",
-        "connect_server_local_ip", "connectServerLocalIP",
-        "tcp_mux", "v2", "proxies", "visitors", "web_server",
-        "feature", "common", "protocol", "tls_trusted_ca_file",
-        "serverAddr", "serverPort", "transport",
-        "log_file", "log_level", "log_max_days", "observability",
+        "server_addr",
+        "server_port",
+        "transport_protocol",
+        "token",
+        "auth",
+        "user",
+        "client_id",
+        "metas",
+        "metadatas",
+        "proxy_url",
+        "proxyURL",
+        "nat_hole_stun_server",
+        "natHoleStunServer",
+        "start",
+        "includes",
+        "include",
+        "tls_enable",
+        "tls_cert_file",
+        "tls_key_file",
+        "tls_ca_file",
+        "tls_server_name",
+        "disable_custom_tls_first_byte",
+        "disableCustomTLSFirstByte",
+        "log",
+        "login_fail_exit",
+        "pool_count",
+        "heartbeat_interval",
+        "heartbeatInterval",
+        "dns_server",
+        "dial_server_keepalive",
+        "dialServerKeepalive",
+        "connect_server_local_ip",
+        "connectServerLocalIP",
+        "tcp_mux",
+        "v2",
+        "proxies",
+        "visitors",
+        "web_server",
+        "feature",
+        "common",
+        "protocol",
+        "tls_trusted_ca_file",
+        "serverAddr",
+        "serverPort",
+        "transport",
+        "log_file",
+        "log_level",
+        "log_max_days",
+        "observability",
     ])
 }
 
@@ -1733,10 +1922,12 @@ fn levenshtein(a: &str, b: &str) -> usize {
     for i in 1..=n {
         curr[0] = i;
         for j in 1..=m {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)
-                .min(curr[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                0
+            } else {
+                1
+            };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -1764,7 +1955,8 @@ fn check_strict(
             let parent_section = path.rsplit('.').next().unwrap_or("");
             if !wildcard_sections.contains(&parent_section) {
                 let mut msg = format!(
-                    "unknown field \"{}\" in config file {}", full_key, config_path
+                    "unknown field \"{}\" in config file {}",
+                    full_key, config_path
                 );
                 // Suggest closest known key if within edit distance 3
                 let mut best: Option<(&str, usize)> = None;
@@ -1785,7 +1977,6 @@ fn check_strict(
 }
 
 /// Load server configs from a directory, merging all `.toml` files.
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2064,12 +2255,7 @@ token = "test-token"
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         let known: std::collections::HashSet<&str> =
             ["token", "server_addr"].iter().copied().collect();
-        let errors = check_strict(
-            value.as_table().unwrap(),
-            &known,
-            "",
-            "test.toml",
-        );
+        let errors = check_strict(value.as_table().unwrap(), &known, "", "test.toml");
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("did you mean 'server_addr'"));
     }
@@ -2107,9 +2293,18 @@ authorized_keys_file = "/etc/frp/authorized_keys"
         let cfg: ServerConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.ssh_tunnel_gateway.bind_port, 2200);
         assert_eq!(cfg.ssh_tunnel_gateway.bind_addr, "0.0.0.0");
-        assert_eq!(cfg.ssh_tunnel_gateway.private_key_file, "/etc/frp/ssh_host_key");
-        assert_eq!(cfg.ssh_tunnel_gateway.auto_gen_private_key_path, "/var/lib/frp/ssh_key");
-        assert_eq!(cfg.ssh_tunnel_gateway.authorized_keys_file, "/etc/frp/authorized_keys");
+        assert_eq!(
+            cfg.ssh_tunnel_gateway.private_key_file,
+            "/etc/frp/ssh_host_key"
+        );
+        assert_eq!(
+            cfg.ssh_tunnel_gateway.auto_gen_private_key_path,
+            "/var/lib/frp/ssh_key"
+        );
+        assert_eq!(
+            cfg.ssh_tunnel_gateway.authorized_keys_file,
+            "/etc/frp/authorized_keys"
+        );
     }
 
     #[test]
@@ -2388,46 +2583,67 @@ bindPort = 2200
         fn server_token_promoted_to_auth() {
             let input = "bind_port = 7000\ntoken = \"my-secret\"\n";
             let norm = super::normalize_server_toml(input);
-            assert!(norm.contains("[auth]"), "token should be promoted into [auth]: {norm}");
-            assert!(norm.contains("token = \"my-secret\""), "token value missing: {norm}");
+            assert!(
+                norm.contains("[auth]"),
+                "token should be promoted into [auth]: {norm}"
+            );
+            assert!(
+                norm.contains("token = \"my-secret\""),
+                "token value missing: {norm}"
+            );
         }
 
         #[test]
         fn server_ssh_tunnel_gateway_rename() {
             let input = "bind_port = 7000\n[sshTunnelGateway]\nbindPort = 2200\n";
             let norm = super::normalize_server_toml(input);
-            assert!(norm.contains("ssh_tunnel_gateway"),
-                "sshTunnelGateway not renamed: {norm}");
-            assert!(!norm.contains("sshTunnelGateway"),
-                "old sshTunnelGateway key still present: {norm}");
+            assert!(
+                norm.contains("ssh_tunnel_gateway"),
+                "sshTunnelGateway not renamed: {norm}"
+            );
+            assert!(
+                !norm.contains("sshTunnelGateway"),
+                "old sshTunnelGateway key still present: {norm}"
+            );
         }
 
         #[test]
         fn client_tls_trusted_ca_rename() {
             let input = "server_addr = \"x\"\nserver_port = 7000\ntls_trusted_ca_file = \"/certs/ca.pem\"\n";
             let norm = super::normalize_client_toml(input);
-            assert!(norm.contains("tls_ca_file"),
-                "tls_trusted_ca_file not renamed to tls_ca_file: {norm}");
-            assert!(!norm.contains("tls_trusted_ca_file"),
-                "old tls_trusted_ca_file key still present: {norm}");
+            assert!(
+                norm.contains("tls_ca_file"),
+                "tls_trusted_ca_file not renamed to tls_ca_file: {norm}"
+            );
+            assert!(
+                !norm.contains("tls_trusted_ca_file"),
+                "old tls_trusted_ca_file key still present: {norm}"
+            );
         }
 
         #[test]
         fn server_enable_prometheus_to_web_server() {
             let input = "bind_port = 7000\nenable_prometheus = true\n";
             let norm = super::normalize_server_toml(input);
-            assert!(norm.contains("[web_server]"),
-                "enable_prometheus should create [web_server]: {norm}");
-            assert!(norm.contains("enable_prometheus"),
-                "enable_prometheus value missing: {norm}");
+            assert!(
+                norm.contains("[web_server]"),
+                "enable_prometheus should create [web_server]: {norm}"
+            );
+            assert!(
+                norm.contains("enable_prometheus"),
+                "enable_prometheus value missing: {norm}"
+            );
         }
 
         #[test]
         fn client_transport_wire_protocol_v2() {
-            let input = "server_addr = \"x\"\nserver_port = 7000\n[transport]\nwireProtocol = \"v2\"\n";
+            let input =
+                "server_addr = \"x\"\nserver_port = 7000\n[transport]\nwireProtocol = \"v2\"\n";
             let norm = super::normalize_client_toml(input);
-            assert!(norm.contains("v2 = true"),
-                "wireProtocol=v2 not converted to v2=true: {norm}");
+            assert!(
+                norm.contains("v2 = true"),
+                "wireProtocol=v2 not converted to v2=true: {norm}"
+            );
         }
     }
 
@@ -2454,8 +2670,10 @@ bindPort = 2200
             remote_port = 6001
         "#;
         let err = super::load_client_config_from_str(toml).unwrap_err();
-        assert!(err.to_string().contains("proxy name [dup] is duplicated"),
-            "expected duplicate proxy error, got: {err}");
+        assert!(
+            err.to_string().contains("proxy name [dup] is duplicated"),
+            "expected duplicate proxy error, got: {err}"
+        );
     }
 
     #[test]
@@ -2479,8 +2697,10 @@ bindPort = 2200
             bind_port = 9002
         "#;
         let err = super::load_client_config_from_str(toml).unwrap_err();
-        assert!(err.to_string().contains("visitor name [dup] is duplicated"),
-            "expected duplicate visitor error, got: {err}");
+        assert!(
+            err.to_string().contains("visitor name [dup] is duplicated"),
+            "expected duplicate visitor error, got: {err}"
+        );
     }
 
     #[test]

@@ -68,27 +68,53 @@ fn ensure_tls_certs() -> (String, String, String) {
     // Generate CA key + self-signed CA cert
     let output = Command::new("openssl")
         .args([
-            "req", "-x509", "-newkey", "rsa:2048", "-keyout",
-            ca_key.to_str().unwrap(), "-out", ca_cert.to_str().unwrap(),
-            "-days", "3650", "-nodes",
-            "-subj", "/CN=frp-test-ca",
-            "-addext", "basicConstraints=critical,CA:TRUE",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            ca_key.to_str().unwrap(),
+            "-out",
+            ca_cert.to_str().unwrap(),
+            "-days",
+            "3650",
+            "-nodes",
+            "-subj",
+            "/CN=frp-test-ca",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
         ])
         .output()
         .expect("openssl not found — install openssl or set RUSTIC_SKIP_QUIC=1");
-    assert!(output.status.success(), "openssl CA cert gen failed: {:?}", output);
+    assert!(
+        output.status.success(),
+        "openssl CA cert gen failed: {:?}",
+        output
+    );
 
     // Generate server key + CSR
     let output = Command::new("openssl")
         .args([
-            "req", "-newkey", "rsa:2048", "-keyout",
-            srv_key.to_str().unwrap(), "-out", dir.join("server.csr").to_str().unwrap(),
-            "-days", "3650", "-nodes",
-            "-subj", "/CN=localhost",
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            srv_key.to_str().unwrap(),
+            "-out",
+            dir.join("server.csr").to_str().unwrap(),
+            "-days",
+            "3650",
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
         ])
         .output()
         .expect("openssl not found");
-    assert!(output.status.success(), "openssl server key gen failed: {:?}", output);
+    assert!(
+        output.status.success(),
+        "openssl server key gen failed: {:?}",
+        output
+    );
 
     // Write extfile with SAN for the server cert
     let ext_path = dir.join("server.ext");
@@ -97,18 +123,29 @@ fn ensure_tls_certs() -> (String, String, String) {
     // Sign server CSR with CA (including SAN extension)
     let output = Command::new("openssl")
         .args([
-            "x509", "-req",
-            "-in", dir.join("server.csr").to_str().unwrap(),
-            "-CA", ca_cert.to_str().unwrap(),
-            "-CAkey", ca_key.to_str().unwrap(),
+            "x509",
+            "-req",
+            "-in",
+            dir.join("server.csr").to_str().unwrap(),
+            "-CA",
+            ca_cert.to_str().unwrap(),
+            "-CAkey",
+            ca_key.to_str().unwrap(),
             "-CAcreateserial",
-            "-out", srv_cert.to_str().unwrap(),
-            "-days", "3650",
-            "-extfile", ext_path.to_str().unwrap(),
+            "-out",
+            srv_cert.to_str().unwrap(),
+            "-days",
+            "3650",
+            "-extfile",
+            ext_path.to_str().unwrap(),
         ])
         .output()
         .expect("openssl not found");
-    assert!(output.status.success(), "openssl server cert sign failed: {:?}", output);
+    assert!(
+        output.status.success(),
+        "openssl server cert sign failed: {:?}",
+        output
+    );
 
     (srv_cert_str, srv_key_str, ca_cert_str)
 }
@@ -153,11 +190,11 @@ port = 0
 
         let log_file = std::fs::File::create(&log_path).unwrap();
         let child = Command::new(workspace_bin("frps"))
-        .args(["-c", config_path.to_str().unwrap()])
-        .stdout(std::process::Stdio::from(log_file.try_clone().unwrap()))
-        .stderr(std::process::Stdio::from(log_file))
-        .spawn()
-        .expect("failed to start frps");
+            .args(["-c", config_path.to_str().unwrap()])
+            .stdout(std::process::Stdio::from(log_file.try_clone().unwrap()))
+            .stderr(std::process::Stdio::from(log_file))
+            .spawn()
+            .expect("failed to start frps");
 
         if !wait_for_port(port, Duration::from_secs(10)) {
             eprintln!("--- frps log ({}) ---", log_path.display());
@@ -220,11 +257,11 @@ remote_port = {proxy_port}
 
         let log_file = std::fs::File::create(&log_path).unwrap();
         let child = Command::new(workspace_bin("frpc"))
-        .args(["-c", config_path.to_str().unwrap()])
-        .stdout(std::process::Stdio::from(log_file.try_clone().unwrap()))
-        .stderr(std::process::Stdio::from(log_file))
-        .spawn()
-        .expect("failed to start frpc");
+            .args(["-c", config_path.to_str().unwrap()])
+            .stdout(std::process::Stdio::from(log_file.try_clone().unwrap()))
+            .stderr(std::process::Stdio::from(log_file))
+            .spawn()
+            .expect("failed to start frpc");
 
         FrpcProcess { child }
     }
@@ -264,16 +301,16 @@ fn v2_quic_r2r_tcp_proxy() {
     let (server_cert, server_key, ca_cert) = ensure_tls_certs();
 
     // Start backend TCP echo server.
-    let backend = std::net::TcpListener::bind(format!("127.0.0.1:{}", BACKEND_PORT))
-        .expect("bind backend");
+    let backend =
+        std::net::TcpListener::bind(format!("127.0.0.1:{}", BACKEND_PORT)).expect("bind backend");
     std::thread::spawn(move || {
-        for stream in backend.incoming() {
-            if let Ok(mut s) = stream {
-                let mut buf = [0u8; 1024];
-                while let Ok(n) = s.read(&mut buf) {
-                    if n == 0 { break; }
-                    s.write_all(&buf[..n]).ok();
+        for mut s in backend.incoming().flatten() {
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = s.read(&mut buf) {
+                if n == 0 {
+                    break;
                 }
+                s.write_all(&buf[..n]).ok();
             }
         }
     });

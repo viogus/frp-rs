@@ -1,20 +1,20 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicI64};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicI64, AtomicU64};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, broadcast};
 use tokio::sync::mpsc;
+use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use frp_core::auth::{AuthConfig, OidcVerifier};
-use frp_core::transport::IoStream;
 use frp_core::metrics::ProxyMetricsRegistry;
+use frp_core::transport::IoStream;
 
-use crate::proxy::ProxyManager;
 use crate::nathole::controller::Controller;
-use crate::vhost::VhostManager;
+use crate::proxy::ProxyManager;
 use crate::tcpmux::TcpMuxManager;
+use crate::vhost::VhostManager;
 
 #[cfg(feature = "vnet")]
 type VnetRouteMap = Arc<RwLock<HashMap<(String, String), (String, String)>>>;
@@ -182,7 +182,9 @@ pub struct AppState {
     pub conn_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     /// Per-IP failed login attempt counter: IP -> (count, window_start).
     /// Window resets after 60 seconds. Max 5 failed attempts per window.
-    pub login_throttle: Arc<tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>>,
+    pub login_throttle: Arc<
+        tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
+    >,
     /// CancellationToken for graceful shutdown. Cancelled on SIGTERM/SIGINT.
     /// Main accept loop and control handlers watch this to stop accepting new
     /// connections while letting existing bridge tasks drain.
@@ -208,7 +210,30 @@ pub struct AppState {
 
 impl AppState {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(auth_cfg: AuthConfig, proxy_bind_addr: String, encryption_key: [u8; 16], allow_ports: Vec<(u16, u16)>, sub_domain_host: String, tcp_mux: bool, tcp_mux_keepalive: i64, heartbeat_timeout: i64, udp_packet_size: usize, tls_only: bool, oidc_verifier: Option<Arc<OidcVerifier>>, sudp_port: u16, vhost_http_timeout: u64, user_conn_timeout: u64, tcp_mux_passthrough: bool, custom_404_page: String, plugin_manager: Arc<crate::plugin::HttpPluginManager>, max_ports_per_client: u64, nat_hole_analysis_data_reserve_hours: u64, detailed_errors_to_client: bool, max_connections: usize, server_config_snapshot: frp_core::config::ServerConfigSnapshot) -> Self {
+    pub fn new(
+        auth_cfg: AuthConfig,
+        proxy_bind_addr: String,
+        encryption_key: [u8; 16],
+        allow_ports: Vec<(u16, u16)>,
+        sub_domain_host: String,
+        tcp_mux: bool,
+        tcp_mux_keepalive: i64,
+        heartbeat_timeout: i64,
+        udp_packet_size: usize,
+        tls_only: bool,
+        oidc_verifier: Option<Arc<OidcVerifier>>,
+        sudp_port: u16,
+        vhost_http_timeout: u64,
+        user_conn_timeout: u64,
+        tcp_mux_passthrough: bool,
+        custom_404_page: String,
+        plugin_manager: Arc<crate::plugin::HttpPluginManager>,
+        max_ports_per_client: u64,
+        nat_hole_analysis_data_reserve_hours: u64,
+        detailed_errors_to_client: bool,
+        max_connections: usize,
+        server_config_snapshot: frp_core::config::ServerConfigSnapshot,
+    ) -> Self {
         Self {
             proxy_manager: Arc::new(ProxyManager::new()),
             reloadable: Arc::new(std::sync::RwLock::new(ReloadableState {
@@ -288,9 +313,7 @@ impl AppState {
         // have active connections in flight. Under DDoS with randomized IPs,
         // this prevents unbounded HashMap growth.
         const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(360); // 5 min + 60s window
-        throttle.retain(|_, (_, window_start)| {
-            now.duration_since(*window_start) < CLEANUP_TIMEOUT
-        });
+        throttle.retain(|_, (_, window_start)| now.duration_since(*window_start) < CLEANUP_TIMEOUT);
 
         match throttle.get(&ip) {
             Some((count, window_start)) => {

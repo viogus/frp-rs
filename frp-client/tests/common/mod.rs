@@ -4,13 +4,13 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task::JoinHandle;
 
-use frp_core::config::{ClientConfig, ProxyConfig, ServerConfig};
 use frp_client::service::Service as ClientService;
+use frp_core::config::{ClientConfig, ProxyConfig, ServerConfig};
 use frp_server::service::Service as ServerService;
 
 static INIT_LOG: Once = Once::new();
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::unnecessary_min_or_max)]
 pub fn init_tracing() {
     INIT_LOG.call_once(|| {
         tracing_subscriber::fmt()
@@ -36,16 +36,11 @@ pub fn start_echo_server(port: u16) -> JoinHandle<()> {
         let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
             .await
             .expect("echo server bind");
-        loop {
-            match listener.accept().await {
-                Ok((mut stream, _)) => {
-                    tokio::spawn(async move {
-                        let (mut r, mut w) = stream.split();
-                        let _ = tokio::io::copy(&mut r, &mut w).await;
-                    });
-                }
-                Err(_) => break,
-            }
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let (mut r, mut w) = stream.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
         }
     })
 }
@@ -61,14 +56,16 @@ pub async fn start_frps(port: u16, token: &str) -> JoinHandle<()> {
             ..Default::default()
         },
         allow_port_start: port.saturating_sub(50),
-        allow_port_end: port.saturating_add(50).min(u16::MAX),
+        allow_port_end: port + 50,
         transport: frp_core::config::ServerTransportConfig {
             tcp_mux: false,
             ..Default::default()
         },
         ..Default::default()
     };
-    let service = ServerService::new(cfg, None).await.expect("create server service");
+    let service = ServerService::new(cfg, None)
+        .await
+        .expect("create server service");
     tokio::spawn(async move {
         let _ = service.run().await;
     })
@@ -94,7 +91,7 @@ pub async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> Result<(), ()
 
 /// Full integration test harness: echo server + frps + frpc.
 /// On drop, all background tasks are aborted.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::unnecessary_min_or_max)]
 pub struct TestHarness {
     pub server_port: u16,
     pub proxy_port: u16,
@@ -109,7 +106,7 @@ impl TestHarness {
     ///
     /// `use_encryption` enables AES-128-CFB on the proxy.
     /// `token` is the shared auth token (empty = no auth).
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::unnecessary_min_or_max)]
     pub async fn new(use_encryption: bool, token: &str) -> Self {
         init_tracing();
         let echo_port = allocate_port();
@@ -168,18 +165,20 @@ impl TestHarness {
                 health_check_interval_seconds: 0,
                 health_check_timeout_seconds: 0,
                 health_check_max_failed: 0,
-            virtual_net: String::new(),
-            advertise_subnet: String::new(),
-            vnet_ip: String::new(),
-            vnet_netmask: String::new(),
-            vnet_mtu: 1420,
-            health_check_http_headers: std::collections::HashMap::new(),
-            proxy_protocol_version: String::new(),
-            enabled: true,
+                virtual_net: String::new(),
+                advertise_subnet: String::new(),
+                vnet_ip: String::new(),
+                vnet_netmask: String::new(),
+                vnet_mtu: 1420,
+                health_check_http_headers: std::collections::HashMap::new(),
+                proxy_protocol_version: String::new(),
+                enabled: true,
             }],
             ..Default::default()
         };
-        let client_service = ClientService::new(client_cfg, None).await.expect("create client service");
+        let client_service = ClientService::new(client_cfg, None)
+            .await
+            .expect("create client service");
         let client_handle = tokio::spawn(async move {
             let _ = client_service.run().await;
         });

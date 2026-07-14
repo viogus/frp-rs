@@ -55,18 +55,35 @@ pub struct QuicStream {
 }
 
 impl QuicStream {
-    pub(crate) fn new(conn: quinn::Connection, send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
-        Self { send, recv, _conn: Some(conn) }
+    pub(crate) fn new(
+        conn: quinn::Connection,
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+    ) -> Self {
+        Self {
+            send,
+            recv,
+            _conn: Some(conn),
+        }
     }
 
     /// Create a `QuicStream` without holding a connection reference.
     /// Use when the connection is held separately (e.g., drain-task-spawned streams).
     pub(crate) fn new_borrowed(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
-        Self { send, recv, _conn: None }
+        Self {
+            send,
+            recv,
+            _conn: None,
+        }
     }
 
     /// Split into boxed read and write halves for use with `IoStream::into_split()`.
-    pub fn into_split(self) -> (Box<dyn AsyncRead + Unpin + Send>, Box<dyn AsyncWrite + Unpin + Send>) {
+    pub fn into_split(
+        self,
+    ) -> (
+        Box<dyn AsyncRead + Unpin + Send>,
+        Box<dyn AsyncWrite + Unpin + Send>,
+    ) {
         (Box::new(self.recv), Box::new(self.send))
     }
 }
@@ -82,7 +99,10 @@ pub struct QuicConnection {
 impl QuicConnection {
     /// Accept the next bidirectional stream from the remote peer (server side).
     pub async fn accept_bi(&self) -> io::Result<QuicStream> {
-        let (send, recv) = self.conn.accept_bi().await
+        let (send, recv) = self
+            .conn
+            .accept_bi()
+            .await
             .map_err(|e| io::Error::other(format!("quinn accept_bi: {e}")))?;
         // Drain-task-spawned streams don't need their own conn ref —
         // the drain task already holds a `QuicConnection` clone.
@@ -91,7 +111,10 @@ impl QuicConnection {
 
     /// Open a new bidirectional stream to the remote peer (client side).
     pub async fn open_bi(&self) -> io::Result<QuicStream> {
-        let (send, recv) = self.conn.open_bi().await
+        let (send, recv) = self
+            .conn
+            .open_bi()
+            .await
             .map_err(|e| io::Error::other(format!("quinn open_bi: {e}")))?;
         Ok(QuicStream::new(self.conn.clone(), send, recv))
     }
@@ -116,11 +139,7 @@ pub struct QuicListener {
 impl QuicListener {
     /// Bind a QUIC listener with default transport parameters.
     /// `cert_pem` and `key_pem` are the server's TLS certificate and key (PEM format).
-    pub fn new(
-        addr: SocketAddr,
-        cert_pem: &str,
-        key_pem: &str,
-    ) -> io::Result<Self> {
+    pub fn new(addr: SocketAddr, cert_pem: &str, key_pem: &str) -> io::Result<Self> {
         Self::new_with_params(addr, cert_pem, key_pem, QuicTransportParams::default())
     }
 
@@ -152,9 +171,9 @@ impl QuicListener {
                 .try_into()
                 .unwrap(),
         ));
-        transport.keep_alive_interval(Some(
-            std::time::Duration::from_secs(params.keepalive_period_secs as u64),
-        ));
+        transport.keep_alive_interval(Some(std::time::Duration::from_secs(
+            params.keepalive_period_secs as u64,
+        )));
         transport.max_concurrent_bidi_streams(params.max_incoming_streams.into());
 
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_tls));
@@ -179,9 +198,13 @@ impl QuicListener {
     /// where the accept loop spawns a handler that then loops on `AcceptStream`.
     /// The caller must call `conn.accept_bi()` to get the control stream.
     pub async fn accept(&self) -> io::Result<QuicConnection> {
-        let incoming = self.endpoint.accept().await
+        let incoming = self
+            .endpoint
+            .accept()
+            .await
             .ok_or_else(|| io::Error::other("quinn endpoint closed"))?;
-        let conn = incoming.await
+        let conn = incoming
+            .await
             .map_err(|e| io::Error::other(format!("quinn accept conn: {e}")))?;
         Ok(QuicConnection { conn })
     }
@@ -196,7 +219,15 @@ pub async fn dial_quic(
     server_name: &str,
     ca_file: Option<&str>,
 ) -> io::Result<(QuicStream, QuicConnection)> {
-    dial_quic_with_params(addr, server_name, ca_file, None, None, QuicTransportParams::default()).await
+    dial_quic_with_params(
+        addr,
+        server_name,
+        ca_file,
+        None,
+        None,
+        QuicTransportParams::default(),
+    )
+    .await
 }
 
 /// Dial a QUIC connection to a remote peer with custom transport parameters
@@ -217,8 +248,8 @@ pub async fn dial_quic_with_params(
     // Build TLS config: either custom CA store or platform verifier.
     // mTLS (client certificate) is only supported with a custom CA store.
     let mut tls_config = if let Some(store) = roots {
-        let builder = rustls::ClientConfig::builder()
-            .with_root_certificates(std::sync::Arc::new(store));
+        let builder =
+            rustls::ClientConfig::builder().with_root_certificates(std::sync::Arc::new(store));
 
         if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
             let cert_pem = std::fs::read_to_string(cert_path)
@@ -241,7 +272,7 @@ pub async fn dial_quic_with_params(
         // verifier there is no builder chain to attach client certs to.
         if cert_file.is_some() || key_file.is_some() {
             return Err(io::Error::other(
-                "QUIC: client certificate (mTLS) requires a CA file (tls_trusted_ca_file)"
+                "QUIC: client certificate (mTLS) requires a CA file (tls_trusted_ca_file)",
             ));
         }
         use rustls_platform_verifier::ConfigVerifierExt;
@@ -260,9 +291,9 @@ pub async fn dial_quic_with_params(
             .try_into()
             .unwrap(),
     ));
-    transport.keep_alive_interval(Some(
-        std::time::Duration::from_secs(params.keepalive_period_secs as u64),
-    ));
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(
+        params.keepalive_period_secs as u64,
+    )));
     transport.max_concurrent_bidi_streams(params.max_incoming_streams.into());
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
@@ -284,12 +315,15 @@ pub async fn dial_quic_with_params(
     .map_err(|e| io::Error::other(format!("quinn endpoint: {e}")))?;
     endpoint.set_default_client_config(client_config);
 
-    let conn = endpoint.connect(remote, server_name)
+    let conn = endpoint
+        .connect(remote, server_name)
         .map_err(|e| io::Error::other(format!("quinn connect: {e}")))?
         .await
         .map_err(|e| io::Error::other(format!("quinn connecting: {e}")))?;
 
-    let (send, recv) = conn.open_bi().await
+    let (send, recv) = conn
+        .open_bi()
+        .await
         .map_err(|e| io::Error::other(format!("quinn open stream: {e}")))?;
 
     let qc = QuicConnection { conn: conn.clone() };
@@ -322,17 +356,11 @@ impl AsyncWrite for QuicStream {
         }
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.send).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.send).poll_shutdown(cx)
     }
 }

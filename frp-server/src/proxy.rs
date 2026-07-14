@@ -196,7 +196,9 @@ impl ProxyManager {
         }
         if !group_key.is_empty() {
             // Sticky session: hash the key to pick a backend
-            let hash = group_key.bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
+            let hash = group_key
+                .bytes()
+                .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
             let idx = hash as usize % members.len();
             Some(members[idx].clone())
         } else {
@@ -211,26 +213,39 @@ impl ProxyManager {
 
     /// Get the group for a proxy, if any.
     pub async fn get_group(&self, name: &str) -> Option<String> {
-        self.proxies.read().await.get(name)
+        self.proxies
+            .read()
+            .await
+            .get(name)
             .and_then(|p| p.group.clone())
             .filter(|g| !g.is_empty())
     }
 
     pub async fn list_client(&self, run_id: &str) -> Vec<ProxyInfo> {
-        self.by_client.read().await.get(run_id)
+        self.by_client
+            .read()
+            .await
+            .get(run_id)
             .map(|proxies| proxies.values().cloned().collect())
             .unwrap_or_default()
     }
 
     /// List proxy names for a specific client (run_id).
     pub async fn list_client_proxy_names(&self, run_id: &str) -> Vec<String> {
-        self.by_client.read().await.get(run_id)
+        self.by_client
+            .read()
+            .await
+            .get(run_id)
             .map(|proxies| proxies.keys().cloned().collect())
             .unwrap_or_default()
     }
 
     pub async fn get_run_id(&self, name: &str) -> Option<String> {
-        self.proxies.read().await.get(name).map(|p| p.run_id.clone())
+        self.proxies
+            .read()
+            .await
+            .get(name)
+            .map(|p| p.run_id.clone())
     }
 
     pub async fn list(&self) -> Vec<ProxyInfo> {

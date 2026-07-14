@@ -64,7 +64,7 @@ async fn test_dashboard_status() {
 
     let client = auth_client();
     let resp = client
-        .get(&frps.dashboard_url("/api/status"))
+        .get(frps.dashboard_url("/api/status"))
         .basic_auth("admin", Some("admin"))
         .send()
         .await
@@ -87,7 +87,7 @@ async fn test_dashboard_serverinfo() {
 
     let client = auth_client();
     let resp = client
-        .get(&frps.dashboard_url("/api/serverinfo"))
+        .get(frps.dashboard_url("/api/serverinfo"))
         .basic_auth("admin", Some("admin"))
         .send()
         .await
@@ -107,7 +107,7 @@ async fn test_dashboard_proxies_list() {
 
     let client = auth_client();
     let resp = client
-        .get(&frps.dashboard_url("/api/proxies"))
+        .get(frps.dashboard_url("/api/proxies"))
         .basic_auth("admin", Some("admin"))
         .send()
         .await
@@ -127,7 +127,7 @@ async fn test_dashboard_proxy_detail_not_found() {
 
     let client = auth_client();
     let resp = client
-        .get(&frps.dashboard_url("/api/proxy/nonexistent"))
+        .get(frps.dashboard_url("/api/proxy/nonexistent"))
         .basic_auth("admin", Some("admin"))
         .send()
         .await
@@ -144,7 +144,7 @@ async fn test_dashboard_clients() {
 
     let client = auth_client();
     let resp = client
-        .get(&frps.dashboard_url("/api/clients"))
+        .get(frps.dashboard_url("/api/clients"))
         .basic_auth("admin", Some("admin"))
         .send()
         .await

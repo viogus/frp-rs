@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # frp-rs Cross-Compatibility Test Suite
-# Tests Go frp v0.69.1 <-> Rust frp-rs interoperability
+# Tests Go frp v0.70.0 <-> Rust frp-rs interoperability
 # =============================================================================
 set -euo pipefail
 
@@ -9,7 +9,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # Go version (overridable via env or --go-version flag)
-GO_FRP_VERSION="${GO_FRP_VERSION:-0.69.1}"
+GO_FRP_VERSION="${GO_FRP_VERSION:-0.70.0}"
 # Auto-detect Go frp binary path. Override with GO_FRP_DIR env var.
 GO_FRP_DIR_USER=""  # track if user provided explicit path
 if [[ -n "${GO_FRP_DIR:-}" ]]; then
@@ -81,7 +81,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --frps-remote HOST  Remote VPS address for XTCP tests"
             echo "  --xtcp-only       Run only XTCP tests (skip all other phases)"
             echo "  --shard INDEX/TOTAL  Shard XTCP tests across N jobs (e.g. 0/4)"
-            echo "  --go-version VER  Go frp version (default: 0.69.1)"
+            echo "  --go-version VER  Go frp version (default: 0.70.0)"
             exit 0
             ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
@@ -118,7 +118,7 @@ run_go() {
 }
 
 # --- Source-built Go frp for V2 tests ---
-# Pre-built Go frp v0.69.1 binary lacks V2 support. When Go is available,
+# Pre-built Go frp v0.70.0 binary lacks V2 support. When Go is available,
 # auto-build from source and cache in /tmp/frp-source-build.
 GO_FRP_SOURCE_DIR="${GO_FRP_SOURCE_DIR:-/tmp/frp-source-build}"
 GO_FRPS_V2="$GO_FRP_SOURCE_DIR/frps"
@@ -135,11 +135,11 @@ build_go_frp_v2() {
         return 1
     fi
 
-    log "Building Go frp from source (v0.69.1, V2 support)..."
+    log "Building Go frp from source (v0.70.0, V2 support)..."
     local clone_dir="/tmp/frp-clone"
 
     if [[ ! -d "$clone_dir" ]]; then
-        git clone -q --depth 1 --branch v0.69.1 \
+        git clone -q --depth 1 --branch v0.70.0 \
             https://github.com/fatedier/frp.git "$clone_dir" 2>&1 || {
             log "SKIP V2: failed to clone Go frp source"
             return 1
@@ -847,7 +847,7 @@ write_frpc_config_xtcp_provider() {
             printf '[[proxies]]\nname = "%s"\ntype = "xtcp"\n' "$name"
             printf 'secretKey = "%s"\n' "$sk"
             printf 'localIP = "127.0.0.1"\nlocalPort = %s\n' "$echo_port"
-            if $has_enc; then printf 'transport.useEncryption = true\n'; fi
+                        if $has_enc; then printf 'transport.useEncryption = true\n'; fi
             if $has_comp; then printf 'transport.useCompression = true\n'; fi
             printf '\n[[proxies]]\nname = "%s-stcp"\ntype = "stcp"\n' "$name"
             printf 'secretKey = "%s"\n' "$sk"
@@ -860,6 +860,7 @@ write_frpc_config_xtcp_provider() {
             printf 'token = "%s"\n' "$token"
             printf 'tcp_mux = false\n'
             printf 'login_fail_exit = true\npool_count = 1\n'
+            printf 'nat_hole_stun_server = "stun.l.google.com:19302"\n'
             printf '\n[[proxies]]\nname = "%s"\ntype = "xtcp"\n' "$name"
             printf 'sk = "%s"\n' "$sk"
             printf 'local_ip = "127.0.0.1"\nlocal_port = %s\n' "$echo_port"
@@ -893,7 +894,7 @@ write_frpc_config_xtcp_visitor() {
             printf 'bindAddr = "127.0.0.1"\nbindPort = %s\n' "$visitor_port"
             printf 'fallbackTo = "%s-stcp-visitor"\n' "$server_name"
             printf 'fallbackTimeoutMs = 2000\n'
-            if $has_enc; then printf 'transport.useEncryption = true\n'; fi
+                        if $has_enc; then printf 'transport.useEncryption = true\n'; fi
             if $has_comp; then printf 'transport.useCompression = true\n'; fi
             printf '\n[[visitors]]\nname = "%s-stcp-visitor"\ntype = "stcp"\n' "$server_name"
             printf 'serverName = "%s-stcp"\n' "$server_name"
@@ -907,6 +908,7 @@ write_frpc_config_xtcp_visitor() {
             printf 'token = "%s"\n' "$token"
             printf 'tcp_mux = false\n'
             printf 'login_fail_exit = true\npool_count = 1\n'
+            printf 'nat_hole_stun_server = "stun.l.google.com:19302"\n'
             printf '\n[[visitors]]\nname = "%s-visitor"\ntype = "xtcp"\n' "$server_name"
             printf 'server_name = "%s"\n' "$server_name"
             printf 'sk = "%s"\n' "$sk"
@@ -2773,7 +2775,7 @@ test_r2g_tcpmux() {
 
 echo "============================================="
 echo " frp-rs Cross-Compatibility Test Suite"
-echo " Go frp v0.69.1 <-> Rust frp-rs"
+echo " Go frp v0.70.0 <-> Rust frp-rs"
 echo "============================================="
 echo ""
 
@@ -4502,6 +4504,8 @@ test_r2g_quic_encrypted() {
         > "$TEST_DIR/$name/frps.log" 2>&1 &
     track_pid $!
     wait_for_port 127.0.0.1 "$frps_port" 10 || {
+        echo "--- Go frps log tail ---"
+        tail -40 "$TEST_DIR/$name/frps.log" 2>/dev/null || true
         fail_test "$name" "Go frps did not start"
         return
     }
@@ -4536,7 +4540,7 @@ test_g2r_v2_tcp() {
     local name="go-to-rust-v2-tcp"
     should_run_test "$name" || return 0
 
-    # V2 needs Go frp source build (pre-built v0.69.1 binary lacks V2).
+    # V2 needs Go frp source build (pre-built v0.70.0 binary lacks V2).
     build_go_frp_v2 || return 0
 
     log "=== $name ==="
@@ -4856,9 +4860,9 @@ run_test test_r2g_ws_encrypted
 run_test test_g2r_wss_plain
 run_test test_g2r_wss_encrypted
 run_test test_g2r_wss_mux
-# r2g: Rust frpc → Go frps — blocked by Go frp v0.69.1 vhostHTTPSPort TLS SNI bug.
+# r2g: Rust frpc → Go frps — blocked by Go frp v0.70.0 vhostHTTPSPort TLS SNI bug.
 # Go frps sends fatal UnrecognisedName alert (112). Rust frpc rustls aborts.
-# TODO: fix after Go frp v0.69.1 vhostHTTPSPort TLS config resolved.
+# TODO: fix after Go frp v0.70.0 vhostHTTPSPort TLS config resolved.
 # run_test test_r2g_wss_plain
 # run_test test_r2g_wss_encrypted
 # run_test test_r2g_wss_mux
@@ -4886,7 +4890,7 @@ run_test test_r2g_kcp
 # QUIC Rust↔Rust: both sides use quinn crate, wire-compatible.
 run_test test_quic_rust_to_rust
 # QUIC Go↔Rust: multi-stream-per-connection enabled.
-# Go frp v0.69.1 uses quic-go (multi-stream), Rust accepts additional streams.
+# Go frp v0.70.0 uses quic-go (multi-stream), Rust accepts additional streams.
 # Both pre-built and source-built Go frp binaries work with release Rust build.
 run_test test_g2r_quic
 run_test test_r2g_quic

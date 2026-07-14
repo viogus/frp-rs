@@ -14,19 +14,14 @@ pub enum ServerEvent {
         remote_port: Option<u16>,
     },
     /// A proxy was explicitly closed or its client disconnected.
-    ProxyDown {
-        proxy_name: String,
-        run_id: String,
-    },
+    ProxyDown { proxy_name: String, run_id: String },
     /// A frpc client connected and authenticated successfully.
     ClientConnected {
         run_id: String,
         client_addr: Option<String>,
     },
     /// A frpc client disconnected (control channel closed).
-    ClientDisconnected {
-        run_id: String,
-    },
+    ClientDisconnected { run_id: String },
     /// Periodic traffic snapshot for a proxy (emitted every ~1s, only when changed).
     Traffic {
         proxy_name: String,

@@ -120,7 +120,11 @@ impl Fec {
         let encode_matrix = if data_shards > 0 && parity_shards > 0 {
             // Vandermonde: vm[r][c] = r^c (r from 0), matching klauspost galExp.
             let vm: Vec<Vec<u8>> = (0..total_shards)
-                .map(|r| (0..data_shards).map(|c| gf256::pow(r as u8, c as u32)).collect())
+                .map(|r| {
+                    (0..data_shards)
+                        .map(|c| gf256::pow(r as u8, c as u32))
+                        .collect()
+                })
                 .collect();
             // Invert the top data×data square; distinct nodes 0..data-1 make it
             // non-singular for data <= 256.
@@ -335,9 +339,7 @@ pub struct XorBlock {
 
 impl XorBlock {
     pub fn new(key: &[u8]) -> Self {
-        Self {
-            key: key.to_vec(),
-        }
+        Self { key: key.to_vec() }
     }
 
     /// XOR encrypt/decrypt in place (symmetric operation).
@@ -495,16 +497,32 @@ mod tests {
         let out = fec.encode(&refs);
 
         // Parity bytes must match klauspost exactly.
-        assert_eq!(out[10], vec![0x45, 0x98, 0x0a, 0xf5], "parity[10] != klauspost");
-        assert_eq!(out[11], vec![0xf2, 0xb4, 0x9a, 0xf4], "parity[11] != klauspost");
-        assert_eq!(out[12], vec![0x12, 0xdc, 0x0d, 0xf3], "parity[12] != klauspost");
+        assert_eq!(
+            out[10],
+            vec![0x45, 0x98, 0x0a, 0xf5],
+            "parity[10] != klauspost"
+        );
+        assert_eq!(
+            out[11],
+            vec![0xf2, 0xb4, 0x9a, 0xf4],
+            "parity[11] != klauspost"
+        );
+        assert_eq!(
+            out[12],
+            vec![0x12, 0xdc, 0x0d, 0xf3],
+            "parity[12] != klauspost"
+        );
 
         // Reconstruct a lost data shard (drop #3, keep all parity).
         let mut shards: Vec<Option<Vec<u8>>> = out.iter().map(|s| Some(s.clone())).collect();
         let orig3 = shards[3].clone().unwrap();
         shards[3] = None;
         assert!(fec.decode(&mut shards), "decode should reconstruct");
-        assert_eq!(shards[3].as_ref().unwrap(), &orig3, "reconstructed shard[3] wrong");
+        assert_eq!(
+            shards[3].as_ref().unwrap(),
+            &orig3,
+            "reconstructed shard[3] wrong"
+        );
     }
 
     #[test]

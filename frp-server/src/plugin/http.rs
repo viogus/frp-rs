@@ -44,31 +44,29 @@ impl HttpPluginManager {
         // Per-plugin timeout is enforced by tokio::time::timeout below.
         // No reqwest-level timeout — the tokio wrapper covers connect + full
         // request lifecycle and respects per-plugin timeout config.
-        let client = reqwest::Client::builder()
-            .build()
-            .unwrap_or_default();
+        let client = reqwest::Client::builder().build().unwrap_or_default();
         let plugins = configs.into_iter().map(|cfg| PluginDef { cfg }).collect();
-        Self { plugins: Arc::new(plugins), client }
+        Self {
+            plugins: Arc::new(plugins),
+            client,
+        }
     }
 
     /// Notify all plugins about an event.
     ///
     /// Returns `Ok(())` if no plugin rejects the event. Returns
     /// `Err(reason)` if any control-enabled plugin rejects.
-    pub async fn notify(
-        &self,
-        op: &str,
-        content: serde_json::Value,
-    ) -> Result<(), String> {
+    pub async fn notify(&self, op: &str, content: serde_json::Value) -> Result<(), String> {
         for plugin in self.plugins.iter() {
             // Filter by ops list if non-empty
-            if !plugin.cfg.ops.is_empty()
-                && !plugin.cfg.ops.iter().any(|o| o == op)
-            {
+            if !plugin.cfg.ops.is_empty() && !plugin.cfg.ops.iter().any(|o| o == op) {
                 continue;
             }
 
-            let event = PluginEvent { op, content: content.clone() };
+            let event = PluginEvent {
+                op,
+                content: content.clone(),
+            };
             let timeout = Duration::from_secs(plugin.cfg.timeout.max(1));
 
             let body = match serde_json::to_string(&event) {
@@ -78,12 +76,16 @@ impl HttpPluginManager {
                     continue;
                 }
             };
-            match tokio::time::timeout(timeout, self.client
-                .post(&plugin.cfg.url)
-                .header("Content-Type", "application/json")
-                .body(body)
-                .send()
-            ).await {
+            match tokio::time::timeout(
+                timeout,
+                self.client
+                    .post(&plugin.cfg.url)
+                    .header("Content-Type", "application/json")
+                    .body(body)
+                    .send(),
+            )
+            .await
+            {
                 Ok(Ok(resp)) => {
                     if plugin.cfg.enable_control {
                         let resp_text = match resp.text().await {

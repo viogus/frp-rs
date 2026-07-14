@@ -7,7 +7,11 @@
 macro_rules! opt_if_empty {
     ($e:expr) => {{
         let v = &$e;
-        if v.is_empty() { None } else { Some(v.clone()) }
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.clone())
+        }
     }};
 }
 pub(crate) use opt_if_empty;

@@ -4,15 +4,15 @@ use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use common::{allocate_port, test_auth_cfg};
 use frp_core::auth;
 use frp_core::config::ServerConfig;
 use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage, NewProxy, NewWorkConn};
+use frp_core::mux;
 use frp_core::transport::{DialOptions, IoStream};
 use frp_core::v2_handshake;
-use frp_core::mux;
 use frp_server::service::Service;
-use common::{allocate_port, test_auth_cfg};
 
 /// Full end-to-end V2 protocol test: Rust frps vs Rust frpc (in-process).
 ///
@@ -32,8 +32,9 @@ async fn test_v2_tcp_proxy() {
     let echo_port = allocate_port();
 
     // ---- start echo TCP server ----
-    let echo_listener =
-        tokio::net::TcpListener::bind(format!("127.0.0.1:{echo_port}")).await.unwrap();
+    let echo_listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{echo_port}"))
+        .await
+        .unwrap();
     let echo_task = tokio::spawn(async move {
         loop {
             let (stream, _) = match echo_listener.accept().await {
@@ -81,16 +82,21 @@ async fn test_v2_tcp_proxy() {
             std::mem::discriminant(&other)
         ),
     };
-    let (control_yamux, yamux_session) =
-        mux::client_mux(tcp_stream, &mux::TcpMuxConfig::default())
-            .await
-            .expect("yamux client init");
+    let (control_yamux, yamux_session) = mux::client_mux(tcp_stream, &mux::TcpMuxConfig::default())
+        .await
+        .expect("yamux client init");
     let mut control = IoStream::Yamux(control_yamux);
 
     // V2 ClientHello / ServerHello handshake on the yamux control stream
-    v2_handshake::v2_handshake_client(&mut control, "tcp", false, true, false /* with_crypto */)
-        .await
-        .expect("V2 handshake");
+    v2_handshake::v2_handshake_client(
+        &mut control,
+        "tcp",
+        false,
+        true,
+        false, /* with_crypto */
+    )
+    .await
+    .expect("V2 handshake");
 
     // ---- Login via V2 on yamux control stream ----
     let ts = SystemTime::now()
@@ -113,10 +119,7 @@ async fn test_v2_tcp_proxy() {
         client_spec: None,
         multiplexer: Some("yamux".into()),
     });
-    control
-        .write_v2_frame(&login)
-        .await
-        .expect("send Login");
+    control.write_v2_frame(&login).await.expect("send Login");
 
     let resp = control.read_v2_frame().await.expect("read LoginResp");
     let run_id = match resp {
@@ -128,7 +131,10 @@ async fn test_v2_tcp_proxy() {
             );
             r.run_id.expect("run_id should be set")
         }
-        other => panic!("expected LoginResp, got v2 type_id: {:?}", other.v2_type_id()),
+        other => panic!(
+            "expected LoginResp, got v2 type_id: {:?}",
+            other.v2_type_id()
+        ),
     };
     println!("V2 login succeeded, run_id: {run_id}");
 
@@ -182,10 +188,7 @@ async fn test_v2_tcp_proxy() {
         #[cfg(feature = "vnet")]
         vnet_mtu: None,
     });
-    control
-        .write_v2_frame(&np)
-        .await
-        .expect("send NewProxy");
+    control.write_v2_frame(&np).await.expect("send NewProxy");
 
     let proxy_resp = control.read_v2_frame().await.expect("read NewProxyResp");
     let proxy_port: u16 = match proxy_resp {
@@ -195,10 +198,7 @@ async fn test_v2_tcp_proxy() {
                 "NewProxy should succeed, got error: {:?}",
                 r.error
             );
-            let addr = r
-                .remote_addr
-                .as_ref()
-                .expect("remote_addr should be set");
+            let addr = r.remote_addr.as_ref().expect("remote_addr should be set");
             addr.trim_start_matches(':')
                 .parse()
                 .expect("remote_addr should contain port")
@@ -266,9 +266,7 @@ async fn test_v2_tcp_proxy() {
     });
 
     // ---- Echo test: write "hello v2", read it back ----
-    user.write_all(b"hello v2")
-        .await
-        .expect("write to proxy");
+    user.write_all(b"hello v2").await.expect("write to proxy");
     println!("Wrote 'hello v2' to proxy port");
 
     let mut buf = [0u8; 1024];
@@ -283,10 +281,7 @@ async fn test_v2_tcp_proxy() {
         "echo mismatch: {}",
         String::from_utf8_lossy(&buf[..n])
     );
-    println!(
-        "Echo test passed: {}",
-        String::from_utf8_lossy(&buf[..n])
-    );
+    println!("Echo test passed: {}", String::from_utf8_lossy(&buf[..n]));
 
     // Cleanup
     drop(control);
@@ -329,9 +324,15 @@ async fn test_v2_ping_pong_raw_tcp() {
         .expect("dial server");
 
     // V2 handshake on raw TCP (no yamux)
-    v2_handshake::v2_handshake_client(&mut stream, "tcp", false, false, false /* with_crypto */)
-        .await
-        .expect("V2 handshake");
+    v2_handshake::v2_handshake_client(
+        &mut stream,
+        "tcp",
+        false,
+        false,
+        false, /* with_crypto */
+    )
+    .await
+    .expect("V2 handshake");
 
     // Login
     let ts = SystemTime::now()
@@ -354,19 +355,12 @@ async fn test_v2_ping_pong_raw_tcp() {
         client_spec: None,
         multiplexer: None,
     });
-    stream
-        .write_v2_frame(&login)
-        .await
-        .expect("send Login");
+    stream.write_v2_frame(&login).await.expect("send Login");
 
     let resp = stream.read_v2_frame().await.expect("read LoginResp");
     match &resp {
         FrpMessage::LoginResp(r) => {
-            assert!(
-                r.error.is_none(),
-                "Login error: {:?}",
-                r.error
-            );
+            assert!(r.error.is_none(), "Login error: {:?}", r.error);
         }
         other => panic!("expected LoginResp, got {:?}", other.v2_type_id()),
     }
@@ -437,7 +431,10 @@ async fn test_v2_ping_pong_yamux() {
     // Wrap in yamux FIRST (matching server)
     let tcp_stream = match raw_stream {
         IoStream::Tcp(s) => s,
-        other => panic!("expected IoStream::Tcp, got {:?}", std::mem::discriminant(&other)),
+        other => panic!(
+            "expected IoStream::Tcp, got {:?}",
+            std::mem::discriminant(&other)
+        ),
     };
     let (control_yamux, _yamux_session) =
         mux::client_mux(tcp_stream, &mux::TcpMuxConfig::default())
@@ -446,9 +443,15 @@ async fn test_v2_ping_pong_yamux() {
     let mut control = IoStream::Yamux(control_yamux);
 
     // V2 handshake on yamux stream
-    v2_handshake::v2_handshake_client(&mut control, "tcp", false, true, false /* with_crypto */)
-        .await
-        .expect("V2 handshake");
+    v2_handshake::v2_handshake_client(
+        &mut control,
+        "tcp",
+        false,
+        true,
+        false, /* with_crypto */
+    )
+    .await
+    .expect("V2 handshake");
 
     // Login
     let ts = SystemTime::now()
@@ -546,7 +549,10 @@ async fn test_v2_aead_ping_pong_yamux() {
     // Wrap in yamux FIRST (matching server)
     let tcp_stream = match raw_stream {
         IoStream::Tcp(s) => s,
-        other => panic!("expected IoStream::Tcp, got {:?}", std::mem::discriminant(&other)),
+        other => panic!(
+            "expected IoStream::Tcp, got {:?}",
+            std::mem::discriminant(&other)
+        ),
     };
     let (control_yamux, _yamux_session) =
         mux::client_mux(tcp_stream, &mux::TcpMuxConfig::default())
@@ -555,15 +561,21 @@ async fn test_v2_aead_ping_pong_yamux() {
     let mut control = IoStream::Yamux(control_yamux);
 
     // Write V2 magic on yamux stream (matching real client + Go frp)
-    frp_core::protocol::write_v2_magic(&mut control).await.expect("write V2 magic");
+    frp_core::protocol::write_v2_magic(&mut control)
+        .await
+        .expect("write V2 magic");
 
     // V2 handshake WITH crypto
     let crypto_ctx = v2_handshake::v2_handshake_client(
-        &mut control, "tcp", false, true, true /* with_crypto */
+        &mut control,
+        "tcp",
+        false,
+        true,
+        true, /* with_crypto */
     )
-        .await
-        .expect("V2 handshake")
-        .expect("crypto must be negotiated");
+    .await
+    .expect("V2 handshake")
+    .expect("crypto must be negotiated");
 
     // Login via plaintext V2 (matching Go frp flow: Login before AEAD wrapping)
     let ts = SystemTime::now()

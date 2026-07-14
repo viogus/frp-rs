@@ -11,7 +11,6 @@
 //! - key_file: path to TLS private key PEM file
 //! - host_header_rewrite: optional Host header override
 
-
 #[cfg(feature = "tls")]
 use tokio::io::AsyncWriteExt;
 #[cfg(feature = "tls")]
@@ -23,9 +22,9 @@ use frp_core::config::PluginConfig;
 #[cfg(feature = "tls")]
 use frp_core::transport::build_tls_acceptor;
 
-use super::{PluginHandle, serve_plugin};
 #[cfg(feature = "tls")]
 use super::split_host_port;
+use super::{serve_plugin, PluginHandle};
 
 /// Start an https2http plugin server.
 #[cfg(feature = "tls")]
@@ -44,16 +43,21 @@ pub async fn start_https2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
     }
     let host_rewrite = cfg.host_header_rewrite.clone();
     let tls_acceptor = build_tls_acceptor(&cfg.crt_file, &cfg.key_file, None)?;
-    serve_plugin("https2http", (target_addr, host_rewrite, tls_acceptor), |tcp, peer, (target, rewrite, acceptor)| async move {
-        match acceptor.accept(tcp).await {
-            Ok(tls) => {
-                if let Err(e) = handle_conn(tls, &target, &rewrite).await {
-                    debug!(%peer, error = %e, "https2http: {peer} error: {e}");
+    serve_plugin(
+        "https2http",
+        (target_addr, host_rewrite, tls_acceptor),
+        |tcp, peer, (target, rewrite, acceptor)| async move {
+            match acceptor.accept(tcp).await {
+                Ok(tls) => {
+                    if let Err(e) = handle_conn(tls, &target, &rewrite).await {
+                        debug!(%peer, error = %e, "https2http: {peer} error: {e}");
+                    }
                 }
+                Err(e) => debug!(%peer, %e, "https2http: {peer} TLS error: {e}"),
             }
-            Err(e) => debug!(%peer, %e, "https2http: {peer} TLS error: {e}"),
-        }
-    }).await
+        },
+    )
+    .await
 }
 
 #[cfg(not(feature = "tls"))]

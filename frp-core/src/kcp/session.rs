@@ -149,7 +149,13 @@ impl KcpSession {
             return Ok(Vec::new());
         }
 
-        tracing::trace!(conv = self.conv, output_count = output.len(), fec_avail = self.fec.is_some(), "KCP SESSION: update produced {} output packets", output.len());
+        tracing::trace!(
+            conv = self.conv,
+            output_count = output.len(),
+            fec_avail = self.fec.is_some(),
+            "KCP SESSION: update produced {} output packets",
+            output.len()
+        );
         let mut packets = Vec::new();
         if let Some(ref fec) = self.fec {
             for raw in &output {
@@ -188,8 +194,7 @@ impl KcpSession {
 
                     // Output parity shards (skip data shards, already sent).
                     for parity in &all_shards[self.config.data_shards..] {
-                        let mut packet =
-                            Vec::with_capacity(FEC_HEADER_SIZE + parity.len());
+                        let mut packet = Vec::with_capacity(FEC_HEADER_SIZE + parity.len());
                         packet.extend_from_slice(&self.fec_seqid.to_le_bytes());
                         packet.extend_from_slice(&TYPE_PARITY.to_le_bytes());
                         packet.extend_from_slice(parity);
@@ -227,7 +232,12 @@ impl KcpSession {
         if output.is_empty() {
             return Ok(Vec::new());
         }
-        tracing::trace!(conv = self.conv, output_count = output.len(), "KCP SESSION: force_flush produced {} packets", output.len());
+        tracing::trace!(
+            conv = self.conv,
+            output_count = output.len(),
+            "KCP SESSION: force_flush produced {} packets",
+            output.len()
+        );
         let mut packets = Vec::new();
         if let Some(ref fec) = self.fec {
             for raw in &output {
@@ -253,8 +263,7 @@ impl KcpSession {
                         self.pending_shards.iter().map(|s| s.as_slice()).collect();
                     let all_shards = fec.encode(&shard_refs);
                     for parity in &all_shards[self.config.data_shards..] {
-                        let mut packet =
-                            Vec::with_capacity(FEC_HEADER_SIZE + parity.len());
+                        let mut packet = Vec::with_capacity(FEC_HEADER_SIZE + parity.len());
                         packet.extend_from_slice(&self.fec_seqid.to_le_bytes());
                         packet.extend_from_slice(&TYPE_PARITY.to_le_bytes());
                         packet.extend_from_slice(parity);
@@ -277,7 +286,12 @@ impl KcpSession {
 
         if let Some(ref fec) = self.fec {
             if data.len() < FEC_HEADER_SIZE {
-                tracing::debug!(conv = self.conv, len = data.len(), "KCP SESSION: input too short for FEC header ({} bytes)", data.len());
+                tracing::debug!(
+                    conv = self.conv,
+                    len = data.len(),
+                    "KCP SESSION: input too short for FEC header ({} bytes)",
+                    data.len()
+                );
                 return Ok(());
             }
             let seqid = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -285,12 +299,26 @@ impl KcpSession {
 
             if flag != TYPE_DATA && flag != TYPE_PARITY {
                 // Not FEC — treat as raw KCP.
-                tracing::trace!(conv = self.conv, len = data.len(), flag, "KCP SESSION: input raw KCP (non-FEC), {} bytes", data.len());
+                tracing::trace!(
+                    conv = self.conv,
+                    len = data.len(),
+                    flag,
+                    "KCP SESSION: input raw KCP (non-FEC), {} bytes",
+                    data.len()
+                );
                 self.kcp.input(data).map_err(io::Error::other)?;
                 return Ok(());
             }
 
-            tracing::trace!(conv = self.conv, len = data.len(), seqid, flag, "KCP SESSION: input FEC {} shard seqid={}", if flag == TYPE_DATA {"DATA"} else {"PARITY"}, seqid);
+            tracing::trace!(
+                conv = self.conv,
+                len = data.len(),
+                seqid,
+                flag,
+                "KCP SESSION: input FEC {} shard seqid={}",
+                if flag == TYPE_DATA { "DATA" } else { "PARITY" },
+                seqid
+            );
 
             let shard_data = &data[FEC_HEADER_SIZE..];
             let total = self.config.data_shards + self.config.parity_shards;
@@ -309,17 +337,16 @@ impl KcpSession {
 
             // Feed data shards to KCP immediately (Go kcp-go behavior).
             // Raw KCP data = shard_data[2..][..SIZE-2] where SIZE is first 2 bytes.
-            if flag == TYPE_DATA && group.shards[shard_index].is_none() && shard_data.len() >= 2
-            {
+            if flag == TYPE_DATA && group.shards[shard_index].is_none() && shard_data.len() >= 2 {
                 let size = u16::from_le_bytes([shard_data[0], shard_data[1]]) as usize;
                 if size >= 2 {
-                        let payload_end = (size - 2).min(shard_data.len() - 2);
-                        if payload_end > 0 {
-                            self.kcp
-                                .input(&shard_data[2..2 + payload_end])
-                                .map_err(io::Error::other)?;
-                        }
+                    let payload_end = (size - 2).min(shard_data.len() - 2);
+                    if payload_end > 0 {
+                        self.kcp
+                            .input(&shard_data[2..2 + payload_end])
+                            .map_err(io::Error::other)?;
                     }
+                }
             }
 
             if group.shards[shard_index].is_none() {
@@ -331,7 +358,12 @@ impl KcpSession {
             if group.received_count >= self.config.data_shards {
                 // Track which data shards were already received (to avoid double-feed).
                 let mut had_data = vec![false; self.config.data_shards];
-                for (i, s) in group.shards.iter().enumerate().take(self.config.data_shards) {
+                for (i, s) in group
+                    .shards
+                    .iter()
+                    .enumerate()
+                    .take(self.config.data_shards)
+                {
                     had_data[i] = s.is_some();
                 }
 
@@ -406,11 +438,23 @@ impl KcpSession {
                     }
                     match self.kcp.recv(&mut self.recv_buf[..size]) {
                         Ok(n) => {
-                            tracing::trace!(conv = self.conv, n, "KCP SESSION: recv_and_push got {} bytes", n);
+                            tracing::trace!(
+                                conv = self.conv,
+                                n,
+                                "KCP SESSION: recv_and_push got {} bytes",
+                                n
+                            );
                             if self.read_tx.send(self.recv_buf[..n].to_vec()).is_err() {
                                 self.shutdown = true;
-                                tracing::debug!(conv = self.conv, "KCP SESSION: read_tx closed, shutting down conv {}", self.conv);
-                                return Err(io::Error::new(io::ErrorKind::NotConnected, "KCP read channel closed"));
+                                tracing::debug!(
+                                    conv = self.conv,
+                                    "KCP SESSION: read_tx closed, shutting down conv {}",
+                                    self.conv
+                                );
+                                return Err(io::Error::new(
+                                    io::ErrorKind::NotConnected,
+                                    "KCP read channel closed",
+                                ));
                             }
                         }
                         Err(e) => return Err(io::Error::other(e)),
@@ -499,12 +543,7 @@ mod tests {
             read_tx1,
         );
         let (read_tx2, mut read_rx2) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let mut s2 = KcpSession::new(
-            1,
-            "127.0.0.1:9000".parse().unwrap(),
-            config,
-            read_tx2,
-        );
+        let mut s2 = KcpSession::new(1, "127.0.0.1:9000".parse().unwrap(), config, read_tx2);
 
         s1.send(b"hello kcp").unwrap();
 
@@ -530,12 +569,7 @@ mod tests {
     fn test_session_send_no_fec_produces_packets() {
         let config = test_config();
         let (read_tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let mut session = KcpSession::new(
-            42,
-            "127.0.0.1:9999".parse().unwrap(),
-            config,
-            read_tx,
-        );
+        let mut session = KcpSession::new(42, "127.0.0.1:9999".parse().unwrap(), config, read_tx);
 
         session.send(b"test data").unwrap();
 
@@ -553,16 +587,15 @@ mod tests {
     #[test]
     fn test_session_shutdown_produces_no_output() {
         let (read_tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let mut session = KcpSession::new(
-            1,
-            "127.0.0.1:9999".parse().unwrap(),
-            test_config(),
-            read_tx,
-        );
+        let mut session =
+            KcpSession::new(1, "127.0.0.1:9999".parse().unwrap(), test_config(), read_tx);
 
         session.shutdown();
         let packets = session.update(10).unwrap();
-        assert!(packets.is_empty(), "shutdown session should produce no output");
+        assert!(
+            packets.is_empty(),
+            "shutdown session should produce no output"
+        );
     }
 
     fn fec_config() -> KcpConfig {
@@ -587,19 +620,9 @@ mod tests {
     fn test_fec_encode_decode_roundtrip() {
         let config = fec_config();
         let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-        let mut sender = KcpSession::new(
-            1,
-            "127.0.0.1:9001".parse().unwrap(),
-            config.clone(),
-            tx1,
-        );
+        let mut sender = KcpSession::new(1, "127.0.0.1:9001".parse().unwrap(), config.clone(), tx1);
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
-        let mut receiver = KcpSession::new(
-            1,
-            "127.0.0.1:9000".parse().unwrap(),
-            config,
-            tx2,
-        );
+        let mut receiver = KcpSession::new(1, "127.0.0.1:9000".parse().unwrap(), config, tx2);
 
         sender.send(b"hello fec").unwrap();
 
@@ -626,19 +649,9 @@ mod tests {
         // Test inter-packet FEC: multiple sends produce data+parity shards.
         let config = fec_config();
         let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-        let mut sender = KcpSession::new(
-            2,
-            "127.0.0.1:9001".parse().unwrap(),
-            config.clone(),
-            tx1,
-        );
+        let mut sender = KcpSession::new(2, "127.0.0.1:9001".parse().unwrap(), config.clone(), tx1);
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
-        let mut receiver = KcpSession::new(
-            2,
-            "127.0.0.1:9000".parse().unwrap(),
-            config,
-            tx2,
-        );
+        let mut receiver = KcpSession::new(2, "127.0.0.1:9000".parse().unwrap(), config, tx2);
 
         // Send 3 packets interleaved with update to force KCP to produce
         // separate output packets (stream mode would otherwise coalesce).
@@ -676,19 +689,9 @@ mod tests {
     fn test_fec_encode_decode_data_ending_with_zero() {
         let config = fec_config();
         let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-        let mut sender = KcpSession::new(
-            3,
-            "127.0.0.1:9001".parse().unwrap(),
-            config.clone(),
-            tx1,
-        );
+        let mut sender = KcpSession::new(3, "127.0.0.1:9001".parse().unwrap(), config.clone(), tx1);
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
-        let mut receiver = KcpSession::new(
-            3,
-            "127.0.0.1:9000".parse().unwrap(),
-            config,
-            tx2,
-        );
+        let mut receiver = KcpSession::new(3, "127.0.0.1:9000".parse().unwrap(), config, tx2);
 
         // Data ending with zero bytes. SIZE field protects against
         // trailing-zero corruption (SIZE tells exact payload length).
@@ -717,19 +720,9 @@ mod tests {
     fn test_fec_parity_recovery() {
         let config = fec_config(); // non-stream: each send = one output packet
         let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-        let mut sender = KcpSession::new(
-            4,
-            "127.0.0.1:9001".parse().unwrap(),
-            config.clone(),
-            tx1,
-        );
+        let mut sender = KcpSession::new(4, "127.0.0.1:9001".parse().unwrap(), config.clone(), tx1);
         let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
-        let mut receiver = KcpSession::new(
-            4,
-            "127.0.0.1:9000".parse().unwrap(),
-            config,
-            tx2,
-        );
+        let mut receiver = KcpSession::new(4, "127.0.0.1:9000".parse().unwrap(), config, tx2);
 
         // Send 3 packets, running update after each to flush individually.
         let mut all_packets = Vec::new();
@@ -753,10 +746,7 @@ mod tests {
 
         let data_packets: Vec<_> = all_packets
             .iter()
-            .filter(|p| {
-                p.len() >= 6
-                    && u16::from_le_bytes([p[4], p[5]]) == TYPE_DATA
-            })
+            .filter(|p| p.len() >= 6 && u16::from_le_bytes([p[4], p[5]]) == TYPE_DATA)
             .collect();
         assert!(
             data_packets.len() >= 3,
@@ -802,7 +792,11 @@ mod tests {
             got.push(data);
         }
         let payload_found = got.iter().any(|d| d == b"parity test payload");
-        assert!(payload_found, "should recover parity test payload, got: {:?}", got);
+        assert!(
+            payload_found,
+            "should recover parity test payload, got: {:?}",
+            got
+        );
     }
 
     #[test]
@@ -810,12 +804,7 @@ mod tests {
         // Verify parity shards appear when data_shards packets are collected.
         let config = fec_config(); // data_shards=3, parity_shards=2
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut sender = KcpSession::new(
-            5,
-            "127.0.0.1:9999".parse().unwrap(),
-            config,
-            tx,
-        );
+        let mut sender = KcpSession::new(5, "127.0.0.1:9999".parse().unwrap(), config, tx);
 
         // Send 3 packets interleaved with update to force KCP to produce
         // separate output packets (stream mode coalesces otherwise).
@@ -835,12 +824,13 @@ mod tests {
         // Should have at least 3 data shards. Parity may follow in later updates.
         let data_count = all_packets
             .iter()
-            .filter(|p| {
-                p.len() >= 6
-                    && u16::from_le_bytes([p[4], p[5]]) == TYPE_DATA
-            })
+            .filter(|p| p.len() >= 6 && u16::from_le_bytes([p[4], p[5]]) == TYPE_DATA)
             .count();
-        assert!(data_count >= 3, "should have at least 3 data shards, got {}", data_count);
+        assert!(
+            data_count >= 3,
+            "should have at least 3 data shards, got {}",
+            data_count
+        );
 
         // Run more updates to flush parity.
         let mut parity_count = 0usize;
@@ -848,16 +838,17 @@ mod tests {
             let packets = sender.update(40 + tick * 10).unwrap();
             parity_count += packets
                 .iter()
-                .filter(|p| {
-                    p.len() >= 6
-                        && u16::from_le_bytes([p[4], p[5]]) == TYPE_PARITY
-                })
+                .filter(|p| p.len() >= 6 && u16::from_le_bytes([p[4], p[5]]) == TYPE_PARITY)
                 .count();
             if parity_count >= 2 {
                 break;
             }
         }
-        assert!(parity_count >= 2, "should have at least 2 parity shards, got {}", parity_count);
+        assert!(
+            parity_count >= 2,
+            "should have at least 2 parity shards, got {}",
+            parity_count
+        );
     }
 
     #[test]
@@ -877,8 +868,8 @@ mod tests {
         // KCP header: conv(4B) + cmd(1B) + frg(1B) + wnd(2B) + ...
         // All zeros = conv=0, cmd=0 (PUSH), frg=0 — will not cause panic.
         let raw_pkt = [0u8; 24]; // minimum KCP header size
-        // This may or may not produce an error from kcp (depends on internal
-        // validation), but it should NOT panic.
+                                 // This may or may not produce an error from kcp (depends on internal
+                                 // validation), but it should NOT panic.
         let _ = receiver.input(&raw_pkt);
     }
 }

@@ -1,20 +1,20 @@
 use std::io;
 use std::pin::Pin;
 
-use crate::TransportError;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-#[cfg(feature = "websocket")]
-use tokio_tungstenite::tungstenite::Message;
-#[cfg(feature = "websocket")]
-use futures_util::{sink::Sink, Stream};
-use tokio::net::TcpStream;
-#[cfg(feature = "websocket")]
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 #[cfg(feature = "kcp")]
 use crate::kcp::KcpStream;
 #[cfg(feature = "quic")]
 use crate::quic::QuicStream;
+use crate::TransportError;
+#[cfg(feature = "websocket")]
+use futures_util::{sink::Sink, Stream};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
+#[cfg(feature = "websocket")]
+use tokio_tungstenite::tungstenite::Message;
+#[cfg(feature = "websocket")]
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 #[cfg(feature = "tls")]
 use std::sync::Arc;
@@ -392,47 +392,51 @@ impl AsyncRead for WsByteStream {
         } = this;
 
         match inner {
-            WsInner::Tungstenite(inner) => {
-                loop {
-                    match inner.as_mut().poll_next(cx) {
-                        Poll::Ready(Some(Ok(Message::Binary(data)))) => {
-                            let len = data.len().min(buf.remaining());
-                            buf.put_slice(&data[..len]);
-                            if len < data.len() {
-                                *read_buf = data[len..].to_vec();
-                                *read_pos = 0;
-                            }
-                            return Poll::Ready(Ok(()));
+            WsInner::Tungstenite(inner) => loop {
+                match inner.as_mut().poll_next(cx) {
+                    Poll::Ready(Some(Ok(Message::Binary(data)))) => {
+                        let len = data.len().min(buf.remaining());
+                        buf.put_slice(&data[..len]);
+                        if len < data.len() {
+                            *read_buf = data[len..].to_vec();
+                            *read_pos = 0;
                         }
-                        Poll::Ready(Some(Ok(Message::Text(text)))) => {
-                            let data = text.into_bytes();
-                            let len = data.len().min(buf.remaining());
-                            buf.put_slice(&data[..len]);
-                            if len < data.len() {
-                                *read_buf = data[len..].to_vec();
-                                *read_pos = 0;
-                            }
-                            return Poll::Ready(Ok(()));
-                        }
-                        Poll::Ready(Some(Ok(Message::Ping(_)))) => continue,
-                        Poll::Ready(Some(Ok(Message::Close(_)))) => return Poll::Ready(Ok(())),
-                        Poll::Ready(Some(Ok(_))) => continue,
-                        Poll::Ready(Some(Err(e))) => {
-                            return Poll::Ready(Err(io::Error::other(e)));
-                        }
-                        Poll::Ready(None) => return Poll::Ready(Ok(())),
-                        Poll::Pending => return Poll::Pending,
+                        return Poll::Ready(Ok(()));
                     }
+                    Poll::Ready(Some(Ok(Message::Text(text)))) => {
+                        let data = text.into_bytes();
+                        let len = data.len().min(buf.remaining());
+                        buf.put_slice(&data[..len]);
+                        if len < data.len() {
+                            *read_buf = data[len..].to_vec();
+                            *read_pos = 0;
+                        }
+                        return Poll::Ready(Ok(()));
+                    }
+                    Poll::Ready(Some(Ok(Message::Ping(_)))) => continue,
+                    Poll::Ready(Some(Ok(Message::Close(_)))) => return Poll::Ready(Ok(())),
+                    Poll::Ready(Some(Ok(_))) => continue,
+                    Poll::Ready(Some(Err(e))) => {
+                        return Poll::Ready(Err(io::Error::other(e)));
+                    }
+                    Poll::Ready(None) => return Poll::Ready(Ok(())),
+                    Poll::Pending => return Poll::Pending,
                 }
-            }
+            },
             WsInner::Raw(raw) => {
                 loop {
                     match raw_read_state {
                         RawReadState::Idle => {
-                            *raw_read_state = RawReadState::ReadingHeader { head: [0u8; 2], filled: 0 };
+                            *raw_read_state = RawReadState::ReadingHeader {
+                                head: [0u8; 2],
+                                filled: 0,
+                            };
                             continue;
                         }
-                        RawReadState::ReadingHeader { ref mut head, ref mut filled } => {
+                        RawReadState::ReadingHeader {
+                            ref mut head,
+                            ref mut filled,
+                        } => {
                             let mut frame_read_buf = ReadBuf::new(&mut head[*filled..]);
                             match Pin::new(raw.as_mut()).poll_read(cx, &mut frame_read_buf) {
                                 Poll::Ready(Ok(())) => {
@@ -450,11 +454,19 @@ impl AsyncRead for WsByteStream {
                                     *raw_frame_opcode = opcode;
                                     *raw_frame_masked = masked;
                                     if raw_len == 126 {
-                                        *raw_read_state = RawReadState::ReadingExtendedLen2 { ext: [0u8; 2], filled: 0 };
+                                        *raw_read_state = RawReadState::ReadingExtendedLen2 {
+                                            ext: [0u8; 2],
+                                            filled: 0,
+                                        };
                                     } else if raw_len == 127 {
-                                        *raw_read_state = RawReadState::ReadingExtendedLen8 { ext: [0u8; 8], filled: 0 };
+                                        *raw_read_state = RawReadState::ReadingExtendedLen8 {
+                                            ext: [0u8; 8],
+                                            filled: 0,
+                                        };
                                     } else {
-                                        if raw_len > crate::protocol::V1_MAX_MSG_LENGTH as u64 + 4096 {
+                                        if raw_len
+                                            > crate::protocol::V1_MAX_MSG_LENGTH as u64 + 4096
+                                        {
                                             *raw_read_state = RawReadState::Idle;
                                             return Poll::Ready(Err(io::Error::new(
                                                 io::ErrorKind::InvalidData,
@@ -463,16 +475,31 @@ impl AsyncRead for WsByteStream {
                                         }
                                         *raw_frame_payload_len = raw_len;
                                         if masked {
-                                            *raw_read_state = RawReadState::ReadingMaskKey { mask_key: [0u8; 4], filled: 0 };
+                                            *raw_read_state = RawReadState::ReadingMaskKey {
+                                                mask_key: [0u8; 4],
+                                                filled: 0,
+                                            };
                                         } else if raw_len > 0 {
-                                            *raw_read_state = RawReadState::ReadingPayload { payload: vec![0u8; raw_len as usize], filled: 0 };
+                                            *raw_read_state = RawReadState::ReadingPayload {
+                                                payload: vec![0u8; raw_len as usize],
+                                                filled: 0,
+                                            };
                                         } else {
                                             let disp = dispatch_raw_frame(
-                                                read_buf, read_pos,
-                                                raw_read_state, *raw_frame_opcode,
-                                                raw, cx, buf, &[],
+                                                read_buf,
+                                                read_pos,
+                                                raw_read_state,
+                                                *raw_frame_opcode,
+                                                raw,
+                                                cx,
+                                                buf,
+                                                &[],
                                             );
-                                            if disp.is_pending() { continue; } else { return disp; }
+                                            if disp.is_pending() {
+                                                continue;
+                                            } else {
+                                                return disp;
+                                            }
                                         }
                                     }
                                     continue;
@@ -481,7 +508,10 @@ impl AsyncRead for WsByteStream {
                                 Poll::Pending => return Poll::Pending,
                             }
                         }
-                        RawReadState::ReadingExtendedLen2 { ref mut ext, ref mut filled } => {
+                        RawReadState::ReadingExtendedLen2 {
+                            ref mut ext,
+                            ref mut filled,
+                        } => {
                             let mut frame_read_buf = ReadBuf::new(&mut ext[*filled..]);
                             match Pin::new(raw.as_mut()).poll_read(cx, &mut frame_read_buf) {
                                 Poll::Ready(Ok(())) => {
@@ -494,7 +524,9 @@ impl AsyncRead for WsByteStream {
                                         return Poll::Pending;
                                     }
                                     let payload_len = u16::from_be_bytes(*ext) as u64;
-                                    if payload_len > crate::protocol::V1_MAX_MSG_LENGTH as u64 + 4096 {
+                                    if payload_len
+                                        > crate::protocol::V1_MAX_MSG_LENGTH as u64 + 4096
+                                    {
                                         *raw_read_state = RawReadState::Idle;
                                         return Poll::Ready(Err(io::Error::new(
                                             io::ErrorKind::InvalidData,
@@ -503,16 +535,31 @@ impl AsyncRead for WsByteStream {
                                     }
                                     *raw_frame_payload_len = payload_len;
                                     if *raw_frame_masked {
-                                        *raw_read_state = RawReadState::ReadingMaskKey { mask_key: [0u8; 4], filled: 0 };
+                                        *raw_read_state = RawReadState::ReadingMaskKey {
+                                            mask_key: [0u8; 4],
+                                            filled: 0,
+                                        };
                                     } else if payload_len > 0 {
-                                        *raw_read_state = RawReadState::ReadingPayload { payload: vec![0u8; payload_len as usize], filled: 0 };
+                                        *raw_read_state = RawReadState::ReadingPayload {
+                                            payload: vec![0u8; payload_len as usize],
+                                            filled: 0,
+                                        };
                                     } else {
                                         let disp = dispatch_raw_frame(
-                                            read_buf, read_pos,
-                                            raw_read_state, *raw_frame_opcode,
-                                            raw, cx, buf, &[],
+                                            read_buf,
+                                            read_pos,
+                                            raw_read_state,
+                                            *raw_frame_opcode,
+                                            raw,
+                                            cx,
+                                            buf,
+                                            &[],
                                         );
-                                        if disp.is_pending() { continue; } else { return disp; }
+                                        if disp.is_pending() {
+                                            continue;
+                                        } else {
+                                            return disp;
+                                        }
                                     }
                                     continue;
                                 }
@@ -520,7 +567,10 @@ impl AsyncRead for WsByteStream {
                                 Poll::Pending => return Poll::Pending,
                             }
                         }
-                        RawReadState::ReadingExtendedLen8 { ref mut ext, ref mut filled } => {
+                        RawReadState::ReadingExtendedLen8 {
+                            ref mut ext,
+                            ref mut filled,
+                        } => {
                             let mut frame_read_buf = ReadBuf::new(&mut ext[*filled..]);
                             match Pin::new(raw.as_mut()).poll_read(cx, &mut frame_read_buf) {
                                 Poll::Ready(Ok(())) => {
@@ -533,7 +583,9 @@ impl AsyncRead for WsByteStream {
                                         return Poll::Pending;
                                     }
                                     let payload_len = u64::from_be_bytes(*ext);
-                                    if payload_len > crate::protocol::V1_MAX_MSG_LENGTH as u64 + 4096 {
+                                    if payload_len
+                                        > crate::protocol::V1_MAX_MSG_LENGTH as u64 + 4096
+                                    {
                                         *raw_read_state = RawReadState::Idle;
                                         return Poll::Ready(Err(io::Error::new(
                                             io::ErrorKind::InvalidData,
@@ -542,16 +594,31 @@ impl AsyncRead for WsByteStream {
                                     }
                                     *raw_frame_payload_len = payload_len;
                                     if *raw_frame_masked {
-                                        *raw_read_state = RawReadState::ReadingMaskKey { mask_key: [0u8; 4], filled: 0 };
+                                        *raw_read_state = RawReadState::ReadingMaskKey {
+                                            mask_key: [0u8; 4],
+                                            filled: 0,
+                                        };
                                     } else if payload_len > 0 {
-                                        *raw_read_state = RawReadState::ReadingPayload { payload: vec![0u8; payload_len as usize], filled: 0 };
+                                        *raw_read_state = RawReadState::ReadingPayload {
+                                            payload: vec![0u8; payload_len as usize],
+                                            filled: 0,
+                                        };
                                     } else {
                                         let disp = dispatch_raw_frame(
-                                            read_buf, read_pos,
-                                            raw_read_state, *raw_frame_opcode,
-                                            raw, cx, buf, &[],
+                                            read_buf,
+                                            read_pos,
+                                            raw_read_state,
+                                            *raw_frame_opcode,
+                                            raw,
+                                            cx,
+                                            buf,
+                                            &[],
                                         );
-                                        if disp.is_pending() { continue; } else { return disp; }
+                                        if disp.is_pending() {
+                                            continue;
+                                        } else {
+                                            return disp;
+                                        }
                                     }
                                     continue;
                                 }
@@ -559,7 +626,10 @@ impl AsyncRead for WsByteStream {
                                 Poll::Pending => return Poll::Pending,
                             }
                         }
-                        RawReadState::ReadingMaskKey { ref mut mask_key, ref mut filled } => {
+                        RawReadState::ReadingMaskKey {
+                            ref mut mask_key,
+                            ref mut filled,
+                        } => {
                             let mut frame_read_buf = ReadBuf::new(&mut mask_key[*filled..]);
                             match Pin::new(raw.as_mut()).poll_read(cx, &mut frame_read_buf) {
                                 Poll::Ready(Ok(())) => {
@@ -574,14 +644,26 @@ impl AsyncRead for WsByteStream {
                                     *raw_frame_mask_key = *mask_key;
                                     let pl = *raw_frame_payload_len;
                                     if pl > 0 {
-                                        *raw_read_state = RawReadState::ReadingPayload { payload: vec![0u8; pl as usize], filled: 0 };
+                                        *raw_read_state = RawReadState::ReadingPayload {
+                                            payload: vec![0u8; pl as usize],
+                                            filled: 0,
+                                        };
                                     } else {
                                         let disp = dispatch_raw_frame(
-                                            read_buf, read_pos,
-                                            raw_read_state, *raw_frame_opcode,
-                                            raw, cx, buf, &[],
+                                            read_buf,
+                                            read_pos,
+                                            raw_read_state,
+                                            *raw_frame_opcode,
+                                            raw,
+                                            cx,
+                                            buf,
+                                            &[],
                                         );
-                                        if disp.is_pending() { continue; } else { return disp; }
+                                        if disp.is_pending() {
+                                            continue;
+                                        } else {
+                                            return disp;
+                                        }
                                     }
                                     continue;
                                 }
@@ -589,7 +671,10 @@ impl AsyncRead for WsByteStream {
                                 Poll::Pending => return Poll::Pending,
                             }
                         }
-                        RawReadState::ReadingPayload { ref mut payload, ref mut filled } => {
+                        RawReadState::ReadingPayload {
+                            ref mut payload,
+                            ref mut filled,
+                        } => {
                             let mut frame_read_buf = ReadBuf::new(&mut payload[*filled..]);
                             match Pin::new(raw.as_mut()).poll_read(cx, &mut frame_read_buf) {
                                 Poll::Ready(Ok(())) => {
@@ -611,11 +696,20 @@ impl AsyncRead for WsByteStream {
                                     let owned_payload = std::mem::take(payload);
                                     *raw_read_state = RawReadState::Idle;
                                     let disp = dispatch_raw_frame(
-                                        read_buf, read_pos,
-                                        raw_read_state, *raw_frame_opcode,
-                                        raw, cx, buf, &owned_payload,
+                                        read_buf,
+                                        read_pos,
+                                        raw_read_state,
+                                        *raw_frame_opcode,
+                                        raw,
+                                        cx,
+                                        buf,
+                                        &owned_payload,
                                     );
-                                    if disp.is_pending() { continue; } else { return disp; }
+                                    if disp.is_pending() {
+                                        continue;
+                                    } else {
+                                        return disp;
+                                    }
                                 }
                                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                                 Poll::Pending => return Poll::Pending,
@@ -664,7 +758,10 @@ impl AsyncWrite for WsByteStream {
                 if !needs_flush_local && !buf.is_empty() {
                     match tungstenite.as_mut().poll_ready(cx) {
                         Poll::Ready(Ok(())) => {
-                            match tungstenite.as_mut().start_send(Message::Binary(buf.to_vec())) {
+                            match tungstenite
+                                .as_mut()
+                                .start_send(Message::Binary(buf.to_vec()))
+                            {
                                 Ok(()) => needs_flush_local = true,
                                 Err(e) => return Poll::Ready(Err(io::Error::other(e))),
                             }
@@ -697,22 +794,21 @@ impl AsyncWrite for WsByteStream {
                 }
             }
             WsInner::Raw(raw) => {
-                WsInner::poll_write_raw(
-                    raw, cx, buf,
-                    write_buf, write_pos, needs_flush,
-                    new_frame,
-                )
+                WsInner::poll_write_raw(raw, cx, buf, write_buf, write_pos, needs_flush, new_frame)
             }
         }
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // Destructure to get separate borrows — same pattern as poll_write.
         let this = &mut *self;
-        let WsByteStream { inner, write_buf, write_pos, needs_flush, .. } = this;
+        let WsByteStream {
+            inner,
+            write_buf,
+            write_pos,
+            needs_flush,
+            ..
+        } = this;
         let needs_flush_local = *needs_flush;
         match inner {
             WsInner::Tungstenite(tungstenite) => {
@@ -760,15 +856,9 @@ impl AsyncWrite for WsByteStream {
         }
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut self.inner {
-            WsInner::Tungstenite(inner) => inner
-                .as_mut()
-                .poll_close(cx)
-                .map_err(io::Error::other),
+            WsInner::Tungstenite(inner) => inner.as_mut().poll_close(cx).map_err(io::Error::other),
             WsInner::Raw(raw) => {
                 let _ = Pin::new(raw.as_mut()).poll_write(cx, &[0x88, 0x02, 0x03, 0xe8]);
                 Pin::new(raw.as_mut()).poll_shutdown(cx)
@@ -832,13 +922,19 @@ impl std::fmt::Debug for IoStream {
             #[cfg(feature = "quic")]
             IoStream::Quic(_) => f.debug_struct("IoStream::Quic").finish_non_exhaustive(),
             #[cfg(feature = "websocket")]
-            IoStream::WebSocket(_) => f.debug_struct("IoStream::WebSocket").finish_non_exhaustive(),
+            IoStream::WebSocket(_) => f
+                .debug_struct("IoStream::WebSocket")
+                .finish_non_exhaustive(),
             IoStream::Yamux(_) => f.debug_struct("IoStream::Yamux").finish_non_exhaustive(),
             IoStream::Cipher(_) => f.debug_struct("IoStream::Cipher").finish_non_exhaustive(),
             IoStream::Aead(_) => f.debug_struct("IoStream::Aead").finish_non_exhaustive(),
-            IoStream::SshChannel(_) => f.debug_struct("IoStream::SshChannel").finish_non_exhaustive(),
+            IoStream::SshChannel(_) => f
+                .debug_struct("IoStream::SshChannel")
+                .finish_non_exhaustive(),
             IoStream::PreRead(..) => f.debug_struct("IoStream::PreRead").finish_non_exhaustive(),
-            IoStream::BufferedRead(..) => f.debug_struct("IoStream::BufferedRead").finish_non_exhaustive(),
+            IoStream::BufferedRead(..) => f
+                .debug_struct("IoStream::BufferedRead")
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -957,7 +1053,10 @@ impl tokio::io::AsyncWrite for IoStream {
 
 impl IoStream {
     /// Write a V1 protocol frame to this stream.
-    pub async fn write_v1_frame(&mut self, msg: &crate::msg::FrpMessage) -> Result<(), crate::Error> {
+    pub async fn write_v1_frame(
+        &mut self,
+        msg: &crate::msg::FrpMessage,
+    ) -> Result<(), crate::Error> {
         match self {
             IoStream::Tcp(s) => crate::protocol::write_msg_v1(s, msg).await,
             #[cfg(feature = "tls")]
@@ -973,7 +1072,9 @@ impl IoStream {
             IoStream::Aead(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::SshChannel(s) => crate::protocol::write_msg_v1(s, msg).await,
             IoStream::PreRead(_, s) => crate::protocol::write_msg_v1(s, msg).await,
-            IoStream::BufferedRead(_, _, inner) => crate::protocol::write_msg_v1(inner.as_mut(), msg).await,
+            IoStream::BufferedRead(_, _, inner) => {
+                crate::protocol::write_msg_v1(inner.as_mut(), msg).await
+            }
         }
     }
 
@@ -999,24 +1100,83 @@ impl IoStream {
     }
 
     /// Write a V2 protocol frame (binary framing + JSON payload) to this stream.
-    pub async fn write_v2_frame(&mut self, msg: &crate::msg::FrpMessage) -> Result<(), crate::Error> {
+    pub async fn write_v2_frame(
+        &mut self,
+        msg: &crate::msg::FrpMessage,
+    ) -> Result<(), crate::Error> {
         use tokio::io::AsyncWriteExt;
         match self {
-            IoStream::Tcp(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?; }
+            IoStream::Tcp(s) => {
+                crate::protocol::write_msg_v2(s, msg).await?;
+                s.flush()
+                    .await
+                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
+            }
             #[cfg(feature = "tls")]
-            IoStream::Tls(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?; }
+            IoStream::Tls(s) => {
+                crate::protocol::write_msg_v2(s, msg).await?;
+                s.flush()
+                    .await
+                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
+            }
             #[cfg(feature = "kcp")]
-            IoStream::Kcp(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?; }
+            IoStream::Kcp(s) => {
+                crate::protocol::write_msg_v2(s, msg).await?;
+                s.flush()
+                    .await
+                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
+            }
             #[cfg(feature = "quic")]
-            IoStream::Quic(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?; }
+            IoStream::Quic(s) => {
+                crate::protocol::write_msg_v2(s, msg).await?;
+                s.flush()
+                    .await
+                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
+            }
             #[cfg(feature = "websocket")]
-            IoStream::WebSocket(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?; }
-            IoStream::Yamux(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?; }
-            IoStream::Cipher(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?; }
-            IoStream::Aead(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?; }
-            IoStream::SshChannel(s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?; }
-            IoStream::PreRead(_, s) => { crate::protocol::write_msg_v2(s, msg).await?; s.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?; }
-            IoStream::BufferedRead(_, _, inner) => { crate::protocol::write_msg_v2(inner.as_mut(), msg).await?; inner.flush().await.map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?; }
+            IoStream::WebSocket(s) => {
+                crate::protocol::write_msg_v2(s, msg).await?;
+                s.flush()
+                    .await
+                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
+            }
+            IoStream::Yamux(s) => {
+                crate::protocol::write_msg_v2(s, msg).await?;
+                s.flush()
+                    .await
+                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
+            }
+            IoStream::Cipher(s) => {
+                crate::protocol::write_msg_v2(s, msg).await?;
+                s.flush()
+                    .await
+                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
+            }
+            IoStream::Aead(s) => {
+                crate::protocol::write_msg_v2(s, msg).await?;
+                s.flush()
+                    .await
+                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
+            }
+            IoStream::SshChannel(s) => {
+                crate::protocol::write_msg_v2(s, msg).await?;
+                s.flush()
+                    .await
+                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
+            }
+            IoStream::PreRead(_, s) => {
+                crate::protocol::write_msg_v2(s, msg).await?;
+                s.flush()
+                    .await
+                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
+            }
+            IoStream::BufferedRead(_, _, inner) => {
+                crate::protocol::write_msg_v2(inner.as_mut(), msg).await?;
+                inner
+                    .flush()
+                    .await
+                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
+            }
         }
         Ok(())
     }
@@ -1044,23 +1204,51 @@ impl IoStream {
 
     /// Write a raw V2 frame (for handshake frames like ClientHello/ServerHello).
     /// Lower-level than write_v2_frame — caller controls frame_type and raw payload bytes.
-    pub async fn write_raw_v2_frame(&mut self, frame_type: u16, flags: u16, payload: &[u8]) -> Result<(), crate::Error> {
+    pub async fn write_raw_v2_frame(
+        &mut self,
+        frame_type: u16,
+        flags: u16,
+        payload: &[u8],
+    ) -> Result<(), crate::Error> {
         match self {
-            IoStream::Tcp(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            IoStream::Tcp(s) => {
+                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
+            }
             #[cfg(feature = "tls")]
-            IoStream::Tls(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            IoStream::Tls(s) => {
+                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
+            }
             #[cfg(feature = "kcp")]
-            IoStream::Kcp(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            IoStream::Kcp(s) => {
+                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
+            }
             #[cfg(feature = "quic")]
-            IoStream::Quic(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
+            IoStream::Quic(s) => {
+                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
+            }
             #[cfg(feature = "websocket")]
-            IoStream::WebSocket(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
-            IoStream::Yamux(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
-            IoStream::Cipher(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
-            IoStream::Aead(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
-            IoStream::SshChannel(s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
-            IoStream::PreRead(_, s) => crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await,
-            IoStream::BufferedRead(_, _, inner) => crate::protocol::write_v2_frame_raw(inner.as_mut(), frame_type, flags, payload).await,
+            IoStream::WebSocket(s) => {
+                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
+            }
+            IoStream::Yamux(s) => {
+                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
+            }
+            IoStream::Cipher(s) => {
+                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
+            }
+            IoStream::Aead(s) => {
+                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
+            }
+            IoStream::SshChannel(s) => {
+                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
+            }
+            IoStream::PreRead(_, s) => {
+                crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
+            }
+            IoStream::BufferedRead(_, _, inner) => {
+                crate::protocol::write_v2_frame_raw(inner.as_mut(), frame_type, flags, payload)
+                    .await
+            }
         }
     }
 
@@ -1129,9 +1317,7 @@ impl IoStream {
                 (Box::new(r), Box::new(w))
             }
             #[cfg(feature = "quic")]
-            IoStream::Quic(stream) => {
-                stream.into_split()
-            }
+            IoStream::Quic(stream) => stream.into_split(),
             #[cfg(feature = "websocket")]
             IoStream::WebSocket(adapter) => {
                 let (r, w) = tokio::io::split(adapter);
@@ -1154,12 +1340,18 @@ impl IoStream {
                 (Box::new(r), Box::new(w))
             }
             IoStream::PreRead(pre_read, s) => {
-                assert!(pre_read.is_empty(), "into_split called before pre_read bytes consumed");
+                assert!(
+                    pre_read.is_empty(),
+                    "into_split called before pre_read bytes consumed"
+                );
                 let (r, w) = tokio::io::split(s);
                 (Box::new(r), Box::new(w))
             }
             IoStream::BufferedRead(buf, pos, inner) => {
-                assert!(pos >= buf.len(), "into_split called before buffered bytes consumed");
+                assert!(
+                    pos >= buf.len(),
+                    "into_split called before buffered bytes consumed"
+                );
                 inner.into_split()
             }
         }
@@ -1194,7 +1386,10 @@ impl IoStream {
             IoStream::BufferedRead(buf, pos, inner) => {
                 // Buffered bytes are preserved inside the returned Cipher wrapper;
                 // they will be replayed before encrypted reads begin.
-                assert!(pos >= buf.len(), "into_encrypted called before buffered bytes consumed");
+                assert!(
+                    pos >= buf.len(),
+                    "into_encrypted called before buffered bytes consumed"
+                );
                 IoStream::BufferedRead(buf, pos, Box::new(inner.into_encrypted(key)))
             }
             IoStream::Aead(inner) => {
@@ -1281,11 +1476,13 @@ async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<String, c
 
     // Parse DNS server address (default port 53)
     let dns_addr = if dns_server.contains(':') {
-        SocketAddr::from_str(dns_server)
-            .map_err(|e| crate::Error::Transport(format!("invalid dns_server '{dns_server}': {e}").into()))?
+        SocketAddr::from_str(dns_server).map_err(|e| {
+            crate::Error::Transport(format!("invalid dns_server '{dns_server}': {e}").into())
+        })?
     } else {
-        SocketAddr::from_str(&format!("{dns_server}:53"))
-            .map_err(|e| crate::Error::Transport(format!("invalid dns_server '{dns_server}': {e}").into()))?
+        SocketAddr::from_str(&format!("{dns_server}:53")).map_err(|e| {
+            crate::Error::Transport(format!("invalid dns_server '{dns_server}': {e}").into())
+        })?
     };
 
     // Build DNS A-record query
@@ -1306,15 +1503,21 @@ async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<String, c
     query.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
 
     // Send query over UDP
-    let socket = UdpSocket::bind("0.0.0.0:0").await
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .await
         .map_err(|e| crate::Error::Transport(format!("DNS: bind: {e}").into()))?;
-    socket.connect(dns_addr).await
+    socket
+        .connect(dns_addr)
+        .await
         .map_err(|e| crate::Error::Transport(format!("DNS: connect {dns_server}: {e}").into()))?;
-    socket.send(&query).await
+    socket
+        .send(&query)
+        .await
         .map_err(|e| crate::Error::Transport(format!("DNS: send to {dns_server}: {e}").into()))?;
 
     let mut buf = [0u8; 512];
-    let n = timeout(Duration::from_secs(5), socket.recv(&mut buf)).await
+    let n = timeout(Duration::from_secs(5), socket.recv(&mut buf))
+        .await
         .map_err(|_| crate::Error::Transport("DNS: timeout".into()))?
         .map_err(|e| crate::Error::Transport(format!("DNS: recv: {e}").into()))?;
 
@@ -1327,14 +1530,16 @@ async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<String, c
     // Verify transaction ID
     let resp_txid = u16::from_be_bytes([response[0], response[1]]);
     if resp_txid != txid {
-        return Err(crate::Error::Transport(format!(
-            "DNS: txid mismatch (sent {txid}, got {resp_txid})"
-        ).into()));
+        return Err(crate::Error::Transport(
+            format!("DNS: txid mismatch (sent {txid}, got {resp_txid})").into(),
+        ));
     }
 
     let ancount = u16::from_be_bytes([response[6], response[7]]) as usize;
     if ancount == 0 {
-        return Err(crate::Error::Transport(format!("DNS resolve {host}: no records found").into()));
+        return Err(crate::Error::Transport(
+            format!("DNS resolve {host}: no records found").into(),
+        ));
     }
 
     // Skip 12-byte header + question section to reach answers
@@ -1345,7 +1550,9 @@ async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<String, c
     // Read answers
     for _ in 0..ancount {
         if pos + 10 > response.len() {
-            return Err(crate::Error::Transport("DNS: truncated answer section".into()));
+            return Err(crate::Error::Transport(
+                "DNS: truncated answer section".into(),
+            ));
         }
         pos = skip_dns_name(response, pos); // NAME (may be compression pointer)
         let qtype = u16::from_be_bytes([response[pos], response[pos + 1]]);
@@ -1356,14 +1563,20 @@ async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<String, c
         }
         if qtype == 1 && rdlength == 4 {
             // A record: 4-byte IPv4 address
-            let ip = std::net::Ipv4Addr::new(response[pos], response[pos + 1],
-                                              response[pos + 2], response[pos + 3]);
+            let ip = std::net::Ipv4Addr::new(
+                response[pos],
+                response[pos + 1],
+                response[pos + 2],
+                response[pos + 3],
+            );
             return Ok(ip.to_string());
         }
         pos += rdlength;
     }
 
-    Err(crate::Error::Transport(format!("DNS resolve {host}: no A record found").into()))
+    Err(crate::Error::Transport(
+        format!("DNS resolve {host}: no A record found").into(),
+    ))
 }
 
 /// Skip a DNS name in the response, handling compression pointers.
@@ -1398,16 +1611,17 @@ async fn connect_direct(
         TcpSocket::new_v4()
     } else {
         TcpSocket::new_v6()
-    }.map_err(|e| crate::Error::Transport(format!("create socket: {e}").into()))?;
+    }
+    .map_err(|e| crate::Error::Transport(format!("create socket: {e}").into()))?;
 
     // Bind to specific local IP if configured
     if let Some(ref bind_ip) = opts.bind_addr {
         let bind_addr: std::net::SocketAddr = format!("{bind_ip}:0").parse().map_err(|e| {
             crate::Error::Transport(format!("invalid bind_addr '{bind_ip}': {e}").into())
         })?;
-        socket.bind(bind_addr).map_err(|e| {
-            crate::Error::Transport(format!("bind to {bind_ip}: {e}").into())
-        })?;
+        socket
+            .bind(bind_addr)
+            .map_err(|e| crate::Error::Transport(format!("bind to {bind_ip}: {e}").into()))?;
     }
 
     let stream = timeout(
@@ -1421,11 +1635,10 @@ async fn connect_direct(
     // Configure TCP keepalive after connection
     if opts.keepalive_secs > 0 {
         let keepalive = socket2::SockRef::from(&stream);
-        let ka = socket2::TcpKeepalive::new()
-            .with_time(Duration::from_secs(opts.keepalive_secs));
-        keepalive.set_tcp_keepalive(&ka).map_err(|e| {
-            crate::Error::Transport(format!("set keepalive: {e}").into())
-        })?;
+        let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(opts.keepalive_secs));
+        keepalive
+            .set_tcp_keepalive(&ka)
+            .map_err(|e| crate::Error::Transport(format!("set keepalive: {e}").into()))?;
     }
 
     // Disable Nagle for low-latency small-message RTT (Go frp parity).
@@ -1474,33 +1687,43 @@ async fn connect_via_proxy(
             let connect_req = format!(
                 "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n\r\n"
             );
-            timeout(Duration::from_secs(dial_timeout_secs), stream.write_all(connect_req.as_bytes()))
-                .await
-                .map_err(|_| crate::Error::Transport("proxy CONNECT write timeout".into()))?
-                .map_err(|e| crate::Error::Transport(format!("proxy CONNECT write: {e}").into()))?;
+            timeout(
+                Duration::from_secs(dial_timeout_secs),
+                stream.write_all(connect_req.as_bytes()),
+            )
+            .await
+            .map_err(|_| crate::Error::Transport("proxy CONNECT write timeout".into()))?
+            .map_err(|e| crate::Error::Transport(format!("proxy CONNECT write: {e}").into()))?;
 
             let mut reader = BufReader::new(&mut stream);
             let mut status_line = String::new();
-            timeout(Duration::from_secs(dial_timeout_secs), reader.read_line(&mut status_line))
-                .await
-                .map_err(|_| crate::Error::Transport("proxy CONNECT read timeout".into()))?
-                .map_err(|e| crate::Error::Transport(format!("proxy CONNECT read: {e}").into()))?;
+            timeout(
+                Duration::from_secs(dial_timeout_secs),
+                reader.read_line(&mut status_line),
+            )
+            .await
+            .map_err(|_| crate::Error::Transport("proxy CONNECT read timeout".into()))?
+            .map_err(|e| crate::Error::Transport(format!("proxy CONNECT read: {e}").into()))?;
 
             if !status_line.contains("200") {
-                return Err(crate::Error::Transport(format!(
-                    "proxy CONNECT rejected: {}",
-                    status_line.trim()
-                ).into()));
+                return Err(crate::Error::Transport(
+                    format!("proxy CONNECT rejected: {}", status_line.trim()).into(),
+                ));
             }
 
             // Read remaining headers until \r\n\r\n
             let mut buf = Vec::new();
             loop {
                 let mut line = String::new();
-                timeout(Duration::from_secs(dial_timeout_secs), reader.read_line(&mut line))
-                    .await
-                    .map_err(|_| crate::Error::Transport("proxy CONNECT headers timeout".into()))?
-                    .map_err(|e| crate::Error::Transport(format!("proxy CONNECT headers: {e}").into()))?;
+                timeout(
+                    Duration::from_secs(dial_timeout_secs),
+                    reader.read_line(&mut line),
+                )
+                .await
+                .map_err(|_| crate::Error::Transport("proxy CONNECT headers timeout".into()))?
+                .map_err(|e| {
+                    crate::Error::Transport(format!("proxy CONNECT headers: {e}").into())
+                })?;
                 if line == "\r\n" || line.is_empty() {
                     break;
                 }
@@ -1529,14 +1752,16 @@ async fn connect_via_proxy(
             .map_err(|e| crate::Error::Transport(format!("SOCKS5 auth read: {e}").into()))?;
 
             if auth_resp[0] != 0x05 || auth_resp[1] != 0x00 {
-                return Err(crate::Error::Transport(format!(
-                    "SOCKS5 auth rejected: {:02x?}", auth_resp
-                ).into()));
+                return Err(crate::Error::Transport(
+                    format!("SOCKS5 auth rejected: {:02x?}", auth_resp).into(),
+                ));
             }
 
             // 3. Resolve target address and build connect request
             let target_ip: std::net::IpAddr = target_host.parse().map_err(|_| {
-                crate::Error::Transport(format!("SOCKS5: cannot resolve hostname '{target_host}' — use IP").into())
+                crate::Error::Transport(
+                    format!("SOCKS5: cannot resolve hostname '{target_host}' — use IP").into(),
+                )
             })?;
 
             let mut connect_req = Vec::with_capacity(10);
@@ -1572,10 +1797,9 @@ async fn connect_via_proxy(
             .map_err(|e| crate::Error::Transport(format!("SOCKS5 connect read: {e}").into()))?;
 
             if resp[0] != 0x05 || resp[1] != 0x00 {
-                return Err(crate::Error::Transport(format!(
-                    "SOCKS5 connect rejected: rep=0x{:02x}",
-                    resp[1]
-                ).into()));
+                return Err(crate::Error::Transport(
+                    format!("SOCKS5 connect rejected: rep=0x{:02x}", resp[1]).into(),
+                ));
             }
 
             // Read remaining bind address bytes.
@@ -1595,13 +1819,15 @@ async fn connect_via_proxy(
                 )
                 .await
                 .map_err(|_| crate::Error::Transport("SOCKS5 bind addr read timeout".into()))?
-                .map_err(|e| crate::Error::Transport(format!("SOCKS5 bind addr read: {e}").into()))?;
+                .map_err(|e| {
+                    crate::Error::Transport(format!("SOCKS5 bind addr read: {e}").into())
+                })?;
             }
         }
         other => {
-            return Err(crate::Error::Transport(format!(
-                "unsupported proxy scheme: '{other}'. Supported: http, socks5"
-            ).into()));
+            return Err(crate::Error::Transport(
+                format!("unsupported proxy scheme: '{other}'. Supported: http, socks5").into(),
+            ));
         }
     }
 
@@ -1613,16 +1839,16 @@ async fn connect_via_proxy(
 
 /// Parse a proxy URL into (scheme, host, port).
 fn parse_proxy_url(url: &str) -> Result<(&str, &str, u16), crate::Error> {
-    let (scheme, rest) = url
-        .split_once("://")
-        .ok_or_else(|| crate::Error::Transport(format!("invalid proxy URL '{url}': missing scheme").into()))?;
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| {
+        crate::Error::Transport(format!("invalid proxy URL '{url}': missing scheme").into())
+    })?;
 
     let (host, port_str) = if let Some((h, p)) = rest.rsplit_once(':') {
         (h, p)
     } else {
-        return Err(crate::Error::Transport(format!(
-            "invalid proxy URL '{url}': missing port"
-        ).into()));
+        return Err(crate::Error::Transport(
+            format!("invalid proxy URL '{url}': missing port").into(),
+        ));
     };
 
     let port: u16 = port_str.parse().map_err(|_| {
@@ -1630,7 +1856,10 @@ fn parse_proxy_url(url: &str) -> Result<(&str, &str, u16), crate::Error> {
     })?;
 
     // Strip brackets from IPv6 addresses
-    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
 
     Ok((scheme, host, port))
 }
@@ -1657,14 +1886,17 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
         Err(_) => {
             // target_ip is a hostname, not an IP — resolve via system DNS.
             // Mirrors what TcpStream::connect(addr) did before b4a9359.
-            tokio::net::lookup_host(&addr).await
-                .map_err(|e| crate::Error::Transport(format!(
-                    "invalid server address '{addr}': {e}"
-                ).into()))?
+            tokio::net::lookup_host(&addr)
+                .await
+                .map_err(|e| {
+                    crate::Error::Transport(format!("invalid server address '{addr}': {e}").into())
+                })?
                 .next()
-                .ok_or_else(|| crate::Error::Transport(format!(
-                    "DNS resolve '{addr}': no records found"
-                ).into()))?
+                .ok_or_else(|| {
+                    crate::Error::Transport(
+                        format!("DNS resolve '{addr}': no records found").into(),
+                    )
+                })?
         }
     };
 
@@ -1672,7 +1904,8 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
         #[cfg(feature = "kcp")]
         TransportProtocol::Kcp => {
             let addr = format!("{}:{}", opts.server_addr, opts.server_port);
-            let stream = crate::kcp::dial_kcp(&addr, crate::kcp::default_kcp_config()).await
+            let stream = crate::kcp::dial_kcp(&addr, crate::kcp::default_kcp_config())
+                .await
                 .map_err(|e| crate::Error::Transport(format!("KCP dial: {e}").into()))?;
             return Ok(IoStream::Kcp(stream));
         }
@@ -1685,7 +1918,8 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 &opts.server_addr
             };
             let ca_file = opts.tls_ca_file.as_deref();
-            let (stream, _conn) = crate::quic::dial_quic(&addr, server_name, ca_file).await
+            let (stream, _conn) = crate::quic::dial_quic(&addr, server_name, ca_file)
+                .await
                 .map_err(|e| crate::Error::Transport(format!("QUIC dial: {e}").into()))?;
             return Ok(IoStream::Quic(stream));
         }
@@ -1698,7 +1932,13 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             // Empty string = direct connection
             connect_direct(&addr, peer, opts).await?
         } else {
-            connect_via_proxy(proxy_url, &target_ip, opts.server_port, opts.dial_timeout_secs).await?
+            connect_via_proxy(
+                proxy_url,
+                &target_ip,
+                opts.server_port,
+                opts.dial_timeout_secs,
+            )
+            .await?
         }
     } else {
         connect_direct(&addr, peer, opts).await?
@@ -1723,8 +1963,9 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 {
                     if !opts.disable_custom_tls_first_byte {
                         // Write FRPTLSHeadByte (0x17) before TLS handshake, matching Go frp v0.69.1
-                        stream.write_all(&[FRP_TLS_HEAD_BYTE]).await
-                            .map_err(|e| crate::Error::Transport(format!("write TLS head byte: {e}").into()))?;
+                        stream.write_all(&[FRP_TLS_HEAD_BYTE]).await.map_err(|e| {
+                            crate::Error::Transport(format!("write TLS head byte: {e}").into())
+                        })?;
                     }
                     let connector = build_tls_connector(
                         opts.tls_ca_file.as_deref(),
@@ -1737,10 +1978,16 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                         opts.server_addr.clone()
                     };
                     let server_name = rustls::pki_types::ServerName::try_from(server_name)
-                        .map_err(|e| crate::Error::Transport(format!("invalid server name: {e}").into()))?;
-                    let tls = connector.connect(server_name, stream).await
+                        .map_err(|e| {
+                            crate::Error::Transport(format!("invalid server name: {e}").into())
+                        })?;
+                    let tls = connector
+                        .connect(server_name, stream)
+                        .await
                         .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}").into()))?;
-                    Ok(IoStream::Tls(Box::new(tokio_rustls::TlsStream::Client(tls))))
+                    Ok(IoStream::Tls(Box::new(tokio_rustls::TlsStream::Client(
+                        tls,
+                    ))))
                 }
             } else {
                 Ok(IoStream::Tcp(stream))
@@ -1767,8 +2014,9 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 #[cfg(feature = "tls")]
                 {
                     if !opts.disable_custom_tls_first_byte {
-                        stream.write_all(&[FRP_TLS_HEAD_BYTE]).await
-                            .map_err(|e| crate::Error::Transport(format!("write TLS head byte: {e}").into()))?;
+                        stream.write_all(&[FRP_TLS_HEAD_BYTE]).await.map_err(|e| {
+                            crate::Error::Transport(format!("write TLS head byte: {e}").into())
+                        })?;
                     }
                     let connector = build_tls_connector(
                         opts.tls_ca_file.as_deref(),
@@ -1781,10 +2029,21 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                         opts.server_addr.clone()
                     };
                     let server_name = rustls::pki_types::ServerName::try_from(server_name)
-                        .map_err(|e| crate::Error::Transport(format!("invalid server name: {e}").into()))?;
-                    let tls_stream = connector.connect(server_name, stream).await
+                        .map_err(|e| {
+                            crate::Error::Transport(format!("invalid server name: {e}").into())
+                        })?;
+                    let tls_stream = connector
+                        .connect(server_name, stream)
+                        .await
                         .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}").into()))?;
-                    connect_ws_raw(tls_stream, &host, opts.server_port, FRP_WEBSOCKET_PATH, "https").await
+                    connect_ws_raw(
+                        tls_stream,
+                        &host,
+                        opts.server_port,
+                        FRP_WEBSOCKET_PATH,
+                        "https",
+                    )
+                    .await
                 }
             } else {
                 // Plain WS: use raw mode to tolerate TEXT frames with
@@ -1793,21 +2052,17 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             }
         }
         #[cfg(feature = "kcp")]
-        TransportProtocol::Kcp => {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "KCP should be handled before TCP connect path",
-            )
-            .into())
-        }
+        TransportProtocol::Kcp => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "KCP should be handled before TCP connect path",
+        )
+        .into()),
         #[cfg(feature = "quic")]
-        TransportProtocol::Quic => {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "QUIC should be handled before TCP connect path",
-            )
-            .into())
-        }
+        TransportProtocol::Quic => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "QUIC should be handled before TCP connect path",
+        )
+        .into()),
     }
 }
 
@@ -1827,13 +2082,19 @@ pub async fn detect_and_strip_magic(
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
         stream.read_exact(&mut magic_buf),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(_n)) => {}
         Ok(Err(e)) => {
-            return Err(crate::Error::Transport(format!("read connection magic: {e}").into()));
+            return Err(crate::Error::Transport(
+                format!("read connection magic: {e}").into(),
+            ));
         }
         Err(_) => {
-            return Err(crate::Error::Transport("timeout reading connection magic".into()));
+            return Err(crate::Error::Transport(
+                "timeout reading connection magic".into(),
+            ));
         }
     }
 
@@ -1905,7 +2166,9 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
     // Read HTTP upgrade request line by line.
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line).await
+        reader
+            .read_line(&mut line)
+            .await
             .map_err(|e| crate::Error::Transport(format!("WS read request: {e}").into()))?;
         if line == "\r\n" || line.is_empty() {
             break;
@@ -1915,10 +2178,9 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
             first_line = false;
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() < 2 || !parts[0].eq_ignore_ascii_case("GET") {
-                return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(format!(
-                    "expected GET request, got: {}",
-                    line.trim()
-                ))));
+                return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
+                    format!("expected GET request, got: {}", line.trim()),
+                )));
             }
             if parts[1] == FRP_WEBSOCKET_PATH {
                 valid_path = true;
@@ -1927,7 +2189,12 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
         if line.len() > 1 {
             let lower = line.to_lowercase();
             if lower.starts_with("sec-websocket-key:") {
-                key = line.split_once(':').map(|x| x.1).unwrap_or("").trim().to_string();
+                key = line
+                    .split_once(':')
+                    .map(|x| x.1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
             } else if lower.starts_with("upgrade:") && lower.contains("websocket") {
                 is_upgrade = true;
             }
@@ -1939,14 +2206,13 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
     }
     if !is_upgrade {
         return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
-            "missing Upgrade: websocket header".into()
+            "missing Upgrade: websocket header".into(),
         )));
     }
     if !valid_path {
-        return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(format!(
-            "unexpected path (expected {})",
-            FRP_WEBSOCKET_PATH
-        ))));
+        return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
+            format!("unexpected path (expected {})", FRP_WEBSOCKET_PATH),
+        )));
     }
 
     // Compute accept key: base64(sha1(key + magic GUID))
@@ -1976,7 +2242,9 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
     let resp = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
     );
-    stream.write_all(resp.as_bytes()).await
+    stream
+        .write_all(resp.as_bytes())
+        .await
         .map_err(|e| crate::Error::Transport(format!("WS write response: {e}").into()))?;
 
     // Feed leftover BufReader bytes back so WsByteStream parses them
@@ -2027,12 +2295,13 @@ pub async fn accept_websocket_from_peeked(
         read_more = true;
         // Need more data — read from raw stream
         let mut chunk = vec![0u8; 1024];
-        let n = raw
-            .read(&mut chunk)
-            .await
-            .map_err(|e| crate::Error::Transport(format!("WS read remaining headers: {e}").into()))?;
+        let n = raw.read(&mut chunk).await.map_err(|e| {
+            crate::Error::Transport(format!("WS read remaining headers: {e}").into())
+        })?;
         if n == 0 {
-            return Err(crate::Error::Transport("WS: connection closed during headers".into()));
+            return Err(crate::Error::Transport(
+                "WS: connection closed during headers".into(),
+            ));
         }
         tracing::debug!(
             read_n = n,
@@ -2062,7 +2331,7 @@ pub async fn accept_websocket_from_peeked(
             if parts.len() >= 2 {
                 if !parts[0].eq_ignore_ascii_case("GET") {
                     return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
-                        format!("expected GET request, got: {}", line)
+                        format!("expected GET request, got: {}", line),
                     )));
                 }
                 if parts[1] == FRP_WEBSOCKET_PATH {
@@ -2073,7 +2342,12 @@ pub async fn accept_websocket_from_peeked(
         if line.len() > 1 {
             let lower = line.to_lowercase();
             if lower.starts_with("sec-websocket-key:") {
-                key = line.split_once(':').map(|x| x.1).unwrap_or("").trim().to_string();
+                key = line
+                    .split_once(':')
+                    .map(|x| x.1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
             } else if lower.starts_with("upgrade:") && lower.contains("websocket") {
                 is_upgrade = true;
             }
@@ -2085,14 +2359,13 @@ pub async fn accept_websocket_from_peeked(
     }
     if !is_upgrade {
         return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
-            "missing Upgrade: websocket header".into()
+            "missing Upgrade: websocket header".into(),
         )));
     }
     if !valid_path {
-        return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(format!(
-            "unexpected path (expected {})",
-            FRP_WEBSOCKET_PATH
-        ))));
+        return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
+            format!("unexpected path (expected {})", FRP_WEBSOCKET_PATH),
+        )));
     }
 
     // Compute accept key: base64(sha1(key + magic GUID))
@@ -2165,43 +2438,46 @@ where
          \r\n"
     );
 
-    stream.write_all(req.as_bytes()).await
+    stream
+        .write_all(req.as_bytes())
+        .await
         .map_err(|e| crate::Error::Transport(format!("WS raw connect write: {e}").into()))?;
 
     // Read HTTP 101 response with timeout.
     // BufReader may buffer WebSocket frame bytes past \r\n\r\n — capture
     // them before into_inner() to avoid permanent stream desync.
-    let (stream, leftover) = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        async {
-            let mut reader = BufReader::new(stream);
-            let mut status_line = String::new();
-            reader.read_line(&mut status_line).await
-                .map_err(|e| crate::Error::Transport(format!("WS raw connect read status: {e}").into()))?;
+    let (stream, leftover) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).await.map_err(|e| {
+            crate::Error::Transport(format!("WS raw connect read status: {e}").into())
+        })?;
 
-            if !status_line.starts_with("HTTP/1.1 101") {
-                return Err(crate::Error::Transport(format!(
-                    "WS upgrade rejected: {}",
-                    status_line.trim()
-                ).into()));
-            }
-
-            // Consume response headers until \r\n\r\n
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).await
-                    .map_err(|e| crate::Error::Transport(format!("WS raw connect read headers: {e}").into()))?;
-                if line == "\r\n" || line.is_empty() {
-                    break;
-                }
-            }
-
-            let leftover = reader.buffer().to_vec();
-            let stream = reader.into_inner();
-            Ok::<_, crate::Error>((stream, leftover))
+        if !status_line.starts_with("HTTP/1.1 101") {
+            return Err(crate::Error::Transport(
+                format!("WS upgrade rejected: {}", status_line.trim()).into(),
+            ));
         }
-    ).await
-        .map_err(|_| crate::Error::Transport("WS raw connect: timeout waiting for 101 response".into()))??;
+
+        // Consume response headers until \r\n\r\n
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.map_err(|e| {
+                crate::Error::Transport(format!("WS raw connect read headers: {e}").into())
+            })?;
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+
+        let leftover = reader.buffer().to_vec();
+        let stream = reader.into_inner();
+        Ok::<_, crate::Error>((stream, leftover))
+    })
+    .await
+    .map_err(|_| {
+        crate::Error::Transport("WS raw connect: timeout waiting for 101 response".into())
+    })??;
 
     let mut ws = WsByteStream::from_raw(Box::new(stream), true);
     if !leftover.is_empty() {
@@ -2232,47 +2508,65 @@ pub fn build_tls_acceptor(
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-    let cert_bytes = std::fs::read(cert_file)
-        .map_err(|e| crate::Error::Transport(TransportError::Other(format!("open cert file: {e}"))))?;
+    let cert_bytes = std::fs::read(cert_file).map_err(|e| {
+        crate::Error::Transport(TransportError::Other(format!("open cert file: {e}")))
+    })?;
     let certs = CertificateDer::pem_slice_iter(&cert_bytes)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| crate::Error::Transport(TransportError::Other(format!("read certs: {e}"))))?;
 
-    let key_bytes = std::fs::read(key_file)
-        .map_err(|e| crate::Error::Transport(TransportError::Other(format!("open key file: {e}"))))?;
-    let key = PrivateKeyDer::from_pem_slice(&key_bytes)
-        .map_err(|e| crate::Error::Transport(TransportError::Other(format!("read private key: {e}"))))?;
+    let key_bytes = std::fs::read(key_file).map_err(|e| {
+        crate::Error::Transport(TransportError::Other(format!("open key file: {e}")))
+    })?;
+    let key = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| {
+        crate::Error::Transport(TransportError::Other(format!("read private key: {e}")))
+    })?;
 
     // Build server config with optional client certificate verification (mTLS)
     let config = if let Some(ca_path) = ca_file {
         if !ca_path.is_empty() {
             let mut roots = rustls::RootCertStore::empty();
-            let ca_bytes = std::fs::read(ca_path)
-                .map_err(|e| crate::Error::Transport(TransportError::Other(format!("open CA file: {e}"))))?;
+            let ca_bytes = std::fs::read(ca_path).map_err(|e| {
+                crate::Error::Transport(TransportError::Other(format!("open CA file: {e}")))
+            })?;
             let ca_certs = CertificateDer::pem_slice_iter(&ca_bytes)
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| crate::Error::Transport(TransportError::Other(format!("read CA certs: {e}"))))?;
+                .map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!("read CA certs: {e}")))
+                })?;
             roots.add_parsable_certificates(ca_certs);
 
             let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
                 .build()
-                .map_err(|e| crate::Error::Transport(TransportError::Other(format!("build client cert verifier: {e}"))))?;
+                .map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!(
+                        "build client cert verifier: {e}"
+                    )))
+                })?;
 
             rustls::ServerConfig::builder()
                 .with_client_cert_verifier(verifier)
                 .with_single_cert(certs, key)
-                .map_err(|e| crate::Error::Transport(TransportError::Other(format!("build mTLS config: {e}"))))?
+                .map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!(
+                        "build mTLS config: {e}"
+                    )))
+                })?
         } else {
             rustls::ServerConfig::builder()
                 .with_no_client_auth()
                 .with_single_cert(certs, key)
-                .map_err(|e| crate::Error::Transport(TransportError::Other(format!("build TLS config: {e}"))))?
+                .map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!("build TLS config: {e}")))
+                })?
         }
     } else {
         rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
-            .map_err(|e| crate::Error::Transport(TransportError::Other(format!("build TLS config: {e}"))))?
+            .map_err(|e| {
+                crate::Error::Transport(TransportError::Other(format!("build TLS config: {e}")))
+            })?
     };
 
     Ok(TlsAcceptor::from(Arc::new(config)))
@@ -2290,11 +2584,15 @@ pub fn build_tls_acceptor(
 pub fn generate_self_signed_tls_config() -> Result<rustls::ServerConfig, crate::Error> {
     use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
 
-    let key_pair = KeyPair::generate()
-        .map_err(|e| crate::Error::Transport(TransportError::Other(format!("generate TLS key pair: {e}"))))?;
+    let key_pair = KeyPair::generate().map_err(|e| {
+        crate::Error::Transport(TransportError::Other(format!("generate TLS key pair: {e}")))
+    })?;
 
-    let mut params = CertificateParams::new(vec!["frp".to_string()])
-        .map_err(|e| crate::Error::Transport(TransportError::Other(format!("create TLS cert params: {e}"))))?;
+    let mut params = CertificateParams::new(vec!["frp".to_string()]).map_err(|e| {
+        crate::Error::Transport(TransportError::Other(format!(
+            "create TLS cert params: {e}"
+        )))
+    })?;
 
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, "frp");
@@ -2309,8 +2607,9 @@ pub fn generate_self_signed_tls_config() -> Result<rustls::ServerConfig, crate::
     // Go frp uses 10 years but the auto-generated cert is regenerated on every
     // frps restart, so a shorter validity is acceptable.
 
-    let cert = params.self_signed(&key_pair)
-        .map_err(|e| crate::Error::Transport(TransportError::Other(format!("self-sign TLS cert: {e}"))))?;
+    let cert = params.self_signed(&key_pair).map_err(|e| {
+        crate::Error::Transport(TransportError::Other(format!("self-sign TLS cert: {e}")))
+    })?;
 
     let cert_der = cert.der().clone();
     let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into();
@@ -2318,7 +2617,11 @@ pub fn generate_self_signed_tls_config() -> Result<rustls::ServerConfig, crate::
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)
-        .map_err(|e| crate::Error::Transport(TransportError::Other(format!("build TLS config from generated cert: {e}"))))?;
+        .map_err(|e| {
+            crate::Error::Transport(TransportError::Other(format!(
+                "build TLS config from generated cert: {e}"
+            )))
+        })?;
 
     Ok(config)
 }
@@ -2350,18 +2653,23 @@ pub fn build_tls_acceptor_or_generate(
 /// Returns `None` when no custom CA is specified (caller should use
 /// the platform verifier instead).
 #[cfg(feature = "tls")]
-pub fn build_root_store(ca_file: Option<&str>) -> Result<Option<rustls::RootCertStore>, crate::Error> {
+pub fn build_root_store(
+    ca_file: Option<&str>,
+) -> Result<Option<rustls::RootCertStore>, crate::Error> {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::CertificateDer;
 
     match ca_file {
         Some(ca_path) if !ca_path.is_empty() => {
             let mut root_store = rustls::RootCertStore::empty();
-            let ca_bytes = std::fs::read(ca_path)
-                .map_err(|e| crate::Error::Transport(TransportError::Other(format!("open CA file: {e}"))))?;
+            let ca_bytes = std::fs::read(ca_path).map_err(|e| {
+                crate::Error::Transport(TransportError::Other(format!("open CA file: {e}")))
+            })?;
             let certs = CertificateDer::pem_slice_iter(&ca_bytes)
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| crate::Error::Transport(TransportError::Other(format!("read CA certs: {e}"))))?;
+                .map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!("read CA certs: {e}")))
+                })?;
             root_store.add_parsable_certificates(certs);
             Ok(Some(root_store))
         }
@@ -2380,10 +2688,10 @@ pub fn build_tls_connector(
     cert_file: Option<&str>,
     key_file: Option<&str>,
 ) -> Result<TlsConnector, crate::Error> {
-    use rustls_platform_verifier::BuilderVerifierExt;
-    use rustls_platform_verifier::ConfigVerifierExt;
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls_platform_verifier::BuilderVerifierExt;
+    use rustls_platform_verifier::ConfigVerifierExt;
 
     let root_store = build_root_store(ca_file)?;
 
@@ -2391,19 +2699,34 @@ pub fn build_tls_connector(
         // Custom CA: use RootCertStore
         if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
             if !cert_path.is_empty() && !key_path.is_empty() {
-                let cert_bytes = std::fs::read(cert_path)
-                    .map_err(|e| crate::Error::Transport(TransportError::Other(format!("open client cert file: {e}"))))?;
+                let cert_bytes = std::fs::read(cert_path).map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!(
+                        "open client cert file: {e}"
+                    )))
+                })?;
                 let client_certs = CertificateDer::pem_slice_iter(&cert_bytes)
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| crate::Error::Transport(TransportError::Other(format!("read client certs: {e}"))))?;
-                let key_bytes = std::fs::read(key_path)
-                    .map_err(|e| crate::Error::Transport(TransportError::Other(format!("open client key file: {e}"))))?;
-                let client_key = PrivateKeyDer::from_pem_slice(&key_bytes)
-                    .map_err(|e| crate::Error::Transport(TransportError::Other(format!("read client key: {e}"))))?;
+                    .map_err(|e| {
+                        crate::Error::Transport(TransportError::Other(format!(
+                            "read client certs: {e}"
+                        )))
+                    })?;
+                let key_bytes = std::fs::read(key_path).map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!(
+                        "open client key file: {e}"
+                    )))
+                })?;
+                let client_key = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!("read client key: {e}")))
+                })?;
                 rustls::ClientConfig::builder()
                     .with_root_certificates(Arc::new(store))
                     .with_client_auth_cert(client_certs, client_key)
-                    .map_err(|e| crate::Error::Transport(TransportError::Other(format!("build mTLS client config: {e}"))))?
+                    .map_err(|e| {
+                        crate::Error::Transport(TransportError::Other(format!(
+                            "build mTLS client config: {e}"
+                        )))
+                    })?
             } else {
                 rustls::ClientConfig::builder()
                     .with_root_certificates(Arc::new(store))
@@ -2417,29 +2740,48 @@ pub fn build_tls_connector(
     } else if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
         // Platform verifier with client certificate (mTLS)
         if !cert_path.is_empty() && !key_path.is_empty() {
-            let cert_bytes = std::fs::read(cert_path)
-                .map_err(|e| crate::Error::Transport(TransportError::Other(format!("open client cert file: {e}"))))?;
+            let cert_bytes = std::fs::read(cert_path).map_err(|e| {
+                crate::Error::Transport(TransportError::Other(format!(
+                    "open client cert file: {e}"
+                )))
+            })?;
             let client_certs = CertificateDer::pem_slice_iter(&cert_bytes)
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| crate::Error::Transport(TransportError::Other(format!("read client certs: {e}"))))?;
-            let key_bytes = std::fs::read(key_path)
-                .map_err(|e| crate::Error::Transport(TransportError::Other(format!("open client key file: {e}"))))?;
-            let client_key = PrivateKeyDer::from_pem_slice(&key_bytes)
-                .map_err(|e| crate::Error::Transport(TransportError::Other(format!("read client key: {e}"))))?;
+                .map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!(
+                        "read client certs: {e}"
+                    )))
+                })?;
+            let key_bytes = std::fs::read(key_path).map_err(|e| {
+                crate::Error::Transport(TransportError::Other(format!("open client key file: {e}")))
+            })?;
+            let client_key = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| {
+                crate::Error::Transport(TransportError::Other(format!("read client key: {e}")))
+            })?;
             rustls::ClientConfig::builder()
                 .with_platform_verifier()
-                .map_err(|e| crate::Error::Transport(TransportError::Other(format!("platform verifier: {e}"))))?
+                .map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!(
+                        "platform verifier: {e}"
+                    )))
+                })?
                 .with_client_auth_cert(client_certs, client_key)
-                .map_err(|e| crate::Error::Transport(TransportError::Other(format!("build mTLS client config: {e}"))))?
+                .map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!(
+                        "build mTLS client config: {e}"
+                    )))
+                })?
         } else {
             // Platform verifier, no client certificate
-            <rustls::ClientConfig as ConfigVerifierExt>::with_platform_verifier()
-                .map_err(|e| crate::Error::Transport(TransportError::Other(format!("platform verifier: {e}"))))?
+            <rustls::ClientConfig as ConfigVerifierExt>::with_platform_verifier().map_err(|e| {
+                crate::Error::Transport(TransportError::Other(format!("platform verifier: {e}")))
+            })?
         }
     } else {
         // Platform verifier, no client certificate
-        <rustls::ClientConfig as ConfigVerifierExt>::with_platform_verifier()
-            .map_err(|e| crate::Error::Transport(TransportError::Other(format!("platform verifier: {e}"))))?
+        <rustls::ClientConfig as ConfigVerifierExt>::with_platform_verifier().map_err(|e| {
+            crate::Error::Transport(TransportError::Other(format!("platform verifier: {e}")))
+        })?
     };
 
     Ok(TlsConnector::from(Arc::new(config)))
@@ -2456,7 +2798,11 @@ pub struct PreReadStream<S> {
 
 impl<S> PreReadStream<S> {
     pub fn new(pre_read: Vec<u8>, inner: S) -> Self {
-        Self { pre_read, pos: 0, inner }
+        Self {
+            pre_read,
+            pos: 0,
+            inner,
+        }
     }
 }
 
@@ -2503,18 +2849,19 @@ mod tests {
     #[cfg(feature = "tls")]
     fn test_build_tls_connector_with_default_roots() {
         let result = build_tls_connector(None, None, None);
-        assert!(result.is_ok(), "TLS connector with default roots should build");
+        assert!(
+            result.is_ok(),
+            "TLS connector with default roots should build"
+        );
     }
 
     #[test]
     #[cfg(feature = "tls")]
     fn test_build_tls_acceptor_missing_cert() {
-        let result = build_tls_acceptor(
-            "/nonexistent/cert.pem",
-            "/nonexistent/key.pem",
-            None,
+        let result = build_tls_acceptor("/nonexistent/cert.pem", "/nonexistent/key.pem", None);
+        assert!(
+            result.is_err(),
+            "TLS acceptor with missing files should fail"
         );
-        assert!(result.is_err(), "TLS acceptor with missing files should fail");
     }
 }
-

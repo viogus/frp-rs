@@ -170,7 +170,10 @@ async fn test_oidc_go_client_to_rust_server() {
             eprintln!("Go frpc version: {}", stdout.trim());
         }
     } else {
-        eprintln!("Skipping test_oidc_go_client_to_rust_server: Go frpc not found at {}", go_frpc);
+        eprintln!(
+            "Skipping test_oidc_go_client_to_rust_server: Go frpc not found at {}",
+            go_frpc
+        );
     }
 }
 
@@ -196,6 +199,9 @@ async fn test_oidc_rust_client_to_go_server() {
             eprintln!("Go frps version: {}", stdout.trim());
         }
     } else {
-        eprintln!("Skipping test_oidc_rust_client_to_go_server: Go frps not found at {}", go_frps);
+        eprintln!(
+            "Skipping test_oidc_rust_client_to_go_server: Go frps not found at {}",
+            go_frps
+        );
     }
 }

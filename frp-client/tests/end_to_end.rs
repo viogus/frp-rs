@@ -1,12 +1,12 @@
 mod common;
 
-use common::{allocate_port, wait_for_port, start_echo_server, init_tracing, TestHarness};
+use common::{allocate_port, init_tracing, start_echo_server, wait_for_port, TestHarness};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use frp_core::config::{ClientConfig, ProxyConfig, ServerConfig};
 use frp_client::service::Service as ClientService;
+use frp_core::config::{ClientConfig, ProxyConfig, ServerConfig};
 use frp_server::service::Service as ServerService;
 
 fn tls_cert_dir() -> PathBuf {
@@ -39,7 +39,10 @@ async fn test_e2e_tcp_proxy_plain() {
 
     // Read echo back
     let mut buf = vec![0u8; payload.len()];
-    stream.read_exact(&mut buf).await.expect("read echo from proxy");
+    stream
+        .read_exact(&mut buf)
+        .await
+        .expect("read echo from proxy");
 
     assert_eq!(&buf, payload, "echo data should match sent data");
 
@@ -72,7 +75,10 @@ async fn test_e2e_tcp_proxy_encrypted() {
     stream.flush().await.expect("flush");
 
     let mut buf = vec![0u8; payload.len()];
-    stream.read_exact(&mut buf).await.expect("read echo from proxy");
+    stream
+        .read_exact(&mut buf)
+        .await
+        .expect("read echo from proxy");
 
     assert_eq!(&buf, payload, "echo through encrypted tunnel should match");
 
@@ -84,7 +90,10 @@ async fn test_e2e_tcp_proxy_encrypted() {
     let mut large_buf = vec![0u8; large.len()];
     stream.read_exact(&mut large_buf).await.expect("read large");
 
-    assert_eq!(large_buf, large, "large echo through encrypted tunnel should match");
+    assert_eq!(
+        large_buf, large,
+        "large echo through encrypted tunnel should match"
+    );
 }
 
 /// End-to-end test: TCP proxy over WebSocket transport.
@@ -107,18 +116,24 @@ async fn test_e2e_tcp_proxy_over_websocket() {
         bind_addr: "127.0.0.1".into(),
         bind_port: server_port,
         allow_port_start: proxy_port.saturating_sub(50),
-        allow_port_end: proxy_port.saturating_add(50).min(u16::MAX),
+        allow_port_end: proxy_port + 50,
         auth: frp_core::config::AuthServerConfig {
             token: "test-token".into(),
             ..Default::default()
         },
         ..Default::default()
     };
-    let server_svc = ServerService::new(server_cfg, None).await.expect("create server service");
-    let _server = tokio::spawn(async move { let _ = server_svc.run().await; });
+    let server_svc = ServerService::new(server_cfg, None)
+        .await
+        .expect("create server service");
+    let _server = tokio::spawn(async move {
+        let _ = server_svc.run().await;
+    });
 
     let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
-    wait_for_port(server_addr, Duration::from_secs(5)).await.expect("server ready");
+    wait_for_port(server_addr, Duration::from_secs(5))
+        .await
+        .expect("server ready");
 
     // 3. frpc with WebSocket transport pointing to main port
     let client_cfg = ClientConfig {
@@ -172,15 +187,23 @@ async fn test_e2e_tcp_proxy_over_websocket() {
         }],
         ..Default::default()
     };
-    let client_svc = ClientService::new(client_cfg, None).await.expect("create client");
-    let _client = tokio::spawn(async move { let _ = client_svc.run().await; });
+    let client_svc = ClientService::new(client_cfg, None)
+        .await
+        .expect("create client");
+    let _client = tokio::spawn(async move {
+        let _ = client_svc.run().await;
+    });
 
     // 4. Wait for proxy port
     let proxy_addr: std::net::SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
-    wait_for_port(proxy_addr, Duration::from_secs(10)).await.expect("proxy port ready");
+    wait_for_port(proxy_addr, Duration::from_secs(10))
+        .await
+        .expect("proxy port ready");
 
     // 5. Test data round-trip through WS transport
-    let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.expect("connect to proxy");
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect to proxy");
     let payload = b"websocket tunnel e2e\n";
     stream.write_all(payload).await.expect("write");
     stream.flush().await.expect("flush");
@@ -228,18 +251,24 @@ async fn test_e2e_tcp_proxy_over_tls() {
         tls_cert_file: cert_dir.join("server.crt").to_string_lossy().into(),
         tls_key_file: cert_dir.join("server.key").to_string_lossy().into(),
         allow_port_start: proxy_port.saturating_sub(50),
-        allow_port_end: proxy_port.saturating_add(50).min(u16::MAX),
+        allow_port_end: proxy_port + 50,
         transport: frp_core::config::ServerTransportConfig {
             tcp_mux: false,
             ..Default::default()
         },
         ..Default::default()
     };
-    let server_svc = ServerService::new(server_cfg, None).await.expect("create server service");
-    let _server = tokio::spawn(async move { let _ = server_svc.run().await; });
+    let server_svc = ServerService::new(server_cfg, None)
+        .await
+        .expect("create server service");
+    let _server = tokio::spawn(async move {
+        let _ = server_svc.run().await;
+    });
 
     let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
-    wait_for_port(server_addr, Duration::from_secs(5)).await.expect("TLS server ready");
+    wait_for_port(server_addr, Duration::from_secs(5))
+        .await
+        .expect("TLS server ready");
 
     // 3. frpc with TLS
     let client_cfg = ClientConfig {
@@ -296,15 +325,23 @@ async fn test_e2e_tcp_proxy_over_tls() {
         }],
         ..Default::default()
     };
-    let client_svc = ClientService::new(client_cfg, None).await.expect("create client");
-    let _client = tokio::spawn(async move { let _ = client_svc.run().await; });
+    let client_svc = ClientService::new(client_cfg, None)
+        .await
+        .expect("create client");
+    let _client = tokio::spawn(async move {
+        let _ = client_svc.run().await;
+    });
 
     // 4. Wait for proxy port
     let proxy_addr: std::net::SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
-    wait_for_port(proxy_addr, Duration::from_secs(10)).await.expect("proxy port ready");
+    wait_for_port(proxy_addr, Duration::from_secs(10))
+        .await
+        .expect("proxy port ready");
 
     // 5. Test data round-trip through TLS + encrypted tunnel
-    let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.expect("connect to proxy");
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect to proxy");
     let payload = b"tls tunnel end-to-end\n";
     stream.write_all(payload).await.expect("write");
     stream.flush().await.expect("flush");
@@ -334,7 +371,7 @@ async fn test_e2e_tcp_proxy_over_yamux() {
         bind_addr: "127.0.0.1".into(),
         bind_port: server_port,
         allow_port_start: proxy_port.saturating_sub(50),
-        allow_port_end: proxy_port.saturating_add(50).min(u16::MAX),
+        allow_port_end: proxy_port + 50,
         auth: frp_core::config::AuthServerConfig {
             token: "test-token".into(),
             ..Default::default()
@@ -346,11 +383,17 @@ async fn test_e2e_tcp_proxy_over_yamux() {
         },
         ..Default::default()
     };
-    let server_svc = ServerService::new(server_cfg, None).await.expect("create server service");
-    let _server = tokio::spawn(async move { let _ = server_svc.run().await; });
+    let server_svc = ServerService::new(server_cfg, None)
+        .await
+        .expect("create server service");
+    let _server = tokio::spawn(async move {
+        let _ = server_svc.run().await;
+    });
 
     let server_addr: std::net::SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
-    wait_for_port(server_addr, Duration::from_secs(5)).await.expect("server ready");
+    wait_for_port(server_addr, Duration::from_secs(5))
+        .await
+        .expect("server ready");
 
     // 3. frpc with tcp_mux enabled
     let client_cfg = ClientConfig {
@@ -404,15 +447,23 @@ async fn test_e2e_tcp_proxy_over_yamux() {
         }],
         ..Default::default()
     };
-    let client_svc = ClientService::new(client_cfg, None).await.expect("create client");
-    let _client = tokio::spawn(async move { let _ = client_svc.run().await; });
+    let client_svc = ClientService::new(client_cfg, None)
+        .await
+        .expect("create client");
+    let _client = tokio::spawn(async move {
+        let _ = client_svc.run().await;
+    });
 
     // 4. Wait for proxy port
     let proxy_addr: std::net::SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
-    wait_for_port(proxy_addr, Duration::from_secs(10)).await.expect("proxy port ready");
+    wait_for_port(proxy_addr, Duration::from_secs(10))
+        .await
+        .expect("proxy port ready");
 
     // 5. Test data round-trip through yamux tunnel
-    let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.expect("connect to proxy");
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect to proxy");
     let payload = b"yamux tunnel e2e\n";
     stream.write_all(payload).await.expect("write");
     stream.flush().await.expect("flush");

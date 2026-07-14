@@ -4,7 +4,7 @@ use frp_core::config::ServerConfig;
 use frp_core::msg::{self, FrpMessage, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 
-use common::{allocate_port, login_with_test_token, raw_login, start_test_server, test_auth_cfg};
+use common::{allocate_port, login_with_test_token, start_test_server, test_auth_cfg};
 
 /// Full STCP relay test:
 /// 1. Provider logs in and registers an STCP proxy with sk
@@ -57,36 +57,48 @@ async fn test_stcp_visitor_routed_to_provider() {
         metas: None,
         multiplexer: None,
         virtual_net: None,
-                    proxy_protocol_version: None,
-                    #[cfg(feature = "vnet")]
-                    advertise_subnet: None,
-                    #[cfg(feature = "vnet")]
-                    vnet_ip: None,
-                    #[cfg(feature = "vnet")]
-                    vnet_netmask: None,
-                    #[cfg(feature = "vnet")]
-                    vnet_mtu: None,
+        proxy_protocol_version: None,
+        #[cfg(feature = "vnet")]
+        advertise_subnet: None,
+        #[cfg(feature = "vnet")]
+        vnet_ip: None,
+        #[cfg(feature = "vnet")]
+        vnet_netmask: None,
+        #[cfg(feature = "vnet")]
+        vnet_mtu: None,
     });
-    write_msg_v1(&mut provider, &np).await.expect("send NewProxy");
+    write_msg_v1(&mut provider, &np)
+        .await
+        .expect("send NewProxy");
     match read_msg_v1(&mut provider).await.expect("read NewProxyResp") {
         FrpMessage::NewProxyResp(ref resp) => {
-            assert!(resp.error.is_none(), "STCP proxy registration should succeed: {:?}", resp.error);
+            assert!(
+                resp.error.is_none(),
+                "STCP proxy registration should succeed: {:?}",
+                resp.error
+            );
         }
         other => panic!("expected NewProxyResp, got: {:?}", other.v1_type_byte()),
     }
 
     // --- Step 3: Provider sends pooled work connection ---
-    let mut work_conn = tokio::net::TcpStream::connect(addr).await.expect("work conn connect");
+    let mut work_conn = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("work conn connect");
     let nwc = FrpMessage::NewWorkConn(msg::NewWorkConn {
         run_id: Some(run_id.clone()),
         timestamp: None,
         privilege_key: None,
     });
-    write_msg_v1(&mut work_conn, &nwc).await.expect("send NewWorkConn");
+    write_msg_v1(&mut work_conn, &nwc)
+        .await
+        .expect("send NewWorkConn");
     // The work connection is now pooled by the server
 
     // --- Step 4: Visitor opens new connection and sends NewVisitorConn ---
-    let mut visitor_conn = tokio::net::TcpStream::connect(addr).await.expect("visitor connect");
+    let mut visitor_conn = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("visitor connect");
     let nvc = FrpMessage::NewVisitorConn(msg::NewVisitorConn {
         proxy_name: "stcp-test".into(),
         sign_key: Some(stcp_sk.to_string()),
@@ -95,17 +107,33 @@ async fn test_stcp_visitor_routed_to_provider() {
         use_encryption: None,
         use_compression: None,
     });
-    write_msg_v1(&mut visitor_conn, &nvc).await.expect("send NewVisitorConn");
+    write_msg_v1(&mut visitor_conn, &nvc)
+        .await
+        .expect("send NewVisitorConn");
 
     // --- Step 5: Verify server assigned the pooled work connection ---
     // The server should send StartWorkConn on the pooled work connection.
-    match read_msg_v1(&mut work_conn).await.expect("read StartWorkConn on work conn") {
+    match read_msg_v1(&mut work_conn)
+        .await
+        .expect("read StartWorkConn on work conn")
+    {
         FrpMessage::StartWorkConn(swc) => {
-            assert_eq!(swc.proxy_name, "stcp-test", "StartWorkConn should be for stcp-test");
-            assert!(swc.error.is_none(), "StartWorkConn should not have error: {:?}", swc.error);
+            assert_eq!(
+                swc.proxy_name, "stcp-test",
+                "StartWorkConn should be for stcp-test"
+            );
+            assert!(
+                swc.error.is_none(),
+                "StartWorkConn should not have error: {:?}",
+                swc.error
+            );
         }
         other => {
-            panic!("expected StartWorkConn, got type byte: {:?} — {:?}", other.v1_type_byte(), other);
+            panic!(
+                "expected StartWorkConn, got type byte: {:?} — {:?}",
+                other.v1_type_byte(),
+                other
+            );
         }
     }
 

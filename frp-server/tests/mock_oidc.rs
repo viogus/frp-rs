@@ -1,6 +1,6 @@
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{extract::State, routing::get, Json, Router};
 use data_encoding::BASE64;
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -68,10 +68,7 @@ impl MockOidcProvider {
         });
 
         let app = Router::new()
-            .route(
-                "/.well-known/openid-configuration",
-                get(oidc_discovery),
-            )
+            .route("/.well-known/openid-configuration", get(oidc_discovery))
             .route("/jwks", get(oidc_jwks))
             .with_state(state.clone());
 
@@ -156,9 +153,7 @@ impl Drop for MockOidcProvider {
 // Axum route handlers
 // ---------------------------------------------------------------
 
-async fn oidc_discovery(
-    State(state): State<Arc<MockOidcState>>,
-) -> Json<serde_json::Value> {
+async fn oidc_discovery(State(state): State<Arc<MockOidcState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "issuer": state.issuer,
         "jwks_uri": format!("{}/jwks", state.issuer),
@@ -170,8 +165,6 @@ async fn oidc_discovery(
     }))
 }
 
-async fn oidc_jwks(
-    State(state): State<Arc<MockOidcState>>,
-) -> Json<serde_json::Value> {
+async fn oidc_jwks(State(state): State<Arc<MockOidcState>>) -> Json<serde_json::Value> {
     Json(state.jwks.clone())
 }

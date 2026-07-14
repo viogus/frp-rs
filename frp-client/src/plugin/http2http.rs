@@ -10,14 +10,14 @@
 //! - host_header_rewrite: optional Host header override
 
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 #[cfg(test)]
 use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 use tracing::debug;
 
 use frp_core::config::PluginConfig;
 
-use super::{PluginHandle, serve_plugin};
+use super::{serve_plugin, PluginHandle};
 
 /// Start an http2http plugin server.
 pub async fn start_http2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle, frp_core::Error> {
@@ -29,11 +29,16 @@ pub async fn start_http2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle, 
         ));
     };
     let host_rewrite = cfg.host_header_rewrite.clone();
-    serve_plugin("http2http", (target_addr, host_rewrite), |client, peer, (target, rewrite)| async move {
-        if let Err(e) = handle_conn(client, &target, &rewrite).await {
-            debug!(%peer, error = %e, "http2http: {peer} error: {e}");
-        }
-    }).await
+    serve_plugin(
+        "http2http",
+        (target_addr, host_rewrite),
+        |client, peer, (target, rewrite)| async move {
+            if let Err(e) = handle_conn(client, &target, &rewrite).await {
+                debug!(%peer, error = %e, "http2http: {peer} error: {e}");
+            }
+        },
+    )
+    .await
 }
 
 async fn handle_conn(
@@ -81,8 +86,13 @@ mod tests {
                 let mut buf = vec![0; 4096];
                 let n = conn.read(&mut buf).await.unwrap();
                 let req = String::from_utf8_lossy(&buf[..n]);
-                assert!(req.contains("GET /test HTTP/1.0"), "unexpected request: {req}");
-                conn.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello").await.unwrap();
+                assert!(
+                    req.contains("GET /test HTTP/1.0"),
+                    "unexpected request: {req}"
+                );
+                conn.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                    .await
+                    .unwrap();
             }
         });
 
@@ -130,8 +140,13 @@ mod tests {
                 let mut buf = vec![0; 4096];
                 let n = conn.read(&mut buf).await.unwrap();
                 let req = String::from_utf8_lossy(&buf[..n]);
-                assert!(req.contains("Host: rewritten.local"), "expected Host rewrite, got: {req}");
-                conn.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+                assert!(
+                    req.contains("Host: rewritten.local"),
+                    "expected Host rewrite, got: {req}"
+                );
+                conn.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
             }
         });
 

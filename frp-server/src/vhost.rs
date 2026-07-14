@@ -1,13 +1,13 @@
-use std::sync::Arc;
 use std::collections::HashMap;
-use tokio::sync::RwLock;
-use tokio::net::TcpListener;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, instrument, warn, debug};
+use tokio::net::TcpListener;
+use tokio::sync::RwLock;
+use tracing::{debug, info, instrument, warn};
 
-use crate::service::{AppState, InternalMsg};
 #[cfg(feature = "tls")]
 use crate::lock::RwLockExt;
+use crate::service::{AppState, InternalMsg};
 
 /// A route mapping: domain or location -> proxy entry.
 #[derive(Debug, Clone)]
@@ -174,17 +174,20 @@ pub(crate) async fn write_http_error(
     // Write failures here mean the client disconnected before receiving the
     // error response — there is no recovery path, so we silently drop them.
     if custom_body.is_empty() {
-        let _ = stream.write_all(
-            format!("{status_line}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
-        ).await;
+        let _ = stream
+            .write_all(format!("{status_line}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+            .await;
     } else {
         let body = custom_body.as_bytes();
-        let _ = stream.write_all(
-            format!(
-                "{status_line}\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
-                body.len()
-            ).as_bytes(),
-        ).await;
+        let _ = stream
+            .write_all(
+                format!(
+                    "{status_line}\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await;
         let _ = stream.write_all(body).await;
     }
 }
@@ -205,7 +208,9 @@ async fn serve_vhost_request<S>(
 {
     // Read the first 4096 bytes to extract Host header (with 10s timeout)
     let mut buf = [0u8; 4096];
-    let n = match tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buf)).await {
+    let n = match tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buf))
+        .await
+    {
         Ok(Ok(n)) if n > 0 => n,
         _ => return,
     };
@@ -227,7 +232,10 @@ async fn serve_vhost_request<S>(
         // HTTP Basic Auth check (Go frp compat)
         if !route.http_user.is_empty() {
             let auth_ok = extract_basic_auth(&request_text)
-                .map(|(u, p)| crate::constant_time_eq_str(&u, &route.http_user) && crate::constant_time_eq_str(&p, &route.http_pwd))
+                .map(|(u, p)| {
+                    crate::constant_time_eq_str(&u, &route.http_user)
+                        && crate::constant_time_eq_str(&p, &route.http_pwd)
+                })
                 .unwrap_or(false);
             if !auth_ok {
                 let _ = stream.write_all(
@@ -250,18 +258,26 @@ async fn serve_vhost_request<S>(
         };
 
         if let Some(ctl_tx) = internal_tx {
-            let _ = ctl_tx.tx.send(InternalMsg::ProxyUserConn {
-                proxy_name: route.proxy_name.clone(),
-                user_conn: wrap(stream),
-                pre_read,
-            }).ok();
+            let _ = ctl_tx
+                .tx
+                .send(InternalMsg::ProxyUserConn {
+                    proxy_name: route.proxy_name.clone(),
+                    user_conn: wrap(stream),
+                    pre_read,
+                })
+                .ok();
         } else {
             warn!(host = %host, path = %path, "{} VHost route for '{}' path '{}' found but control handler gone", scheme, host, path);
             write_http_error(&mut stream, "HTTP/1.1 502 Bad Gateway", "").await;
         }
     } else {
         warn!(host = %host, path = %path, peer = %peer, "No {} VHost route for '{}' path '{}' from {}", scheme, host, path, peer);
-        write_http_error(&mut stream, "HTTP/1.1 404 Not Found", &state.custom_404_page).await;
+        write_http_error(
+            &mut stream,
+            "HTTP/1.1 404 Not Found",
+            &state.custom_404_page,
+        )
+        .await;
     }
 }
 
@@ -281,7 +297,14 @@ pub async fn run_vhost_http_listener(
         let state = state.clone();
 
         tokio::spawn(async move {
-            serve_vhost_request(stream, peer, state, "HTTP", frp_core::transport::IoStream::Tcp).await;
+            serve_vhost_request(
+                stream,
+                peer,
+                state,
+                "HTTP",
+                frp_core::transport::IoStream::Tcp,
+            )
+            .await;
         });
     }
 }
@@ -318,13 +341,10 @@ pub async fn run_vhost_https_listener(
                 }
             };
 
-            serve_vhost_request(
-                tls_stream,
-                peer,
-                state,
-                "HTTPS",
-                |s| frp_core::transport::IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(s))),
-            ).await;
+            serve_vhost_request(tls_stream, peer, state, "HTTPS", |s| {
+                frp_core::transport::IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(s)))
+            })
+            .await;
         });
     }
 }
@@ -389,9 +409,9 @@ fn rewrite_host_header(data: &[u8], new_host: &str) -> Vec<u8> {
 /// Extract HTTP Basic Auth credentials from the Authorization header.
 /// Returns Some((username, password)) or None if no/invalid auth header.
 fn extract_basic_auth(request: &str) -> Option<(String, String)> {
-    let auth_line = request.lines().find(|line| {
-        line.len() >= 14 && line[..14].eq_ignore_ascii_case("authorization:")
-    })?;
+    let auth_line = request
+        .lines()
+        .find(|line| line.len() >= 14 && line[..14].eq_ignore_ascii_case("authorization:"))?;
     let value = auth_line[14..].trim();
     let encoded = value.strip_prefix("Basic ")?.trim();
     let decoded = data_encoding::BASE64.decode(encoded.as_bytes()).ok()?;
@@ -403,8 +423,12 @@ fn extract_basic_auth(request: &str) -> Option<(String, String)> {
 /// Extract the Host header value from an HTTP request (hostname only, no port).
 fn extract_host_header(request: &str) -> Option<&str> {
     for line in request.lines() {
-        if line.len() < 6 { continue; }
-        if !line[..5].eq_ignore_ascii_case("host:") { continue; }
+        if line.len() < 6 {
+            continue;
+        }
+        if !line[..5].eq_ignore_ascii_case("host:") {
+            continue;
+        }
         let value = line[5..].trim();
         // Handle IPv6: [::1]:8080 → ::1, example.com:8080 → example.com
         if value.starts_with('[') {
@@ -443,9 +467,8 @@ pub fn extract_sni_from_client_hello(data: &[u8]) -> Option<String> {
     if handshake.len() < 4 {
         return None;
     }
-    let hs_len = ((handshake[1] as usize) << 16)
-        | ((handshake[2] as usize) << 8)
-        | (handshake[3] as usize);
+    let hs_len =
+        ((handshake[1] as usize) << 16) | ((handshake[2] as usize) << 8) | (handshake[3] as usize);
     if handshake.len() < 4 + hs_len {
         return None;
     }
@@ -539,8 +562,8 @@ mod tests {
         let sni_ext_list_len: u16 = sni_ext_data_len; // just one ServerName
         let sni_ext_len: u16 = 2 + sni_ext_list_len; // list_len + list
         let extensions_len: u16 = 4 + sni_ext_len; // ext_type + ext_len + ext_data
-        // ClientHello body: version(2) + random(32) + sid_len(1) + sid(0)
-        //   + cs_len(2) + cs_data(2) + cm_len(1) + cm_data(1) + ext_len(2) + ext_data
+                                                   // ClientHello body: version(2) + random(32) + sid_len(1) + sid(0)
+                                                   //   + cs_len(2) + cs_data(2) + cm_len(1) + cm_data(1) + ext_len(2) + ext_data
         let ch_body_len: u16 = 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + extensions_len;
         let hs_len: u32 = ch_body_len as u32;
         // record = hs_type(1) + hs_len(3) + ch_body
@@ -559,7 +582,7 @@ mod tests {
 
         // ClientHello body
         bytes.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
-        // Random (32 bytes)
+                                                // Random (32 bytes)
         bytes.extend_from_slice(&[0x00u8; 32]);
         // Session ID: empty
         bytes.push(0x00);
@@ -584,7 +607,9 @@ mod tests {
             bytes.len(),
             5 + 4 + ch_body_len as usize,
             "record_len={} ch_body_len={} hs_len={}",
-            record_len, ch_body_len, hs_len
+            record_len,
+            ch_body_len,
+            hs_len
         );
 
         let result = extract_sni_from_client_hello(&bytes);
@@ -597,12 +622,9 @@ mod tests {
         let data = vec![
             0x16, 0x03, 0x01, 0x00, 0x29, // record header
             0x01, 0x00, 0x00, 0x25, // handshake header
-            0x03, 0x03,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, // session_id_len = 0
+            0x03, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // session_id_len = 0
             0x00, 0x02, 0x13, 0x01, // cipher suites
             0x01, 0x00, // compression
             0x00, 0x00, // extensions length = 0

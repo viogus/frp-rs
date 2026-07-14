@@ -5,7 +5,7 @@ use frp_core::msg::{self, FrpMessage, NatHoleVisitor, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::IoStream;
 
-use common::{allocate_port, login_with_test_token, raw_login, start_test_server, test_auth_cfg};
+use common::{allocate_port, login_with_test_token, start_test_server, test_auth_cfg};
 
 /// Helper: build a minimal `NewProxy` for XTCP with only the required fields set.
 fn xtcp_proxy(name: &str, sk: &str, local_str: &str) -> NewProxy {
@@ -114,8 +114,7 @@ async fn test_xtcp_precheck_disconnect_does_not_crash() {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // Login as provider and register an XTCP proxy
-    let (mut provider_ctl, _resp) =
-        login_with_test_token(addr).await.expect("provider login");
+    let (mut provider_ctl, _resp) = login_with_test_token(addr).await.expect("provider login");
 
     let np = FrpMessage::NewProxy(xtcp_proxy(
         "xtcp-drop-test",
@@ -211,14 +210,9 @@ async fn test_xtcp_nat_hole_client_invalid_sid() {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // Provider logs in and registers an XTCP proxy
-    let (mut provider_ctl, _resp) =
-        login_with_test_token(addr).await.expect("provider login");
+    let (mut provider_ctl, _resp) = login_with_test_token(addr).await.expect("provider login");
 
-    let np = FrpMessage::NewProxy(xtcp_proxy(
-        "xtcp-sid-test",
-        "sid-test-sk",
-        "127.0.0.1:6666",
-    ));
+    let np = FrpMessage::NewProxy(xtcp_proxy("xtcp-sid-test", "sid-test-sk", "127.0.0.1:6666"));
     write_msg_v1(&mut provider_ctl, &np)
         .await
         .expect("send NewProxy");
@@ -265,10 +259,7 @@ async fn test_xtcp_nat_hole_client_invalid_sid() {
                 r.error
             );
         }
-        other => panic!(
-            "expected NewProxyResp, got: {:?}",
-            other.v1_type_byte()
-        ),
+        other => panic!("expected NewProxyResp, got: {:?}", other.v1_type_byte()),
     }
 
     drop(provider_ctl);
@@ -288,8 +279,7 @@ async fn test_xtcp_nat_hole_client_without_sid() {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // Provider logs in and registers an XTCP proxy
-    let (mut provider_ctl, _resp) =
-        login_with_test_token(addr).await.expect("provider login");
+    let (mut provider_ctl, _resp) = login_with_test_token(addr).await.expect("provider login");
 
     let np = FrpMessage::NewProxy(xtcp_proxy(
         "xtcp-nosid-test",
@@ -342,10 +332,7 @@ async fn test_xtcp_nat_hole_client_without_sid() {
                 r.error
             );
         }
-        other => panic!(
-            "expected NewProxyResp, got: {:?}",
-            other.v1_type_byte()
-        ),
+        other => panic!("expected NewProxyResp, got: {:?}", other.v1_type_byte()),
     }
 
     drop(provider_ctl);
@@ -370,8 +357,7 @@ async fn test_xtcp_nat_hole_report_cleanup() {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
     // --- Provider login + register XTCP proxy ---
-    let (mut provider_ctl, resp) =
-        login_with_test_token(addr).await.expect("provider login");
+    let (mut provider_ctl, resp) = login_with_test_token(addr).await.expect("provider login");
     let run_id = resp.run_id.expect("provider should get run_id");
 
     let xtcp_sk = "cleanup-test-sk";
@@ -451,10 +437,7 @@ async fn test_xtcp_nat_hole_report_cleanup() {
         protocol: Some("tcp".to_string()),
         sign_key: None,
         timestamp: None,
-        mapped_addrs: Some(vec![
-            "1.2.3.4:5678".into(),
-            "1.2.3.4:5680".into(),
-        ]),
+        mapped_addrs: Some(vec!["1.2.3.4:5678".into(), "1.2.3.4:5680".into()]),
         assisted_addrs: Some(vec!["192.168.1.5:5678".into()]),
     });
     write_msg_v1(&mut visitor_conn, &nhv)
@@ -489,10 +472,7 @@ async fn test_xtcp_nat_hole_report_cleanup() {
         proxy_name: "xtcp-cleanup".into(),
         sid: Some(sid.clone()),
         protocol: Some("tcp".to_string()),
-        mapped_addrs: Some(vec![
-            "10.0.0.1:7000".into(),
-            "10.0.0.1:7002".into(),
-        ]),
+        mapped_addrs: Some(vec!["10.0.0.1:7000".into(), "10.0.0.1:7002".into()]),
         assisted_addrs: None,
         visitor_addr: None,
     });
@@ -595,10 +575,7 @@ async fn test_xtcp_nat_hole_report_cleanup() {
                 r.error
             );
         }
-        other => panic!(
-            "expected NewProxyResp, got: {:?}",
-            other.v1_type_byte()
-        ),
+        other => panic!("expected NewProxyResp, got: {:?}", other.v1_type_byte()),
     }
 
     drop(provider_ctl);

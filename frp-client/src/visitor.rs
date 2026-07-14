@@ -1,12 +1,11 @@
 use std::net::SocketAddr;
-use tokio::net::{TcpStream, TcpSocket};
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
-use frp_core::transport::{TransportProtocol, DialOptions, dial_server};
 use frp_core::msg::{self, FrpMessage};
-
+use frp_core::transport::{dial_server, DialOptions, TransportProtocol};
 
 /// Attempt TCP simultaneous open to `peer_addr`.
 ///
@@ -17,7 +16,10 @@ use frp_core::msg::{self, FrpMessage};
 ///
 /// Returns the connected TcpStream on success, or an error on timeout (5s)
 /// or other failures.
-pub(crate) async fn tcp_simultaneous_open(peer_addr: &str, timeout_ms: u64) -> Result<TcpStream, String> {
+pub(crate) async fn tcp_simultaneous_open(
+    peer_addr: &str,
+    timeout_ms: u64,
+) -> Result<TcpStream, String> {
     let peer: SocketAddr = peer_addr
         .parse()
         .map_err(|e| format!("invalid peer address '{}': {}", peer_addr, e))?;
@@ -38,7 +40,11 @@ pub(crate) async fn tcp_simultaneous_open(peer_addr: &str, timeout_ms: u64) -> R
     local.set_reuseport(true).ok();
 
     // Bind to any available port
-    let wildcard: &str = if peer.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let wildcard: &str = if peer.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
     local
         .bind(wildcard.parse().unwrap())
         .map_err(|e| format!("bind: {}", e))?;
@@ -205,7 +211,11 @@ pub(crate) async fn run_visitor_listener(
                                     protocol: Some("tcp".to_string()),
                                     sign_key,
                                     timestamp: Some(ts),
-                                    mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
+                                    mapped_addrs: if mapped_addrs.is_empty() {
+                                        None
+                                    } else {
+                                        Some(mapped_addrs)
+                                    },
                                     ..Default::default()
                                 },
                                 reply: reply_tx,
@@ -218,24 +228,29 @@ pub(crate) async fn run_visitor_listener(
 
                             // --- Wait for NatHoleResp from control loop ---
                             // Timeout after 15s (server NAT_HOLE_TIMEOUT is 10s)
-                            let resp = match tokio::time::timeout(
-                                Duration::from_secs(15),
-                                reply_rx,
-                            ).await {
+                            let resp = match tokio::time::timeout(Duration::from_secs(15), reply_rx)
+                                .await
+                            {
                                 Ok(Ok(Ok(resp))) => resp,
                                 Ok(Ok(Err(e))) => {
                                     warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': NatHoleResp error from server: {}", visitor_name, e);
-                                    if keep_tunnel_open && attempt < max_retries { continue; }
+                                    if keep_tunnel_open && attempt < max_retries {
+                                        continue;
+                                    }
                                     return;
                                 }
                                 Ok(Err(_)) => {
                                     warn!(visitor_name = %visitor_name, "Visitor '{}': NatHoleResp channel closed (control loop dropped)", visitor_name);
-                                    if keep_tunnel_open && attempt < max_retries { continue; }
+                                    if keep_tunnel_open && attempt < max_retries {
+                                        continue;
+                                    }
                                     return;
                                 }
                                 Err(_elapsed) => {
                                     warn!(visitor_name = %visitor_name, "Visitor '{}': NatHoleResp timed out after 15s", visitor_name);
-                                    if keep_tunnel_open && attempt < max_retries { continue; }
+                                    if keep_tunnel_open && attempt < max_retries {
+                                        continue;
+                                    }
                                     return;
                                 }
                             };
@@ -252,20 +267,36 @@ pub(crate) async fn run_visitor_listener(
                                         info!(visitor_name = %visitor_name, addr = %addr, "Visitor '{}': XTCP P2P connected to {}", visitor_name, addr);
                                         // Encrypt P2P channel if configured (matches Go frp wrapVisitorConn).
                                         let use_enc = use_encryption && !sk.is_empty();
-                                        let (user_r, user_w) = user_conn.take().unwrap().into_split();
+                                        let (user_r, user_w) =
+                                            user_conn.take().unwrap().into_split();
                                         let (p2p_r, p2p_w) = p2p_stream.into_split();
                                         if use_enc {
                                             let key = frp_core::encryption::derive_key(&sk);
                                             frp_core::bridge::bridge_encrypted(
-                                                user_r, user_w, p2p_r, p2p_w,
-                                                &key, use_compression, vec![], None, None, None,
-                                            ).await;
+                                                user_r,
+                                                user_w,
+                                                p2p_r,
+                                                p2p_w,
+                                                &key,
+                                                use_compression,
+                                                vec![],
+                                                None,
+                                                None,
+                                                None,
+                                            )
+                                            .await;
                                             debug!(visitor_name = %visitor_name, "Visitor '{}' XTCP encrypted P2P closed", visitor_name);
                                         } else {
                                             frp_core::bridge::bridge_plain(
-                                                user_r, user_w, p2p_r, p2p_w,
-                                                use_compression, vec![], None,
-                                            ).await;
+                                                user_r,
+                                                user_w,
+                                                p2p_r,
+                                                p2p_w,
+                                                use_compression,
+                                                vec![],
+                                                None,
+                                            )
+                                            .await;
                                             debug!(visitor_name = %visitor_name, "Visitor '{}' XTCP closed", visitor_name);
                                         }
                                         hole_punch_ok = true;
@@ -286,7 +317,8 @@ pub(crate) async fn run_visitor_listener(
                         }
 
                         // Unwrap user_conn for STCP fallback (hole punch failed, so not moved).
-                        let user_conn = user_conn.expect("user_conn not consumed when hole_punch_ok=false");
+                        let user_conn =
+                            user_conn.expect("user_conn not consumed when hole_punch_ok=false");
 
                         // --- STCP fallback (hole punch failed) ---
                         // STCP relay via NewVisitorConn on a fresh connection works against
@@ -304,14 +336,23 @@ pub(crate) async fn run_visitor_listener(
                             }
                         };
 
-                        let stcp_proxy_name = if fb_to.is_empty() { sn.clone() } else { fb_to.clone() };
+                        let stcp_proxy_name = if fb_to.is_empty() {
+                            sn.clone()
+                        } else {
+                            fb_to.clone()
+                        };
                         // STCP fallback is always plain relay. Go frp semantics:
                         // `fallbackTo` routes to a SEPARATE STCP visitor with its own
                         // encryption config; the XTCP visitor's use_encryption applies
                         // to the P2P channel ONLY and does not carry into the fallback.
                         // Sending use_encryption=true here would make the server↔provider
                         // work-conn bridge encrypted while this side stays plain → mismatch.
-                        let nvc = crate::proxy::create_visitor_conn_msg(&stcp_proxy_name, &sk, false, false);
+                        let nvc = crate::proxy::create_visitor_conn_msg(
+                            &stcp_proxy_name,
+                            &sk,
+                            false,
+                            false,
+                        );
                         debug!(visitor_name = %visitor_name, json = %serde_json::to_string(&nvc).unwrap_or_default(), "Visitor '{}': NewVisitorConn JSON: {}", visitor_name, serde_json::to_string(&nvc).unwrap_or_default());
                         if let Err(e) = server_conn.write_v1_frame(&nvc).await {
                             warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STCP fallback send NewVisitorConn failed: {}", visitor_name, e);
@@ -342,9 +383,15 @@ pub(crate) async fn run_visitor_listener(
                         let (user_r, user_w) = user.into_split();
                         let (srv_r, srv_w) = server_conn.into_split();
                         frp_core::bridge::bridge_plain(
-                            user_r, user_w, srv_r, srv_w,
-                            false, vec![], None,
-                        ).await;
+                            user_r,
+                            user_w,
+                            srv_r,
+                            srv_w,
+                            false,
+                            vec![],
+                            None,
+                        )
+                        .await;
                         debug!(visitor_name = %visitor_name, "Visitor '{}' STCP relay closed", visitor_name);
                     } else {
                         // --- STCP relay path (existing) ---
@@ -356,7 +403,12 @@ pub(crate) async fn run_visitor_listener(
                             }
                         };
 
-                        let nvc = crate::proxy::create_visitor_conn_msg(&sn, &sk, use_encryption, use_compression);
+                        let nvc = crate::proxy::create_visitor_conn_msg(
+                            &sn,
+                            &sk,
+                            use_encryption,
+                            use_compression,
+                        );
                         debug!(visitor_name = %visitor_name, json = %serde_json::to_string(&nvc).unwrap_or_default(), "Visitor '{}': NewVisitorConn JSON: {}", visitor_name, serde_json::to_string(&nvc).unwrap_or_default());
                         if let Err(e) = server_conn.write_v1_frame(&nvc).await {
                             warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': send NewVisitorConn failed: {}", visitor_name, e);
@@ -390,15 +442,30 @@ pub(crate) async fn run_visitor_listener(
                         if use_enc_relay {
                             let key = frp_core::encryption::derive_key(&sk);
                             frp_core::bridge::bridge_encrypted(
-                                user_r, user_w, srv_r, srv_w,
-                                &key, use_compression, vec![], None, None, None,
-                            ).await;
+                                user_r,
+                                user_w,
+                                srv_r,
+                                srv_w,
+                                &key,
+                                use_compression,
+                                vec![],
+                                None,
+                                None,
+                                None,
+                            )
+                            .await;
                             debug!(visitor_name = %visitor_name, "Visitor '{}' STCP encrypted relay closed", visitor_name);
                         } else {
                             frp_core::bridge::bridge_plain(
-                                user_r, user_w, srv_r, srv_w,
-                                use_compression, vec![], None,
-                            ).await;
+                                user_r,
+                                user_w,
+                                srv_r,
+                                srv_w,
+                                use_compression,
+                                vec![],
+                                None,
+                            )
+                            .await;
                             debug!(visitor_name = %visitor_name, "Visitor '{}' STCP relay closed", visitor_name);
                         }
                     }

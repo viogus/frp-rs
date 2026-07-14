@@ -1,31 +1,31 @@
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpListener;
 use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
 
 use tokio_util::sync::CancellationToken;
 
-use tracing::{info, error, warn, debug, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
-use frp_core::config::ServerConfig;
-use frp_core::auth::{AuthConfig, AuthMethod};
-use frp_core::unsafe_features::UnsafeFeatures;
 #[cfg(feature = "oidc")]
 use frp_core::auth::OidcVerifier;
+use frp_core::auth::{AuthConfig, AuthMethod};
+use frp_core::config::ServerConfig;
+use frp_core::format_socket_addr;
 use frp_core::mux;
-use frp_core::transport::{IoStream, ConnectionType, detect_and_strip_magic, PreReadStream};
 #[cfg(feature = "tls")]
 use frp_core::transport::build_tls_acceptor_or_generate;
 #[cfg(feature = "websocket")]
 use frp_core::transport::{accept_websocket, accept_websocket_from_peeked};
-use frp_core::format_socket_addr;
+use frp_core::transport::{detect_and_strip_magic, ConnectionType, IoStream, PreReadStream};
+use frp_core::unsafe_features::UnsafeFeatures;
 
 use crate::control;
 use crate::lock::RwLockExt;
 
 // Re-export state types for backward compatibility.
 // All existing `use crate::service::*` imports continue to work.
-pub use crate::state::{InternalMsg, ControlTx, ReloadableState, AppState};
+pub use crate::state::{AppState, ControlTx, InternalMsg, ReloadableState};
 
 // ---------------------------------------------------------------
 // Helpers
@@ -70,17 +70,21 @@ async fn v2_handshake_and_read(
 
 /// Build an `AuthConfig` from a server config's `auth` sub-struct.
 /// Shared by `Service::new()` and `Service::reload()`.
-fn build_auth_config(auth: &frp_core::config::AuthServerConfig, unsafe_features: &UnsafeFeatures) -> AuthConfig {
+fn build_auth_config(
+    auth: &frp_core::config::AuthServerConfig,
+    unsafe_features: &UnsafeFeatures,
+) -> AuthConfig {
     AuthConfig {
         method: match auth.method.to_lowercase().as_str() {
             #[cfg(feature = "oidc")]
             "oidc" => AuthMethod::Oidc,
             _ => AuthMethod::Token,
         },
-        token: frp_core::auth::resolve_dynamic_token_checked(&auth.token, unsafe_features).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
-            String::new()
-        }),
+        token: frp_core::auth::resolve_dynamic_token_checked(&auth.token, unsafe_features)
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
+                String::new()
+            }),
         oidc_issuer: auth.oidc_issuer.clone(),
         oidc_audience: auth.oidc_audience.clone(),
         oidc_skip_expiry: auth.oidc_skip_expiry,
@@ -137,7 +141,11 @@ impl Service {
 
     /// Create a new Service with a custom unsafe features allowlist.
     /// Use this when `--allow-unsafe` CLI flag is provided.
-    pub async fn with_unsafe_features(cfg: ServerConfig, config_file: Option<String>, unsafe_features: UnsafeFeatures) -> Result<Self, String> {
+    pub async fn with_unsafe_features(
+        cfg: ServerConfig,
+        config_file: Option<String>,
+        unsafe_features: UnsafeFeatures,
+    ) -> Result<Self, String> {
         let auth_cfg = build_auth_config(&cfg.auth, &unsafe_features);
         auth_cfg
             .check_startup()
@@ -151,7 +159,9 @@ impl Service {
                 auth_cfg.oidc_skip_expiry,
                 auth_cfg.oidc_skip_issuer,
                 Some(auth_cfg.oidc_proxy_url.clone()).filter(|s| !s.is_empty()),
-            ).await {
+            )
+            .await
+            {
                 Ok(v) => {
                     info!(issuer = %auth_cfg.oidc_issuer, "OIDC verifier initialized (issuer: {})", auth_cfg.oidc_issuer);
                     let v = Arc::new(v);
@@ -198,7 +208,9 @@ impl Service {
             cfg.user_conn_timeout,
             cfg.tcp_mux_passthrough,
             cfg.web_server.custom_404_page.clone(),
-            Arc::new(crate::plugin::HttpPluginManager::new(cfg.http_plugins.clone())),
+            Arc::new(crate::plugin::HttpPluginManager::new(
+                cfg.http_plugins.clone(),
+            )),
             cfg.max_ports_per_client,
             cfg.nat_hole_analysis_data_reserve_hours,
             cfg.detailed_errors_to_client,
@@ -245,8 +257,16 @@ impl Service {
 
         #[cfg(feature = "tls")]
         {
-            let ca_file = if self.cfg.tls_ca_file.is_empty() { None } else { Some(self.cfg.tls_ca_file.as_str()) };
-            let acceptor = match build_tls_acceptor_or_generate(&self.cfg.tls_cert_file, &self.cfg.tls_key_file, ca_file) {
+            let ca_file = if self.cfg.tls_ca_file.is_empty() {
+                None
+            } else {
+                Some(self.cfg.tls_ca_file.as_str())
+            };
+            let acceptor = match build_tls_acceptor_or_generate(
+                &self.cfg.tls_cert_file,
+                &self.cfg.tls_key_file,
+                ca_file,
+            ) {
                 Ok(acc) => {
                     if self.cfg.tls_cert_file.is_empty() {
                         info!("TLS enabled with auto-generated self-signed certificate");
@@ -417,7 +437,6 @@ impl Service {
             info!(addr = %ws_addr, "WebSocket listener started on {}", ws_addr);
         }
 
-
         // Start HTTP VHost listener if configured
         if self.cfg.vhost_http_port > 0 {
             let http_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.vhost_http_port);
@@ -436,7 +455,9 @@ impl Service {
             let https_addr2 = https_addr.clone();
             let https_state = self.state.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::vhost::run_vhost_https_listener(https_addr, https_state).await {
+                if let Err(e) =
+                    crate::vhost::run_vhost_https_listener(https_addr, https_state).await
+                {
                     error!(error = %e, "HTTPS VHost listener failed: {}", e);
                 }
             });
@@ -445,14 +466,11 @@ impl Service {
 
         // Start TCPMux HTTP CONNECT listener if configured
         if self.cfg.tcpmux_httpconnect_port > 0 {
-            let tcpmux_addr = format_socket_addr(
-                &self.cfg.bind_addr,
-                self.cfg.tcpmux_httpconnect_port,
-            );
+            let tcpmux_addr =
+                format_socket_addr(&self.cfg.bind_addr, self.cfg.tcpmux_httpconnect_port);
             let tcpmux_state = self.state.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    crate::tcpmux::run_tcpmux_listener(tcpmux_addr, tcpmux_state).await
+                if let Err(e) = crate::tcpmux::run_tcpmux_listener(tcpmux_addr, tcpmux_state).await
                 {
                     error!(error = %e, "TCPMux HTTP CONNECT listener failed: {}", e);
                 }
@@ -497,7 +515,12 @@ impl Service {
             let kcp_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.kcp_bind_port);
             let kcp_addr2 = kcp_addr.clone();
             tokio::spawn(async move {
-                let mut listener = match frp_core::kcp::KcpListener::bind(&kcp_addr2, frp_core::kcp::default_kcp_config()).await {
+                let mut listener = match frp_core::kcp::KcpListener::bind(
+                    &kcp_addr2,
+                    frp_core::kcp::default_kcp_config(),
+                )
+                .await
+                {
                     Ok(l) => l,
                     Err(e) => {
                         tracing::error!(error = %e, "KCP listener bind failed: {}", e);
@@ -507,435 +530,435 @@ impl Service {
                 tracing::info!(addr = %kcp_addr2, "KCP listener started on {}", kcp_addr2);
                 'kcp_accept: loop {
                     tokio::select! {
-                        result = listener.accept() => {
-                            match result {
-                                Ok(stream) => {
-                                    tracing::debug!("KCP ACCEPT: got stream, spawning handler");
-                                    let state = kcp_state.clone();
-                                    let addr = stream.peer_addr;
-                                    let permit = state.conn_semaphore.as_ref()
-                                        .and_then(|s| s.clone().try_acquire_owned().ok());
-                                    if permit.is_none() && state.conn_semaphore.is_some() {
-                                        warn!(addr = %addr, "Max connections reached, rejecting KCP from {}", addr);
-                                        continue;
-                                    }
-                                    tokio::spawn(async move {
-                                        let _permit = permit;
-                                        let peer = stream.peer_addr;
-                                let conv = stream.conv();
-                                tracing::debug!(peer = %peer, conv = conv, "KCP HANDLER: spawned");
-                                tracing::info!(peer = %peer, conv = conv, "KCP handler: spawned for {} conv={}", peer, conv);
-                                let mut ctl = frp_core::transport::IoStream::Kcp(stream);
-
-                                // Try V2 magic detection
-                                let mut magic = [0u8; 7];
-                                let is_v2 = match ctl.read_exact(&mut magic).await {
-                                    Ok(_) => is_v2_magic(&magic),
-                                    Err(e) => {
-                                        tracing::debug!(peer = %peer, error = %e, "KCP: failed to read initial 7 bytes from {}", peer);
-                                        false
-                                    }
-                                };
-                                tracing::info!(peer = %peer, first_byte = ?format_args!("0x{:02x}", magic[0]), is_v2, "KCP: new session from {} (first_byte=0x{:02x}, is_v2={})", peer, magic[0], is_v2);
-
-                                if is_v2 {
-                                    // V2 path: ClientHello/ServerHello handshake
-                                    let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ctl).await {
-                                        Ok((Some(p), crypto)) => (p, crypto),
-                                        Ok((None, crypto)) => {
-                                            match ctl.read_raw_v2_frame().await {
-                                                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                Ok((ft, _, _)) => {
-                                                    tracing::warn!(frame_type = ?ft, "KCP V2: unexpected frame type {} after handshake", ft);
-                                                    return;
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(error = %e, "KCP V2: failed to read message after handshake: {}", e);
-                                                    return;
-                                                }
-                                            }
+                            result = listener.accept() => {
+                                match result {
+                                    Ok(stream) => {
+                                        tracing::debug!("KCP ACCEPT: got stream, spawning handler");
+                                        let state = kcp_state.clone();
+                                        let addr = stream.peer_addr;
+                                        let permit = state.conn_semaphore.as_ref()
+                                            .and_then(|s| s.clone().try_acquire_owned().ok());
+                                        if permit.is_none() && state.conn_semaphore.is_some() {
+                                            warn!(addr = %addr, "Max connections reached, rejecting KCP from {}", addr);
+                                            continue;
                                         }
+                                        tokio::spawn(async move {
+                                            let _permit = permit;
+                                            let peer = stream.peer_addr;
+                                    let conv = stream.conv();
+                                    tracing::debug!(peer = %peer, conv = conv, "KCP HANDLER: spawned");
+                                    tracing::info!(peer = %peer, conv = conv, "KCP handler: spawned for {} conv={}", peer, conv);
+                                    let mut ctl = frp_core::transport::IoStream::Kcp(stream);
+
+                                    // Try V2 magic detection
+                                    let mut magic = [0u8; 7];
+                                    let is_v2 = match ctl.read_exact(&mut magic).await {
+                                        Ok(_) => is_v2_magic(&magic),
                                         Err(e) => {
-                                            tracing::warn!(error = %e, "KCP V2 handshake error: {}", e);
-                                            return;
+                                            tracing::debug!(peer = %peer, error = %e, "KCP: failed to read initial 7 bytes from {}", peer);
+                                            false
                                         }
                                     };
-                                    // KCP listener doesn't capture peer addr (matching V1 behavior).
-                                    // Use unspecified addr for dispatch_v2_message logging.
-                                    let peer_addr = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
-                                    crate::handlers::dispatch_v2_message(ctl, msg_payload, state, peer_addr, None, None, crypto_ctx).await;
-                                } else {
-                                    let first_byte = magic[0];
+                                    tracing::info!(peer = %peer, first_byte = ?format_args!("0x{:02x}", magic[0]), is_v2, "KCP: new session from {} (first_byte=0x{:02x}, is_v2={})", peer, magic[0], is_v2);
 
-                                    #[cfg(feature = "tls")]
-                                    let is_tls = state.tls_acceptor.read_ok().is_some()
-                                        && (first_byte == 0x16 || first_byte == frp_core::transport::FRP_TLS_HEAD_BYTE);
-                                    #[cfg(not(feature = "tls"))]
-                                    let is_tls = false;
-
-                                    if is_tls {
-                                        #[cfg(feature = "tls")]
-                                        {
-                                            // TLS over KCP: Go frpc performs TLS handshake inside the KCP
-                                            // stream before sending any FRP protocol data. Strip the
-                                            // Go frp 0x17 prefix byte if present, replay remaining
-                                            // pre-read bytes, then do TLS accept.
-                                            let tls_pre_read = if first_byte == frp_core::transport::FRP_TLS_HEAD_BYTE {
-                                                magic[1..].to_vec()
-                                            } else {
-                                                magic.to_vec()
-                                            };
-                                            let pre_read_len = tls_pre_read.len();
-                                            let ctl = frp_core::transport::IoStream::BufferedRead(
-                                                tls_pre_read, 0, Box::new(ctl),
-                                            );
-                                            let acceptor = match state.tls_acceptor.read_ok().clone() {
-                                                Some(a) => a,
-                                                None => {
-                                                    tracing::warn!("KCP TLS connection but no TLS acceptor configured");
-                                                    return;
-                                                }
-                                            };
-                                            tracing::info!(peer = %peer, pre_read_len, "KCP TLS: starting TLS accept ({} bytes pre-read)", pre_read_len);
-                                            let tls_stream = match tokio::time::timeout(
-                                                std::time::Duration::from_secs(10),
-                                                acceptor.accept(ctl),
-                                            ).await {
-                                                Ok(Ok(s)) => {
-                                                    tracing::info!(peer = %peer, "KCP TLS handshake succeeded from {}", peer);
-                                                    s
-                                                }
-                                                Ok(Err(e)) => {
-                                                    tracing::warn!(error = %e, "KCP TLS handshake failed: {}", e);
-                                                    return;
-                                                }
-                                                Err(_elapsed) => {
-                                                    tracing::warn!(peer = %peer, "KCP TLS handshake timed out after 10s");
-                                                    return;
-                                                }
-                                            };
-                                            let tls_io = frp_core::transport::IoStream::Tls(Box::new(tls_stream));
-
-                                            // After TLS: if tcpMux, wrap in yamux before V2/V1
-                                            // (matching Go frps: TLS accept → yamux → V2/V1 on yamux stream).
-                                            if state.tcp_mux {
-                                                let mux_cfg = frp_core::mux::TcpMuxConfig {
-                                                    keepalive_interval: std::time::Duration::from_secs(
-                                                        state.tcp_mux_keepalive.max(1) as u64
-                                                    ),
-                                                };
-                                                match frp_core::mux::server_mux(tls_io, &mux_cfg).await {
-                                                    Ok((control_stream, incoming)) => {
-                                                        let mut io = frp_core::transport::IoStream::Yamux(control_stream);
-                                                        tracing::info!(peer = %peer, "KCP TLS+yamux session established for {}", peer);
-
-                                                        let mut yamux_magic = [0u8; 7];
-                                                        let is_v2 = match io.read_exact(&mut yamux_magic).await {
-                                                            Ok(_) => is_v2_magic(&yamux_magic),
-                                                            Err(_) => false,
-                                                        };
-                                                        if is_v2 {
-                                                            let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
-                                                                Ok((Some(p), crypto)) => (p, crypto),
-                                                                Ok((None, crypto)) => {
-                                                                    match io.read_raw_v2_frame().await {
-                                                                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                                        Ok((ft, _, _)) => {
-                                                                            tracing::warn!(frame_type = ?ft, peer = %peer, "KCP TLS+yamux V2: unexpected frame type {}", ft);
-                                                                            return;
-                                                                        }
-                                                                        Err(e) => {
-                                                                            tracing::warn!(peer = %peer, error = %e, "KCP TLS+yamux V2: read error: {}", e);
-                                                                            return;
-                                                                        }
-                                                                    }
-                                                                }
-                                                                Err(e) => {
-                                                                    tracing::warn!(peer = %peer, error = %e, "KCP TLS+yamux V2 handshake error: {}", e);
-                                                                    return;
-                                                                }
-                                                            };
-                                                            let peer_addr = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
-                                                            crate::handlers::dispatch_v2_message(io, msg_payload, state, peer_addr, Some(incoming), None, crypto_ctx).await;
-                                                        } else {
-                                                            let mut io = frp_core::transport::IoStream::BufferedRead(yamux_magic.to_vec(), 0, Box::new(io));
-                                                            match frp_core::protocol::read_msg_v1(&mut io).await {
-                                                                Ok(frp_core::msg::FrpMessage::Login(login)) => {
-                                                                    tracing::info!(peer = %peer, "KCP TLS+yamux Login from {}", peer);
-                                                                    control::handle_control(io, login, state, Some(peer), Some(incoming), false, None).await;
-                                                                }
-                                                                Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
-                                                                    tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP TLS+yamux NewWorkConn from {}", peer);
-                                                                    crate::handlers::handle_work_conn_inner(io, nwc, state).await;
-                                                                }
-                                                                Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
-                                                                    tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP TLS+yamux NewVisitorConn from {}", peer);
-                                                                    crate::handlers::handle_visitor_conn_inner(io, nvc, state, false).await;
-                                                                }
-                                                                Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
-                                                                    tracing::info!(peer = %peer, "KCP TLS+yamux NatHoleVisitor from {}", peer);
-                                                                    crate::handlers::handle_nat_hole_visitor(io, nhv, state, None, false).await;
-                                                                }
-                                                                Ok(other) => {
-                                                                    tracing::warn!(peer = %peer, other = ?other.v1_type_byte(), "Unexpected KCP TLS+yamux message: {:?}", other.v1_type_byte());
-                                                                }
-                                                                Err(e) => {
-                                                                    tracing::warn!(peer = %peer, error = %e, "KCP TLS+yamux read error: {}", e);
-                                                                }
-                                                            }
-                                                        }
+                                    if is_v2 {
+                                        // V2 path: ClientHello/ServerHello handshake
+                                        let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ctl).await {
+                                            Ok((Some(p), crypto)) => (p, crypto),
+                                            Ok((None, crypto)) => {
+                                                match ctl.read_raw_v2_frame().await {
+                                                    Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                    Ok((ft, _, _)) => {
+                                                        tracing::warn!(frame_type = ?ft, "KCP V2: unexpected frame type {} after handshake", ft);
+                                                        return;
                                                     }
                                                     Err(e) => {
-                                                        tracing::warn!(peer = %peer, error = %e, "KCP TLS+yamux server error: {}", e);
+                                                        tracing::warn!(error = %e, "KCP V2: failed to read message after handshake: {}", e);
+                                                        return;
                                                     }
                                                 }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(error = %e, "KCP V2 handshake error: {}", e);
                                                 return;
                                             }
+                                        };
+                                        // KCP listener doesn't capture peer addr (matching V1 behavior).
+                                        // Use unspecified addr for dispatch_v2_message logging.
+                                        let peer_addr = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
+                                        crate::handlers::dispatch_v2_message(ctl, msg_payload, state, peer_addr, None, None, crypto_ctx).await;
+                                    } else {
+                                        let first_byte = magic[0];
 
-                                            // tcpMux disabled: V2/V1 directly on TLS-decrypted stream
-                                            let mut ctl = tls_io;
+                                        #[cfg(feature = "tls")]
+                                        let is_tls = state.tls_acceptor.read_ok().is_some()
+                                            && (first_byte == 0x16 || first_byte == frp_core::transport::FRP_TLS_HEAD_BYTE);
+                                        #[cfg(not(feature = "tls"))]
+                                        let is_tls = false;
 
-                                            // After TLS: detect V2 then V1 on the decrypted stream
-                                            let mut tls_magic = [0u8; 7];
-                                            let is_v2 = match ctl.read_exact(&mut tls_magic).await {
-                                                Ok(_) => is_v2_magic(&tls_magic),
-                                                Err(_) => false,
-                                            };
-                                            if is_v2 {
-                                                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ctl).await {
-                                                    Ok((Some(p), crypto)) => (p, crypto),
-                                                    Ok((None, crypto)) => {
-                                                        match ctl.read_raw_v2_frame().await {
-                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                            Ok((ft, _, _)) => {
-                                                                tracing::warn!(frame_type = ?ft, "KCP TLS V2: unexpected frame type {} after handshake", ft);
-                                                                return;
-                                                            }
-                                                            Err(e) => {
-                                                                tracing::warn!(error = %e, "KCP TLS V2: failed to read message after handshake: {}", e);
-                                                                return;
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(error = %e, "KCP TLS V2 handshake error: {}", e);
+                                        if is_tls {
+                                            #[cfg(feature = "tls")]
+                                            {
+                                                // TLS over KCP: Go frpc performs TLS handshake inside the KCP
+                                                // stream before sending any FRP protocol data. Strip the
+                                                // Go frp 0x17 prefix byte if present, replay remaining
+                                                // pre-read bytes, then do TLS accept.
+                                                let tls_pre_read = if first_byte == frp_core::transport::FRP_TLS_HEAD_BYTE {
+                                                    magic[1..].to_vec()
+                                                } else {
+                                                    magic.to_vec()
+                                                };
+                                                let pre_read_len = tls_pre_read.len();
+                                                let ctl = frp_core::transport::IoStream::BufferedRead(
+                                                    tls_pre_read, 0, Box::new(ctl),
+                                                );
+                                                let acceptor = match state.tls_acceptor.read_ok().clone() {
+                                                    Some(a) => a,
+                                                    None => {
+                                                        tracing::warn!("KCP TLS connection but no TLS acceptor configured");
                                                         return;
                                                     }
                                                 };
-                                                let peer_addr = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
-                                                crate::handlers::dispatch_v2_message(ctl, msg_payload, state, peer_addr, None, None, crypto_ctx).await;
-                                            } else {
-                                                // After KCP TLS handshake, Go frpc's decrypted stream
-                                                // starts with non-FRP bytes (TLS Finished verify_data
-                                                // or other post-handshake data that rustls doesn't
-                                                // fully consume). The actual V1 Login/NewWorkConn
-                                                // message follows in subsequent TLS records.
-                                                //
-                                                // Accumulate data across TLS records until we find
-                                                // a valid V1 header or reach 2 KiB without one.
-                                                let mut scan_data = tls_magic.to_vec();
-                                                fn is_v1_type_byte(b: u8) -> bool {
-                                                    b.is_ascii_alphanumeric() || matches!(b, 0x40..=0x42)
-                                                }
-                                                let find_v1 = |data: &[u8]| -> Option<usize> {
-                                                    data.windows(9).position(|w| {
-                                                        is_v1_type_byte(w[0])
-                                                            && u64::from_be_bytes([
-                                                                w[1], w[2], w[3], w[4],
-                                                                w[5], w[6], w[7], w[8],
-                                                            ]) <= frp_core::protocol::V1_MAX_MSG_LENGTH as u64
-                                                    })
+                                                tracing::info!(peer = %peer, pre_read_len, "KCP TLS: starting TLS accept ({} bytes pre-read)", pre_read_len);
+                                                let tls_stream = match tokio::time::timeout(
+                                                    std::time::Duration::from_secs(10),
+                                                    acceptor.accept(ctl),
+                                                ).await {
+                                                    Ok(Ok(s)) => {
+                                                        tracing::info!(peer = %peer, "KCP TLS handshake succeeded from {}", peer);
+                                                        s
+                                                    }
+                                                    Ok(Err(e)) => {
+                                                        tracing::warn!(error = %e, "KCP TLS handshake failed: {}", e);
+                                                        return;
+                                                    }
+                                                    Err(_elapsed) => {
+                                                        tracing::warn!(peer = %peer, "KCP TLS handshake timed out after 10s");
+                                                        return;
+                                                    }
                                                 };
+                                                let tls_io = frp_core::transport::IoStream::Tls(Box::new(tls_stream));
 
-                                                // Keep reading TLS records until we find a V1 header
-                                                // or run out of data. Each read() returns one TLS
-                                                // record's plaintext; Go frpc sends a small prefix
-                                                // record (~12 bytes) then the Login record (~200 bytes).
-                                                let v1_offset = loop {
-                                                    if let Some(off) = find_v1(&scan_data) {
-                                                        break Some(off);
-                                                    }
-                                                    if scan_data.len() > 2048 {
-                                                        break None;
-                                                    }
-                                                    let mut buf = vec![0u8; 1024];
-                                                    match ctl.read(&mut buf).await {
-                                                        Ok(n) if n > 0 => {
-                                                            scan_data.extend_from_slice(&buf[..n]);
+                                                // After TLS: if tcpMux, wrap in yamux before V2/V1
+                                                // (matching Go frps: TLS accept → yamux → V2/V1 on yamux stream).
+                                                if state.tcp_mux {
+                                                    let mux_cfg = frp_core::mux::TcpMuxConfig {
+                                                        keepalive_interval: std::time::Duration::from_secs(
+                                                            state.tcp_mux_keepalive.max(1) as u64
+                                                        ),
+                                                    };
+                                                    match frp_core::mux::server_mux(tls_io, &mux_cfg).await {
+                                                        Ok((control_stream, incoming)) => {
+                                                            let mut io = frp_core::transport::IoStream::Yamux(control_stream);
+                                                            tracing::info!(peer = %peer, "KCP TLS+yamux session established for {}", peer);
+
+                                                            let mut yamux_magic = [0u8; 7];
+                                                            let is_v2 = match io.read_exact(&mut yamux_magic).await {
+                                                                Ok(_) => is_v2_magic(&yamux_magic),
+                                                                Err(_) => false,
+                                                            };
+                                                            if is_v2 {
+                                                                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                                    Ok((Some(p), crypto)) => (p, crypto),
+                                                                    Ok((None, crypto)) => {
+                                                                        match io.read_raw_v2_frame().await {
+                                                                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                            Ok((ft, _, _)) => {
+                                                                                tracing::warn!(frame_type = ?ft, peer = %peer, "KCP TLS+yamux V2: unexpected frame type {}", ft);
+                                                                                return;
+                                                                            }
+                                                                            Err(e) => {
+                                                                                tracing::warn!(peer = %peer, error = %e, "KCP TLS+yamux V2: read error: {}", e);
+                                                                                return;
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    Err(e) => {
+                                                                        tracing::warn!(peer = %peer, error = %e, "KCP TLS+yamux V2 handshake error: {}", e);
+                                                                        return;
+                                                                    }
+                                                                };
+                                                                let peer_addr = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
+                                                                crate::handlers::dispatch_v2_message(io, msg_payload, state, peer_addr, Some(incoming), None, crypto_ctx).await;
+                                                            } else {
+                                                                let mut io = frp_core::transport::IoStream::BufferedRead(yamux_magic.to_vec(), 0, Box::new(io));
+                                                                match frp_core::protocol::read_msg_v1(&mut io).await {
+                                                                    Ok(frp_core::msg::FrpMessage::Login(login)) => {
+                                                                        tracing::info!(peer = %peer, "KCP TLS+yamux Login from {}", peer);
+                                                                        control::handle_control(io, login, state, Some(peer), Some(incoming), false, None).await;
+                                                                    }
+                                                                    Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                                                                        tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP TLS+yamux NewWorkConn from {}", peer);
+                                                                        crate::handlers::handle_work_conn_inner(io, nwc, state).await;
+                                                                    }
+                                                                    Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
+                                                                        tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP TLS+yamux NewVisitorConn from {}", peer);
+                                                                        crate::handlers::handle_visitor_conn_inner(io, nvc, state, false).await;
+                                                                    }
+                                                                    Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
+                                                                        tracing::info!(peer = %peer, "KCP TLS+yamux NatHoleVisitor from {}", peer);
+                                                                        crate::handlers::handle_nat_hole_visitor(io, nhv, state, None, false).await;
+                                                                    }
+                                                                    Ok(other) => {
+                                                                        tracing::warn!(peer = %peer, other = ?other.v1_type_byte(), "Unexpected KCP TLS+yamux message: {:?}", other.v1_type_byte());
+                                                                    }
+                                                                    Err(e) => {
+                                                                        tracing::warn!(peer = %peer, error = %e, "KCP TLS+yamux read error: {}", e);
+                                                                    }
+                                                                }
+                                                            }
                                                         }
-                                                        Ok(_) => break None, // EOF
                                                         Err(e) => {
-                                                            tracing::debug!(peer = %peer, error = %e, "KCP TLS: read error during scan");
-                                                            break None;
+                                                            tracing::warn!(peer = %peer, error = %e, "KCP TLS+yamux server error: {}", e);
                                                         }
                                                     }
-                                                };
-
-                                                let scan_len = scan_data.len();
-                                                match v1_offset {
-                                                    Some(off) => {
-                                                        tracing::debug!(peer = %peer, offset = off, scan_len, "KCP TLS: found V1 message at offset {} ({} bytes scanned)", off, scan_len);
-                                                        let mut ctl = frp_core::transport::IoStream::BufferedRead(
-                                                            scan_data[off..].to_vec(), 0, Box::new(ctl),
-                                                        );
-                                                        match frp_core::protocol::read_msg_v1(&mut ctl).await {
-                                                            Ok(frp_core::msg::FrpMessage::Login(login)) => {
-                                                                tracing::info!(peer = %peer, "KCP TLS Login from {}", peer);
-                                                                control::handle_control(ctl, login, state, None, None, false, None).await;
-                                                            }
-                                                            Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
-                                                                tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP TLS NewWorkConn from {}", peer);
-                                                                crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
-                                                            }
-                                                            Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
-                                                                tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP TLS NewVisitorConn from {}", peer);
-                                                                crate::handlers::handle_visitor_conn_inner(ctl, nvc, state, false).await;
-                                                            }
-                                                            Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
-                                                                tracing::info!(peer = %peer, "KCP TLS NatHoleVisitor from {}", peer);
-                                                                crate::handlers::handle_nat_hole_visitor(ctl, nhv, state, None, false).await;
-                                                            }
-                                                            Ok(other) => {
-                                                                tracing::warn!(other = ?other.v1_type_byte(), "Unexpected KCP TLS message: {:?}", other.v1_type_byte());
-                                                            }
-                                                            Err(e) => {
-                                                                tracing::warn!(error = %e, "KCP TLS read error: {}", e);
-                                                            }
-                                                        }
-                                                    }
-                                                    None => {
-                                                        tracing::warn!(peer = %peer, scan_len, scan_hex = %data_encoding::HEXLOWER.encode(&scan_data[..scan_len.min(128)]), "KCP TLS: no valid V1 header found in {} bytes", scan_len);
-                                                    }
+                                                    return;
                                                 }
-                                            }
-                                        }
-                                        #[cfg(not(feature = "tls"))]
-                                        {
-                                            tracing::warn!("KCP TLS connection requires TLS feature (disabled in this build)");
-                                        }
-                                    } else {
-                                        // Reject plain KCP when tls_only is set
-                                        if state.tls_only {
-                                            warn!(peer = %peer, "TLS-only mode: rejected plain KCP from {}", peer);
-                                            return;
-                                        }
-                                        if state.tcp_mux {
-                                        // tcp_mux enabled: Go frpc wraps KCP conn in yamux
-                                        // before sending Login (matching Go frps flow).
-                                        // Replay the 7 bytes consumed by magic check —
-                                        // they are part of the yamux SYN header.
-                                        let stream = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ctl));
-                                        let mux_cfg = frp_core::mux::TcpMuxConfig {
-                                            keepalive_interval: std::time::Duration::from_secs(
-                                                state.tcp_mux_keepalive.max(1) as u64
-                                            ),
-                                        };
-                                        match frp_core::mux::server_mux(stream, &mux_cfg).await {
-                                            Ok((control_stream, incoming)) => {
-                                                let mut io = frp_core::transport::IoStream::Yamux(control_stream);
-                                                tracing::info!(peer = %peer, "KCP yamux session established for {}", peer);
 
-                                                // V2 magic detection on yamux stream
-                                                let mut yamux_magic = [0u8; 7];
-                                                let is_v2 = match io.read_exact(&mut yamux_magic).await {
-                                                    Ok(_) => is_v2_magic(&yamux_magic),
+                                                // tcpMux disabled: V2/V1 directly on TLS-decrypted stream
+                                                let mut ctl = tls_io;
+
+                                                // After TLS: detect V2 then V1 on the decrypted stream
+                                                let mut tls_magic = [0u8; 7];
+                                                let is_v2 = match ctl.read_exact(&mut tls_magic).await {
+                                                    Ok(_) => is_v2_magic(&tls_magic),
                                                     Err(_) => false,
                                                 };
                                                 if is_v2 {
-                                                    let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                    let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ctl).await {
                                                         Ok((Some(p), crypto)) => (p, crypto),
                                                         Ok((None, crypto)) => {
-                                                            match io.read_raw_v2_frame().await {
+                                                            match ctl.read_raw_v2_frame().await {
                                                                 Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                                 Ok((ft, _, _)) => {
-                                                                    tracing::warn!(frame_type = ?ft, peer = %peer, "KCP yamux V2: unexpected frame type {}", ft);
+                                                                    tracing::warn!(frame_type = ?ft, "KCP TLS V2: unexpected frame type {} after handshake", ft);
                                                                     return;
                                                                 }
                                                                 Err(e) => {
-                                                                    tracing::warn!(peer = %peer, error = %e, "KCP yamux V2: read error: {}", e);
+                                                                    tracing::warn!(error = %e, "KCP TLS V2: failed to read message after handshake: {}", e);
                                                                     return;
                                                                 }
                                                             }
                                                         }
                                                         Err(e) => {
-                                                            tracing::warn!(peer = %peer, error = %e, "KCP yamux V2 handshake error: {}", e);
+                                                            tracing::warn!(error = %e, "KCP TLS V2 handshake error: {}", e);
                                                             return;
                                                         }
                                                     };
-                                                    crate::handlers::dispatch_v2_message(io, msg_payload, state, peer, Some(incoming), None, crypto_ctx).await;
+                                                    let peer_addr = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
+                                                    crate::handlers::dispatch_v2_message(ctl, msg_payload, state, peer_addr, None, None, crypto_ctx).await;
                                                 } else {
-                                                    // V1 on yamux: replay consumed bytes, read Login/NewWorkConn
-                                                    let mut io = frp_core::transport::IoStream::BufferedRead(yamux_magic.to_vec(), 0, Box::new(io));
-                                                    match frp_core::protocol::read_msg_v1(&mut io).await {
-                                                        Ok(frp_core::msg::FrpMessage::Login(login)) => {
-                                                            tracing::info!(peer = %peer, "KCP yamux Login from {}", peer);
-                                                            control::handle_control(io, login, state, Some(peer), Some(incoming), false, None).await;
+                                                    // After KCP TLS handshake, Go frpc's decrypted stream
+                                                    // starts with non-FRP bytes (TLS Finished verify_data
+                                                    // or other post-handshake data that rustls doesn't
+                                                    // fully consume). The actual V1 Login/NewWorkConn
+                                                    // message follows in subsequent TLS records.
+                                                    //
+                                                    // Accumulate data across TLS records until we find
+                                                    // a valid V1 header or reach 2 KiB without one.
+                                                    let mut scan_data = tls_magic.to_vec();
+                                                    fn is_v1_type_byte(b: u8) -> bool {
+                                                        b.is_ascii_alphanumeric() || matches!(b, 0x40..=0x42)
+                                                    }
+                                                    let find_v1 = |data: &[u8]| -> Option<usize> {
+                                                        data.windows(9).position(|w| {
+                                                            is_v1_type_byte(w[0])
+                                                                && u64::from_be_bytes([
+                                                                    w[1], w[2], w[3], w[4],
+                                                                    w[5], w[6], w[7], w[8],
+                                                                ]) <= frp_core::protocol::V1_MAX_MSG_LENGTH as u64
+                                                        })
+                                                    };
+
+                                                    // Keep reading TLS records until we find a V1 header
+                                                    // or run out of data. Each read() returns one TLS
+                                                    // record's plaintext; Go frpc sends a small prefix
+                                                    // record (~12 bytes) then the Login record (~200 bytes).
+                                                    let v1_offset = loop {
+                                                        if let Some(off) = find_v1(&scan_data) {
+                                                            break Some(off);
                                                         }
-                                                        Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
-                                                            tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP yamux NewWorkConn from {}", peer);
-                                                            crate::handlers::handle_work_conn_inner(io, nwc, state).await;
+                                                        if scan_data.len() > 2048 {
+                                                            break None;
                                                         }
-                                                        Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
-                                                            tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP yamux NewVisitorConn from {}", peer);
-                                                            crate::handlers::handle_visitor_conn_inner(io, nvc, state, false).await;
+                                                        let mut buf = vec![0u8; 1024];
+                                                        match ctl.read(&mut buf).await {
+                                                            Ok(n) if n > 0 => {
+                                                                scan_data.extend_from_slice(&buf[..n]);
+                                                            }
+                                                            Ok(_) => break None, // EOF
+                                                            Err(e) => {
+                                                                tracing::debug!(peer = %peer, error = %e, "KCP TLS: read error during scan");
+                                                                break None;
+                                                            }
                                                         }
-                                                        Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
-                                                            tracing::info!(peer = %peer, "KCP yamux NatHoleVisitor from {}", peer);
-                                                            crate::handlers::handle_nat_hole_visitor(io, nhv, state, None, false).await;
+                                                    };
+
+                                                    let scan_len = scan_data.len();
+                                                    match v1_offset {
+                                                        Some(off) => {
+                                                            tracing::debug!(peer = %peer, offset = off, scan_len, "KCP TLS: found V1 message at offset {} ({} bytes scanned)", off, scan_len);
+                                                            let mut ctl = frp_core::transport::IoStream::BufferedRead(
+                                                                scan_data[off..].to_vec(), 0, Box::new(ctl),
+                                                            );
+                                                            match frp_core::protocol::read_msg_v1(&mut ctl).await {
+                                                                Ok(frp_core::msg::FrpMessage::Login(login)) => {
+                                                                    tracing::info!(peer = %peer, "KCP TLS Login from {}", peer);
+                                                                    control::handle_control(ctl, login, state, None, None, false, None).await;
+                                                                }
+                                                                Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                                                                    tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP TLS NewWorkConn from {}", peer);
+                                                                    crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
+                                                                }
+                                                                Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
+                                                                    tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP TLS NewVisitorConn from {}", peer);
+                                                                    crate::handlers::handle_visitor_conn_inner(ctl, nvc, state, false).await;
+                                                                }
+                                                                Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
+                                                                    tracing::info!(peer = %peer, "KCP TLS NatHoleVisitor from {}", peer);
+                                                                    crate::handlers::handle_nat_hole_visitor(ctl, nhv, state, None, false).await;
+                                                                }
+                                                                Ok(other) => {
+                                                                    tracing::warn!(other = ?other.v1_type_byte(), "Unexpected KCP TLS message: {:?}", other.v1_type_byte());
+                                                                }
+                                                                Err(e) => {
+                                                                    tracing::warn!(error = %e, "KCP TLS read error: {}", e);
+                                                                }
+                                                            }
                                                         }
-                                                        Ok(other) => {
-                                                            tracing::warn!(peer = %peer, other = ?other.v1_type_byte(), "Unexpected KCP yamux message: {:?}", other.v1_type_byte());
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::warn!(peer = %peer, error = %e, "KCP yamux read error: {}", e);
+                                                        None => {
+                                                            tracing::warn!(peer = %peer, scan_len, scan_hex = %data_encoding::HEXLOWER.encode(&scan_data[..scan_len.min(128)]), "KCP TLS: no valid V1 header found in {} bytes", scan_len);
                                                         }
                                                     }
                                                 }
                                             }
-                                            Err(e) => {
-                                                tracing::warn!(peer = %peer, error = %e, "KCP yamux server error: {}", e);
+                                            #[cfg(not(feature = "tls"))]
+                                            {
+                                                tracing::warn!("KCP TLS connection requires TLS feature (disabled in this build)");
                                             }
-                                        }
-                                    } else {
-                                        // No tcp_mux: replay consumed 7 bytes, read V1 frame directly
-                                        let mut ctl = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ctl));
-                                        match frp_core::protocol::read_msg_v1(&mut ctl).await {
-                                            Ok(frp_core::msg::FrpMessage::Login(login)) => {
-                                                tracing::info!(peer = %peer, "KCP Login from {}", peer);
-                                                control::handle_control(ctl, login, state, None, None, false, None).await;
+                                        } else {
+                                            // Reject plain KCP when tls_only is set
+                                            if state.tls_only {
+                                                warn!(peer = %peer, "TLS-only mode: rejected plain KCP from {}", peer);
+                                                return;
                                             }
-                                            Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
-                                                tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP NewWorkConn from {}", peer);
-                                                crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
+                                            if state.tcp_mux {
+                                            // tcp_mux enabled: Go frpc wraps KCP conn in yamux
+                                            // before sending Login (matching Go frps flow).
+                                            // Replay the 7 bytes consumed by magic check —
+                                            // they are part of the yamux SYN header.
+                                            let stream = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ctl));
+                                            let mux_cfg = frp_core::mux::TcpMuxConfig {
+                                                keepalive_interval: std::time::Duration::from_secs(
+                                                    state.tcp_mux_keepalive.max(1) as u64
+                                                ),
+                                            };
+                                            match frp_core::mux::server_mux(stream, &mux_cfg).await {
+                                                Ok((control_stream, incoming)) => {
+                                                    let mut io = frp_core::transport::IoStream::Yamux(control_stream);
+                                                    tracing::info!(peer = %peer, "KCP yamux session established for {}", peer);
+
+                                                    // V2 magic detection on yamux stream
+                                                    let mut yamux_magic = [0u8; 7];
+                                                    let is_v2 = match io.read_exact(&mut yamux_magic).await {
+                                                        Ok(_) => is_v2_magic(&yamux_magic),
+                                                        Err(_) => false,
+                                                    };
+                                                    if is_v2 {
+                                                        let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                            Ok((Some(p), crypto)) => (p, crypto),
+                                                            Ok((None, crypto)) => {
+                                                                match io.read_raw_v2_frame().await {
+                                                                    Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                    Ok((ft, _, _)) => {
+                                                                        tracing::warn!(frame_type = ?ft, peer = %peer, "KCP yamux V2: unexpected frame type {}", ft);
+                                                                        return;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        tracing::warn!(peer = %peer, error = %e, "KCP yamux V2: read error: {}", e);
+                                                                        return;
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::warn!(peer = %peer, error = %e, "KCP yamux V2 handshake error: {}", e);
+                                                                return;
+                                                            }
+                                                        };
+                                                        crate::handlers::dispatch_v2_message(io, msg_payload, state, peer, Some(incoming), None, crypto_ctx).await;
+                                                    } else {
+                                                        // V1 on yamux: replay consumed bytes, read Login/NewWorkConn
+                                                        let mut io = frp_core::transport::IoStream::BufferedRead(yamux_magic.to_vec(), 0, Box::new(io));
+                                                        match frp_core::protocol::read_msg_v1(&mut io).await {
+                                                            Ok(frp_core::msg::FrpMessage::Login(login)) => {
+                                                                tracing::info!(peer = %peer, "KCP yamux Login from {}", peer);
+                                                                control::handle_control(io, login, state, Some(peer), Some(incoming), false, None).await;
+                                                            }
+                                                            Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                                                                tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP yamux NewWorkConn from {}", peer);
+                                                                crate::handlers::handle_work_conn_inner(io, nwc, state).await;
+                                                            }
+                                                            Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
+                                                                tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP yamux NewVisitorConn from {}", peer);
+                                                                crate::handlers::handle_visitor_conn_inner(io, nvc, state, false).await;
+                                                            }
+                                                            Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
+                                                                tracing::info!(peer = %peer, "KCP yamux NatHoleVisitor from {}", peer);
+                                                                crate::handlers::handle_nat_hole_visitor(io, nhv, state, None, false).await;
+                                                            }
+                                                            Ok(other) => {
+                                                                tracing::warn!(peer = %peer, other = ?other.v1_type_byte(), "Unexpected KCP yamux message: {:?}", other.v1_type_byte());
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::warn!(peer = %peer, error = %e, "KCP yamux read error: {}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(peer = %peer, error = %e, "KCP yamux server error: {}", e);
+                                                }
                                             }
-                                            Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
-                                                tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP NewVisitorConn from {}", peer);
-                                                crate::handlers::handle_visitor_conn_inner(ctl, nvc, state, false).await;
-                                            }
-                                            Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
-                                                tracing::info!(peer = %peer, "KCP NatHoleVisitor from {}", peer);
-                                                crate::handlers::handle_nat_hole_visitor(ctl, nhv, state, None, false).await;
-                                            }
-                                            Ok(other) => {
-                                                tracing::warn!(other = ?other.v1_type_byte(), "Unexpected KCP message: {:?}", other.v1_type_byte());
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(error = %e, "KCP read error: {}", e);
+                                        } else {
+                                            // No tcp_mux: replay consumed 7 bytes, read V1 frame directly
+                                            let mut ctl = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ctl));
+                                            match frp_core::protocol::read_msg_v1(&mut ctl).await {
+                                                Ok(frp_core::msg::FrpMessage::Login(login)) => {
+                                                    tracing::info!(peer = %peer, "KCP Login from {}", peer);
+                                                    control::handle_control(ctl, login, state, None, None, false, None).await;
+                                                }
+                                                Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                                                    tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP NewWorkConn from {}", peer);
+                                                    crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
+                                                }
+                                                Ok(frp_core::msg::FrpMessage::NewVisitorConn(nvc)) => {
+                                                    tracing::info!(peer = %peer, proxy_name = %nvc.proxy_name, "KCP NewVisitorConn from {}", peer);
+                                                    crate::handlers::handle_visitor_conn_inner(ctl, nvc, state, false).await;
+                                                }
+                                                Ok(frp_core::msg::FrpMessage::NatHoleVisitor(nhv)) => {
+                                                    tracing::info!(peer = %peer, "KCP NatHoleVisitor from {}", peer);
+                                                    crate::handlers::handle_nat_hole_visitor(ctl, nhv, state, None, false).await;
+                                                }
+                                                Ok(other) => {
+                                                    tracing::warn!(other = ?other.v1_type_byte(), "Unexpected KCP message: {:?}", other.v1_type_byte());
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(error = %e, "KCP read error: {}", e);
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                }
-                            });
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "KCP accept error: {}", e);
+                                break 'kcp_accept;
+                            }
                         }
-                        Err(e) => {
-                            tracing::error!(error = %e, "KCP accept error: {}", e);
-                            break 'kcp_accept;
                         }
+                        _ = kcp_state.shutdown_token.cancelled() => break 'kcp_accept,
                     }
-                    }
-                    _ = kcp_state.shutdown_token.cancelled() => break 'kcp_accept,
-                }
                 }
             });
             tracing::info!(addr = %kcp_addr, "KCP listener starting on {}", kcp_addr);
@@ -971,55 +994,56 @@ impl Service {
                         return;
                     }
                 };
-                let listener = match frp_core::quic::QuicListener::new(sockaddr, &cert_pem, &key_pem) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        tracing::error!(error = %e, "QUIC listener bind failed: {}", e);
-                        return;
-                    }
-                };
+                let listener =
+                    match frp_core::quic::QuicListener::new(sockaddr, &cert_pem, &key_pem) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::error!(error = %e, "QUIC listener bind failed: {}", e);
+                            return;
+                        }
+                    };
                 tracing::info!(addr = %quic_addr, "QUIC listener started on {}", quic_addr);
                 'quic_accept: loop {
                     tokio::select! {
-                        result = listener.accept() => {
-                            match result {
-                                Ok(conn) => {
-                                    let state = quic_state.clone();
-                                    let quic_addr = conn.remote_address();
-                                    let permit = state.conn_semaphore.as_ref()
-                                        .and_then(|s| s.clone().try_acquire_owned().ok());
-                                    if permit.is_none() && state.conn_semaphore.is_some() {
-                                        warn!(addr = %quic_addr, "Max connections reached, rejecting QUIC from {}", quic_addr);
-                                        continue;
+                            result = listener.accept() => {
+                                match result {
+                                    Ok(conn) => {
+                                        let state = quic_state.clone();
+                                        let quic_addr = conn.remote_address();
+                                        let permit = state.conn_semaphore.as_ref()
+                                            .and_then(|s| s.clone().try_acquire_owned().ok());
+                                        if permit.is_none() && state.conn_semaphore.is_some() {
+                                            warn!(addr = %quic_addr, "Max connections reached, rejecting QUIC from {}", quic_addr);
+                                            continue;
+                                        }
+                                        tokio::spawn(async move {
+                                            let _permit = permit;
+                                            // Accept first bidirectional stream (control channel).
+                                            // This is inside the handler, not in the accept loop —
+                                            // matching Go frp's HandleQUICListener pattern where
+                                            // the accept loop never blocks on a stream.
+                                            let stream = match conn.accept_bi().await {
+                                                Ok(s) => s,
+                                                Err(e) => {
+                                                    tracing::warn!(error = %e, "QUIC: failed to accept first stream: {e}");
+                                                    return;
+                                                }
+                                            };
+                                            handle_quic_stream(stream, conn, state).await;
+                                        });
                                     }
-                                    tokio::spawn(async move {
-                                        let _permit = permit;
-                                        // Accept first bidirectional stream (control channel).
-                                        // This is inside the handler, not in the accept loop —
-                                        // matching Go frp's HandleQUICListener pattern where
-                                        // the accept loop never blocks on a stream.
-                                        let stream = match conn.accept_bi().await {
-                                            Ok(s) => s,
-                                            Err(e) => {
-                                                tracing::warn!(error = %e, "QUIC: failed to accept first stream: {e}");
-                                                return;
-                                            }
-                                        };
-                                        handle_quic_stream(stream, conn, state).await;
-                                    });
-                                }
-                        Err(e) => {
-                            tracing::error!(error = %e, "QUIC accept error: {e}");
-                            tracing::info!("QUIC accept loop shut down due to error");
+                            Err(e) => {
+                                tracing::error!(error = %e, "QUIC accept error: {e}");
+                                tracing::info!("QUIC accept loop shut down due to error");
+                                break 'quic_accept;
+                            }
+                        }
+                        }
+                        _ = quic_state.shutdown_token.cancelled() => {
+                            tracing::debug!("QUIC accept loop: shutdown requested");
                             break 'quic_accept;
                         }
                     }
-                    }
-                    _ = quic_state.shutdown_token.cancelled() => {
-                        tracing::debug!("QUIC accept loop: shutdown requested");
-                        break 'quic_accept;
-                    }
-                }
                 }
                 tracing::info!("QUIC accept loop shut down gracefully");
             });
@@ -1049,21 +1073,23 @@ impl Service {
 
             if is_v2 {
                 // --- V2 path ---
-                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ctl).await {
+                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(
+                    &mut ctl,
+                )
+                .await
+                {
                     Ok((Some(p), crypto)) => (p, crypto),
-                    Ok((None, crypto)) => {
-                        match ctl.read_raw_v2_frame().await {
-                            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                            Ok((ft, _, _)) => {
-                                tracing::warn!(frame_type = ?ft, "QUIC V2: unexpected frame type {} after handshake", ft);
-                                return;
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "QUIC V2: failed to read message after handshake: {}", e);
-                                return;
-                            }
+                    Ok((None, crypto)) => match ctl.read_raw_v2_frame().await {
+                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                        Ok((ft, _, _)) => {
+                            tracing::warn!(frame_type = ?ft, "QUIC V2: unexpected frame type {} after handshake", ft);
+                            return;
                         }
-                    }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "QUIC V2: failed to read message after handshake: {}", e);
+                            return;
+                        }
+                    },
                     Err(e) => {
                         tracing::warn!(error = %e, "QUIC V2 handshake error: {}", e);
                         return;
@@ -1072,11 +1098,21 @@ impl Service {
 
                 let addr: std::net::SocketAddr = conn.remote_address();
                 let cancel = spawn_quic_drain(conn, Arc::clone(&state), "V2");
-                crate::handlers::dispatch_v2_message(ctl, msg_payload, state, addr, None, None, crypto_ctx).await;
+                crate::handlers::dispatch_v2_message(
+                    ctl,
+                    msg_payload,
+                    state,
+                    addr,
+                    None,
+                    None,
+                    crypto_ctx,
+                )
+                .await;
                 cancel.cancel();
             } else {
                 // --- V1 fallback ---
-                let mut ctl = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ctl));
+                let mut ctl =
+                    frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ctl));
 
                 match frp_core::protocol::read_msg_v1(&mut ctl).await {
                     Ok(frp_core::msg::FrpMessage::Login(login)) => {
@@ -1189,9 +1225,16 @@ impl Service {
             let enable_prom = self.cfg.web_server.enable_prometheus;
             tokio::spawn(async move {
                 if let Err(e) = crate::dashboard::run_dashboard(
-                    dash_addr, dash_state, dash_user, dash_pwd,
-                    enable_prom, dash_tls_cert, dash_tls_key,
-                ).await {
+                    dash_addr,
+                    dash_state,
+                    dash_user,
+                    dash_pwd,
+                    enable_prom,
+                    dash_tls_cert,
+                    dash_tls_key,
+                )
+                .await
+                {
                     tracing::error!(error = %e, "Dashboard server failed: {}", e);
                 }
             });
@@ -2104,13 +2147,19 @@ impl Service {
         // Accept loop has stopped. Let existing bridge connections finish.
         let drain_timeout = Duration::from_secs(self.cfg.graceful_shutdown_timeout);
         let drain_start = std::time::Instant::now();
-        let initial = self.state.active_connections.load(std::sync::atomic::Ordering::Relaxed);
+        let initial = self
+            .state
+            .active_connections
+            .load(std::sync::atomic::Ordering::Relaxed);
         info!(active = %initial, timeout_secs = %drain_timeout.as_secs(),
             "Draining {} active connections (timeout {}s)",
             initial, drain_timeout.as_secs());
 
         loop {
-            let remaining = self.state.active_connections.load(std::sync::atomic::Ordering::Relaxed);
+            let remaining = self
+                .state
+                .active_connections
+                .load(std::sync::atomic::Ordering::Relaxed);
             if remaining == 0 {
                 info!(elapsed_secs = %drain_start.elapsed().as_secs_f32(),
                     "All connections drained in {:.1}s", drain_start.elapsed().as_secs_f32());
@@ -2153,7 +2202,8 @@ impl Service {
             let mut r = self.state.reloadable.write_ok();
             if r.allow_ports != new_allow_ports {
                 changes.push(format!(
-                    "allow_ports: {:?} -> {:?}", r.allow_ports, new_allow_ports
+                    "allow_ports: {:?} -> {:?}",
+                    r.allow_ports, new_allow_ports
                 ));
                 r.allow_ports = new_allow_ports;
             }
@@ -2173,9 +2223,24 @@ impl Service {
         }
 
         // Log settings that require restart
-        note_restart_change(&self.cfg.bind_port, &new_cfg.bind_port, "bind_port", &mut changes);
-        note_restart_change(&self.cfg.bind_addr, &new_cfg.bind_addr, "bind_addr", &mut changes);
-        note_restart_change(&self.cfg.tls_enable, &new_cfg.tls_enable, "tls_enable", &mut changes);
+        note_restart_change(
+            &self.cfg.bind_port,
+            &new_cfg.bind_port,
+            "bind_port",
+            &mut changes,
+        );
+        note_restart_change(
+            &self.cfg.bind_addr,
+            &new_cfg.bind_addr,
+            "bind_addr",
+            &mut changes,
+        );
+        note_restart_change(
+            &self.cfg.tls_enable,
+            &new_cfg.tls_enable,
+            "tls_enable",
+            &mut changes,
+        );
         // TLS certificate hot-reload: if cert/key/ca paths changed, rebuild
         // acceptor and swap atomically. Existing connections keep old config;
         // new connections pick up the new cert immediately.
@@ -2189,7 +2254,8 @@ impl Service {
             } else {
                 Some(new_cfg.tls_ca_file.as_str())
             };
-            match build_tls_acceptor_or_generate(&new_cfg.tls_cert_file, &new_cfg.tls_key_file, ca) {
+            match build_tls_acceptor_or_generate(&new_cfg.tls_cert_file, &new_cfg.tls_key_file, ca)
+            {
                 Ok(acceptor) => {
                     *self.state.tls_acceptor.write_ok() = Some(acceptor);
                     changes.push(format!(
@@ -2212,9 +2278,7 @@ impl Service {
             || self.cfg.auth.oidc_skip_expiry != new_cfg.auth.oidc_skip_expiry
             || self.cfg.auth.oidc_skip_issuer != new_cfg.auth.oidc_skip_issuer
         {
-            changes.push(
-                "OIDC settings changed (restart required)".to_string()
-            );
+            changes.push("OIDC settings changed (restart required)".to_string());
         }
 
         if changes.is_empty() {
@@ -2224,6 +2288,4 @@ impl Service {
             Ok(changes.join("; "))
         }
     }
-
 }
-

@@ -2,21 +2,26 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
+use frp_core::auth::{AuthConfig, OidcClient};
 use frp_core::config::{ProxyConfig, VisitorConfig};
 use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::write_msg_v1;
-use frp_core::auth::{AuthConfig, OidcClient};
 use frp_core::mux::{self, YamuxSession};
-use frp_core::transport::{IoStream, TransportProtocol, DialOptions, dial_server};
-use frp_core::TransportError;
+use frp_core::protocol::write_msg_v1;
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
+use frp_core::transport::{dial_server, DialOptions, IoStream, TransportProtocol};
+use frp_core::TransportError;
 use frp_core::VERSION;
 
 use crate::util::opt_if_empty;
 
 #[cfg(feature = "quic")]
-type LoginRet = (IoStream, String, Option<YamuxSession>, Option<QuicConnection>);
+type LoginRet = (
+    IoStream,
+    String,
+    Option<YamuxSession>,
+    Option<QuicConnection>,
+);
 #[cfg(not(feature = "quic"))]
 type LoginRet = (IoStream, String, Option<YamuxSession>);
 
@@ -110,8 +115,7 @@ impl ControlConnection {
         // Go frp servers with tcpMux=true wrap every incoming TCP connection
         // in yamux immediately, so the client MUST wrap BEFORE sending Login.
         // Works over both plain TCP and TLS (yamux sits on top of TLS).
-        let propose_mux = self.tcp_mux
-            && matches!(self.transport_protocol, TransportProtocol::Tcp);
+        let propose_mux = self.tcp_mux && matches!(self.transport_protocol, TransportProtocol::Tcp);
 
         let opts = DialOptions {
             server_addr: self.server_addr.clone(),
@@ -136,7 +140,11 @@ impl ControlConnection {
         // QUIC transport: dial directly via dial_quic() to capture the
         // QuicConnection handle. Other transports go through dial_server().
         #[cfg(feature = "quic")]
-        let (mut io_stream, yamux_session, quic_conn): (IoStream, Option<YamuxSession>, Option<QuicConnection>) = {
+        let (mut io_stream, yamux_session, quic_conn): (
+            IoStream,
+            Option<YamuxSession>,
+            Option<QuicConnection>,
+        ) = {
             if self.transport_protocol == TransportProtocol::Quic {
                 let addr = format!("{}:{}", self.server_addr, self.server_port);
                 let server_name = if !self.tls_server_name.is_empty() {
@@ -145,7 +153,8 @@ impl ControlConnection {
                     &self.server_addr
                 };
                 let ca_file = self.tls_ca_file.as_deref();
-                let (stream, qc) = frp_core::quic::dial_quic(&addr, server_name, ca_file).await
+                let (stream, qc) = frp_core::quic::dial_quic(&addr, server_name, ca_file)
+                    .await
                     .map_err(|e| frp_core::Error::Transport(format!("QUIC dial: {e}").into()))?;
                 (IoStream::Quic(stream), None, Some(qc))
             } else {
@@ -157,13 +166,15 @@ impl ControlConnection {
                     let mux_cfg = mux::TcpMuxConfig::default();
                     match raw_stream {
                         IoStream::Tcp(tcp_stream) => {
-                            let (control_stream, session) = mux::client_mux(tcp_stream, &mux_cfg).await?;
+                            let (control_stream, session) =
+                                mux::client_mux(tcp_stream, &mux_cfg).await?;
                             info!("Yamux session established");
                             (IoStream::Yamux(control_stream), Some(session), None)
                         }
                         #[cfg(feature = "tls")]
                         IoStream::Tls(tls_stream) => {
-                            let (control_stream, session) = mux::client_mux(tls_stream, &mux_cfg).await?;
+                            let (control_stream, session) =
+                                mux::client_mux(tls_stream, &mux_cfg).await?;
                             info!("Yamux session established over TLS");
                             (IoStream::Yamux(control_stream), Some(session), None)
                         }
@@ -193,13 +204,15 @@ impl ControlConnection {
                 let mux_cfg = mux::TcpMuxConfig::default();
                 match raw_stream {
                     IoStream::Tcp(tcp_stream) => {
-                        let (control_stream, session) = mux::client_mux(tcp_stream, &mux_cfg).await?;
+                        let (control_stream, session) =
+                            mux::client_mux(tcp_stream, &mux_cfg).await?;
                         info!("Yamux session established");
                         (IoStream::Yamux(control_stream), Some(session))
                     }
                     #[cfg(feature = "tls")]
                     IoStream::Tls(tls_stream) => {
-                        let (control_stream, session) = mux::client_mux(tls_stream, &mux_cfg).await?;
+                        let (control_stream, session) =
+                            mux::client_mux(tls_stream, &mux_cfg).await?;
                         info!("Yamux session established over TLS");
                         (IoStream::Yamux(control_stream), Some(session))
                     }
@@ -226,7 +239,8 @@ impl ControlConnection {
             // - QUIC: dial_quic() doesn't write magic (per-stream independence)
             // - TCP non-mux/KCP/WS/WSS: magic already written by dial_server() (opts.v2=true)
             #[cfg(feature = "quic")]
-            let needs_v2_magic = propose_mux || matches!(self.transport_protocol, TransportProtocol::Quic);
+            let needs_v2_magic =
+                propose_mux || matches!(self.transport_protocol, TransportProtocol::Quic);
             #[cfg(not(feature = "quic"))]
             let needs_v2_magic = propose_mux;
 
@@ -252,8 +266,8 @@ impl ControlConnection {
                 self.tls_enable,
                 self.tcp_mux,
                 true, // with_crypto
-            ).await?;
-
+            )
+            .await?;
         }
 
         let timestamp = std::time::SystemTime::now()
@@ -274,12 +288,17 @@ impl ControlConnection {
             privilege_key: None,
             metas: opt_if_empty!(self.metas),
             client_spec: None,
-            multiplexer: if propose_mux { Some("yamux".into()) } else { None },
+            multiplexer: if propose_mux {
+                Some("yamux".into())
+            } else {
+                None
+            },
         };
 
         // Set auth: OIDC path or token path
         if let Some(ref oidc) = self.oidc_client {
-            oidc.set_login(&mut login).await
+            oidc.set_login(&mut login)
+                .await
                 .map_err(|e| frp_core::Error::Auth(format!("OIDC login: {e}").into()))?;
         } else {
             login.privilege_key = self.auth_cfg.generate_login_key(timestamp);
@@ -307,20 +326,29 @@ impl ControlConnection {
                 let token = self.auth_cfg.token.clone();
                 // derive_aead_control_keys returns (client_to_server, server_to_client)
                 let (write_key, read_key) = frp_core::crypto::derive_aead_control_keys(
-                    token.as_bytes(), ctx.algorithm, &ctx.transcript_hash,
-                ).map_err(|e| frp_core::Error::Protocol(e.into()))?;
+                    token.as_bytes(),
+                    ctx.algorithm,
+                    &ctx.transcript_hash,
+                )
+                .map_err(|e| frp_core::Error::Protocol(e.into()))?;
                 // Client reads from server → server_to_client
                 // Client writes to server → client_to_server
                 let aead = frp_core::crypto::AeadStream::new(
-                    Box::new(io_stream), ctx.algorithm, &read_key, &write_key,
-                ).map_err(|e| frp_core::Error::Protocol(e.into()))?;
+                    Box::new(io_stream),
+                    ctx.algorithm,
+                    &read_key,
+                    &write_key,
+                )
+                .map_err(|e| frp_core::Error::Protocol(e.into()))?;
                 io_stream = IoStream::Aead(Box::new(aead));
             }
         }
         match resp_msg {
             FrpMessage::LoginResp(resp) => {
                 if let Some(err) = resp.error {
-                    return Err(frp_core::Error::Auth(format!("Login failed: {}", err).into()));
+                    return Err(frp_core::Error::Auth(
+                        format!("Login failed: {}", err).into(),
+                    ));
                 }
                 self.run_id = resp.run_id.clone().unwrap_or_default();
                 self.server_auth_scopes = resp.server_additional_auth_scopes.unwrap_or_default();
@@ -334,7 +362,9 @@ impl ControlConnection {
                     Ok((io_stream, self.run_id.clone(), yamux_session))
                 }
             }
-            _ => Err(frp_core::Error::Protocol("Unexpected response to login".into())),
+            _ => Err(frp_core::Error::Protocol(
+                "Unexpected response to login".into(),
+            )),
         }
     }
 
@@ -360,7 +390,8 @@ impl ControlConnection {
         loop {
             if iterations >= 100 {
                 return Err(frp_core::Error::Transport(TransportError::Other(format!(
-                    "Proxy '{}' registration failed: too many non-response messages", p.name
+                    "Proxy '{}' registration failed: too many non-response messages",
+                    p.name
                 ))));
             }
             iterations += 1;
@@ -373,7 +404,8 @@ impl ControlConnection {
                 FrpMessage::NewProxyResp(resp) => {
                     if let Some(err) = resp.error {
                         return Err(frp_core::Error::Transport(TransportError::Other(format!(
-                            "Proxy '{}' registration failed: {err}", p.name
+                            "Proxy '{}' registration failed: {err}",
+                            p.name
                         ))));
                     }
                     info!(name = %p.name, remote_addr = ?resp.remote_addr, "Proxy '{}' registered on remote port {:?}", p.name, resp.remote_addr);
@@ -401,8 +433,10 @@ impl ControlConnection {
         stream: &mut IoStream,
     ) -> Result<msg::NewVisitorConnResp, frp_core::Error> {
         let nvc = crate::proxy::create_visitor_conn_msg(
-            &v.server_name, &v.secret_key,
-            v.use_encryption, v.use_compression,
+            &v.server_name,
+            &v.secret_key,
+            v.use_encryption,
+            v.use_compression,
         );
         debug!(server_name = %v.server_name, json = %serde_json::to_string(&nvc).unwrap_or_default(), "NewVisitorConn for '{}': {}", v.server_name,
             serde_json::to_string(&nvc).unwrap_or_default());
@@ -416,7 +450,8 @@ impl ControlConnection {
         loop {
             if iterations >= 100 {
                 return Err(frp_core::Error::Transport(TransportError::Other(format!(
-                    "Visitor '{}' registration failed: too many non-response messages", v.name
+                    "Visitor '{}' registration failed: too many non-response messages",
+                    v.name
                 ))));
             }
             iterations += 1;
@@ -429,7 +464,8 @@ impl ControlConnection {
                 FrpMessage::NewVisitorConnResp(resp) => {
                     if let Some(err) = resp.error {
                         return Err(frp_core::Error::Transport(TransportError::Other(format!(
-                            "Visitor '{}' registration failed: {err}", v.name
+                            "Visitor '{}' registration failed: {err}",
+                            v.name
                         ))));
                     }
                     info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}'", v.name, v.server_name);
@@ -453,7 +489,9 @@ impl ControlConnection {
     }
 
     /// Send a ping to the server.
-    pub async fn send_ping(writer: &mut (impl AsyncWriteExt + Unpin)) -> Result<(), frp_core::Error> {
+    pub async fn send_ping(
+        writer: &mut (impl AsyncWriteExt + Unpin),
+    ) -> Result<(), frp_core::Error> {
         let ping = FrpMessage::Ping(msg::Ping {
             privilege_key: None,
             timestamp: None,
@@ -461,7 +499,6 @@ impl ControlConnection {
         write_msg_v1(writer, &ping).await
     }
 }
-
 
 /// Resolve the local hostname. Cached via OnceLock — blocking I/O runs in
 /// `spawn_blocking` on first call to avoid stalling the tokio worker thread.

@@ -22,8 +22,10 @@ fn bench_nat_classify(c: &mut Criterion) {
 
     group.bench_function("classify_easy_nat", |b| {
         b.iter(|| {
-            let _ =
-                frp_server::nathole::classify::classify_nat_feature(black_box(&easy_addrs), black_box(&local_ips));
+            let _ = frp_server::nathole::classify::classify_nat_feature(
+                black_box(&easy_addrs),
+                black_box(&local_ips),
+            );
         });
     });
 
@@ -37,8 +39,10 @@ fn bench_nat_classify(c: &mut Criterion) {
 
     group.bench_function("classify_hard_nat", |b| {
         b.iter(|| {
-            let _ =
-                frp_server::nathole::classify::classify_nat_feature(black_box(&hard_addrs), black_box(&local_ips));
+            let _ = frp_server::nathole::classify::classify_nat_feature(
+                black_box(&hard_addrs),
+                black_box(&local_ips),
+            );
         });
     });
 
@@ -50,8 +54,7 @@ fn bench_nat_classify(c: &mut Criterion) {
 
     group.bench_function("classify_feature_count", |b| {
         b.iter(|| {
-            let _ =
-                frp_server::nathole::classify::classify_feature_count(black_box(&features));
+            let _ = frp_server::nathole::classify::classify_feature_count(black_box(&features));
         });
     });
 

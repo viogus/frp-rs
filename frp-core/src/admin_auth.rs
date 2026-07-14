@@ -1,9 +1,9 @@
 use axum::{
     extract::Request,
+    http::StatusCode,
     middleware,
     middleware::Next,
     response::{IntoResponse, Response},
-    http::StatusCode,
     Router,
 };
 use std::sync::Arc;
@@ -44,7 +44,10 @@ where
         String::new()
     };
 
-    let state = Arc::new(AuthState { enabled, expected_header: expected });
+    let state = Arc::new(AuthState {
+        enabled,
+        expected_header: expected,
+    });
 
     async fn check_auth(req: Request, next: Next) -> Response {
         let state = match req.extensions().get::<Arc<AuthState>>().cloned() {
@@ -54,7 +57,11 @@ where
                 // applied. This is a configuration/programming error, not a
                 // client auth failure. Return 500 so the operator notices.
                 tracing::error!("Admin auth middleware: AuthState extension missing — middleware layer not properly applied");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Internal configuration error").into_response();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal configuration error",
+                )
+                    .into_response();
             }
         };
         if state.enabled {
@@ -90,17 +97,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{routing::get, body::Body};
+    use axum::{body::Body, routing::get};
     use tower::ServiceExt;
 
-    async fn ok() -> &'static str { "ok" }
+    async fn ok() -> &'static str {
+        "ok"
+    }
 
     #[tokio::test]
     async fn test_auth_disabled_when_empty() {
-        let app = apply_admin_auth(
-            Router::new().route("/api/test", get(ok)),
-            "", "",
-        );
+        let app = apply_admin_auth(Router::new().route("/api/test", get(ok)), "", "");
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -115,10 +121,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_rejects_no_header() {
-        let app = apply_admin_auth(
-            Router::new().route("/api/test", get(ok)),
-            "admin", "secret",
-        );
+        let app = apply_admin_auth(Router::new().route("/api/test", get(ok)), "admin", "secret");
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -133,10 +136,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_accepts_valid() {
-        let app = apply_admin_auth(
-            Router::new().route("/api/test", get(ok)),
-            "admin", "secret",
-        );
+        let app = apply_admin_auth(Router::new().route("/api/test", get(ok)), "admin", "secret");
         let creds = data_encoding::BASE64.encode(b"admin:secret");
         let resp = app
             .oneshot(
@@ -153,10 +153,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_rejects_wrong_password() {
-        let app = apply_admin_auth(
-            Router::new().route("/api/test", get(ok)),
-            "admin", "secret",
-        );
+        let app = apply_admin_auth(Router::new().route("/api/test", get(ok)), "admin", "secret");
         let creds = data_encoding::BASE64.encode(b"admin:wrong");
         let resp = app
             .oneshot(

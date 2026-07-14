@@ -1,8 +1,8 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex, RwLock, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
 /// Internal request from a visitor task to the control loop.
 /// Visitor sends NatHoleVisitor on the control connection (Go frps compat:
@@ -12,13 +12,13 @@ pub(crate) struct VisitorRequest {
     pub nhv: msg::NatHoleVisitor,
     pub reply: oneshot::Sender<Result<msg::NatHoleResp, String>>,
 }
-use tokio::time::{interval, Duration};
-use tracing::{info, warn, debug, instrument};
 use rand::Rng;
+use tokio::time::{interval, Duration};
+use tracing::{debug, info, instrument, warn};
 
 use frp_core::auth::{AuthConfig, AuthMethod, OidcClient};
-use frp_core::unsafe_features::UnsafeFeatures;
 use frp_core::config::ClientConfig;
+use frp_core::unsafe_features::UnsafeFeatures;
 
 #[cfg(feature = "vnet")]
 type VnetTunMap = Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>;
@@ -31,12 +31,12 @@ use frp_core::transport::TransportProtocol;
 
 use frp_core::metrics::ProxyMetricsRegistry;
 
-use crate::plugin::{self, PluginHandle, PluginContext};
-use crate::control::ControlConnection;
-use crate::util::opt_if_empty;
-use crate::proxy_runtime::{ProxyRuntimeInfo, ReloadRequest};
 #[cfg(feature = "admin")]
 use crate::admin::AdminState;
+use crate::control::ControlConnection;
+use crate::plugin::{self, PluginContext, PluginHandle};
+use crate::proxy_runtime::{ProxyRuntimeInfo, ReloadRequest};
+use crate::util::opt_if_empty;
 use crate::work_conn::XtcpNotification;
 
 /// Dispatch to the correct plugin start function based on plugin_type.
@@ -57,14 +57,14 @@ async fn dispatch_plugin_start(
         "https2http" => plugin::start_https2http_plugin(plugin_cfg).await,
         "https2https" => plugin::start_https2https_plugin(plugin_cfg).await,
         "visitor_plugin" => {
-            let ctx = plugin_ctx.ok_or_else(|| frp_core::Error::Config(
-                "visitor_plugin requires PluginContext".into()
-            ))?;
+            let ctx = plugin_ctx.ok_or_else(|| {
+                frp_core::Error::Config("visitor_plugin requires PluginContext".into())
+            })?;
             plugin::start_visitor_plugin(plugin_cfg, ctx).await
         }
         other => Err(frp_core::Error::Config(
-            format!("unknown plugin type: {other}")
-        .into())),
+            format!("unknown plugin type: {other}").into(),
+        )),
     }
 }
 
@@ -123,16 +123,27 @@ pub struct Service {
 
 impl Service {
     /// Create a new client Service with default unsafe features (all blocked).
-    pub async fn new(cfg: ClientConfig, config_file: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(
+        cfg: ClientConfig,
+        config_file: Option<String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         Self::with_unsafe_features(cfg, config_file, UnsafeFeatures::default()).await
     }
 
     /// Create a new client Service with a custom unsafe features allowlist.
-    pub async fn with_unsafe_features(cfg: ClientConfig, config_file: Option<String>, unsafe_features: UnsafeFeatures) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn with_unsafe_features(
+        cfg: ClientConfig,
+        config_file: Option<String>,
+        unsafe_features: UnsafeFeatures,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // Determine auth method from [auth] section if present, otherwise token
         #[cfg(feature = "oidc")]
         let auth_method = if let Some(ref ac) = cfg.auth {
-            if ac.method == "oidc" { AuthMethod::Oidc } else { AuthMethod::Token }
+            if ac.method == "oidc" {
+                AuthMethod::Oidc
+            } else {
+                AuthMethod::Token
+            }
         } else {
             AuthMethod::Token
         };
@@ -141,12 +152,21 @@ impl Service {
 
         let auth_cfg = AuthConfig {
             method: auth_method.clone(),
-            token: frp_core::auth::resolve_dynamic_token_checked(&cfg.token, &unsafe_features).unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
-                String::new()
-            }),
-            oidc_issuer: cfg.auth.as_ref().map(|a| a.oidc_issuer.clone()).unwrap_or_default(),
-            oidc_audience: cfg.auth.as_ref().map(|a| a.oidc_audience.clone()).unwrap_or_default(),
+            token: frp_core::auth::resolve_dynamic_token_checked(&cfg.token, &unsafe_features)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
+                    String::new()
+                }),
+            oidc_issuer: cfg
+                .auth
+                .as_ref()
+                .map(|a| a.oidc_issuer.clone())
+                .unwrap_or_default(),
+            oidc_audience: cfg
+                .auth
+                .as_ref()
+                .map(|a| a.oidc_audience.clone())
+                .unwrap_or_default(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
             additional_data: None,
@@ -161,7 +181,10 @@ impl Service {
         // Create OIDC client if auth method is OIDC
         #[cfg(feature = "oidc")]
         let oidc_client = if auth_method == AuthMethod::Oidc {
-            let ac = cfg.auth.as_ref().ok_or("OIDC auth requires [auth] section in config")?;
+            let ac = cfg
+                .auth
+                .as_ref()
+                .ok_or("OIDC auth requires [auth] section in config")?;
             let client = OidcClient::new(
                 ac.oidc_client_id.clone(),
                 ac.oidc_client_secret.clone(),
@@ -173,7 +196,9 @@ impl Service {
                 Some(ac.oidc_tls_trusted_ca_file.clone()).filter(|s| !s.is_empty()),
                 ac.oidc_tls_insecure_skip_verify,
                 Some(ac.oidc_proxy_url.clone()).filter(|s| !s.is_empty()),
-            ).await.map_err(|e| format!("OIDC client init failed: {e}"))?;
+            )
+            .await
+            .map_err(|e| format!("OIDC client init failed: {e}"))?;
             info!(endpoint = %client.token_endpoint(), "OIDC client initialized, token endpoint: {}", client.token_endpoint());
             Some(Arc::new(client))
         } else {
@@ -218,8 +243,7 @@ impl Service {
                     if effective.proxy_protocol_version.is_empty()
                         && !p.proxy_protocol_version.is_empty()
                     {
-                        effective.proxy_protocol_version =
-                            p.proxy_protocol_version.clone();
+                        effective.proxy_protocol_version = p.proxy_protocol_version.clone();
                     }
                     plugin::start_tls2raw_plugin(&effective).await
                 } else if plugin_cfg.plugin_type == "visitor_plugin" {
@@ -239,8 +263,13 @@ impl Service {
                 } else {
                     dispatch_plugin_start(plugin_cfg, None).await
                 };
-                record_plugin(&plugin_cfg.plugin_type, &p.name, result,
-                    &mut plugin_addrs, &mut plugin_handles_map);
+                record_plugin(
+                    &plugin_cfg.plugin_type,
+                    &p.name,
+                    result,
+                    &mut plugin_addrs,
+                    &mut plugin_handles_map,
+                );
             }
         }
 
@@ -254,24 +283,29 @@ impl Service {
                 .get(&p.name)
                 .cloned()
                 .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
-            let plugin_type = p.plugin.as_ref()
+            let plugin_type = p
+                .plugin
+                .as_ref()
                 .map(|pl| pl.plugin_type.clone())
                 .unwrap_or_default();
             let snapshot = crate::reload::config_snapshot(p);
-            map.insert(p.name.clone(), ProxyRuntimeInfo {
-                local_addr,
-                proxy_type: p.proxy_type.clone(),
-                use_encryption: p.use_encryption,
-                use_compression: p.use_compression,
-                sk: p.sk.clone(),
-                bandwidth_limit: bw_limit,
-                bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
-                proxy_protocol_version: p.proxy_protocol_version.clone(),
-                plugin: plugin_type,
-                remote_addr: String::new(),
-                err: String::new(),
-                config_snapshot: snapshot,
-            });
+            map.insert(
+                p.name.clone(),
+                ProxyRuntimeInfo {
+                    local_addr,
+                    proxy_type: p.proxy_type.clone(),
+                    use_encryption: p.use_encryption,
+                    use_compression: p.use_compression,
+                    sk: p.sk.clone(),
+                    bandwidth_limit: bw_limit,
+                    bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
+                    proxy_protocol_version: p.proxy_protocol_version.clone(),
+                    plugin: plugin_type,
+                    remote_addr: String::new(),
+                    err: String::new(),
+                    config_snapshot: snapshot,
+                },
+            );
         }
         let proxy_info_map = Arc::new(RwLock::new(map));
 
@@ -288,9 +322,7 @@ impl Service {
         #[cfg(feature = "vnet")]
         let vnet_tuns = Arc::new(Mutex::new(HashMap::new()));
         #[cfg(feature = "vnet")]
-        let vnet_routes = Arc::new(tokio::sync::RwLock::new(
-            frp_vnet::router::RouteTable::new(),
-        ));
+        let vnet_routes = Arc::new(tokio::sync::RwLock::new(frp_vnet::router::RouteTable::new()));
         #[cfg(feature = "vnet")]
         let vnet_tun_tx = Arc::new(Mutex::new(HashMap::new()));
         #[cfg(feature = "vnet")]
@@ -371,7 +403,8 @@ impl Service {
                 return Err(format!(
                     "unknown transport protocol '{}'. Valid transports: tcp, kcp, quic, websocket",
                     self.cfg.transport_protocol
-                ).into());
+                )
+                .into());
             }
         };
         let pool_count = self.cfg.pool_count.max(0);
@@ -382,8 +415,12 @@ impl Service {
         let proxies: Vec<frp_core::config::ProxyConfig> = if self.cfg.start.is_empty() {
             proxies
         } else {
-            let start_set: std::collections::HashSet<&str> = self.cfg.start.iter().map(|s| s.as_str()).collect();
-            let filtered: Vec<_> = proxies.into_iter().filter(|p| start_set.contains(p.name.as_str())).collect();
+            let start_set: std::collections::HashSet<&str> =
+                self.cfg.start.iter().map(|s| s.as_str()).collect();
+            let filtered: Vec<_> = proxies
+                .into_iter()
+                .filter(|p| start_set.contains(p.name.as_str()))
+                .collect();
             info!(
                 active = %filtered.len(), total = %self.cfg.proxies.len(), start = ?self.cfg.start,
                 "Selective proxy start: {} of {} proxies active (start={:?})",
@@ -395,12 +432,13 @@ impl Service {
         };
 
         // Filter out disabled proxies. Go frp compat: proxy.enabled.
-        let proxies: Vec<frp_core::config::ProxyConfig> = proxies
-            .into_iter()
-            .filter(|p| p.enabled)
-            .collect();
+        let proxies: Vec<frp_core::config::ProxyConfig> =
+            proxies.into_iter().filter(|p| p.enabled).collect();
         if proxies.len() < self.cfg.proxies.len() {
-            let disabled: Vec<&str> = self.cfg.proxies.iter()
+            let disabled: Vec<&str> = self
+                .cfg
+                .proxies
+                .iter()
                 .filter(|p| !p.enabled)
                 .map(|p| p.name.as_str())
                 .collect();
@@ -420,15 +458,28 @@ impl Service {
         // Stored on self so try_reload() can cancel health checks for removed proxies.
         let health_cancels = self.health_cancels.clone();
 
-        self.spawn_health_checks(&proxies, &health_tx, &health_cancels).await;
+        self.spawn_health_checks(&proxies, &health_tx, &health_cancels)
+            .await;
 
         // Start admin HTTP server if configured
         let _reload_tx = self.reload_tx.clone();
-        let mut reload_rx = self.reload_rx.lock().unwrap().take()
+        let mut reload_rx = self
+            .reload_rx
+            .lock()
+            .unwrap()
+            .take()
             .expect("reload_rx already taken — run() called twice?");
-        let mut xtcp_rx = self.xtcp_rx.lock().unwrap().take()
+        let mut xtcp_rx = self
+            .xtcp_rx
+            .lock()
+            .unwrap()
+            .take()
             .expect("xtcp_rx already taken — run() called twice?");
-        let mut visitor_rx = self.visitor_rx.lock().unwrap().take()
+        let mut visitor_rx = self
+            .visitor_rx
+            .lock()
+            .unwrap()
+            .take()
             .expect("visitor_rx already taken — run() called twice?");
         let xtcp_tx = self.xtcp_tx.clone();
         let nat_hole_stun_server = self.nat_hole_stun_server.clone();
@@ -487,7 +538,9 @@ impl Service {
                     let (stream, run_id, yamux) = r;
                     let enc_key = encryption::derive_key(&self.auth_cfg.token);
                     #[cfg(feature = "quic")]
-                    { quic_conn = quic; }
+                    {
+                        quic_conn = quic;
+                    }
                     (stream.into_encrypted(enc_key), run_id, yamux)
                 }
                 Err(e) => {
@@ -510,13 +563,20 @@ impl Service {
 
             // Register proxies using IoStream directly (supports TCP and TLS)
             for p in &proxies {
-                let local_addr = self.proxy_info_map.read().await
+                let local_addr = self
+                    .proxy_info_map
+                    .read()
+                    .await
                     .get(&p.name)
                     .map(|info| info.local_addr.clone())
                     .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
-                match ctl.register_proxy(p, &local_addr, &mut control_stream).await {
+                match ctl
+                    .register_proxy(p, &local_addr, &mut control_stream)
+                    .await
+                {
                     Ok(resp) => {
-                        let remote = resp.remote_addr
+                        let remote = resp
+                            .remote_addr
                             .unwrap_or_else(|| format!("0.0.0.0:{}", p.remote_port));
                         info!(proxy_name = %p.name, remote = %remote, "Proxy '{}' registered on remote port {}", p.name, remote);
                         // Update runtime info for admin API
@@ -567,15 +627,17 @@ impl Service {
                                     }
                                     // Send VnetRouteAdvertise if subnet is configured
                                     if !p.advertise_subnet.is_empty() {
-                                        let adv = FrpMessage::VnetRouteAdvertise(msg::VnetRouteAdvertise {
-                                            proxy_name: p.name.clone(),
-                                            subnet: p.advertise_subnet.clone(),
-                                            virtual_net: if p.virtual_net.is_empty() {
-                                                None
-                                            } else {
-                                                Some(p.virtual_net.clone())
+                                        let adv = FrpMessage::VnetRouteAdvertise(
+                                            msg::VnetRouteAdvertise {
+                                                proxy_name: p.name.clone(),
+                                                subnet: p.advertise_subnet.clone(),
+                                                virtual_net: if p.virtual_net.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(p.virtual_net.clone())
+                                                },
                                             },
-                                        });
+                                        );
                                         let send_result = if v2 {
                                             control_stream.write_v2_frame(&adv).await
                                         } else {
@@ -641,9 +703,8 @@ impl Service {
                         let routes = self.vnet_routes.clone();
                         let pn = proxy_name.clone();
                         tokio::spawn(async move {
-                            let ctrl = frp_vnet::controller::VnetController::new(
-                                pn.clone(), routes, v2,
-                            );
+                            let ctrl =
+                                frp_vnet::controller::VnetController::new(pn.clone(), routes, v2);
                             if let Err(e) = ctrl.run(tun, ctl_writer, tun_rx).await {
                                 tracing::error!(proxy_name = %pn, error = %e, "vnet controller exited with error");
                             }
@@ -688,14 +749,21 @@ impl Service {
                         cfg.insert(local_addr.clone(), enc);
                         cfg.insert(p.name.clone(), enc);
                     }
-                    let enc_label = if p.use_encryption { "encrypted" } else { "plain" };
+                    let enc_label = if p.use_encryption {
+                        "encrypted"
+                    } else {
+                        "plain"
+                    };
                     info!(proxy_name = %p.name, local_addr = %local_addr, enc_label = %enc_label, "UDP proxy '{}' ready, bridging to {} ({})", p.name, local_addr, enc_label);
                 }
             }
 
             // Spawn initial pool work connections
             let auth_token = self.auth_cfg.token.clone();
-            let client_scopes: Vec<String> = self.cfg.auth.as_ref()
+            let client_scopes: Vec<String> = self
+                .cfg
+                .auth
+                .as_ref()
                 .map(|a| a.additional_auth_scopes.clone())
                 .unwrap_or_default();
             let server_scopes = self.server_auth_scopes.read().await.clone();
@@ -779,21 +847,45 @@ impl Service {
                 let fallback_to = v.fallback_to.clone();
                 let vtx = self.visitor_tx.clone();
                 let handle = tokio::spawn(async move {
-                    crate::visitor::run_visitor_listener(sa, sp, pt, server_name, secret_key, bind_addr, use_enc, use_comp, name,
-                        tls_enable, tls_server_name, tls_ca_file, visitor_type, fallback_timeout_ms,
-                        keep_tunnel_open, max_retries_an_hour, min_retry_interval, stun_server, vtx, fallback_to).await;
+                    crate::visitor::run_visitor_listener(
+                        sa,
+                        sp,
+                        pt,
+                        server_name,
+                        secret_key,
+                        bind_addr,
+                        use_enc,
+                        use_comp,
+                        name,
+                        tls_enable,
+                        tls_server_name,
+                        tls_ca_file,
+                        visitor_type,
+                        fallback_timeout_ms,
+                        keep_tunnel_open,
+                        max_retries_an_hour,
+                        min_retry_interval,
+                        stun_server,
+                        vtx,
+                        fallback_to,
+                    )
+                    .await;
                 });
                 visitor_handles.push(handle);
             }
 
             // --- Message loop ---
             // Map sid -> proxy_name for XTCP NatHoleResp routing (provider side).
-            let mut pending_xtcp: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let mut pending_xtcp: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             // Map sid -> oneshot sender for visitor NatHoleResp routing (Go frps compat).
-            let mut visitor_pending: std::collections::HashMap<String, oneshot::Sender<Result<msg::NatHoleResp, String>>> = std::collections::HashMap::new();
+            let mut visitor_pending: std::collections::HashMap<
+                String,
+                oneshot::Sender<Result<msg::NatHoleResp, String>>,
+            > = std::collections::HashMap::new();
             let ping_secs = self.cfg.heartbeat_interval.max(1) as u64;
-        info!(interval = %ping_secs, "Heartbeat interval: {}s", ping_secs);
-        let mut ping_interval = interval(Duration::from_secs(ping_secs));
+            info!(interval = %ping_secs, "Heartbeat interval: {}s", ping_secs);
+            let mut ping_interval = interval(Duration::from_secs(ping_secs));
 
             loop {
                 tokio::select! {
@@ -1047,20 +1139,23 @@ impl Service {
                 warn!(health_check_type = %hc_type, proxy_name = %p.name, "Health check type '{}' not yet supported for '{}'", hc_type, p.name);
                 continue;
             }
-            let la = self.proxy_info_map.read().await
+            let la = self
+                .proxy_info_map
+                .read()
+                .await
                 .get(&p.name)
                 .map(|info| info.local_addr.clone())
                 .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
             let pn = p.name.clone();
-            let interval = std::time::Duration::from_secs(
-                p.health_check_interval_seconds.max(10)
-            );
-            let timeout = std::time::Duration::from_secs(
-                p.health_check_timeout_seconds.max(3)
-            );
+            let interval = std::time::Duration::from_secs(p.health_check_interval_seconds.max(10));
+            let timeout = std::time::Duration::from_secs(p.health_check_timeout_seconds.max(3));
             let max_failed = p.health_check_max_failed.max(1);
             let tx = health_tx.clone();
-            let hc_url = if hc_type == "http" { p.health_check_url.clone() } else { String::new() };
+            let hc_url = if hc_type == "http" {
+                p.health_check_url.clone()
+            } else {
+                String::new()
+            };
             let hc_headers = p.health_check_http_headers.clone();
             let cancel = Arc::new(AtomicBool::new(false));
             {
@@ -1068,7 +1163,10 @@ impl Service {
                 cancels.insert(pn.clone(), cancel.clone());
             }
             tokio::spawn(async move {
-                crate::health::run_health_check(pn, la, hc_type, hc_url, hc_headers, interval, timeout, max_failed, tx, cancel).await;
+                crate::health::run_health_check(
+                    pn, la, hc_type, hc_url, hc_headers, interval, timeout, max_failed, tx, cancel,
+                )
+                .await;
             });
         }
     }
@@ -1082,10 +1180,8 @@ impl Service {
         stop_tx: &mpsc::UnboundedSender<()>,
     ) {
         if self.cfg.web_server.port > 0 {
-            let admin_addr = frp_core::format_socket_addr(
-                &self.cfg.web_server.addr,
-                self.cfg.web_server.port,
-            );
+            let admin_addr =
+                frp_core::format_socket_addr(&self.cfg.web_server.addr, self.cfg.web_server.port);
             let admin_state = AdminState {
                 proxy_metrics: self.proxy_metrics.clone(),
                 proxies: self.proxy_info_map.clone(),
@@ -1107,9 +1203,15 @@ impl Service {
             };
             tokio::spawn(async move {
                 if let Err(e) = crate::admin::run_admin_server(
-                    admin_addr, admin_state, admin_auth_user, admin_auth_pwd,
-                    admin_tls_cert, admin_tls_key,
-                ).await {
+                    admin_addr,
+                    admin_state,
+                    admin_auth_user,
+                    admin_auth_pwd,
+                    admin_tls_cert,
+                    admin_tls_key,
+                )
+                .await
+                {
                     tracing::error!(error = %e, "frpc admin server failed: {}", e);
                 }
             });
@@ -1131,9 +1233,14 @@ impl Service {
         let visitor_addr = nhc.visitor_addr.unwrap_or_default();
         let proxy_name = nhc.proxy_name.clone();
         let sid = nhc.transaction_id.clone();
-        let proxy_info = self.proxy_info_map.read().await
-            .get(&proxy_name)
-            .map(|p| (p.local_addr.clone(), p.use_encryption, p.use_compression, p.sk.clone()));
+        let proxy_info = self.proxy_info_map.read().await.get(&proxy_name).map(|p| {
+            (
+                p.local_addr.clone(),
+                p.use_encryption,
+                p.use_compression,
+                p.sk.clone(),
+            )
+        });
         let local_addr = proxy_info.as_ref().map(|p| p.0.clone());
         let xtcp_use_enc = proxy_info.as_ref().map(|p| p.1).unwrap_or(false);
         let xtcp_use_comp = proxy_info.as_ref().map(|p| p.2).unwrap_or(false);
@@ -1172,42 +1279,66 @@ impl Service {
                                     let (p2p_r, p2p_w) = p2p_stream.into_split();
                                     let (local_r, local_w) = local_stream.into_split();
                                     frp_core::bridge::bridge_encrypted(
-                                        local_r, local_w, p2p_r, p2p_w,
-                                        &key, use_comp, vec![], None, None, None,
-                                    ).await;
+                                        local_r,
+                                        local_w,
+                                        p2p_r,
+                                        p2p_w,
+                                        &key,
+                                        use_comp,
+                                        vec![],
+                                        None,
+                                        None,
+                                        None,
+                                    )
+                                    .await;
                                     debug!(proxy_name = %pn, "XTCP provider '{}' encrypted P2P closed", pn);
                                 } else if !use_comp {
                                     // Plain, no compression: try zero-copy on Linux.
                                     #[cfg(target_os = "linux")]
                                     {
                                         let _ = frp_core::bridge::bridge_plain_zero_copy(
-                                            local_stream, p2p_stream,
-                                        ).await;
+                                            local_stream,
+                                            p2p_stream,
+                                        )
+                                        .await;
                                     }
                                     #[cfg(not(target_os = "linux"))]
                                     {
                                         let (local_r, local_w) = local_stream.into_split();
                                         let (p2p_r, p2p_w) = p2p_stream.into_split();
                                         frp_core::bridge::bridge_plain(
-                                            local_r, local_w, p2p_r, p2p_w,
-                                            false, vec![], None,
-                                        ).await;
+                                            local_r,
+                                            local_w,
+                                            p2p_r,
+                                            p2p_w,
+                                            false,
+                                            vec![],
+                                            None,
+                                        )
+                                        .await;
                                     }
                                     debug!(proxy_name = %pn, "XTCP provider '{}' P2P closed", pn);
                                 } else {
                                     let (local_r, local_w) = local_stream.into_split();
                                     let (p2p_r, p2p_w) = p2p_stream.into_split();
                                     frp_core::bridge::bridge_plain(
-                                        local_r, local_w, p2p_r, p2p_w,
-                                        use_comp, vec![], None,
-                                    ).await;
+                                        local_r,
+                                        local_w,
+                                        p2p_r,
+                                        p2p_w,
+                                        use_comp,
+                                        vec![],
+                                        None,
+                                    )
+                                    .await;
                                     debug!(proxy_name = %pn, "XTCP provider '{}' P2P closed", pn);
                                 }
                             });
                         }
                         Err(e) => {
                             warn!(proxy_name = %proxy_name, error = %e, "XTCP provider '{}': connect local failed: {}", proxy_name, e);
-                            Self::send_nat_hole_report(writer, v2, sid, "connect local failed").await;
+                            Self::send_nat_hole_report(writer, v2, sid, "connect local failed")
+                                .await;
                         }
                     }
                 } else {
@@ -1275,9 +1406,14 @@ impl Service {
             proxy_name, candidate_addrs.len());
 
         // Spawn hole punch task (don't block control loop)
-        let proxy_info = self.proxy_info_map.read().await
-            .get(&proxy_name)
-            .map(|p| (p.local_addr.clone(), p.use_encryption, p.use_compression, p.sk.clone()));
+        let proxy_info = self.proxy_info_map.read().await.get(&proxy_name).map(|p| {
+            (
+                p.local_addr.clone(),
+                p.use_encryption,
+                p.use_compression,
+                p.sk.clone(),
+            )
+        });
         let local_addr = proxy_info.as_ref().map(|p| p.0.clone());
         let xtcp_use_enc = proxy_info.as_ref().map(|p| p.1).unwrap_or(false);
         let xtcp_use_comp = proxy_info.as_ref().map(|p| p.2).unwrap_or(false);
@@ -1299,9 +1435,18 @@ impl Service {
                                         let (p2p_r, p2p_w) = p2p.into_split();
                                         let (local_r, local_w) = local_conn.into_split();
                                         frp_core::bridge::bridge_encrypted(
-                                            local_r, local_w, p2p_r, p2p_w,
-                                            &key, xtcp_use_comp, vec![], None, None, None,
-                                        ).await;
+                                            local_r,
+                                            local_w,
+                                            p2p_r,
+                                            p2p_w,
+                                            &key,
+                                            xtcp_use_comp,
+                                            vec![],
+                                            None,
+                                            None,
+                                            None,
+                                        )
+                                        .await;
                                         debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' encrypted P2P closed", proxy_name_clone);
                                     } else if !xtcp_use_comp {
                                         // Plain, no compression: try zero-copy on Linux.
@@ -1309,25 +1454,38 @@ impl Service {
                                         {
                                             let _ = frp_core::bridge::bridge_plain_zero_copy(
                                                 local_conn, p2p,
-                                            ).await;
+                                            )
+                                            .await;
                                         }
                                         #[cfg(not(target_os = "linux"))]
                                         {
                                             let (local_r, local_w) = local_conn.into_split();
                                             let (p2p_r, p2p_w) = p2p.into_split();
                                             frp_core::bridge::bridge_plain(
-                                                local_r, local_w, p2p_r, p2p_w,
-                                                false, vec![], None,
-                                            ).await;
+                                                local_r,
+                                                local_w,
+                                                p2p_r,
+                                                p2p_w,
+                                                false,
+                                                vec![],
+                                                None,
+                                            )
+                                            .await;
                                         }
                                         debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' P2P closed", proxy_name_clone);
                                     } else {
                                         let (local_r, local_w) = local_conn.into_split();
                                         let (p2p_r, p2p_w) = p2p.into_split();
                                         frp_core::bridge::bridge_plain(
-                                            local_r, local_w, p2p_r, p2p_w,
-                                            xtcp_use_comp, vec![], None,
-                                        ).await;
+                                            local_r,
+                                            local_w,
+                                            p2p_r,
+                                            p2p_w,
+                                            xtcp_use_comp,
+                                            vec![],
+                                            None,
+                                        )
+                                        .await;
                                         debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' P2P closed", proxy_name_clone);
                                     }
                                 }
@@ -1410,11 +1568,7 @@ impl Service {
         strict: bool,
         writer: &Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>,
     ) -> Result<String, String> {
-        let delta = crate::reload::do_reload(
-            &self.proxy_info_map,
-            config_path,
-            strict,
-        ).await?;
+        let delta = crate::reload::do_reload(&self.proxy_info_map, config_path, strict).await?;
 
         if delta.removed.is_empty() && delta.added.is_empty() && delta.changed.is_empty() {
             return Ok(delta.summary);
@@ -1453,7 +1607,10 @@ impl Service {
                     if let Some(handle) = self.start_plugin(name, plugin_cfg).await {
                         let addr = handle.local_addr.to_string();
                         plugin_addrs.insert(name.clone(), addr);
-                        self.plugin_handles.lock().unwrap().insert(name.clone(), handle);
+                        self.plugin_handles
+                            .lock()
+                            .unwrap()
+                            .insert(name.clone(), handle);
                     }
                     // If plugin start fails, plugin_addrs won't have an entry;
                     // the proxy uses configured local_ip:local_port as fallback.
@@ -1470,7 +1627,8 @@ impl Service {
             let close = FrpMessage::CloseProxy(msg::CloseProxy {
                 proxy_name: name.clone(),
             });
-            write_msg(&mut *w, &close, v2).await
+            write_msg(&mut *w, &close, v2)
+                .await
                 .map_err(|e| format!("send CloseProxy for '{name}': {e}"))?;
             changes.push(format!("proxy '{name}' removed"));
             tracing::info!(name = %name, "Reload: sent CloseProxy for removed '{}'", name);
@@ -1482,7 +1640,8 @@ impl Service {
                 let close = FrpMessage::CloseProxy(msg::CloseProxy {
                     proxy_name: name.clone(),
                 });
-                write_msg(&mut *w, &close, v2).await
+                write_msg(&mut *w, &close, v2)
+                    .await
                     .map_err(|e| format!("send CloseProxy for changed '{name}': {e}"))?;
 
                 let local_addr = plugin_addrs
@@ -1490,7 +1649,8 @@ impl Service {
                     .cloned()
                     .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
                 let np = crate::proxy::create_new_proxy_msg(p, &local_addr);
-                write_msg(&mut *w, &np, v2).await
+                write_msg(&mut *w, &np, v2)
+                    .await
                     .map_err(|e| format!("send NewProxy for changed '{name}': {e}"))?;
                 changes.push(format!("proxy '{name}' updated"));
                 tracing::info!(name = %name, local_addr = %local_addr, "Reload: sent CloseProxy+NewProxy for changed '{}'", name);
@@ -1505,7 +1665,8 @@ impl Service {
                     .cloned()
                     .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
                 let np = crate::proxy::create_new_proxy_msg(p, &local_addr);
-                write_msg(&mut *w, &np, v2).await
+                write_msg(&mut *w, &np, v2)
+                    .await
                     .map_err(|e| format!("send NewProxy for added '{name}': {e}"))?;
                 changes.push(format!("proxy '{name}' added"));
                 tracing::info!(name = %name, local_addr = %local_addr, "Reload: sent NewProxy for added '{}'", name);
@@ -1522,12 +1683,15 @@ impl Service {
             }
             for name in delta.changed.iter().chain(delta.added.iter()) {
                 if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
-                    let bw_limit = frp_core::config::parse_bandwidth_limit(&p.bandwidth_limit).unwrap_or(0);
+                    let bw_limit =
+                        frp_core::config::parse_bandwidth_limit(&p.bandwidth_limit).unwrap_or(0);
                     let local_addr = plugin_addrs
                         .get(name)
                         .cloned()
                         .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
-                    let plugin_type = p.plugin.as_ref()
+                    let plugin_type = p
+                        .plugin
+                        .as_ref()
                         .map(|pl| pl.plugin_type.clone())
                         .unwrap_or_default();
                     let snapshot = crate::reload::config_snapshot(p);
@@ -1537,20 +1701,23 @@ impl Service {
                     if p.plugin.is_some() && !plugin_addrs.contains_key(name) {
                         err = format!("plugin '{}' failed to start", plugin_type);
                     }
-                    map.insert(name.clone(), ProxyRuntimeInfo {
-                        local_addr,
-                        proxy_type: p.proxy_type.clone(),
-                        use_encryption: p.use_encryption,
-                        use_compression: p.use_compression,
-                        sk: p.sk.clone(),
-                        bandwidth_limit: bw_limit,
-                        bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
-                        proxy_protocol_version: p.proxy_protocol_version.clone(),
-                        plugin: plugin_type,
-                        remote_addr: String::new(),
-                        err,
-                        config_snapshot: snapshot,
-                    });
+                    map.insert(
+                        name.clone(),
+                        ProxyRuntimeInfo {
+                            local_addr,
+                            proxy_type: p.proxy_type.clone(),
+                            use_encryption: p.use_encryption,
+                            use_compression: p.use_compression,
+                            sk: p.sk.clone(),
+                            bandwidth_limit: bw_limit,
+                            bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
+                            proxy_protocol_version: p.proxy_protocol_version.clone(),
+                            plugin: plugin_type,
+                            remote_addr: String::new(),
+                            err,
+                            config_snapshot: snapshot,
+                        },
+                    );
                 }
             }
         }
@@ -1645,7 +1812,10 @@ mod tests {
     fn reconnect_delay_secs_monotonic_in_mean() {
         // Mean delay should increase with failed_count
         fn mean_delay(n: u32) -> f64 {
-            (0..50).map(|_| Service::reconnect_delay_secs(n) as f64).sum::<f64>() / 50.0
+            (0..50)
+                .map(|_| Service::reconnect_delay_secs(n) as f64)
+                .sum::<f64>()
+                / 50.0
         }
         let m1 = mean_delay(1);
         let m2 = mean_delay(2);

@@ -3,10 +3,10 @@ mod common;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use common::{allocate_port, login_with_test_token, start_test_server, test_auth_cfg};
 use frp_core::config::ServerConfig;
 use frp_core::msg::{FrpMessage, NewProxy};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
-use common::{allocate_port, login_with_test_token, start_test_server, test_auth_cfg};
 
 /// Helper: construct a tcpmux NewProxy with minimal fields.
 fn tcpmux_proxy(name: &str, domains: Vec<String>, local: &str) -> NewProxy {
@@ -36,15 +36,15 @@ fn tcpmux_proxy(name: &str, domains: Vec<String>, local: &str) -> NewProxy {
         metas: None,
         multiplexer: Some("httpconnect".into()),
         virtual_net: None,
-                    proxy_protocol_version: None,
-                    #[cfg(feature = "vnet")]
-                    advertise_subnet: None,
-                    #[cfg(feature = "vnet")]
-                    vnet_ip: None,
-                    #[cfg(feature = "vnet")]
-                    vnet_netmask: None,
-                    #[cfg(feature = "vnet")]
-                    vnet_mtu: None,
+        proxy_protocol_version: None,
+        #[cfg(feature = "vnet")]
+        advertise_subnet: None,
+        #[cfg(feature = "vnet")]
+        vnet_ip: None,
+        #[cfg(feature = "vnet")]
+        vnet_netmask: None,
+        #[cfg(feature = "vnet")]
+        vnet_mtu: None,
     }
 }
 
@@ -77,7 +77,9 @@ async fn test_tcpmux_connect_routing() {
         vec!["machine-a.example.com".into()],
         "127.0.0.1:22",
     ));
-    write_msg_v1(&mut provider, &np).await.expect("send NewProxy");
+    write_msg_v1(&mut provider, &np)
+        .await
+        .expect("send NewProxy");
 
     match read_msg_v1(&mut provider).await.expect("read NewProxyResp") {
         FrpMessage::NewProxyResp(ref resp) => {
@@ -145,7 +147,9 @@ async fn test_tcpmux_unknown_domain_returns_404() {
         vec!["known.example.com".into()],
         "127.0.0.1:22",
     ));
-    write_msg_v1(&mut provider, &np).await.expect("send NewProxy");
+    write_msg_v1(&mut provider, &np)
+        .await
+        .expect("send NewProxy");
     let _ = read_msg_v1(&mut provider).await.expect("read NewProxyResp");
 
     // Connect to tcpmux port with unknown domain

@@ -1,18 +1,18 @@
 #![cfg(feature = "admin")]
 
-use std::sync::Arc;
-use std::collections::HashMap;
 use axum::{
-    Router, Json,
-    extract::{State, DefaultBodyLimit},
+    extract::{DefaultBodyLimit, State},
+    http::{header, StatusCode},
     routing::get,
-    http::{StatusCode, header},
+    Json, Router,
 };
 use serde::Serialize;
-use tokio::sync::{mpsc, RwLock, oneshot};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot, RwLock};
 
-use frp_core::metrics::ProxyMetricsRegistry;
 use frp_core::admin_auth::apply_admin_auth;
+use frp_core::metrics::ProxyMetricsRegistry;
 
 use crate::proxy_runtime::{ProxyRuntimeInfo, ReloadRequest};
 
@@ -46,8 +46,8 @@ pub struct AdminState {
 /// must be escaped with a backslash.
 fn prometheus_escape(s: &str) -> String {
     s.replace('\\', "\\\\")
-     .replace('"', "\\\"")
-     .replace('\n', "\\n")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 async fn handle_metrics(State(state): State<AdminState>) -> String {
@@ -66,9 +66,18 @@ async fn handle_metrics(State(state): State<AdminState>) -> String {
                 prometheus_escape(&info.proxy_type),
             );
             traffic_in.push_str(&format!("frp_client_traffic_in{} {}\n", labels, s.bytes_in));
-            traffic_out.push_str(&format!("frp_client_traffic_out{} {}\n", labels, s.bytes_out));
-            conn_counts.push_str(&format!("frp_client_connection_counts{} {}\n", labels, s.total_conns));
-            current_conns.push_str(&format!("frp_client_current_conns{} {}\n", labels, s.current_conns));
+            traffic_out.push_str(&format!(
+                "frp_client_traffic_out{} {}\n",
+                labels, s.bytes_out
+            ));
+            conn_counts.push_str(&format!(
+                "frp_client_connection_counts{} {}\n",
+                labels, s.total_conns
+            ));
+            current_conns.push_str(&format!(
+                "frp_client_current_conns{} {}\n",
+                labels, s.current_conns
+            ));
         }
     }
 
@@ -94,7 +103,11 @@ async fn handle_status(State(state): State<AdminState>) -> Json<serde_json::Valu
     let mut by_type: HashMap<String, Vec<ProxyStatusEntry>> = HashMap::new();
 
     for (name, info) in proxies.iter() {
-        let status = if !info.err.is_empty() { "error" } else { "online" };
+        let status = if !info.err.is_empty() {
+            "error"
+        } else {
+            "online"
+        };
         let entry = ProxyStatusEntry {
             name: name.clone(),
             proxy_type: info.proxy_type.clone(),
@@ -104,11 +117,16 @@ async fn handle_status(State(state): State<AdminState>) -> Json<serde_json::Valu
             plugin: info.plugin.clone(),
             err: info.err.clone(),
         };
-        by_type.entry(info.proxy_type.clone()).or_default().push(entry);
+        by_type
+            .entry(info.proxy_type.clone())
+            .or_default()
+            .push(entry);
     }
 
     // Ensure all known types appear even if empty (Go frp compat)
-    for ty in &["tcp", "http", "https", "stcp", "xtcp", "sudp", "udp", "tcpmux"] {
+    for ty in &[
+        "tcp", "http", "https", "stcp", "xtcp", "sudp", "udp", "tcpmux",
+    ] {
         by_type.entry(ty.to_string()).or_default();
     }
 
@@ -126,12 +144,18 @@ async fn handle_reload(
     let (tx, rx) = oneshot::channel();
     let req = ReloadRequest { strict, reply: tx };
     state.reload_tx.send(req).map_err(|_| {
-        (StatusCode::INTERNAL_SERVER_ERROR, "reload channel closed".into())
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reload channel closed".into(),
+        )
     })?;
     match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
         Ok(Ok(Ok(summary))) => Ok(summary),
         Ok(Ok(Err(e))) => Err((StatusCode::BAD_REQUEST, e)),
-        Ok(Err(_)) => Err((StatusCode::INTERNAL_SERVER_ERROR, "reload handler disconnected".into())),
+        Ok(Err(_)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reload handler disconnected".into(),
+        )),
         Err(_) => Err((StatusCode::REQUEST_TIMEOUT, "reload timed out".into())),
     }
 }
@@ -141,21 +165,35 @@ async fn handle_stop(State(state): State<AdminState>) -> &'static str {
     "stop success"
 }
 
-async fn handle_get_config(State(state): State<AdminState>) -> Result<String, (StatusCode, String)> {
-    let path = state.config_path.as_ref()
+async fn handle_get_config(
+    State(state): State<AdminState>,
+) -> Result<String, (StatusCode, String)> {
+    let path = state
+        .config_path
+        .as_ref()
         .ok_or_else(|| (StatusCode::NOT_FOUND, "no config file path stored".into()))?;
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| {
-            tracing::error!(path = %path, error = %e, "Failed to read config file: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "failed to read config file".into())
-        })?;
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        tracing::error!(path = %path, error = %e, "Failed to read config file: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to read config file".into(),
+        )
+    })?;
 
     // Parse and redact sensitive fields before returning
-    let value: toml::Value = toml::from_str(&raw)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("invalid TOML syntax: {e}")))?;
+    let value: toml::Value = toml::from_str(&raw).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("invalid TOML syntax: {e}"),
+        )
+    })?;
     let redacted = redact_sensitive(value);
-    toml::to_string(&redacted)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to serialize config: {e}")))
+    toml::to_string(&redacted).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize config: {e}"),
+        )
+    })
 }
 
 async fn handle_put_config(
@@ -178,23 +216,33 @@ async fn handle_put_config(
         ));
     }
 
-    let path = state.config_path.as_ref()
+    let path = state
+        .config_path
+        .as_ref()
         .ok_or_else(|| (StatusCode::NOT_FOUND, "no config file path stored".into()))?;
 
     // Validate TOML before writing — don't overwrite with invalid config
     let _ = frp_core::config::load_client_config_from_str(&body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid config: {e}")))?;
 
-    std::fs::write(path, &body)
-        .map_err(|e| {
-            tracing::error!(path = %path, error = %e, "Failed to write config file: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "failed to write config file".into())
-        })?;
+    std::fs::write(path, &body).map_err(|e| {
+        tracing::error!(path = %path, error = %e, "Failed to write config file: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to write config file".into(),
+        )
+    })?;
     // Trigger reload after config update
     let (tx, rx) = oneshot::channel();
-    let req = ReloadRequest { strict: true, reply: tx };
+    let req = ReloadRequest {
+        strict: true,
+        reply: tx,
+    };
     state.reload_tx.send(req).map_err(|_| {
-        (StatusCode::INTERNAL_SERVER_ERROR, "reload channel closed".into())
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reload channel closed".into(),
+        )
     })?;
     match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
         Ok(Ok(_)) => Ok("update success"),
@@ -279,10 +327,11 @@ pub async fn run_admin_server(
         .route("/api/metrics", get(handle_metrics))
         .route("/api/reload", axum::routing::post(handle_reload))
         .route("/api/stop", axum::routing::post(handle_stop))
-        .route("/api/config",
+        .route(
+            "/api/config",
             get(handle_get_config)
                 .put(handle_put_config)
-                .layer(DefaultBodyLimit::max(1024 * 1024))
+                .layer(DefaultBodyLimit::max(1024 * 1024)),
         );
 
     let app = apply_admin_auth(app, &auth_user, &auth_password);
@@ -292,10 +341,7 @@ pub async fn run_admin_server(
     // to prevent unauthenticated access to the admin API (which exposes
     // config with tokens, reload, and stop).
     let bind_addr = if auth_user.is_empty() || auth_password.is_empty() {
-        let localhost_addr = format!(
-            "127.0.0.1:{}",
-            addr.rsplit(':').next().unwrap_or("7400")
-        );
+        let localhost_addr = format!("127.0.0.1:{}", addr.rsplit(':').next().unwrap_or("7400"));
         tracing::warn!(
             original = %addr,
             bind = %localhost_addr,
@@ -335,11 +381,16 @@ pub async fn run_admin_server(
 
 /// Sensitive keys that should be redacted from config responses.
 const SENSITIVE_KEYS: &[&str] = &[
-    "token", "auth_token", "privilege_token",
-    "http_pwd", "http_password",
-    "sk", "group_key",
+    "token",
+    "auth_token",
+    "privilege_token",
+    "http_pwd",
+    "http_password",
+    "sk",
+    "group_key",
     "oidc_client_secret",
-    "user", "password",
+    "user",
+    "password",
 ];
 
 /// Recursively redact sensitive values in TOML, returning a copy with

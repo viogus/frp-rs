@@ -28,8 +28,10 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
       - name: Install Rust stable
         run: rustup default stable
+      - name: Format check
+        run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Build binaries (needed for integration tests)
         run: cargo build --bin frps --bin frpc
       - name: Run tests

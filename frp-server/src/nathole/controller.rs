@@ -12,9 +12,9 @@ use tracing::{instrument, trace, warn};
 
 use frp_core::msg::{self, FrpMessage, NatHoleDetectBehavior, PortsRange};
 
-use crate::service::InternalMsg;
 use super::analysis::{Analyzer, RecommendBehavior};
 use super::classify::NatFeature;
+use crate::service::InternalMsg;
 
 /// Maximum concurrent NAT hole punch sessions.
 /// Prevents unbounded memory growth under load or attack.
@@ -133,7 +133,7 @@ impl Controller {
             client_msg: Mutex::new(None),
             c_resp: Mutex::new(None),
             c_nat_feature: Mutex::new(None),
-            notify_ch: Mutex::new(None),  // caller sets up before notifying provider
+            notify_ch: Mutex::new(None), // caller sets up before notifying provider
             report_tx: Mutex::new(Some(report_tx)),
             created_at: Instant::now(),
             last_activity: std::sync::Mutex::new(Instant::now()),
@@ -143,7 +143,10 @@ impl Controller {
         {
             let mut sessions = self.sessions.write().await;
             if sessions.len() >= MAX_SESSIONS {
-                warn!(max_sessions = MAX_SESSIONS, "NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session");
+                warn!(
+                    max_sessions = MAX_SESSIONS,
+                    "NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session"
+                );
                 // Send error response to visitor so it doesn't hang.
                 let mut guard = session.visitor_writer.lock().await;
                 if let Some(ref mut w) = *guard {
@@ -197,7 +200,10 @@ impl Controller {
         {
             let mut sessions = self.sessions.write().await;
             if sessions.len() >= MAX_SESSIONS {
-                warn!(max_sessions = MAX_SESSIONS, "NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session");
+                warn!(
+                    max_sessions = MAX_SESSIONS,
+                    "NAT hole session limit reached ({MAX_SESSIONS}), rejecting new session"
+                );
                 // Send error response via control channel so visitor doesn't hang.
                 if let Some(ref tx) = session.visitor_ctl_tx {
                     let _ = tx.send(InternalMsg::WriteNatHoleResp {
@@ -265,7 +271,8 @@ impl Controller {
                         if let (Some(ref vf), Some(ref cf)) = (&*v_feat, &*c_feat) {
                             let key = gen_analysis_key(cf, vf);
                             let index = *session.selected_index.lock().await;
-                            self.analyzer.report_success(&key, db.mode, index.unwrap_or(0));
+                            self.analyzer
+                                .report_success(&key, db.mode, index.unwrap_or(0));
                         }
                     }
                 }
@@ -328,11 +335,7 @@ impl Controller {
 
     /// Forward NatHoleSid to the visitor via control channel.
     /// Returns true if forwarded via ctl path.
-    pub async fn forward_sid_via_ctl(
-        &self,
-        sid: &str,
-        provider_addr: Option<String>,
-    ) -> bool {
+    pub async fn forward_sid_via_ctl(&self, sid: &str, provider_addr: Option<String>) -> bool {
         let sessions = self.sessions.read().await;
         if let Some(session) = sessions.get(sid) {
             if let Some(ref tx) = session.visitor_ctl_tx {
@@ -386,7 +389,6 @@ impl Controller {
         }
         false
     }
-
 }
 
 /// Generate a stable analysis key from two NAT features for analyzer lookup.
@@ -395,8 +397,12 @@ impl Controller {
 pub fn gen_analysis_key(c: &NatFeature, v: &NatFeature) -> String {
     format!(
         "{}:{}:{}|{}:{}:{}",
-        c.nat_type, c.behavior, c.regular_ports_change as u8,
-        v.nat_type, v.behavior, v.regular_ports_change as u8,
+        c.nat_type,
+        c.behavior,
+        c.regular_ports_change as u8,
+        v.nat_type,
+        v.behavior,
+        v.regular_ports_change as u8,
     )
 }
 

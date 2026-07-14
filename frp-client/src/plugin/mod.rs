@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
-
+mod context;
 mod http;
 mod http2http;
 mod http2https;
@@ -23,21 +23,20 @@ mod https2http;
 mod https2https;
 mod socks5;
 mod static_file;
-mod unix_socket;
 mod tls2raw;
+mod unix_socket;
 mod visitor;
-mod context;
 
+pub(crate) use context::PluginContext;
 pub(crate) use http::start_http_proxy;
 pub(crate) use http2http::start_http2http_plugin;
 pub(crate) use http2https::start_http2https_plugin;
 pub(crate) use https2http::start_https2http_plugin;
 pub(crate) use https2https::start_https2https_plugin;
 pub(crate) use socks5::start_socks5_proxy;
-pub(crate) use context::PluginContext;
 pub(crate) use static_file::start_static_file_proxy;
-pub(crate) use unix_socket::start_unix_socket_plugin;
 pub(crate) use tls2raw::start_tls2raw_plugin;
+pub(crate) use unix_socket::start_unix_socket_plugin;
 pub(crate) use visitor::start_visitor_plugin;
 
 /// A running plugin server. Drop to shut down.
@@ -188,7 +187,10 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     let mut buf = Vec::new();
     let mut chunk = [0u8; 512];
     loop {
-        let n = stream.read(&mut chunk).await.map_err(|e| format!("read: {e}"))?;
+        let n = stream
+            .read(&mut chunk)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
         if n == 0 {
             return Err("connection closed".into());
         }
@@ -222,8 +224,13 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
     // Build forwarded request with optional Host rewrite.
     // Strip hop-by-hop headers per RFC 2616 Section 13.5.1.
     let hop_by_hop: &[&str] = &[
-        "transfer-encoding:", "proxy-authorization:", "proxy-authenticate:",
-        "te:", "trailer:", "upgrade:", "connection:",
+        "transfer-encoding:",
+        "proxy-authorization:",
+        "proxy-authenticate:",
+        "te:",
+        "trailer:",
+        "upgrade:",
+        "connection:",
     ];
     let mut fwd = format!("{method} {path} HTTP/1.0\r\n");
     for line in lines {

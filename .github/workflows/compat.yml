@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       go_frp_version:
-        description: 'Go frp version (e.g. 0.69.1)'
+        description: 'Go frp version (e.g. 0.70.0)'
         required: false
-        default: '0.69.1'
+        default: '0.70.0'
 
 permissions:
   contents: read
@@ -21,12 +21,12 @@ env:
 jobs:
   compat:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       fail-fast: false
 
     env:
-      GO_FRP_VERSION: ${{ github.event.inputs.go_frp_version || '0.69.1' }}
+      GO_FRP_VERSION: ${{ github.event.inputs.go_frp_version || '0.70.0' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -61,4 +61,6 @@ jobs:
         run: bash scripts/download-go-frp.sh "$GO_FRP_VERSION"
 
       - name: Run compat tests
+        env:
+          GO_FRP_V2: "1"
         run: bash scripts/compat-test.sh --ci --go-version "$GO_FRP_VERSION"

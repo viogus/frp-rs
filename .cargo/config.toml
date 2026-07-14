@@ -1,0 +1,3 @@
+[profile.release]
+lto = false
+opt-level = 2

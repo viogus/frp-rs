@@ -1103,7 +1103,18 @@ pub async fn handle_control<S>(
                                 true // No sk configured
                             }
                         } else {
-                            false // Proxy not found
+                            // Race: NewVisitorConn may arrive before proxy_manager
+                            // registration completes. Fall back to pre-populated sk_index.
+                            let sk_map = state.xtcp.sk_index.read().await;
+                            sk_map.iter().any(|(sk_key, pn)| {
+                                if pn == &nvc.proxy_name {
+                                    let sk_raw = sk_key.rsplit(':').next().unwrap_or(sk_key);
+                                    let expected = frp_core::auth::generate_token(sk_raw, timestamp);
+                                    expected == sign_key
+                                } else {
+                                    false
+                                }
+                            })
                         };
 
                         if ok {

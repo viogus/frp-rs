@@ -4,7 +4,7 @@ use tracing::debug;
 
 use frp_core::config::PluginConfig;
 
-use super::{PluginHandle, serve_plugin};
+use super::{serve_plugin, PluginHandle};
 
 use crate::util::opt_if_empty;
 
@@ -51,7 +51,8 @@ pub async fn start_socks5_proxy(cfg: &PluginConfig) -> Result<PluginHandle, frp_
         if let Err(e) = handle_socks5_conn(stream, u, p).await {
             debug!(%peer, error = %e, "socks5: {peer} error: {e}");
         }
-    }).await
+    })
+    .await
 }
 
 async fn handle_socks5_conn(
@@ -62,7 +63,10 @@ async fn handle_socks5_conn(
     let mut buf = [0u8; 512];
 
     // Step 1: Auth method negotiation
-    client.read_exact(&mut buf[..2]).await.map_err(|e| format!("read greeting: {e}"))?;
+    client
+        .read_exact(&mut buf[..2])
+        .await
+        .map_err(|e| format!("read greeting: {e}"))?;
     let ver = buf[0];
     let nmethods = buf[1] as usize;
     if ver != SOCKS5_VERSION {
@@ -71,7 +75,10 @@ async fn handle_socks5_conn(
     if nmethods == 0 {
         return Err("no auth methods offered".into());
     }
-    client.read_exact(&mut buf[..nmethods]).await.map_err(|e| format!("read methods: {e}"))?;
+    client
+        .read_exact(&mut buf[..nmethods])
+        .await
+        .map_err(|e| format!("read methods: {e}"))?;
     let methods = &buf[..nmethods];
 
     let use_auth = user.is_some() && pass.is_some();
@@ -81,12 +88,16 @@ async fn handle_socks5_conn(
     } else if !use_auth && methods.contains(&AUTH_NO_AUTH) {
         AUTH_NO_AUTH
     } else {
-        client.write_all(&[SOCKS5_VERSION, AUTH_NO_ACCEPTABLE]).await
+        client
+            .write_all(&[SOCKS5_VERSION, AUTH_NO_ACCEPTABLE])
+            .await
             .map_err(|e| format!("write auth reject: {e}"))?;
         return Err("no acceptable auth method".into());
     };
 
-    client.write_all(&[SOCKS5_VERSION, chosen_method]).await
+    client
+        .write_all(&[SOCKS5_VERSION, chosen_method])
+        .await
         .map_err(|e| format!("write auth reply: {e}"))?;
 
     // Step 2: Username/password auth (if selected)
@@ -94,9 +105,14 @@ async fn handle_socks5_conn(
         let u = user.as_deref().unwrap();
         let p = pass.as_deref().unwrap();
 
-        client.read_exact(&mut buf[..2]).await.map_err(|e| format!("read user/pass ver: {e}"))?;
+        client
+            .read_exact(&mut buf[..2])
+            .await
+            .map_err(|e| format!("read user/pass ver: {e}"))?;
         if buf[0] != USERPASS_VERSION {
-            client.write_all(&[USERPASS_VERSION, USERPASS_FAIL]).await
+            client
+                .write_all(&[USERPASS_VERSION, USERPASS_FAIL])
+                .await
                 .map_err(|e| format!("write auth fail: {e}"))?;
             return Err(format!("bad user/pass version: {}", buf[0]));
         }
@@ -104,17 +120,26 @@ async fn handle_socks5_conn(
         if ulen > 255 {
             return Err("username too long".into());
         }
-        client.read_exact(&mut buf[..ulen]).await.map_err(|e| format!("read username: {e}"))?;
+        client
+            .read_exact(&mut buf[..ulen])
+            .await
+            .map_err(|e| format!("read username: {e}"))?;
         let client_user = std::str::from_utf8(&buf[..ulen])
             .map_err(|e| format!("username utf8: {e}"))?
             .to_string();
 
-        client.read_exact(&mut buf[..1]).await.map_err(|e| format!("read plen: {e}"))?;
+        client
+            .read_exact(&mut buf[..1])
+            .await
+            .map_err(|e| format!("read plen: {e}"))?;
         let plen = buf[0] as usize;
         if plen > 255 {
             return Err("password too long".into());
         }
-        client.read_exact(&mut buf[..plen]).await.map_err(|e| format!("read password: {e}"))?;
+        client
+            .read_exact(&mut buf[..plen])
+            .await
+            .map_err(|e| format!("read password: {e}"))?;
         let client_pass = std::str::from_utf8(&buf[..plen])
             .map_err(|e| format!("password utf8: {e}"))?
             .to_string();
@@ -122,17 +147,24 @@ async fn handle_socks5_conn(
         if constant_time_eq(client_user.as_bytes(), u.as_bytes())
             && constant_time_eq(client_pass.as_bytes(), p.as_bytes())
         {
-            client.write_all(&[USERPASS_VERSION, USERPASS_OK]).await
+            client
+                .write_all(&[USERPASS_VERSION, USERPASS_OK])
+                .await
                 .map_err(|e| format!("write auth ok: {e}"))?;
         } else {
-            client.write_all(&[USERPASS_VERSION, USERPASS_FAIL]).await
+            client
+                .write_all(&[USERPASS_VERSION, USERPASS_FAIL])
+                .await
                 .map_err(|e| format!("write auth fail: {e}"))?;
             return Err("auth failed".into());
         }
     }
 
     // Step 3: Read request
-    client.read_exact(&mut buf[..4]).await.map_err(|e| format!("read request hdr: {e}"))?;
+    client
+        .read_exact(&mut buf[..4])
+        .await
+        .map_err(|e| format!("read request hdr: {e}"))?;
     if buf[0] != SOCKS5_VERSION {
         return Err(format!("bad request version: {}", buf[0]));
     }
@@ -141,7 +173,10 @@ async fn handle_socks5_conn(
 
     if cmd != CMD_CONNECT {
         let reply = make_socks5_reply(REP_CMD_NOT_SUPPORTED, ATYP_IPV4, &[0, 0, 0, 0], 0);
-        client.write_all(&reply).await.map_err(|e| format!("write reply: {e}"))?;
+        client
+            .write_all(&reply)
+            .await
+            .map_err(|e| format!("write reply: {e}"))?;
         return Err(format!("unsupported cmd: {cmd}"));
     }
 
@@ -162,7 +197,10 @@ async fn handle_socks5_conn(
 
     // Send success reply
     let reply = make_socks5_reply(REP_SUCCEEDED, ATYP_IPV4, &[0, 0, 0, 0], 0);
-    client.write_all(&reply).await.map_err(|e| format!("write reply: {e}"))?;
+    client
+        .write_all(&reply)
+        .await
+        .map_err(|e| format!("write reply: {e}"))?;
 
     // Step 5: Bidirectional relay
     let _ = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
@@ -233,27 +271,42 @@ async fn parse_socks5_target(
 ) -> Result<(String, u16), String> {
     match atyp {
         ATYP_IPV4 => {
-            client.read_exact(&mut buf[..6]).await.map_err(|e| format!("read ipv4: {e}"))?;
+            client
+                .read_exact(&mut buf[..6])
+                .await
+                .map_err(|e| format!("read ipv4: {e}"))?;
             let host = format!("{}.{}.{}.{}", buf[0], buf[1], buf[2], buf[3]);
             let port = u16::from_be_bytes([buf[4], buf[5]]);
             Ok((host, port))
         }
         ATYP_DOMAIN => {
-            client.read_exact(&mut buf[..1]).await.map_err(|e| format!("read domain len: {e}"))?;
+            client
+                .read_exact(&mut buf[..1])
+                .await
+                .map_err(|e| format!("read domain len: {e}"))?;
             let dlen = buf[0] as usize;
             if dlen > 255 {
                 return Err("domain name too long".into());
             }
-            client.read_exact(&mut buf[..dlen]).await.map_err(|e| format!("read domain: {e}"))?;
+            client
+                .read_exact(&mut buf[..dlen])
+                .await
+                .map_err(|e| format!("read domain: {e}"))?;
             let domain = std::str::from_utf8(&buf[..dlen])
                 .map_err(|e| format!("domain utf8: {e}"))?
                 .to_string();
-            client.read_exact(&mut buf[..2]).await.map_err(|e| format!("read port: {e}"))?;
+            client
+                .read_exact(&mut buf[..2])
+                .await
+                .map_err(|e| format!("read port: {e}"))?;
             let port = u16::from_be_bytes([buf[0], buf[1]]);
             Ok((domain, port))
         }
         ATYP_IPV6 => {
-            client.read_exact(&mut buf[..18]).await.map_err(|e| format!("read ipv6: {e}"))?;
+            client
+                .read_exact(&mut buf[..18])
+                .await
+                .map_err(|e| format!("read ipv6: {e}"))?;
             let host = format!(
                 "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
                 u16::from_be_bytes([buf[0], buf[1]]),
@@ -270,7 +323,10 @@ async fn parse_socks5_target(
         }
         _ => {
             let reply = make_socks5_reply(REP_ADDR_NOT_SUPPORTED, ATYP_IPV4, &[0, 0, 0, 0], 0);
-            client.write_all(&reply).await.map_err(|e| format!("write reply: {e}"))?;
+            client
+                .write_all(&reply)
+                .await
+                .map_err(|e| format!("write reply: {e}"))?;
             Err(format!("unsupported atyp: {atyp}"))
         }
     }
@@ -363,7 +419,10 @@ mod tests {
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
 
         // Send greeting: version=5, 1 method, method=NO_AUTH
-        client.write_all(&[SOCKS5_VERSION, 1, AUTH_NO_AUTH]).await.unwrap();
+        client
+            .write_all(&[SOCKS5_VERSION, 1, AUTH_NO_AUTH])
+            .await
+            .unwrap();
 
         // Read auth reply
         let mut reply = [0u8; 2];
@@ -395,7 +454,10 @@ mod tests {
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
 
         // Send greeting: version=5, 2 methods: USER_PASS, NO_AUTH
-        client.write_all(&[SOCKS5_VERSION, 2, AUTH_USER_PASS, AUTH_NO_AUTH]).await.unwrap();
+        client
+            .write_all(&[SOCKS5_VERSION, 2, AUTH_USER_PASS, AUTH_NO_AUTH])
+            .await
+            .unwrap();
 
         // Server should pick USER_PASS
         let mut reply = [0u8; 2];

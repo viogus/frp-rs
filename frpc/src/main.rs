@@ -6,14 +6,13 @@ use std::sync::Arc;
 use tokio::signal;
 use tracing_subscriber::EnvFilter;
 
+use frp_client::service::Service;
 use frp_core::cli::{
-    parse_frpc_args, FrpcCmd, FrpcRunArgs, ReloadArgs, StatusArgs,
-    build_single_proxy_config,
+    build_single_proxy_config, parse_frpc_args, FrpcCmd, FrpcRunArgs, ReloadArgs, StatusArgs,
 };
-use frp_core::config::{load_client_config, collect_config_files, ClientConfig, ProxyConfig};
+use frp_core::config::{collect_config_files, load_client_config, ClientConfig, ProxyConfig};
 use frp_core::unsafe_features::UnsafeFeatures;
 use frp_core::{EXIT_AUTH, EXIT_BIND, EXIT_CONFIG, EXIT_RUNTIME};
-use frp_client::service::Service;
 
 use data_encoding::BASE64;
 
@@ -65,7 +64,10 @@ fn basic_auth_header(user: &str, password: &str) -> String {
         return String::new();
     }
     let creds = format!("{user}:{password}");
-    format!("Authorization: Basic {}\r\n", BASE64.encode(creds.as_bytes()))
+    format!(
+        "Authorization: Basic {}\r\n",
+        BASE64.encode(creds.as_bytes())
+    )
 }
 
 async fn admin_get(conn: &AdminConnection, path: &str) -> Result<String, String> {
@@ -98,7 +100,11 @@ async fn admin_get(conn: &AdminConnection, path: &str) -> Result<String, String>
     }
 }
 
-async fn admin_post_json(conn: &AdminConnection, path: &str, json_body: &str) -> Result<String, String> {
+async fn admin_post_json(
+    conn: &AdminConnection,
+    path: &str,
+    json_body: &str,
+) -> Result<String, String> {
     let mut stream = tokio::net::TcpStream::connect(&conn.addr)
         .await
         .map_err(|e| format!("connect {}: {e}", conn.addr))?;
@@ -143,38 +149,78 @@ async fn main() {
     frp_core::mem_profile::spawn_emitter();
     match cmd {
         FrpcCmd::Run(args) => run_normal(args).await,
-        FrpcCmd::Tcp(args) => run_single_proxy(
-            &args.server_addr, args.server_port, args.token.as_deref(),
-            args.to_proxy_config(),
-        ).await,
-        FrpcCmd::Udp(args) => run_single_proxy(
-            &args.server_addr, args.server_port, args.token.as_deref(),
-            args.to_proxy_config(),
-        ).await,
-        FrpcCmd::Http(args) => run_single_proxy(
-            &args.server_addr, args.server_port, args.token.as_deref(),
-            args.to_proxy_config(),
-        ).await,
-        FrpcCmd::Https(args) => run_single_proxy(
-            &args.server_addr, args.server_port, args.token.as_deref(),
-            args.to_proxy_config(),
-        ).await,
-        FrpcCmd::Stcp(args) => run_single_proxy(
-            &args.server_addr, args.server_port, args.token.as_deref(),
-            args.to_proxy_config(),
-        ).await,
-        FrpcCmd::Xtcp(args) => run_single_proxy(
-            &args.server_addr, args.server_port, args.token.as_deref(),
-            args.to_proxy_config(),
-        ).await,
-        FrpcCmd::Sudp(args) => run_single_proxy(
-            &args.server_addr, args.server_port, args.token.as_deref(),
-            args.to_proxy_config(),
-        ).await,
-        FrpcCmd::Tcpmux(args) => run_single_proxy(
-            &args.server_addr, args.server_port, args.token.as_deref(),
-            args.to_proxy_config(),
-        ).await,
+        FrpcCmd::Tcp(args) => {
+            run_single_proxy(
+                &args.server_addr,
+                args.server_port,
+                args.token.as_deref(),
+                args.to_proxy_config(),
+            )
+            .await
+        }
+        FrpcCmd::Udp(args) => {
+            run_single_proxy(
+                &args.server_addr,
+                args.server_port,
+                args.token.as_deref(),
+                args.to_proxy_config(),
+            )
+            .await
+        }
+        FrpcCmd::Http(args) => {
+            run_single_proxy(
+                &args.server_addr,
+                args.server_port,
+                args.token.as_deref(),
+                args.to_proxy_config(),
+            )
+            .await
+        }
+        FrpcCmd::Https(args) => {
+            run_single_proxy(
+                &args.server_addr,
+                args.server_port,
+                args.token.as_deref(),
+                args.to_proxy_config(),
+            )
+            .await
+        }
+        FrpcCmd::Stcp(args) => {
+            run_single_proxy(
+                &args.server_addr,
+                args.server_port,
+                args.token.as_deref(),
+                args.to_proxy_config(),
+            )
+            .await
+        }
+        FrpcCmd::Xtcp(args) => {
+            run_single_proxy(
+                &args.server_addr,
+                args.server_port,
+                args.token.as_deref(),
+                args.to_proxy_config(),
+            )
+            .await
+        }
+        FrpcCmd::Sudp(args) => {
+            run_single_proxy(
+                &args.server_addr,
+                args.server_port,
+                args.token.as_deref(),
+                args.to_proxy_config(),
+            )
+            .await
+        }
+        FrpcCmd::Tcpmux(args) => {
+            run_single_proxy(
+                &args.server_addr,
+                args.server_port,
+                args.token.as_deref(),
+                args.to_proxy_config(),
+            )
+            .await
+        }
         FrpcCmd::Verify(args) => run_verify(&args.config).await,
         FrpcCmd::Reload(args) => run_reload(args).await,
         FrpcCmd::Status(args) => run_status(args).await,
@@ -183,16 +229,27 @@ async fn main() {
 
 // ── Logging / tracing init ────────────────────────────────────────────────────
 
-fn resolve_log_settings(cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) -> (String, Option<String>, bool) {
+fn resolve_log_settings(
+    cli: &FrpcRunArgs,
+    cfg: Option<&ClientConfig>,
+) -> (String, Option<String>, bool) {
     let level = cli.log_level.clone().unwrap_or_else(|| {
-        cfg.map(|c| c.log.level.as_str()).unwrap_or(
-            #[cfg(feature = "debug-logs")]
-            "debug,yamux=trace",
-            #[cfg(not(feature = "debug-logs"))]
-            "info",
-        ).to_string()
+        cfg.map(|c| c.log.level.as_str())
+            .unwrap_or(
+                #[cfg(feature = "debug-logs")]
+                "debug,yamux=trace",
+                #[cfg(not(feature = "debug-logs"))]
+                "info",
+            )
+            .to_string()
     });
-    let file = cfg.and_then(|c| if c.log.file.is_empty() { None } else { Some(c.log.file.clone()) });
+    let file = cfg.and_then(|c| {
+        if c.log.file.is_empty() {
+            None
+        } else {
+            Some(c.log.file.clone())
+        }
+    });
     let ansi = !cli.disable_log_color;
     (level, file, ansi)
 }
@@ -202,8 +259,7 @@ fn resolve_log_settings(cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) -> (Strin
 #[cfg(not(feature = "otel"))]
 fn init_logging(cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
     let (level, file, ansi) = resolve_log_settings(cli, cfg);
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -212,7 +268,9 @@ fn init_logging(cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
     if let Some(path) = file {
         let file_appender = tracing_appender::rolling::daily(
             Path::new(&path).parent().unwrap_or(Path::new(".")),
-            Path::new(&path).file_name().unwrap_or(std::ffi::OsStr::new("frpc.log")),
+            Path::new(&path)
+                .file_name()
+                .unwrap_or(std::ffi::OsStr::new("frpc.log")),
         );
         builder.with_writer(file_appender).init();
     } else {
@@ -232,20 +290,33 @@ fn init_logging(cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
     // OTel endpoint resolution: env var → config field → disabled
     let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .ok()
-        .or_else(|| cfg.and_then(|c| {
-            if c.observability.otlp_endpoint.is_empty() { None }
-            else { Some(c.observability.otlp_endpoint.clone()) }
-        }));
+        .or_else(|| {
+            cfg.and_then(|c| {
+                if c.observability.otlp_endpoint.is_empty() {
+                    None
+                } else {
+                    Some(c.observability.otlp_endpoint.clone())
+                }
+            })
+        });
 
     let svc_name = cfg
-        .and_then(|c| if c.observability.service_name.is_empty() { None } else { Some(c.observability.service_name.clone()) })
+        .and_then(|c| {
+            if c.observability.service_name.is_empty() {
+                None
+            } else {
+                Some(c.observability.service_name.clone())
+            }
+        })
         .unwrap_or_else(|| "frpc".to_string());
 
     let (otel_layer, _provider) = if let Some(ref ep) = otlp_endpoint {
         match build_otel_layer(ep, &svc_name) {
             Ok((layer, provider)) => (Some(layer), Some(provider)),
             Err(e) => {
-                eprintln!("WARNING: OTel init failed (endpoint={ep}): {e}. Tracing without OTLP export.");
+                eprintln!(
+                    "WARNING: OTel init failed (endpoint={ep}): {e}. Tracing without OTLP export."
+                );
                 (None, None)
             }
         }
@@ -257,7 +328,9 @@ fn init_logging(cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
     if let Some(path) = file {
         let file_appender = tracing_appender::rolling::daily(
             Path::new(&path).parent().unwrap_or(Path::new(".")),
-            Path::new(&path).file_name().unwrap_or(std::ffi::OsStr::new("frpc.log")),
+            Path::new(&path)
+                .file_name()
+                .unwrap_or(std::ffi::OsStr::new("frpc.log")),
         );
         if let Some(layer) = otel_layer {
             if let Some(p) = _provider {
@@ -265,8 +338,7 @@ fn init_logging(cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
             }
             tracing_subscriber::registry()
                 .with(layer)
-                .with(EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new(&level)))
+                .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&level)))
                 .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                 .with(
                     tracing_subscriber::fmt::layer()
@@ -276,8 +348,7 @@ fn init_logging(cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
                 .init();
         } else {
             tracing_subscriber::registry()
-                .with(EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new(&level)))
+                .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&level)))
                 .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                 .with(
                     tracing_subscriber::fmt::layer()
@@ -293,14 +364,12 @@ fn init_logging(cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
             }
             tracing_subscriber::registry()
                 .with(layer)
-                .with(EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new(&level)))
+                .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&level)))
                 .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                 .init();
         } else {
             tracing_subscriber::registry()
-                .with(EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new(&level)))
+                .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&level)))
                 .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                 .init();
         }
@@ -312,17 +381,20 @@ fn init_logging(cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
 fn build_otel_layer(
     endpoint: &str,
     service_name: &str,
-) -> Result<(
-    tracing_opentelemetry::OpenTelemetryLayer<
-        tracing_subscriber::Registry,
-        opentelemetry_sdk::trace::Tracer,
-    >,
-    opentelemetry_sdk::trace::TracerProvider,
-), Box<dyn std::error::Error>> {
-    use opentelemetry::KeyValue;
+) -> Result<
+    (
+        tracing_opentelemetry::OpenTelemetryLayer<
+            tracing_subscriber::Registry,
+            opentelemetry_sdk::trace::Tracer,
+        >,
+        opentelemetry_sdk::trace::TracerProvider,
+    ),
+    Box<dyn std::error::Error>,
+> {
     use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::Resource;
+    use opentelemetry::KeyValue;
     use opentelemetry_otlp::WithExportConfig as _;
+    use opentelemetry_sdk::Resource;
 
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
@@ -331,9 +403,10 @@ fn build_otel_layer(
 
     let provider = opentelemetry_sdk::trace::TracerProvider::builder()
         .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-        .with_resource(Resource::new(vec![
-            KeyValue::new("service.name", service_name.to_string()),
-        ]))
+        .with_resource(Resource::new(vec![KeyValue::new(
+            "service.name",
+            service_name.to_string(),
+        )]))
         .build();
 
     let tracer = provider.tracer("frp-rs");
@@ -424,18 +497,22 @@ async fn run_normal(mut args: FrpcRunArgs) {
     init_logging(&args, Some(&cfg));
 
     tracing::info!(version = %frp_core::VERSION, "frpc (Rust) v{} connecting...", frp_core::VERSION);
-    let service = Arc::new(match Service::with_unsafe_features(cfg, Some(args.config.clone()), unsafe_features.clone()).await {
-        Ok(svc) => svc,
-        Err(e) => {
-            let code = if e.to_string().contains("token") || e.to_string().contains("auth") {
-                EXIT_AUTH
-            } else {
-                EXIT_BIND
-            };
-            tracing::error!(error = %e, "frpc init error: {}", e);
-            process::exit(code);
-        }
-    });
+    let service = Arc::new(
+        match Service::with_unsafe_features(cfg, Some(args.config.clone()), unsafe_features.clone())
+            .await
+        {
+            Ok(svc) => svc,
+            Err(e) => {
+                let code = if e.to_string().contains("token") || e.to_string().contains("auth") {
+                    EXIT_AUTH
+                } else {
+                    EXIT_BIND
+                };
+                tracing::error!(error = %e, "frpc init error: {}", e);
+                process::exit(code);
+            }
+        },
+    );
 
     // SIGUSR1 → config hot reload
     #[cfg(unix)]
@@ -488,15 +565,17 @@ async fn run_normal(mut args: FrpcRunArgs) {
                     .ok()
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(30);
-                let output_dir = std::env::var("FRP_PROFILE_DIR")
-                    .unwrap_or_else(|_| ".".to_string());
+                let output_dir =
+                    std::env::var("FRP_PROFILE_DIR").unwrap_or_else(|_| ".".to_string());
                 tokio::task::spawn_blocking(move || {
                     match frp_core::profiling::dump_cpu_profile(
                         std::time::Duration::from_secs(duration_secs),
                         std::path::Path::new(&output_dir),
                         "frpc",
                     ) {
-                        Ok(path) => tracing::info!("SIGUSR2: CPU profile saved to {}", path.display()),
+                        Ok(path) => {
+                            tracing::info!("SIGUSR2: CPU profile saved to {}", path.display())
+                        }
                         Err(e) => tracing::error!(error = %e, "SIGUSR2: CPU profile failed: {}", e),
                     }
                 });
@@ -513,9 +592,16 @@ async fn run_normal(mut args: FrpcRunArgs) {
     profile_handle.abort();
 }
 
-async fn run_single_proxy(server_addr: &str, server_port: u16, token: Option<&str>, proxy: ProxyConfig) {
+async fn run_single_proxy(
+    server_addr: &str,
+    server_port: u16,
+    token: Option<&str>,
+    proxy: ProxyConfig,
+) {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let cfg = build_single_proxy_config(server_addr, server_port, token, proxy);
@@ -542,7 +628,9 @@ async fn run_single_proxy(server_addr: &str, server_port: u16, token: Option<&st
 
 async fn run_verify(config_path: &str) {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     match load_client_config(config_path, true) {
@@ -683,8 +771,10 @@ mod tests {
     #[test]
     fn test_resolve_admin_connection_cli_priority() {
         let conn = resolve_admin_connection(
-            Some("10.0.0.1"), Some(1234),
-            Some("u"), Some("p"),
+            Some("10.0.0.1"),
+            Some(1234),
+            Some("u"),
+            Some("p"),
             None, // no config file
         );
         assert_eq!(conn.addr, "10.0.0.1:1234");
@@ -694,9 +784,7 @@ mod tests {
 
     #[test]
     fn test_resolve_admin_connection_defaults() {
-        let conn = resolve_admin_connection(
-            None, None, None, None, None,
-        );
+        let conn = resolve_admin_connection(None, None, None, None, None);
         assert_eq!(conn.addr, "127.0.0.1:7400");
         assert_eq!(conn.user, "");
         assert_eq!(conn.password, "");
@@ -705,21 +793,13 @@ mod tests {
     #[test]
     fn test_resolve_admin_connection_cli_addr_only_falls_through() {
         // addr without port is not enough — falls to defaults
-        let conn = resolve_admin_connection(
-            Some("10.0.0.1"), None,
-            Some("u"), Some("p"),
-            None,
-        );
+        let conn = resolve_admin_connection(Some("10.0.0.1"), None, Some("u"), Some("p"), None);
         assert_eq!(conn.addr, "127.0.0.1:7400");
     }
 
     #[test]
     fn test_resolve_admin_connection_cli_port_only_falls_through() {
-        let conn = resolve_admin_connection(
-            None, Some(9999),
-            None, None,
-            None,
-        );
+        let conn = resolve_admin_connection(None, Some(9999), None, None, None);
         assert_eq!(conn.addr, "127.0.0.1:7400");
     }
 }

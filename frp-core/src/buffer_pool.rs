@@ -8,8 +8,8 @@
 //! Fixed capacity: `MAX_POOLED_BUFFERS` (32). Excess buffers are dropped.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 
 /// Pooled buffer size in bytes. Defaults to 32KB (matches Go frp io.Copy); override
 /// for experiments via FRP_BRIDGE_BUF_KB (e.g. 256). Read once at process start.
@@ -53,7 +53,9 @@ impl BufferPool {
     /// allocates via `Vec::with_capacity`, returning length 0.
     pub fn acquire(&self) -> Vec<u8> {
         let mut inner = self.inner.lock().expect("buffer pool lock poisoned");
-        inner.pop_front().unwrap_or_else(|| Vec::with_capacity(*BUFFER_SIZE))
+        inner
+            .pop_front()
+            .unwrap_or_else(|| Vec::with_capacity(*BUFFER_SIZE))
     }
 
     /// Return a buffer to the pool for reuse.
@@ -164,7 +166,11 @@ mod tests {
 
         // Reacquire: buffer is still full length, so the resize guard is a no-op.
         let g2 = PoolGuard::acquire();
-        assert_eq!(g2.data().len(), *BUFFER_SIZE, "recycled buffer stays full length");
+        assert_eq!(
+            g2.data().len(),
+            *BUFFER_SIZE,
+            "recycled buffer stays full length"
+        );
     }
 
     #[test]

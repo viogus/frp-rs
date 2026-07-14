@@ -3,8 +3,8 @@
 //! Same data source as the dashboard API (single metrics system).
 
 use prometheus::{Encoder, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
-use std::sync::LazyLock;
 use std::sync::atomic::Ordering;
+use std::sync::LazyLock;
 
 use crate::service::AppState;
 
@@ -15,14 +15,20 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 
 /// frp_server_client_counts — current number of connected clients.
 static CLIENT_COUNTS: LazyLock<IntGauge> = LazyLock::new(|| {
-    IntGauge::with_opts(Opts::new("frp_server_client_counts", "current client counts"))
-        .expect("metric definition must be valid")
+    IntGauge::with_opts(Opts::new(
+        "frp_server_client_counts",
+        "current client counts",
+    ))
+    .expect("metric definition must be valid")
 });
 
 /// frp_server_proxy_counts — current proxy count, labeled by type.
 static PROXY_COUNTS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    IntGaugeVec::new(Opts::new("frp_server_proxy_counts", "current proxy counts"), &["type"])
-        .expect("metric definition must be valid")
+    IntGaugeVec::new(
+        Opts::new("frp_server_proxy_counts", "current proxy counts"),
+        &["type"],
+    )
+    .expect("metric definition must be valid")
 });
 
 /// frp_server_proxy_counts_detailed — current proxy count, labeled by type and name.
@@ -65,20 +71,29 @@ static TRAFFIC_OUT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 
 /// frp_server_pool_hits_total — lifetime work connection pool hits.
 static POOL_HITS: LazyLock<IntGauge> = LazyLock::new(|| {
-    IntGauge::with_opts(Opts::new("frp_server_pool_hits_total", "lifetime work conn pool hits"))
-        .expect("metric definition must be valid")
+    IntGauge::with_opts(Opts::new(
+        "frp_server_pool_hits_total",
+        "lifetime work conn pool hits",
+    ))
+    .expect("metric definition must be valid")
 });
 
 /// frp_server_pool_misses_total — lifetime pool misses (pool empty, ReqWorkConn sent).
 static POOL_MISSES: LazyLock<IntGauge> = LazyLock::new(|| {
-    IntGauge::with_opts(Opts::new("frp_server_pool_misses_total", "lifetime pool misses"))
-        .expect("metric definition must be valid")
+    IntGauge::with_opts(Opts::new(
+        "frp_server_pool_misses_total",
+        "lifetime pool misses",
+    ))
+    .expect("metric definition must be valid")
 });
 
 /// frp_server_pool_drops_total — lifetime pool drops (pool full, conn discarded).
 static POOL_DROPS: LazyLock<IntGauge> = LazyLock::new(|| {
-    IntGauge::with_opts(Opts::new("frp_server_pool_drops_total", "lifetime pool drops"))
-        .expect("metric definition must be valid")
+    IntGauge::with_opts(Opts::new(
+        "frp_server_pool_drops_total",
+        "lifetime pool drops",
+    ))
+    .expect("metric definition must be valid")
 });
 
 /// frp_server_pool_size — current number of idle work connections across all clients.
@@ -89,8 +104,11 @@ static POOL_SIZE: LazyLock<IntGauge> = LazyLock::new(|| {
 
 /// frp_server_pool_pending_requests — current pending requests waiting for work conns.
 static POOL_PENDING: LazyLock<IntGauge> = LazyLock::new(|| {
-    IntGauge::with_opts(Opts::new("frp_server_pool_pending_requests", "current pending requests"))
-        .expect("metric definition must be valid")
+    IntGauge::with_opts(Opts::new(
+        "frp_server_pool_pending_requests",
+        "current pending requests",
+    ))
+    .expect("metric definition must be valid")
 });
 
 /// Register all 11 metrics with the registry. Called once at startup.
@@ -101,7 +119,9 @@ pub fn register_all() {
     INIT.call_once(|| {
         REGISTRY.register(Box::new(CLIENT_COUNTS.clone())).ok();
         REGISTRY.register(Box::new(PROXY_COUNTS.clone())).ok();
-        REGISTRY.register(Box::new(PROXY_COUNTS_DETAILED.clone())).ok();
+        REGISTRY
+            .register(Box::new(PROXY_COUNTS_DETAILED.clone()))
+            .ok();
         REGISTRY.register(Box::new(CONNECTION_COUNTS.clone())).ok();
         REGISTRY.register(Box::new(TRAFFIC_IN.clone())).ok();
         REGISTRY.register(Box::new(TRAFFIC_OUT.clone())).ok();
@@ -136,7 +156,10 @@ pub async fn sync_from_state(state: &AppState) {
     for p in &proxies {
         *type_counts.entry(p.proxy_type.clone()).or_default() += 1;
 
-        let snap = state.proxy_metrics.get(&p.name).await
+        let snap = state
+            .proxy_metrics
+            .get(&p.name)
+            .await
             .map(|m| m.snapshot())
             .unwrap_or_else(|| frp_core::metrics::MetricsSnapshot {
                 bytes_in: 0,
@@ -149,9 +172,15 @@ pub async fn sync_from_state(state: &AppState) {
         let pn = &p.name;
 
         PROXY_COUNTS_DETAILED.with_label_values(&[pt, pn]).set(1);
-        CONNECTION_COUNTS.with_label_values(&[pn, pt]).set(snap.current_conns);
-        TRAFFIC_IN.with_label_values(&[pn, pt]).set(i64::try_from(snap.bytes_in).unwrap_or(i64::MAX));
-        TRAFFIC_OUT.with_label_values(&[pn, pt]).set(i64::try_from(snap.bytes_out).unwrap_or(i64::MAX));
+        CONNECTION_COUNTS
+            .with_label_values(&[pn, pt])
+            .set(snap.current_conns);
+        TRAFFIC_IN
+            .with_label_values(&[pn, pt])
+            .set(i64::try_from(snap.bytes_in).unwrap_or(i64::MAX));
+        TRAFFIC_OUT
+            .with_label_values(&[pn, pt])
+            .set(i64::try_from(snap.bytes_out).unwrap_or(i64::MAX));
     }
 
     for (pt, count) in &type_counts {
@@ -163,12 +192,20 @@ pub async fn sync_from_state(state: &AppState) {
     POOL_MISSES.set(i64::try_from(state.pool.misses.load(Ordering::Relaxed)).unwrap_or(i64::MAX));
     POOL_DROPS.set(i64::try_from(state.pool.drops.load(Ordering::Relaxed)).unwrap_or(i64::MAX));
 
-    let total_pool_size: i64 = state.run_id_to_ctl_tx.read().await.values()
+    let total_pool_size: i64 = state
+        .run_id_to_ctl_tx
+        .read()
+        .await
+        .values()
         .map(|ctl| ctl.pool_stats.pool_size.load(Ordering::Relaxed))
         .sum();
     POOL_SIZE.set(total_pool_size);
 
-    let total_pending: i64 = state.run_id_to_ctl_tx.read().await.values()
+    let total_pending: i64 = state
+        .run_id_to_ctl_tx
+        .read()
+        .await
+        .values()
         .map(|ctl| ctl.pool_stats.pending_requests.load(Ordering::Relaxed))
         .sum();
     POOL_PENDING.set(total_pending);
@@ -208,10 +245,18 @@ mod tests {
         register_all();
         // Touch a gauge label so it appears in render output
         PROXY_COUNTS.with_label_values(&["__fmt_test"]).set(1);
-        PROXY_COUNTS_DETAILED.with_label_values(&["__fmt_test", "__fmt_proxy"]).set(1);
-        TRAFFIC_IN.with_label_values(&["__fmt_proxy", "__fmt_test"]).set(0);
-        TRAFFIC_OUT.with_label_values(&["__fmt_proxy", "__fmt_test"]).set(0);
-        CONNECTION_COUNTS.with_label_values(&["__fmt_proxy", "__fmt_test"]).set(0);
+        PROXY_COUNTS_DETAILED
+            .with_label_values(&["__fmt_test", "__fmt_proxy"])
+            .set(1);
+        TRAFFIC_IN
+            .with_label_values(&["__fmt_proxy", "__fmt_test"])
+            .set(0);
+        TRAFFIC_OUT
+            .with_label_values(&["__fmt_proxy", "__fmt_test"])
+            .set(0);
+        CONNECTION_COUNTS
+            .with_label_values(&["__fmt_proxy", "__fmt_test"])
+            .set(0);
         let text = render_metrics_text();
         // HEADER line present for gauge (always renders)
         assert!(text.contains("TYPE frp_server_client_counts gauge"));

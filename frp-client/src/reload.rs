@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing;
 
@@ -91,9 +91,7 @@ pub(crate) async fn do_reload(
         .map_err(|e| format!("failed to load config: {e}"))?;
 
     // Diff old vs new proxy names
-    let old_names: HashSet<String> = {
-        proxy_info_map.read().await.keys().cloned().collect()
-    };
+    let old_names: HashSet<String> = { proxy_info_map.read().await.keys().cloned().collect() };
     let new_names: HashSet<String> = new_cfg.proxies.iter().map(|p| p.name.clone()).collect();
 
     let removed: Vec<String> = old_names.difference(&new_names).cloned().collect();
@@ -105,7 +103,10 @@ pub(crate) async fn do_reload(
     {
         let map = proxy_info_map.read().await;
         for name in &common {
-            if let (Some(old_info), Some(new_p)) = (map.get(*name), new_cfg.proxies.iter().find(|p| &p.name == *name)) {
+            if let (Some(old_info), Some(new_p)) = (
+                map.get(*name),
+                new_cfg.proxies.iter().find(|p| &p.name == *name),
+            ) {
                 let new_snapshot = config_snapshot(new_p);
                 if old_info.config_snapshot != new_snapshot {
                     changed.push((*name).clone());
@@ -116,9 +117,15 @@ pub(crate) async fn do_reload(
 
     if strict && (!removed.is_empty() || !added.is_empty() || !changed.is_empty()) {
         let mut parts: Vec<String> = Vec::new();
-        if !removed.is_empty() { parts.push(format!("removed: {:?}", removed)); }
-        if !added.is_empty() { parts.push(format!("added: {:?}", added)); }
-        if !changed.is_empty() { parts.push(format!("changed: {:?}", changed)); }
+        if !removed.is_empty() {
+            parts.push(format!("removed: {:?}", removed));
+        }
+        if !added.is_empty() {
+            parts.push(format!("added: {:?}", added));
+        }
+        if !changed.is_empty() {
+            parts.push(format!("changed: {:?}", changed));
+        }
         return Err(format!("config changed — {}", parts.join("; ")));
     }
 
@@ -142,5 +149,11 @@ pub(crate) async fn do_reload(
         "Config diff: +{} added, ~{} changed, -{} removed",
         added.len(), changed.len(), removed.len());
 
-    Ok(ReloadDelta { summary, removed, added, changed, new_config: new_cfg })
+    Ok(ReloadDelta {
+        summary,
+        removed,
+        added,
+        changed,
+        new_config: new_cfg,
+    })
 }

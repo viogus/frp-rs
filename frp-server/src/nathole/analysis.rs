@@ -11,7 +11,7 @@ use super::classify::{classify_feature_count, NatFeature};
 /// Recommended hole-punch behavior for one peer.
 #[derive(Debug, Clone)]
 pub struct RecommendBehavior {
-    pub role: String,            // "sender" or "receiver"
+    pub role: String, // "sender" or "receiver"
     pub ttl: i32,
     pub send_delay_ms: i32,
     pub ports_range_number: i32,
@@ -34,11 +34,11 @@ fn mode0_table() -> &'static [BehaviorPair] {
     static TABLE: OnceLock<Vec<BehaviorPair>> = OnceLock::new();
     TABLE.get_or_init(|| {
         vec![
-            (sender(0, 0, 0, 0, 0),  receiver(7, 0, 0, 0, 0)),
+            (sender(0, 0, 0, 0, 0), receiver(7, 0, 0, 0, 0)),
             (receiver(7, 0, 0, 0, 0), sender(0, 0, 0, 0, 0)),
-            (sender(0, 0, 0, 0, 0),  receiver(4, 0, 0, 0, 0)),
+            (sender(0, 0, 0, 0, 0), receiver(4, 0, 0, 0, 0)),
             (receiver(4, 0, 0, 0, 0), sender(0, 0, 0, 0, 0)),
-            (sender(0, 0, 0, 0, 0),  receiver(0, 0, 0, 0, 0)),
+            (sender(0, 0, 0, 0, 0), receiver(0, 0, 0, 0, 0)),
             (receiver(0, 0, 0, 0, 0), sender(0, 0, 0, 0, 0)),
             (sender(0, 5000, 0, 0, 0), receiver(0, 0, 0, 0, 0)),
             (sender(0, 10000, 0, 0, 0), receiver(0, 0, 0, 0, 0)),
@@ -54,12 +54,12 @@ fn mode1_table() -> &'static [BehaviorPair] {
     static TABLE: OnceLock<Vec<BehaviorPair>> = OnceLock::new();
     TABLE.get_or_init(|| {
         vec![
-            (sender(0, 0, 0, 0, 0),      recv_ports(7, 0, 10)),
-            (sender(0, 2000, 0, 0, 0),    recv_ports(7, 0, 10)),
-            (sender(0, 0, 0, 0, 0),      recv_ports(4, 0, 10)),
-            (sender(0, 2000, 0, 0, 0),    recv_ports(4, 0, 10)),
-            (sender(0, 0, 0, 0, 0),      recv_ports(0, 0, 10)),
-            (sender(0, 2000, 0, 0, 0),    recv_ports(0, 0, 10)),
+            (sender(0, 0, 0, 0, 0), recv_ports(7, 0, 10)),
+            (sender(0, 2000, 0, 0, 0), recv_ports(7, 0, 10)),
+            (sender(0, 0, 0, 0, 0), recv_ports(4, 0, 10)),
+            (sender(0, 2000, 0, 0, 0), recv_ports(4, 0, 10)),
+            (sender(0, 0, 0, 0, 0), recv_ports(0, 0, 10)),
+            (sender(0, 2000, 0, 0, 0), recv_ports(0, 0, 10)),
         ]
     })
 }
@@ -70,9 +70,9 @@ fn mode2_table() -> &'static [BehaviorPair] {
     static TABLE: OnceLock<Vec<BehaviorPair>> = OnceLock::new();
     TABLE.get_or_init(|| {
         vec![
-            (sender_port(3000, 1000, 0),  recv_listen(7, 256)),
-            (sender_port(3000, 1000, 0),  recv_listen(4, 256)),
-            (sender_port(3000, 1000, 0),  recv_listen(0, 256)),
+            (sender_port(3000, 1000, 0), recv_listen(7, 256)),
+            (sender_port(3000, 1000, 0), recv_listen(4, 256)),
+            (sender_port(3000, 1000, 0), recv_listen(0, 256)),
         ]
     })
 }
@@ -84,9 +84,9 @@ fn mode3_table() -> &'static [BehaviorPair] {
     static TABLE: OnceLock<Vec<BehaviorPair>> = OnceLock::new();
     TABLE.get_or_init(|| {
         vec![
-            (send_ports(0, 10),   recv_ports(7, 0, 10)),
-            (send_ports(0, 10),   recv_ports(4, 0, 10)),
-            (send_ports(0, 10),   recv_ports(0, 0, 10)),
+            (send_ports(0, 10), recv_ports(7, 0, 10)),
+            (send_ports(0, 10), recv_ports(4, 0, 10)),
+            (send_ports(0, 10), recv_ports(0, 0, 10)),
             (recv_ports(7, 0, 10), send_ports(0, 10)),
             (recv_ports(4, 0, 10), send_ports(0, 10)),
             (recv_ports(0, 0, 10), send_ports(0, 10)),
@@ -100,9 +100,9 @@ fn mode4_table() -> &'static [BehaviorPair] {
     static TABLE: OnceLock<Vec<BehaviorPair>> = OnceLock::new();
     TABLE.get_or_init(|| {
         vec![
-            (sender_port(3000, 1000, 0),  recv_listen_ports(7, 256, 2)),
-            (sender_port(3000, 1000, 0),  recv_listen_ports(4, 256, 2)),
-            (sender_port(3000, 1000, 0),  recv_listen_ports(0, 256, 2)),
+            (sender_port(3000, 1000, 0), recv_listen_ports(7, 256, 2)),
+            (sender_port(3000, 1000, 0), recv_listen_ports(4, 256, 2)),
+            (sender_port(3000, 1000, 0), recv_listen_ports(0, 256, 2)),
         ]
     })
 }
@@ -110,38 +110,80 @@ fn mode4_table() -> &'static [BehaviorPair] {
 // --- Helper constructors for table entries ---
 
 fn sender(ttl: i32, delay: i32, prn: i32, prnn: i32, lrp: i32) -> RecommendBehavior {
-    RecommendBehavior { role: "sender".into(), ttl, send_delay_ms: delay,
-        ports_range_number: prn, ports_random_number: prnn, listen_random_ports: lrp }
+    RecommendBehavior {
+        role: "sender".into(),
+        ttl,
+        send_delay_ms: delay,
+        ports_range_number: prn,
+        ports_random_number: prnn,
+        listen_random_ports: lrp,
+    }
 }
 
 fn receiver(ttl: i32, delay: i32, prn: i32, prnn: i32, lrp: i32) -> RecommendBehavior {
-    RecommendBehavior { role: "receiver".into(), ttl, send_delay_ms: delay,
-        ports_range_number: prn, ports_random_number: prnn, listen_random_ports: lrp }
+    RecommendBehavior {
+        role: "receiver".into(),
+        ttl,
+        send_delay_ms: delay,
+        ports_range_number: prn,
+        ports_random_number: prnn,
+        listen_random_ports: lrp,
+    }
 }
 
 fn recv_ports(ttl: i32, delay: i32, prn: i32) -> RecommendBehavior {
-    RecommendBehavior { role: "receiver".into(), ttl, send_delay_ms: delay,
-        ports_range_number: prn, ports_random_number: 0, listen_random_ports: 0 }
+    RecommendBehavior {
+        role: "receiver".into(),
+        ttl,
+        send_delay_ms: delay,
+        ports_range_number: prn,
+        ports_random_number: 0,
+        listen_random_ports: 0,
+    }
 }
 
 fn send_ports(ttl: i32, prn: i32) -> RecommendBehavior {
-    RecommendBehavior { role: "sender".into(), ttl, send_delay_ms: 0,
-        ports_range_number: prn, ports_random_number: 0, listen_random_ports: 0 }
+    RecommendBehavior {
+        role: "sender".into(),
+        ttl,
+        send_delay_ms: 0,
+        ports_range_number: prn,
+        ports_random_number: 0,
+        listen_random_ports: 0,
+    }
 }
 
 fn sender_port(delay: i32, prnn: i32, lrp: i32) -> RecommendBehavior {
-    RecommendBehavior { role: "sender".into(), ttl: 0, send_delay_ms: delay,
-        ports_range_number: 0, ports_random_number: prnn, listen_random_ports: lrp }
+    RecommendBehavior {
+        role: "sender".into(),
+        ttl: 0,
+        send_delay_ms: delay,
+        ports_range_number: 0,
+        ports_random_number: prnn,
+        listen_random_ports: lrp,
+    }
 }
 
 fn recv_listen(ttl: i32, lrp: i32) -> RecommendBehavior {
-    RecommendBehavior { role: "receiver".into(), ttl, send_delay_ms: 0,
-        ports_range_number: 0, ports_random_number: 0, listen_random_ports: lrp }
+    RecommendBehavior {
+        role: "receiver".into(),
+        ttl,
+        send_delay_ms: 0,
+        ports_range_number: 0,
+        ports_random_number: 0,
+        listen_random_ports: lrp,
+    }
 }
 
 fn recv_listen_ports(ttl: i32, lrp: i32, prn: i32) -> RecommendBehavior {
-    RecommendBehavior { role: "receiver".into(), ttl, send_delay_ms: 0,
-        ports_range_number: prn, ports_random_number: 0, listen_random_ports: lrp }
+    RecommendBehavior {
+        role: "receiver".into(),
+        ttl,
+        send_delay_ms: 0,
+        ports_range_number: prn,
+        ports_random_number: 0,
+        listen_random_ports: lrp,
+    }
 }
 
 // --------------- Scoring and Records ---------------
@@ -177,11 +219,23 @@ impl MakeHoleRecords {
         let append_mode0 = |scores: &mut Vec<BehaviorScore>, c_pub: bool, v_pub: bool| {
             for i in 0..MODE_COUNTS[0] as i32 {
                 if c_pub {
-                    scores.push(BehaviorScore { mode: 0, index: i, score: 0 });
+                    scores.push(BehaviorScore {
+                        mode: 0,
+                        index: i,
+                        score: 0,
+                    });
                 } else if v_pub {
-                    scores.push(BehaviorScore { mode: 0, index: i, score: 1 });
+                    scores.push(BehaviorScore {
+                        mode: 0,
+                        index: i,
+                        score: 1,
+                    });
                 } else {
-                    scores.push(BehaviorScore { mode: 0, index: i, score: 0 });
+                    scores.push(BehaviorScore {
+                        mode: 0,
+                        index: i,
+                        score: 0,
+                    });
                 }
             }
         };
@@ -189,23 +243,39 @@ impl MakeHoleRecords {
         // Helper: append all entries for a mode with uniform score.
         let append_mode = |scores: &mut Vec<BehaviorScore>, mode: i32, score: i32| {
             for i in 0..MODE_COUNTS[mode as usize] as i32 {
-                scores.push(BehaviorScore { mode, index: i, score });
+                scores.push(BehaviorScore {
+                    mode,
+                    index: i,
+                    score,
+                });
             }
         };
 
         if easy_count == 2 {
             // Both easy NAT: mode 0 only, with PublicNetwork-aware scoring.
-            append_mode0(&mut scores, c_feature.public_network, v_feature.public_network);
+            append_mode0(
+                &mut scores,
+                c_feature.public_network,
+                v_feature.public_network,
+            );
         } else if hard_count == 1 && ports_changed_regular_count == 1 {
             // One hard with regular port change: mode1, mode2, mode0.
             append_mode(&mut scores, 1, 1);
             append_mode(&mut scores, 2, 1);
-            append_mode0(&mut scores, c_feature.public_network, v_feature.public_network);
+            append_mode0(
+                &mut scores,
+                c_feature.public_network,
+                v_feature.public_network,
+            );
         } else if hard_count == 1 && ports_changed_regular_count == 0 {
             // One hard without regular port change: mode2, mode1, mode0.
             append_mode(&mut scores, 2, 1);
             append_mode(&mut scores, 1, 1);
-            append_mode0(&mut scores, c_feature.public_network, v_feature.public_network);
+            append_mode0(
+                &mut scores,
+                c_feature.public_network,
+                v_feature.public_network,
+            );
         } else if hard_count == 2 && ports_changed_regular_count == 2 {
             // Both hard, both regular: mode3, mode4.
             append_mode(&mut scores, 3, 1);
@@ -215,9 +285,21 @@ impl MakeHoleRecords {
             append_mode(&mut scores, 4, 1);
         } else {
             // Fallback: single-entry modes 0, 1, 3 with score 1.
-            scores.push(BehaviorScore { mode: 0, index: 0, score: 1 });
-            scores.push(BehaviorScore { mode: 1, index: 0, score: 1 });
-            scores.push(BehaviorScore { mode: 3, index: 0, score: 1 });
+            scores.push(BehaviorScore {
+                mode: 0,
+                index: 0,
+                score: 1,
+            });
+            scores.push(BehaviorScore {
+                mode: 1,
+                index: 0,
+                score: 1,
+            });
+            scores.push(BehaviorScore {
+                mode: 3,
+                index: 0,
+                score: 1,
+            });
         }
 
         MakeHoleRecords {

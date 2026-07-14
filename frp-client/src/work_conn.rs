@@ -1,20 +1,20 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 use frp_core::auth::{AuthConfig, OidcClient};
 use frp_core::encryption;
+use frp_core::metrics::ProxyMetricsRegistry;
 use frp_core::msg::{self, FrpMessage};
-use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1, write_msg_v2};
 use frp_core::mux::YamuxSession;
+use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1, write_msg_v2};
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
-use frp_core::transport::{DialOptions, dial_server, IoStream};
-use frp_core::metrics::ProxyMetricsRegistry;
+use frp_core::transport::{dial_server, DialOptions, IoStream};
 
 use crate::proxy;
 use crate::proxy_runtime::ProxyRuntimeInfo;
@@ -39,7 +39,11 @@ pub(crate) struct XtcpNotification {
 }
 
 /// Check if an auth scope is enabled, considering both client and server config.
-pub(crate) fn scope_requires_auth(client_scopes: &[String], server_scopes: &[String], scope: &str) -> bool {
+pub(crate) fn scope_requires_auth(
+    client_scopes: &[String],
+    server_scopes: &[String],
+    scope: &str,
+) -> bool {
     client_scopes.iter().any(|s| s == scope) || server_scopes.iter().any(|s| s == scope)
 }
 
@@ -346,18 +350,23 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                     Ok(_) => {
                                         consumed.extend_from_slice(&header);
                                         let length = i64::from_be_bytes(header);
-                                        if (0..=frp_core::protocol::V1_MAX_MSG_LENGTH).contains(&length) {
+                                        if (0..=frp_core::protocol::V1_MAX_MSG_LENGTH)
+                                            .contains(&length)
+                                        {
                                             let mut payload = vec![0u8; length as usize];
                                             if work.read_exact(&mut payload).await.is_ok() {
                                                 consumed.extend_from_slice(&payload);
-                                                match serde_json::from_slice::<msg::NatHoleSid>(&payload) {
+                                                match serde_json::from_slice::<msg::NatHoleSid>(
+                                                    &payload,
+                                                ) {
                                                     Ok(sid_msg) => {
                                                         if let Some(sid) = sid_msg.sid {
                                                             debug!(label = %label, proxy_name = %proxy_name, "XTCP work conn {}: NatHoleSid (Go frps) for '{}'", label, proxy_name);
-                                                            let _ = xtcp_tx.send(XtcpNotification {
-                                                                sid,
-                                                                proxy_name: proxy_name.clone(),
-                                                            });
+                                                            let _ =
+                                                                xtcp_tx.send(XtcpNotification {
+                                                                    sid,
+                                                                    proxy_name: proxy_name.clone(),
+                                                                });
                                                             return;
                                                         }
                                                         // sid=None: STCP fallback (Go frps — unlikely)
@@ -367,16 +376,25 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                                     _ => {
                                                         // Parsed as non-NatHoleSid — bridge data with a
                                                         // very unlikely 0x35 collision. Wrap consumed bytes.
-                                                        work = IoStream::BufferedRead(consumed, 0, Box::new(work));
+                                                        work = IoStream::BufferedRead(
+                                                            consumed,
+                                                            0,
+                                                            Box::new(work),
+                                                        );
                                                     }
                                                 }
                                             } else {
                                                 // Payload read failed — wrap consumed header bytes.
-                                                work = IoStream::BufferedRead(consumed, 0, Box::new(work));
+                                                work = IoStream::BufferedRead(
+                                                    consumed,
+                                                    0,
+                                                    Box::new(work),
+                                                );
                                             }
                                         } else {
                                             // Invalid V1 length — wrap consumed header bytes.
-                                            work = IoStream::BufferedRead(consumed, 0, Box::new(work));
+                                            work =
+                                                IoStream::BufferedRead(consumed, 0, Box::new(work));
                                         }
                                     }
                                     Err(_) => {
@@ -412,7 +430,9 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                 if payload.len() >= 2 {
                                     let type_id = u16::from_be_bytes([payload[0], payload[1]]);
                                     if type_id == msg::V2_TYPE_NAT_HOLE_SID {
-                                        if let Ok(sid_msg) = serde_json::from_slice::<msg::NatHoleSid>(&payload[2..]) {
+                                        if let Ok(sid_msg) =
+                                            serde_json::from_slice::<msg::NatHoleSid>(&payload[2..])
+                                        {
                                             if let Some(sid) = sid_msg.sid {
                                                 if !sid.is_empty() {
                                                     debug!(label = %label, proxy_name = %proxy_name, "XTCP work conn {}: NatHoleSid (V2) for '{}'", label, proxy_name);
@@ -488,8 +508,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     // Shared last_remote_addr: the server tells us the remote user's address
                     // in each UDPPacket. We must echo it back so the server can route
                     // the response to the correct remote user (not the local echo service).
-                    let last_remote: Arc<Mutex<Option<msg::UdpAddr>>> =
-                        Arc::new(Mutex::new(None));
+                    let last_remote: Arc<Mutex<Option<msg::UdpAddr>>> = Arc::new(Mutex::new(None));
 
                     // Reader: work conn → local UDP socket
                     // Decrypt/decompress before forwarding to local service
@@ -557,10 +576,14 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                     payload.clear();
                                     payload.extend_from_slice(&buf[..n]);
                                     if use_comp {
-                                        if let Ok(c) = encryption::compress(&payload) { payload = c; }
+                                        if let Ok(c) = encryption::compress(&payload) {
+                                            payload = c;
+                                        }
                                     }
                                     if use_enc {
-                                        if let Ok(e) = encryption::encrypt(&payload, &enc_key) { payload = e; }
+                                        if let Ok(e) = encryption::encrypt(&payload, &enc_key) {
+                                            payload = e;
+                                        }
                                     }
                                     // Use saved remote_addr from server (the true remote user)
                                     let remote = last_remote_w.lock().await.clone();
@@ -598,12 +621,13 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                             if !info.proxy_protocol_version.is_empty() {
                                 if let Some(ref src) = swc.src_addr {
                                     if info.proxy_protocol_version == "v1" {
-                                        let header = frp_core::proxy_protocol::build_proxy_protocol_v1(
-                                            src,
-                                            swc.dst_addr.as_deref().unwrap_or("0.0.0.0"),
-                                            swc.src_port.unwrap_or(0) as u16,
-                                            swc.dst_port.unwrap_or(0) as u16,
-                                        );
+                                        let header =
+                                            frp_core::proxy_protocol::build_proxy_protocol_v1(
+                                                src,
+                                                swc.dst_addr.as_deref().unwrap_or("0.0.0.0"),
+                                                swc.src_port.unwrap_or(0) as u16,
+                                                swc.dst_port.unwrap_or(0) as u16,
+                                            );
                                         if let Err(e) = local.write_all(header.as_bytes()).await {
                                             warn!(error = %e, "Failed to write PROXY v1 header: {}", e);
                                         }
@@ -634,7 +658,18 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                             let use_enc = swc.use_encryption.unwrap_or(info.use_encryption);
                             let use_comp = swc.use_compression.unwrap_or(info.use_compression);
                             let enc = if use_enc { Some(&enc_key) } else { None };
-                            proxy::bridge_streams(local, work, proxy_name, use_enc, use_comp, enc, info.bandwidth_limit, &info.bandwidth_limit_mode, proxy_metrics).await;
+                            proxy::bridge_streams(
+                                local,
+                                work,
+                                proxy_name,
+                                use_enc,
+                                use_comp,
+                                enc,
+                                info.bandwidth_limit,
+                                &info.bandwidth_limit_mode,
+                                proxy_metrics,
+                            )
+                            .await;
                         }
                         Err(e) => {
                             warn!(label = %label, local_addr = %info.local_addr, error = %e, "Work conn {}: failed to connect to local {}: {}", label, info.local_addr, e);

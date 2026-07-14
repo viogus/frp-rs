@@ -4,7 +4,7 @@ use tracing::debug;
 
 use frp_core::config::PluginConfig;
 
-use super::{PluginHandle, base64_decode, serve_plugin, split_host_port};
+use super::{base64_decode, serve_plugin, split_host_port, PluginHandle};
 
 /// Start an HTTP proxy plugin server.
 ///
@@ -18,7 +18,8 @@ pub async fn start_http_proxy(cfg: &PluginConfig) -> Result<PluginHandle, frp_co
         if let Err(e) = handle_http_proxy_conn(stream, auth).await {
             debug!(%peer, error = %e, "http_proxy: {peer} error: {e}");
         }
-    }).await
+    })
+    .await
 }
 
 #[derive(Clone)]
@@ -69,7 +70,10 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
     let mut buf = Vec::new();
     let mut chunk = [0u8; 512];
     loop {
-        let n = client.read(&mut chunk).await.map_err(|e| format!("read: {e}"))?;
+        let n = client
+            .read(&mut chunk)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
         if n == 0 {
             return Err("connection closed".into());
         }
@@ -135,7 +139,10 @@ async fn handle_connect(mut client: TcpStream, target: &str) -> Result<(), Strin
 
     // Tell client connection established
     let resp = b"HTTP/1.1 200 Connection Established\r\n\r\n";
-    client.write_all(resp).await.map_err(|e| format!("write: {e}"))?;
+    client
+        .write_all(resp)
+        .await
+        .map_err(|e| format!("write: {e}"))?;
 
     // Bidirectional copy
     let _ = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
@@ -168,9 +175,7 @@ async fn handle_http_forward(
     // Build forwarded request: rewrite request line, strip Proxy-Auth, add Connection: close
     let headers_str = String::from_utf8_lossy(header_bytes);
     let mut header_lines: Vec<&str> = headers_str.lines().skip(1).collect();
-    header_lines.retain(|line| {
-        !line.to_lowercase().starts_with("proxy-authorization:")
-    });
+    header_lines.retain(|line| !line.to_lowercase().starts_with("proxy-authorization:"));
 
     let mut fwd = Vec::new();
     fwd.extend_from_slice(format!("{method} {path} HTTP/1.0\r\n").as_bytes());

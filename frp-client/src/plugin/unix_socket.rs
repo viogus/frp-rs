@@ -22,9 +22,11 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
 
     debug!(path = %path, "unix_domain_socket plugin: connecting to {}", path);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
-        frp_core::Error::Transport(format!("unix_domain_socket plugin: bind: {e}").into())
-    })?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| {
+            frp_core::Error::Transport(format!("unix_domain_socket plugin: bind: {e}").into())
+        })?;
     let local_addr = listener.local_addr().map_err(|e| {
         frp_core::Error::Transport(format!("unix_domain_socket plugin: local_addr: {e}").into())
     })?;
@@ -83,7 +85,9 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
 }
 
 #[cfg(not(unix))]
-pub async fn start_unix_socket_plugin(_cfg: &PluginConfig) -> Result<PluginHandle, frp_core::Error> {
+pub async fn start_unix_socket_plugin(
+    _cfg: &PluginConfig,
+) -> Result<PluginHandle, frp_core::Error> {
     Err(frp_core::Error::Transport(
         "unix_domain_socket plugin is not supported on this platform".into(),
     ))
