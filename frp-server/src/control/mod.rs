@@ -250,6 +250,10 @@ pub async fn handle_control<S>(
             server_additional_auth_scopes: None,
         });
         let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+        // Clean up OIDC subject inserted before login validation.
+        if oidc_subject.is_some() {
+            state.oidc.subjects.write().await.remove(&run_id);
+        }
         return;
     }
 

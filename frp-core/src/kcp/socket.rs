@@ -123,6 +123,13 @@ impl KcpSocket {
                         if let Err(e) = session.recv_and_push() {
                             tracing::debug!(conv = key.0, peer = %key.1, error = %e, "KCP recv error");
                             to_remove.push(*key);
+                            continue;
+                        }
+                        // Remove dead sessions (retransmission exhaustion).
+                        // is_dead_link() was previously defined but never called.
+                        if session.is_dead_link() {
+                            tracing::warn!(conv = key.0, peer = %key.1, "KCP session dead link (retransmission limit)");
+                            to_remove.push(*key);
                         }
                     }
                     for key in to_remove {
