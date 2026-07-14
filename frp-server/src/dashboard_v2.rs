@@ -151,7 +151,7 @@ struct V2ProxyResp {
     status: V2ProxyStatus,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Default)]
 struct V2ProxySpec {
     #[serde(rename = "type")]
     proxy_type: String,
@@ -299,14 +299,14 @@ fn parse_page(p: Option<u32>, ps: Option<u32>) -> Result<(u32, u32), (StatusCode
     Ok((page, size))
 }
 
-fn paginate<T: Serialize + Clone>(items: Vec<T>, page: u32, page_size: u32) -> V2PageResp<T> {
+fn paginate<T: Serialize>(mut items: Vec<T>, page: u32, page_size: u32) -> V2PageResp<T> {
     let total = items.len();
     let start = ((page as usize).saturating_sub(1)).saturating_mul(page_size as usize);
     let items = if start >= total {
         Vec::new()
     } else {
         let end = (start + page_size as usize).min(total);
-        items[start..end].to_vec()
+        items.drain(start..end).collect()
     };
     V2PageResp { total, page, page_size, items }
 }
@@ -409,18 +409,40 @@ fn proxy_base_spec(info: &crate::proxy::ProxyInfo) -> V2ProxyBaseSpec {
 }
 
 fn proxy_spec(info: &crate::proxy::ProxyInfo) -> V2ProxySpec {
-    let base = proxy_base_spec(info);
-    let pt = info.proxy_type.as_str();
-    V2ProxySpec {
-        proxy_type: info.proxy_type.clone(),
-        tcp: if pt == "tcp" { Some(V2TcpUdpSpec { base: base.clone(), remote_port: info.remote_port }) } else { None },
-        udp: if pt == "udp" { Some(V2TcpUdpSpec { base: base.clone(), remote_port: info.remote_port }) } else { None },
-        http: if pt == "http" { Some(V2HttpSpec { base: base.clone(), custom_domains: info.custom_domains.clone(), subdomain: String::new(), host_header_rewrite: String::new() }) } else { None },
-        https: if pt == "https" { Some(V2HttpsSpec { base: base.clone(), custom_domains: info.custom_domains.clone(), subdomain: String::new() }) } else { None },
-        tcpmux: if pt == "tcpmux" { Some(V2TcpMuxSpec { base: base.clone(), custom_domains: info.custom_domains.clone(), subdomain: String::new(), multiplexer: info.multiplexer.clone() }) } else { None },
-        stcp: if pt == "stcp" { Some(V2BaseOnlySpec { base: base.clone() }) } else { None },
-        sudp: if pt == "sudp" { Some(V2BaseOnlySpec { base: base.clone() }) } else { None },
-        xtcp: if pt == "xtcp" { Some(V2BaseOnlySpec { base: base.clone() }) } else { None },
+    // Match on proxy type once; move base into the matching variant.
+    // Avoids 7 unnecessary clone()s of the V2ProxyBaseSpec.
+    macro_rules! spec {
+        ($variant:ident, $ctor:expr) => {{
+            let base = proxy_base_spec(info);
+            let mut s = V2ProxySpec::default();
+            s.$variant = Some($ctor(base));
+            s
+        }};
+    }
+    match info.proxy_type.as_str() {
+        "tcp" => spec!(tcp, |base| V2TcpUdpSpec { base, remote_port: info.remote_port }),
+        "udp" => spec!(udp, |base| V2TcpUdpSpec { base, remote_port: info.remote_port }),
+        "http" => spec!(http, |base| V2HttpSpec {
+            base,
+            custom_domains: info.custom_domains.clone(),
+            subdomain: String::new(),
+            host_header_rewrite: String::new(),
+        }),
+        "https" => spec!(https, |base| V2HttpsSpec {
+            base,
+            custom_domains: info.custom_domains.clone(),
+            subdomain: String::new(),
+        }),
+        "tcpmux" => spec!(tcpmux, |base| V2TcpMuxSpec {
+            base,
+            custom_domains: info.custom_domains.clone(),
+            subdomain: String::new(),
+            multiplexer: info.multiplexer.clone(),
+        }),
+        "stcp" => spec!(stcp, |base| V2BaseOnlySpec { base }),
+        "sudp" => spec!(sudp, |base| V2BaseOnlySpec { base }),
+        "xtcp" => spec!(xtcp, |base| V2BaseOnlySpec { base }),
+        _ => V2ProxySpec { proxy_type: info.proxy_type.clone(), ..Default::default() },
     }
 }
 
@@ -616,13 +638,14 @@ async fn handle_v2_clients(
         if let Some(ref rid) = q.run_id { if *rid != *run_id { continue; } }
         if let Some(ref cid) = q.client_id { if *cid != *run_id { continue; } }
 
+        let proxy_count = proxies.len();
         let entry = V2ClientEntry {
             run_id: run_id.clone(),
             client_addr,
             online,
             login_time_secs: login_secs,
-            proxy_count: proxies.len(),
-            proxies: proxies.clone(),
+            proxy_count,
+            proxies,
             pool_size: ctl.pool_stats.pool_size.load(Ordering::Relaxed),
             pending_requests: ctl.pool_stats.pending_requests.load(Ordering::Relaxed),
         };

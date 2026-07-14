@@ -40,7 +40,7 @@ rustls-platform-verifier = "0.6"
 ring = "0.17"
 jsonwebtoken = "9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-axum = "0.8.9"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query", "tracing"] }
 prometheus = "0.14"
 yamux = "0.14"
 russh = { version = "0.61", default-features = false, features = ["ring", "rsa"] }
