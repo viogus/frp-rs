@@ -119,6 +119,33 @@ impl ProxyManager {
         }
     }
 
+    /// Remove all proxies belonging to a disconnected client.
+    ///
+    /// ## Lock ordering
+    ///
+    /// The canonical lock acquisition order is:
+    ///   1. `self.proxies` (tokio RwLock)
+    ///   2. `self.by_client` (tokio RwLock)
+    ///   3. `self.groups` (tokio RwLock)
+    ///   4. `self.group_counters` (std Mutex)
+    ///
+    /// When a proxy belongs to a group, we must clean up the group entry.
+    /// To avoid deadlock, we **drop** proxies and by_client before acquiring
+    /// groups (step 3). After the group cleanup, we **re-acquire** proxies
+    /// and by_client to continue iterating. This drop/reacquire is correct
+    /// because:
+    ///   - `client_proxies.keys()` is an owned Vec (from `by_client.remove`)
+    ///     and does not borrow the lock guards.
+    ///   - The loop over proxy names iterates the owned keys — no iterator
+    ///     invalidation risk from releasing and reacquiring.
+    ///   - Other clients may add/remove proxies between the drop and
+    ///     reacquire, but only THIS client's proxies are being removed,
+    ///     and `by_client.remove(run_id)` already took them out — no other
+    ///     task can observe them.
+    ///
+    /// **Do not** reorder these locks without verifying the full call graph
+    /// for cycles. The existing callers acquire in this order; changing it
+    /// risks deadlock with `register`, `unregister`, or `select_group_backend`.
     pub async fn remove_client(&self, run_id: &str) {
         let mut proxies = self.proxies.write().await;
         let mut by_client = self.by_client.write().await;
@@ -127,8 +154,9 @@ impl ProxyManager {
                 if let Some(info) = proxies.remove(name) {
                     if let Some(ref group) = info.group {
                         if !group.is_empty() {
-                            // Clean group — acquire groups lock after dropping proxies
-                            // to avoid deadlock. We'll handle this after the main cleanup.
+                            // Drop proxies and by_client to avoid deadlock
+                            // when acquiring the groups lock below.
+                            // See doc comment above for the full ordering.
                             drop(proxies);
                             drop(by_client);
                             let mut groups = self.groups.write().await;
@@ -136,12 +164,17 @@ impl ProxyManager {
                                 members.retain(|n| n != name);
                                 if members.is_empty() {
                                     groups.remove(group);
-                                    // Clean up stale round-robin counter
+                                    // Clean up stale round-robin counter.
+                                    // group_counters is a std Mutex (not
+                                    // tokio), so it must not be held across
+                                    // .await. It is always acquired last.
                                     let mut counters = self.group_counters.lock().unwrap();
                                     counters.remove(group);
                                 }
                             }
-                            // Re-acquire for the loop
+                            // Re-acquire proxies and by_client for the
+                            // remaining loop iterations. Safe because we
+                            // iterate over owned keys (see doc comment).
                             proxies = self.proxies.write().await;
                             by_client = self.by_client.write().await;
                         }
