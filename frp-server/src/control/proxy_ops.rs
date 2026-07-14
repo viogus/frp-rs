@@ -533,12 +533,11 @@ pub(crate) async fn unregister_control(state: &Arc<AppState>, run_id: &str, skip
         let mut routes = state.vnet_routes.write().await;
         routes.retain(|_, (_, name)| !proxies.iter().any(|p| &p.name == name));
     }
-    // Clean up OIDC subject mappings for all proxies of this client.
-    // When a control connection drops, any OIDC subject→proxy entries
-    // pointing to this client's proxies must be removed to prevent
-    // unbounded memory growth.
+    // Clean up OIDC subject mapping for this client.
+    // Map key is run_id; remove it directly rather than scanning values
+    // (which are OIDC subject strings, not proxy names — retain would
+    // never match and entries would leak unboundedly).
     {
-        let mut subjects = state.oidc.subjects.write().await;
-        subjects.retain(|_, proxy_name| !proxies.iter().any(|p| &p.name == proxy_name));
+        state.oidc.subjects.write().await.remove(run_id);
     }
 }

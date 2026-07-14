@@ -100,6 +100,9 @@ pub struct Service {
     visitor_tx: mpsc::UnboundedSender<VisitorRequest>,
     /// Receiver side of visitor channel — consumed by run().
     visitor_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<VisitorRequest>>>,
+    /// Per-proxy health check cancel flags. Keyed by proxy name.
+    /// Set to true on CloseProxy/CloseProxyResp; entry removed in try_reload.
+    health_cancels: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// Shared TUN devices for vnet proxies, keyed by proxy name.
     /// Work connection tasks take ownership of the TUN device via Option::take().
     #[cfg(feature = "vnet")]
@@ -304,6 +307,7 @@ impl Service {
             xtcp_rx: std::sync::Mutex::new(Some(xtcp_rx)),
             visitor_tx,
             visitor_rx: std::sync::Mutex::new(Some(visitor_rx)),
+            health_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(feature = "vnet")]
             vnet_tuns,
             #[cfg(feature = "vnet")]
@@ -407,8 +411,8 @@ impl Service {
 
         // Cancellation flags for health check tasks — set to true when a proxy
         // is closed (via CloseProxy from server, admin, or health check failure).
-        let health_cancels: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        // Stored on self so try_reload() can cancel health checks for removed proxies.
+        let health_cancels = self.health_cancels.clone();
 
         self.spawn_health_checks(&proxies, &health_tx, &health_cancels).await;
 
@@ -798,17 +802,21 @@ impl Service {
                             }
                             Ok(FrpMessage::CloseProxy(cp)) => {
                                 info!(proxy_name = %cp.proxy_name, "Server closed proxy: {}", cp.proxy_name);
-                                // Cancel health check task for this proxy.
-                                if let Some(cancel) = health_cancels.lock().unwrap().get(&cp.proxy_name) {
+                                // Cancel health check task and remove map entry.
+                                let mut cancels = health_cancels.lock().unwrap();
+                                if let Some(cancel) = cancels.get(&cp.proxy_name) {
                                     cancel.store(true, Ordering::Relaxed);
                                 }
+                                cancels.remove(&cp.proxy_name);
                             }
                             Ok(FrpMessage::CloseProxyResp(cpr)) => {
                                 info!(proxy_name = %cpr.proxy_name, "Server confirmed proxy close: {}", cpr.proxy_name);
-                                // Cancel health check task for this proxy.
-                                if let Some(cancel) = health_cancels.lock().unwrap().get(&cpr.proxy_name) {
+                                // Cancel health check task and remove map entry.
+                                let mut cancels = health_cancels.lock().unwrap();
+                                if let Some(cancel) = cancels.get(&cpr.proxy_name) {
                                     cancel.store(true, Ordering::Relaxed);
                                 }
+                                cancels.remove(&cpr.proxy_name);
                             }
                             Ok(FrpMessage::Error(err)) => {
                                 warn!(error = %err.error, "Server error: {}", err.error);
@@ -919,11 +927,12 @@ impl Service {
                         if let Err(e) = write_msg(&mut *writer.lock().await, &close, v2).await {
                             warn!(proxy_name = %proxy_name, error = %e, "Failed to send CloseProxy for {}: {}", proxy_name, e);
                         }
-                        // Cancel health check task for this proxy (already stopped itself,
-                        // but set the flag for any other listeners).
-                        if let Some(cancel) = health_cancels.lock().unwrap().get(&proxy_name) {
+                        // Cancel health check task and remove map entry.
+                        let mut cancels = health_cancels.lock().unwrap();
+                        if let Some(cancel) = cancels.get(&proxy_name) {
                             cancel.store(true, Ordering::Relaxed);
                         }
+                        cancels.remove(&proxy_name);
                     }
 
                     Some(req) = reload_rx.recv() => {
@@ -1407,8 +1416,19 @@ impl Service {
 
         let v2 = self.cfg.v2;
 
-        // Step 1: Drop old PluginHandles for removed and changed proxies.
-        // PluginHandle::Drop sends a oneshot shutdown signal to the plugin task.
+        // Step 1: Cancel health checks and drop old PluginHandles for removed
+        // and changed proxies. Health check tasks hold Arc<AtomicBool> cancel
+        // flags — setting them to true stops the health check loop. PluginHandle::Drop
+        // sends a oneshot shutdown signal to the plugin task.
+        {
+            let mut cancels = self.health_cancels.lock().unwrap();
+            for name in delta.removed.iter().chain(delta.changed.iter()) {
+                if let Some(cancel) = cancels.get(name) {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                cancels.remove(name);
+            }
+        }
         {
             let mut handles = self.plugin_handles.lock().unwrap();
             for name in delta.removed.iter().chain(delta.changed.iter()) {

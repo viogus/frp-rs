@@ -327,11 +327,13 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
             let mut iv = [0u8; 16];
             rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut iv);
             this.cfb = Some(CfbState::new(&this.key, &iv));
-            let mut encrypted = buf.to_vec();
-            this.cfb.as_mut().unwrap().encrypt(&mut encrypted);
-            let mut output = Vec::with_capacity(16 + encrypted.len());
+            // Encrypt into reusable scratch buffer — avoids buf.to_vec() allocation.
+            this.scratch.clear();
+            this.scratch.extend_from_slice(buf);
+            this.cfb.as_mut().unwrap().encrypt(&mut this.scratch);
+            let mut output = Vec::with_capacity(16 + this.scratch.len());
             output.extend_from_slice(&iv);
-            output.extend_from_slice(&encrypted);
+            output.extend_from_slice(&this.scratch);
             match Pin::new(&mut this.inner).poll_write(cx, &output) {
                 Poll::Ready(Ok(n)) if n >= output.len() => {
                     return Poll::Ready(Ok(buf.len()));
@@ -683,11 +685,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
             this.iv_sent = true;
             this.write_cfb = Some(CfbState::new(&this.write_key, &this.write_iv));
             tracing::debug!(iv_hex = %hex::encode(this.write_iv), data_len = buf.len(), "CipherStream: first write, sending IV + encrypted data");
-            let mut encrypted = buf.to_vec();
-            this.write_cfb.as_mut().unwrap().encrypt(&mut encrypted);
-            let mut output = Vec::with_capacity(16 + encrypted.len());
+            // Encrypt into reusable scratch buffer — avoids buf.to_vec() allocation.
+            this.scratch.clear();
+            this.scratch.extend_from_slice(buf);
+            this.write_cfb.as_mut().unwrap().encrypt(&mut this.scratch);
+            let mut output = Vec::with_capacity(16 + this.scratch.len());
             output.extend_from_slice(&this.write_iv);
-            output.extend_from_slice(&encrypted);
+            output.extend_from_slice(&this.scratch);
             match Pin::new(&mut this.inner).poll_write(cx, &output) {
                 Poll::Ready(Ok(n)) if n >= output.len() => {
                     return Poll::Ready(Ok(buf.len()));

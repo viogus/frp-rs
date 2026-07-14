@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rand::RngExt;
+use rand::Rng;
 use tracing::{error, info, warn};
 
 use frp_core::config::ProxyConfig;
@@ -77,7 +77,7 @@ pub fn save_store(path: &Path, configs: &HashMap<String, ProxyConfig>) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let random_suffix: u16 = rand::rng().random();
+    let random_suffix: u16 = rand::thread_rng().gen();
     let tmp_path = {
         let mut tmp = path.as_os_str().to_os_string();
         tmp.push(format!(".{nanos}_{random_suffix:04x}.tmp"));

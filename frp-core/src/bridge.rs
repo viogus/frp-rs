@@ -151,6 +151,7 @@ pub async fn bridge_encrypted(
             return;
         }
         let mut buf = PoolGuard::acquire();
+        let cap = buf.as_mut_slice().len();
         let mut comp_buf = Vec::new(); // reusable compression buffer
         loop {
             let n = match user_r.read(buf.as_mut_slice()).await {
@@ -182,7 +183,10 @@ pub async fn bridge_encrypted(
                 }
                 if enc_work_w.write_encrypted(slice).await.is_err() { break; }
             }
-            if enc_work_w.flush().await.is_err() { break; }
+            // Conditional flush: batch on full reads unless compressing
+            // (matching bridge_plain behavior — CFB is a streaming cipher
+            // and does not require per-chunk flushes).
+            if (use_compression || n < cap) && enc_work_w.flush().await.is_err() { break; }
         }
         // Symmetric shutdown: signal EOF to work side (matching bridge_plain).
         // When pre_read bytes were forwarded (e.g. VHost), leave work_w open
@@ -197,6 +201,7 @@ pub async fn bridge_encrypted(
     // Work → User: read from work (decrypted), decompress, write to user
     let work_to_user = async {
         let mut buf = PoolGuard::acquire();
+        let cap = buf.as_mut_slice().len();
         let mut decomp_buf = Vec::new(); // reusable decompression buffer
         let mut decompressor = make_decompressor(use_compression);
         loop {
@@ -223,7 +228,9 @@ pub async fn bridge_encrypted(
                 if let Some(ref m) = metrics {
                     m.bytes_out.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
                 }
-                if user_w.flush().await.is_err() { break; }
+                // Conditional flush: batch on full reads unless compressing
+                // (matching bridge_plain + user_to_work above).
+                if (use_compression || n < cap) && user_w.flush().await.is_err() { break; }
             }
         }
         // Flush remaining buffered compressed data

@@ -410,7 +410,7 @@ impl KcpSession {
                             if self.read_tx.send(self.recv_buf[..n].to_vec()).is_err() {
                                 self.shutdown = true;
                                 tracing::debug!(conv = self.conv, "KCP SESSION: read_tx closed, shutting down conv {}", self.conv);
-                                return Ok(());
+                                return Err(io::Error::new(io::ErrorKind::NotConnected, "KCP read channel closed"));
                             }
                         }
                         Err(e) => return Err(io::Error::other(e)),
@@ -431,7 +431,6 @@ impl KcpSession {
     }
 
     /// Check if the KCP connection is dead (too many retransmissions).
-    #[allow(dead_code)]
     pub fn is_dead_link(&self) -> bool {
         self.kcp.is_dead_link()
     }

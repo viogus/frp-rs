@@ -1095,7 +1095,7 @@ async fn load_or_generate_host_key(
     }
 
     // Generate new Ed25519 key
-    let mut rng = rand::rng();
+    let mut rng = rand010::rng();
     let key = russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519)
         .map_err(|e| format!("generate key: {}", e))?;
     let pem = key
@@ -1183,7 +1183,7 @@ mod key_tests {
 
         // Create explicit key
         let explicit_path = dir.path().join("explicit_key");
-        let mut rng = rand::rng();
+        let mut rng = rand010::rng();
         let explicit = russh::keys::PrivateKey::random(
             &mut rng,
             russh::keys::Algorithm::Ed25519,
