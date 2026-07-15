@@ -276,7 +276,13 @@ pub(crate) async fn run_visitor_listener(
                                 let sid = resp.sid.clone().unwrap_or_default();
                                 let conv = frp_core::xtcp_p2p::conv_from_sid(&sid);
                                 let kcp_cfg = frp_core::kcp::KcpConfig::default();
-                                // Go v0.70 compat: yamux client (visitor opens stream).
+                                // Go v0.70 compat: NatHoleSid detect + yamux client.
+                                let p2p_key = if !sk.is_empty() {
+                                    Some(frp_core::xtcp_p2p::derive_detect_key(&sk))
+                                } else {
+                                    None
+                                };
+                                let p2p_sid = if sid.is_empty() { None } else { Some(sid.as_str()) };
                                 match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
                                     socket,
                                     &candidates,
@@ -284,6 +290,8 @@ pub(crate) async fn run_visitor_listener(
                                     kcp_cfg,
                                     fallback_timeout_ms,
                                     true,  // yamux_client = visitor
+                                    p2p_sid,
+                                    p2p_key.as_ref(),
                                 ).await {
                                     Ok(mut p2p_stream) => {
                                         info!(visitor_name = %visitor_name, "Visitor '{}': XTCP P2P connected via KCP", visitor_name);

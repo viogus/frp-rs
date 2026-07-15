@@ -1279,9 +1279,17 @@ impl Service {
         }
 
         // Go v0.70 compat: UDP hole punch + KCP data plane.
-        let socket = match tokio::net::UdpSocket::bind("[::]:0").await {
+        // Bind socket matching the visitor's address family to avoid
+        // EINVAL on macOS when sending IPv4 from IPv6 socket.
+        let is_v4 = visitor_addr
+            .parse::<std::net::SocketAddr>()
+            .map(|a| a.is_ipv4())
+            .unwrap_or(false);
+        let bind_addr = if is_v4 { "0.0.0.0:0" } else { "[::]:0" };
+        let fallback = if is_v4 { "[::]:0" } else { "0.0.0.0:0" };
+        let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
             Ok(s) => s,
-            Err(_) => match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+            Err(_) => match tokio::net::UdpSocket::bind(fallback).await {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(proxy_name = %proxy_name, error = %e, "XTCP: failed to bind UDP socket: {}", e);
@@ -1294,6 +1302,12 @@ impl Service {
         let candidates = vec![visitor_addr];
         let conv = frp_core::xtcp_p2p::conv_from_sid(&sid);
         let kcp_cfg = frp_core::kcp::KcpConfig::default();
+        let p2p_key = if !xtcp_sk.is_empty() {
+            Some(frp_core::xtcp_p2p::derive_detect_key(&xtcp_sk))
+        } else {
+            None
+        };
+        let p2p_sid = if sid.is_empty() { None } else { Some(sid.as_str()) };
 
         match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
             socket,
@@ -1302,6 +1316,8 @@ impl Service {
             kcp_cfg,
             5000,
             false,  // yamux_client = false (provider/server)
+            p2p_sid,
+            p2p_key.as_ref(),
         ).await {
             Ok(mut p2p_stream) => {
                 if let Some(ref local) = local_addr {
@@ -1427,38 +1443,57 @@ impl Service {
                 map.remove(&sid_clone)
             };
 
-            let socket = match stun_socket {
-                Some(arc_sock) => {
-                    // Try to unwrap the Arc. If there are other references,
-                    // bind a fresh socket (unlikely — we removed from map).
-                    match std::sync::Arc::try_unwrap(arc_sock) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            warn!(proxy_name = %proxy_name_clone, "XTCP provider '{}': STUN socket still shared, binding fresh", proxy_name_clone);
-                            match tokio::net::UdpSocket::bind("[::]:0").await {
+            // Bind socket address family matching the first candidate to avoid
+            // IPv4/IPv6 mismatch (EINVAL on macOS).
+            let is_v4 = candidate_addrs
+                .first()
+                .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
+                .map(|a| a.is_ipv4())
+                .unwrap_or(false);
+            let bind_addr = if is_v4 { "0.0.0.0:0" } else { "[::]:0" };
+            let fallback_bind = if is_v4 { "[::]:0" } else { "0.0.0.0:0" };
+
+            let socket = if let Some(arc_sock) = stun_socket {
+                // Try to unwrap the Arc. If there are other references,
+                // bind a fresh socket (unlikely — we removed from map).
+                match std::sync::Arc::try_unwrap(arc_sock) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        warn!(proxy_name = %proxy_name_clone, "XTCP provider '{}': STUN socket still shared, binding fresh", proxy_name_clone);
+                        match tokio::net::UdpSocket::bind(bind_addr).await {
+                            Ok(s) => s,
+                            Err(_) => match tokio::net::UdpSocket::bind(fallback_bind).await {
                                 Ok(s) => s,
                                 Err(e) => {
                                     warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': failed to bind UDP socket", proxy_name_clone);
                                     return;
                                 }
-                            }
+                            },
                         }
                     }
                 }
-                None => {
-                    match tokio::net::UdpSocket::bind("[::]:0").await {
+            } else {
+                match tokio::net::UdpSocket::bind(bind_addr).await {
+                    Ok(s) => s,
+                    Err(_) => match tokio::net::UdpSocket::bind(fallback_bind).await {
                         Ok(s) => s,
                         Err(e) => {
                             warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': failed to bind UDP socket", proxy_name_clone);
                             return;
                         }
-                    }
+                    },
                 }
             };
 
             // UDP hole punch + KCP data plane (Go v0.70 compat).
             let conv = frp_core::xtcp_p2p::conv_from_sid(&sid_clone);
             let kcp_cfg = frp_core::kcp::KcpConfig::default();
+            let p2p_key = if !xtcp_sk.is_empty() {
+                Some(frp_core::xtcp_p2p::derive_detect_key(&xtcp_sk))
+            } else {
+                None
+            };
+            let p2p_sid = if sid_clone.is_empty() { None } else { Some(sid_clone.as_str()) };
             // Provider acts as yamux server: accepts the visitor's stream.
             match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
                 socket,
@@ -1467,6 +1502,8 @@ impl Service {
                 kcp_cfg,
                 5000,
                 false,  // yamux_client = false (provider/server)
+                p2p_sid,
+                p2p_key.as_ref(),
             ).await {
                 Ok(mut p2p_stream) => {
                     info!(proxy_name = %proxy_name_clone, "XTCP provider '{}': P2P connected via KCP+yamux", proxy_name_clone);

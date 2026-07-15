@@ -9,6 +9,24 @@
 //! 2. Exchange UDP punch packets with the peer's candidate addresses
 //! 3. Create a KCP session over the established UDP path
 //! 4. Expose an AsyncRead + AsyncWrite stream for bridging
+//!
+//! ## Hole-punch protocol (dual-mode)
+//!
+//! Two hole-punch modes are supported:
+//!
+//! **Rust↔Rust (simple "frp" magic):** Each side sends the 3-byte magic
+//! `b"frp"` to the peer's candidate addresses and waits for the same
+//! magic in response. Fast and simple — used when no secret key is
+//! provided.
+//!
+//! **Go-compat (encrypted NatHoleSid):** When a secret key is provided,
+//! the hole-punch sends Go frp-compatible `NatHoleSid` messages (JSON
+//! encrypted with AES-128-CFB). This is required for Go↔Rust XTCP P2P.
+//! The Rust side acts as sender (sends `response:false` first, waits for
+//! `response:true` echo) and also echoes back any incoming
+//! `response:false` probes (like Go's receiver role). This dual-role
+//! ensures compatibility with Go peers regardless of detect_behavior
+//! role assignment.
 
 use std::future::Future;
 use std::io;
@@ -49,35 +67,147 @@ pub fn conv_from_sid(sid: &str) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Go-compat NatHoleSid detect messages
+// ---------------------------------------------------------------------------
+
+/// Go frp v0.70 NatHoleSid message used during UDP hole-punch detection.
+///
+/// Matches Go struct wire format exactly: `json:"...,omitempty"` on all
+/// fields. Go's omitempty omits zero values (false for bool, "" for string).
+/// Deserialization uses `#[serde(default)]` to handle missing fields.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct NatHoleDetectSid {
+    #[serde(rename = "transaction_id", default, skip_serializing_if = "String::is_empty")]
+    transaction_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    sid: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    response: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    nonce: String,
+}
+
+/// Serde helper: skip serializing `false` bool values (match Go omitempty).
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
+impl NatHoleDetectSid {
+    fn new(sid: &str, response: bool) -> Self {
+        Self {
+            transaction_id: uuid::Uuid::new_v4().to_string(),
+            sid: sid.to_string(),
+            response,
+            nonce: String::new(),
+        }
+    }
+}
+
+/// Encode a `NatHoleDetectSid` for UDP hole-punch detection.
+/// Format matches Go frp v0.70 `EncodeMessage` in nathole/utils.go:
+///   V1 framing (type byte '5' + 8-byte BE length + JSON) → AES-128-CFB encrypt
+///   with PBKDF2-SHA1(key, salt="frp", iter=64, len=16) key + random 16-byte IV.
+fn encode_detect_msg(msg: &NatHoleDetectSid, key: &[u8; 16]) -> Result<Vec<u8>, String> {
+    // V1 framing: 1-byte type + 8-byte BE length + JSON payload.
+    // Go frp TypeNatHoleSid = '5' = 0x35.
+    let json = serde_json::to_vec(msg).map_err(|e| format!("json encode: {e}"))?;
+    let json_len = json.len() as u64;
+    let mut frame = Vec::with_capacity(9 + json.len());
+    frame.push(0x35u8); // TypeNatHoleSid = '5'
+    frame.extend_from_slice(&json_len.to_be_bytes());
+    frame.extend_from_slice(&json);
+    crate::encryption::encrypt(&frame, key)
+}
+
+/// Decode a `NatHoleDetectSid` from UDP hole-punch detection data.
+/// Reverse of `encode_detect_msg`: AES-128-CFB decrypt → parse V1 framing
+/// (1-byte type + 8-byte BE length + JSON) → deserialize JSON.
+fn decode_detect_msg(data: &[u8], key: &[u8; 16]) -> Result<NatHoleDetectSid, String> {
+    let frame = crate::encryption::decrypt(data, key)?;
+    if frame.len() < 9 {
+        return Err("frame too short for V1 header".into());
+    }
+    // Type byte is at offset 0; we don't validate it strictly since some
+    // Go messages may use different framing.
+    let json_len = u64::from_be_bytes(frame[1..9].try_into().unwrap()) as usize;
+    if frame.len() < 9 + json_len {
+        return Err(format!(
+            "frame truncated: need {} bytes, have {}",
+            9 + json_len,
+            frame.len()
+        ));
+    }
+    let json = &frame[9..9 + json_len];
+    serde_json::from_slice(json).map_err(|e| format!("json decode: {e}"))
+}
+
+/// Derive a 16-byte AES key from a secret key string for NatHoleSid detection.
+///
+/// Go frp v0.70 calls `crypto.Encode()` from `github.com/fatedier/golib/crypto`,
+/// which internally derives: `pbkdf2.Key(key, "frp", 64, 16, sha1.New)`.
+/// Go frp sets `crypto.DefaultSalt = "frp"` at startup in both client and
+/// server. This matches Rust's `encryption::derive_key`.
+pub fn derive_detect_key(sk: &str) -> [u8; 16] {
+    crate::encryption::derive_key(sk)
+}
+
+// ---------------------------------------------------------------------------
 // Hole punching
 // ---------------------------------------------------------------------------
 
-/// Punch a UDP hole to the peer by sending magic packets to each candidate
-/// address and waiting for a response. Returns the confirmed peer address.
+/// Punch a UDP hole to the peer. Returns the confirmed peer address.
+///
+/// Two modes:
+/// - **Simple** (no key): send "frp" magic, wait for "frp" back. Used for Rust↔Rust.
+/// - **Go-compat** (with key): send encrypted NatHoleSid, accept both
+///   NatHoleSid{response:true} and "frp" magic as valid responses.
+///   Also echoes NatHoleSid{response:false} probes (Go receiver role).
 ///
 /// `socket` should be the same UDP socket used for STUN (already bound).
 /// `candidates` are the peer's candidate addresses from the server's
-/// NatHoleResp.
+/// NatHoleResp. `sid` and `key` are only used in Go-compat mode.
 pub async fn punch_udp_hole(
     socket: &UdpSocket,
     candidates: &[String],
     timeout_ms: u64,
+    sid: Option<&str>,
+    key: Option<&[u8; 16]>,
 ) -> Result<SocketAddr, String> {
     if candidates.is_empty() {
         return Err("no candidate addresses".into());
     }
 
-    // Send hole-punch packets to all candidates.
-    for addr_str in candidates {
-        let peer: SocketAddr = addr_str
-            .parse()
-            .map_err(|e| format!("invalid candidate '{}': {}", addr_str, e))?;
-        // Fire-and-forget — some packets may be dropped by NAT.
-        let _ = socket.send_to(HOLE_PUNCH_MAGIC, peer).await;
+    // Parse all candidates upfront.
+    let peers: Vec<SocketAddr> = candidates
+        .iter()
+        .filter_map(|a| a.parse().ok())
+        .collect();
+    if peers.is_empty() {
+        return Err("no valid candidate addresses".into());
     }
 
-    // Wait for a hole-punch response from the peer.
-    let mut buf = [0u8; 16];
+    // --- Send phase: always send "frp" magic (Rust↔Rust compat) ---
+    for peer in &peers {
+        let _ = socket.send_to(HOLE_PUNCH_MAGIC, *peer).await;
+    }
+
+    // --- Send phase: Go-compat NatHoleSid ---
+    if let (Some(sid_str), Some(enc_key)) = (sid, key) {
+        let detect_msg = NatHoleDetectSid::new(sid_str, false);
+        let encoded = match encode_detect_msg(&detect_msg, enc_key) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::debug!("XTCP P2P: failed to encode NatHoleSid: {e}");
+                return Err(format!("encode NatHoleSid: {e}"));
+            }
+        };
+        for peer in &peers {
+            let _ = socket.send_to(&encoded, *peer).await;
+        }
+    }
+
+    // --- Receive phase: accept "frp" magic OR NatHoleSid{response:true} ---
+    let mut buf = [0u8; 1024];
     let deadline = tokio::time::timeout(
         std::time::Duration::from_millis(timeout_ms),
         socket.recv_from(&mut buf),
@@ -87,30 +217,99 @@ pub async fn punch_udp_hole(
 
     match deadline {
         Ok((n, peer)) => {
-            if &buf[..n] != HOLE_PUNCH_MAGIC {
-                // Not our magic — keep waiting (one more try).
-                tracing::debug!(peer = %peer, n, "XTCP P2P: unexpected hole-punch data from {}", peer);
-                let deadline2 = tokio::time::timeout(
-                    std::time::Duration::from_millis(timeout_ms),
-                    socket.recv_from(&mut buf),
-                )
-                .await
-                .map_err(|_| "hole punch timeout (2nd attempt)".to_string())?;
-                match deadline2 {
-                    Ok((n2, peer2)) => {
-                        if &buf[..n2] != HOLE_PUNCH_MAGIC {
-                            return Err(format!(
-                                "unexpected hole-punch data from {}",
-                                peer2
-                            ));
-                        }
-                        Ok(peer2)
-                    }
-                    Err(e) => Err(format!("recv error: {}", e)),
+            let data = &buf[..n];
+
+            // 1. Check for "frp" magic (Rust↔Rust).
+            if data == HOLE_PUNCH_MAGIC {
+                if peers.contains(&peer) {
+                    return Ok(peer);
                 }
-            } else {
-                Ok(peer)
+                // From non-candidate — retry once.
+                return recv_second_attempt(socket, timeout_ms, sid, key, &peers).await;
             }
+
+            // 2. Check for Go-compat NatHoleSid.
+            if let (Some(sid_str), Some(enc_key)) = (sid, key) {
+                match decode_detect_msg(data, enc_key) {
+                    Ok(msg) => {
+                        if msg.sid != sid_str {
+                            // Wrong sid — retry once.
+                            tracing::debug!(peer = %peer, msg_sid = %msg.sid, our_sid = %sid_str,
+                                "XTCP P2P: NatHoleSid with wrong sid");
+                            return recv_second_attempt(socket, timeout_ms, sid, key, &peers).await;
+                        }
+                        if msg.response {
+                            // Got response:true from peer → hole punched!
+                            tracing::debug!(peer = %peer, "XTCP P2P: got NatHoleSid response from {}", peer);
+                            return Ok(peer);
+                        }
+                        // Got response:false probe → echo back (Go receiver role).
+                        let mut echo = msg;
+                        echo.response = true;
+                        if let Ok(encoded) = encode_detect_msg(&echo, enc_key) {
+                            let _ = socket.send_to(&encoded, peer).await;
+                            tracing::debug!(peer = %peer, "XTCP P2P: echoed NatHoleSid response to {}", peer);
+                        }
+                        // Continue waiting for response:true.
+                        return recv_second_attempt(socket, timeout_ms, sid, key, &peers).await;
+                    }
+                    Err(_) => {
+                        // Not NatHoleSid either — unknown data.
+                        tracing::debug!(peer = %peer, n, "XTCP P2P: unexpected hole-punch data from {}", peer);
+                        return recv_second_attempt(socket, timeout_ms, sid, key, &peers).await;
+                    }
+                }
+            }
+
+            // No key provided and data != "frp" — unknown, retry once.
+            tracing::debug!(peer = %peer, n, "XTCP P2P: unexpected hole-punch data from {}", peer);
+            recv_second_attempt(socket, timeout_ms, sid, key, &peers).await
+        }
+        Err(e) => Err(format!("recv error: {}", e)),
+    }
+}
+
+/// Second receive attempt. See `punch_udp_hole` for semantics of `sid`/`key`.
+async fn recv_second_attempt(
+    socket: &UdpSocket,
+    timeout_ms: u64,
+    sid: Option<&str>,
+    key: Option<&[u8; 16]>,
+    _peers: &[SocketAddr],
+) -> Result<SocketAddr, String> {
+    let mut buf = [0u8; 1024];
+    let deadline2 = tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        socket.recv_from(&mut buf),
+    )
+    .await
+    .map_err(|_| "hole punch timeout (2nd attempt)".to_string())?;
+
+    match deadline2 {
+        Ok((n, peer)) => {
+            let data = &buf[..n];
+
+            if data == HOLE_PUNCH_MAGIC {
+                return Ok(peer);
+            }
+
+            if let (Some(sid_str), Some(enc_key)) = (sid, key) {
+                if let Ok(msg) = decode_detect_msg(data, enc_key) {
+                    if msg.sid == sid_str && msg.response {
+                        return Ok(peer);
+                    }
+                    // Echo response:false probes.
+                    if msg.sid == sid_str && !msg.response {
+                        let mut echo = msg;
+                        echo.response = true;
+                        if let Ok(encoded) = encode_detect_msg(&echo, enc_key) {
+                            let _ = socket.send_to(&encoded, peer).await;
+                        }
+                    }
+                }
+            }
+
+            Err(format!("unexpected hole-punch data from {}", peer))
         }
         Err(e) => Err(format!("recv error: {}", e)),
     }
@@ -429,15 +628,20 @@ impl AsyncWrite for XtcpP2pStream {
 /// 3. Waits for peer's hole-punch response
 /// 4. Creates a KCP session over the established UDP path
 /// 5. Returns an AsyncRead + AsyncWrite stream
+///
+/// `sid` and `key` enable Go-compat hole-punch (encrypted NatHoleSid
+/// exchange). When both are `None`, uses simple "frp" magic (Rust↔Rust).
 pub async fn xtcp_p2p_connect(
     socket: UdpSocket,
     candidates: &[String],
     conv: u32,
     kcp_config: KcpConfig,
     hole_punch_timeout_ms: u64,
+    sid: Option<&str>,
+    key: Option<&[u8; 16]>,
 ) -> Result<XtcpP2pStream, String> {
     // 1. Punch hole.
-    let peer_addr = punch_udp_hole(&socket, candidates, hole_punch_timeout_ms).await?;
+    let peer_addr = punch_udp_hole(&socket, candidates, hole_punch_timeout_ms, sid, key).await?;
 
     tracing::info!(
         peer = %peer_addr,
@@ -470,6 +674,9 @@ pub async fn xtcp_p2p_connect(
 /// - `true` = visitor (opens yamux stream, Mode::Client)
 /// - `false` = provider (accepts yamux stream, Mode::Server)
 ///
+/// `sid` and `key` enable Go-compat NatHoleSid detection protocol.
+/// When both are `None`, uses simple "frp" magic (Rust↔Rust).
+///
 /// When `tcp-mux` feature is enabled, returns a yamux `Stream` (compat'd to
 /// tokio traits). When disabled, returns the raw KCP stream.
 ///
@@ -479,6 +686,7 @@ pub async fn xtcp_p2p_connect(
 /// when the peer stops responding.
 // --- yamux-enabled path (default) ---
 #[cfg(feature = "tcp-mux")]
+#[allow(clippy::too_many_arguments)]
 pub async fn xtcp_p2p_connect_yamux(
     socket: UdpSocket,
     candidates: &[String],
@@ -486,6 +694,8 @@ pub async fn xtcp_p2p_connect_yamux(
     kcp_config: KcpConfig,
     hole_punch_timeout_ms: u64,
     yamux_client: bool,
+    sid: Option<&str>,
+    key: Option<&[u8; 16]>,
 ) -> Result<crate::mux::YamuxStream, String> {
     use std::sync::Mutex;
     use std::time::Duration;
@@ -500,6 +710,8 @@ pub async fn xtcp_p2p_connect_yamux(
         conv,
         kcp_config,
         hole_punch_timeout_ms,
+        sid,
+        key,
     )
     .await?;
 
@@ -629,11 +841,22 @@ pub async fn xtcp_p2p_connect_yamux(
     kcp_config: KcpConfig,
     hole_punch_timeout_ms: u64,
     _yamux_client: bool,
+    _sid: Option<&str>,
+    _key: Option<&[u8; 16]>,
 ) -> Result<XtcpP2pStream, String> {
     tracing::info!(
         conv,
         "XTCP P2P: yamux disabled (tcp-mux feature off), using raw KCP stream, conv={}",
         conv,
     );
-    xtcp_p2p_connect(socket, candidates, conv, kcp_config, hole_punch_timeout_ms).await
+    xtcp_p2p_connect(
+        socket,
+        candidates,
+        conv,
+        kcp_config,
+        hole_punch_timeout_ms,
+        _sid,
+        _key,
+    )
+    .await
 }
