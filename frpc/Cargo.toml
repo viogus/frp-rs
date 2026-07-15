@@ -7,8 +7,8 @@ license = "MIT"
 [features]
 default = ["full"]
 full = ["frp-client/default"]
-# Tiny: removes heavy protocols (QUIC/KCP/WS/OIDC) but keeps TLS
-tiny = ["frp-client/tls"]
+# Tiny: removes heavy protocols (QUIC/KCP/WS/OIDC) but keeps TLS + tcp-mux
+tiny = ["frp-client/tls", "frp-client/tcp-mux"]
 # Micro: absolutely minimal — just TCP + V1/V2 core, no optional deps
 micro = []
 # Enable debug/trace logging for development. Default: info only.

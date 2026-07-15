@@ -17,6 +17,9 @@ pub struct KcpListener {
     /// Held to keep write/register channels alive for spawned driver.
     _handle: KcpSocketHandle,
     accept_rx: mpsc::UnboundedReceiver<KcpStream>,
+    /// Back-channel: notify the socket driver when a session has been
+    /// accepted, so it stops being subject to the unaccepted timeout.
+    accept_notify_tx: mpsc::UnboundedSender<(u32, SocketAddr)>,
 }
 
 impl KcpListener {
@@ -30,20 +33,29 @@ impl KcpListener {
 
         tokio::spawn(async move { kcp_socket.run().await });
 
+        let accept_notify_tx = handle.accept_notify_tx.clone();
         Ok(Self {
             local_addr,
             _handle: handle,
             accept_rx,
+            accept_notify_tx,
         })
     }
 
     /// Accept the next incoming KCP connection.
     /// Returns KcpStream with peer_addr already set (matching old API).
     pub async fn accept(&mut self) -> io::Result<KcpStream> {
-        self.accept_rx
+        let stream = self
+            .accept_rx
             .recv()
             .await
-            .ok_or_else(|| io::Error::other("KCP listener closed"))
+            .ok_or_else(|| io::Error::other("KCP listener closed"))?;
+        // Notify the socket driver that this session has been accepted.
+        // If the driver has already shut down (channel closed), ignore.
+        let _ = self
+            .accept_notify_tx
+            .send((stream.conv(), stream.peer_addr));
+        Ok(stream)
     }
 
     /// Local address of the underlying UDP socket.

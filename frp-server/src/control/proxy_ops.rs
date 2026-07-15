@@ -244,41 +244,24 @@ pub(crate) async fn handle_new_proxy(
             // so that NewVisitorConn arriving during the registration
             // race window can fall back to sk_index for auth.
             // (Go frp startVisitorListener pattern equivalent.)
-            // Indexed by proxy_name — no collision when multiple proxies
-            // share the same secret key.
             let needs_sk_index = (np.proxy_type == "stcp" || np.proxy_type == "xtcp")
                 && np.sk.as_deref().filter(|s| !s.is_empty()).is_some();
-            // Use entry() to avoid overwriting an existing entry from a
-            // concurrent registration or a prior proxy with the same name.
-            // We update sk_index AFTER successful register() so that:
-            // - On failure, we only remove if we were the ones who inserted.
-            // - On success, we always store the new value (replacing any old).
-            let raw_sk = if needs_sk_index {
-                np.sk.clone().unwrap_or_default()
-            } else {
-                String::new()
-            };
-            let did_insert_sk = if needs_sk_index {
-                use std::collections::hash_map::Entry;
+            // Store our raw_sk for compare-before-remove on failure.
+            // Using value comparison instead of a boolean prevents a race:
+            // if concurrent registrations A→B both target the same name,
+            // A's failure won't remove B's successfully-inserted value
+            // (unless they happen to have the same sk).
+            let our_raw_sk: Option<String> = if needs_sk_index {
+                let raw = np.sk.clone().unwrap_or_default();
                 let mut sk_map = state.xtcp.sk_index.write().await;
-                match sk_map.entry(np.proxy_name.clone()) {
-                    Entry::Vacant(e) => {
-                        e.insert(raw_sk.clone());
-                        let vn = np.virtual_net.as_deref().unwrap_or("");
-                        info!(proxy_name = %np.proxy_name, vn = %vn, "STCP/XTCP sk_index pre-populated for '{}'{}",
-                            np.proxy_name,
-                            if vn.is_empty() { String::new() } else { format!(" (virtual_net: {vn})") });
-                        true
-                    }
-                    Entry::Occupied(_) => {
-                        // Another registration (or a prior proxy) already has
-                        // an sk_index entry for this name. Don't overwrite it.
-                        // If our register() succeeds, we'll update it below.
-                        false
-                    }
-                }
+                sk_map.insert(np.proxy_name.clone(), raw.clone());
+                let vn = np.virtual_net.as_deref().unwrap_or("");
+                info!(proxy_name = %np.proxy_name, vn = %vn, "STCP/XTCP sk_index pre-populated for '{}'{}",
+                    np.proxy_name,
+                    if vn.is_empty() { String::new() } else { format!(" (virtual_net: {vn})") });
+                Some(raw)
             } else {
-                false
+                None
             };
 
             if let Err(e) = state
@@ -287,11 +270,17 @@ pub(crate) async fn handle_new_proxy(
                 .await
             {
                 state.used_ports.write().await.remove(&port);
-                // Only remove sk_index entry if we were the ones who inserted it.
-                // If another registration or prior proxy already had an entry,
-                // leaving it intact is correct — this registration failed.
-                if did_insert_sk {
-                    state.xtcp.sk_index.write().await.remove(&np.proxy_name);
+                // Compare-before-remove: only delete sk_index if our value
+                // is still present. If a concurrent registration overwrote
+                // our entry with a different value, leave it intact.
+                if let Some(ref our_sk) = our_raw_sk {
+                    let mut sk_map = state.xtcp.sk_index.write().await;
+                    let should_remove = sk_map
+                        .get(&np.proxy_name)
+                        .is_some_and(|stored| *stored == *our_sk);
+                    if should_remove {
+                        sk_map.remove(&np.proxy_name);
+                    }
                 }
                 reject_new_proxy(
                     writer,
@@ -326,16 +315,13 @@ pub(crate) async fn handle_new_proxy(
             }
 
             // Update sk_index with the final value now that registration succeeded.
-            // If we pre-populated (did_insert_sk=true), this is a no-op update.
-            // If another registration or prior proxy already had an entry
-            // (did_insert_sk=false), this replaces it with the new value.
-            if needs_sk_index {
+            if let Some(ref sk) = our_raw_sk {
                 state
                     .xtcp
                     .sk_index
                     .write()
                     .await
-                    .insert(np.proxy_name.clone(), raw_sk);
+                    .insert(np.proxy_name.clone(), sk.clone());
             }
 
             // Register HTTP proxies with VhostManager

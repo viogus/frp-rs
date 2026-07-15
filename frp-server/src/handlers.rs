@@ -298,29 +298,49 @@ pub(crate) async fn handle_nat_hole_visitor(
 
         let proxy_sk = proxy_info.sk.as_deref().unwrap_or("");
         if proxy_sk.is_empty() {
-            // Proxy has no sk — allow (no auth configured).
-            debug!(proxy_name = %proxy_name, "NatHoleVisitor: proxy has no sk, allowing");
-        } else {
-            let expected = frp_core::auth::generate_token(proxy_sk, timestamp);
-            if expected != sign_key {
-                warn!(proxy_name = %proxy_name, "NatHoleVisitor auth failed for proxy '{}'", proxy_name);
-                let mut writer = stream.into_split().1;
-                let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-                    transaction_id: transaction_id.clone(),
-                    error: Some("auth failed".into()),
-                    ..Default::default()
-                });
-                let _ = write_msg(&mut writer, &resp, v2).await;
-                return;
-            }
-            debug!(proxy_name = %proxy_name, "NatHoleVisitor auth OK for proxy '{}'", proxy_name);
+            // XTCP proxy without a shared secret: no way to authenticate
+            // visitors on fresh connections. Reject.
+            warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy has no sk configured — rejecting fresh connection");
+            let mut writer = stream.into_split().1;
+            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                transaction_id: transaction_id.clone(),
+                error: Some("proxy has no shared secret".into()),
+                ..Default::default()
+            });
+            let _ = write_msg(&mut writer, &resp, v2).await;
+            return;
         }
 
-        // Verify allow_users if the proxy restricts visitors.
-        // On a fresh TCP connection we don't have a user identity, but
-        // we can verify the sign_key (shared secret). The allow_users
-        // check on a fresh connection without login is inherently limited;
-        // the sign_key verification above provides the primary auth gate.
+        let expected = frp_core::auth::generate_token(proxy_sk, timestamp);
+        if expected != sign_key {
+            warn!(proxy_name = %proxy_name, "NatHoleVisitor auth failed for proxy '{}'", proxy_name);
+            let mut writer = stream.into_split().1;
+            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                transaction_id: transaction_id.clone(),
+                error: Some("auth failed".into()),
+                ..Default::default()
+            });
+            let _ = write_msg(&mut writer, &resp, v2).await;
+            return;
+        }
+        debug!(proxy_name = %proxy_name, "NatHoleVisitor auth OK for proxy '{}'", proxy_name);
+
+        // --- allow_users check on fresh connections ---
+        // Fresh TCP connections carry no user identity — only sign_key.
+        // If the proxy restricts visitors via allow_users, reject fresh
+        // connections outright; authorized visitors must use the control
+        // channel path (control/mod.rs NatHoleVisitor handler).
+        if !proxy_info.allow_users.is_empty() {
+            warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy has allow_users configured — rejecting fresh connection (use control channel)");
+            let mut writer = stream.into_split().1;
+            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                transaction_id: transaction_id.clone(),
+                error: Some("access denied: use control channel for user-based auth".into()),
+                ..Default::default()
+            });
+            let _ = write_msg(&mut writer, &resp, v2).await;
+            return;
+        }
     }
 
     let (reader, writer) = stream.into_split();

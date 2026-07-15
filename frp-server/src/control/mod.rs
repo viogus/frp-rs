@@ -1208,27 +1208,31 @@ pub async fn handle_control<S>(
                             }
                         };
 
-                        // Go frp v0.69.1 pre_check compat: validate and return OK,
-                        // no session created, no provider notified.
-                        if nhv.pre_check && nhv.mapped_addrs.is_none() {
-                            debug!(proxy_name = %proxy_name, "NatHoleVisitor pre_check on ctl channel: proxy='{}' OK", proxy_name);
-                            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-                                transaction_id: transaction_id.clone(),
-                                error: None,
-                                ..Default::default()
-                            });
-                            let _ = write_ctl_msg(&mut writer, &resp, v2).await;
-                            continue;
-                        }
-
                         // --- Auth: verify visitor is authorized to access this proxy ---
+                        // Go frp v0.70 allowUsers semantics:
+                        //   - Empty: only the proxy owner can be a visitor
+                        //   - ["*"]: all authenticated users
+                        //   - Specific list: only those users
+                        // Auth is enforced BEFORE pre_check response so Go frp's
+                        // pre_check permission model is preserved.
                         let visitor_user = login.user.clone().unwrap_or_default();
 
-                        // Check allow_users: if proxy restricts visitors, the
-                        // logged-in user must be in the allow list.
-                        if !proxy_info.allow_users.is_empty()
-                            && !proxy_info.allow_users.contains(&visitor_user)
-                        {
+                        if proxy_info.allow_users.is_empty() {
+                            // Empty = proxy owner only
+                            let owner = &proxy_info.user;
+                            if visitor_user.is_empty() || visitor_user != *owner {
+                                warn!(proxy_name = %proxy_name, user = %visitor_user, owner = %owner, "NatHoleVisitor: user '{}' not proxy owner '{}' for proxy '{}'", visitor_user, owner, proxy_name);
+                                let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                    transaction_id: transaction_id.clone(),
+                                    error: Some("access denied: owner only".into()),
+                                    ..Default::default()
+                                });
+                                let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                                continue;
+                            }
+                        } else if proxy_info.allow_users.iter().any(|u| u == "*") {
+                            // Wildcard — any authenticated user
+                        } else if !proxy_info.allow_users.contains(&visitor_user) {
                             warn!(proxy_name = %proxy_name, user = %visitor_user, "NatHoleVisitor: user '{}' not in allow_users for proxy '{}'", visitor_user, proxy_name);
                             let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
                                 transaction_id: transaction_id.clone(),
@@ -1267,6 +1271,19 @@ pub async fn handle_control<S>(
                                 }
                                 debug!(proxy_name = %proxy_name, "NatHoleVisitor auth OK on ctl for proxy '{}'", proxy_name);
                             }
+                        }
+
+                        // Go frp v0.70 pre_check compat: after auth, return OK without
+                        // creating a session or notifying the provider.
+                        if nhv.pre_check && nhv.mapped_addrs.is_none() {
+                            debug!(proxy_name = %proxy_name, user = %visitor_user, "NatHoleVisitor pre_check on ctl channel: proxy='{}' OK", proxy_name);
+                            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                transaction_id: transaction_id.clone(),
+                                error: None,
+                                ..Default::default()
+                            });
+                            let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                            continue;
                         }
 
                         // Look up provider run_id and control channel

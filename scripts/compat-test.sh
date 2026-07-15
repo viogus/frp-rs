@@ -914,15 +914,10 @@ write_frpc_config_xtcp_visitor() {
             printf 'serverName = "%s"\n' "$server_name"
             printf 'secretKey = "%s"\n' "$sk"
             printf 'bindAddr = "127.0.0.1"\nbindPort = %s\n' "$visitor_port"
-            printf 'fallbackTo = "%s-stcp-visitor"\n' "$server_name"
-            printf 'fallbackTimeoutMs = 2000\n'
-                        if $has_enc; then printf 'transport.useEncryption = true\n'; fi
+            # No fallbackTo — P2P must succeed for the test to pass.
+            # STCP fallback would mask XTCP failures (compat matrix P1).
+            if $has_enc; then printf 'transport.useEncryption = true\n'; fi
             if $has_comp; then printf 'transport.useCompression = true\n'; fi
-            printf '\n[[visitors]]\nname = "%s-stcp-visitor"\ntype = "stcp"\n' "$server_name"
-            printf 'serverName = "%s-stcp"\n' "$server_name"
-            printf 'secretKey = "%s"\n' "$sk"
-            printf 'bindAddr = "127.0.0.1"\nbindPort = -1\n'
-            # STCP fallback visitor is always plain relay — encryption is P2P-only
         } > "$out"
     else
         {
@@ -935,8 +930,8 @@ write_frpc_config_xtcp_visitor() {
             printf 'server_name = "%s"\n' "$server_name"
             printf 'sk = "%s"\n' "$sk"
             printf 'bind_addr = "127.0.0.1"\nbind_port = %s\n' "$visitor_port"
-            printf 'fallback_to = "%s-stcp"\n' "$server_name"
-            printf 'fallback_timeout_ms = 2000\n'
+            # No fallback_to — P2P must succeed for the test to pass.
+            # STCP fallback would mask XTCP failures (compat matrix P1).
             if $has_enc; then printf 'use_encryption = true\n'; fi
             if $has_comp; then printf 'use_compression = true\n'; fi
         } > "$out"

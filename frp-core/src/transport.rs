@@ -2157,7 +2157,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 /// WsByteStream in Raw mode — all data frames are treated as opaque bytes.
 #[cfg(feature = "websocket")]
 pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncWriteExt, BufReader};
 
     let mut reader = BufReader::new(stream);
     let mut key = String::new();
@@ -2165,56 +2165,76 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
     let mut first_line = true;
     let mut valid_path = false;
 
-    // Read HTTP upgrade request line by line with size limits and timeout.
-    // Limits prevent a slow or malicious client from exhausting server memory
-    // or pinning a connection indefinitely during the WebSocket handshake.
+    // Read HTTP upgrade request with size limits and timeout.
+    // Uses a bounded byte-oriented parser: checks limits BEFORE extending
+    // buffers, unlike read_line which extends the String unboundedly until
+    // a newline arrives.
     const MAX_LINE_LEN: usize = 16 * 1024; // 16 KiB per header line
     const MAX_TOTAL_HEADERS: usize = 64 * 1024; // 64 KiB total headers
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
     let header_result = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::with_capacity(4096);
         let mut total_bytes = 0usize;
         loop {
-            let mut line = String::new();
+            // Read one byte at a time to stay bounded. BufReader's internal
+            // buffer (default 8 KiB) amortises the syscall cost, so this is
+            // not one syscall per byte.
+            let mut byte = [0u8; 1];
             reader
-                .read_line(&mut line)
+                .read_exact(&mut byte)
                 .await
                 .map_err(|e| crate::Error::Transport(format!("WS read request: {e}").into()))?;
-            total_bytes += line.len();
+            buf.push(byte[0]);
+            total_bytes += 1;
+
+            // Check total limit BEFORE allowing more reads.
             if total_bytes > MAX_TOTAL_HEADERS {
                 return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
                     "request headers too large".into(),
                 )));
             }
-            if line.len() > MAX_LINE_LEN {
+
+            // Only parse when we hit a newline.
+            if byte[0] != b'\n' {
+                continue;
+            }
+
+            // Got a complete line — check per-line length.
+            if buf.len() > MAX_LINE_LEN {
                 return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
                     format!(
                         "header line too long ({} bytes, max {})",
-                        line.len(),
+                        buf.len(),
                         MAX_LINE_LEN
                     ),
                 )));
             }
-            if line == "\r\n" || line.is_empty() {
+
+            let line = String::from_utf8_lossy(&buf);
+            let line_str = line.as_ref();
+
+            if line_str == "\r\n" || line_str == "\n" || line_str.is_empty() {
                 break;
             }
             if first_line {
                 // Validate request line: GET /~!frp HTTP/1.x
                 first_line = false;
-                let parts: Vec<&str> = line.split_whitespace().collect();
+                let parts: Vec<&str> = line_str.split_whitespace().collect();
                 if parts.len() < 2 || !parts[0].eq_ignore_ascii_case("GET") {
                     return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
-                        format!("expected GET request, got: {}", line.trim()),
+                        format!("expected GET request, got: {}", line_str.trim()),
                     )));
                 }
                 if parts[1] == FRP_WEBSOCKET_PATH {
                     valid_path = true;
                 }
             }
-            if line.len() > 1 {
-                let lower = line.to_lowercase();
+            if line_str.len() > 1 {
+                let lower = line_str.to_lowercase();
                 if lower.starts_with("sec-websocket-key:") {
-                    key = line
+                    key = line_str
                         .split_once(':')
                         .map(|x| x.1)
                         .unwrap_or("")
@@ -2224,6 +2244,8 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
                     is_upgrade = true;
                 }
             }
+            // Reset for next line.
+            buf.clear();
         }
         Ok(())
     })
@@ -2320,35 +2342,51 @@ pub async fn accept_websocket_from_peeked(
 ) -> Result<IoStream, crate::Error> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // Parse HTTP headers from peeked data. Read more from raw if the
-    // complete request (ending with \r\n\r\n) is not in peeked.
+    // Parse HTTP headers from peeked data with size limits and timeout,
+    // matching accept_websocket()'s protections.
+    const MAX_TOTAL_HEADERS: usize = 64 * 1024;
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
     let mut buf = peeked;
     let mut read_more = false;
-    let extra: Vec<u8> = loop {
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let tail = buf.split_off(pos + 4);
-            buf.truncate(pos + 4);
-            break tail;
+    let extra: Vec<u8> = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let tail = buf.split_off(pos + 4);
+                buf.truncate(pos + 4);
+                return Ok::<_, crate::Error>(tail);
+            }
+            read_more = true;
+            // Check size limit BEFORE reading more.
+            if buf.len() >= MAX_TOTAL_HEADERS {
+                return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
+                    "request headers too large".into(),
+                )));
+            }
+            let mut chunk = vec![0u8; 1024];
+            let n = raw.read(&mut chunk).await.map_err(|e| {
+                crate::Error::Transport(format!("WS read remaining headers: {e}").into())
+            })?;
+            if n == 0 {
+                return Err(crate::Error::Transport(
+                    "WS: connection closed during headers".into(),
+                ));
+            }
+            tracing::debug!(
+                read_n = n,
+                chunk_hex = %hex::encode(&chunk[..n.min(32)]),
+                "accept_websocket_from_peeked: read {} more bytes from raw stream",
+                n
+            );
+            buf.extend_from_slice(&chunk[..n]);
         }
-        read_more = true;
-        // Need more data — read from raw stream
-        let mut chunk = vec![0u8; 1024];
-        let n = raw.read(&mut chunk).await.map_err(|e| {
-            crate::Error::Transport(format!("WS read remaining headers: {e}").into())
-        })?;
-        if n == 0 {
-            return Err(crate::Error::Transport(
-                "WS: connection closed during headers".into(),
-            ));
-        }
-        tracing::debug!(
-            read_n = n,
-            chunk_hex = %hex::encode(&chunk[..n.min(32)]),
-            "accept_websocket_from_peeked: read {} more bytes from raw stream",
-            n
-        );
-        buf.extend_from_slice(&chunk[..n]);
-    };
+    })
+    .await
+    .map_err(|_| {
+        crate::Error::Transport(TransportError::WebSocketUpgrade(
+            "handshake timed out".into(),
+        ))
+    })??;
 
     tracing::debug!(
         peeked_len = buf.len(),
