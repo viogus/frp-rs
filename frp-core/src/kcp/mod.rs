@@ -5,12 +5,13 @@
 
 mod config;
 mod listener;
-mod session;
+pub mod session;
 mod socket;
 mod stream;
 
 pub use config::{KcpConfig, KcpNoDelayConfig};
 pub use listener::{dial_kcp, KcpListener};
+pub use session::KcpSession;
 pub use stream::KcpStream;
 
 /// Build a KcpConfig matching Go frp v0.69.1 defaults.

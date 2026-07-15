@@ -229,9 +229,17 @@ where
             match stream {
                 Some(Ok(stream)) => {
                     let compat = stream.compat();
-                    if tx.try_send(compat).is_err() {
-                        debug!("yamux server: incoming channel closed, stopping acceptor");
-                        break;
+                    match tx.try_send(compat) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Channel is temporarily full — drop this stream
+                            // and continue. Do NOT kill the acceptor.
+                            debug!("yamux server: incoming channel full, dropping stream");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            debug!("yamux server: incoming channel closed, stopping acceptor");
+                            break;
+                        }
                     }
                 }
                 Some(Err(e)) => {

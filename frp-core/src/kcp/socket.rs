@@ -18,7 +18,10 @@ use super::stream::KcpStream;
 /// Max unprocessed write requests before KcpStream::poll_write applies
 /// backpressure (returns Poll::Pending). Prevents unbounded memory growth
 /// in the write_rx mpsc channel under high packet loss.
-pub(crate) const KCP_WRITE_BACKLOG_THRESHOLD: usize = 1024;
+/// Threshold must be strictly less than the write channel capacity (256)
+/// so the backlog gate triggers BEFORE the channel is full. This prevents
+/// the try_send-Full lost-wake race in poll_write and poll_flush.
+pub(crate) const KCP_WRITE_BACKLOG_THRESHOLD: usize = 200;
 
 /// Hard limit on total KCP sessions. Prevents an attacker from exhausting
 /// server memory by sending UDP packets with random conv values.

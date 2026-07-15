@@ -16,6 +16,7 @@ use frp_core::transport::{dial_server, DialOptions, TransportProtocol};
 ///
 /// Returns the connected TcpStream on success, or an error on timeout (5s)
 /// or other failures.
+#[allow(dead_code)]
 pub(crate) async fn tcp_simultaneous_open(
     peer_addr: &str,
     timeout_ms: u64,
@@ -169,26 +170,32 @@ pub(crate) async fn run_visitor_listener(
                                 tokio::time::sleep(retry_delay).await;
                             }
 
-                            // --- STUN Discovery ---
-                            // Run STUN twice — Go frps v0.69.1 NAT classifier needs ≥2
-                            // mapped addresses to determine NAT type and behavior.
-                            let mut mapped_addrs = Vec::new();
-                            for _ in 0..2 {
-                                match frp_core::stun::stun_binding(&stun_server).await {
-                                    Ok(addr) => {
-                                        debug!(visitor_name = %visitor_name, addr = %addr, "Visitor '{}': STUN mapped address: {}", visitor_name, addr);
-                                        if !mapped_addrs.contains(&addr) {
-                                            mapped_addrs.push(addr);
+                            // --- STUN Discovery (UDP socket for XTCP P2P) ---
+                            // Go frps v0.69.1 NAT classifier needs ≥2 mapped
+                            // addresses. Reuse the same UDP socket for both
+                            // STUN calls and subsequent KCP data plane.
+                            let (stun_socket, mapped_addrs) = match frp_core::stun::stun_binding_with_socket(&stun_server).await {
+                                Ok((sock, addr1)) => {
+                                    debug!(visitor_name = %visitor_name, addr = %addr1, "Visitor '{}': STUN #1: {}", visitor_name, addr1);
+                                    let mut addrs = vec![addr1];
+                                    match frp_core::stun::stun_binding_on_socket(&sock, &stun_server).await {
+                                        Ok(addr2) => {
+                                            debug!(visitor_name = %visitor_name, addr = %addr2, "Visitor '{}': STUN #2: {}", visitor_name, addr2);
+                                            if !addrs.contains(&addr2) {
+                                                addrs.push(addr2);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STUN #2 failed: {}", visitor_name, e);
                                         }
                                     }
-                                    Err(e) => {
-                                        warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STUN failed: {}", visitor_name, e);
-                                    }
+                                    (Some(sock), addrs)
                                 }
-                            }
-                            if mapped_addrs.is_empty() {
-                                warn!(visitor_name = %visitor_name, "Visitor '{}': all STUN attempts failed", visitor_name);
-                            }
+                                Err(e) => {
+                                    warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STUN failed: {}", visitor_name, e);
+                                    (None, vec![])
+                                }
+                            };
 
                             // --- Send NatHoleVisitor on control connection ---
                             let txn_id = uuid::Uuid::new_v4().to_string();
@@ -203,12 +210,13 @@ pub(crate) async fn run_visitor_listener(
                                 Some(frp_core::auth::generate_token(&sk, ts))
                             };
                             let (reply_tx, reply_rx) = oneshot::channel();
+                            // Go v0.70 compat: XTCP P2P uses KCP over UDP.
                             let nhv = crate::service::VisitorRequest {
                                 nhv: msg::NatHoleVisitor {
                                     transaction_id: txn_id.clone(),
                                     proxy_name: sn.clone(),
                                     pre_check: false,
-                                    protocol: Some("tcp".to_string()),
+                                    protocol: Some("kcp".to_string()),
                                     sign_key,
                                     timestamp: Some(ts),
                                     mapped_addrs: if mapped_addrs.is_empty() {
@@ -259,17 +267,28 @@ pub(crate) async fn run_visitor_listener(
                             let candidates = resp.candidate_addrs.unwrap_or_default();
                             debug!(visitor_name = %visitor_name, candidate_count = %candidates.len(), "Visitor '{}': got {} candidate addresses from server", visitor_name, candidates.len());
 
-                            // TCP simultaneous open to each candidate
-                            for addr in &candidates {
-                                debug!(visitor_name = %visitor_name, addr = %addr, "Visitor '{}': trying simultaneous open to {}", visitor_name, addr);
-                                match tcp_simultaneous_open(addr, fallback_timeout_ms).await {
-                                    Ok(p2p_stream) => {
-                                        info!(visitor_name = %visitor_name, addr = %addr, "Visitor '{}': XTCP P2P connected to {}", visitor_name, addr);
-                                        // Encrypt P2P channel if configured (matches Go frp wrapVisitorConn).
+                            // UDP hole punch + KCP data plane (Go v0.70 compat).
+                            // Uses the STUN socket to punch a hole and create
+                            // a KCP stream over UDP.
+                            if let Some(socket) = stun_socket {
+                                // Generate random KCP conv (non-zero).
+                                let conv: u32 = rand::random::<u32>().max(1);
+                                let kcp_cfg = frp_core::kcp::KcpConfig::default();
+                                // Go v0.70 compat: yamux client (visitor opens stream).
+                                match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
+                                    socket,
+                                    &candidates,
+                                    conv,
+                                    kcp_cfg,
+                                    fallback_timeout_ms,
+                                    true,  // yamux_client = visitor
+                                ).await {
+                                    Ok(mut p2p_stream) => {
+                                        info!(visitor_name = %visitor_name, "Visitor '{}': XTCP P2P connected via KCP", visitor_name);
                                         let use_enc = use_encryption && !sk.is_empty();
                                         let (user_r, user_w) =
                                             user_conn.take().unwrap().into_split();
-                                        let (p2p_r, p2p_w) = p2p_stream.into_split();
+                                        let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
                                         if use_enc {
                                             let key = frp_core::encryption::derive_key(&sk);
                                             frp_core::bridge::bridge_encrypted(
@@ -300,12 +319,13 @@ pub(crate) async fn run_visitor_listener(
                                             debug!(visitor_name = %visitor_name, "Visitor '{}' XTCP closed", visitor_name);
                                         }
                                         hole_punch_ok = true;
-                                        break; // P2P succeeded
                                     }
                                     Err(e) => {
-                                        debug!(visitor_name = %visitor_name, addr = %addr, error = %e, "Visitor '{}': hole punch to {} failed: {}", visitor_name, addr, e);
+                                        debug!(visitor_name = %visitor_name, error = %e, "Visitor '{}': UDP+KCP hole punch failed: {}", visitor_name, e);
                                     }
                                 }
+                            } else {
+                                warn!(visitor_name = %visitor_name, "Visitor '{}': no STUN socket for XTCP P2P", visitor_name);
                             }
                             if hole_punch_ok {
                                 break; // Exit retry loop

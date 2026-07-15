@@ -63,7 +63,7 @@ impl Write for KcpWriter {
     }
 }
 
-pub(crate) struct KcpSession {
+pub struct KcpSession {
     conv: u32,
     #[allow(dead_code)]
     peer_addr: std::net::SocketAddr,
@@ -76,6 +76,11 @@ pub(crate) struct KcpSession {
     recv_buf: Vec<u8>,
     read_tx: mpsc::Sender<Vec<u8>>,
     shutdown: bool,
+    /// Frame that couldn't be delivered to the read channel on the previous
+    /// tick because the channel was full. Must be flushed before consuming
+    /// additional KCP data — the sender already ACK'd the lost frame and
+    /// retransmission will NOT recover it.
+    pending_read: Option<Vec<u8>>,
     /// Inter-packet FEC: pending data shard RS payloads (SIZE + raw KCP data).
     pending_shards: Vec<Vec<u8>>,
     /// Max RS payload length in current pending group.
@@ -121,6 +126,7 @@ impl KcpSession {
             recv_buf: Vec::new(), // lazily allocated on first recv_and_push
             read_tx,
             shutdown: false,
+            pending_read: None,
             pending_shards: Vec::new(),
             pending_max_size: 0,
         }
@@ -430,6 +436,30 @@ impl KcpSession {
     /// Push any received KCP data to the stream's read channel.
     /// Called by driver on each tick after update().
     pub fn recv_and_push(&mut self) -> io::Result<()> {
+        // Flush pending frame from previous tick first. Data already consumed
+        // from KCP receive queue and ACK'd — retransmission will NOT recover it.
+        if let Some(pending) = self.pending_read.take() {
+            match self.read_tx.try_send(pending) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(data)) => {
+                    self.pending_read = Some(data);
+                    return Ok(());
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.shutdown = true;
+                    tracing::debug!(
+                        conv = self.conv,
+                        "KCP SESSION: read_tx closed, shutting down conv {}",
+                        self.conv
+                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "KCP read channel closed",
+                    ));
+                }
+            }
+        }
+
         loop {
             match self.kcp.peeksize() {
                 Ok(size) => {
@@ -444,17 +474,22 @@ impl KcpSession {
                                 "KCP SESSION: recv_and_push got {} bytes",
                                 n
                             );
-                            match self.read_tx.try_send(self.recv_buf[..n].to_vec()) {
+                            let data = self.recv_buf[..n].to_vec();
+                            match self.read_tx.try_send(data) {
                                 Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    // Reader is slow — drop this frame.
-                                    // KCP retransmission will recover.
+                                Err(mpsc::error::TrySendError::Full(d)) => {
+                                    // Save for next tick — data was already
+                                    // consumed from KCP receive queue and ACK'd.
+                                    // Dropping it would cause a permanent byte-stream
+                                    // hole (KCP retransmission won't recover it).
                                     tracing::debug!(
                                         conv = self.conv,
                                         n,
-                                        "KCP SESSION: read_tx full, dropping frame ({} bytes)",
+                                        "KCP SESSION: read_tx full, holding frame ({} bytes) for retry",
                                         n
                                     );
+                                    self.pending_read = Some(d);
+                                    return Ok(());
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
                                     self.shutdown = true;

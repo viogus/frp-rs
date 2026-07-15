@@ -67,6 +67,104 @@ pub async fn stun_binding(stun_addr: &str) -> Result<String, String> {
     parse_binding_response(&buf[..n], &tx_id)
 }
 
+/// Run STUN on an already-bound UDP socket, returning the mapped address.
+/// Useful for XTCP: run STUN twice on the same socket to get ≥2 mapped
+/// addresses for NAT classification, then reuse the socket for hole punching.
+pub async fn stun_binding_on_socket(
+    socket: &UdpSocket,
+    stun_addr: &str,
+) -> Result<String, String> {
+    let addr_str = stun_addr.strip_prefix("stun:").unwrap_or(stun_addr);
+    let addr: SocketAddr = if let Ok(sa) = addr_str.parse::<SocketAddr>() {
+        sa
+    } else {
+        let addrs = tokio::net::lookup_host(addr_str.to_string())
+            .await
+            .map_err(|e| format!("STUN DNS lookup failed for '{}': {}", addr_str, e))?;
+        addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("STUN DNS: no addresses found for '{}'", addr_str))?
+    };
+
+    let mut tx_id = [0u8; 12];
+    rand::thread_rng().fill(&mut tx_id);
+    let request = build_binding_request(&tx_id);
+
+    socket
+        .send_to(&request, addr)
+        .await
+        .map_err(|e| format!("STUN send: {e}"))?;
+
+    let mut buf = [0u8; 256];
+    let (n, _src) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        socket.recv_from(&mut buf),
+    )
+    .await
+    .map_err(|_| "STUN response timeout".to_string())?
+    .map_err(|e| format!("STUN recv: {e}"))?;
+
+    if n < 20 {
+        return Err("STUN response too short".into());
+    }
+
+    parse_binding_response(&buf[..n], &tx_id)
+}
+
+/// Like `stun_binding`, but returns the bound UDP socket along with the
+/// mapped address. The caller can reuse the socket for subsequent NAT hole
+/// punching (XTCP P2P).
+pub async fn stun_binding_with_socket(
+    stun_addr: &str,
+) -> Result<(UdpSocket, String), String> {
+    let addr_str = stun_addr.strip_prefix("stun:").unwrap_or(stun_addr);
+    let addr: SocketAddr = if let Ok(sa) = addr_str.parse::<SocketAddr>() {
+        sa
+    } else {
+        let addrs = tokio::net::lookup_host(addr_str.to_string())
+            .await
+            .map_err(|e| format!("STUN DNS lookup failed for '{}': {}", addr_str, e))?;
+        addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("STUN DNS: no addresses found for '{}'", addr_str))?
+    };
+
+    let socket = match UdpSocket::bind("[::]:0").await {
+        Ok(s) => s,
+        Err(_) => UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| format!("STUN socket bind: {e}"))?,
+    };
+
+    let mut tx_id = [0u8; 12];
+    rand::thread_rng().fill(&mut tx_id);
+    let request = build_binding_request(&tx_id);
+
+    socket
+        .send_to(&request, addr)
+        .await
+        .map_err(|e| format!("STUN send: {e}"))?;
+    debug!(addr = %addr, "STUN Binding Request sent to {}", addr);
+
+    let mut buf = [0u8; 256];
+    let (n, _src) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        socket.recv_from(&mut buf),
+    )
+    .await
+    .map_err(|_| "STUN response timeout".to_string())?
+    .map_err(|e| format!("STUN recv: {e}"))?;
+
+    if n < 20 {
+        return Err("STUN response too short".into());
+    }
+
+    let mapped = parse_binding_response(&buf[..n], &tx_id)?;
+    Ok((socket, mapped))
+}
+
 fn build_binding_request(tx_id: &[u8; 12]) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(20);
     pkt.extend_from_slice(&0x0001u16.to_be_bytes());
