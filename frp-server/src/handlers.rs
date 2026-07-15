@@ -68,22 +68,19 @@ pub(crate) async fn handle_visitor_conn_inner(
     let proxy_name = match proxy_name {
         Some(pn) => pn,
         None => {
-            // Fall back to raw sk lookup for old Rust clients that send raw sk as sign_key
-            // sk_index is now keyed by proxy_name (not raw sk). Iterate to
-            // find a proxy whose stored raw_sk matches the legacy sign_key.
-            let pn = state
-                .xtcp
-                .sk_index
-                .read()
-                .await
-                .iter()
-                .find(|(_, raw_sk)| *raw_sk == &sign_key)
-                .map(|(pn, _)| pn.clone());
-            match pn {
-                Some(pn) => {
-                    debug!(proxy_name = %pn, "STCP visitor auth OK (raw sk_index lookup) for proxy '{}'", pn);
-                    pn
+            // Fall back to raw sk lookup for old Rust clients that send raw sk as sign_key.
+            // Look up by msg.proxy_name directly — do NOT iterate the whole map:
+            // multiple proxies sharing the same sk would route to the wrong one.
+            let sk_map = state.xtcp.sk_index.read().await;
+            let pn = match sk_map.get(&msg.proxy_name) {
+                Some(stored_sk) if *stored_sk == sign_key => {
+                    debug!(proxy_name = %msg.proxy_name, "STCP visitor auth OK (raw sk_index lookup) for proxy '{}'", msg.proxy_name);
+                    Some(msg.proxy_name.clone())
                 }
+                _ => None,
+            };
+            match pn {
+                Some(pn) => pn,
                 None => {
                     warn!(proxy_name = %msg.proxy_name, sign_key_prefix = %&sign_key[..sign_key.len().min(8)], "NewVisitorConn: no STCP proxy found for proxy_name='{}', sign_key='{}...'",
                         msg.proxy_name, &sign_key[..sign_key.len().min(8)]);
