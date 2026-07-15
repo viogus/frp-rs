@@ -1194,24 +1194,13 @@ pub async fn handle_control<S>(
                         let transaction_id = nhv.transaction_id.clone();
                         let proxy_name = nhv.proxy_name.clone();
 
-                        // Validate proxy exists
-                        if state.proxy_manager.get(&proxy_name).await.is_none() {
-                            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-                                transaction_id: transaction_id.clone(),
-                                error: Some("proxy not found".into()),
-                                ..Default::default()
-                            });
-                            let _ = write_ctl_msg(&mut writer, &resp, v2).await;
-                            continue;
-                        }
-
-                        // Look up provider run_id and control channel
-                        let provider_run_id = match state.proxy_manager.get_run_id(&proxy_name).await {
-                            Some(id) => id,
+                        // Validate proxy exists and capture info for auth
+                        let proxy_info = match state.proxy_manager.get(&proxy_name).await {
+                            Some(info) => info,
                             None => {
                                 let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
                                     transaction_id: transaction_id.clone(),
-                                    error: Some("provider offline".into()),
+                                    error: Some("proxy not found".into()),
                                     ..Default::default()
                                 });
                                 let _ = write_ctl_msg(&mut writer, &resp, v2).await;
@@ -1231,6 +1220,68 @@ pub async fn handle_control<S>(
                             let _ = write_ctl_msg(&mut writer, &resp, v2).await;
                             continue;
                         }
+
+                        // --- Auth: verify visitor is authorized to access this proxy ---
+                        let visitor_user = login.user.clone().unwrap_or_default();
+
+                        // Check allow_users: if proxy restricts visitors, the
+                        // logged-in user must be in the allow list.
+                        if !proxy_info.allow_users.is_empty()
+                            && !proxy_info.allow_users.contains(&visitor_user)
+                        {
+                            warn!(proxy_name = %proxy_name, user = %visitor_user, "NatHoleVisitor: user '{}' not in allow_users for proxy '{}'", visitor_user, proxy_name);
+                            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                transaction_id: transaction_id.clone(),
+                                error: Some("access denied".into()),
+                                ..Default::default()
+                            });
+                            let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                            continue;
+                        }
+
+                        // Verify sign_key if the proxy has a shared secret.
+                        let sign_key = nhv.sign_key.as_deref().unwrap_or("");
+                        let timestamp = nhv.timestamp.unwrap_or(0);
+                        if let Some(ref sk) = proxy_info.sk {
+                            if !sk.is_empty() {
+                                if sign_key.is_empty() {
+                                    warn!(proxy_name = %proxy_name, "NatHoleVisitor: missing sign_key for protected proxy '{}'", proxy_name);
+                                    let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                        transaction_id: transaction_id.clone(),
+                                        error: Some("auth required".into()),
+                                        ..Default::default()
+                                    });
+                                    let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                                    continue;
+                                }
+                                let expected = frp_core::auth::generate_token(sk, timestamp);
+                                if expected != sign_key {
+                                    warn!(proxy_name = %proxy_name, "NatHoleVisitor auth failed on ctl for proxy '{}'", proxy_name);
+                                    let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                        transaction_id: transaction_id.clone(),
+                                        error: Some("auth failed".into()),
+                                        ..Default::default()
+                                    });
+                                    let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                                    continue;
+                                }
+                                debug!(proxy_name = %proxy_name, "NatHoleVisitor auth OK on ctl for proxy '{}'", proxy_name);
+                            }
+                        }
+
+                        // Look up provider run_id and control channel
+                        let provider_run_id = match state.proxy_manager.get_run_id(&proxy_name).await {
+                            Some(id) => id,
+                            None => {
+                                let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                    transaction_id: transaction_id.clone(),
+                                    error: Some("provider offline".into()),
+                                    ..Default::default()
+                                });
+                                let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                                continue;
+                            }
+                        };
 
                         let provider_ctl = {
                             let map = state.run_id_to_ctl_tx.read().await;

@@ -33,6 +33,22 @@ jobs:
           - armv7-unknown-linux-musleabihf
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Checkout the specific tag being released, not the default branch.
+          # workflow_dispatch: inputs.tag is the tag name.
+          # push (tag trigger): github.ref is refs/tags/vX.Y.Z.
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Verify tag checkout
+        run: |
+          EXPECTED_TAG="${{ inputs.tag || github.ref_name }}"
+          ACTUAL_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || echo 'NOT_A_TAG')"
+          if [ "$ACTUAL_TAG" != "$EXPECTED_TAG" ]; then
+            echo "ERROR: HEAD is not tag '${EXPECTED_TAG}' (got: ${ACTUAL_TAG})"
+            echo "Refusing to build release from non-tag commit."
+            exit 1
+          fi
+          echo "Building release for tag: ${EXPECTED_TAG} @ $(git rev-parse HEAD)"
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -67,18 +83,18 @@ jobs:
           mkdir -p dist dist/tiny dist/micro
           cp target/${{ matrix.target }}/release/frps dist/frps
           cp target/${{ matrix.target }}/release/frpc dist/frpc
-          tar czf dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}.tar.gz -C dist frps frpc
+          tar czf dist/frp-rs_${{ inputs.tag || github.ref_name }}_${{ matrix.target }}.tar.gz -C dist frps frpc
           cp target/${{ matrix.target }}/release/frps-tiny dist/tiny/frps
           cp target/${{ matrix.target }}/release/frpc-tiny dist/tiny/frpc
-          tar czf dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}-tiny.tar.gz -C dist/tiny frps frpc
+          tar czf dist/frp-rs_${{ inputs.tag || github.ref_name }}_${{ matrix.target }}-tiny.tar.gz -C dist/tiny frps frpc
           cp target/${{ matrix.target }}/release/frps-micro dist/micro/frps
           cp target/${{ matrix.target }}/release/frpc-micro dist/micro/frpc
-          tar czf dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}-micro.tar.gz -C dist/micro frps frpc
+          tar czf dist/frp-rs_${{ inputs.tag || github.ref_name }}_${{ matrix.target }}-micro.tar.gz -C dist/micro frps frpc
 
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.target }}
-          path: dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}*.tar.gz
+          path: dist/frp-rs_${{ inputs.tag || github.ref_name }}_${{ matrix.target }}*.tar.gz
 
   # ── macOS: native builds ─────────────────────────────
   build-macos:
@@ -91,6 +107,19 @@ jobs:
           - aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Verify tag checkout
+        run: |
+          EXPECTED_TAG="${{ inputs.tag || github.ref_name }}"
+          ACTUAL_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || echo 'NOT_A_TAG')"
+          if [ "$ACTUAL_TAG" != "$EXPECTED_TAG" ]; then
+            echo "ERROR: HEAD is not tag '${EXPECTED_TAG}' (got: ${ACTUAL_TAG})"
+            echo "Refusing to build release from non-tag commit."
+            exit 1
+          fi
+          echo "Building release for tag: ${EXPECTED_TAG} @ $(git rev-parse HEAD)"
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -114,18 +143,18 @@ jobs:
           mkdir -p dist dist/tiny dist/micro
           cp target/${{ matrix.target }}/release/frps dist/frps
           cp target/${{ matrix.target }}/release/frpc dist/frpc
-          tar czf dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}.tar.gz -C dist frps frpc
+          tar czf dist/frp-rs_${{ inputs.tag || github.ref_name }}_${{ matrix.target }}.tar.gz -C dist frps frpc
           cp target/${{ matrix.target }}/release/frps-tiny dist/tiny/frps
           cp target/${{ matrix.target }}/release/frpc-tiny dist/tiny/frpc
-          tar czf dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}-tiny.tar.gz -C dist/tiny frps frpc
+          tar czf dist/frp-rs_${{ inputs.tag || github.ref_name }}_${{ matrix.target }}-tiny.tar.gz -C dist/tiny frps frpc
           cp target/${{ matrix.target }}/release/frps-micro dist/micro/frps
           cp target/${{ matrix.target }}/release/frpc-micro dist/micro/frpc
-          tar czf dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}-micro.tar.gz -C dist/micro frps frpc
+          tar czf dist/frp-rs_${{ inputs.tag || github.ref_name }}_${{ matrix.target }}-micro.tar.gz -C dist/micro frps frpc
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.target }}
-          path: dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}*.tar.gz
+          path: dist/frp-rs_${{ inputs.tag || github.ref_name }}_${{ matrix.target }}*.tar.gz
 
   # ── Windows: native builds ──────────────────────────
   build-windows:
@@ -138,6 +167,21 @@ jobs:
           - aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Verify tag checkout
+        shell: pwsh
+        run: |
+          $EXPECTED_TAG = "${{ inputs.tag || github.ref_name }}"
+          $ACTUAL_TAG = (git describe --tags --exact-match HEAD 2>$null)
+          if (-not $ACTUAL_TAG) { $ACTUAL_TAG = "NOT_A_TAG" }
+          if ($ACTUAL_TAG -ne $EXPECTED_TAG) {
+            Write-Error "ERROR: HEAD is not tag '${EXPECTED_TAG}' (got: ${ACTUAL_TAG})"
+            Write-Error "Refusing to build release from non-tag commit."
+            exit 1
+          }
+          Write-Host "Building release for tag: ${EXPECTED_TAG} @ $(git rev-parse HEAD)"
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -163,20 +207,20 @@ jobs:
           # Full
           Copy-Item target/${{ matrix.target }}/release/frps.exe dist/
           Copy-Item target/${{ matrix.target }}/release/frpc.exe dist/
-          Compress-Archive -Path dist/frps.exe, dist/frpc.exe -DestinationPath dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}.zip
+          Compress-Archive -Path dist/frps.exe, dist/frpc.exe -DestinationPath dist/frp-rs_${{ inputs.tag || github.ref_name }}_${{ matrix.target }}.zip
           # Tiny
           Copy-Item target/${{ matrix.target }}/release/frps-tiny.exe dist/frps.exe -Force
           Copy-Item target/${{ matrix.target }}/release/frpc-tiny.exe dist/frpc.exe -Force
-          Compress-Archive -Path dist/frps.exe, dist/frpc.exe -DestinationPath dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}-tiny.zip
+          Compress-Archive -Path dist/frps.exe, dist/frpc.exe -DestinationPath dist/frp-rs_${{ inputs.tag || github.ref_name }}_${{ matrix.target }}-tiny.zip
           # Micro
           Copy-Item target/${{ matrix.target }}/release/frps-micro.exe dist/frps.exe -Force
           Copy-Item target/${{ matrix.target }}/release/frpc-micro.exe dist/frpc.exe -Force
-          Compress-Archive -Path dist/frps.exe, dist/frpc.exe -DestinationPath dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}-micro.zip
+          Compress-Archive -Path dist/frps.exe, dist/frpc.exe -DestinationPath dist/frp-rs_${{ inputs.tag || github.ref_name }}_${{ matrix.target }}-micro.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-${{ matrix.target }}
-          path: dist/frp-rs_${{ github.ref_name }}_${{ matrix.target }}*.zip
+          path: dist/frp-rs_${{ inputs.tag || github.ref_name }}_${{ matrix.target }}*.zip
 
   # ── collect & upload to release ──────────────────────
   publish:
@@ -188,6 +232,19 @@ jobs:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Verify tag checkout
+        run: |
+          EXPECTED_TAG="$RELEASE_TAG"
+          ACTUAL_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || echo 'NOT_A_TAG')"
+          if [ "$ACTUAL_TAG" != "$EXPECTED_TAG" ]; then
+            echo "ERROR: HEAD is not tag '${EXPECTED_TAG}' (got: ${ACTUAL_TAG})"
+            echo "Refusing to publish release from non-tag commit."
+            exit 1
+          fi
+          echo "Publishing release for tag: ${EXPECTED_TAG} @ $(git rev-parse HEAD)"
 
       - uses: actions/download-artifact@v4
         with:
@@ -200,7 +257,7 @@ jobs:
           gh release create "$RELEASE_TAG" \
             --title "$RELEASE_TAG" \
             --generate-notes \
-            --verify-tag || true
+            --verify-tag
 
       - name: Upload assets to release
         env:

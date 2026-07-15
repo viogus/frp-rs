@@ -425,6 +425,11 @@ async fn test_xtcp_nat_hole_report_cleanup() {
 
     // --- Full NatHoleVisitor ---
     let txn_id = format!("cleanup-txn-{}", port);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let sign_key = frp_core::auth::generate_token(xtcp_sk, ts);
     let mut visitor_conn = IoStream::Tcp(
         tokio::net::TcpStream::connect(addr)
             .await
@@ -435,8 +440,8 @@ async fn test_xtcp_nat_hole_report_cleanup() {
         proxy_name: "xtcp-cleanup".into(),
         pre_check: false,
         protocol: Some("tcp".to_string()),
-        sign_key: None,
-        timestamp: None,
+        sign_key: Some(sign_key),
+        timestamp: Some(ts),
         mapped_addrs: Some(vec!["1.2.3.4:5678".into(), "1.2.3.4:5680".into()]),
         assisted_addrs: Some(vec!["192.168.1.5:5678".into()]),
     });

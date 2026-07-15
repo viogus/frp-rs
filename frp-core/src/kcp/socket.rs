@@ -20,6 +20,19 @@ use super::stream::KcpStream;
 /// in the write_rx mpsc channel under high packet loss.
 pub(crate) const KCP_WRITE_BACKLOG_THRESHOLD: usize = 1024;
 
+/// Hard limit on total KCP sessions. Prevents an attacker from exhausting
+/// server memory by sending UDP packets with random conv values.
+const MAX_SESSIONS: usize = 1024;
+
+/// Per-IP session limit. Prevents a single host from monopolizing the
+/// session table.
+const MAX_SESSIONS_PER_IP: usize = 64;
+
+/// Maximum time a KCP session can exist without being accepted by the
+/// listener. Sessions that haven't been picked up within this window
+/// are cleaned up by the tick loop.
+const UNACCEPTED_SESSION_TIMEOUT_MS: u32 = 30_000; // 30 seconds
+
 pub(crate) enum WriteRequest {
     Data(Vec<u8>),
     Flush(tokio::sync::oneshot::Sender<()>),
@@ -46,6 +59,10 @@ pub(crate) struct KcpSocket {
     /// conv → peer addr index for O(1) write-path lookups.
     /// Avoids O(n) `iter().find()` on `sessions` in Data/Flush handlers.
     conv_index: HashMap<u32, SocketAddr>,
+    /// Per-IP session count for admission control.
+    peer_session_counts: HashMap<SocketAddr, usize>,
+    /// Session creation timestamps for unaccepted session timeout.
+    session_created_at: HashMap<(u32, SocketAddr), u32>,
     write_tx: mpsc::UnboundedSender<(u32, WriteRequest)>,
     write_rx: mpsc::UnboundedReceiver<(u32, WriteRequest)>,
     register_rx: mpsc::UnboundedReceiver<(u32, SocketAddr, KcpSession)>,
@@ -70,6 +87,8 @@ impl KcpSocket {
             config,
             sessions: HashMap::new(),
             conv_index: HashMap::new(),
+            peer_session_counts: HashMap::new(),
+            session_created_at: HashMap::new(),
             write_tx: write_tx.clone(),
             write_rx,
             register_rx,
@@ -135,6 +154,34 @@ impl KcpSocket {
                     for key in to_remove {
                         self.sessions.remove(&key);
                         self.conv_index.remove(&key.0);
+                        self.session_created_at.remove(&key);
+                        if let Some(count) = self.peer_session_counts.get_mut(&key.1) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                self.peer_session_counts.remove(&key.1);
+                            }
+                        }
+                    }
+                    // Clean up sessions that were never accepted by the listener.
+                    // These are created from garbage packets that happen to pass
+                    // the first input() check but are never picked up.
+                    let mut expired = Vec::new();
+                    for (key, created_at) in &self.session_created_at {
+                        if now_ms.wrapping_sub(*created_at) > UNACCEPTED_SESSION_TIMEOUT_MS {
+                            expired.push(*key);
+                        }
+                    }
+                    for key in expired {
+                        tracing::debug!(conv = key.0, peer = %key.1, "KCP: removing unaccepted session");
+                        self.sessions.remove(&key);
+                        self.conv_index.remove(&key.0);
+                        self.session_created_at.remove(&key);
+                        if let Some(count) = self.peer_session_counts.get_mut(&key.1) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                self.peer_session_counts.remove(&key.1);
+                            }
+                        }
                     }
                 }
 
@@ -233,13 +280,28 @@ impl KcpSocket {
                                         }
                                     }
                                 } else if key.0 != 0 {
-                                    // New peer detected — create session + stream
+                                    // New peer — admission control.
+                                    // Reject if global or per-IP limit is reached.
+                                    let ip_count = self.peer_session_counts.get(&src).copied().unwrap_or(0);
+                                    if self.sessions.len() >= MAX_SESSIONS {
+                                        tracing::warn!(conv = key.0, peer = %src, total = self.sessions.len(), "KCP: session limit reached ({MAX_SESSIONS}), dropping new conv={}", key.0);
+                                        continue;
+                                    }
+                                    if ip_count >= MAX_SESSIONS_PER_IP {
+                                        tracing::warn!(conv = key.0, peer = %src, ip_sessions = ip_count, "KCP: per-IP session limit reached ({MAX_SESSIONS_PER_IP}), dropping new conv={}", key.0);
+                                        continue;
+                                    }
+
+                                    // Create session and validate the first packet.
+                                    // If input() fails on the very first packet, the
+                                    // data is garbage — don't create a permanent session.
                                     let (read_tx, read_rx) = mpsc::unbounded_channel();
                                     let mut session = KcpSession::new(
                                         key.0, src, self.config.clone(), read_tx,
                                     );
                                     if let Err(e) = session.input(&data) {
-                                        tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP new peer input error");
+                                        tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP new peer: first input failed, dropping");
+                                        continue;
                                     }
                                     let stream = KcpStream::new(
                                         key.0, src,
@@ -251,6 +313,9 @@ impl KcpSocket {
                                     let _ = self.accept_tx.send(stream);
                                     self.conv_index.insert(key.0, key.1);
                                     self.sessions.insert(key, session);
+                                    *self.peer_session_counts.entry(src).or_default() += 1;
+                                    let now_ms = self.start.elapsed().as_millis() as u32;
+                                    self.session_created_at.insert(key, now_ms);
                                 }
                             }
                         }

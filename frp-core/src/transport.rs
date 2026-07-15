@@ -2168,7 +2168,7 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
     // Read HTTP upgrade request line by line with size limits and timeout.
     // Limits prevent a slow or malicious client from exhausting server memory
     // or pinning a connection indefinitely during the WebSocket handshake.
-    const MAX_LINE_LEN: usize = 16 * 1024;     // 16 KiB per header line
+    const MAX_LINE_LEN: usize = 16 * 1024; // 16 KiB per header line
     const MAX_TOTAL_HEADERS: usize = 64 * 1024; // 64 KiB total headers
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -2182,18 +2182,18 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
                 .map_err(|e| crate::Error::Transport(format!("WS read request: {e}").into()))?;
             total_bytes += line.len();
             if total_bytes > MAX_TOTAL_HEADERS {
-                return Err(crate::Error::Transport(
-                    TransportError::WebSocketUpgrade("request headers too large".into()),
-                ));
+                return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
+                    "request headers too large".into(),
+                )));
             }
             if line.len() > MAX_LINE_LEN {
-                return Err(crate::Error::Transport(
-                    TransportError::WebSocketUpgrade(format!(
+                return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
+                    format!(
                         "header line too long ({} bytes, max {})",
                         line.len(),
                         MAX_LINE_LEN
-                    )),
-                ));
+                    ),
+                )));
             }
             if line == "\r\n" || line.is_empty() {
                 break;
@@ -2233,9 +2233,9 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(e),
         Err(_elapsed) => {
-            return Err(crate::Error::Transport(
-                TransportError::WebSocketUpgrade("handshake timed out".into()),
-            ));
+            return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
+                "handshake timed out".into(),
+            )));
         }
     }
 

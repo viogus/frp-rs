@@ -200,18 +200,21 @@ pub(crate) async fn handle_nat_hole_visitor(
         return;
     }
 
-    // Validate proxy exists
-    if state.proxy_manager.get(&proxy_name).await.is_none() {
-        warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy '{}' not found", proxy_name);
-        let mut writer = stream.into_split().1;
-        let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-            transaction_id: transaction_id.clone(),
-            error: Some("proxy not found".into()),
-            ..Default::default()
-        });
-        let _ = write_msg(&mut writer, &resp, v2).await;
-        return;
-    }
+    // Validate proxy exists and capture its info for auth.
+    let proxy_info = match state.proxy_manager.get(&proxy_name).await {
+        Some(info) => info,
+        None => {
+            warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy '{}' not found", proxy_name);
+            let mut writer = stream.into_split().1;
+            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                transaction_id: transaction_id.clone(),
+                error: Some("proxy not found".into()),
+                ..Default::default()
+            });
+            let _ = write_msg(&mut writer, &resp, v2).await;
+            return;
+        }
+    };
 
     // Look up the provider's run_id from proxy_manager
     let run_id = state.proxy_manager.get_run_id(&proxy_name).await;
@@ -268,6 +271,56 @@ pub(crate) async fn handle_nat_hole_visitor(
         });
         let _ = write_msg(&mut writer, &resp, v2).await;
         return;
+    }
+
+    // --- Auth: verify visitor knows the shared secret ---
+    // NatHoleVisitor on a fresh TCP connection must prove knowledge of the
+    // proxy's secret key, just like NewVisitorConn. Without this check, an
+    // attacker can trigger NAT traversal and provider simultaneous-open for
+    // any proxy they can name.
+    {
+        let sign_key = msg.sign_key.as_deref().unwrap_or("");
+        let timestamp = msg.timestamp.unwrap_or(0);
+
+        // Require sign_key for non-pre_check requests on fresh connections.
+        // The sign_key must equal MD5(proxy_sk + timestamp).
+        if sign_key.is_empty() {
+            warn!(proxy_name = %proxy_name, "NatHoleVisitor: missing sign_key, rejecting");
+            let mut writer = stream.into_split().1;
+            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                transaction_id: transaction_id.clone(),
+                error: Some("auth required".into()),
+                ..Default::default()
+            });
+            let _ = write_msg(&mut writer, &resp, v2).await;
+            return;
+        }
+
+        let proxy_sk = proxy_info.sk.as_deref().unwrap_or("");
+        if proxy_sk.is_empty() {
+            // Proxy has no sk — allow (no auth configured).
+            debug!(proxy_name = %proxy_name, "NatHoleVisitor: proxy has no sk, allowing");
+        } else {
+            let expected = frp_core::auth::generate_token(proxy_sk, timestamp);
+            if expected != sign_key {
+                warn!(proxy_name = %proxy_name, "NatHoleVisitor auth failed for proxy '{}'", proxy_name);
+                let mut writer = stream.into_split().1;
+                let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                    transaction_id: transaction_id.clone(),
+                    error: Some("auth failed".into()),
+                    ..Default::default()
+                });
+                let _ = write_msg(&mut writer, &resp, v2).await;
+                return;
+            }
+            debug!(proxy_name = %proxy_name, "NatHoleVisitor auth OK for proxy '{}'", proxy_name);
+        }
+
+        // Verify allow_users if the proxy restricts visitors.
+        // On a fresh TCP connection we don't have a user identity, but
+        // we can verify the sign_key (shared secret). The allow_users
+        // check on a fresh connection without login is inherently limited;
+        // the sign_key verification above provides the primary auth gate.
     }
 
     let (reader, writer) = stream.into_split();
