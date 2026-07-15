@@ -263,6 +263,12 @@ impl AsyncWrite for KcpStream {
             match self.write_tx.try_send((self.conv, WriteRequest::Flush(tx))) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Wait for socket to drain — same backpressure as poll_write.
+                    let notified = self.write_notify.clone().notified_owned();
+                    self.backpressure_fut = Some(Box::pin(notified));
+                    if let Some(ref mut fut) = self.backpressure_fut {
+                        let _ = fut.as_mut().poll(cx);
+                    }
                     return Poll::Pending;
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {

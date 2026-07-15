@@ -205,8 +205,9 @@ impl KcpSocket {
                 }
 
                 Some((conv, req)) = self.write_rx.recv() => {
-                    // Backlog was incremented by KcpStream before try_send.
-                    // We decrement after processing (below).
+                    // Backlog was incremented by KcpStream before try_send
+                    // for Data requests only (not Flush). Decrement inside
+                    // each arm.
                     match req {
                         WriteRequest::Data(data) => {
                             let len = data.len();
@@ -220,6 +221,15 @@ impl KcpSocket {
                             } else {
                                 tracing::trace!(conv, len, "KCP SOCKET: write queued {} bytes", len);
                             }
+                            // Decrement backlog and wake blocked writers.
+                            // Two cases:
+                            // 1. Gate check (backlog >= 1024): rare with bounded
+                            //    channel (cap 256), but notify when draining.
+                            // 2. try_send Full: channel fills before threshold.
+                            //    Notify after every Data item so writers blocked
+                            //    on backpressure_fut can retry.
+                            let _prev = self.write_backlog.fetch_sub(1, Ordering::Release);
+                            self.write_notify.notify_waiters();
                         }
                         WriteRequest::Flush(tx) => {
                             // Force immediate KCP flush: update → drain output →
@@ -227,6 +237,9 @@ impl KcpSocket {
                             // correctness: caller needs StartWorkConn on wire
                             // before bridge data so Go frpc can process them as
                             // separate messages.
+                            // No backlog decrement — poll_flush does not
+                            // increment the backlog (it uses a oneshot for
+                            // wakeup, not the backlog gate).
                             tracing::trace!(conv, "KCP SOCKET: flush");
                             let addr = self.conv_index.get(&conv).copied();
                             let packets = if let Some(session) = addr
@@ -254,11 +267,6 @@ impl KcpSocket {
                             tracing::trace!(conv, npkts = packets.len(), "KCP SOCKET: flush sent {} packets", packets.len());
                             let _ = tx.send(());
                         }
-                    }
-                    let prev = self.write_backlog.fetch_sub(1, Ordering::Release);
-                    // Wake blocked KcpStream writers when backlog drops below threshold.
-                    if prev == KCP_WRITE_BACKLOG_THRESHOLD {
-                        self.write_notify.notify_waiters();
                     }
                 }
 
