@@ -244,22 +244,18 @@ pub(crate) async fn handle_new_proxy(
             // so that NewVisitorConn arriving during the registration
             // race window can fall back to sk_index for auth.
             // (Go frp startVisitorListener pattern equivalent.)
-            let sk_key: Option<(String, String)> =
-                if np.proxy_type == "stcp" || np.proxy_type == "xtcp" {
-                    info.sk_index_key().map(|key| {
-                        let raw_sk = np.sk.clone().unwrap_or_default();
-                        (key, raw_sk)
-                    })
-                } else {
-                    None
-                };
-            if let Some((ref key, ref raw_sk)) = sk_key {
+            // Indexed by proxy_name — no collision when multiple proxies
+            // share the same secret key.
+            let needs_sk_index = (np.proxy_type == "stcp" || np.proxy_type == "xtcp")
+                && np.sk.as_deref().filter(|s| !s.is_empty()).is_some();
+            if needs_sk_index {
+                let raw_sk = np.sk.clone().unwrap_or_default();
                 state
                     .xtcp
                     .sk_index
                     .write()
                     .await
-                    .insert(key.clone(), (np.proxy_name.clone(), raw_sk.clone()));
+                    .insert(np.proxy_name.clone(), raw_sk);
                 let vn = np.virtual_net.as_deref().unwrap_or("");
                 info!(proxy_name = %np.proxy_name, vn = %vn, "STCP/XTCP sk_index pre-populated for '{}'{}",
                     np.proxy_name,
@@ -273,8 +269,8 @@ pub(crate) async fn handle_new_proxy(
             {
                 state.used_ports.write().await.remove(&port);
                 // Clean up pre-populated sk_index on registration failure
-                if let Some((ref key, _)) = sk_key {
-                    state.xtcp.sk_index.write().await.remove(key);
+                if needs_sk_index {
+                    state.xtcp.sk_index.write().await.remove(&np.proxy_name);
                 }
                 reject_new_proxy(
                     writer,
@@ -644,8 +640,9 @@ pub(crate) async fn unregister_control(
         if let Some(port) = p.remote_port {
             ports.remove(&port);
         }
-        // Clean up STCP sk_index (use unified helper for composite key)
-        if let Some(ref key) = p.sk_index_key() {
+        // Clean up STCP sk_index (indexed by proxy_name — exact match, no
+        // risk of removing another proxy's entry even when keys are shared)
+        if let Some(key) = p.sk_index_key() {
             state.xtcp.sk_index.write().await.remove(key);
         }
     }

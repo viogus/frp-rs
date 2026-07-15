@@ -950,8 +950,8 @@ pub async fn handle_control<S>(
                             if let Some(port) = info.remote_port {
                                 state.used_ports.write().await.remove(&port);
                             }
-                            // Clean up STCP sk_index (use composite key for virtual_net)
-                            if let Some(ref key) = info.sk_index_key() {
+                            // Clean up STCP sk_index (indexed by proxy_name)
+                            if let Some(key) = info.sk_index_key() {
                                 state.xtcp.sk_index.write().await.remove(key);
                             }
                             // Clean up VHost routes
@@ -1161,14 +1161,13 @@ pub async fn handle_control<S>(
                             // Race: NewVisitorConn may arrive before proxy_manager
                             // registration completes. Fall back to pre-populated sk_index.
                             let sk_map = state.xtcp.sk_index.read().await;
-                            sk_map.iter().any(|(_sk_key, (pn, sk_raw))| {
-                                if pn == &nvc.proxy_name {
-                                    let expected = frp_core::auth::generate_token(sk_raw, timestamp);
+                            sk_map
+                                .get(&nvc.proxy_name)
+                                .is_some_and(|sk_raw| {
+                                    let expected =
+                                        frp_core::auth::generate_token(sk_raw, timestamp);
                                     expected == sign_key
-                                } else {
-                                    false
-                                }
-                            })
+                                })
                         };
 
                         if ok {

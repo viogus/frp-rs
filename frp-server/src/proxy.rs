@@ -32,17 +32,17 @@ pub struct ProxyInfo {
 }
 
 impl ProxyInfo {
-    /// Compute the composite key used in `sk_index`.
+    /// Returns the proxy name for use as an `sk_index` key, if this proxy
+    /// has a non-empty secret key (STCP/XTCP). Returns `None` when `sk`
+    /// is empty/missing.
     ///
-    /// When `virtual_net` is set, the key is `"{virtual_net}\0{sk}"`;
-    /// otherwise it is just `sk`. The `\0` separator is unambiguous because
-    /// null bytes cannot appear in TOML/JSON config strings.
-    /// Returns `None` when `sk` is empty/missing.
-    pub fn sk_index_key(&self) -> Option<String> {
-        let sk = self.sk.as_deref().filter(|s| !s.is_empty())?;
-        match self.virtual_net.as_deref().filter(|v| !v.is_empty()) {
-            Some(vn) => Some(format!("{}\0{}", vn, sk)),
-            None => Some(sk.to_string()),
+    /// The key is `proxy_name` — unique per ProxyManager, so multiple
+    /// proxies sharing the same secret key never collide.
+    pub fn sk_index_key(&self) -> Option<&str> {
+        if self.sk.as_deref().filter(|s| !s.is_empty()).is_some() {
+            Some(&self.name)
+        } else {
+            None
         }
     }
 }
