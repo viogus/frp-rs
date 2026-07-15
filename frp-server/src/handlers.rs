@@ -82,8 +82,12 @@ pub(crate) async fn handle_visitor_conn_inner(
             match pn {
                 Some(pn) => pn,
                 None => {
-                    warn!(proxy_name = %msg.proxy_name, sign_key_prefix = %&sign_key[..sign_key.len().min(8)], "NewVisitorConn: no STCP proxy found for proxy_name='{}', sign_key='{}...'",
-                        msg.proxy_name, &sign_key[..sign_key.len().min(8)]);
+                    // SAFETY: chars().take(8) is safe on any UTF-8 input, including
+                    // multi-byte characters. Byte-index slicing (&s[..8]) would
+                    // panic if byte 8 falls inside a multi-byte char boundary.
+                    let sign_key_prefix: String = sign_key.chars().take(8).collect();
+                    warn!(proxy_name = %msg.proxy_name, sign_key_prefix = %sign_key_prefix, "NewVisitorConn: no STCP proxy found for proxy_name='{}', sign_key='{}...'",
+                        msg.proxy_name, sign_key_prefix);
                     // Send error response to visitor (Go frp expects NewVisitorConnResp)
                     let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
                         proxy_name: msg.proxy_name.clone(),

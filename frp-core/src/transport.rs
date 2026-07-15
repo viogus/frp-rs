@@ -1,5 +1,7 @@
 use std::io;
 use std::pin::Pin;
+#[cfg(feature = "websocket")]
+use std::time::Duration;
 
 #[cfg(feature = "kcp")]
 use crate::kcp::KcpStream;
@@ -2163,41 +2165,77 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
     let mut first_line = true;
     let mut valid_path = false;
 
-    // Read HTTP upgrade request line by line.
-    loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| crate::Error::Transport(format!("WS read request: {e}").into()))?;
-        if line == "\r\n" || line.is_empty() {
-            break;
+    // Read HTTP upgrade request line by line with size limits and timeout.
+    // Limits prevent a slow or malicious client from exhausting server memory
+    // or pinning a connection indefinitely during the WebSocket handshake.
+    const MAX_LINE_LEN: usize = 16 * 1024;     // 16 KiB per header line
+    const MAX_TOTAL_HEADERS: usize = 64 * 1024; // 64 KiB total headers
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let header_result = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let mut total_bytes = 0usize;
+        loop {
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .map_err(|e| crate::Error::Transport(format!("WS read request: {e}").into()))?;
+            total_bytes += line.len();
+            if total_bytes > MAX_TOTAL_HEADERS {
+                return Err(crate::Error::Transport(
+                    TransportError::WebSocketUpgrade("request headers too large".into()),
+                ));
+            }
+            if line.len() > MAX_LINE_LEN {
+                return Err(crate::Error::Transport(
+                    TransportError::WebSocketUpgrade(format!(
+                        "header line too long ({} bytes, max {})",
+                        line.len(),
+                        MAX_LINE_LEN
+                    )),
+                ));
+            }
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if first_line {
+                // Validate request line: GET /~!frp HTTP/1.x
+                first_line = false;
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 2 || !parts[0].eq_ignore_ascii_case("GET") {
+                    return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
+                        format!("expected GET request, got: {}", line.trim()),
+                    )));
+                }
+                if parts[1] == FRP_WEBSOCKET_PATH {
+                    valid_path = true;
+                }
+            }
+            if line.len() > 1 {
+                let lower = line.to_lowercase();
+                if lower.starts_with("sec-websocket-key:") {
+                    key = line
+                        .split_once(':')
+                        .map(|x| x.1)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                } else if lower.starts_with("upgrade:") && lower.contains("websocket") {
+                    is_upgrade = true;
+                }
+            }
         }
-        if first_line {
-            // Validate request line: GET /~!frp HTTP/1.x
-            first_line = false;
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 2 || !parts[0].eq_ignore_ascii_case("GET") {
-                return Err(crate::Error::Transport(TransportError::WebSocketUpgrade(
-                    format!("expected GET request, got: {}", line.trim()),
-                )));
-            }
-            if parts[1] == FRP_WEBSOCKET_PATH {
-                valid_path = true;
-            }
-        }
-        if line.len() > 1 {
-            let lower = line.to_lowercase();
-            if lower.starts_with("sec-websocket-key:") {
-                key = line
-                    .split_once(':')
-                    .map(|x| x.1)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-            } else if lower.starts_with("upgrade:") && lower.contains("websocket") {
-                is_upgrade = true;
-            }
+        Ok(())
+    })
+    .await;
+
+    match header_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_elapsed) => {
+            return Err(crate::Error::Transport(
+                TransportError::WebSocketUpgrade("handshake timed out".into()),
+            ));
         }
     }
 

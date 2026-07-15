@@ -1293,30 +1293,20 @@ impl Service {
                                     .await;
                                     debug!(proxy_name = %pn, "XTCP provider '{}' encrypted P2P closed", pn);
                                 } else if !use_comp {
-                                    // Plain, no compression: try zero-copy on Linux.
-                                    #[cfg(target_os = "linux")]
-                                    {
-                                        let _ = frp_core::bridge::bridge_plain_zero_copy(
-                                            local_stream,
-                                            p2p_stream,
-                                        )
-                                        .await;
-                                    }
-                                    #[cfg(not(target_os = "linux"))]
-                                    {
-                                        let (local_r, local_w) = local_stream.into_split();
-                                        let (p2p_r, p2p_w) = p2p_stream.into_split();
-                                        frp_core::bridge::bridge_plain(
-                                            local_r,
-                                            local_w,
-                                            p2p_r,
-                                            p2p_w,
-                                            false,
-                                            vec![],
-                                            None,
-                                        )
-                                        .await;
-                                    }
+                                    // Plain, no compression. Zero-copy splice
+                                    // disabled for v0.7.0 — see bridge.rs.
+                                    let (local_r, local_w) = local_stream.into_split();
+                                    let (p2p_r, p2p_w) = p2p_stream.into_split();
+                                    frp_core::bridge::bridge_plain(
+                                        local_r,
+                                        local_w,
+                                        p2p_r,
+                                        p2p_w,
+                                        false,
+                                        vec![],
+                                        None,
+                                    )
+                                    .await;
                                     debug!(proxy_name = %pn, "XTCP provider '{}' P2P closed", pn);
                                 } else {
                                     let (local_r, local_w) = local_stream.into_split();
@@ -1449,29 +1439,20 @@ impl Service {
                                         .await;
                                         debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' encrypted P2P closed", proxy_name_clone);
                                     } else if !xtcp_use_comp {
-                                        // Plain, no compression: try zero-copy on Linux.
-                                        #[cfg(target_os = "linux")]
-                                        {
-                                            let _ = frp_core::bridge::bridge_plain_zero_copy(
-                                                local_conn, p2p,
-                                            )
-                                            .await;
-                                        }
-                                        #[cfg(not(target_os = "linux"))]
-                                        {
-                                            let (local_r, local_w) = local_conn.into_split();
-                                            let (p2p_r, p2p_w) = p2p.into_split();
-                                            frp_core::bridge::bridge_plain(
-                                                local_r,
-                                                local_w,
-                                                p2p_r,
-                                                p2p_w,
-                                                false,
-                                                vec![],
-                                                None,
-                                            )
-                                            .await;
-                                        }
+                                        // Plain, no compression. Zero-copy splice
+                                        // disabled for v0.7.0 — see bridge.rs.
+                                        let (local_r, local_w) = local_conn.into_split();
+                                        let (p2p_r, p2p_w) = p2p.into_split();
+                                        frp_core::bridge::bridge_plain(
+                                            local_r,
+                                            local_w,
+                                            p2p_r,
+                                            p2p_w,
+                                            false,
+                                            vec![],
+                                            None,
+                                        )
+                                        .await;
                                         debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' P2P closed", proxy_name_clone);
                                     } else {
                                         let (local_r, local_w) = local_conn.into_split();

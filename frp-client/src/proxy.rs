@@ -28,11 +28,12 @@ pub fn create_visitor_conn_msg(
         None
     } else {
         let hash = frp_core::auth::generate_token(secret_key, timestamp);
-        // Redact secret key in logs: only show first 4 chars for debugging.
-        let sk_redacted = if secret_key.len() > 4 {
-            format!("{}...", &secret_key[..4])
+        // Redact secret key in logs: show only first 4 chars (safe on any UTF-8).
+        let sk_redacted: String = secret_key.chars().take(4).collect();
+        let sk_redacted = if sk_redacted.len() < secret_key.len() {
+            format!("{sk_redacted}...")
         } else {
-            "****".to_string()
+            sk_redacted
         };
         debug!(
             secret_key = %sk_redacted, timestamp = %timestamp, sign_key = %hash,

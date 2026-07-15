@@ -257,24 +257,14 @@ async fn relay_plain_fast(
 ) {
     use std::sync::atomic::Ordering;
 
-    // On Linux, try zero-copy splice for Tcp-to-Tcp.
-    // Use try_tcp() to check without enumerating all IoStream variants.
-    #[cfg(target_os = "linux")]
-    if user_conn.try_tcp().is_some() && work_conn.try_tcp().is_some() {
-        let (IoStream::Tcp(user), IoStream::Tcp(work)) = (user_conn, work_conn) else {
-            unreachable!()
-        };
-        match frp_core::bridge::bridge_plain_zero_copy(user, work).await {
-            Ok((a, b)) => {
-                metrics.record_traffic(a, b);
-                return;
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "zero-copy bridge failed: {}", e);
-                return;
-            }
-        }
-    }
+    // Zero-copy splice disabled for v0.7.0 — EAGAIN busy-loop on non-blocking
+    // fds can saturate CPU under backpressure (2 spawn_blocking tasks per conn).
+    // TODO: re-enable with AsyncFd/epoll-driven readiness waiting.
+    // Fall through to copy_bidirectional on all platforms.
+    // #[cfg(target_os = "linux")]
+    // if user_conn.try_tcp().is_some() && work_conn.try_tcp().is_some() {
+    //     ...
+    // }
 
     // Fallback: standard copy_bidirectional.
     match tokio::io::copy_bidirectional(&mut user_conn, &mut work_conn).await {

@@ -81,14 +81,11 @@ impl ProxyManager {
 
     pub async fn register(&self, run_id: String, info: ProxyInfo) -> Result<(), String> {
         let name = info.name.clone();
-        // Register in group index
-        if let Some(ref group) = info.group {
-            if !group.is_empty() {
-                let mut groups = self.groups.write().await;
-                groups.entry(group.clone()).or_default().push(name.clone());
-            }
-        }
+        let group = info.group.clone();
         // Check-and-insert atomically under write lock (fixes TOCTOU).
+        // Must check BEFORE updating group index — if registration fails
+        // due to name conflict, the group index must not be polluted with
+        // a proxy name that belongs to a different (already-registered) proxy.
         {
             let mut proxies = self.proxies.write().await;
             if proxies.contains_key(&name) {
@@ -101,7 +98,14 @@ impl ProxyManager {
             .await
             .entry(run_id)
             .or_default()
-            .insert(name, info);
+            .insert(name.clone(), info);
+        // Register in group index only after successful insertion.
+        if let Some(ref group) = group {
+            if !group.is_empty() {
+                let mut groups = self.groups.write().await;
+                groups.entry(group.clone()).or_default().push(name);
+            }
+        }
         Ok(())
     }
 

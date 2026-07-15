@@ -39,7 +39,9 @@ pub struct KcpStream {
     write_notify: Arc<Notify>,
     /// Pending backpressure wait future. Created when write backlog is full;
     /// resolved when KcpSocket drains enough backlog and calls notify_waiters().
-    backpressure_fut: Option<Pin<Box<tokio::sync::futures::Notified<'static>>>>,
+    /// Uses OwnedNotified (not Notified<'_>) so the future holds its own
+    /// Arc<Notify> reference — no transmute, no field ordering dependency.
+    backpressure_fut: Option<Pin<Box<tokio::sync::futures::OwnedNotified>>>,
 }
 
 impl KcpStream {
@@ -176,10 +178,9 @@ impl AsyncWrite for KcpStream {
         let backlog = self.write_backlog.load(Ordering::Relaxed);
         if backlog >= KCP_WRITE_BACKLOG_THRESHOLD {
             // Create a Notified future to wait for KcpSocket to drain backlog.
-            // SAFETY: write_notify is Arc<Notify>; the Notify lives as long as
-            // KcpStream. The Notified future borrows from this stable allocation.
-            let notified: tokio::sync::futures::Notified<'static> =
-                unsafe { std::mem::transmute(self.write_notify.notified()) };
+            // notified_owned() takes an Arc<Notify> and returns an OwnedNotified
+            // that holds its own reference — no unsafe transmute, no lifetime issue.
+            let notified = self.write_notify.clone().notified_owned();
             self.backpressure_fut = Some(Box::pin(notified));
             // Re-poll the newly created future with the current waker.
             if let Some(ref mut fut) = self.backpressure_fut {
