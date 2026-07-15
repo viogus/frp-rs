@@ -1430,7 +1430,7 @@ impl Service {
                                                 info!(sni_host = %sni_host, proxy_name = %route.proxy_name, addr = %addr,
                                                     "SNI route '{}' → HTTPS proxy '{}' from {}",
                                                     sni_host, route.proxy_name, addr);
-                                                let _ = ctl.tx.send(InternalMsg::ProxyUserConn {
+                                                let _ = ctl.tx.try_send(InternalMsg::ProxyUserConn {
                                                     proxy_name: route.proxy_name.clone(),
                                                     user_conn: IoStream::Tcp(inner_stream),
                                                     pre_read: sni_data,

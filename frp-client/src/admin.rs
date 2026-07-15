@@ -34,8 +34,8 @@ struct ProxyStatusEntry {
 pub struct AdminState {
     pub proxy_metrics: Arc<ProxyMetricsRegistry>,
     pub proxies: Arc<RwLock<HashMap<String, ProxyRuntimeInfo>>>,
-    pub reload_tx: mpsc::UnboundedSender<ReloadRequest>,
-    pub stop_tx: mpsc::UnboundedSender<()>,
+    pub reload_tx: mpsc::Sender<ReloadRequest>,
+    pub stop_tx: mpsc::Sender<()>,
     pub config_path: Option<String>,
 }
 
@@ -143,7 +143,7 @@ async fn handle_reload(
         .unwrap_or(false);
     let (tx, rx) = oneshot::channel();
     let req = ReloadRequest { strict, reply: tx };
-    state.reload_tx.send(req).map_err(|_| {
+    state.reload_tx.send(req).await.map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "reload channel closed".into(),
@@ -161,7 +161,7 @@ async fn handle_reload(
 }
 
 async fn handle_stop(State(state): State<AdminState>) -> &'static str {
-    let _ = state.stop_tx.send(());
+    let _ = state.stop_tx.try_send(());
     "stop success"
 }
 
@@ -238,7 +238,7 @@ async fn handle_put_config(
         strict: true,
         reply: tx,
     };
-    state.reload_tx.send(req).map_err(|_| {
+    state.reload_tx.send(req).await.map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "reload channel closed".into(),

@@ -280,7 +280,7 @@ pub async fn handle_control<S>(
     }
 
     // --- Set up internal channel ---
-    let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<InternalMsg>();
+    let (internal_tx, mut internal_rx) = mpsc::channel::<InternalMsg>(1024);
 
     // Register control channel. If a previous handler exists for this run_id,
     // send Shutdown to it so it stops listening (Go frp v0.69.1 compat).
@@ -289,7 +289,7 @@ pub async fn handle_control<S>(
         let mut map = state.run_id_to_ctl_tx.write().await;
         if let Some(old_ctl) = map.get(&run_id) {
             warn!(run_id = %run_id, "Duplicate run_id {}: shutting down old control handler", run_id);
-            let _ = old_ctl.tx.send(InternalMsg::Shutdown);
+            let _ = old_ctl.tx.try_send(InternalMsg::Shutdown);
         }
         map.insert(
             run_id.clone(),
@@ -653,7 +653,7 @@ pub async fn handle_control<S>(
                                 map.get(&target_run_id).cloned()
                             };
                             if let Some(ctl) = ctl_tx {
-                                let _ = ctl.tx.send(InternalMsg::ProxyUserConn {
+                                let _ = ctl.tx.try_send(InternalMsg::ProxyUserConn {
                                     proxy_name: target_proxy,
                                     user_conn,
                                     pre_read,
@@ -920,7 +920,7 @@ pub async fn handle_control<S>(
                                 // Same client — no forwarding needed (client handles locally)
                                 debug!(proxy_name = %pkt.proxy_name, "vnet packet target is self, skipping forward");
                             } else if let Some(ctl_tx) = state.run_id_to_ctl_tx.read().await.get(&target_run_id) {
-                                let _ = ctl_tx.tx.send(crate::state::InternalMsg::VnetPacketForward {
+                                let _ = ctl_tx.tx.try_send(crate::state::InternalMsg::VnetPacketForward {
                                     proxy_name: pkt.proxy_name.clone(),
                                     data: pkt.data.clone(),
                                 });
@@ -1342,7 +1342,7 @@ pub async fn handle_control<S>(
                         };
 
                         // Send NatHoleSid to provider ON A WORK CONNECTION (Go frp compat).
-                        if provider_ctl.tx.send(InternalMsg::NatHoleSidOnWorkConn {
+                        if provider_ctl.tx.try_send(InternalMsg::NatHoleSidOnWorkConn {
                             sid: transaction_id.clone(),
                             proxy_name: proxy_name.clone(),
                         }).is_err() {
@@ -1467,7 +1467,7 @@ pub async fn handle_control<S>(
                             }
 
                             // Send NatHoleResp to visitor via control channel
-                            let _ = visitor_tx.send(InternalMsg::WriteNatHoleResp {
+                            let _ = visitor_tx.try_send(InternalMsg::WriteNatHoleResp {
                                 transaction_id: v_resp.transaction_id.clone(),
                                 error: v_resp.error.clone(),
                                 sid: v_resp.sid.clone(),
@@ -1478,7 +1478,7 @@ pub async fn handle_control<S>(
 
                             // Send NatHoleResp to provider via control channel
                             if let Some(ref cr) = c_resp {
-                                let _ = provider_tx.send(InternalMsg::WriteNatHoleResp {
+                                let _ = provider_tx.try_send(InternalMsg::WriteNatHoleResp {
                                     transaction_id: cr.transaction_id.clone(),
                                     error: cr.error.clone(),
                                     sid: cr.sid.clone(),

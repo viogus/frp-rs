@@ -23,8 +23,8 @@ static KCP_WRITE_CALLS: AtomicU64 = AtomicU64::new(0);
 pub struct KcpStream {
     conv: u32,
     pub peer_addr: SocketAddr,
-    write_tx: mpsc::UnboundedSender<(u32, WriteRequest)>,
-    read_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    write_tx: mpsc::Sender<(u32, WriteRequest)>,
+    read_rx: mpsc::Receiver<Vec<u8>>,
     read_buffer: Vec<u8>,
     read_pos: usize,
     read_count: u64,
@@ -48,8 +48,8 @@ impl KcpStream {
     pub(crate) fn new(
         conv: u32,
         peer_addr: SocketAddr,
-        write_tx: mpsc::UnboundedSender<(u32, WriteRequest)>,
-        read_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        write_tx: mpsc::Sender<(u32, WriteRequest)>,
+        read_rx: mpsc::Receiver<Vec<u8>>,
         write_backlog: Arc<AtomicUsize>,
         write_notify: Arc<Notify>,
     ) -> Self {
@@ -203,11 +203,29 @@ impl AsyncWrite for KcpStream {
 
         let req = WriteRequest::Data(buf.to_vec());
 
-        if self.write_tx.send((self.conv, req)).is_err() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "KCP driver closed",
-            )));
+        // Increment backlog BEFORE try_send so it reflects queued messages,
+        // not just those being processed. Decrement on Full to avoid
+        // permanently consuming capacity.
+        self.write_backlog.fetch_add(1, Ordering::Relaxed);
+        match self.write_tx.try_send((self.conv, req)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.write_backlog.fetch_sub(1, Ordering::Relaxed);
+                // Apply backpressure — wait for socket to drain.
+                let notified = self.write_notify.clone().notified_owned();
+                self.backpressure_fut = Some(Box::pin(notified));
+                if let Some(ref mut fut) = self.backpressure_fut {
+                    let _ = fut.as_mut().poll(cx);
+                }
+                return Poll::Pending;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.write_backlog.fetch_sub(1, Ordering::Relaxed);
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "KCP driver closed",
+                )));
+            }
         }
 
         // Fire-and-forget: KCP's send window handles backpressure.
@@ -242,15 +260,17 @@ impl AsyncWrite for KcpStream {
         // Send a flush request if we don't have one pending.
         if self.flush_rx.is_none() {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            if self
-                .write_tx
-                .send((self.conv, WriteRequest::Flush(tx)))
-                .is_err()
-            {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "KCP driver closed",
-                )));
+            match self.write_tx.try_send((self.conv, WriteRequest::Flush(tx))) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    return Poll::Pending;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "KCP driver closed",
+                    )));
+                }
             }
             self.flush_rx = Some(rx);
         }

@@ -39,15 +39,15 @@ pub(crate) enum WriteRequest {
 }
 
 pub(crate) struct KcpSocketHandle {
-    pub write_tx: mpsc::UnboundedSender<(u32, WriteRequest)>,
-    pub register_tx: mpsc::UnboundedSender<(u32, SocketAddr, KcpSession)>,
+    pub write_tx: mpsc::Sender<(u32, WriteRequest)>,
+    pub register_tx: mpsc::Sender<(u32, SocketAddr, KcpSession)>,
     /// Channel to send newly accepted streams back to KcpListener::accept().
     #[allow(dead_code)]
-    pub accept_tx: mpsc::UnboundedSender<KcpStream>,
+    pub accept_tx: mpsc::Sender<KcpStream>,
     /// Notify the socket driver that a session has been accepted by the
     /// listener, so it should no longer be subject to the unaccepted-
     /// session timeout. Carries (conv, peer_addr) to identify the session.
-    pub accept_notify_tx: mpsc::UnboundedSender<(u32, SocketAddr)>,
+    pub accept_notify_tx: mpsc::Sender<(u32, SocketAddr)>,
     /// Shared write backlog counter: incremented by KcpSocket on recv from
     /// write_rx, decremented after processing. KcpStream reads this to gate
     /// poll_write before sending.
@@ -70,13 +70,13 @@ pub(crate) struct KcpSocket {
     /// listener. Removed on accept (via accept_notify_rx) or on session
     /// removal (dead/error).
     session_created_at: HashMap<(u32, SocketAddr), u32>,
-    write_tx: mpsc::UnboundedSender<(u32, WriteRequest)>,
-    write_rx: mpsc::UnboundedReceiver<(u32, WriteRequest)>,
-    register_rx: mpsc::UnboundedReceiver<(u32, SocketAddr, KcpSession)>,
-    accept_tx: mpsc::UnboundedSender<KcpStream>,
+    write_tx: mpsc::Sender<(u32, WriteRequest)>,
+    write_rx: mpsc::Receiver<(u32, WriteRequest)>,
+    register_rx: mpsc::Receiver<(u32, SocketAddr, KcpSession)>,
+    accept_tx: mpsc::Sender<KcpStream>,
     /// Back-channel: listener sends (conv, addr) when it accepts a stream,
     /// so the driver can remove it from the unaccepted timeout set.
-    accept_notify_rx: mpsc::UnboundedReceiver<(u32, SocketAddr)>,
+    accept_notify_rx: mpsc::Receiver<(u32, SocketAddr)>,
     write_backlog: Arc<AtomicUsize>,
     write_notify: Arc<Notify>,
     start: Instant,
@@ -86,11 +86,15 @@ impl KcpSocket {
     pub fn new(
         socket: Arc<UdpSocket>,
         config: KcpConfig,
-    ) -> (Self, KcpSocketHandle, mpsc::UnboundedReceiver<KcpStream>) {
-        let (write_tx, write_rx) = mpsc::unbounded_channel();
-        let (register_tx, register_rx) = mpsc::unbounded_channel();
-        let (accept_tx, accept_rx) = mpsc::unbounded_channel();
-        let (accept_notify_tx, accept_notify_rx) = mpsc::unbounded_channel();
+    ) -> (Self, KcpSocketHandle, mpsc::Receiver<KcpStream>) {
+        const CAP_WRITE: usize = 256;
+        const CAP_REGISTER: usize = 64;
+        const CAP_ACCEPT: usize = 256;
+        const CAP_ACCEPT_NOTIFY: usize = 256;
+        let (write_tx, write_rx) = mpsc::channel(CAP_WRITE);
+        let (register_tx, register_rx) = mpsc::channel(CAP_REGISTER);
+        let (accept_tx, accept_rx) = mpsc::channel(CAP_ACCEPT);
+        let (accept_notify_tx, accept_notify_rx) = mpsc::channel(CAP_ACCEPT_NOTIFY);
         let write_backlog = Arc::new(AtomicUsize::new(0));
         let write_notify = Arc::new(Notify::new());
         let this = Self {
@@ -201,7 +205,8 @@ impl KcpSocket {
                 }
 
                 Some((conv, req)) = self.write_rx.recv() => {
-                    self.write_backlog.fetch_add(1, Ordering::Relaxed);
+                    // Backlog was incremented by KcpStream before try_send.
+                    // We decrement after processing (below).
                     match req {
                         WriteRequest::Data(data) => {
                             let len = data.len();
@@ -324,7 +329,7 @@ impl KcpSocket {
                                     // Create session and validate the first packet.
                                     // If input() fails on the very first packet, the
                                     // data is garbage — don't create a permanent session.
-                                    let (read_tx, read_rx) = mpsc::unbounded_channel();
+                                    let (read_tx, read_rx) = mpsc::channel(256);
                                     let mut session = KcpSession::new(
                                         key.0, src, self.config.clone(), read_tx,
                                     );
@@ -339,7 +344,26 @@ impl KcpSocket {
                                         self.write_backlog.clone(),
                                         self.write_notify.clone(),
                                     );
-                                    let _ = self.accept_tx.send(stream);
+                                    if let Err(mpsc::error::TrySendError::Full(_)) =
+                                        self.accept_tx.try_send(stream)
+                                    {
+                                        tracing::warn!(
+                                            conv = key.0,
+                                            peer = %key.1,
+                                            "KCP: accept channel full, dropping new session"
+                                        );
+                                        // Clean up the partially-created session.
+                                        self.sessions.remove(&key);
+                                        self.conv_index.remove(&key.0);
+                                        let ip = key.1.ip();
+                                        if let Some(count) = self.peer_session_counts.get_mut(&ip) {
+                                            *count = count.saturating_sub(1);
+                                            if *count == 0 {
+                                                self.peer_session_counts.remove(&ip);
+                                            }
+                                        }
+                                        continue;
+                                    }
                                     self.conv_index.insert(key.0, key.1);
                                     self.sessions.insert(key, session);
                                     *self.peer_session_counts.entry(src.ip()).or_default() += 1;

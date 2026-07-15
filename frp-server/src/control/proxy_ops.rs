@@ -53,7 +53,7 @@ pub(crate) async fn handle_new_proxy(
     run_id: &str,
     state: &Arc<AppState>,
     writer: &mut (impl AsyncWriteExt + Unpin),
-    internal_tx: &mpsc::UnboundedSender<InternalMsg>,
+    internal_tx: &mpsc::Sender<InternalMsg>,
     listener_handles: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
     udp_sockets: &mut std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
     udp_local_to_proxy: &mut std::collections::HashMap<String, String>,
@@ -543,7 +543,7 @@ pub(crate) async fn handle_new_proxy(
                     udp_resp_signals.push(tx);
                     tokio::spawn(async move {
                         let _ = rx.await; // Wait until NewProxyResp is written
-                        let _ = itx_clone.send(InternalMsg::UdpNeedsWorkConn {
+                        let _ = itx_clone.try_send(InternalMsg::UdpNeedsWorkConn {
                             proxy_name: pn_clone,
                         });
                     });
@@ -600,7 +600,7 @@ pub(crate) async fn listen_and_proxy(
     bind_addr: String,
     port: u16,
     proxy_name: String,
-    internal_tx: mpsc::UnboundedSender<InternalMsg>,
+    internal_tx: mpsc::Sender<InternalMsg>,
 ) {
     let addr = format_socket_addr(&bind_addr, port);
     let listener = match TcpListener::bind(&addr).await {
@@ -619,7 +619,7 @@ pub(crate) async fn listen_and_proxy(
             Ok((user_conn, _addr)) => {
                 frp_core::transport::set_nodelay(&user_conn);
                 if internal_tx
-                    .send(InternalMsg::ProxyUserConn {
+                    .try_send(InternalMsg::ProxyUserConn {
                         proxy_name: proxy_name.clone(),
                         user_conn: IoStream::Tcp(user_conn),
                         pre_read: vec![],

@@ -260,7 +260,7 @@ async fn serve_vhost_request<S>(
         if let Some(ctl_tx) = internal_tx {
             let _ = ctl_tx
                 .tx
-                .send(InternalMsg::ProxyUserConn {
+                .try_send(InternalMsg::ProxyUserConn {
                     proxy_name: route.proxy_name.clone(),
                     user_conn: wrap(stream),
                     pre_read,

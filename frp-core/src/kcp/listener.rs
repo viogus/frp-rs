@@ -16,10 +16,10 @@ pub struct KcpListener {
     local_addr: SocketAddr,
     /// Held to keep write/register channels alive for spawned driver.
     _handle: KcpSocketHandle,
-    accept_rx: mpsc::UnboundedReceiver<KcpStream>,
+    accept_rx: mpsc::Receiver<KcpStream>,
     /// Back-channel: notify the socket driver when a session has been
     /// accepted, so it stops being subject to the unaccepted timeout.
-    accept_notify_tx: mpsc::UnboundedSender<(u32, SocketAddr)>,
+    accept_notify_tx: mpsc::Sender<(u32, SocketAddr)>,
 }
 
 impl KcpListener {
@@ -51,10 +51,11 @@ impl KcpListener {
             .await
             .ok_or_else(|| io::Error::other("KCP listener closed"))?;
         // Notify the socket driver that this session has been accepted.
-        // If the driver has already shut down (channel closed), ignore.
+        // If channel is full or closed, ignore — session ages out of
+        // timeout set naturally after 30s.
         let _ = self
             .accept_notify_tx
-            .send((stream.conv(), stream.peer_addr));
+            .try_send((stream.conv(), stream.peer_addr));
         Ok(stream)
     }
 
@@ -78,7 +79,7 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
     let socket = Arc::new(socket);
 
     let (kcp_socket, handle, _accept_rx) = KcpSocket::new(socket, config.clone());
-    let (read_tx, read_rx) = mpsc::unbounded_channel();
+    let (read_tx, read_rx) = mpsc::channel(256);
     let session = KcpSession::new(conv, remote, config.clone(), read_tx);
 
     // Register session BEFORE spawning driver so the driver can route
@@ -87,8 +88,8 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
     // wrong conv → creates duplicate session before register_tx processed.
     handle
         .register_tx
-        .send((conv, remote, session))
-        .map_err(|_| io::Error::other("driver closed"))?;
+        .try_send((conv, remote, session))
+        .map_err(|e| io::Error::other(format!("KCP register failed: {e}")))?;
 
     tokio::spawn(async move { kcp_socket.run().await });
 

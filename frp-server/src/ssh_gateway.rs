@@ -253,13 +253,13 @@ impl VirtualControl {
         enc_key: [u8; 16],
     ) -> (
         impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-        mpsc::UnboundedSender<Vec<u8>>,
-        mpsc::UnboundedReceiver<WorkConnRequest>,
+        mpsc::Sender<Vec<u8>>,
+        mpsc::Receiver<WorkConnRequest>,
         tokio::sync::oneshot::Receiver<()>,
     ) {
         let (to_handler, from_ssh) = tokio::io::duplex(65536);
-        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (work_tx, work_rx) = mpsc::unbounded_channel::<WorkConnRequest>();
+        let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (work_tx, work_rx) = mpsc::channel::<WorkConnRequest>(16);
         let (phase2_tx, phase2_rx) = tokio::sync::oneshot::channel();
 
         // Spawn background task that bridges the duplex to the mpsc channels,
@@ -335,7 +335,7 @@ impl VirtualControl {
                                 // proxy_name intentionally empty: ReqWorkConn
                                 // carries no proxy_name in V1 protocol, and
                                 // the work-connection pool does not use it.
-                                let _ = read_work_tx.send(WorkConnRequest {
+                                let _ = read_work_tx.try_send(WorkConnRequest {
                                     proxy_name: String::new(),
                                 });
                             }
@@ -385,10 +385,10 @@ pub struct SshSession {
     /// channels and request work connections from the SSH client.
     pub ssh_handle: Option<russh::server::Handle>,
     /// V1 frame sender into the VirtualControl channel (→ control handler).
-    frame_tx: mpsc::UnboundedSender<Vec<u8>>,
+    frame_tx: mpsc::Sender<Vec<u8>>,
     /// Receives WorkConnRequest from VirtualControl's AsyncWrite intercept.
     /// Taken by the background task spawned in `auth_succeeded`.
-    work_conn_rx: Option<mpsc::UnboundedReceiver<WorkConnRequest>>,
+    work_conn_rx: Option<mpsc::Receiver<WorkConnRequest>>,
     /// SSH listen ports allocated by `tcpip_forward`, consumed by the
     /// work-connection background task to open TCP connections that
     /// traverse the SSH reverse tunnel.
@@ -419,8 +419,8 @@ impl Drop for SshSession {
 impl SshSession {
     pub fn new(
         run_id: String,
-        frame_tx: mpsc::UnboundedSender<Vec<u8>>,
-        work_conn_rx: mpsc::UnboundedReceiver<WorkConnRequest>,
+        frame_tx: mpsc::Sender<Vec<u8>>,
+        work_conn_rx: mpsc::Receiver<WorkConnRequest>,
         server_token: String,
         authorized_keys: Vec<russh::keys::PublicKey>,
         state: std::sync::Arc<AppState>,
@@ -665,7 +665,7 @@ impl Handler for SshSession {
         let v1_frame = build_v1_frame_from_args(&args, allocated)?;
 
         self.frame_tx
-            .send(v1_frame)
+            .try_send(v1_frame)
             .map_err(|_| anyhow!("virtual control channel closed"))?;
 
         let proxy_name = args.proxy_name.clone();
@@ -796,7 +796,7 @@ impl Handler for SshSession {
 /// back to the client's local service, and sends the stream as
 /// InternalMsg::NewWorkConn to the control handler for bridging.
 async fn handle_work_conn_requests(
-    mut work_rx: mpsc::UnboundedReceiver<WorkConnRequest>,
+    mut work_rx: mpsc::Receiver<WorkConnRequest>,
     listen_ports: std::sync::Arc<tokio::sync::Mutex<std::collections::VecDeque<u16>>>,
     state: std::sync::Arc<AppState>,
     run_id: String,
@@ -850,7 +850,12 @@ async fn handle_work_conn_requests(
             Some(tx) => {
                 use crate::service::InternalMsg;
                 let io_stream = frp_core::transport::IoStream::Tcp(stream);
-                if tx.tx.send(InternalMsg::NewWorkConn(io_stream)).is_err() {
+                if tx
+                    .tx
+                    .send(InternalMsg::NewWorkConn(io_stream))
+                    .await
+                    .is_err()
+                {
                     tracing::error!(
                         run_id = %run_id,
                         "SSH session {}: control handler channel closed",
@@ -1321,7 +1326,7 @@ mod virtual_ctrl_tests {
         // Feed LoginResp so the bg task transitions to encrypted mode
         feed_login_resp(&mut vc, phase2).await;
         // Channel should be alive — sending a frame should work
-        assert!(tx.send(vec![0x04, 0, 0, 0, 0, 0, 0, 0, 0]).is_ok());
+        assert!(tx.try_send(vec![0x04, 0, 0, 0, 0, 0, 0, 0, 0]).is_ok());
     }
 
     #[tokio::test]
@@ -1339,7 +1344,7 @@ mod virtual_ctrl_tests {
         // it and writes to the duplex. We read the encrypted data from vc
         // (the to_handler end).
         let frame = vec![0x04u8, 0, 0, 0, 0, 0, 0, 0, 0]; // TYPE_NEW_PROXY + 8-byte len
-        tx.send(frame.clone()).unwrap();
+        tx.try_send(frame.clone()).unwrap();
         drop(tx);
 
         // Read back from vc — should get encrypted data

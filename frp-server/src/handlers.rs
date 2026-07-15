@@ -152,7 +152,7 @@ pub(crate) async fn handle_visitor_conn_inner(
             }
             if ctl
                 .tx
-                .send(InternalMsg::VisitorConn {
+                .try_send(InternalMsg::VisitorConn {
                     proxy_name,
                     visitor_conn: stream,
                 })
@@ -377,7 +377,7 @@ pub(crate) async fn handle_nat_hole_visitor(
     // handle_client() signals notify_ch when the provider's response arrives.
     if ctl_tx
         .tx
-        .send(InternalMsg::NatHoleSidOnWorkConn {
+        .try_send(InternalMsg::NatHoleSidOnWorkConn {
             sid: sid.clone(),
             proxy_name: proxy_name.clone(),
         })
@@ -554,7 +554,7 @@ pub(crate) async fn handle_nat_hole_visitor(
 
     // Send to provider via control channel
     if let Some(ref cr) = c_resp {
-        let _ = ctl_tx.tx.send(InternalMsg::WriteNatHoleResp {
+        let _ = ctl_tx.tx.try_send(InternalMsg::WriteNatHoleResp {
             transaction_id: cr.transaction_id.clone(),
             error: cr.error.clone(),
             sid: cr.sid.clone(),
@@ -737,7 +737,7 @@ pub(crate) async fn handle_work_conn_inner(
 
     match ctl_tx {
         Some(ctl) => {
-            if ctl.tx.send(InternalMsg::NewWorkConn(stream)).is_err() {
+            if ctl.tx.try_send(InternalMsg::NewWorkConn(stream)).is_err() {
                 warn!(run_id = %run_id, "Control handler for {} has gone away", run_id);
             }
         }

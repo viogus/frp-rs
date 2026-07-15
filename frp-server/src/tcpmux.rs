@@ -231,7 +231,7 @@ pub async fn run_tcpmux_listener(
             if let Some(ctl_tx) = internal_tx {
                 let _ = ctl_tx
                     .tx
-                    .send(InternalMsg::ProxyUserConn {
+                    .try_send(InternalMsg::ProxyUserConn {
                         proxy_name: route.proxy_name.clone(),
                         user_conn: frp_core::transport::IoStream::Tcp(stream),
                         pre_read: Vec::new(),
