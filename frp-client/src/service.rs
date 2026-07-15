@@ -86,20 +86,20 @@ pub struct Service {
     /// Path to config file for admin reload/config endpoints.
     config_file: Option<String>,
     /// Channel to trigger config reload from external signal (SIGUSR1).
-    reload_tx: mpsc::UnboundedSender<ReloadRequest>,
+    reload_tx: mpsc::Sender<ReloadRequest>,
     /// Receiver side of reload channel — consumed by run().
-    reload_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<ReloadRequest>>>,
+    reload_rx: std::sync::Mutex<Option<mpsc::Receiver<ReloadRequest>>>,
     /// STUN server address for XTCP NAT traversal.
     nat_hole_stun_server: String,
     /// Channel from work connection tasks to the control loop for XTCP (provider side).
-    xtcp_tx: mpsc::UnboundedSender<XtcpNotification>,
+    xtcp_tx: mpsc::Sender<XtcpNotification>,
     /// Receiver side of XTCP channel — consumed by run().
-    xtcp_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<XtcpNotification>>>,
+    xtcp_rx: std::sync::Mutex<Option<mpsc::Receiver<XtcpNotification>>>,
     /// Channel from visitor tasks to the control loop (Go frps compat:
     /// NatHoleVisitor is sent on the control connection, not fresh TCP).
-    visitor_tx: mpsc::UnboundedSender<VisitorRequest>,
+    visitor_tx: mpsc::Sender<VisitorRequest>,
     /// Receiver side of visitor channel — consumed by run().
-    visitor_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<VisitorRequest>>>,
+    visitor_rx: std::sync::Mutex<Option<mpsc::Receiver<VisitorRequest>>>,
     /// Per-proxy health check cancel flags. Keyed by proxy name.
     /// Set to true on CloseProxy/CloseProxyResp; entry removed in try_reload.
     health_cancels: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
@@ -115,7 +115,7 @@ pub struct Service {
     /// Per-proxy TX channels for forwarding received VnetPackets to TUN devices.
     /// Keyed by proxy name.
     #[cfg(feature = "vnet")]
-    vnet_tun_tx: Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>,
+    vnet_tun_tx: Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>>>,
     /// Per-proxy TUN device names for OS route injection.
     #[cfg(feature = "vnet")]
     vnet_tun_names: Arc<Mutex<HashMap<String, String>>>,
@@ -309,9 +309,9 @@ impl Service {
         }
         let proxy_info_map = Arc::new(RwLock::new(map));
 
-        let (reload_tx, reload_rx) = mpsc::unbounded_channel::<ReloadRequest>();
-        let (xtcp_tx, xtcp_rx) = mpsc::unbounded_channel::<XtcpNotification>();
-        let (visitor_tx, visitor_rx) = mpsc::unbounded_channel::<VisitorRequest>();
+        let (reload_tx, reload_rx) = mpsc::channel::<ReloadRequest>(4);
+        let (xtcp_tx, xtcp_rx) = mpsc::channel::<XtcpNotification>(64);
+        let (visitor_tx, visitor_rx) = mpsc::channel::<VisitorRequest>(64);
 
         let nat_hole_stun_server = if cfg.nat_hole_stun_server.is_empty() {
             "stun:stun.l.google.com:19302".to_string()
@@ -379,7 +379,7 @@ impl Service {
     /// Request a config reload. Safe to call from signal handler.
     /// Returns immediately; actual reload happens asynchronously in run().
     pub fn request_reload(&self) {
-        let _ = self.reload_tx.send(ReloadRequest {
+        let _ = self.reload_tx.try_send(ReloadRequest {
             strict: false,
             reply: {
                 let (tx, _) = tokio::sync::oneshot::channel();
@@ -451,7 +451,7 @@ impl Service {
 
         // Channel for health checks to signal unhealthy proxies.
         // Health checks send the proxy name; the control loop sends CloseProxy to the server.
-        let (health_tx, mut health_rx) = mpsc::unbounded_channel::<String>();
+        let (health_tx, mut health_rx) = mpsc::channel::<String>(16);
 
         // Cancellation flags for health check tasks — set to true when a proxy
         // is closed (via CloseProxy from server, admin, or health check failure).
@@ -483,7 +483,7 @@ impl Service {
             .expect("visitor_rx already taken — run() called twice?");
         let xtcp_tx = self.xtcp_tx.clone();
         let nat_hole_stun_server = self.nat_hole_stun_server.clone();
-        let (_stop_tx, mut stop_rx) = mpsc::unbounded_channel::<()>();
+        let (_stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         #[cfg(feature = "admin")]
@@ -694,7 +694,7 @@ impl Service {
                 let mut tuns = self.vnet_tuns.lock().await;
                 for (proxy_name, tun_opt) in tuns.iter_mut() {
                     if let Some(tun) = tun_opt.take() {
-                        let (tun_tx, tun_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                        let (tun_tx, tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
                         {
                             let mut txs = self.vnet_tun_tx.lock().await;
                             txs.insert(proxy_name.clone(), tun_tx);
@@ -956,7 +956,7 @@ impl Service {
                                     Ok(packet) => {
                                         let txs = self.vnet_tun_tx.lock().await;
                                         if let Some(tx) = txs.get(&vpkt.proxy_name) {
-                                            if tx.send(packet).is_err() {
+                                            if tx.try_send(packet).is_err() {
                                                 warn!(proxy_name = %vpkt.proxy_name, "vnet TUN channel closed");
                                             }
                                         }
@@ -1127,7 +1127,7 @@ impl Service {
     async fn spawn_health_checks(
         &self,
         proxies: &[frp_core::config::ProxyConfig],
-        health_tx: &mpsc::UnboundedSender<String>,
+        health_tx: &mpsc::Sender<String>,
         health_cancels: &Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
     ) {
         for p in proxies {
@@ -1176,8 +1176,8 @@ impl Service {
     #[cfg(feature = "admin")]
     fn spawn_admin_server(
         &self,
-        reload_tx: &mpsc::UnboundedSender<ReloadRequest>,
-        stop_tx: &mpsc::UnboundedSender<()>,
+        reload_tx: &mpsc::Sender<ReloadRequest>,
+        stop_tx: &mpsc::Sender<()>,
     ) {
         if self.cfg.web_server.port > 0 {
             let admin_addr =
@@ -1293,30 +1293,20 @@ impl Service {
                                     .await;
                                     debug!(proxy_name = %pn, "XTCP provider '{}' encrypted P2P closed", pn);
                                 } else if !use_comp {
-                                    // Plain, no compression: try zero-copy on Linux.
-                                    #[cfg(target_os = "linux")]
-                                    {
-                                        let _ = frp_core::bridge::bridge_plain_zero_copy(
-                                            local_stream,
-                                            p2p_stream,
-                                        )
-                                        .await;
-                                    }
-                                    #[cfg(not(target_os = "linux"))]
-                                    {
-                                        let (local_r, local_w) = local_stream.into_split();
-                                        let (p2p_r, p2p_w) = p2p_stream.into_split();
-                                        frp_core::bridge::bridge_plain(
-                                            local_r,
-                                            local_w,
-                                            p2p_r,
-                                            p2p_w,
-                                            false,
-                                            vec![],
-                                            None,
-                                        )
-                                        .await;
-                                    }
+                                    // Plain, no compression. Zero-copy splice
+                                    // disabled for v0.7.0 — see bridge.rs.
+                                    let (local_r, local_w) = local_stream.into_split();
+                                    let (p2p_r, p2p_w) = p2p_stream.into_split();
+                                    frp_core::bridge::bridge_plain(
+                                        local_r,
+                                        local_w,
+                                        p2p_r,
+                                        p2p_w,
+                                        false,
+                                        vec![],
+                                        None,
+                                    )
+                                    .await;
                                     debug!(proxy_name = %pn, "XTCP provider '{}' P2P closed", pn);
                                 } else {
                                     let (local_r, local_w) = local_stream.into_split();
@@ -1449,29 +1439,20 @@ impl Service {
                                         .await;
                                         debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' encrypted P2P closed", proxy_name_clone);
                                     } else if !xtcp_use_comp {
-                                        // Plain, no compression: try zero-copy on Linux.
-                                        #[cfg(target_os = "linux")]
-                                        {
-                                            let _ = frp_core::bridge::bridge_plain_zero_copy(
-                                                local_conn, p2p,
-                                            )
-                                            .await;
-                                        }
-                                        #[cfg(not(target_os = "linux"))]
-                                        {
-                                            let (local_r, local_w) = local_conn.into_split();
-                                            let (p2p_r, p2p_w) = p2p.into_split();
-                                            frp_core::bridge::bridge_plain(
-                                                local_r,
-                                                local_w,
-                                                p2p_r,
-                                                p2p_w,
-                                                false,
-                                                vec![],
-                                                None,
-                                            )
-                                            .await;
-                                        }
+                                        // Plain, no compression. Zero-copy splice
+                                        // disabled for v0.7.0 — see bridge.rs.
+                                        let (local_r, local_w) = local_conn.into_split();
+                                        let (p2p_r, p2p_w) = p2p.into_split();
+                                        frp_core::bridge::bridge_plain(
+                                            local_r,
+                                            local_w,
+                                            p2p_r,
+                                            p2p_w,
+                                            false,
+                                            vec![],
+                                            None,
+                                        )
+                                        .await;
                                         debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' P2P closed", proxy_name_clone);
                                     } else {
                                         let (local_r, local_w) = local_conn.into_split();

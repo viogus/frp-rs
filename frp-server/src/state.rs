@@ -91,7 +91,7 @@ pub struct PoolStats {
 
 #[derive(Debug, Clone)]
 pub struct ControlTx {
-    pub tx: mpsc::UnboundedSender<InternalMsg>,
+    pub tx: mpsc::Sender<InternalMsg>,
     pub client_addr: Option<SocketAddr>,
     pub login_time: Instant,
     /// Absolute Unix epoch timestamp of login, for dashboard v2 API.

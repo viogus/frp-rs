@@ -124,7 +124,7 @@ fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
 
 /// Receiver for incoming yamux streams (work connections) accepted by the server.
 pub struct IncomingStreams {
-    rx: mpsc::UnboundedReceiver<YamuxStream>,
+    rx: mpsc::Receiver<YamuxStream>,
 }
 
 impl IncomingStreams {
@@ -137,7 +137,7 @@ impl IncomingStreams {
 /// Handle for opening new yamux streams (client-side work connections).
 #[derive(Clone)]
 pub struct YamuxSession {
-    tx: mpsc::UnboundedSender<OpenRequest>,
+    tx: mpsc::Sender<OpenRequest>,
 }
 
 impl YamuxSession {
@@ -145,7 +145,7 @@ impl YamuxSession {
     /// Returns `None` if the yamux session is closed/dropped.
     pub async fn open_stream(&self) -> Option<YamuxStream> {
         let (reply, rx) = oneshot::channel();
-        if self.tx.send(OpenRequest { reply }).is_err() {
+        if self.tx.send(OpenRequest { reply }).await.is_err() {
             return None;
         }
         rx.await.ok().flatten()
@@ -187,7 +187,7 @@ where
     let control_compat = control.compat();
 
     // Channel for forwarding accepted work connection streams.
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(256);
 
     // Spawn background task: accept yamux streams and drive connection I/O.
     //
@@ -229,7 +229,7 @@ where
             match stream {
                 Some(Ok(stream)) => {
                     let compat = stream.compat();
-                    if tx.send(compat).is_err() {
+                    if tx.try_send(compat).is_err() {
                         debug!("yamux server: incoming channel closed, stopping acceptor");
                         break;
                     }
@@ -292,7 +292,7 @@ where
     let control_compat = control.compat();
 
     // Channel for open-stream requests.
-    let (tx, mut rx) = mpsc::unbounded_channel::<OpenRequest>();
+    let (tx, mut rx) = mpsc::channel::<OpenRequest>(256);
 
     let conn = Arc::new(Mutex::new(conn));
     let bg_conn = conn.clone();

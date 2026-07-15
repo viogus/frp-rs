@@ -538,7 +538,7 @@ fn default_plugin_timeout() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerTransportConfig {
-    #[serde(default = "default_true")]
+    #[serde(default = "default_tcp_mux")]
     pub tcp_mux: bool,
     #[serde(default)]
     pub tcp_mux_keepalive_interval: i64,
@@ -558,7 +558,7 @@ pub struct ServerTransportConfig {
 impl Default for ServerTransportConfig {
     fn default() -> Self {
         Self {
-            tcp_mux: true,
+            tcp_mux: default_tcp_mux(),
             tcp_mux_keepalive_interval: 30,
             heartbeat_timeout: default_heartbeat_timeout(),
             max_pool_count: default_max_pool_count(),
@@ -801,10 +801,8 @@ pub struct ClientConfig {
     /// Empty means use system default. Go frp compat: connectServerLocalIP.
     #[serde(default, alias = "connectServerLocalIP")]
     pub connect_server_local_ip: String,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_tcp_mux")]
     pub tcp_mux: bool,
-    /// Use V2 protocol framing (binary header + JSON payload).
-    /// Requires tcp_mux for yamux multiplexing. Default: false.
     #[serde(default)]
     pub v2: bool,
     #[serde(default)]
@@ -849,7 +847,7 @@ impl Default for ClientConfig {
             dns_server: String::new(),
             dial_server_keepalive: 0,
             connect_server_local_ip: String::new(),
-            tcp_mux: true,
+            tcp_mux: default_tcp_mux(),
             v2: false,
             proxies: vec![],
             visitors: vec![],
@@ -868,6 +866,9 @@ fn default_transport_protocol() -> String {
 }
 fn default_true() -> bool {
     true
+}
+fn default_tcp_mux() -> bool {
+    cfg!(feature = "tcp-mux")
 }
 fn default_heartbeat_interval() -> i64 {
     30

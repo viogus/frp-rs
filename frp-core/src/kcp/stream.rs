@@ -23,8 +23,8 @@ static KCP_WRITE_CALLS: AtomicU64 = AtomicU64::new(0);
 pub struct KcpStream {
     conv: u32,
     pub peer_addr: SocketAddr,
-    write_tx: mpsc::UnboundedSender<(u32, WriteRequest)>,
-    read_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    write_tx: mpsc::Sender<(u32, WriteRequest)>,
+    read_rx: mpsc::Receiver<Vec<u8>>,
     read_buffer: Vec<u8>,
     read_pos: usize,
     read_count: u64,
@@ -39,15 +39,17 @@ pub struct KcpStream {
     write_notify: Arc<Notify>,
     /// Pending backpressure wait future. Created when write backlog is full;
     /// resolved when KcpSocket drains enough backlog and calls notify_waiters().
-    backpressure_fut: Option<Pin<Box<tokio::sync::futures::Notified<'static>>>>,
+    /// Uses OwnedNotified (not Notified<'_>) so the future holds its own
+    /// Arc<Notify> reference — no transmute, no field ordering dependency.
+    backpressure_fut: Option<Pin<Box<tokio::sync::futures::OwnedNotified>>>,
 }
 
 impl KcpStream {
     pub(crate) fn new(
         conv: u32,
         peer_addr: SocketAddr,
-        write_tx: mpsc::UnboundedSender<(u32, WriteRequest)>,
-        read_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        write_tx: mpsc::Sender<(u32, WriteRequest)>,
+        read_rx: mpsc::Receiver<Vec<u8>>,
         write_backlog: Arc<AtomicUsize>,
         write_notify: Arc<Notify>,
     ) -> Self {
@@ -176,10 +178,9 @@ impl AsyncWrite for KcpStream {
         let backlog = self.write_backlog.load(Ordering::Relaxed);
         if backlog >= KCP_WRITE_BACKLOG_THRESHOLD {
             // Create a Notified future to wait for KcpSocket to drain backlog.
-            // SAFETY: write_notify is Arc<Notify>; the Notify lives as long as
-            // KcpStream. The Notified future borrows from this stable allocation.
-            let notified: tokio::sync::futures::Notified<'static> =
-                unsafe { std::mem::transmute(self.write_notify.notified()) };
+            // notified_owned() takes an Arc<Notify> and returns an OwnedNotified
+            // that holds its own reference — no unsafe transmute, no lifetime issue.
+            let notified = self.write_notify.clone().notified_owned();
             self.backpressure_fut = Some(Box::pin(notified));
             // Re-poll the newly created future with the current waker.
             if let Some(ref mut fut) = self.backpressure_fut {
@@ -202,11 +203,29 @@ impl AsyncWrite for KcpStream {
 
         let req = WriteRequest::Data(buf.to_vec());
 
-        if self.write_tx.send((self.conv, req)).is_err() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "KCP driver closed",
-            )));
+        // Increment backlog BEFORE try_send so it reflects queued messages,
+        // not just those being processed. Decrement on Full to avoid
+        // permanently consuming capacity.
+        self.write_backlog.fetch_add(1, Ordering::Relaxed);
+        match self.write_tx.try_send((self.conv, req)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.write_backlog.fetch_sub(1, Ordering::Relaxed);
+                // Apply backpressure — wait for socket to drain.
+                let notified = self.write_notify.clone().notified_owned();
+                self.backpressure_fut = Some(Box::pin(notified));
+                if let Some(ref mut fut) = self.backpressure_fut {
+                    let _ = fut.as_mut().poll(cx);
+                }
+                return Poll::Pending;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.write_backlog.fetch_sub(1, Ordering::Relaxed);
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "KCP driver closed",
+                )));
+            }
         }
 
         // Fire-and-forget: KCP's send window handles backpressure.
@@ -241,15 +260,23 @@ impl AsyncWrite for KcpStream {
         // Send a flush request if we don't have one pending.
         if self.flush_rx.is_none() {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            if self
-                .write_tx
-                .send((self.conv, WriteRequest::Flush(tx)))
-                .is_err()
-            {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "KCP driver closed",
-                )));
+            match self.write_tx.try_send((self.conv, WriteRequest::Flush(tx))) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Wait for socket to drain — same backpressure as poll_write.
+                    let notified = self.write_notify.clone().notified_owned();
+                    self.backpressure_fut = Some(Box::pin(notified));
+                    if let Some(ref mut fut) = self.backpressure_fut {
+                        let _ = fut.as_mut().poll(cx);
+                    }
+                    return Poll::Pending;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "KCP driver closed",
+                    )));
+                }
             }
             self.flush_rx = Some(rx);
         }

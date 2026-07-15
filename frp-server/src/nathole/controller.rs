@@ -25,7 +25,7 @@ pub struct ClientCfg {
     pub name: String,
     pub sk: String,
     pub allow_users: Vec<String>,
-    pub sid_ch: mpsc::UnboundedSender<String>,
+    pub sid_ch: mpsc::Sender<String>,
 }
 
 /// Active NAT hole-punch session between visitor and provider.
@@ -36,7 +36,7 @@ pub struct Session {
     // Visitor side
     pub visitor_msg: msg::NatHoleVisitor,
     pub visitor_writer: Mutex<Option<Box<dyn AsyncWrite + Send + Unpin>>>,
-    pub visitor_ctl_tx: Option<mpsc::UnboundedSender<InternalMsg>>,
+    pub visitor_ctl_tx: Option<mpsc::Sender<InternalMsg>>,
     pub v_resp: Mutex<Option<msg::NatHoleResp>>,
     pub v_nat_feature: Mutex<Option<NatFeature>>,
 
@@ -77,8 +77,8 @@ impl Controller {
         name: String,
         sk: String,
         allow_users: Vec<String>,
-    ) -> Result<mpsc::UnboundedReceiver<String>, String> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    ) -> Result<mpsc::Receiver<String>, String> {
+        let (tx, rx) = mpsc::channel(64);
         let cfg = ClientCfg {
             name: name.clone(),
             sk,
@@ -108,7 +108,7 @@ impl Controller {
             .get(name)
             .ok_or_else(|| format!("xtcp server for [{}] doesn't exist", name))?;
         cfg.sid_ch
-            .send(sid.to_string())
+            .try_send(sid.to_string())
             .map_err(|_| format!("provider [{}] channel closed", name))
     }
 
@@ -175,7 +175,7 @@ impl Controller {
         sid: String,
         proxy_name: String,
         visitor_msg: msg::NatHoleVisitor,
-        visitor_ctl_tx: mpsc::UnboundedSender<InternalMsg>,
+        visitor_ctl_tx: mpsc::Sender<InternalMsg>,
     ) -> Result<(Arc<Session>, oneshot::Receiver<msg::NatHoleReport>), String> {
         let (report_tx, report_rx) = oneshot::channel();
         let (notify_tx, _notify_rx) = oneshot::channel();
@@ -206,7 +206,7 @@ impl Controller {
                 );
                 // Send error response via control channel so visitor doesn't hang.
                 if let Some(ref tx) = session.visitor_ctl_tx {
-                    let _ = tx.send(InternalMsg::WriteNatHoleResp {
+                    let _ = tx.try_send(InternalMsg::WriteNatHoleResp {
                         transaction_id: session.visitor_msg.transaction_id.clone(),
                         error: Some("NAT hole session limit reached".into()),
                         sid: Some(sid.clone()),
@@ -339,7 +339,7 @@ impl Controller {
         let sessions = self.sessions.read().await;
         if let Some(session) = sessions.get(sid) {
             if let Some(ref tx) = session.visitor_ctl_tx {
-                let _ = tx.send(InternalMsg::WriteNatHoleSid {
+                let _ = tx.try_send(InternalMsg::WriteNatHoleSid {
                     sid: sid.to_string(),
                     provider_addr,
                 });
@@ -362,7 +362,7 @@ impl Controller {
         let sessions = self.sessions.read().await;
         if let Some(session) = sessions.get(sid) {
             if let Some(ref tx) = session.visitor_ctl_tx {
-                let _ = tx.send(InternalMsg::WriteNatHoleResp {
+                let _ = tx.try_send(InternalMsg::WriteNatHoleResp {
                     transaction_id: sid.to_string(),
                     error,
                     sid: resp_sid,
@@ -381,7 +381,7 @@ impl Controller {
         let sessions = self.sessions.read().await;
         if let Some(session) = sessions.get(sid) {
             if let Some(ref tx) = session.visitor_ctl_tx {
-                let _ = tx.send(InternalMsg::WriteNatHoleReport {
+                let _ = tx.try_send(InternalMsg::WriteNatHoleReport {
                     sid: sid.to_string(),
                 });
                 return true;

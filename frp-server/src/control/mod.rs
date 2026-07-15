@@ -280,7 +280,7 @@ pub async fn handle_control<S>(
     }
 
     // --- Set up internal channel ---
-    let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<InternalMsg>();
+    let (internal_tx, mut internal_rx) = mpsc::channel::<InternalMsg>(1024);
 
     // Register control channel. If a previous handler exists for this run_id,
     // send Shutdown to it so it stops listening (Go frp v0.69.1 compat).
@@ -289,7 +289,7 @@ pub async fn handle_control<S>(
         let mut map = state.run_id_to_ctl_tx.write().await;
         if let Some(old_ctl) = map.get(&run_id) {
             warn!(run_id = %run_id, "Duplicate run_id {}: shutting down old control handler", run_id);
-            let _ = old_ctl.tx.send(InternalMsg::Shutdown);
+            let _ = old_ctl.tx.try_send(InternalMsg::Shutdown);
         }
         map.insert(
             run_id.clone(),
@@ -653,7 +653,7 @@ pub async fn handle_control<S>(
                                 map.get(&target_run_id).cloned()
                             };
                             if let Some(ctl) = ctl_tx {
-                                let _ = ctl.tx.send(InternalMsg::ProxyUserConn {
+                                let _ = ctl.tx.try_send(InternalMsg::ProxyUserConn {
                                     proxy_name: target_proxy,
                                     user_conn,
                                     pre_read,
@@ -920,7 +920,7 @@ pub async fn handle_control<S>(
                                 // Same client — no forwarding needed (client handles locally)
                                 debug!(proxy_name = %pkt.proxy_name, "vnet packet target is self, skipping forward");
                             } else if let Some(ctl_tx) = state.run_id_to_ctl_tx.read().await.get(&target_run_id) {
-                                let _ = ctl_tx.tx.send(crate::state::InternalMsg::VnetPacketForward {
+                                let _ = ctl_tx.tx.try_send(crate::state::InternalMsg::VnetPacketForward {
                                     proxy_name: pkt.proxy_name.clone(),
                                     data: pkt.data.clone(),
                                 });
@@ -1194,11 +1194,92 @@ pub async fn handle_control<S>(
                         let transaction_id = nhv.transaction_id.clone();
                         let proxy_name = nhv.proxy_name.clone();
 
-                        // Validate proxy exists
-                        if state.proxy_manager.get(&proxy_name).await.is_none() {
+                        // Validate proxy exists and capture info for auth
+                        let proxy_info = match state.proxy_manager.get(&proxy_name).await {
+                            Some(info) => info,
+                            None => {
+                                let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                    transaction_id: transaction_id.clone(),
+                                    error: Some("proxy not found".into()),
+                                    ..Default::default()
+                                });
+                                let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                                continue;
+                            }
+                        };
+
+                        // --- Auth: verify visitor is authorized to access this proxy ---
+                        // Go frp v0.70 allowUsers semantics:
+                        //   - Empty: only the proxy owner can be a visitor
+                        //   - ["*"]: all authenticated users
+                        //   - Specific list: only those users
+                        // Auth is enforced BEFORE pre_check response so Go frp's
+                        // pre_check permission model is preserved.
+                        let visitor_user = login.user.clone().unwrap_or_default();
+
+                        if proxy_info.allow_users.is_empty() {
+                            // Empty = proxy owner only
+                            let owner = &proxy_info.user;
+                            if visitor_user.is_empty() || visitor_user != *owner {
+                                warn!(proxy_name = %proxy_name, user = %visitor_user, owner = %owner, "NatHoleVisitor: user '{}' not proxy owner '{}' for proxy '{}'", visitor_user, owner, proxy_name);
+                                let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                    transaction_id: transaction_id.clone(),
+                                    error: Some("access denied: owner only".into()),
+                                    ..Default::default()
+                                });
+                                let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                                continue;
+                            }
+                        } else if proxy_info.allow_users.iter().any(|u| u == "*") {
+                            // Wildcard — any authenticated user
+                        } else if !proxy_info.allow_users.contains(&visitor_user) {
+                            warn!(proxy_name = %proxy_name, user = %visitor_user, "NatHoleVisitor: user '{}' not in allow_users for proxy '{}'", visitor_user, proxy_name);
                             let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
                                 transaction_id: transaction_id.clone(),
-                                error: Some("proxy not found".into()),
+                                error: Some("access denied".into()),
+                                ..Default::default()
+                            });
+                            let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                            continue;
+                        }
+
+                        // Verify sign_key if the proxy has a shared secret.
+                        let sign_key = nhv.sign_key.as_deref().unwrap_or("");
+                        let timestamp = nhv.timestamp.unwrap_or(0);
+                        if let Some(ref sk) = proxy_info.sk {
+                            if !sk.is_empty() {
+                                if sign_key.is_empty() {
+                                    warn!(proxy_name = %proxy_name, "NatHoleVisitor: missing sign_key for protected proxy '{}'", proxy_name);
+                                    let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                        transaction_id: transaction_id.clone(),
+                                        error: Some("auth required".into()),
+                                        ..Default::default()
+                                    });
+                                    let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                                    continue;
+                                }
+                                let expected = frp_core::auth::generate_token(sk, timestamp);
+                                if expected != sign_key {
+                                    warn!(proxy_name = %proxy_name, "NatHoleVisitor auth failed on ctl for proxy '{}'", proxy_name);
+                                    let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                        transaction_id: transaction_id.clone(),
+                                        error: Some("auth failed".into()),
+                                        ..Default::default()
+                                    });
+                                    let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                                    continue;
+                                }
+                                debug!(proxy_name = %proxy_name, "NatHoleVisitor auth OK on ctl for proxy '{}'", proxy_name);
+                            }
+                        }
+
+                        // Go frp v0.70 pre_check compat: after auth, return OK without
+                        // creating a session or notifying the provider.
+                        if nhv.pre_check && nhv.mapped_addrs.is_none() {
+                            debug!(proxy_name = %proxy_name, user = %visitor_user, "NatHoleVisitor pre_check on ctl channel: proxy='{}' OK", proxy_name);
+                            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                transaction_id: transaction_id.clone(),
+                                error: None,
                                 ..Default::default()
                             });
                             let _ = write_ctl_msg(&mut writer, &resp, v2).await;
@@ -1218,19 +1299,6 @@ pub async fn handle_control<S>(
                                 continue;
                             }
                         };
-
-                        // Go frp v0.69.1 pre_check compat: validate and return OK,
-                        // no session created, no provider notified.
-                        if nhv.pre_check && nhv.mapped_addrs.is_none() {
-                            debug!(proxy_name = %proxy_name, "NatHoleVisitor pre_check on ctl channel: proxy='{}' OK", proxy_name);
-                            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-                                transaction_id: transaction_id.clone(),
-                                error: None,
-                                ..Default::default()
-                            });
-                            let _ = write_ctl_msg(&mut writer, &resp, v2).await;
-                            continue;
-                        }
 
                         let provider_ctl = {
                             let map = state.run_id_to_ctl_tx.read().await;
@@ -1274,7 +1342,7 @@ pub async fn handle_control<S>(
                         };
 
                         // Send NatHoleSid to provider ON A WORK CONNECTION (Go frp compat).
-                        if provider_ctl.tx.send(InternalMsg::NatHoleSidOnWorkConn {
+                        if provider_ctl.tx.try_send(InternalMsg::NatHoleSidOnWorkConn {
                             sid: transaction_id.clone(),
                             proxy_name: proxy_name.clone(),
                         }).is_err() {
@@ -1399,7 +1467,7 @@ pub async fn handle_control<S>(
                             }
 
                             // Send NatHoleResp to visitor via control channel
-                            let _ = visitor_tx.send(InternalMsg::WriteNatHoleResp {
+                            let _ = visitor_tx.try_send(InternalMsg::WriteNatHoleResp {
                                 transaction_id: v_resp.transaction_id.clone(),
                                 error: v_resp.error.clone(),
                                 sid: v_resp.sid.clone(),
@@ -1410,7 +1478,7 @@ pub async fn handle_control<S>(
 
                             // Send NatHoleResp to provider via control channel
                             if let Some(ref cr) = c_resp {
-                                let _ = provider_tx.send(InternalMsg::WriteNatHoleResp {
+                                let _ = provider_tx.try_send(InternalMsg::WriteNatHoleResp {
                                     transaction_id: cr.transaction_id.clone(),
                                     error: cr.error.clone(),
                                     sid: cr.sid.clone(),

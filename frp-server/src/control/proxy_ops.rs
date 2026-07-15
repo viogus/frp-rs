@@ -53,7 +53,7 @@ pub(crate) async fn handle_new_proxy(
     run_id: &str,
     state: &Arc<AppState>,
     writer: &mut (impl AsyncWriteExt + Unpin),
-    internal_tx: &mpsc::UnboundedSender<InternalMsg>,
+    internal_tx: &mpsc::Sender<InternalMsg>,
     listener_handles: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
     udp_sockets: &mut std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
     udp_local_to_proxy: &mut std::collections::HashMap<String, String>,
@@ -244,23 +244,25 @@ pub(crate) async fn handle_new_proxy(
             // so that NewVisitorConn arriving during the registration
             // race window can fall back to sk_index for auth.
             // (Go frp startVisitorListener pattern equivalent.)
-            // Indexed by proxy_name — no collision when multiple proxies
-            // share the same secret key.
             let needs_sk_index = (np.proxy_type == "stcp" || np.proxy_type == "xtcp")
                 && np.sk.as_deref().filter(|s| !s.is_empty()).is_some();
-            if needs_sk_index {
-                let raw_sk = np.sk.clone().unwrap_or_default();
-                state
-                    .xtcp
-                    .sk_index
-                    .write()
-                    .await
-                    .insert(np.proxy_name.clone(), raw_sk);
+            // Store our raw_sk for compare-before-remove on failure.
+            // Using value comparison instead of a boolean prevents a race:
+            // if concurrent registrations A→B both target the same name,
+            // A's failure won't remove B's successfully-inserted value
+            // (unless they happen to have the same sk).
+            let our_raw_sk: Option<String> = if needs_sk_index {
+                let raw = np.sk.clone().unwrap_or_default();
+                let mut sk_map = state.xtcp.sk_index.write().await;
+                sk_map.insert(np.proxy_name.clone(), raw.clone());
                 let vn = np.virtual_net.as_deref().unwrap_or("");
                 info!(proxy_name = %np.proxy_name, vn = %vn, "STCP/XTCP sk_index pre-populated for '{}'{}",
                     np.proxy_name,
                     if vn.is_empty() { String::new() } else { format!(" (virtual_net: {vn})") });
-            }
+                Some(raw)
+            } else {
+                None
+            };
 
             if let Err(e) = state
                 .proxy_manager
@@ -268,9 +270,17 @@ pub(crate) async fn handle_new_proxy(
                 .await
             {
                 state.used_ports.write().await.remove(&port);
-                // Clean up pre-populated sk_index on registration failure
-                if needs_sk_index {
-                    state.xtcp.sk_index.write().await.remove(&np.proxy_name);
+                // Compare-before-remove: only delete sk_index if our value
+                // is still present. If a concurrent registration overwrote
+                // our entry with a different value, leave it intact.
+                if let Some(ref our_sk) = our_raw_sk {
+                    let mut sk_map = state.xtcp.sk_index.write().await;
+                    let should_remove = sk_map
+                        .get(&np.proxy_name)
+                        .is_some_and(|stored| *stored == *our_sk);
+                    if should_remove {
+                        sk_map.remove(&np.proxy_name);
+                    }
                 }
                 reject_new_proxy(
                     writer,
@@ -304,8 +314,15 @@ pub(crate) async fn handle_new_proxy(
                 }
             }
 
-            // sk_index was pre-populated before proxy_manager.register() above
-            // to close the NewVisitorConn race window.
+            // Update sk_index with the final value now that registration succeeded.
+            if let Some(ref sk) = our_raw_sk {
+                state
+                    .xtcp
+                    .sk_index
+                    .write()
+                    .await
+                    .insert(np.proxy_name.clone(), sk.clone());
+            }
 
             // Register HTTP proxies with VhostManager
             if np.proxy_type == "http" {
@@ -526,7 +543,7 @@ pub(crate) async fn handle_new_proxy(
                     udp_resp_signals.push(tx);
                     tokio::spawn(async move {
                         let _ = rx.await; // Wait until NewProxyResp is written
-                        let _ = itx_clone.send(InternalMsg::UdpNeedsWorkConn {
+                        let _ = itx_clone.try_send(InternalMsg::UdpNeedsWorkConn {
                             proxy_name: pn_clone,
                         });
                     });
@@ -583,7 +600,7 @@ pub(crate) async fn listen_and_proxy(
     bind_addr: String,
     port: u16,
     proxy_name: String,
-    internal_tx: mpsc::UnboundedSender<InternalMsg>,
+    internal_tx: mpsc::Sender<InternalMsg>,
 ) {
     let addr = format_socket_addr(&bind_addr, port);
     let listener = match TcpListener::bind(&addr).await {
@@ -602,7 +619,7 @@ pub(crate) async fn listen_and_proxy(
             Ok((user_conn, _addr)) => {
                 frp_core::transport::set_nodelay(&user_conn);
                 if internal_tx
-                    .send(InternalMsg::ProxyUserConn {
+                    .try_send(InternalMsg::ProxyUserConn {
                         proxy_name: proxy_name.clone(),
                         user_conn: IoStream::Tcp(user_conn),
                         pre_read: vec![],

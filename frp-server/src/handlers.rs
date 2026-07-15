@@ -68,25 +68,26 @@ pub(crate) async fn handle_visitor_conn_inner(
     let proxy_name = match proxy_name {
         Some(pn) => pn,
         None => {
-            // Fall back to raw sk lookup for old Rust clients that send raw sk as sign_key
-            // sk_index is now keyed by proxy_name (not raw sk). Iterate to
-            // find a proxy whose stored raw_sk matches the legacy sign_key.
-            let pn = state
-                .xtcp
-                .sk_index
-                .read()
-                .await
-                .iter()
-                .find(|(_, raw_sk)| *raw_sk == &sign_key)
-                .map(|(pn, _)| pn.clone());
-            match pn {
-                Some(pn) => {
-                    debug!(proxy_name = %pn, "STCP visitor auth OK (raw sk_index lookup) for proxy '{}'", pn);
-                    pn
+            // Fall back to raw sk lookup for old Rust clients that send raw sk as sign_key.
+            // Look up by msg.proxy_name directly — do NOT iterate the whole map:
+            // multiple proxies sharing the same sk would route to the wrong one.
+            let sk_map = state.xtcp.sk_index.read().await;
+            let pn = match sk_map.get(&msg.proxy_name) {
+                Some(stored_sk) if *stored_sk == sign_key => {
+                    debug!(proxy_name = %msg.proxy_name, "STCP visitor auth OK (raw sk_index lookup) for proxy '{}'", msg.proxy_name);
+                    Some(msg.proxy_name.clone())
                 }
+                _ => None,
+            };
+            match pn {
+                Some(pn) => pn,
                 None => {
-                    warn!(proxy_name = %msg.proxy_name, sign_key_prefix = %&sign_key[..sign_key.len().min(8)], "NewVisitorConn: no STCP proxy found for proxy_name='{}', sign_key='{}...'",
-                        msg.proxy_name, &sign_key[..sign_key.len().min(8)]);
+                    // SAFETY: chars().take(8) is safe on any UTF-8 input, including
+                    // multi-byte characters. Byte-index slicing (&s[..8]) would
+                    // panic if byte 8 falls inside a multi-byte char boundary.
+                    let sign_key_prefix: String = sign_key.chars().take(8).collect();
+                    warn!(proxy_name = %msg.proxy_name, sign_key_prefix = %sign_key_prefix, "NewVisitorConn: no STCP proxy found for proxy_name='{}', sign_key='{}...'",
+                        msg.proxy_name, sign_key_prefix);
                     // Send error response to visitor (Go frp expects NewVisitorConnResp)
                     let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
                         proxy_name: msg.proxy_name.clone(),
@@ -151,7 +152,7 @@ pub(crate) async fn handle_visitor_conn_inner(
             }
             if ctl
                 .tx
-                .send(InternalMsg::VisitorConn {
+                .try_send(InternalMsg::VisitorConn {
                     proxy_name,
                     visitor_conn: stream,
                 })
@@ -199,18 +200,21 @@ pub(crate) async fn handle_nat_hole_visitor(
         return;
     }
 
-    // Validate proxy exists
-    if state.proxy_manager.get(&proxy_name).await.is_none() {
-        warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy '{}' not found", proxy_name);
-        let mut writer = stream.into_split().1;
-        let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-            transaction_id: transaction_id.clone(),
-            error: Some("proxy not found".into()),
-            ..Default::default()
-        });
-        let _ = write_msg(&mut writer, &resp, v2).await;
-        return;
-    }
+    // Validate proxy exists and capture its info for auth.
+    let proxy_info = match state.proxy_manager.get(&proxy_name).await {
+        Some(info) => info,
+        None => {
+            warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy '{}' not found", proxy_name);
+            let mut writer = stream.into_split().1;
+            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                transaction_id: transaction_id.clone(),
+                error: Some("proxy not found".into()),
+                ..Default::default()
+            });
+            let _ = write_msg(&mut writer, &resp, v2).await;
+            return;
+        }
+    };
 
     // Look up the provider's run_id from proxy_manager
     let run_id = state.proxy_manager.get_run_id(&proxy_name).await;
@@ -269,6 +273,76 @@ pub(crate) async fn handle_nat_hole_visitor(
         return;
     }
 
+    // --- Auth: verify visitor knows the shared secret ---
+    // NatHoleVisitor on a fresh TCP connection must prove knowledge of the
+    // proxy's secret key, just like NewVisitorConn. Without this check, an
+    // attacker can trigger NAT traversal and provider simultaneous-open for
+    // any proxy they can name.
+    {
+        let sign_key = msg.sign_key.as_deref().unwrap_or("");
+        let timestamp = msg.timestamp.unwrap_or(0);
+
+        // Require sign_key for non-pre_check requests on fresh connections.
+        // The sign_key must equal MD5(proxy_sk + timestamp).
+        if sign_key.is_empty() {
+            warn!(proxy_name = %proxy_name, "NatHoleVisitor: missing sign_key, rejecting");
+            let mut writer = stream.into_split().1;
+            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                transaction_id: transaction_id.clone(),
+                error: Some("auth required".into()),
+                ..Default::default()
+            });
+            let _ = write_msg(&mut writer, &resp, v2).await;
+            return;
+        }
+
+        let proxy_sk = proxy_info.sk.as_deref().unwrap_or("");
+        if proxy_sk.is_empty() {
+            // XTCP proxy without a shared secret: no way to authenticate
+            // visitors on fresh connections. Reject.
+            warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy has no sk configured — rejecting fresh connection");
+            let mut writer = stream.into_split().1;
+            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                transaction_id: transaction_id.clone(),
+                error: Some("proxy has no shared secret".into()),
+                ..Default::default()
+            });
+            let _ = write_msg(&mut writer, &resp, v2).await;
+            return;
+        }
+
+        let expected = frp_core::auth::generate_token(proxy_sk, timestamp);
+        if expected != sign_key {
+            warn!(proxy_name = %proxy_name, "NatHoleVisitor auth failed for proxy '{}'", proxy_name);
+            let mut writer = stream.into_split().1;
+            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                transaction_id: transaction_id.clone(),
+                error: Some("auth failed".into()),
+                ..Default::default()
+            });
+            let _ = write_msg(&mut writer, &resp, v2).await;
+            return;
+        }
+        debug!(proxy_name = %proxy_name, "NatHoleVisitor auth OK for proxy '{}'", proxy_name);
+
+        // --- allow_users check on fresh connections ---
+        // Fresh TCP connections carry no user identity — only sign_key.
+        // If the proxy restricts visitors via allow_users, reject fresh
+        // connections outright; authorized visitors must use the control
+        // channel path (control/mod.rs NatHoleVisitor handler).
+        if !proxy_info.allow_users.is_empty() {
+            warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy has allow_users configured — rejecting fresh connection (use control channel)");
+            let mut writer = stream.into_split().1;
+            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                transaction_id: transaction_id.clone(),
+                error: Some("access denied: use control channel for user-based auth".into()),
+                ..Default::default()
+            });
+            let _ = write_msg(&mut writer, &resp, v2).await;
+            return;
+        }
+    }
+
     let (reader, writer) = stream.into_split();
     let sid = transaction_id.clone();
 
@@ -303,7 +377,7 @@ pub(crate) async fn handle_nat_hole_visitor(
     // handle_client() signals notify_ch when the provider's response arrives.
     if ctl_tx
         .tx
-        .send(InternalMsg::NatHoleSidOnWorkConn {
+        .try_send(InternalMsg::NatHoleSidOnWorkConn {
             sid: sid.clone(),
             proxy_name: proxy_name.clone(),
         })
@@ -480,7 +554,7 @@ pub(crate) async fn handle_nat_hole_visitor(
 
     // Send to provider via control channel
     if let Some(ref cr) = c_resp {
-        let _ = ctl_tx.tx.send(InternalMsg::WriteNatHoleResp {
+        let _ = ctl_tx.tx.try_send(InternalMsg::WriteNatHoleResp {
             transaction_id: cr.transaction_id.clone(),
             error: cr.error.clone(),
             sid: cr.sid.clone(),
@@ -663,7 +737,7 @@ pub(crate) async fn handle_work_conn_inner(
 
     match ctl_tx {
         Some(ctl) => {
-            if ctl.tx.send(InternalMsg::NewWorkConn(stream)).is_err() {
+            if ctl.tx.try_send(InternalMsg::NewWorkConn(stream)).is_err() {
                 warn!(run_id = %run_id, "Control handler for {} has gone away", run_id);
             }
         }

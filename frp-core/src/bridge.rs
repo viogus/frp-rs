@@ -597,6 +597,10 @@ const SPLICE_F_MOVE: libc::c_uint = 1;
 
 /// Zero-copy bridge between two TcpStreams using `splice(2)`.
 ///
+/// **DISABLED for v0.7.0**: the non-blocking EAGAIN loop can busy-wait
+/// under backpressure, saturating CPU with 2 spawn_blocking tasks per
+/// connection. Re-enable with AsyncFd/epoll-driven readiness waiting.
+///
 /// Data is relayed kernel-space via two pipe pairs (one per direction),
 /// avoiding userspace copies entirely. Only available on Linux.
 ///
@@ -604,6 +608,7 @@ const SPLICE_F_MOVE: libc::c_uint = 1;
 /// On failure, the TcpStreams are consumed (their fds are invalid after
 /// `into_std()`).
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 pub async fn bridge_plain_zero_copy(
     user: tokio::net::TcpStream,
     work: tokio::net::TcpStream,
