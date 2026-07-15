@@ -31,6 +31,21 @@ const KCP_TICK_MS: u32 = 10;
 /// Default timeout for hole-punch response.
 pub const DEFAULT_HOLE_PUNCH_TIMEOUT_MS: u64 = 5000;
 
+/// Derive a KCP conversation ID from a shared session identifier.
+///
+/// Both sides of an XTCP P2P connection must use the same `conv` for KCP
+/// packets to be accepted by the peer's session (the `kcp` crate drops
+/// packets with mismatched `conv` when `input_conv` is `false`).
+///
+/// The NAT hole-punch session ID (`sid`) is known to both visitor (via
+/// `NatHoleResp.sid`) and provider (via `XtcpNotification` / `NatHoleResp`).
+pub fn conv_from_sid(sid: &str) -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    sid.hash(&mut h);
+    (h.finish() as u32).max(1)
+}
+
 // ---------------------------------------------------------------------------
 // Hole punching
 // ---------------------------------------------------------------------------

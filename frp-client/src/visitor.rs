@@ -271,8 +271,10 @@ pub(crate) async fn run_visitor_listener(
                             // Uses the STUN socket to punch a hole and create
                             // a KCP stream over UDP.
                             if let Some(socket) = stun_socket {
-                                // Generate random KCP conv (non-zero).
-                                let conv: u32 = rand::random::<u32>().max(1);
+                                // Derive shared KCP conv from the NAT session ID
+                                // (both sides get the same sid from the server).
+                                let sid = resp.sid.clone().unwrap_or_default();
+                                let conv = frp_core::xtcp_p2p::conv_from_sid(&sid);
                                 let kcp_cfg = frp_core::kcp::KcpConfig::default();
                                 // Go v0.70 compat: yamux client (visitor opens stream).
                                 match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(

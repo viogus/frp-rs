@@ -1289,7 +1289,7 @@ impl Service {
         };
 
         let candidates = vec![visitor_addr];
-        let conv: u32 = rand::random::<u32>().max(1);
+        let conv = frp_core::xtcp_p2p::conv_from_sid(&sid);
         let kcp_cfg = frp_core::kcp::KcpConfig::default();
 
         match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
@@ -1454,7 +1454,7 @@ impl Service {
             };
 
             // UDP hole punch + KCP data plane (Go v0.70 compat).
-            let conv: u32 = rand::random::<u32>().max(1);
+            let conv = frp_core::xtcp_p2p::conv_from_sid(&sid_clone);
             let kcp_cfg = frp_core::kcp::KcpConfig::default();
             // Provider acts as yamux server: accepts the visitor's stream.
             match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
