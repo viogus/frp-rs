@@ -69,12 +69,15 @@ pub(crate) async fn handle_visitor_conn_inner(
         Some(pn) => pn,
         None => {
             // Fall back to raw sk lookup for old Rust clients that send raw sk as sign_key
+            // sk_index is now keyed by proxy_name (not raw sk). Iterate to
+            // find a proxy whose stored raw_sk matches the legacy sign_key.
             let pn = state
                 .xtcp
                 .sk_index
                 .read()
                 .await
-                .get(&sign_key)
+                .iter()
+                .find(|(_, raw_sk)| *raw_sk == &sign_key)
                 .map(|(pn, _)| pn.clone());
             match pn {
                 Some(pn) => {

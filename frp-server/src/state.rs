@@ -128,10 +128,11 @@ pub struct OidcState {
 /// XTCP NAT-hole-punch coordination state.
 pub struct XtcpState {
     pub nat_hole: Arc<Controller>,
-    /// Key: composite `virtual_net\0sk` or just `sk` (no virtual_net).
-    /// Value: `(proxy_name, raw_sk)` — raw_sk stored so reverse-parsing
-    /// the key is never needed.
-    pub sk_index: Arc<RwLock<HashMap<String, (String, String)>>>,
+    /// Key: `proxy_name` (unique per ProxyManager — no collision when
+    /// multiple STCP/XTCP proxies share the same secret key).
+    /// Value: `raw_sk` — used for fallback auth during the
+    /// NewVisitorConn-before-registration race window.
+    pub sk_index: Arc<RwLock<HashMap<String, String>>>,
 }
 
 pub struct AppState {

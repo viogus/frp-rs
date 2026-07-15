@@ -553,8 +553,8 @@ async fn handle_store_proxy_delete(
     if let Some(port) = proxy.remote_port {
         state.used_ports.write().await.remove(&port);
     }
-    // Clean up sk_index (use composite key for virtual_net)
-    if let Some(ref key) = proxy.sk_index_key() {
+    // Clean up sk_index (indexed by proxy_name)
+    if let Some(key) = proxy.sk_index_key() {
         state.xtcp.sk_index.write().await.remove(key);
     }
     // Clean up VHost and TCPMux routes
@@ -587,7 +587,7 @@ async fn handle_proxies_delete(
             if let Some(port) = proxy.remote_port {
                 state.used_ports.write().await.remove(&port);
             }
-            if let Some(ref key) = proxy.sk_index_key() {
+            if let Some(key) = proxy.sk_index_key() {
                 state.xtcp.sk_index.write().await.remove(key);
             }
             state.vhost_manager.unregister(name).await;
