@@ -659,7 +659,7 @@ async fn handle_v2_users(
     }
     // Count clients per user. Each control connection maps to one client.
     // Clients are attributed to their login user (ControlTx.user).
-    for (run_id, _ctl) in ctl_map.iter() {
+    for run_id in ctl_map.keys() {
         let proxies = state.proxy_manager.list_client(run_id).await;
         if let Some(first_proxy) = proxies.first() {
             let user = if first_proxy.user.is_empty() {
