@@ -1281,11 +1281,14 @@ impl Service {
         // Go v0.70 compat: UDP hole punch + KCP data plane.
         let socket = match tokio::net::UdpSocket::bind("[::]:0").await {
             Ok(s) => s,
-            Err(e) => {
-                warn!(proxy_name = %proxy_name, error = %e, "XTCP: failed to bind UDP socket: {}", e);
-                Self::send_nat_hole_report(writer, v2, sid, "bind failed").await;
-                return;
-            }
+            Err(_) => match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(proxy_name = %proxy_name, error = %e, "XTCP: failed to bind UDP socket: {}", e);
+                    Self::send_nat_hole_report(writer, v2, sid, "bind failed").await;
+                    return;
+                }
+            },
         };
 
         let candidates = vec![visitor_addr];
