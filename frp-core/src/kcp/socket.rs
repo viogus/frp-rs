@@ -224,15 +224,15 @@ impl KcpSocket {
                             } else {
                                 tracing::trace!(conv, len, "KCP SOCKET: write queued {} bytes", len);
                             }
-                            // Decrement backlog and wake blocked writers.
-                            // Two cases:
-                            // 1. Gate check (backlog >= 1024): rare with bounded
-                            //    channel (cap 256), but notify when draining.
-                            // 2. try_send Full: channel fills before threshold.
-                            //    Notify after every Data item so writers blocked
-                            //    on backpressure_fut can retry.
+                            // Decrement backlog and wake ONE blocked writer.
+                            // notify_one() stores a permit if no waiters exist,
+                            // preventing the lost-wake race between poll_write's
+                            // notified_owned() and our decrement. (If we used
+                            // notify_waiters() and no waiter is registered yet,
+                            // the notification is lost, permanently blocking the
+                            // writer.)
                             let _prev = self.write_backlog.fetch_sub(1, Ordering::Release);
-                            self.write_notify.notify_waiters();
+                            self.write_notify.notify_one();
                         }
                         WriteRequest::Flush(tx) => {
                             // Force immediate KCP flush: update → drain output →

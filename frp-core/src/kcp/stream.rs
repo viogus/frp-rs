@@ -35,7 +35,7 @@ pub struct KcpStream {
     /// Shared write backlog counter with KcpSocket. poll_write gates on this
     /// to prevent unbounded write_rx channel growth under high packet loss.
     write_backlog: Arc<AtomicUsize>,
-    /// Woken by KcpSocket when backlog drains below threshold.
+    /// Woken by KcpSocket when backlog drains below threshold (via notify_one).
     write_notify: Arc<Notify>,
     /// Pending backpressure wait future. Created when write backlog is full;
     /// resolved when KcpSocket drains enough backlog and calls notify_waiters().

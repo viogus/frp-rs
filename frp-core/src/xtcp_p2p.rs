@@ -395,8 +395,11 @@ impl XtcpP2pStream {
             let data = std::mem::take(&mut self.pending_send);
             self.session.send(&data)?;
             // Wake write pollers that were blocked on the high-water mark.
+            // notify_one() stores a permit if no waiters exist, preventing
+            // the lost-wake race between poll_write's notified_owned() and
+            // our drain. (notify_waiters() would lose the notification.)
             if was_full {
-                self.write_notify.notify_waiters();
+                self.write_notify.notify_one();
             }
         }
 
