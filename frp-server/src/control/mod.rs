@@ -2,9 +2,9 @@ mod bridge;
 mod login;
 mod nathole;
 mod pool;
+mod proxy;
 mod proxy_ops;
 
-use proxy_ops::err_msg;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -13,7 +13,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, instrument, warn};
 
-use frp_core::encryption;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::mux::IncomingStreams;
 use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1, write_msg_v2};
@@ -98,7 +97,7 @@ pub async fn handle_control<S>(
     let (
         mut ctx,
         ctl,
-        internal_tx,
+        _internal_tx,
         mut internal_rx,
         mut reader,
         mut writer,
@@ -290,64 +289,14 @@ pub async fn handle_control<S>(
             msg = read_ctl_msg(&mut reader, v2) => {
                 match msg {
                     Ok(FrpMessage::UDPPacket(up)) => {
-                        debug!(byte_count = %up.content.len(), remote_addr = ?up.remote_addr, "UDPPacket from client: {} bytes to {:?}", up.content.len(), up.remote_addr);
-                        // Forward via the proxy's UDP socket (bidirectional NAT, Go frp compat).
-                        let local_addr_str = up.local_addr.as_ref().map(|a| a.to_string()).unwrap_or_default();
-                        let proxy_name = ctl.udp_local_to_proxy.get(&local_addr_str).cloned();
-                        // Cache local_addr → proxy_name mapping from incoming packets
-                        if !local_addr_str.is_empty() && !ctl.udp_local_to_proxy.contains_key(&local_addr_str) {
-                            let fallback_pn = proxy_name
-                                .clone()
-                                .or_else(|| {
-                                    let first = ctl.udp_sockets.keys().next().cloned();
-                                    if first.is_some() {
-                                        tracing::debug!(
-                                            local_addr = %local_addr_str,
-                                            "UDP packet local_addr→proxy_name not cached, falling back to first available socket"
-                                        );
-                                    }
-                                    first
-                                });
-                            if let Some(ref pn) = fallback_pn {
-                                ctl.udp_local_to_proxy.insert(local_addr_str.clone(), pn.clone());
-                            }
-                        }
-                        // Decrypt/decompress if the proxy requires it
-                        let mut payload = up.content.clone();
-                        if let Some(ref pn) = proxy_name {
-                            if let Some(proxy_info) = state.proxy_manager.get(pn.as_str()).await {
-                                if proxy_info.use_encryption {
-                                    if let Ok(decrypted) = encryption::decrypt(&payload, &reloadable.encryption_key) {
-                                        payload = decrypted;
-                                    }
-                                }
-                                if proxy_info.use_compression {
-                                    if let Ok(decompressed) = encryption::decompress(&payload) {
-                                        payload = decompressed;
-                                    }
-                                }
-                            }
-                        }
-                        let sock_opt = proxy_name
-                            .as_ref()
-                            .and_then(|pn| ctl.udp_sockets.get(pn.as_str()))
-                            .or_else(|| ctl.udp_sockets.iter().next().map(|(_, s)| s));
-                        if let Some(sock) = sock_opt {
-                            let sock = sock.clone();
-                            let content = payload;
-                            if let Some(ref remote) = up.remote_addr {
-                                let remote_str = remote.to_string();
-                                tokio::spawn(async move {
-                                    let _ = sock.send_to(&content, &remote_str).await;
-                                });
-                            }
-                        } else {
-                            warn!(byte_count = %up.content.len(), "No UDP socket for proxy, dropping {} bytes", up.content.len());
+                        if proxy::handle_udp_packet(&mut ctx, &mut ctl, &mut writer, up).await.is_err() {
+                            break;
                         }
                     }
                     Ok(FrpMessage::NewProxy(np)) => {
-                        info!(proxy_name = %np.proxy_name, "KCP TLS: received NewProxy for {}", np.proxy_name);
-                        proxy_ops::handle_new_proxy(np, &run_id, &state, &mut writer, &internal_tx, &mut ctl.listener_handles, &mut ctl.udp_sockets, &mut ctl.udp_local_to_proxy, v2).await;
+                        if proxy::handle_new_proxy(&mut ctx, &mut ctl, &mut writer, np).await.is_err() {
+                            break;
+                        }
                     }
                     #[cfg(feature = "vnet")]
                     Ok(FrpMessage::VnetRouteAdvertise(adv)) => {
@@ -362,63 +311,9 @@ pub async fn handle_control<S>(
                         nathole::handle_vnet_route_remove(&ctx, &mut ctl, &mut writer, rem).await;
                     }
                     Ok(FrpMessage::CloseProxy(cp)) => {
-                        // Verify the proxy belongs to this client
-                        let owner_run_id = state.proxy_manager.get_run_id(&cp.proxy_name).await;
-                        if owner_run_id.as_ref() != Some(&run_id) {
-                            warn!(
-                                proxy_name = %cp.proxy_name,
-                                run_id = %run_id,
-                                owner = ?owner_run_id,
-                                "CloseProxy rejected: proxy belongs to different client"
-                            );
-                            continue;
+                        if proxy::handle_close_proxy(&mut ctx, &mut ctl, &mut writer, cp).await.is_err() {
+                            break;
                         }
-                        if let Some(info) = state.proxy_manager.get(&cp.proxy_name).await {
-                            if let Some(port) = info.remote_port {
-                                state.used_ports.write().await.remove(&port);
-                            }
-                            // Clean up STCP sk_index (indexed by proxy_name)
-                            if let Some(key) = info.sk_index_key() {
-                                state.xtcp.sk_index.write().await.remove(key);
-                            }
-                            // Clean up VHost routes
-                            state.vhost_manager.unregister(&cp.proxy_name).await;
-                            state.proxy_metrics.remove(&cp.proxy_name).await;
-                            #[cfg(feature = "vnet")]
-                            {
-                                let mut routes = state.vnet_routes.write().await;
-                                routes.retain(|_, (_, name)| name != &cp.proxy_name);
-                            }
-                        }
-                        // Stop the listener task
-                        if let Some(handle) = ctl.listener_handles.remove(&cp.proxy_name) {
-                            handle.abort();
-                        }
-                        state.proxy_manager.remove(&cp.proxy_name).await;
-                        info!(proxy_name = %cp.proxy_name, "Proxy closed: {}", cp.proxy_name);
-                        // Emit WebSocket event for dashboard subscribers
-                        #[cfg(feature = "dashboard")]
-                        {
-                            let _ = state.event_tx.send(crate::event::ServerEvent::ProxyDown {
-                                proxy_name: cp.proxy_name.clone(),
-                                run_id: run_id.clone(),
-                            });
-                        }
-                        // Server plugin: close_proxy hook (fire-and-forget)
-                        let plugin_state = state.clone();
-                        let pn = cp.proxy_name.clone();
-                        let rid = run_id.clone();
-                        tokio::spawn(async move {
-                            let _ = plugin_state.plugin_manager.notify(
-                                "close_proxy",
-                                serde_json::json!({ "proxy_name": pn, "run_id": rid }),
-                            ).await;
-                        });
-                        // Note: Go frp does not send CloseProxyResp (type 7/19 is
-                        // Rust-only). frp-rs client handles both CloseProxy
-                        // and CloseProxyResp identically and already cleans up
-                        // health_cancels immediately after sending CloseProxy,
-                        // so no response is needed here.
                     }
                     Ok(FrpMessage::NatHoleClient(client_msg)) => {
                         nathole::handle_nat_hole_client(&ctx, &mut ctl, &mut writer, client_msg).await;
@@ -432,51 +327,10 @@ pub async fn handle_control<S>(
                     Ok(FrpMessage::NatHoleReport(report_msg)) => {
                         nathole::handle_nat_hole_report(&ctx, &mut ctl, &mut writer, report_msg).await;
                     }
-                    Ok(FrpMessage::Ping(ref ping_msg)) => {
-                        // Validate ping auth (Go frp v0.69.1 compat).
-                        // Only validate when "HeartBeats" is in additional_auth_scopes.
-                        let requires_ping_auth = reloadable
-                            .additional_auth_scopes.iter().any(|s| s == "HeartBeats");
-                        let ping_auth_result = if !requires_ping_auth {
-                            Ok(())
-                        } else if let Some(ref verifier) = state.oidc.verifier {
-                            let expected_sub = state.oidc.subjects.read().await
-                                .get(&run_id).cloned().unwrap_or_default();
-                            verifier.verify_ping(
-                                ping_msg.privilege_key.as_deref().unwrap_or(""),
-                                &expected_sub,
-                            ).await
-                        } else {
-                            reloadable.auth_cfg.validate_login(
-                                ping_msg.privilege_key.as_deref(),
-                                ping_msg.timestamp,
-                            ).map(|_| ())
-                        };
-                        if let Err(e) = ping_auth_result {
-                            warn!(peer = ?peer, error = %e, "Ping auth failed from {:?}: {}", peer, e);
-                            let pong = FrpMessage::Pong(msg::Pong { error: Some(err_msg(state.detailed_errors_to_client, e, "ping authentication failed")) });
-                            let _ = write_ctl_msg(&mut writer, &pong, v2).await;
+                    Ok(FrpMessage::Ping(ping_msg)) => {
+                        if proxy::handle_ping(&mut ctx, &mut ctl, &mut writer, ping_msg).await.is_err() {
                             break;
                         }
-                        ctl.last_ping = Instant::now();
-                        // Fire ping plugin hook (fire-and-forget — don't block control loop)
-                        let ping_content = serde_json::json!({
-                            "run_id": run_id,
-                            "remote_addr": peer.map(|a| a.to_string()).unwrap_or_default(),
-                            "timestamp": ping_msg.timestamp,
-                        });
-                        let plugin_mgr = state.plugin_manager.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = plugin_mgr.notify("ping", ping_content).await {
-                                debug!(error = %e, "Ping plugin hook failed");
-                            }
-                        });
-                        let pong = FrpMessage::Pong(msg::Pong { error: None });
-                        if let Err(e) = write_ctl_msg(&mut writer, &pong, v2).await {
-                            warn!(error = %e, "Failed to send pong: {}", e);
-                            break;
-                        }
-                        debug!(peer = ?peer, "Ping from {:?}", peer);
                     }
                     Ok(FrpMessage::NewVisitorConn(nvc)) => {
                         nathole::handle_new_visitor_conn(&ctx, &mut ctl, &mut writer, nvc, &login_user).await;
@@ -522,30 +376,5 @@ pub async fn handle_control<S>(
     }
 
     // Cleanup
-    for (_, handle) in ctl.listener_handles.drain() {
-        handle.abort();
-    }
-    // Emit ProxyDown for all proxies owned by this client (before removing them)
-    #[cfg(feature = "dashboard")]
-    {
-        let proxies = state.proxy_manager.list_client(&run_id).await;
-        for p in &proxies {
-            let _ = state.event_tx.send(crate::event::ServerEvent::ProxyDown {
-                proxy_name: p.name.clone(),
-                run_id: run_id.clone(),
-            });
-        }
-    }
-    // Emit ClientDisconnected
-    #[cfg(feature = "dashboard")]
-    {
-        let _ = state
-            .event_tx
-            .send(crate::event::ServerEvent::ClientDisconnected {
-                run_id: run_id.clone(),
-            });
-    }
-    proxy_ops::unregister_control(&state, &run_id, ctl.shutting_down).await;
-    state.proxy_manager.remove_client(&run_id).await;
-    info!(run_id = %run_id, "Control connection {} removed", run_id);
+    proxy::cleanup(&mut ctx, &mut ctl, &mut writer).await;
 }
