@@ -117,6 +117,82 @@ impl<W: AsyncWrite + Unpin> WorkWriter<W> {
     }
 }
 
+/// Bridge user→work direction: read from user, optionally compress,
+/// apply write bandwidth limit, write through WorkWriter.
+///
+/// When `pre_read` is non-empty (VHost HTTP parsing), the bytes are written
+/// first. If `had_pre_read` is true, the writer is NOT shut down at the end
+/// so the work→user direction can still receive the backend response.
+async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
+    mut user_r: impl AsyncReadExt + Unpin,
+    mut writer: WorkWriter<W>,
+    use_compression: bool,
+    pre_read: Vec<u8>,
+    mut write_limiter: Option<&mut BandwidthLimiter>,
+    metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
+) {
+    let had_pre_read = !pre_read.is_empty();
+
+    if had_pre_read {
+        // Pre-read bytes (VHost HTTP parsing): write through WorkWriter.
+        // CipherWriter variant encrypts automatically.
+        let mut pre_read_buf = pre_read;
+        if writer.write_bridge_all(&mut pre_read_buf).await.is_err() {
+            return;
+        }
+    }
+
+    let mut buf = PoolGuard::acquire();
+    let cap = buf.as_mut_slice().len();
+    let mut comp_buf = Vec::new();
+    loop {
+        let n = match user_r.read(buf.as_mut_slice()).await {
+            Ok(0) => break,
+            Ok(n) => {
+                trace_hex!(n, first_hex = %hex::encode(&buf.raw_buf()[..n.min(32)]), "bridge user_to_work: read {} bytes", n);
+                if let Some(ref m) = metrics {
+                    m.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                n
+            }
+            Err(_) => break,
+        };
+
+        if use_compression {
+            if compress_chunk_into(&buf.raw_buf()[..n], true, &mut comp_buf).is_none() {
+                break;
+            }
+            if let Some(ref mut lim) = write_limiter {
+                lim.consume(comp_buf.len()).await;
+            }
+            if writer.write_bridge_all(&mut comp_buf).await.is_err() {
+                break;
+            }
+            // comp_buf is cleared on next compress_chunk_into call
+        } else {
+            let slice = &mut buf.as_mut_slice()[..n];
+            if let Some(ref mut lim) = write_limiter {
+                lim.consume(slice.len()).await;
+            }
+            if writer.write_bridge_all(slice).await.is_err() {
+                break;
+            }
+        }
+
+        // Conditional flush: batch on full reads unless compressing
+        if (use_compression || n < cap) && writer.flush_bridge().await.is_err() {
+            break;
+        }
+    }
+
+    // Symmetric shutdown: signal EOF to work side.
+    // When pre_read bytes were forwarded (e.g. VHost), leave writer open
+    // so work_to_user can receive the backend response.
+    if !had_pre_read {
+        let _ = writer.shutdown_bridge().await;
+    }
+}
+
 /// Bridge encrypted data between two IoStreams, splitting them internally.
 #[allow(clippy::too_many_arguments)]
 #[instrument(
