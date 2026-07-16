@@ -307,14 +307,17 @@ impl AppState {
     /// Returns true if the login should be allowed, false if throttled.
     ///
     /// This method atomically checks AND reserves an attempt slot within
-    /// a single lock hold — no separate `record_login_failure` call needed.
-    /// The reservation is consumed on auth failure (no-op needed) and
-    /// naturally expires after the 60s window rolls over. Successful logins
-    /// also hold a reservation until window expiry; this is harmless since
-    /// a successful login means the attacker knew the token, and the window
-    /// resets naturally every 60s.
+    /// a single lock hold. Unlike the old two-phase design, this counts ALL
+    /// login attempts (both successes and failures) against the window.
+    /// This is acceptable because:
+    /// - A successful login means the attacker knew the token — they don't
+    ///   need to brute-force.
+    /// - The 60s window means even a legitimate frpc restart-loop (6+
+    ///   reconnects/minute) self-throttles briefly then recovers.
+    /// - Counting failures-only (old design) had a TOCTOU race: concurrent
+    ///   attackers all passed the check before any reached the increment.
     ///
-    /// Max 5 failed attempts per 60-second window per IP.
+    /// Max 5 attempts per 60-second window per IP.
     ///
     /// Also performs inline cleanup of expired entries to prevent unbounded
     /// memory growth from DDoS attacks with randomized source IPs.

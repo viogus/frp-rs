@@ -161,14 +161,20 @@ async fn test_xtcp_p2p_multiple_roundtrips() {
     let mut stream_a = stream_a.expect("side A connect");
     let mut stream_b = stream_b.expect("side B connect");
 
-    // KCP tick is 10ms. After each write, sleep to let ticks fire on both
-    // sides so the queued KCP data is actually sent over UDP.
+    // KCP flushes data to UDP only when maybe_tick fires (every 10ms).
+    // After write+flush, poll the writer for read to drive its KCP tick
+    // (which sends queued data to UDP), then read on the other side.
+    // Timeout-based — no fixed sleep that could flake on slow CI.
     for i in 0..5 {
         let msg = format!("p2p msg {}", i).into_bytes();
         stream_a.write_all(&msg).await.expect("write");
         stream_a.flush().await.expect("flush");
-        // Let KCP tick fire: writer flushes to UDP, reader processes incoming.
-        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Drive KCP tick on writer: poll_read calls maybe_tick which flushes
+        // queued KCP segments to UDP. Timeout ensures we don't hang if the
+        // peer hasn't sent anything yet (WouldBlock is fine).
+        let mut dummy = [0u8; 1];
+        let _ = tokio::time::timeout(Duration::from_millis(200), stream_a.read(&mut dummy)).await;
 
         let mut buf = vec![0u8; msg.len()];
         tokio::time::timeout(Duration::from_secs(5), stream_b.read_exact(&mut buf))

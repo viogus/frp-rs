@@ -1,3 +1,5 @@
+#![cfg(feature = "dashboard")]
+
 use common::FrpsHandle;
 
 mod common;
