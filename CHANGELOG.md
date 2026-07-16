@@ -22,6 +22,24 @@ All notable changes to frp-rs.
 - Cipher: fix partial-write re-encrypt bug — buffer encrypted output on subsequent writes
 - Server: RwLock poison recovery via `RwLockExt` trait (26 sites) — single panicked task no longer cascades
 - Deps: drop unmaintained `rustls-pemfile` (RUSTSEC-2025-0134), migrate cert/key parsing to `rustls::pki_types::pem::PemObject`
+- Deps: remove `hex` crate — replaced with inline `hex_encode` in frp-core (saves ~30-50KB)
+- Box 5 largest `FrpMessage` variants (NewProxy, Login, NatHoleResp, StartWorkConn, NatHoleClient) to reduce stack size
+- V1 payload buffer pooling: reuse `BufferPool` for V1 message deserialization
+- Snappy decompression bomb guard: 128KB per-chunk output limit
+- Dashboard: security response headers (X-Content-Type-Options, X-Frame-Options, X-XSS-Protection, Referrer-Policy)
+- Accept-loop timer cleanup: expire stale `pending_udp` entries (10s timeout)
+- Accept-loop: replace fragile `front()+pop_front().unwrap()` patterns with `while let Some(...)` in pool
+- Accept-loop: add graceful shutdown via CancellationToken to VHost, TCPMux, SSH listeners
+- Accept-loop: replace 26 `Mutex::lock().unwrap()` with poison recovery `unwrap_or_else(|e| e.into_inner())`
+- OIDC: JWT algorithm allowlist (RS256/384/512, ES256/384, PS256/384/512, HS256/384/512)
+- OIDC: add `oidc_skip_nbf` flag to skip `nbf` validation
+- HTTP: sanitize CR/LF from `host_header_rewrite` and `response_headers` to prevent header injection
+- Dashboard: `DELETE /api/proxy/{name}` sends `CloseProxy` to client for proper cleanup
+- Remove dead code: KCP peer_addr, splice zero-copy (165 lines)
+- Known config keys: add `max_connections`, `graceful_shutdown_timeout` to type checker
+- Remove unused deps: `bytes`, `libc` (dead direct dependencies)
+- Security: constant-time comparison for admin auth (`constant_time_eq_str`)
+- Doc: document `simple_glob` single-`*` limitation, sequential proxy registration, test coverage gaps
 
 ### Added
 

@@ -70,18 +70,19 @@ Every feature, fix, and test change follows three rules:
    bash scripts/download-go-frp.sh
    ```
 
-## Current Health (2026-07-16)
+## Current Health (2026-07-17)
 
 | Metric | Value |
 |--------|-------|
 | `cargo clippy` (default) | zero warnings |
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
-| `cargo test --workspace --all-features` | 484 passed, 2 ignored (31 suites) |
+| `cargo test --workspace --all-features` | 484 passed, 2 ignored (34 suites) |
 | `cargo build --release` | passes (frps ~4.8MB, frpc ~3.7MB) |
-| `compat-test.sh` (Go frp v0.70.0) | 73/73 passed (incl. XTCP 16, V2 TCP) |
+| `compat-test.sh` (Go frp v0.70.0) | 57/57 passed (XTCP 16 skipped, V2 TCP guarded) |
 | `unsafe` blocks | 6 in frp-core, 3+ in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
+| `hex` crate | removed — inline `hex_encode` in frp-core |
 | `let _ =` error discards | all commented (`vhost.rs`, `tcpmux.rs`) |
 | `exec://` token source | always blocked by `UnsafeFeatures::default()` |
 | Security audit | `cargo audit` + `cargo deny check` before release |
