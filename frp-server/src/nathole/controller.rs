@@ -178,6 +178,9 @@ impl Controller {
         visitor_ctl_tx: mpsc::Sender<InternalMsg>,
     ) -> Result<(Arc<Session>, oneshot::Receiver<msg::NatHoleReport>), String> {
         let (report_tx, report_rx) = oneshot::channel();
+        // NOTE: The notify_ch oneshot created here is set up for use by the
+        // caller; the _notify_rx receiver may be replaced. The initial oneshot
+        // allocation is intentional (API symmetry with create_session).
         let (notify_tx, _notify_rx) = oneshot::channel();
         let session = Arc::new(Session {
             sid: sid.clone(),
@@ -242,7 +245,10 @@ impl Controller {
                     msg.proxy_name
                 );
                 *session.client_msg.lock().await = Some(msg);
-                *session.last_activity.lock().unwrap() = Instant::now();
+                *session
+                    .last_activity
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Instant::now();
                 // Signal the waiting HandleVisitor
                 if let Some(notify) = session.notify_ch.lock().await.take() {
                     let _ = notify.send(());
@@ -261,7 +267,10 @@ impl Controller {
                 sessions.get(sid).cloned()
             };
             if let Some(session) = session {
-                *session.last_activity.lock().unwrap() = Instant::now();
+                *session
+                    .last_activity
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Instant::now();
                 // Report success to analyzer
                 let v_resp = session.v_resp.lock().await;
                 if let Some(ref resp) = *v_resp {
@@ -310,7 +319,7 @@ impl Controller {
         let now = Instant::now();
         let mut sessions = self.sessions.write().await;
         sessions.retain(|_sid, s| {
-            let last = *s.last_activity.lock().unwrap();
+            let last = *s.last_activity.lock().unwrap_or_else(|e| e.into_inner());
             now.duration_since(last) < timeout
         });
     }

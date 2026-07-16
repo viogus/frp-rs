@@ -1,6 +1,6 @@
 #[cfg(feature = "tls")]
 use crate::lock::RwLockExt;
-use crate::service::AppState;
+use crate::service::{AppState, InternalMsg};
 use axum::http::StatusCode;
 use axum::{
     extract::{
@@ -537,7 +537,8 @@ async fn handle_store_proxy_create(
     Ok(Json(serde_json::json!({"status": "created", "name": name})))
 }
 
-/// DELETE /api/store/proxy/:name — remove a proxy (cleans up server-side state).
+/// DELETE /api/store/proxy/:name — remove a proxy (cleans up server-side state
+/// and notifies the client via CloseProxy so it stops forwarding).
 async fn handle_store_proxy_delete(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -548,6 +549,8 @@ async fn handle_store_proxy_delete(
         .get(&name)
         .await
         .ok_or_else(|| not_found("proxy not found"))?;
+
+    let run_id = proxy.run_id.clone();
 
     // Clean up port
     if let Some(port) = proxy.remote_port {
@@ -569,6 +572,16 @@ async fn handle_store_proxy_delete(
     if let Some(ref p) = state.store_path {
         let snapshot = state.proxy_config_store.read().await.clone();
         crate::store::save_store(p, &snapshot);
+    }
+
+    // Notify the client to close the proxy on its side (Go frp compat).
+    if let Some(ctl_tx) = state.run_id_to_ctl_tx.read().await.get(&run_id).cloned() {
+        let _ = ctl_tx
+            .tx
+            .try_send(InternalMsg::WriteCloseProxy {
+                proxy_name: name.clone(),
+            })
+            .ok();
     }
 
     Ok(Json(serde_json::json!({"status": "deleted", "name": name})))

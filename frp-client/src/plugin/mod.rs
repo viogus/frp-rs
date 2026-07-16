@@ -8,7 +8,9 @@
 //! - `http_proxy`: HTTP/HTTPS forward proxy with optional basic auth.
 //! - `socks5`: SOCKS5 proxy (CONNECT only) with optional username/password auth.
 //! - `static_file`: Serve static files from a local directory with optional basic auth.
-//! - `visitor_plugin`: Placeholder for STCP/XTCP visitor connection hooks.
+//! - `visitor_plugin`: STATUS: Placeholder for STCP/XTCP visitor connection
+//!   hooks. This is a frp-rs extension (not present in Go frp). Planned for
+//!   post-v0.7.0 release.
 
 use std::net::SocketAddr;
 

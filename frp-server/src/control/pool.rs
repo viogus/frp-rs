@@ -165,11 +165,11 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
 ) -> Result<(), ()> {
     debug!(run_id = %ctx.run_id, "Got work conn for run_id {}", ctx.run_id);
     // Expire stale pending NatHoleSid entries first.
-    while let Some((_, _, ts)) = ctl.pending_nat_hole_sids.front() {
+    while let Some((sid, _pn, ts)) = ctl.pending_nat_hole_sids.pop_front() {
         if ts.elapsed() > PENDING_REQUEST_TIMEOUT {
-            let (sid, _pn, _) = ctl.pending_nat_hole_sids.pop_front().unwrap();
             debug!(sid = %sid, "Pending NatHoleSid {} timed out", sid);
         } else {
+            ctl.pending_nat_hole_sids.push_front((sid, _pn, ts));
             break;
         }
     }
@@ -199,11 +199,11 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
         // Work conn consumed for XTCP notification — drop it.
     } else {
         // Expire stale pending UDP requests first
-        while let Some((_, ts)) = ctl.pending_udp.front() {
+        while let Some((pn, ts)) = ctl.pending_udp.pop_front() {
             if ts.elapsed() > PENDING_REQUEST_TIMEOUT {
-                let (pn, _) = ctl.pending_udp.pop_front().unwrap();
                 debug!(proxy_name = %pn, "Pending UDP work conn for '{}' timed out", pn);
             } else {
+                ctl.pending_udp.push_front((pn, ts));
                 break;
             }
         }

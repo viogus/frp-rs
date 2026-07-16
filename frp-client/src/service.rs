@@ -169,6 +169,7 @@ impl Service {
                 .unwrap_or_default(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+            oidc_skip_nbf: false,
             additional_data: None,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
@@ -907,7 +908,7 @@ impl Service {
                             Ok(FrpMessage::CloseProxy(cp)) => {
                                 info!(proxy_name = %cp.proxy_name, "Server closed proxy: {}", cp.proxy_name);
                                 // Cancel health check task and remove map entry.
-                                let mut cancels = health_cancels.lock().unwrap();
+                                let mut cancels = health_cancels.lock().unwrap_or_else(|e| e.into_inner());
                                 if let Some(cancel) = cancels.get(&cp.proxy_name) {
                                     cancel.store(true, Ordering::Relaxed);
                                 }
@@ -916,7 +917,7 @@ impl Service {
                             Ok(FrpMessage::CloseProxyResp(cpr)) => {
                                 info!(proxy_name = %cpr.proxy_name, "Server confirmed proxy close: {}", cpr.proxy_name);
                                 // Cancel health check task and remove map entry.
-                                let mut cancels = health_cancels.lock().unwrap();
+                                let mut cancels = health_cancels.lock().unwrap_or_else(|e| e.into_inner());
                                 if let Some(cancel) = cancels.get(&cpr.proxy_name) {
                                     cancel.store(true, Ordering::Relaxed);
                                 }
@@ -1032,7 +1033,7 @@ impl Service {
                             warn!(proxy_name = %proxy_name, error = %e, "Failed to send CloseProxy for {}: {}", proxy_name, e);
                         }
                         // Cancel health check task and remove map entry.
-                        let mut cancels = health_cancels.lock().unwrap();
+                        let mut cancels = health_cancels.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(cancel) = cancels.get(&proxy_name) {
                             cancel.store(true, Ordering::Relaxed);
                         }
@@ -1177,7 +1178,7 @@ impl Service {
             let hc_headers = p.health_check_http_headers.clone();
             let cancel = Arc::new(AtomicBool::new(false));
             {
-                let mut cancels = health_cancels.lock().unwrap();
+                let mut cancels = health_cancels.lock().unwrap_or_else(|e| e.into_inner());
                 cancels.insert(pn.clone(), cancel.clone());
             }
             tokio::spawn(async move {
@@ -1664,7 +1665,10 @@ impl Service {
         // flags — setting them to true stops the health check loop. PluginHandle::Drop
         // sends a oneshot shutdown signal to the plugin task.
         {
-            let mut cancels = self.health_cancels.lock().unwrap();
+            let mut cancels = self
+                .health_cancels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             for name in delta.removed.iter().chain(delta.changed.iter()) {
                 if let Some(cancel) = cancels.get(name) {
                     cancel.store(true, Ordering::Relaxed);
@@ -1673,7 +1677,10 @@ impl Service {
             }
         }
         {
-            let mut handles = self.plugin_handles.lock().unwrap();
+            let mut handles = self
+                .plugin_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             for name in delta.removed.iter().chain(delta.changed.iter()) {
                 if handles.remove(name).is_some() {
                     debug!(proxy_name = %name, "Dropped old plugin handle for '{}'", name);

@@ -7,10 +7,10 @@ type Aes128CfbDec = cfb_mode::Decryptor<aes::Aes128>;
 /// Derive an AES-128 key from a token using PBKDF2-SHA1.
 /// Matches Go frp v0.69.1 binary: pbkdf2.Key(token, "frp", 64, 16, sha1.New)
 ///
-/// V1 only. Uses PBKDF2-SHA1 with 64 iterations and salt "frp" — deliberately
-/// weak, for Go frp binary compatibility. For stronger key derivation, use the
-/// V2 AEAD path (HKDF-SHA256 with transcript hashing). Do not increase
-/// iterations: it breaks Go frp interop.
+/// SECURITY NOTE: V1 uses PBKDF2-SHA1 with 64 iterations and salt="frp" for
+/// Go frp wire compatibility. This provides minimal brute-force protection.
+/// Prefer V2 protocol (AEAD with HKDF-SHA256) for stronger key derivation.
+/// Do not increase iterations: it breaks Go frp interop.
 pub fn derive_key(token: &str) -> [u8; 16] {
     let mut key = [0u8; 16];
     pbkdf2::pbkdf2_hmac::<sha1::Sha1>(token.as_bytes(), b"frp", 64, &mut key);
@@ -141,6 +141,7 @@ impl SnappyDecompressor {
     /// reusing its allocation.
     pub fn feed_into(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
         const MAX_SNAPPY_BUFFER: usize = 16 * 1024 * 1024; // 16 MB
+        const MAX_OUTPUT_PER_FEED: usize = 64 * 1024 * 1024; // 64 MB
         if self.buf.len() + data.len() > MAX_SNAPPY_BUFFER {
             return Err("snappy decompression buffer exhausted".into());
         }
@@ -174,6 +175,9 @@ impl SnappyDecompressor {
                         .decompress_vec(compressed)
                         .map_err(|e| format!("snappy decompress: {e}"))?;
                     out.extend_from_slice(&decompressed);
+                    if out.len() > MAX_OUTPUT_PER_FEED {
+                        return Err("snappy: decompressed output exceeds 64 MB limit".into());
+                    }
                     pos += total;
                 }
                 0x01 => {
@@ -188,6 +192,9 @@ impl SnappyDecompressor {
                     let data_start = pos + 8; // skip header + CRC
                     let data = &self.buf[data_start..pos + total];
                     out.extend_from_slice(data);
+                    if out.len() > MAX_OUTPUT_PER_FEED {
+                        return Err("snappy: decompressed output exceeds 64 MB limit".into());
+                    }
                     pos += total;
                 }
                 0xFF => {

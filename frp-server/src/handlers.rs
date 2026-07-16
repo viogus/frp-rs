@@ -48,8 +48,8 @@ pub(crate) async fn handle_visitor_conn_inner(
                 if sign_key.is_empty() {
                     warn!(proxy_name = %msg.proxy_name, "STCP visitor: missing sign_key for protected proxy '{}'", msg.proxy_name);
                     None
-                } else if ts_valid.is_err() {
-                    warn!(proxy_name = %msg.proxy_name, error = %ts_valid.as_ref().unwrap_err(), "STCP visitor: timestamp rejected for proxy '{}'", msg.proxy_name);
+                } else if let Err(e) = &ts_valid {
+                    warn!(proxy_name = %msg.proxy_name, error = %e, "STCP visitor: timestamp rejected for proxy '{}'", msg.proxy_name);
                     None
                 } else if frp_core::auth::verify_token(sk, timestamp, &sign_key) {
                     debug!(proxy_name = %msg.proxy_name, "STCP visitor auth OK (Go-compat MD5, constant-time) for proxy '{}'", msg.proxy_name);
@@ -585,7 +585,9 @@ pub(crate) async fn handle_nat_hole_visitor(
     {
         let mut writer_guard = session.visitor_writer.lock().await;
         if let Some(ref mut w) = *writer_guard {
-            let _ = write_msg(w, &FrpMessage::NatHoleResp(v_resp), v2).await;
+            if let Err(e) = write_msg(w, &FrpMessage::NatHoleResp(v_resp), v2).await {
+                warn!(error = %e, "failed to write NatHoleResp to visitor");
+            }
         }
     }
 

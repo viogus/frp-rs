@@ -102,7 +102,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
             let mut injected = Vec::with_capacity(this.buffer.len() + 512);
             injected.extend_from_slice(&this.buffer[..pos]);
             for (k, v) in &this.headers {
-                injected.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
+                // Sanitize header names/values to prevent HTTP header injection.
+                let safe_k: String = k.chars().filter(|&c| c != '\r' && c != '\n').collect();
+                let safe_v: String = v.chars().filter(|&c| c != '\r' && c != '\n').collect();
+                injected.extend_from_slice(format!("{}: {}\r\n", safe_k, safe_v).as_bytes());
             }
             injected.extend_from_slice(&this.buffer[pos..]);
             this.buffer = injected;

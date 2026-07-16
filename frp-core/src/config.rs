@@ -394,6 +394,8 @@ pub struct AuthServerConfig {
     pub oidc_skip_expiry: bool,
     #[serde(default, alias = "oidcSkipIssuer")]
     pub oidc_skip_issuer: bool,
+    #[serde(default, alias = "oidcSkipNbf")]
+    pub oidc_skip_nbf: bool,
     /// HTTP/SOCKS5 proxy URL for OIDC HTTP client connections.
     /// Go frp compat: oidcProxyURL.
     #[serde(default, alias = "oidcProxyURL")]
@@ -432,6 +434,7 @@ impl Default for AuthServerConfig {
             oidc_token_endpoint: String::new(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+            oidc_skip_nbf: false,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
             authentication_timeout: 15,
@@ -1075,7 +1078,18 @@ pub fn load_client_config_from_str(
 /// limits, CR/LF in response headers, and other semantic issues that serde
 /// cannot express.
 fn validate_proxy_configs(proxies: &[ProxyConfig]) -> Result<(), String> {
+    const VALID_PROXY_TYPES: &[&str] = &[
+        "tcp", "udp", "http", "https", "stcp", "xtcp", "sudp", "tcpmux",
+    ];
     for p in proxies {
+        // Validate proxy_type
+        if !VALID_PROXY_TYPES.contains(&p.proxy_type.as_str()) {
+            return Err(format!(
+                "proxy '{}': invalid proxy_type '{}'. Valid types: tcp, udp, http, https, stcp, xtcp, sudp, tcpmux",
+                p.name, p.proxy_type
+            ));
+        }
+
         // Validate response headers: no CR or LF in names or values
         for (name, value) in &p.response_headers {
             if name.contains('\r') || name.contains('\n') {
@@ -1829,6 +1843,8 @@ fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "enable_prometheus",
         "tcp_mux",
         "tcp_mux_keepalive_interval",
+        "max_connections",
+        "graceful_shutdown_timeout",
         "sshTunnelGateway",
         "bindPort",
         "bindAddr",

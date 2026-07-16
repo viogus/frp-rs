@@ -75,6 +75,12 @@ pub enum InternalMsg {
         candidate_addrs: Option<Vec<String>>,
         assisted_addrs: Option<Vec<String>>,
     },
+    /// Send a CloseProxy message to the client via its control channel.
+    /// Used by the dashboard delete API to notify the client to shut
+    /// down its proxy listener.
+    WriteCloseProxy {
+        proxy_name: String,
+    },
     /// Forward a vnet IP packet to a target client's control handler.
     #[cfg(feature = "vnet")]
     VnetPacketForward {

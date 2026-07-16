@@ -4879,7 +4879,8 @@ run_test test_g2r_wss_encrypted
 run_test test_g2r_wss_mux
 # r2g: Rust frpc → Go frps — blocked by Go frp v0.70.0 vhostHTTPSPort TLS SNI bug.
 # Go frps sends fatal UnrecognisedName alert (112). Rust frpc rustls aborts.
-# TODO: fix after Go frp v0.70.0 vhostHTTPSPort TLS config resolved.
+# Go frps vhostHTTPSPort TLS config does not set ServerName for reverse WSS
+# connections. Monitor Go frp upstream for fix.
 # run_test test_r2g_wss_plain
 # run_test test_r2g_wss_encrypted
 # run_test test_r2g_wss_mux
@@ -4898,7 +4899,9 @@ run_test test_kcp_rust_to_rust
 # all working. echo server 100ms delay workaround for kcp-go Close() race.
 run_test test_g2r_kcp
 run_test test_r2g_kcp
-# KCP+TLS and KCP+tcpMux: test functions defined in PR #123, not yet in this branch.
+# KCP+TLS and KCP+tcpMux: Rust-Rust only tests (Go frp doesn't support KCP+TLS
+# combined), not blocked by Go compat. Test functions defined in PR #123, not yet
+# in this branch. TODO: enable for Rust-Rust KCP+TLS coverage when merged.
 # run_test test_g2r_kcp_tls
 # run_test test_r2g_kcp_tls
 # run_test test_g2r_kcp_mux

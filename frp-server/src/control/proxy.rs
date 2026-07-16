@@ -179,6 +179,30 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+/// Write a CloseProxy message to the client via its control channel.
+/// Called from the dashboard delete API to notify the client to shut
+/// down its proxy listener and local resources.
+pub(crate) async fn handle_write_close_proxy<W: AsyncWriteExt + Unpin>(
+    ctx: &ControlContext,
+    _ctl: &mut ControlState,
+    writer: &mut W,
+    proxy_name: String,
+) {
+    debug!(
+        proxy_name = %proxy_name,
+        "Writing CloseProxy to client via control channel for {}",
+        proxy_name
+    );
+    let msg = FrpMessage::CloseProxy(msg::CloseProxy { proxy_name });
+    if let Err(e) = write_ctl_msg(writer, &msg, ctx.v2).await {
+        warn!(
+            error = %e,
+            "Failed to write CloseProxy to client: {}",
+            e
+        );
+    }
+}
+
 /// Handle a Ping from the frpc client: validate auth, update last_ping, send Pong.
 pub(crate) async fn handle_ping<W: AsyncWriteExt + Unpin>(
     ctx: &mut ControlContext,

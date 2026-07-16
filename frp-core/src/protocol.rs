@@ -9,6 +9,9 @@ pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg: &FrpMessage,
 ) -> Result<(), crate::Error> {
+    // NOTE: V1 type bytes 7 (CloseProxyResp) and 8 (Error) are Rust-only
+    // extensions. Go frp v0.70.0 treats unknown type bytes as errors.
+    // These MUST NOT be sent to Go peers. See msg.rs lines 26-29.
     let type_byte = msg.v1_type_byte();
     let payload = serde_json::to_vec(msg)
         .map_err(|e| crate::Error::Protocol(format!("serialize V1 msg: {e}").into()))?;
@@ -345,6 +348,10 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
 
 /// Write a FrpMessage using Go-compatible V2 framing.
 /// Frame: type=16(Message) flags=0, payload = type_id(2 BE) + JSON.
+///
+/// NOTE: V2 type IDs 19 (CloseProxyResp) and 20 (Error) are Rust-only
+/// extensions. Go frp v0.70.0 treats unknown type IDs as errors.
+/// These MUST NOT be sent to Go peers. See msg.rs lines 59-62.
 pub async fn write_msg_v2<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg: &FrpMessage,

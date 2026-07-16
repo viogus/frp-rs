@@ -126,7 +126,10 @@ impl ProxyManager {
                         if members.is_empty() {
                             groups.remove(group);
                             // Clean up stale round-robin counter
-                            let mut counters = self.group_counters.lock().unwrap();
+                            let mut counters = self
+                                .group_counters
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
                             counters.remove(group);
                         }
                     }
@@ -189,7 +192,10 @@ impl ProxyManager {
                                     // group_counters is a std Mutex (not
                                     // tokio), so it must not be held across
                                     // .await. It is always acquired last.
-                                    let mut counters = self.group_counters.lock().unwrap();
+                                    let mut counters = self
+                                        .group_counters
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
                                     counters.remove(group);
                                 }
                             }
@@ -224,7 +230,10 @@ impl ProxyManager {
             Some(members[idx].clone())
         } else {
             // True round-robin: increment counter, modulo member count.
-            let mut counters = self.group_counters.lock().unwrap();
+            let mut counters = self
+                .group_counters
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let counter = counters.entry(group.to_string()).or_insert(0);
             let idx = (*counter as usize) % members.len();
             *counter += 1;
@@ -302,5 +311,9 @@ pub fn allocate_port_multi(
             }
         }
     }
+    tracing::warn!(
+        ranges = ?ranges,
+        "Port exhaustion: no available ports in configured allow_ports ranges",
+    );
     None
 }

@@ -754,7 +754,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
         // send().await: backpressure is correct — silently
         // dropping NatHoleResp would permanently hang the
         // visitor (protocol-critical message).
-        let _ = visitor_tx
+        if let Err(e) = visitor_tx
             .send(InternalMsg::WriteNatHoleResp {
                 transaction_id: v_resp.transaction_id.clone(),
                 error: v_resp.error.clone(),
@@ -763,11 +763,14 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                 candidate_addrs: v_resp.candidate_addrs.clone(),
                 assisted_addrs: v_resp.assisted_addrs.clone(),
             })
-            .await;
+            .await
+        {
+            warn!(error = %e, "failed to send NatHoleResp to visitor via control channel");
+        }
 
         // Send NatHoleResp to provider via control channel
         if let Some(ref cr) = c_resp {
-            let _ = provider_tx
+            if let Err(e) = provider_tx
                 .send(InternalMsg::WriteNatHoleResp {
                     transaction_id: cr.transaction_id.clone(),
                     error: cr.error.clone(),
@@ -776,7 +779,10 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                     candidate_addrs: cr.candidate_addrs.clone(),
                     assisted_addrs: cr.assisted_addrs.clone(),
                 })
-                .await;
+                .await
+            {
+                warn!(error = %e, "failed to send NatHoleResp to provider via control channel");
+            }
         }
 
         // Wait for report

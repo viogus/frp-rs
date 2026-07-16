@@ -8,6 +8,20 @@ use axum::{
 };
 use std::sync::Arc;
 
+/// Constant-time string comparison — execution time depends only on the
+/// shorter input length, not on where the first difference occurs.
+/// Prevents timing side-channel attacks on credential comparisons.
+fn constant_time_eq_str(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.bytes().zip(b.bytes()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
 #[derive(Clone)]
 struct AuthState {
     enabled: bool,
@@ -69,7 +83,7 @@ where
                 .headers()
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
-                .map(|v| v == state.expected_header)
+                .map(|v| constant_time_eq_str(v, &state.expected_header))
                 .unwrap_or(false);
             if !ok {
                 // Match Go frp's authFailDelay (200ms) to slow brute-force attacks

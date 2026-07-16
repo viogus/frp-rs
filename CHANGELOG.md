@@ -2,7 +2,7 @@
 
 All notable changes to frp-rs.
 
-## v0.7.0 (unreleased)
+## v0.7.0 (2026-07-16)
 
 ### Security
 

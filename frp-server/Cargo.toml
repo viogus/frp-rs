@@ -8,6 +8,8 @@ license = "MIT"
 frp-core = { path = "../frp-core", default-features = false }
 frp-vnet = { workspace = true, optional = true }
 russh = { workspace = true, optional = true }
+# NOTE: russh → ssh-cipher → aes-gcm 0.11.0-rc.4 is a pre-release. Only used for
+# SSH feature. Monitor upstream for stable release.
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,12 +22,13 @@ tokio-tungstenite = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 tokio-util.workspace = true
 # ws feature pulls tokio-tungstenite 0.29 alongside frp-core's 0.24.
-# Remove when v1 dashboard WebSocket is fully supplanted by v2 REST polling.
+# TARGET: Remove when v1 dashboard WebSocket is fully supplanted by v2 REST
+# polling (target: v0.8.0).
 axum = { workspace = true, optional = true, features = ["ws"] }
 prometheus = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 rand.workspace = true
-rand010 = { package = "rand", version = "0.10", optional = true }  # SSH compat (russh expects rand 0.10 RNG traits)
+rand010 = { package = "rand", version = "0.10", optional = true }  # NOTE: rand 0.10 required by russh 0.61 for SSH feature. Workspace uses rand 0.8. Track russh upstream migration to unified rand version.
 ring.workspace = true
 
 [features]
