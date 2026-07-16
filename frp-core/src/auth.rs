@@ -810,9 +810,19 @@ pub fn zeroize_string(s: &mut String) {
     // SAFETY: Vec<u8> is the backing store for String.
     // Overwriting with zeros preserves valid UTF-8 (NUL bytes are valid).
     // No references into `s` can exist while we hold `&mut String`.
+    //
+    // We use core::ptr::write_volatile in a manual loop rather than
+    // Vec::fill(0) because LLVM can eliminate a plain memset as a dead
+    // store when the allocation is freed immediately after (as happens in
+    // AuthConfig::drop).  write_volatile forces the store to survive
+    // optimisation, which is the whole point of the zeroize primitive.
     unsafe {
         let v = s.as_mut_vec();
-        v.fill(0);
+        let len = v.len();
+        let ptr = v.as_mut_ptr();
+        for i in 0..len {
+            core::ptr::write_volatile(ptr.add(i), 0u8);
+        }
     }
     // Clear len so the now-zeroed bytes are not accidentally re-read.
     s.clear();

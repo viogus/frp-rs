@@ -108,9 +108,13 @@ impl PoolGuard {
         &mut self.buf
     }
 
-    /// Get an immutable slice over the buffered data.
+    /// Return the full underlying buffer (`len == BUFFER_SIZE`).
+    ///
+    /// **WARNING:** Recycled buffers contain stale bytes beyond the valid
+    /// prefix.  Always slice to the length returned by the corresponding
+    /// `read()` call: `buf.raw_buf()[..n]`.
     #[inline]
-    pub fn data(&self) -> &[u8] {
+    pub fn raw_buf(&self) -> &[u8] {
         &self.buf
     }
 }
@@ -154,7 +158,7 @@ mod tests {
     }
 
     /// PoolGuard reuse: a recycled buffer returns at full BUFFER_SIZE length,
-    /// so acquire() skips the 64KB zero-fill (the P2 optimization) and data()
+    /// so acquire() skips the 64KB zero-fill (the P2 optimization) and raw_buf()
     /// still exposes a full-length slice.
     #[test]
     fn test_pool_guard_reuse_stays_full_length() {
@@ -167,7 +171,7 @@ mod tests {
         // Reacquire: buffer is still full length, so the resize guard is a no-op.
         let g2 = PoolGuard::acquire();
         assert_eq!(
-            g2.data().len(),
+            g2.raw_buf().len(),
             *BUFFER_SIZE,
             "recycled buffer stays full length"
         );

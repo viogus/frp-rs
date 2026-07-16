@@ -191,7 +191,7 @@ pub async fn bridge_encrypted(
 
             if use_compression {
                 // Compress into reusable buffer, then encrypt in-place.
-                if compress_chunk_into(&buf.data()[..n], true, &mut comp_buf).is_none() {
+                if compress_chunk_into(&buf.raw_buf()[..n], true, &mut comp_buf).is_none() {
                     break;
                 }
                 if let Some(ref mut lim) = write_limiter {
@@ -240,7 +240,7 @@ pub async fn bridge_encrypted(
                 Ok(n) => n,
                 Err(_) => break,
             };
-            let decrypted = &buf.data()[..n];
+            let decrypted = &buf.raw_buf()[..n];
 
             let plaintext =
                 match decompress_chunk_into(&mut decompressor, decrypted, &mut decomp_buf) {
@@ -337,7 +337,7 @@ pub async fn bridge_plain(
                     break;
                 }
                 Ok(n) => {
-                    trace_hex!(n, first_hex = %hex::encode(&buf.data()[..n.min(32)]), "bridge_plain: user_r read {} bytes", n);
+                    trace_hex!(n, first_hex = %hex::encode(&buf.raw_buf()[..n.min(32)]), "bridge_plain: user_r read {} bytes", n);
                     if let Some(ref m) = metrics {
                         m.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
                     }
@@ -348,7 +348,7 @@ pub async fn bridge_plain(
                     break;
                 }
             };
-            let payload = &buf.data()[..n];
+            let payload = &buf.raw_buf()[..n];
             if compress_chunk_into(payload, use_compression, &mut comp_buf).is_none() {
                 break;
             }
@@ -392,7 +392,7 @@ pub async fn bridge_plain(
                     break;
                 }
                 Ok(n) => {
-                    trace_hex!(n, first_hex = %hex::encode(&buf.data()[..n.min(32)]), "bridge_plain: work_r read {} bytes", n);
+                    trace_hex!(n, first_hex = %hex::encode(&buf.raw_buf()[..n.min(32)]), "bridge_plain: work_r read {} bytes", n);
                     n
                 }
                 Err(e) => {
@@ -401,7 +401,7 @@ pub async fn bridge_plain(
                 }
             };
             let plaintext =
-                match decompress_chunk_into(&mut decompressor, &buf.data()[..n], &mut decomp_buf) {
+                match decompress_chunk_into(&mut decompressor, &buf.raw_buf()[..n], &mut decomp_buf) {
                     Some(p) => p,
                     None => break,
                 };
@@ -498,7 +498,7 @@ pub async fn bridge_plain_rate_limited(
             };
 
             if use_compression {
-                if compress_chunk_into(&buf.data()[..n], true, &mut comp_buf).is_none() {
+                if compress_chunk_into(&buf.raw_buf()[..n], true, &mut comp_buf).is_none() {
                     break;
                 }
                 if let Some(ref mut lim) = write_limiter {
@@ -508,7 +508,7 @@ pub async fn bridge_plain_rate_limited(
                     break;
                 }
             } else {
-                let slice = &buf.data()[..n];
+                let slice = &buf.raw_buf()[..n];
                 if let Some(ref mut lim) = write_limiter {
                     lim.consume(slice.len()).await;
                 }
@@ -541,7 +541,7 @@ pub async fn bridge_plain_rate_limited(
                 Err(_) => break,
             };
             let plaintext =
-                match decompress_chunk_into(&mut decompressor, &buf.data()[..n], &mut decomp_buf) {
+                match decompress_chunk_into(&mut decompressor, &buf.raw_buf()[..n], &mut decomp_buf) {
                     Some(p) => p,
                     None => break,
                 };
