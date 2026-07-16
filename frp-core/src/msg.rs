@@ -314,6 +314,12 @@ pub struct StartWorkConn {
     /// Go frp silently ignores unknown JSON fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nat_hole_visitor_addr: Option<String>,
+    /// Secret key for NAT hole-punch detection encryption (Go frp v0.70 compat).
+    /// Go frp uses this key to encrypt/decrypt NatHoleSid detect messages
+    /// during the MakeHole phase. Without it, Go provider can't decrypt
+    /// NatHoleSid from Rust visitor and falls back to passive detection (TCP).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sk: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -773,6 +779,7 @@ impl FrpMessage {
                 use_compression: None,
                 nat_hole_sid: None,
                 nat_hole_visitor_addr: None,
+                sk: None,
             })),
             TYPE_PING => Some(FrpMessage::Ping(Ping {
                 privilege_key: None,
@@ -1048,6 +1055,7 @@ mod tests {
             use_compression: None,
             nat_hole_sid: None,
             nat_hole_visitor_addr: None,
+            sk: None,
         };
         roundtrip(
             &swc,

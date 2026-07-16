@@ -30,6 +30,25 @@ pub fn verify_token(token: &str, timestamp: i64, expected_hex: &str) -> bool {
     constant_time_eq(computed.as_bytes(), expected_hex.as_bytes())
 }
 
+/// Validate that a timestamp is within the acceptable freshness window.
+/// Returns Ok(()) if `timeout_secs` is 0 (disabled) or if `|ts - now| <= timeout_secs`.
+/// Returns Err with a message if the timestamp is outside the window.
+///
+/// Go frp compat: matches the `authentication_timeout` check in `AuthConfig::validate_login`.
+pub fn validate_timestamp_freshness(timestamp: i64, timeout_secs: i64) -> Result<(), String> {
+    if timeout_secs <= 0 {
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    if (timestamp - now).abs() > timeout_secs {
+        return Err("timestamp outside acceptable window".into());
+    }
+    Ok(())
+}
+
 /// Authentication configuration.
 #[derive(Debug, Clone)]
 pub struct AuthConfig {

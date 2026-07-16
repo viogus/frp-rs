@@ -336,15 +336,21 @@ impl Controller {
     /// Forward NatHoleSid to the visitor via control channel.
     /// Returns true if forwarded via ctl path.
     pub async fn forward_sid_via_ctl(&self, sid: &str, provider_addr: Option<String>) -> bool {
-        let sessions = self.sessions.read().await;
-        if let Some(session) = sessions.get(sid) {
-            if let Some(ref tx) = session.visitor_ctl_tx {
-                let _ = tx.try_send(InternalMsg::WriteNatHoleSid {
+        let tx = {
+            let sessions = self.sessions.read().await;
+            sessions.get(sid).and_then(|s| s.visitor_ctl_tx.clone())
+        };
+        if let Some(tx) = tx {
+            // Protocol-critical one-shot message: use send().await for
+            // reliable delivery. try_send Full would silently drop the
+            // NAT hole punch handshake, breaking XTCP setup.
+            let _ = tx
+                .send(InternalMsg::WriteNatHoleSid {
                     sid: sid.to_string(),
                     provider_addr,
-                });
-                return true;
-            }
+                })
+                .await;
+            return true;
         }
         false
     }
@@ -359,33 +365,39 @@ impl Controller {
         candidate_addrs: Option<Vec<String>>,
         assisted_addrs: Option<Vec<String>>,
     ) -> bool {
-        let sessions = self.sessions.read().await;
-        if let Some(session) = sessions.get(sid) {
-            if let Some(ref tx) = session.visitor_ctl_tx {
-                let _ = tx.try_send(InternalMsg::WriteNatHoleResp {
+        let tx = {
+            let sessions = self.sessions.read().await;
+            sessions.get(sid).and_then(|s| s.visitor_ctl_tx.clone())
+        };
+        if let Some(tx) = tx {
+            let _ = tx
+                .send(InternalMsg::WriteNatHoleResp {
                     transaction_id: sid.to_string(),
                     error,
                     sid: resp_sid,
                     protocol,
                     candidate_addrs,
                     assisted_addrs,
-                });
-                return true;
-            }
+                })
+                .await;
+            return true;
         }
         false
     }
 
     /// Forward NatHoleReport to the visitor via control channel.
     pub async fn forward_report_via_ctl(&self, sid: &str) -> bool {
-        let sessions = self.sessions.read().await;
-        if let Some(session) = sessions.get(sid) {
-            if let Some(ref tx) = session.visitor_ctl_tx {
-                let _ = tx.try_send(InternalMsg::WriteNatHoleReport {
+        let tx = {
+            let sessions = self.sessions.read().await;
+            sessions.get(sid).and_then(|s| s.visitor_ctl_tx.clone())
+        };
+        if let Some(tx) = tx {
+            let _ = tx
+                .send(InternalMsg::WriteNatHoleReport {
                     sid: sid.to_string(),
-                });
-                return true;
-            }
+                })
+                .await;
+            return true;
         }
         false
     }

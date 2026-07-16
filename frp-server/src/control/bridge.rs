@@ -158,6 +158,7 @@ pub(crate) async fn assign_udp_work_conn(
         use_compression: None,
         nat_hole_sid: None,
         nat_hole_visitor_addr: None,
+        sk: None,
     });
     if v2 {
         if let Err(e) = work_conn.write_v2_frame(&swc).await {
@@ -356,6 +357,7 @@ pub(crate) async fn assign_work_to_proxy(
             None
         },
         nat_hole_visitor_addr: None,
+        sk: None,
     });
 
     let write_result = if v2 {

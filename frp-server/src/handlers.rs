@@ -33,18 +33,26 @@ pub(crate) async fn handle_visitor_conn_inner(
     let sign_key = msg.sign_key.unwrap_or_default();
     let timestamp = msg.timestamp.unwrap_or(0);
 
-    if sign_key.is_empty() {
-        warn!("NewVisitorConn without sign_key, ignoring");
-        return;
-    }
+    // Validate timestamp freshness to prevent replay attacks.
+    // Uses the same authentication_timeout as control-channel Login
+    // (Go frp compat: authentication_timeout config).
+    let auth_timeout = state.reloadable.read_ok().auth_cfg.authentication_timeout;
+    let ts_valid = frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout);
 
     // --- Mode 1: Go-compatible — lookup by proxy_name, validate MD5(sk + timestamp) ---
+    // Look up proxy BEFORE rejecting empty sign_key: a proxy with no sk
+    // allows unauthenticated access (Rust↔Rust STCP with useEncryption=false).
     let proxy_name = if let Some(proxy_info) = state.proxy_manager.get(&msg.proxy_name).await {
         if let Some(ref sk) = proxy_info.sk {
             if !sk.is_empty() {
-                let expected = frp_core::auth::generate_token(sk, timestamp);
-                if expected == sign_key {
-                    debug!(proxy_name = %msg.proxy_name, "STCP visitor auth OK (Go-compat MD5) for proxy '{}'", msg.proxy_name);
+                if sign_key.is_empty() {
+                    warn!(proxy_name = %msg.proxy_name, "STCP visitor: missing sign_key for protected proxy '{}'", msg.proxy_name);
+                    None
+                } else if ts_valid.is_err() {
+                    warn!(proxy_name = %msg.proxy_name, error = %ts_valid.as_ref().unwrap_err(), "STCP visitor: timestamp rejected for proxy '{}'", msg.proxy_name);
+                    None
+                } else if frp_core::auth::verify_token(sk, timestamp, &sign_key) {
+                    debug!(proxy_name = %msg.proxy_name, "STCP visitor auth OK (Go-compat MD5, constant-time) for proxy '{}'", msg.proxy_name);
                     Some(msg.proxy_name.clone())
                 } else {
                     warn!(proxy_name = %msg.proxy_name, "STCP visitor MD5 auth mismatch for proxy '{}'", msg.proxy_name);
@@ -150,15 +158,21 @@ pub(crate) async fn handle_visitor_conn_inner(
                 warn!(proxy_name = %proxy_name, error = %e, "Failed to send NewVisitorConnResp for proxy '{}': {}", proxy_name, e);
                 return;
             }
+            // Use send().await, not try_send: we already sent success to the
+            // visitor, so this connection MUST be delivered. Backpressure is
+            // correct here — the visitor is waiting anyway.
             if ctl
                 .tx
-                .try_send(InternalMsg::VisitorConn {
+                .send(InternalMsg::VisitorConn {
                     proxy_name,
                     visitor_conn: stream,
                 })
+                .await
                 .is_err()
             {
-                warn!(run_id = %run_id, "Provider for run_id {} has gone away", run_id);
+                // Channel closed: provider disconnected between auth check
+                // and delivery. Visitor will time out and retry.
+                warn!(run_id = %run_id, "Provider for run_id {} disconnected during visitor delivery", run_id);
             }
         }
         None => {
@@ -283,7 +297,9 @@ pub(crate) async fn handle_nat_hole_visitor(
         let timestamp = msg.timestamp.unwrap_or(0);
 
         // Require sign_key for non-pre_check requests on fresh connections.
-        // The sign_key must equal MD5(proxy_sk + timestamp).
+        // The sign_key must equal MD5(proxy_sk + timestamp), verified with
+        // constant-time comparison and timestamp freshness check to prevent
+        // replay attacks.
         if sign_key.is_empty() {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: missing sign_key, rejecting");
             let mut writer = stream.into_split().1;
@@ -311,8 +327,23 @@ pub(crate) async fn handle_nat_hole_visitor(
             return;
         }
 
-        let expected = frp_core::auth::generate_token(proxy_sk, timestamp);
-        if expected != sign_key {
+        // Validate timestamp freshness (replay attack prevention).
+        let auth_timeout = state.reloadable.read_ok().auth_cfg.authentication_timeout;
+        if let Err(freshness_err) =
+            frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout)
+        {
+            warn!(proxy_name = %proxy_name, error = %freshness_err, "NatHoleVisitor: timestamp rejected for proxy '{}'", proxy_name);
+            let mut writer = stream.into_split().1;
+            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                transaction_id: transaction_id.clone(),
+                error: Some(freshness_err),
+                ..Default::default()
+            });
+            let _ = write_msg(&mut writer, &resp, v2).await;
+            return;
+        }
+
+        if !frp_core::auth::verify_token(proxy_sk, timestamp, sign_key) {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor auth failed for proxy '{}'", proxy_name);
             let mut writer = stream.into_split().1;
             let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
@@ -323,7 +354,7 @@ pub(crate) async fn handle_nat_hole_visitor(
             let _ = write_msg(&mut writer, &resp, v2).await;
             return;
         }
-        debug!(proxy_name = %proxy_name, "NatHoleVisitor auth OK for proxy '{}'", proxy_name);
+        debug!(proxy_name = %proxy_name, "NatHoleVisitor auth OK (constant-time) for proxy '{}'", proxy_name);
 
         // --- allow_users check on fresh connections ---
         // Fresh TCP connections carry no user identity — only sign_key.
@@ -488,10 +519,15 @@ pub(crate) async fn handle_nat_hole_visitor(
             c_ports_diff,
         );
 
+        // Use visitor's protocol for provider's response too —
+        // Go frp provider reads NatHoleResp.protocol to decide
+        // KCP vs TCP transport. If empty, Go falls back to TCP
+        // which is incompatible with visitor's KCP.
+        let protocol_for_provider = msg.protocol.clone().or_else(|| client_msg.protocol.clone());
         let c_resp = nathole_ctrl::build_nat_hole_response(
             &client_msg.transaction_id,
             &sid,
-            client_msg.protocol.clone(),
+            protocol_for_provider,
             mode,
             visitor_mapped.clone(), // provider gets VISITOR's addresses
             visitor_assisted.clone(),
@@ -520,11 +556,12 @@ pub(crate) async fn handle_nat_hole_visitor(
             },
             ..Default::default()
         };
+        let protocol_for_provider = msg.protocol.clone().or_else(|| client_msg.protocol.clone());
         let c_resp = msg::NatHoleResp {
             transaction_id: client_msg.transaction_id.clone(),
             error: None,
             sid: Some(sid.clone()),
-            protocol: client_msg.protocol.clone(),
+            protocol: protocol_for_provider,
             candidate_addrs: if visitor_mapped.is_empty() {
                 None
             } else {
@@ -552,16 +589,23 @@ pub(crate) async fn handle_nat_hole_visitor(
         }
     }
 
-    // Send to provider via control channel
+    // Send to provider via control channel.
+    // send().await: backpressure is correct — if the provider's
+    // control handler cannot drain messages, the XTCP session
+    // should wait rather than silently drop the NatHoleResp
+    // (which would cause a permanent visitor hang).
     if let Some(ref cr) = c_resp {
-        let _ = ctl_tx.tx.try_send(InternalMsg::WriteNatHoleResp {
-            transaction_id: cr.transaction_id.clone(),
-            error: cr.error.clone(),
-            sid: cr.sid.clone(),
-            protocol: cr.protocol.clone(),
-            candidate_addrs: cr.candidate_addrs.clone(),
-            assisted_addrs: cr.assisted_addrs.clone(),
-        });
+        let _ = ctl_tx
+            .tx
+            .send(InternalMsg::WriteNatHoleResp {
+                transaction_id: cr.transaction_id.clone(),
+                error: cr.error.clone(),
+                sid: cr.sid.clone(),
+                protocol: cr.protocol.clone(),
+                candidate_addrs: cr.candidate_addrs.clone(),
+                assisted_addrs: cr.assisted_addrs.clone(),
+            })
+            .await;
     }
 
     info!(sid = %sid, "NatHole session {}: NatHoleResp sent to both sides", sid);
@@ -737,7 +781,10 @@ pub(crate) async fn handle_work_conn_inner(
 
     match ctl_tx {
         Some(ctl) => {
-            if ctl.tx.try_send(InternalMsg::NewWorkConn(stream)).is_err() {
+            // Use send().await: a dropped NewWorkConn leaves the proxy
+            // without a work connection until the control handler times out
+            // and requests a new one. Backpressure is correct.
+            if ctl.tx.send(InternalMsg::NewWorkConn(stream)).await.is_err() {
                 warn!(run_id = %run_id, "Control handler for {} has gone away", run_id);
             }
         }
