@@ -212,7 +212,11 @@ async fn test_xtcp_nat_hole_client_invalid_sid() {
     // Provider logs in and registers an XTCP proxy
     let (mut provider_ctl, _resp) = login_with_test_token(addr).await.expect("provider login");
 
-    let np = FrpMessage::NewProxy(Box::new(xtcp_proxy("xtcp-sid-test", "sid-test-sk", "127.0.0.1:6666")));
+    let np = FrpMessage::NewProxy(Box::new(xtcp_proxy(
+        "xtcp-sid-test",
+        "sid-test-sk",
+        "127.0.0.1:6666",
+    )));
     write_msg_v1(&mut provider_ctl, &np)
         .await
         .expect("send NewProxy");
@@ -361,7 +365,11 @@ async fn test_xtcp_nat_hole_report_cleanup() {
     let run_id = resp.run_id.expect("provider should get run_id");
 
     let xtcp_sk = "cleanup-test-sk";
-    let np = FrpMessage::NewProxy(Box::new(xtcp_proxy("xtcp-cleanup", xtcp_sk, "127.0.0.1:2222")));
+    let np = FrpMessage::NewProxy(Box::new(xtcp_proxy(
+        "xtcp-cleanup",
+        xtcp_sk,
+        "127.0.0.1:2222",
+    )));
     write_msg_v1(&mut provider_ctl, &np)
         .await
         .expect("send NewProxy");

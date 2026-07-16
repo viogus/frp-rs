@@ -806,7 +806,9 @@ impl FrpMessage {
                 remote_addr: None,
             })),
             TYPE_NAT_HOLE_VISITOR => Some(FrpMessage::NatHoleVisitor(NatHoleVisitor::default())),
-            TYPE_NAT_HOLE_CLIENT => Some(FrpMessage::NatHoleClient(Box::<NatHoleClient>::default())),
+            TYPE_NAT_HOLE_CLIENT => {
+                Some(FrpMessage::NatHoleClient(Box::<NatHoleClient>::default()))
+            }
             TYPE_NAT_HOLE_RESP => Some(FrpMessage::NatHoleResp(Box::<NatHoleResp>::default())),
             TYPE_NAT_HOLE_SID => Some(FrpMessage::NatHoleSid(NatHoleSid {
                 sid: None,

@@ -253,7 +253,11 @@ async fn test_xtcp_multiple_providers_same_server() {
     let (mut provider_a_ctl, resp_a) = login_with_test_token(addr).await.expect("provider A login");
     let run_id_a = resp_a.run_id.expect("provider A run_id");
 
-    let np_a = FrpMessage::NewProxy(Box::new(xtcp_proxy("xtcp-prov-a", "sk-prov-a", "127.0.0.1:9001")));
+    let np_a = FrpMessage::NewProxy(Box::new(xtcp_proxy(
+        "xtcp-prov-a",
+        "sk-prov-a",
+        "127.0.0.1:9001",
+    )));
     write_msg_v1(&mut provider_a_ctl, &np_a)
         .await
         .expect("send NewProxy A");
@@ -286,7 +290,11 @@ async fn test_xtcp_multiple_providers_same_server() {
     let (mut provider_b_ctl, resp_b) = login_with_test_token(addr).await.expect("provider B login");
     let run_id_b = resp_b.run_id.expect("provider B run_id");
 
-    let np_b = FrpMessage::NewProxy(Box::new(xtcp_proxy("xtcp-prov-b", "sk-prov-b", "127.0.0.1:9002")));
+    let np_b = FrpMessage::NewProxy(Box::new(xtcp_proxy(
+        "xtcp-prov-b",
+        "sk-prov-b",
+        "127.0.0.1:9002",
+    )));
     write_msg_v1(&mut provider_b_ctl, &np_b)
         .await
         .expect("send NewProxy B");
@@ -489,7 +497,11 @@ async fn test_xtcp_multiple_providers_same_server() {
     }
 
     // --- Provider B's control channel must still be usable ---
-    let np_b2 = FrpMessage::NewProxy(Box::new(xtcp_proxy("xtcp-prov-b-2", "sk-prov-b-2", "127.0.0.1:9003")));
+    let np_b2 = FrpMessage::NewProxy(Box::new(xtcp_proxy(
+        "xtcp-prov-b-2",
+        "sk-prov-b-2",
+        "127.0.0.1:9003",
+    )));
     write_msg_v1(&mut provider_b_ctl, &np_b2)
         .await
         .expect("send NewProxy B2");

@@ -737,9 +737,15 @@ async fn run_traffic_events(state: Arc<AppState>) {
 async fn add_security_headers(req: axum::extract::Request, next: Next) -> axum::response::Response {
     let mut response = next.run(req).await;
     let headers = response.headers_mut();
-    headers.insert("X-Content-Type-Options", HeaderValue::from_static("nosniff"));
+    headers.insert(
+        "X-Content-Type-Options",
+        HeaderValue::from_static("nosniff"),
+    );
     headers.insert("X-Frame-Options", HeaderValue::from_static("DENY"));
-    headers.insert("X-XSS-Protection", HeaderValue::from_static("1; mode=block"));
+    headers.insert(
+        "X-XSS-Protection",
+        HeaderValue::from_static("1; mode=block"),
+    );
     headers.insert(
         "Referrer-Policy",
         HeaderValue::from_static("strict-origin-when-cross-origin"),

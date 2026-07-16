@@ -659,7 +659,8 @@ pub(crate) async fn dispatch_v2_message(
     };
     match msg {
         FrpMessage::Login(login) => {
-            control::handle_control(io, *login, state, Some(addr), incoming, true, crypto_ctx).await;
+            control::handle_control(io, *login, state, Some(addr), incoming, true, crypto_ctx)
+                .await;
         }
         FrpMessage::NewWorkConn(nwc) => {
             handle_work_conn_inner(io, nwc, state).await;
