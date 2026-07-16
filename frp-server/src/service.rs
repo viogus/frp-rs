@@ -1486,23 +1486,36 @@ impl Service {
                                     Some(a) => a,
                                     None => {
                                         // Go frp compat: Go frpc sends 0x17 (FRP_TLS_HEAD_BYTE)
-                                        // by default even without TLS configured. Go frps
-                                        // falls back to plain TCP via CheckAndEnableTLSServerConnWithTimeout.
-                                        // Match that behavior: when the first byte is 0x17 and TLS
-                                        // is not configured, strip 0x17 (already done above) and
+                                        // or 0x16 (FRP_TLS_DIRECT_BYTE) as the first byte when
+                                        // TLS is enabled on the client but not on the server.
+                                        // Go frps falls back to plain TCP via
+                                        // CheckAndEnableTLSServerConnWithTimeout.
+                                        // Match that behavior: strip the first byte and
                                         // treat the remaining data as V1.
-                                        if first_byte == frp_core::transport::FRP_TLS_HEAD_BYTE {
-                                            info!(addr = %addr, "TLS head byte (0x17) but TLS not configured, falling back to V1");
-                                            // sni_data contains the bytes after 0x17 (pre_read
-                                            // minus 0x17 + SNI peek). Replay them via PreRead
-                                            // and dispatch as V1.
+                                        if first_byte == frp_core::transport::FRP_TLS_HEAD_BYTE
+                                            || first_byte == frp_core::transport::FRP_TLS_DIRECT_BYTE
+                                        {
+                                            info!(addr = %addr, first_byte = first_byte,
+                                                "TLS byte (0x{:02x}) but TLS not configured, falling back to V1",
+                                                first_byte);
+                                            // 0x17 is already stripped from pre_read_bytes above,
+                                            // but 0x16 is not (kept for TLS handshake path).
+                                            // Strip it here so V1 dispatch sees valid data.
+                                            if first_byte == frp_core::transport::FRP_TLS_DIRECT_BYTE
+                                                && !sni_data.is_empty()
+                                            {
+                                                sni_data.remove(0);
+                                            }
                                             let stream = IoStream::PreRead(sni_data, inner_stream);
                                             crate::handlers::dispatch_v1_message(stream, state, Some(addr), None, Some(addr.to_string())).await;
                                             return;
                                         }
-                                        // 0x16 (standard TLS ClientHello) — genuine TLS,
-                                        // can't fall back to V1.
-                                        debug!(addr = %addr, "TLS connection from {} but TLS not configured (likely internet scanner)", addr);
+                                        // first_byte is always 0x17 or 0x16 here
+                                        // (ConnectionType::Tls only matches those),
+                                        // but the compiler needs an explicit fallback.
+                                        debug!(addr = %addr, first_byte = first_byte,
+                                            "TLS byte (0x{:02x}) — unexpected, dropping",
+                                            first_byte);
                                         return;
                                     }
                                 };
