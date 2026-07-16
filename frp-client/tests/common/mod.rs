@@ -106,8 +106,19 @@ impl TestHarness {
     ///
     /// `use_encryption` enables AES-128-CFB on the proxy.
     /// `token` is the shared auth token (empty = no auth).
+    /// `v2` enables V2 wire protocol (defaults to V1).
     #[allow(dead_code, clippy::unnecessary_min_or_max)]
     pub async fn new(use_encryption: bool, token: &str) -> Self {
+        Self::new_inner(use_encryption, token, false).await
+    }
+
+    /// Build and start the full stack with V2 protocol support.
+    #[allow(dead_code, clippy::unnecessary_min_or_max)]
+    pub async fn new_v2(use_encryption: bool, token: &str) -> Self {
+        Self::new_inner(use_encryption, token, true).await
+    }
+
+    async fn new_inner(use_encryption: bool, token: &str, v2: bool) -> Self {
         init_tracing();
         let echo_port = allocate_port();
         let server_port = allocate_port();
@@ -132,6 +143,7 @@ impl TestHarness {
             login_fail_exit: false,
             pool_count: 1,
             tcp_mux: false,
+            v2,
             proxies: vec![ProxyConfig {
                 name: "e2e-test".into(),
                 proxy_type: "tcp".into(),

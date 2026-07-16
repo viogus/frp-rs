@@ -190,6 +190,9 @@ struct AeadReadState {
     /// does not re-read (and re-consume) the 4-byte length header.
     header_buf: [u8; AEAD_FRAME_HEADER_SIZE],
     header_have: bool,
+    /// Reusable AAD buffer: stream_nonce || frame_header (4 bytes).
+    /// Allocated once when stream_nonce is set, reused per frame.
+    aad_buf: Vec<u8>,
 }
 
 /// Write-half state for an AEAD stream.
@@ -203,6 +206,9 @@ struct AeadWriteState {
     pending: Vec<u8>,
     pending_pos: usize,
     err: Option<io::Error>,
+    /// Reusable AAD buffer: stream_nonce || frame_header (4 bytes).
+    /// Allocated once, reused per frame.
+    aad_buf: Vec<u8>,
 }
 
 /// Combined AEAD stream wrapping a bidirectional byte transport.
@@ -254,17 +260,19 @@ impl AeadStream {
                 scratch_filled: 0,
                 header_buf: [0u8; AEAD_FRAME_HEADER_SIZE],
                 header_have: false,
+                aad_buf: Vec::with_capacity(nonce_size + AEAD_FRAME_HEADER_SIZE),
             },
             write: AeadWriteState {
                 cipher: write_cipher,
                 nonce: write_nonce.clone(),
-                stream_nonce: write_nonce,
+                stream_nonce: write_nonce.clone(),
                 header_sent: false,
                 frame_count: 0,
                 max_frame_count: algorithm.max_frame_count(),
                 pending: Vec::new(),
                 pending_pos: 0,
                 err: None,
+                aad_buf: Vec::with_capacity(nonce_size + AEAD_FRAME_HEADER_SIZE),
             },
         })
     }
@@ -407,11 +415,15 @@ impl AeadStream {
             .stream_nonce
             .as_ref()
             .expect("stream_nonce must be set");
-        let mut aad = Vec::with_capacity(stream_nonce.len() + AEAD_FRAME_HEADER_SIZE);
-        aad.extend_from_slice(stream_nonce);
-        aad.extend_from_slice(&header);
+        self.read.aad_buf.clear();
+        self.read.aad_buf.extend_from_slice(stream_nonce);
+        self.read.aad_buf.extend_from_slice(&header);
 
-        let plaintext = match self.read.cipher.decrypt(&self.read.nonce, ciphertext, &aad) {
+        let plaintext = match self.read.cipher.decrypt(
+            &self.read.nonce,
+            ciphertext,
+            &self.read.aad_buf,
+        ) {
             Ok(p) => {
                 tracing::debug!(frame = %self.read.frame_count, plaintext_len = %p.len(), "[AEAD-READ] frame={} decrypt OK, plaintext_len={}", self.read.frame_count, p.len());
                 p
@@ -550,24 +562,24 @@ impl AsyncWrite for AeadStream {
             let mut header = [0u8; AEAD_FRAME_HEADER_SIZE];
             header.copy_from_slice(&ciphertext_len.to_be_bytes());
 
-            let mut aad =
-                Vec::with_capacity(this.write.stream_nonce.len() + AEAD_FRAME_HEADER_SIZE);
-            aad.extend_from_slice(&this.write.stream_nonce);
-            aad.extend_from_slice(&header);
+            this.write.aad_buf.clear();
+            this.write
+                .aad_buf
+                .extend_from_slice(&this.write.stream_nonce);
+            this.write.aad_buf.extend_from_slice(&header);
 
-            let sealed =
-                match this
-                    .write
-                    .cipher
-                    .encrypt(&this.write.nonce, plaintext.to_vec(), &aad)
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let io_err = io::Error::other(e);
-                        this.write.err = Some(io_err);
-                        return Poll::Ready(Err(io::Error::other("encrypt failed")));
-                    }
-                };
+            let sealed = match this.write.cipher.encrypt(
+                &this.write.nonce,
+                plaintext.to_vec(),
+                &this.write.aad_buf,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    let io_err = io::Error::other(e);
+                    this.write.err = Some(io_err);
+                    return Poll::Ready(Err(io::Error::other("encrypt failed")));
+                }
+            };
 
             pending.extend_from_slice(&header);
             pending.extend_from_slice(&sealed);
@@ -587,24 +599,24 @@ impl AsyncWrite for AeadStream {
             let mut header = [0u8; AEAD_FRAME_HEADER_SIZE];
             header.copy_from_slice(&ciphertext_len.to_be_bytes());
 
-            let mut aad =
-                Vec::with_capacity(this.write.stream_nonce.len() + AEAD_FRAME_HEADER_SIZE);
-            aad.extend_from_slice(&this.write.stream_nonce);
-            aad.extend_from_slice(&header);
+            this.write.aad_buf.clear();
+            this.write
+                .aad_buf
+                .extend_from_slice(&this.write.stream_nonce);
+            this.write.aad_buf.extend_from_slice(&header);
 
-            let sealed =
-                match this
-                    .write
-                    .cipher
-                    .encrypt(&this.write.nonce, plaintext.to_vec(), &aad)
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let io_err = io::Error::other(e);
-                        this.write.err = Some(io_err);
-                        return Poll::Ready(Err(io::Error::other("encrypt failed")));
-                    }
-                };
+            let sealed = match this.write.cipher.encrypt(
+                &this.write.nonce,
+                plaintext.to_vec(),
+                &this.write.aad_buf,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    let io_err = io::Error::other(e);
+                    this.write.err = Some(io_err);
+                    return Poll::Ready(Err(io::Error::other("encrypt failed")));
+                }
+            };
 
             if !increment_nonce(&mut this.write.nonce) {
                 return Poll::Ready(Err(io::Error::other("AEAD write nonce exhausted")));

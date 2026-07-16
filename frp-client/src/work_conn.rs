@@ -18,7 +18,6 @@ use frp_core::transport::{dial_server, DialOptions, IoStream};
 
 use crate::proxy;
 use crate::proxy_runtime::ProxyRuntimeInfo;
-use crate::util::opt_if_empty;
 
 #[cfg(feature = "vnet")]
 type VnetTunMap = Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>;
@@ -79,6 +78,66 @@ pub(crate) struct WorkConnConfig {
     pub vnet_tuns: VnetTunMap,
     #[cfg(feature = "vnet")]
     pub vnet_routes: Arc<RwLock<frp_vnet::router::RouteTable>>,
+}
+
+/// Bundled parameters for work connection transport acquisition.
+/// Extracted from `connect_yamux_or_dial` to keep the argument count manageable.
+struct WorkConnDialConfig<'a> {
+    yamux: &'a Option<Arc<YamuxSession>>,
+    label: &'a str,
+    server_addr: &'a str,
+    server_port: u16,
+    protocol: &'a frp_core::transport::TransportProtocol,
+    tls_enable: bool,
+    tls_server_name: &'a str,
+    tls_ca_file: &'a Option<String>,
+    disable_custom_tls_first_byte: bool,
+    keepalive_secs: u64,
+    bind_addr: &'a Option<String>,
+    proxy_url: &'a str,
+}
+
+/// Shared yamux-or-dial path for work connection transport acquisition.
+/// Used by both QUIC and non-QUIC branches.
+async fn connect_yamux_or_dial(cfg: &WorkConnDialConfig<'_>) -> Option<IoStream> {
+    if let Some(ref yamux) = *cfg.yamux {
+        match yamux.open_stream().await {
+            Some(stream) => {
+                debug!(label = %cfg.label, "Work conn {} opened yamux stream", cfg.label);
+                Some(IoStream::Yamux(stream))
+            }
+            None => {
+                warn!(label = %cfg.label, "Work conn {}: yamux open stream failed, session closed?", cfg.label);
+                None
+            }
+        }
+    } else {
+        debug!(label = %cfg.label, "Work conn {} dialing server", cfg.label);
+        let opts = DialOptions {
+            server_addr: cfg.server_addr.to_string(),
+            server_port: cfg.server_port,
+            protocol: cfg.protocol.clone(),
+            tls_enable: cfg.tls_enable,
+            tls_server_name: cfg.tls_server_name.to_string(),
+            tls_ca_file: cfg.tls_ca_file.clone(),
+            disable_custom_tls_first_byte: cfg.disable_custom_tls_first_byte,
+            keepalive_secs: cfg.keepalive_secs,
+            bind_addr: cfg.bind_addr.clone(),
+            proxy_url: if cfg.proxy_url.is_empty() {
+                None
+            } else {
+                Some(cfg.proxy_url.to_string())
+            },
+            ..Default::default()
+        };
+        match dial_server(&opts).await {
+            Ok(io) => Some(io),
+            Err(e) => {
+                debug!(label = %cfg.label, error = %e, "Work conn {} dial failed: {}", cfg.label, e);
+                None
+            }
+        }
+    }
 }
 
 /// Spawn a single work connection task.
@@ -149,75 +208,46 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     return;
                 }
             }
-        } else if let Some(ref yamux) = yamux {
-            match yamux.open_stream().await {
-                Some(stream) => {
-                    debug!(label = %label, "Work conn {} opened yamux stream", label);
-                    IoStream::Yamux(stream)
-                }
-                None => {
-                    warn!(label = %label, "Work conn {}: yamux open stream failed, session closed?", label);
-                    return;
-                }
-            }
         } else {
-            debug!(label = %label, "Work conn {} dialing server", label);
-            let opts = DialOptions {
-                server_addr: server_addr.clone(),
+            let dial_cfg = WorkConnDialConfig {
+                yamux: &yamux,
+                label: &label,
+                server_addr: &server_addr,
                 server_port,
-                protocol: protocol.clone(),
+                protocol: &protocol,
                 tls_enable,
-                tls_server_name: tls_server_name.clone(),
-                tls_ca_file: tls_ca_file.clone(),
+                tls_server_name: &tls_server_name,
+                tls_ca_file: &tls_ca_file,
                 disable_custom_tls_first_byte,
                 keepalive_secs,
-                bind_addr: bind_addr.clone(),
-                proxy_url: opt_if_empty!(proxy_url),
-                ..Default::default()
+                bind_addr: &bind_addr,
+                proxy_url: &proxy_url,
             };
-            match dial_server(&opts).await {
-                Ok(io) => io,
-                Err(e) => {
-                    debug!(label = %label, error = %e, "Work conn {} dial failed: {}", label, e);
-                    return;
-                }
+            match connect_yamux_or_dial(&dial_cfg).await {
+                Some(io) => io,
+                None => return,
             }
         };
 
         #[cfg(not(feature = "quic"))]
-        let mut work = if let Some(ref yamux) = yamux {
-            match yamux.open_stream().await {
-                Some(stream) => {
-                    debug!(label = %label, "Work conn {} opened yamux stream", label);
-                    IoStream::Yamux(stream)
-                }
-                None => {
-                    warn!(label = %label, "Work conn {}: yamux open stream failed, session closed?", label);
-                    return;
-                }
-            }
-        } else {
-            debug!(label = %label, "Work conn {} dialing server", label);
-            let opts = DialOptions {
-                server_addr: server_addr.clone(),
-                server_port,
-                protocol: protocol.clone(),
-                tls_enable,
-                tls_server_name: tls_server_name.clone(),
-                tls_ca_file: tls_ca_file.clone(),
-                disable_custom_tls_first_byte,
-                keepalive_secs,
-                bind_addr: bind_addr.clone(),
-                proxy_url: opt_if_empty!(proxy_url),
-                ..Default::default()
-            };
-            match dial_server(&opts).await {
-                Ok(io) => io,
-                Err(e) => {
-                    debug!(label = %label, error = %e, "Work conn {} dial failed: {}", label, e);
-                    return;
-                }
-            }
+        let dial_cfg = WorkConnDialConfig {
+            yamux: &yamux,
+            label: &label,
+            server_addr: &server_addr,
+            server_port,
+            protocol: &protocol,
+            tls_enable,
+            tls_server_name: &tls_server_name,
+            tls_ca_file: &tls_ca_file,
+            disable_custom_tls_first_byte,
+            keepalive_secs,
+            bind_addr: &bind_addr,
+            proxy_url: &proxy_url,
+        };
+        #[cfg(not(feature = "quic"))]
+        let mut work = match connect_yamux_or_dial(&dial_cfg).await {
+            Some(io) => io,
+            None => return,
         };
 
         // Send NewWorkConn — required for both yamux and raw transports.

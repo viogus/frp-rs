@@ -375,9 +375,9 @@ impl AsyncRead for WsByteStream {
 
         // Destructure to get independent field borrows, avoiding borrow conflicts
         // between inner (Raw) and the raw_read_state / raw_frame_* fields.
-        // SAFETY: WsByteStream is Unpin (all fields are Unpin), so
-        // Pin<&mut Self> is equivalent to &mut Self with no move risk.
-        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        // &mut *self is safe because WsByteStream is Unpin (all fields are Unpin),
+        // so Pin<&mut Self> implements DerefMut.
+        let this = &mut *self;
         let WsByteStream {
             inner,
             read_buf,

@@ -70,9 +70,7 @@ where
             }
             Err(e) => {
                 warn!(peer = ?peer, error = %e, "OIDC auth failed for {:?}: {}", peer, e);
-                if let Some(ref peer_addr) = peer {
-                    state.record_login_failure(*peer_addr).await;
-                }
+                // Login throttle slot was reserved atomically in check_login_throttle above.
                 let (_, mut writer) = tokio::io::split(stream);
                 let resp = FrpMessage::LoginResp(msg::LoginResp {
                     version: Some(frp_core::VERSION.into()),
@@ -92,9 +90,7 @@ where
         let auth_cfg = state.reloadable.read_ok().auth_cfg.clone();
         if let Err(e) = auth_cfg.validate_login(login.privilege_key.as_deref(), login.timestamp) {
             warn!(peer = ?peer, error = %e, "Authentication failed for {:?}: {}", peer, e);
-            if let Some(ref peer_addr) = peer {
-                state.record_login_failure(*peer_addr).await;
-            }
+            // Login throttle slot was reserved atomically in check_login_throttle above.
             // Emit WebSocket event for dashboard subscribers
             #[cfg(feature = "dashboard")]
             {

@@ -491,6 +491,17 @@ dispatch it:
 | 'h'       | Ping            | Bidirectional  | Keepalive heartbeat |
 | '4'       | Pong            | Bidirectional  | Heartbeat response |
 | 'u'       | UDPPacket       | Bidirectional  | Encapsulated UDP data |
+| 'v'       | NewVisitorConn  | Client to Server | STCP/XTCP visitor connection |
+| '3'       | NewVisitorConnResp | Server to Client | Visitor connection result |
+| 'i'       | NatHoleVisitor  | Client to Server | NAT hole punch visitor |
+| 'n'       | NatHoleClient   | Client to Server | NAT hole punch client (STUN candidates) |
+| 'm'       | NatHoleResp     | Server to Client | NAT hole punch response (peer candidates) |
+| '5'       | NatHoleSid      | Server to Client | NAT hole SID assignment |
+| '6'       | NatHoleReport   | Client to Server | NAT hole detection report |
+| '7'       | CloseProxyResp  | Server to Client | **Rust-only** — proxy close acknowledgment |
+| '8'       | Error           | Server to Client | **Rust-only** — protocol error message |
+
+> **Rust-only types ('7', '8'):** These are frp-rs extensions not present in Go frp v0.70.0. Go frp treats unknown message types as errors. Only send on Rust↔Rust connections after capability negotiation. See `frp-core/src/msg.rs` for the payload structs.
 
 ### Work Connection Lifecycle
 
