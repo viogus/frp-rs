@@ -391,6 +391,13 @@ impl XtcpP2pStream {
         self.peer_addr
     }
 
+    /// Return a clone of the write notifier for external wakeup.
+    /// Used by the yamux background driver to wake on write activity
+    /// instead of relying solely on the periodic KCP tick.
+    pub fn write_notifier(&self) -> Arc<Notify> {
+        self.write_notify.clone()
+    }
+
     /// Drive one KCP tick: update clock, send output, recv input.
     fn drive_kcp(&mut self, now_ms: u32) -> io::Result<()> {
         // 1. Flush pending send data to KCP.
@@ -724,10 +731,13 @@ pub async fn xtcp_p2p_connect_yamux(
     )
     .await?;
 
-    // 2. Compat KCP stream to futures traits for yamux.
+    // 2. Extract write notifier before yamux consumes the KCP stream.
+    let write_notify = kcp_stream.write_notifier();
+
+    // 3. Compat KCP stream to futures traits for yamux.
     let compat_stream = kcp_stream.compat();
 
-    // 3. Create yamux Connection.
+    // 4. Create yamux Connection.
     let mut yamux_cfg = Config::default();
     yamux_cfg.set_max_connection_receive_window(Some(128 * 1024 * 1024));
     yamux_cfg.set_max_num_streams(256);
@@ -752,52 +762,67 @@ pub async fn xtcp_p2p_connect_yamux(
         let keepalive = Duration::from_millis(tick_ms);
         let mut stream_tx = Some(stream_tx);
         loop {
-            let result = tokio::time::timeout(
-                keepalive,
-                poll_fn(|cx| {
+            // select! with write_notify avoids pure timeout-based busy-poll:
+            // write activity wakes the driver immediately; the sleep branch
+            // provides the periodic KCP tick for retransmission timing.
+            tokio::select! {
+                biased;
+                _ = write_notify.notified() => {
+                    // Write activity — drive yamux to flush pending frames
+                    // and tick KCP without waiting for the next sleep.
+                    let _ = poll_fn(|cx| {
+                        let mut c = bg_conn.lock().unwrap();
+                        let _ = c.poll_next_inbound(cx);
+                        std::task::Poll::Ready(())
+                    }).await;
+                }
+                result = poll_fn(|cx| {
                     let mut c = bg_conn.lock().unwrap();
                     // Double-poll: first poll processes stream commands
                     // into pending_frames; second poll sends them on wire.
                     match c.poll_next_inbound(cx) {
                         Poll::Ready(r) => Poll::Ready(r),
-                        Poll::Pending => c.poll_next_inbound(cx),
+                        Poll::Pending => Poll::Pending,
                     }
-                }),
-            )
-            .await;
-
-            match result {
-                Ok(Some(Ok(stream))) => {
-                    if let Some(tx) = stream_tx.take() {
-                        // Send first accepted stream back to connect function.
-                        // If receiver is gone, connection closed — exit.
-                        if tx.send(Ok(stream)).is_err() {
-                            tracing::debug!("yamux P2P: caller dropped, exiting");
+                }) => {
+                    match result {
+                        Some(Ok(stream)) => {
+                            if let Some(tx) = stream_tx.take() {
+                                // Send first accepted stream back to connect function.
+                                // If receiver is gone, connection closed — exit.
+                                if tx.send(Ok(stream)).is_err() {
+                                    tracing::debug!("yamux P2P: caller dropped, exiting");
+                                    break;
+                                }
+                            } else {
+                                tracing::debug!("yamux P2P: unexpected inbound stream, ignoring");
+                            }
+                        }
+                        Some(Err(e)) => {
+                            // If the caller hasn't received a stream yet, send the
+                            // error so it doesn't wait for the full timeout.
+                            if let Some(tx) = stream_tx.take() {
+                                let _ = tx.send(Err(format!("yamux: {e}")));
+                            }
+                            tracing::debug!("yamux P2P: connection error, exiting");
                             break;
                         }
-                    } else {
-                        tracing::debug!("yamux P2P: unexpected inbound stream, ignoring");
+                        None => {
+                            if let Some(tx) = stream_tx.take() {
+                                let _ = tx.send(Err("yamux: connection closed before stream".into()));
+                            }
+                            tracing::debug!("yamux P2P: connection closed, exiting");
+                            break;
+                        }
                     }
                 }
-                Ok(Some(Err(e))) => {
-                    // If the caller hasn't received a stream yet, send the
-                    // error so it doesn't wait for the full timeout.
-                    if let Some(tx) = stream_tx.take() {
-                        let _ = tx.send(Err(format!("yamux: {e}")));
-                    }
-                    tracing::debug!("yamux P2P: connection error, exiting");
-                    break;
-                }
-                Ok(None) => {
-                    if let Some(tx) = stream_tx.take() {
-                        let _ = tx.send(Err("yamux: connection closed before stream".into()));
-                    }
-                    tracing::debug!("yamux P2P: connection closed, exiting");
-                    break;
-                }
-                Err(_elapsed) => {
-                    // Normal timeout — poll_next_inbound was called and
-                    // KCP was ticked. Continue the loop.
+                _ = tokio::time::sleep(keepalive) => {
+                    // Periodic KCP tick for retransmission timing.
+                    let _ = poll_fn(|cx| {
+                        let mut c = bg_conn.lock().unwrap();
+                        let _ = c.poll_next_inbound(cx);
+                        std::task::Poll::Ready(())
+                    }).await;
                 }
             }
         }

@@ -364,7 +364,9 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
                     this.encrypted_write_pos += n;
                     if this.encrypted_write_pos >= pending.len() {
                         let written = pending.len(); // CFB does not expand; == original buf.len()
-                        this.encrypted_buf = None;
+                                                     // Return buffer to scratch to reuse allocation on next write.
+                        this.scratch = this.encrypted_buf.take().unwrap();
+                        this.scratch.clear();
                         this.encrypted_write_pos = 0;
                         return Poll::Ready(Ok(written));
                     } else {
@@ -433,7 +435,9 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CipherWriter<W> {
                 Poll::Ready(Ok(n)) => {
                     this.encrypted_write_pos += n;
                     if this.encrypted_write_pos >= pending.len() {
-                        this.encrypted_buf = None;
+                        // Return buffer to scratch to reuse allocation.
+                        this.scratch = this.encrypted_buf.take().unwrap();
+                        this.scratch.clear();
                         this.encrypted_write_pos = 0;
                     } else {
                         cx.waker().wake_by_ref();
@@ -742,7 +746,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
                     this.encrypted_write_pos += n;
                     if this.encrypted_write_pos >= pending.len() {
                         let written = pending.len(); // CFB does not expand; == original buf.len()
-                        this.encrypted_buf = None;
+                                                     // Return buffer to scratch to reuse allocation on next write.
+                        this.scratch = this.encrypted_buf.take().unwrap();
+                        this.scratch.clear();
                         this.encrypted_write_pos = 0;
                         return Poll::Ready(Ok(written));
                     } else {
@@ -809,7 +815,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CipherStream<S> {
                 Poll::Ready(Ok(n)) => {
                     this.encrypted_write_pos += n;
                     if this.encrypted_write_pos >= pending.len() {
-                        this.encrypted_buf = None;
+                        // Return buffer to scratch to reuse allocation.
+                        this.scratch = this.encrypted_buf.take().unwrap();
+                        this.scratch.clear();
                         this.encrypted_write_pos = 0;
                     } else {
                         cx.waker().wake_by_ref();
