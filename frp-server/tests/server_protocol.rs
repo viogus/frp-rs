@@ -173,7 +173,7 @@ async fn test_new_proxy_registration_auto_port() {
     let (mut stream, _resp) = login_with_test_token(addr).await.expect("login");
 
     // Register a TCP proxy with auto-assign port (remote_port = 0)
-    let np = FrpMessage::NewProxy(msg::NewProxy {
+    let np = FrpMessage::NewProxy(Box::new(msg::NewProxy {
         proxy_name: "test-tcp".into(),
         proxy_type: "tcp".into(),
         use_encryption: None,
@@ -204,7 +204,7 @@ async fn test_new_proxy_registration_auto_port() {
         vnet_ip: None,
         vnet_netmask: None,
         vnet_mtu: None,
-    });
+    }));
     write_msg_v1(&mut stream, &np).await.expect("send NewProxy");
 
     match read_msg_v1(&mut stream).await.expect("read NewProxyResp") {
@@ -249,7 +249,7 @@ async fn test_new_proxy_duplicate_name_fails() {
     let (mut stream, _resp) = login_with_test_token(addr).await.expect("login");
 
     let mk_proxy = || {
-        FrpMessage::NewProxy(msg::NewProxy {
+        FrpMessage::NewProxy(Box::new(msg::NewProxy {
             proxy_name: "dup-tcp".into(),
             proxy_type: "tcp".into(),
             local_str: Some("127.0.0.1:9876".into()),
@@ -280,7 +280,7 @@ async fn test_new_proxy_duplicate_name_fails() {
             vnet_ip: None,
             vnet_netmask: None,
             vnet_mtu: None,
-        })
+        }))
     };
 
     // First registration — should succeed
@@ -358,7 +358,7 @@ async fn test_vhost_location_routing() {
     let (mut provider, resp) = login_with_test_token(addr).await.expect("provider login");
     let run_id = resp.run_id.expect("provider should get run_id");
 
-    let np = FrpMessage::NewProxy(NewProxy {
+    let np = FrpMessage::NewProxy(Box::new(NewProxy {
         proxy_name: "http-loc-test".into(),
         proxy_type: "http".into(),
         custom_domains: Some(vec!["test.local".into()]),
@@ -389,7 +389,7 @@ async fn test_vhost_location_routing() {
         vnet_ip: None,
         vnet_netmask: None,
         vnet_mtu: None,
-    });
+    }));
     write_msg_v1(&mut provider, &np)
         .await
         .expect("send NewProxy");
@@ -491,7 +491,7 @@ async fn test_vhost_location_path_mismatch_404() {
     // Provider registers HTTP proxy with locations (only /api)
     let (mut provider, _resp) = login_with_test_token(addr).await.expect("provider login");
 
-    let np = FrpMessage::NewProxy(NewProxy {
+    let np = FrpMessage::NewProxy(Box::new(NewProxy {
         proxy_name: "http-loc-only".into(),
         proxy_type: "http".into(),
         custom_domains: Some(vec!["test.local".into()]),
@@ -522,7 +522,7 @@ async fn test_vhost_location_path_mismatch_404() {
         vnet_ip: None,
         vnet_netmask: None,
         vnet_mtu: None,
-    });
+    }));
     write_msg_v1(&mut provider, &np)
         .await
         .expect("send NewProxy");
@@ -596,7 +596,7 @@ async fn test_login_via_websocket() {
         .unwrap()
         .as_secs() as i64;
     let key = auth::generate_token("test-token", ts);
-    let login = FrpMessage::Login(msg::Login {
+    let login = FrpMessage::Login(Box::new(msg::Login {
         version: Some(frp_core::VERSION.into()),
         hostname: Some("test-ws-host".into()),
         os: Some(std::env::consts::OS.into()),
@@ -610,7 +610,7 @@ async fn test_login_via_websocket() {
         metas: None,
         client_spec: None,
         multiplexer: None,
-    });
+    }));
     io.write_v1_frame(&login).await.expect("send login over WS");
 
     let resp = io.read_v1_frame().await.expect("read LoginResp over WS");
@@ -670,7 +670,7 @@ async fn test_login_via_tls() {
         .unwrap()
         .as_secs() as i64;
     let key = auth::generate_token("test-token", ts);
-    let login = FrpMessage::Login(msg::Login {
+    let login = FrpMessage::Login(Box::new(msg::Login {
         version: Some(frp_core::VERSION.into()),
         hostname: Some("test-tls-host".into()),
         os: Some(std::env::consts::OS.into()),
@@ -684,7 +684,7 @@ async fn test_login_via_tls() {
         metas: None,
         client_spec: None,
         multiplexer: None,
-    });
+    }));
     io.write_v1_frame(&login)
         .await
         .expect("send login over TLS");

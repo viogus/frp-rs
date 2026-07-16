@@ -116,11 +116,11 @@ async fn test_xtcp_precheck_disconnect_does_not_crash() {
     // Login as provider and register an XTCP proxy
     let (mut provider_ctl, _resp) = login_with_test_token(addr).await.expect("provider login");
 
-    let np = FrpMessage::NewProxy(xtcp_proxy(
+    let np = FrpMessage::NewProxy(Box::new(xtcp_proxy(
         "xtcp-drop-test",
         "drop-test-sk",
         "127.0.0.1:7777",
-    ));
+    )));
     write_msg_v1(&mut provider_ctl, &np)
         .await
         .expect("send NewProxy");
@@ -212,7 +212,7 @@ async fn test_xtcp_nat_hole_client_invalid_sid() {
     // Provider logs in and registers an XTCP proxy
     let (mut provider_ctl, _resp) = login_with_test_token(addr).await.expect("provider login");
 
-    let np = FrpMessage::NewProxy(xtcp_proxy("xtcp-sid-test", "sid-test-sk", "127.0.0.1:6666"));
+    let np = FrpMessage::NewProxy(Box::new(xtcp_proxy("xtcp-sid-test", "sid-test-sk", "127.0.0.1:6666")));
     write_msg_v1(&mut provider_ctl, &np)
         .await
         .expect("send NewProxy");
@@ -227,24 +227,24 @@ async fn test_xtcp_nat_hole_client_invalid_sid() {
     }
 
     // Send NatHoleClient with a sid that does not exist
-    let bogus_client = FrpMessage::NatHoleClient(msg::NatHoleClient {
+    let bogus_client = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
         transaction_id: "bogus-txn".into(),
         proxy_name: "xtcp-sid-test".into(),
         sid: Some("deadbeef-nonexistent-sid".into()),
         protocol: Some("tcp".into()),
         mapped_addrs: Some(vec!["9.9.9.9:9999".into()]),
         ..Default::default()
-    });
+    }));
     write_msg_v1(&mut provider_ctl, &bogus_client)
         .await
         .expect("send NatHoleClient with invalid sid");
 
     // Control channel must still be usable -- register another proxy
-    let np2 = FrpMessage::NewProxy(xtcp_proxy(
+    let np2 = FrpMessage::NewProxy(Box::new(xtcp_proxy(
         "xtcp-sid-test-2",
         "sid-test-sk-2",
         "127.0.0.1:5555",
-    ));
+    )));
     write_msg_v1(&mut provider_ctl, &np2)
         .await
         .expect("send NewProxy after invalid sid");
@@ -281,11 +281,11 @@ async fn test_xtcp_nat_hole_client_without_sid() {
     // Provider logs in and registers an XTCP proxy
     let (mut provider_ctl, _resp) = login_with_test_token(addr).await.expect("provider login");
 
-    let np = FrpMessage::NewProxy(xtcp_proxy(
+    let np = FrpMessage::NewProxy(Box::new(xtcp_proxy(
         "xtcp-nosid-test",
         "nosid-test-sk",
         "127.0.0.1:4444",
-    ));
+    )));
     write_msg_v1(&mut provider_ctl, &np)
         .await
         .expect("send NewProxy");
@@ -300,24 +300,24 @@ async fn test_xtcp_nat_hole_client_without_sid() {
     }
 
     // Send NatHoleClient with sid=None
-    let no_sid_client = FrpMessage::NatHoleClient(msg::NatHoleClient {
+    let no_sid_client = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
         transaction_id: "no-sid-txn".into(),
         proxy_name: "xtcp-nosid-test".into(),
         sid: None,
         protocol: Some("tcp".into()),
         mapped_addrs: Some(vec!["8.8.8.8:8888".into()]),
         ..Default::default()
-    });
+    }));
     write_msg_v1(&mut provider_ctl, &no_sid_client)
         .await
         .expect("send NatHoleClient without sid");
 
     // Control channel must still be usable
-    let np2 = FrpMessage::NewProxy(xtcp_proxy(
+    let np2 = FrpMessage::NewProxy(Box::new(xtcp_proxy(
         "xtcp-nosid-test-2",
         "nosid-test-sk-2",
         "127.0.0.1:3333",
-    ));
+    )));
     write_msg_v1(&mut provider_ctl, &np2)
         .await
         .expect("send NewProxy after no-sid");
@@ -361,7 +361,7 @@ async fn test_xtcp_nat_hole_report_cleanup() {
     let run_id = resp.run_id.expect("provider should get run_id");
 
     let xtcp_sk = "cleanup-test-sk";
-    let np = FrpMessage::NewProxy(xtcp_proxy("xtcp-cleanup", xtcp_sk, "127.0.0.1:2222"));
+    let np = FrpMessage::NewProxy(Box::new(xtcp_proxy("xtcp-cleanup", xtcp_sk, "127.0.0.1:2222")));
     write_msg_v1(&mut provider_ctl, &np)
         .await
         .expect("send NewProxy");
@@ -472,7 +472,7 @@ async fn test_xtcp_nat_hole_report_cleanup() {
     };
 
     // --- Provider sends NatHoleClient on control ---
-    let client_msg = FrpMessage::NatHoleClient(msg::NatHoleClient {
+    let client_msg = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
         transaction_id: txn_id.clone(),
         proxy_name: "xtcp-cleanup".into(),
         sid: Some(sid.clone()),
@@ -480,7 +480,7 @@ async fn test_xtcp_nat_hole_report_cleanup() {
         mapped_addrs: Some(vec!["10.0.0.1:7000".into(), "10.0.0.1:7002".into()]),
         assisted_addrs: None,
         visitor_addr: None,
-    });
+    }));
     write_msg_v1(&mut provider_ctl, &client_msg)
         .await
         .expect("send NatHoleClient on control");
@@ -547,7 +547,7 @@ async fn test_xtcp_nat_hole_report_cleanup() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // --- Another NatHoleClient with same sid --> silently ignored ---
-    let stale_client = FrpMessage::NatHoleClient(msg::NatHoleClient {
+    let stale_client = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
         transaction_id: txn_id.clone(),
         proxy_name: "xtcp-cleanup".into(),
         sid: Some(sid.clone()),
@@ -555,17 +555,17 @@ async fn test_xtcp_nat_hole_report_cleanup() {
         mapped_addrs: Some(vec!["11.11.11.11:1111".into()]),
         assisted_addrs: None,
         visitor_addr: None,
-    });
+    }));
     write_msg_v1(&mut provider_ctl, &stale_client)
         .await
         .expect("send stale NatHoleClient (should be ignored)");
 
     // --- Control channel must still work after all this ---
-    let np2 = FrpMessage::NewProxy(xtcp_proxy(
+    let np2 = FrpMessage::NewProxy(Box::new(xtcp_proxy(
         "xtcp-cleanup-2",
         "cleanup-sk-2",
         "127.0.0.1:1111",
-    ));
+    )));
     write_msg_v1(&mut provider_ctl, &np2)
         .await
         .expect("send NewProxy after report");

@@ -152,12 +152,12 @@ impl Controller {
                 if let Some(ref mut w) = *guard {
                     let _ = frp_core::protocol::write_v1_frame(
                         w,
-                        &FrpMessage::NatHoleResp(msg::NatHoleResp {
+                        &FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                             transaction_id: session.visitor_msg.transaction_id.clone(),
                             sid: Some(sid.clone()),
                             error: Some("NAT hole session limit reached".into()),
                             ..Default::default()
-                        }),
+                        })),
                     )
                     .await;
                 }

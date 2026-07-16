@@ -220,11 +220,11 @@ pub(crate) async fn handle_nat_hole_visitor(
         None => {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy '{}' not found", proxy_name);
             let mut writer = stream.into_split().1;
-            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+            let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("proxy not found".into()),
                 ..Default::default()
-            });
+            }));
             let _ = write_msg(&mut writer, &resp, v2).await;
             return;
         }
@@ -237,11 +237,11 @@ pub(crate) async fn handle_nat_hole_visitor(
         None => {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: no run_id found for proxy '{}'", proxy_name);
             let mut writer = stream.into_split().1;
-            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+            let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("provider offline".into()),
                 ..Default::default()
-            });
+            }));
             let _ = write_msg(&mut writer, &resp, v2).await;
             return;
         }
@@ -257,11 +257,11 @@ pub(crate) async fn handle_nat_hole_visitor(
         None => {
             warn!(run_id = %run_id, "No provider control handler for run_id {}", run_id);
             let mut writer = stream.into_split().1;
-            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+            let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("provider disconnected".into()),
                 ..Default::default()
-            });
+            }));
             let _ = write_msg(&mut writer, &resp, v2).await;
             return;
         }
@@ -278,11 +278,11 @@ pub(crate) async fn handle_nat_hole_visitor(
             proxy_name
         );
         let (_, mut writer) = stream.into_split();
-        let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+        let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
             transaction_id: transaction_id.clone(),
             error: None,
             ..Default::default()
-        });
+        }));
         let _ = write_msg(&mut writer, &resp, v2).await;
         return;
     }
@@ -303,11 +303,11 @@ pub(crate) async fn handle_nat_hole_visitor(
         if sign_key.is_empty() {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: missing sign_key, rejecting");
             let mut writer = stream.into_split().1;
-            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+            let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("auth required".into()),
                 ..Default::default()
-            });
+            }));
             let _ = write_msg(&mut writer, &resp, v2).await;
             return;
         }
@@ -318,11 +318,11 @@ pub(crate) async fn handle_nat_hole_visitor(
             // visitors on fresh connections. Reject.
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy has no sk configured — rejecting fresh connection");
             let mut writer = stream.into_split().1;
-            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+            let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("proxy has no shared secret".into()),
                 ..Default::default()
-            });
+            }));
             let _ = write_msg(&mut writer, &resp, v2).await;
             return;
         }
@@ -334,11 +334,11 @@ pub(crate) async fn handle_nat_hole_visitor(
         {
             warn!(proxy_name = %proxy_name, error = %freshness_err, "NatHoleVisitor: timestamp rejected for proxy '{}'", proxy_name);
             let mut writer = stream.into_split().1;
-            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+            let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some(freshness_err),
                 ..Default::default()
-            });
+            }));
             let _ = write_msg(&mut writer, &resp, v2).await;
             return;
         }
@@ -346,11 +346,11 @@ pub(crate) async fn handle_nat_hole_visitor(
         if !frp_core::auth::verify_token(proxy_sk, timestamp, sign_key) {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor auth failed for proxy '{}'", proxy_name);
             let mut writer = stream.into_split().1;
-            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+            let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("auth failed".into()),
                 ..Default::default()
-            });
+            }));
             let _ = write_msg(&mut writer, &resp, v2).await;
             return;
         }
@@ -364,11 +364,11 @@ pub(crate) async fn handle_nat_hole_visitor(
         if !proxy_info.allow_users.is_empty() {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy has allow_users configured — rejecting fresh connection (use control channel)");
             let mut writer = stream.into_split().1;
-            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+            let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("access denied: use control channel for user-based auth".into()),
                 ..Default::default()
-            });
+            }));
             let _ = write_msg(&mut writer, &resp, v2).await;
             return;
         }
@@ -444,7 +444,7 @@ pub(crate) async fn handle_nat_hole_visitor(
         // without holding the tokio::sync::Mutex guard.
         let mut taken_writer = session.visitor_writer.lock().await.take();
         if let Some(ref mut w) = taken_writer {
-            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+            let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("provider NAT detection timeout".into()),
                 sid: None,
@@ -452,7 +452,7 @@ pub(crate) async fn handle_nat_hole_visitor(
                 candidate_addrs: None,
                 assisted_addrs: None,
                 detect_behavior: None,
-            });
+            }));
             let _ = write_msg(w, &resp, v2).await;
             // Return the writer to the session
             *session.visitor_writer.lock().await = taken_writer;
@@ -585,7 +585,7 @@ pub(crate) async fn handle_nat_hole_visitor(
     {
         let mut writer_guard = session.visitor_writer.lock().await;
         if let Some(ref mut w) = *writer_guard {
-            if let Err(e) = write_msg(w, &FrpMessage::NatHoleResp(v_resp), v2).await {
+            if let Err(e) = write_msg(w, &FrpMessage::NatHoleResp(Box::new(v_resp)), v2).await {
                 warn!(error = %e, "failed to write NatHoleResp to visitor");
             }
         }
@@ -659,7 +659,7 @@ pub(crate) async fn dispatch_v2_message(
     };
     match msg {
         FrpMessage::Login(login) => {
-            control::handle_control(io, login, state, Some(addr), incoming, true, crypto_ctx).await;
+            control::handle_control(io, *login, state, Some(addr), incoming, true, crypto_ctx).await;
         }
         FrpMessage::NewWorkConn(nwc) => {
             handle_work_conn_inner(io, nwc, state).await;
@@ -688,7 +688,7 @@ pub(crate) async fn dispatch_v1_message(
 ) {
     match frp_core::protocol::read_msg_v1(&mut io).await {
         Ok(FrpMessage::Login(login)) => {
-            control::handle_control(io, login, state, addr, incoming, false, None).await;
+            control::handle_control(io, *login, state, addr, incoming, false, None).await;
         }
         Ok(FrpMessage::NewWorkConn(nwc)) => {
             handle_work_conn_inner(io, nwc, state).await;

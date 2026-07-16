@@ -19,7 +19,6 @@ uuid.workspace = true
 tokio-tungstenite = { workspace = true, optional = true }
 sha1.workspace = true
 md-5.workspace = true
-hex.workspace = true
 data-encoding.workspace = true
 aes.workspace = true
 cfb-mode.workspace = true

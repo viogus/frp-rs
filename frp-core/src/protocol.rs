@@ -59,18 +59,18 @@ pub async fn read_v1_frame<R: AsyncReadExt + Unpin>(
     tracing::debug!(
         type_byte = %type_byte,
         length = %length,
-        raw = %hex::encode(header),
+        raw = %crate::hex_encode(&header),
         "V1 header: type={:#04x} len={} raw={}",
         type_byte,
         length,
-        hex::encode(header)
+        crate::hex_encode(&header)
     );
 
     if length > V1_MAX_MSG_LENGTH as u64 {
         return Err(crate::Error::Protocol(
             format!(
                 "invalid V1 msg length: {length}, raw header: {}",
-                hex::encode(header)
+                crate::hex_encode(&header)
             )
             .into(),
         ));
@@ -92,8 +92,57 @@ pub async fn read_v1_frame<R: AsyncReadExt + Unpin>(
 pub async fn read_msg_v1<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> Result<FrpMessage, crate::Error> {
-    let (type_byte, payload) = read_v1_frame(reader).await?;
-    deserialize_v1(type_byte, &payload)
+    let mut header = [0u8; V1_HEADER_LEN];
+    reader
+        .read_exact(&mut header)
+        .await
+        .map_err(|e| crate::Error::Protocol(format!("read V1 header: {e}").into()))?;
+
+    let type_byte = header[0];
+    let length = u64::from_be_bytes([
+        header[1], header[2], header[3], header[4], header[5], header[6], header[7], header[8],
+    ]);
+
+    tracing::debug!(
+        type_byte = %type_byte,
+        length = %length,
+        raw = %crate::hex_encode(&header),
+        "V1 header: type={:#04x} len={} raw={}",
+        type_byte,
+        length,
+        crate::hex_encode(&header)
+    );
+
+    if length > V1_MAX_MSG_LENGTH as u64 {
+        return Err(crate::Error::Protocol(
+            format!(
+                "invalid V1 msg length: {length}, raw header: {}",
+                crate::hex_encode(&header)
+            )
+            .into(),
+        ));
+    }
+
+    let length = length as usize;
+    // Use the global buffer pool for small payloads (<= BUFFER_SIZE, 32 KiB
+    // by default).  Larger payloads fall back to a heap allocation.  The
+    // PoolGuard is dropped after deserialization, returning the buffer.
+    let pool_size = *crate::buffer_pool::BUFFER_SIZE;
+    if length <= pool_size {
+        let mut guard = crate::buffer_pool::PoolGuard::acquire();
+        reader
+            .read_exact(&mut guard.as_mut_slice()[..length])
+            .await
+            .map_err(|e| crate::Error::Protocol(format!("read V1 payload: {e}").into()))?;
+        deserialize_v1(type_byte, &guard.raw_buf()[..length])
+    } else {
+        let mut payload = vec![0u8; length];
+        reader
+            .read_exact(&mut payload)
+            .await
+            .map_err(|e| crate::Error::Protocol(format!("read V1 payload: {e}").into()))?;
+        deserialize_v1(type_byte, &payload)
+    }
 }
 
 pub async fn write_msg_v1<W: AsyncWriteExt + Unpin>(
@@ -122,28 +171,46 @@ macro_rules! deser_msg {
     }};
 }
 
+/// Variant of `deser_msg!` for heap-allocated (Boxed) message types.
+macro_rules! deser_msg_boxed {
+    ($payload:expr, $MsgType:ident, $version_suffix:literal) => {{
+        let v: msg::$MsgType = serde_json::from_slice($payload).map_err(|e| {
+            crate::Error::Protocol(
+                format!(
+                    "deserialize {}{}: {}",
+                    stringify!($MsgType),
+                    $version_suffix,
+                    e
+                )
+                .into(),
+            )
+        })?;
+        FrpMessage::$MsgType(Box::new(v))
+    }};
+}
+
 /// Deserialize a V2 message from its type ID and JSON payload bytes.
 /// V2 uses numeric type IDs (u16) instead of V1's ASCII type bytes.
 pub fn deserialize_v2(type_id: u16, json_bytes: &[u8]) -> Result<FrpMessage, crate::Error> {
     let msg = match type_id {
-        msg::V2_TYPE_LOGIN => deser_msg!(json_bytes, Login, " (v2)"),
+        msg::V2_TYPE_LOGIN => deser_msg_boxed!(json_bytes, Login, " (v2)"),
         msg::V2_TYPE_LOGIN_RESP => deser_msg!(json_bytes, LoginResp, " (v2)"),
-        msg::V2_TYPE_NEW_PROXY => deser_msg!(json_bytes, NewProxy, " (v2)"),
+        msg::V2_TYPE_NEW_PROXY => deser_msg_boxed!(json_bytes, NewProxy, " (v2)"),
         msg::V2_TYPE_NEW_PROXY_RESP => deser_msg!(json_bytes, NewProxyResp, " (v2)"),
         msg::V2_TYPE_CLOSE_PROXY => deser_msg!(json_bytes, CloseProxy, " (v2)"),
         msg::V2_TYPE_CLOSE_PROXY_RESP => deser_msg!(json_bytes, CloseProxyResp, " (v2)"),
         msg::V2_TYPE_ERROR => deser_msg!(json_bytes, Error, " (v2)"),
         msg::V2_TYPE_NEW_WORK_CONN => deser_msg!(json_bytes, NewWorkConn, " (v2)"),
         msg::V2_TYPE_REQ_WORK_CONN => deser_msg!(json_bytes, ReqWorkConn, " (v2)"),
-        msg::V2_TYPE_START_WORK_CONN => deser_msg!(json_bytes, StartWorkConn, " (v2)"),
+        msg::V2_TYPE_START_WORK_CONN => deser_msg_boxed!(json_bytes, StartWorkConn, " (v2)"),
         msg::V2_TYPE_NEW_VISITOR_CONN => deser_msg!(json_bytes, NewVisitorConn, " (v2)"),
         msg::V2_TYPE_NEW_VISITOR_CONN_RESP => deser_msg!(json_bytes, NewVisitorConnResp, " (v2)"),
         msg::V2_TYPE_PING => deser_msg!(json_bytes, Ping, " (v2)"),
         msg::V2_TYPE_PONG => deser_msg!(json_bytes, Pong, " (v2)"),
         msg::V2_TYPE_UDP_PACKET => deser_msg!(json_bytes, UDPPacket, " (v2)"),
         msg::V2_TYPE_NAT_HOLE_VISITOR => deser_msg!(json_bytes, NatHoleVisitor, " (v2)"),
-        msg::V2_TYPE_NAT_HOLE_CLIENT => deser_msg!(json_bytes, NatHoleClient, " (v2)"),
-        msg::V2_TYPE_NAT_HOLE_RESP => deser_msg!(json_bytes, NatHoleResp, " (v2)"),
+        msg::V2_TYPE_NAT_HOLE_CLIENT => deser_msg_boxed!(json_bytes, NatHoleClient, " (v2)"),
+        msg::V2_TYPE_NAT_HOLE_RESP => deser_msg_boxed!(json_bytes, NatHoleResp, " (v2)"),
         msg::V2_TYPE_NAT_HOLE_SID => deser_msg!(json_bytes, NatHoleSid, " (v2)"),
         msg::V2_TYPE_NAT_HOLE_REPORT => deser_msg!(json_bytes, NatHoleReport, " (v2)"),
         #[cfg(feature = "vnet")]
@@ -163,16 +230,16 @@ pub fn deserialize_v2(type_id: u16, json_bytes: &[u8]) -> Result<FrpMessage, cra
 
 pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate::Error> {
     let msg = match type_byte {
-        msg::TYPE_LOGIN => deser_msg!(payload, Login, ""),
+        msg::TYPE_LOGIN => deser_msg_boxed!(payload, Login, ""),
         msg::TYPE_LOGIN_RESP => deser_msg!(payload, LoginResp, ""),
-        msg::TYPE_NEW_PROXY => deser_msg!(payload, NewProxy, ""),
+        msg::TYPE_NEW_PROXY => deser_msg_boxed!(payload, NewProxy, ""),
         msg::TYPE_NEW_PROXY_RESP => deser_msg!(payload, NewProxyResp, ""),
         msg::TYPE_CLOSE_PROXY => deser_msg!(payload, CloseProxy, ""),
         msg::TYPE_CLOSE_PROXY_RESP => deser_msg!(payload, CloseProxyResp, ""),
         msg::TYPE_ERROR => deser_msg!(payload, Error, ""),
         msg::TYPE_NEW_WORK_CONN => deser_msg!(payload, NewWorkConn, ""),
         msg::TYPE_REQ_WORK_CONN => deser_msg!(payload, ReqWorkConn, ""),
-        msg::TYPE_START_WORK_CONN => deser_msg!(payload, StartWorkConn, ""),
+        msg::TYPE_START_WORK_CONN => deser_msg_boxed!(payload, StartWorkConn, ""),
         msg::TYPE_PING => deser_msg!(payload, Ping, ""),
         msg::TYPE_PONG => deser_msg!(payload, Pong, ""),
         msg::TYPE_NEW_VISITOR_CONN => deser_msg!(payload, NewVisitorConn, ""),
@@ -198,8 +265,8 @@ pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate
             );
             FrpMessage::NatHoleVisitor(v)
         }
-        msg::TYPE_NAT_HOLE_CLIENT => deser_msg!(payload, NatHoleClient, ""),
-        msg::TYPE_NAT_HOLE_RESP => deser_msg!(payload, NatHoleResp, ""),
+        msg::TYPE_NAT_HOLE_CLIENT => deser_msg_boxed!(payload, NatHoleClient, ""),
+        msg::TYPE_NAT_HOLE_RESP => deser_msg_boxed!(payload, NatHoleResp, ""),
         msg::TYPE_NAT_HOLE_SID => deser_msg!(payload, NatHoleSid, ""),
         msg::TYPE_NAT_HOLE_REPORT => deser_msg!(payload, NatHoleReport, ""),
         #[cfg(feature = "vnet")]
@@ -430,7 +497,7 @@ mod tests {
     #[tokio::test]
     async fn test_v1_frame_roundtrip() {
         let (mut client, mut server) = duplex(65536);
-        let msg = FrpMessage::Login(msg::Login {
+        let msg = FrpMessage::Login(Box::new(msg::Login {
             version: Some("0.69.1".into()),
             hostname: Some("testhost".into()),
             os: Some("linux".into()),
@@ -444,7 +511,7 @@ mod tests {
             metas: None,
             client_spec: None,
             multiplexer: Some("yamux".into()),
-        });
+        }));
         write_v1_frame(&mut client, &msg).await.expect("write");
         let result = read_msg_v1(&mut server).await.expect("read");
         match result {
@@ -556,7 +623,7 @@ mod tests {
     #[tokio::test]
     async fn test_v2_msg_roundtrip() {
         let (mut client, mut server) = duplex(65536);
-        let msg = FrpMessage::Login(msg::Login {
+        let msg = FrpMessage::Login(Box::new(msg::Login {
             version: Some("0.69.1".into()),
             hostname: Some("testhost".into()),
             os: Some("linux".into()),
@@ -570,7 +637,7 @@ mod tests {
             metas: None,
             client_spec: None,
             multiplexer: Some("yamux".into()),
-        });
+        }));
         write_msg_v2(&mut client, &msg).await.expect("write V2 msg");
         let result = read_msg_v2(&mut server).await.expect("read V2 msg");
         match result {
@@ -682,7 +749,7 @@ mod tests {
         }
 
         let messages: Vec<FrpMessage> = vec![
-            FrpMessage::Login(msg::Login {
+            FrpMessage::Login(Box::new(msg::Login {
                 version: Some("1.0".into()),
                 hostname: Some("h".into()),
                 os: None,
@@ -696,14 +763,14 @@ mod tests {
                 metas: None,
                 client_spec: None,
                 multiplexer: None,
-            }),
+            })),
             FrpMessage::LoginResp(msg::LoginResp {
                 version: None,
                 run_id: None,
                 error: None,
                 server_additional_auth_scopes: None,
             }),
-            FrpMessage::NewProxy(msg::NewProxy {
+            FrpMessage::NewProxy(Box::new(msg::NewProxy {
                 proxy_name: "p".into(),
                 proxy_type: "tcp".into(),
                 use_encryption: None,
@@ -734,7 +801,7 @@ mod tests {
                 vnet_ip: None,
                 vnet_netmask: None,
                 vnet_mtu: None,
-            }),
+            })),
             FrpMessage::NewProxyResp(msg::NewProxyResp {
                 proxy_name: "p".into(),
                 remote_addr: None,
@@ -749,7 +816,7 @@ mod tests {
                 privilege_key: None,
             }),
             FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
-            FrpMessage::StartWorkConn(msg::StartWorkConn {
+            FrpMessage::StartWorkConn(Box::new(msg::StartWorkConn {
                 proxy_name: "p".into(),
                 src_addr: None,
                 src_port: None,
@@ -761,7 +828,7 @@ mod tests {
                 nat_hole_sid: None,
                 nat_hole_visitor_addr: None,
                 sk: None,
-            }),
+            })),
             FrpMessage::NewVisitorConn(msg::NewVisitorConn {
                 proxy_name: "p".into(),
                 sign_key: None,
@@ -785,8 +852,8 @@ mod tests {
                 remote_addr: Some(test_addr()),
             }),
             FrpMessage::NatHoleVisitor(msg::NatHoleVisitor::default()),
-            FrpMessage::NatHoleClient(msg::NatHoleClient::default()),
-            FrpMessage::NatHoleResp(msg::NatHoleResp::default()),
+            FrpMessage::NatHoleClient(Box::<msg::NatHoleClient>::default()),
+            FrpMessage::NatHoleResp(Box::<msg::NatHoleResp>::default()),
             FrpMessage::NatHoleSid(msg::NatHoleSid {
                 sid: None,
                 provider_addr: None,
@@ -866,7 +933,7 @@ mod tests {
     #[tokio::test]
     async fn test_v2_msg_login_content() {
         let (mut client, mut server) = duplex(65536);
-        let msg = FrpMessage::Login(msg::Login {
+        let msg = FrpMessage::Login(Box::new(msg::Login {
             version: Some("0.69.1".into()),
             hostname: Some("testhost".into()),
             os: Some("linux".into()),
@@ -880,7 +947,7 @@ mod tests {
             metas: None,
             client_spec: None,
             multiplexer: Some("yamux".into()),
-        });
+        }));
         write_msg_v2(&mut client, &msg).await.expect("write");
         let result = read_msg_v2(&mut server).await.expect("read");
         match result {

@@ -721,7 +721,7 @@ impl Service {
                                                                 match frp_core::protocol::read_msg_v1(&mut io).await {
                                                                     Ok(frp_core::msg::FrpMessage::Login(login)) => {
                                                                         tracing::info!(peer = %peer, "KCP TLS+yamux Login from {}", peer);
-                                                                        control::handle_control(io, login, state, Some(peer), Some(incoming), false, None).await;
+                                                                        control::handle_control(io, *login, state, Some(peer), Some(incoming), false, None).await;
                                                                     }
                                                                     Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                                                         tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP TLS+yamux NewWorkConn from {}", peer);
@@ -840,7 +840,7 @@ impl Service {
                                                             match frp_core::protocol::read_msg_v1(&mut ctl).await {
                                                                 Ok(frp_core::msg::FrpMessage::Login(login)) => {
                                                                     tracing::info!(peer = %peer, "KCP TLS Login from {}", peer);
-                                                                    control::handle_control(ctl, login, state, None, None, false, None).await;
+                                                                    control::handle_control(ctl, *login, state, None, None, false, None).await;
                                                                 }
                                                                 Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                                                     tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP TLS NewWorkConn from {}", peer);
@@ -928,7 +928,7 @@ impl Service {
                                                         match frp_core::protocol::read_msg_v1(&mut io).await {
                                                             Ok(frp_core::msg::FrpMessage::Login(login)) => {
                                                                 tracing::info!(peer = %peer, "KCP yamux Login from {}", peer);
-                                                                control::handle_control(io, login, state, Some(peer), Some(incoming), false, None).await;
+                                                                control::handle_control(io, *login, state, Some(peer), Some(incoming), false, None).await;
                                                             }
                                                             Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                                                 tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP yamux NewWorkConn from {}", peer);
@@ -961,7 +961,7 @@ impl Service {
                                             match frp_core::protocol::read_msg_v1(&mut ctl).await {
                                                 Ok(frp_core::msg::FrpMessage::Login(login)) => {
                                                     tracing::info!(peer = %peer, "KCP Login from {}", peer);
-                                                    control::handle_control(ctl, login, state, None, None, false, None).await;
+                                                    control::handle_control(ctl, *login, state, None, None, false, None).await;
                                                 }
                                                 Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                                     tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP NewWorkConn from {}", peer);
@@ -1153,7 +1153,7 @@ impl Service {
                 match frp_core::protocol::read_msg_v1(&mut ctl).await {
                     Ok(frp_core::msg::FrpMessage::Login(login)) => {
                         let cancel = spawn_quic_drain(conn, Arc::clone(&state), "V1");
-                        control::handle_control(ctl, login, state, None, None, false, None).await;
+                        control::handle_control(ctl, *login, state, None, None, false, None).await;
                         cancel.cancel();
                     }
                     Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {

@@ -237,6 +237,15 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 - **Cross-compat tests**: `scripts/compat-test.sh` — 55 default + 18 guarded (XTCP 16-test pairwise matrix + V2 TCP `GO_FRP_V2=1`). Runs on every push via `compat.yml`. XTCP compat runs daily on VPS via `xtcp-compat.yml`.
 - **Security audit**: Run `cargo audit` and `cargo deny check` before each release to catch known vulnerabilities and license issues in the dependency tree.
 
+### Test Coverage Gaps
+
+Known areas lacking e2e cross-compat test coverage:
+
+- **UDP proxy**: no Go frp cross-compat for UDP tunneling
+- **HTTP/HTTPS proxy**: no e2e tests with real HTTP backends
+- **Reload configuration**: no automated test for `SIGUSR1` reload path
+- **XTCP NAT traversal**: tested pairwise on localhost, not across real NAT devices
+
 ### Dependency Policy (mandatory)
 
 **No new dependencies without explicit justification.** Every new crate added to the workspace must have a documented reason covering:

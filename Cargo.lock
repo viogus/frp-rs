@@ -1163,7 +1163,6 @@ dependencies = [
  "criterion",
  "data-encoding",
  "futures-util",
- "hex",
  "jsonwebtoken",
  "kcp",
  "md-5",

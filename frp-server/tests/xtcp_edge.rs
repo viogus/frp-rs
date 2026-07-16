@@ -92,11 +92,11 @@ async fn test_xtcp_concurrent_3_sessions() {
             let run_id = resp.run_id.expect("provider should get run_id");
 
             // --- Register XTCP proxy ---
-            let np = FrpMessage::NewProxy(xtcp_proxy(
+            let np = FrpMessage::NewProxy(Box::new(xtcp_proxy(
                 &proxy_name,
                 &sk,
                 &format!("127.0.0.1:{}", 9000 + i),
-            ));
+            )));
             write_msg_v1(&mut provider_ctl, &np)
                 .await
                 .unwrap_or_else(|_| panic!("[{}] send NewProxy", i));
@@ -253,7 +253,7 @@ async fn test_xtcp_multiple_providers_same_server() {
     let (mut provider_a_ctl, resp_a) = login_with_test_token(addr).await.expect("provider A login");
     let run_id_a = resp_a.run_id.expect("provider A run_id");
 
-    let np_a = FrpMessage::NewProxy(xtcp_proxy("xtcp-prov-a", "sk-prov-a", "127.0.0.1:9001"));
+    let np_a = FrpMessage::NewProxy(Box::new(xtcp_proxy("xtcp-prov-a", "sk-prov-a", "127.0.0.1:9001")));
     write_msg_v1(&mut provider_a_ctl, &np_a)
         .await
         .expect("send NewProxy A");
@@ -286,7 +286,7 @@ async fn test_xtcp_multiple_providers_same_server() {
     let (mut provider_b_ctl, resp_b) = login_with_test_token(addr).await.expect("provider B login");
     let run_id_b = resp_b.run_id.expect("provider B run_id");
 
-    let np_b = FrpMessage::NewProxy(xtcp_proxy("xtcp-prov-b", "sk-prov-b", "127.0.0.1:9002"));
+    let np_b = FrpMessage::NewProxy(Box::new(xtcp_proxy("xtcp-prov-b", "sk-prov-b", "127.0.0.1:9002")));
     write_msg_v1(&mut provider_b_ctl, &np_b)
         .await
         .expect("send NewProxy B");
@@ -396,7 +396,7 @@ async fn test_xtcp_multiple_providers_same_server() {
     };
 
     // --- Provider A sends NatHoleClient on control ---
-    let client_msg = FrpMessage::NatHoleClient(msg::NatHoleClient {
+    let client_msg = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
         transaction_id: txn_id.clone(),
         proxy_name: "xtcp-prov-a".into(),
         sid: Some(sid.clone()),
@@ -407,7 +407,7 @@ async fn test_xtcp_multiple_providers_same_server() {
         ]),
         assisted_addrs: None,
         visitor_addr: None,
-    });
+    }));
     write_msg_v1(&mut provider_a_ctl, &client_msg)
         .await
         .expect("send NatHoleClient A");
@@ -489,7 +489,7 @@ async fn test_xtcp_multiple_providers_same_server() {
     }
 
     // --- Provider B's control channel must still be usable ---
-    let np_b2 = FrpMessage::NewProxy(xtcp_proxy("xtcp-prov-b-2", "sk-prov-b-2", "127.0.0.1:9003"));
+    let np_b2 = FrpMessage::NewProxy(Box::new(xtcp_proxy("xtcp-prov-b-2", "sk-prov-b-2", "127.0.0.1:9003")));
     write_msg_v1(&mut provider_b_ctl, &np_b2)
         .await
         .expect("send NewProxy B2");
@@ -541,11 +541,11 @@ async fn test_xtcp_encrypted_proxy_registration() {
     let (mut provider_ctl, resp) = login_with_test_token(addr).await.expect("provider login");
     let run_id = resp.run_id.expect("provider should get run_id");
 
-    let np = FrpMessage::NewProxy(xtcp_proxy_encrypted(
+    let np = FrpMessage::NewProxy(Box::new(xtcp_proxy_encrypted(
         "xtcp-encrypted",
         "encrypted-sk",
         "127.0.0.1:7777",
-    ));
+    )));
     write_msg_v1(&mut provider_ctl, &np)
         .await
         .expect("send NewProxy");

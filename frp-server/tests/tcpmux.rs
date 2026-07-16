@@ -72,11 +72,11 @@ async fn test_tcpmux_connect_routing() {
     let (mut provider, resp) = login_with_test_token(addr).await.expect("provider login");
     let _run_id = resp.run_id.expect("provider should get run_id");
 
-    let np = FrpMessage::NewProxy(tcpmux_proxy(
+    let np = FrpMessage::NewProxy(Box::new(tcpmux_proxy(
         "tcpmux-ssh",
         vec!["machine-a.example.com".into()],
         "127.0.0.1:22",
-    ));
+    )));
     write_msg_v1(&mut provider, &np)
         .await
         .expect("send NewProxy");
@@ -142,11 +142,11 @@ async fn test_tcpmux_unknown_domain_returns_404() {
     // Register a tcpmux proxy so TcpMuxManager is active
     let (mut provider, resp) = login_with_test_token(addr).await.expect("provider login");
     let _run_id = resp.run_id.expect("provider should get run_id");
-    let np = FrpMessage::NewProxy(tcpmux_proxy(
+    let np = FrpMessage::NewProxy(Box::new(tcpmux_proxy(
         "tcpmux-1",
         vec!["known.example.com".into()],
         "127.0.0.1:22",
-    ));
+    )));
     write_msg_v1(&mut provider, &np)
         .await
         .expect("send NewProxy");
@@ -208,7 +208,7 @@ async fn test_tcpmux_proxy_auth() {
     );
     auth_np.http_user = Some("admin".into());
     auth_np.http_pwd = Some("secret".into());
-    write_msg_v1(&mut provider, &FrpMessage::NewProxy(auth_np))
+    write_msg_v1(&mut provider, &FrpMessage::NewProxy(Box::new(auth_np)))
         .await
         .expect("send NewProxy");
     let _ = read_msg_v1(&mut provider).await.expect("read NewProxyResp");

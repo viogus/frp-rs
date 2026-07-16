@@ -2370,7 +2370,7 @@ pub async fn accept_websocket_from_peeked(
             }
             tracing::debug!(
                 read_n = n,
-                chunk_hex = %hex::encode(&chunk[..n.min(32)]),
+                chunk_hex = %crate::hex_encode(&chunk[..n.min(32)]),
                 "accept_websocket_from_peeked: read {} more bytes from raw stream",
                 n
             );

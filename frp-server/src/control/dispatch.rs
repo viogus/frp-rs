@@ -102,12 +102,12 @@ pub(crate) async fn dispatch_frp_message<W: AsyncWriteExt + Unpin>(
     login_user: &str,
 ) -> Result<(), ()> {
     match msg {
-        FrpMessage::NewProxy(m) => super::proxy::handle_new_proxy(ctx, ctl, writer, m).await,
+        FrpMessage::NewProxy(m) => super::proxy::handle_new_proxy(ctx, ctl, writer, *m).await,
         FrpMessage::CloseProxy(m) => super::proxy::handle_close_proxy(ctx, ctl, writer, m).await,
         FrpMessage::Ping(m) => super::proxy::handle_ping(ctx, ctl, writer, m).await,
         FrpMessage::UDPPacket(m) => super::proxy::handle_udp_packet(ctx, ctl, writer, m).await,
         FrpMessage::NatHoleClient(m) => {
-            super::nathole::handle_nat_hole_client(ctx, ctl, writer, m).await;
+            super::nathole::handle_nat_hole_client(ctx, ctl, writer, *m).await;
             Ok(())
         }
         FrpMessage::NatHoleSid(m) => {
@@ -115,7 +115,7 @@ pub(crate) async fn dispatch_frp_message<W: AsyncWriteExt + Unpin>(
             Ok(())
         }
         FrpMessage::NatHoleResp(m) => {
-            super::nathole::handle_nat_hole_resp(ctx, ctl, writer, m).await;
+            super::nathole::handle_nat_hole_resp(ctx, ctl, writer, *m).await;
             Ok(())
         }
         FrpMessage::NatHoleReport(m) => {

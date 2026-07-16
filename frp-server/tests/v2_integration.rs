@@ -109,7 +109,7 @@ async fn test_v2_tcp_proxy() {
         .unwrap()
         .as_secs() as i64;
     let auth_key = auth::generate_token("test-token", ts);
-    let login = FrpMessage::Login(msg::Login {
+    let login = FrpMessage::Login(Box::new(msg::Login {
         version: Some(frp_core::VERSION.into()),
         hostname: Some("v2-test-host".into()),
         os: Some(std::env::consts::OS.into()),
@@ -123,7 +123,7 @@ async fn test_v2_tcp_proxy() {
         metas: None,
         client_spec: None,
         multiplexer: Some("yamux".into()),
-    });
+    }));
     control.write_v2_frame(&login).await.expect("send Login");
 
     let resp = control.read_v2_frame().await.expect("read LoginResp");
@@ -157,7 +157,7 @@ async fn test_v2_tcp_proxy() {
     }
 
     // ---- Register TCP proxy ----
-    let np = FrpMessage::NewProxy(NewProxy {
+    let np = FrpMessage::NewProxy(Box::new(NewProxy {
         proxy_name: "v2-tcp-test".into(),
         proxy_type: "tcp".into(),
         local_str: Some(format!("127.0.0.1:{echo_port}")),
@@ -192,7 +192,7 @@ async fn test_v2_tcp_proxy() {
         vnet_netmask: None,
         #[cfg(feature = "vnet")]
         vnet_mtu: None,
-    });
+    }));
     control.write_v2_frame(&np).await.expect("send NewProxy");
 
     let proxy_resp = control.read_v2_frame().await.expect("read NewProxyResp");
@@ -352,7 +352,7 @@ async fn test_v2_ping_pong_raw_tcp() {
         .unwrap()
         .as_secs() as i64;
     let auth_key = auth::generate_token("test-token", ts);
-    let login = FrpMessage::Login(msg::Login {
+    let login = FrpMessage::Login(Box::new(msg::Login {
         version: Some(frp_core::VERSION.into()),
         hostname: Some("v2-smoke".into()),
         os: Some(std::env::consts::OS.into()),
@@ -366,7 +366,7 @@ async fn test_v2_ping_pong_raw_tcp() {
         metas: None,
         client_spec: None,
         multiplexer: None,
-    });
+    }));
     stream.write_v2_frame(&login).await.expect("send Login");
 
     let resp = stream.read_v2_frame().await.expect("read LoginResp");
@@ -475,7 +475,7 @@ async fn test_v2_ping_pong_yamux() {
         .unwrap()
         .as_secs() as i64;
     let auth_key = auth::generate_token("test-token", ts);
-    let login = FrpMessage::Login(msg::Login {
+    let login = FrpMessage::Login(Box::new(msg::Login {
         version: Some(frp_core::VERSION.into()),
         hostname: Some("v2-yamux".into()),
         os: Some(std::env::consts::OS.into()),
@@ -489,7 +489,7 @@ async fn test_v2_ping_pong_yamux() {
         metas: None,
         client_spec: None,
         multiplexer: Some("yamux".into()),
-    });
+    }));
     control.write_v2_frame(&login).await.expect("send Login");
 
     let resp = control.read_v2_frame().await.expect("read LoginResp");
@@ -599,7 +599,7 @@ async fn test_v2_aead_ping_pong_yamux() {
         .unwrap()
         .as_secs() as i64;
     let auth_key = auth::generate_token("test-token", ts);
-    let login = FrpMessage::Login(msg::Login {
+    let login = FrpMessage::Login(Box::new(msg::Login {
         version: Some(frp_core::VERSION.into()),
         hostname: Some("v2-aead".into()),
         os: Some(std::env::consts::OS.into()),
@@ -613,7 +613,7 @@ async fn test_v2_aead_ping_pong_yamux() {
         metas: None,
         client_spec: None,
         multiplexer: Some("yamux".into()),
-    });
+    }));
     control.write_v2_frame(&login).await.expect("send Login");
 
     let resp = control.read_v2_frame().await.expect("read LoginResp");

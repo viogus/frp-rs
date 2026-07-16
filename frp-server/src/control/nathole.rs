@@ -53,7 +53,7 @@ pub(crate) async fn handle_write_resp<W: AsyncWriteExt + Unpin>(
     assisted_addrs: Option<Vec<String>>,
 ) {
     debug!(transaction_id = %transaction_id, "Writing NatHoleResp to visitor via control channel for {}", transaction_id);
-    let forward = FrpMessage::NatHoleResp(msg::NatHoleResp {
+    let forward = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
         transaction_id,
         error,
         sid,
@@ -61,7 +61,7 @@ pub(crate) async fn handle_write_resp<W: AsyncWriteExt + Unpin>(
         candidate_addrs,
         assisted_addrs,
         ..Default::default()
-    });
+    }));
     if let Err(e) = write_ctl_msg(writer, &forward, ctx.v2).await {
         warn!(error = %e, "Failed to write NatHoleResp to visitor: {}", e);
     }
@@ -244,7 +244,7 @@ pub(crate) async fn handle_nat_hole_resp(
     {
         debug!(tid = %tid, "Forwarded NatHoleResp via control channel for {}", tid);
     } else if let Some(mut accept_writer) = ctx.state.xtcp.nat_hole.take_writer(tid).await {
-        let forward = FrpMessage::NatHoleResp(msg::NatHoleResp {
+        let forward = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
             transaction_id: tid.clone(),
             error: resp_msg.error.clone(),
             sid: resp_msg.sid.clone(),
@@ -252,7 +252,7 @@ pub(crate) async fn handle_nat_hole_resp(
             candidate_addrs: resp_msg.candidate_addrs.clone(),
             assisted_addrs: resp_msg.assisted_addrs.clone(),
             ..Default::default()
-        });
+        }));
         let _ = write_ctl_msg(&mut accept_writer, &forward, ctx.v2).await;
         ctx.state
             .xtcp
@@ -413,11 +413,11 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
     let proxy_info = match ctx.state.proxy_manager.get(&proxy_name).await {
         Some(info) => info,
         None => {
-            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+            let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("proxy not found".into()),
                 ..Default::default()
-            });
+            }));
             let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
             return Ok(());
         }
@@ -439,11 +439,11 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
         let owner = &proxy_info.user;
         if login_user != *owner {
             warn!(proxy_name = %proxy_name, user = %login_user, owner = %owner, "NatHoleVisitor: user '{}' not proxy owner '{}' for proxy '{}'", login_user, owner, proxy_name);
-            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+            let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("access denied: owner only".into()),
                 ..Default::default()
-            });
+            }));
             let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
             return Ok(());
         }
@@ -451,11 +451,11 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
         // Wildcard — any authenticated user
     } else if !proxy_info.allow_users.iter().any(|u| u == login_user) {
         warn!(proxy_name = %proxy_name, user = %login_user, "NatHoleVisitor: user '{}' not in allow_users for proxy '{}'", login_user, proxy_name);
-        let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+        let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
             transaction_id: transaction_id.clone(),
             error: Some("access denied".into()),
             ..Default::default()
-        });
+        }));
         let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
         return Ok(());
     }
@@ -469,11 +469,11 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
         if !sk.is_empty() {
             if sign_key.is_empty() {
                 warn!(proxy_name = %proxy_name, "NatHoleVisitor: missing sign_key for protected proxy '{}'", proxy_name);
-                let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                     transaction_id: transaction_id.clone(),
                     error: Some("auth required".into()),
                     ..Default::default()
-                });
+                }));
                 let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
                 return Ok(());
             }
@@ -488,21 +488,21 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                 frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout)
             {
                 warn!(proxy_name = %proxy_name, error = %freshness_err, "NatHoleVisitor on ctl: timestamp stale for proxy '{}'", proxy_name);
-                let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                     transaction_id: transaction_id.clone(),
                     error: Some(freshness_err),
                     ..Default::default()
-                });
+                }));
                 let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
                 return Ok(());
             }
             if !frp_core::auth::verify_token(sk, timestamp, sign_key) {
                 warn!(proxy_name = %proxy_name, "NatHoleVisitor auth failed on ctl for proxy '{}'", proxy_name);
-                let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                     transaction_id: transaction_id.clone(),
                     error: Some("auth failed".into()),
                     ..Default::default()
-                });
+                }));
                 let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
                 return Ok(());
             }
@@ -514,11 +514,11 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
     // creating a session or notifying the provider.
     if nhv.pre_check && nhv.mapped_addrs.is_none() {
         debug!(proxy_name = %proxy_name, user = %login_user, "NatHoleVisitor pre_check on ctl channel: proxy='{}' OK", proxy_name);
-        let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+        let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
             transaction_id: transaction_id.clone(),
             error: None,
             ..Default::default()
-        });
+        }));
         let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
         return Ok(());
     }
@@ -527,11 +527,11 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
     let provider_run_id = match ctx.state.proxy_manager.get_run_id(&proxy_name).await {
         Some(id) => id,
         None => {
-            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+            let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("provider offline".into()),
                 ..Default::default()
-            });
+            }));
             let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
             return Ok(());
         }
@@ -544,11 +544,11 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
     let provider_ctl = match provider_ctl {
         Some(ctl) => ctl,
         None => {
-            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+            let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("provider disconnected".into()),
                 ..Default::default()
-            });
+            }));
             let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
             return Ok(());
         }

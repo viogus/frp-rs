@@ -133,6 +133,16 @@ pub async fn handle_control<S>(
             }
         }
 
+        // Expire stale pending_udp entries
+        while let Some((proxy_name, ts)) = ctl.pending_udp.pop_front() {
+            if ts.elapsed() > pool::PENDING_REQUEST_TIMEOUT {
+                debug!(%proxy_name, timeout = ?pool::PENDING_REQUEST_TIMEOUT, "Pending UDP request for proxy '{}' timed out after {:?}", proxy_name, pool::PENDING_REQUEST_TIMEOUT);
+            } else {
+                ctl.pending_udp.push_front((proxy_name, ts));
+                break;
+            }
+        }
+
         // Expire idle pooled connections (if timeout configured)
         let pool_idle_timeout = state.pool.idle_timeout;
         if pool_idle_timeout > Duration::ZERO {

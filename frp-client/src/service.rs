@@ -562,7 +562,12 @@ impl Service {
 
             let session_alive = Arc::new(AtomicBool::new(true));
 
-            // Register proxies using IoStream directly (supports TCP and TLS)
+            // Register proxies using IoStream directly (supports TCP and TLS).
+            // NOTE: each proxy is registered sequentially via a NewProxy
+            // request/response round-trip over the control channel. N proxies
+            // cost N sequential network round-trips. Batching could speed up
+            // registration for clients with many proxies, but would require
+            // protocol changes beyond Go frp v0.70.0 wire compatibility.
             for p in &proxies {
                 let local_addr = self
                     .proxy_info_map
@@ -927,10 +932,10 @@ impl Service {
                                 warn!(error = %err.error, "Server error: {}", err.error);
                             }
                             Ok(FrpMessage::NatHoleClient(nhc)) => {
-                                self.handle_nat_hole_client(nhc, &writer, v2).await;
+                                self.handle_nat_hole_client(*nhc, &writer, v2).await;
                             }
                             Ok(FrpMessage::NatHoleResp(resp)) => {
-                                self.handle_nat_hole_resp(resp, &mut pending_xtcp, &mut visitor_pending, &xtcp_sockets).await;
+                                self.handle_nat_hole_resp(*resp, &mut pending_xtcp, &mut visitor_pending, &xtcp_sockets).await;
                             }
                             Ok(FrpMessage::NewProxyResp(resp)) => {
                                 if let Some(err) = resp.error {
@@ -1080,7 +1085,7 @@ impl Service {
                             xtcp_sockets.lock().await.insert(sid.clone(), std::sync::Arc::new(sock));
                         }
                         // 2. Send NatHoleClient on control (Go v0.70 compat: protocol "kcp").
-                        let client_msg = FrpMessage::NatHoleClient(msg::NatHoleClient {
+                        let client_msg = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
                             transaction_id: sid.clone(),
                             proxy_name: proxy_name.clone(),
                             sid: Some(sid.clone()),
@@ -1088,7 +1093,7 @@ impl Service {
                             mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
                             assisted_addrs: None,
                             visitor_addr: None,
-                        });
+                        }));
                         if let Err(e) = write_msg(&mut *writer.lock().await, &client_msg, v2).await {
                             warn!(error = %e, "XTCP: failed to send NatHoleClient: {}", e);
                         } else {

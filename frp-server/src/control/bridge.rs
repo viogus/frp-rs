@@ -150,7 +150,7 @@ pub(crate) async fn assign_udp_work_conn(
     let proxy_name = proxy_name.to_string();
 
     // Send StartWorkConn to tell the client which proxy to associate
-    let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
+    let swc = FrpMessage::StartWorkConn(Box::new(msg::StartWorkConn {
         proxy_name: proxy_name.clone(),
         src_addr: None,
         dst_addr: None,
@@ -162,7 +162,7 @@ pub(crate) async fn assign_udp_work_conn(
         nat_hole_sid: None,
         nat_hole_visitor_addr: None,
         sk: None,
-    });
+    }));
     if v2 {
         if let Err(e) = work_conn.write_v2_frame(&swc).await {
             warn!(proxy_name = %proxy_name, error = %e, "Failed to send StartWorkConn (V2) for UDP '{}': {}", proxy_name, e);
@@ -315,7 +315,7 @@ pub(crate) async fn assign_work_to_proxy(
         .map(|p| p as i32)
         .unwrap_or(0);
 
-    let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
+    let swc = FrpMessage::StartWorkConn(Box::new(msg::StartWorkConn {
         proxy_name: req.proxy_name.clone(),
         src_addr: if !proxy_protocol_version.is_empty() && !src_addr.is_empty() {
             Some(src_addr)
@@ -361,7 +361,7 @@ pub(crate) async fn assign_work_to_proxy(
         },
         nat_hole_visitor_addr: None,
         sk: None,
-    });
+    }));
 
     let write_result = if v2 {
         work_conn.write_v2_frame(&swc).await
