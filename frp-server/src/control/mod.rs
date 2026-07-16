@@ -97,7 +97,7 @@ pub async fn handle_control<S>(
     // 1. Authenticate and set up per-client state (login.rs)
     let (
         mut ctx,
-        ctl,
+        mut ctl,
         _internal_tx,
         mut internal_rx,
         mut reader,
@@ -118,8 +118,6 @@ pub async fn handle_control<S>(
     let reloadable = ctx.reloadable.clone();
     let peer = ctx.peer;
     let login_user = login.user.clone().unwrap_or_default();
-
-    let mut ctl = ctl;
 
     // --- Main select loop ---
     loop {
