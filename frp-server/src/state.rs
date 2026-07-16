@@ -209,7 +209,9 @@ pub struct AppState {
     #[cfg(feature = "vnet")]
     pub vnet_routes: VnetRouteMap,
     /// Broadcast channel for admin WebSocket event stream.
-    /// Capacity 256 — slow clients get Lagged and skip events.
+    /// Capacity 1024 — each event is ~200 bytes JSON (max ~200 KiB).
+    /// Slow clients get `Lagged` and receive a synthetic Error event
+    /// telling them to re-sync via the REST API.
     #[cfg(feature = "dashboard")]
     pub event_tx: broadcast::Sender<crate::event::ServerEvent>,
 }
@@ -297,7 +299,7 @@ impl AppState {
             vnet_routes: Arc::new(RwLock::new(HashMap::new())),
             server_config_snapshot,
             #[cfg(feature = "dashboard")]
-            event_tx: broadcast::channel(256).0,
+            event_tx: broadcast::channel(1024).0,
         }
     }
 
@@ -314,11 +316,12 @@ impl AppState {
         let now = std::time::Instant::now();
         let mut throttle = self.login_throttle.lock().await;
 
-        // Cleanup: remove entries older than 5 minutes past window expiration.
-        // 5-minute grace avoids cleaning entries that just expired but might
-        // have active connections in flight. Under DDoS with randomized IPs,
-        // this prevents unbounded HashMap growth.
-        const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(360); // 5 min + 60s window
+        // Cleanup: remove entries older than 90s (60s window + 30s grace).
+        // 30s grace covers in-flight login attempts that span the window
+        // boundary. Under DDoS with randomized IPs, short cleanup bounds
+        // HashMap memory — at steady state ~90s worth of unique IPs.
+        // Go frp v0.70.0 has no login throttle; this is a Rust defense.
+        const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
         throttle.retain(|_, (_, window_start)| now.duration_since(*window_start) < CLEANUP_TIMEOUT);
 
         match throttle.get(&ip) {
@@ -336,10 +339,24 @@ impl AppState {
 
     /// Record a failed login attempt for the given IP address.
     /// Should be called only after authentication actually fails.
+    ///
+    /// Defense-in-depth: caps the HashMap at 512 entries. Under normal
+    /// operation, 512 distinct IPs failing login within 90s is implausible.
+    /// If the cap is hit, new IPs are silently dropped — existing entries
+    /// continue to be updated normally.
     pub async fn record_login_failure(&self, addr: std::net::SocketAddr) {
+        const MAX_THROTTLE_ENTRIES: usize = 512;
+
         let ip = addr.ip();
         let now = std::time::Instant::now();
         let mut throttle = self.login_throttle.lock().await;
+
+        // Cap: refuse new entries when the map is full. Existing IPs still
+        // increment normally so known attackers stay throttled.
+        if !throttle.contains_key(&ip) && throttle.len() >= MAX_THROTTLE_ENTRIES {
+            return;
+        }
+
         let (count, window_start) = throttle.entry(ip).or_insert((0, now));
         if now.duration_since(*window_start) > std::time::Duration::from_secs(60) {
             *count = 1;

@@ -634,11 +634,23 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::debug!(
+                        tracing::warn!(
                             skipped = n,
-                            "WebSocket event stream lagged, skipped {} events",
+                            "WebSocket event stream lagged, {} events skipped — client should re-sync via REST API",
                             n
                         );
+                        // Send synthetic error so client knows state may be stale
+                        let resync = crate::event::ServerEvent::Error {
+                            message: format!(
+                                "event stream lagged: {} events skipped — re-sync via GET /api/proxies and /api/clients",
+                                n
+                            ),
+                            context: None,
+                        };
+                        let json = serde_json::to_string(&resync).unwrap_or_default();
+                        if socket.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
                         // Continue — rx.recv() recovers after lagged
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
