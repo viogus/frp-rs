@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+#[cfg(feature = "dashboard")]
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;

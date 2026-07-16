@@ -1511,7 +1511,7 @@ impl Service {
                                 // health checks, scanners, and other non-frp HTTP
                                 // clients that connect to the frps TLS port.
                                 let mut ws_peek = vec![0u8; 4];
-                                let _got_http = match tokio::time::timeout(
+                                let got_http = match tokio::time::timeout(
                                     std::time::Duration::from_secs(5),
                                     io.read_exact(&mut ws_peek[..4]),
                                 ).await {
@@ -1542,7 +1542,7 @@ impl Service {
                                     false
                                 };
                                 #[cfg(not(feature = "websocket"))]
-                                let _is_ws_tls = false;
+                                let is_ws_tls = false;
 
                                 #[cfg(feature = "websocket")]
                                 if is_ws_tls {

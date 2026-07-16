@@ -71,7 +71,7 @@ fn decompress_chunk_into<'a>(
             d.feed_into(data, buf)
                 .inspect_err(|_e| {
                     #[cfg(feature = "compression")]
-                    tracing::warn!(error = %e, "snappy decompress error in bridge: {}", e);
+                    tracing::warn!(error = %_e, "snappy decompress error in bridge: {}", _e);
                 })
                 .ok()?;
             Some(buf.as_slice())
