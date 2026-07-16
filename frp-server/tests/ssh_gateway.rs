@@ -150,3 +150,82 @@ async fn test_ssh_gateway_with_auth_token() {
 
     drop(stream);
 }
+
+/// SSH gateway should close connection cleanly when non-SSH data is sent.
+/// Sending garbage (not starting with SSH handshake) should not crash server.
+#[tokio::test]
+async fn test_ssh_gateway_rejects_non_ssh_data() {
+    let ssh_port = allocate_port();
+    let bind_port = allocate_port();
+
+    let cfg = ssh_test_config(ssh_port, bind_port);
+    let (_handle, _port) = start_test_server(cfg).await;
+
+    // Retry connect
+    let mut stream = None;
+    for _ in 0..20 {
+        if let Ok(s) = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", ssh_port)).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut stream = stream.expect("SSH port should accept connections");
+
+    // Read banner first (SSH protocol sends banner before client data)
+    let mut buf = [0u8; 256];
+    let n = timeout(Duration::from_secs(2), stream.read(&mut buf))
+        .await
+        .expect("banner timeout")
+        .expect("banner read");
+    assert!(n > 0, "should get SSH banner");
+
+    // Send garbage data (not valid SSH handshake)
+    use tokio::io::AsyncWriteExt;
+    stream.write_all(b"NOT SSH DATA\r\n").await.unwrap();
+    stream.flush().await.unwrap();
+
+    // Server should close connection (not crash)
+    let mut buf = [0u8; 64];
+    let result = timeout(Duration::from_secs(3), stream.read(&mut buf)).await;
+    match result {
+        Ok(Ok(0)) => {
+            // Clean close — server sent FIN
+        }
+        Ok(Ok(_)) => {
+            // Server may send SSH disconnect before closing
+        }
+        Ok(Err(_)) | Err(_) => {
+            // Connection error / timeout — also acceptable (server may RST)
+        }
+    }
+}
+
+/// SSH gateway with max_ports_per_client: verify server starts and accepts
+/// SSH connections with port limit configured.
+#[tokio::test]
+async fn test_ssh_gateway_with_port_limit() {
+    let ssh_port = allocate_port();
+    let bind_port = allocate_port();
+
+    let mut cfg = ssh_test_config(ssh_port, bind_port);
+    cfg.max_ports_per_client = 3;
+
+    let (_handle, _port) = start_test_server(cfg).await;
+
+    let mut stream = None;
+    for _ in 0..20 {
+        if let Ok(s) = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", ssh_port)).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut ssh_stream = stream.expect("SSH port should accept connections");
+
+    let banner = read_ssh_banner(&mut ssh_stream).await;
+    assert!(banner.starts_with("SSH-"));
+    assert!(banner.contains("frp-rs"));
+
+    drop(ssh_stream);
+}

@@ -953,6 +953,45 @@ mod tests {
         let tokens = shell_split(r#"tcp --proxy_name "my web""#);
         assert_eq!(tokens, vec!["tcp", "--proxy_name", "my web"]);
     }
+
+    #[test]
+    fn test_shell_split_multiple_spaces() {
+        let tokens = shell_split("tcp   --proxy_name   web   --remote_port   9090");
+        assert_eq!(
+            tokens,
+            vec!["tcp", "--proxy_name", "web", "--remote_port", "9090"]
+        );
+    }
+
+    #[test]
+    fn test_shell_split_empty_quoted() {
+        // Empty quoted strings are dropped (current.is_empty() guard).
+        // This is acceptable — proxy names are never empty in practice.
+        let tokens = shell_split(r#"tcp --proxy_name """#);
+        assert_eq!(tokens, vec!["tcp", "--proxy_name"]);
+    }
+
+    #[test]
+    fn test_constant_time_eq_same() {
+        assert!(constant_time_eq(b"hello", b"hello"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_different() {
+        assert!(!constant_time_eq(b"hello", b"world"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_different_length() {
+        assert!(!constant_time_eq(b"hello", b"hell"));
+        assert!(!constant_time_eq(b"hell", b"hello"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_empty() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"", b"a"));
+    }
 }
 
 use std::borrow::Cow;

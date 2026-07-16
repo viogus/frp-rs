@@ -305,64 +305,47 @@ impl AppState {
 
     /// Check if an IP has exceeded the login attempt throttle.
     /// Returns true if the login should be allowed, false if throttled.
-    /// This method only reads the counter; it does NOT increment it.
-    /// Call [`record_login_failure`] after an actual authentication failure.
+    ///
+    /// This method atomically checks AND reserves an attempt slot within
+    /// a single lock hold — no separate `record_login_failure` call needed.
+    /// The reservation is consumed on auth failure (no-op needed) and
+    /// naturally expires after the 60s window rolls over. Successful logins
+    /// also hold a reservation until window expiry; this is harmless since
+    /// a successful login means the attacker knew the token, and the window
+    /// resets naturally every 60s.
+    ///
     /// Max 5 failed attempts per 60-second window per IP.
     ///
     /// Also performs inline cleanup of expired entries to prevent unbounded
     /// memory growth from DDoS attacks with randomized source IPs.
     pub async fn check_login_throttle(&self, addr: std::net::SocketAddr) -> bool {
-        let ip = addr.ip();
-        let now = std::time::Instant::now();
-        let mut throttle = self.login_throttle.lock().await;
-
-        // Cleanup: remove entries older than 90s (60s window + 30s grace).
-        // 30s grace covers in-flight login attempts that span the window
-        // boundary. Under DDoS with randomized IPs, short cleanup bounds
-        // HashMap memory — at steady state ~90s worth of unique IPs.
-        // Go frp v0.70.0 has no login throttle; this is a Rust defense.
-        const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
-        throttle.retain(|_, (_, window_start)| now.duration_since(*window_start) < CLEANUP_TIMEOUT);
-
-        match throttle.get(&ip) {
-            Some((count, window_start)) => {
-                if now.duration_since(*window_start) > std::time::Duration::from_secs(60) {
-                    // Window expired — entry is stale but will be cleaned up on next call.
-                    // For this check, expired window means not throttled.
-                    return true;
-                }
-                *count < 5
-            }
-            None => true,
-        }
-    }
-
-    /// Record a failed login attempt for the given IP address.
-    /// Should be called only after authentication actually fails.
-    ///
-    /// Defense-in-depth: caps the HashMap at 512 entries. Under normal
-    /// operation, 512 distinct IPs failing login within 90s is implausible.
-    /// If the cap is hit, new IPs are silently dropped — existing entries
-    /// continue to be updated normally.
-    pub async fn record_login_failure(&self, addr: std::net::SocketAddr) {
         const MAX_THROTTLE_ENTRIES: usize = 512;
 
         let ip = addr.ip();
         let now = std::time::Instant::now();
         let mut throttle = self.login_throttle.lock().await;
 
-        // Cap: refuse new entries when the map is full. Existing IPs still
-        // increment normally so known attackers stay throttled.
+        // Cleanup: remove entries older than 90s (60s window + 30s grace).
+        const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+        throttle.retain(|_, (_, window_start)| now.duration_since(*window_start) < CLEANUP_TIMEOUT);
+
+        // Cap: refuse new entries when the map is full. Check BEFORE
+        // calling entry() to avoid a borrow conflict with the mutable ref.
         if !throttle.contains_key(&ip) && throttle.len() >= MAX_THROTTLE_ENTRIES {
-            return;
+            return true; // Silently allow — existing entries stay throttled.
         }
 
         let (count, window_start) = throttle.entry(ip).or_insert((0, now));
         if now.duration_since(*window_start) > std::time::Duration::from_secs(60) {
+            // Window expired — reset and allow this attempt.
             *count = 1;
             *window_start = now;
-        } else {
-            *count += 1;
+            return true;
         }
+        if *count >= 5 {
+            return false; // Throttled
+        }
+        *count += 1; // Reserve this attempt atomically
+        true
     }
 }
