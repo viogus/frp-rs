@@ -909,6 +909,38 @@ mod tests {
         assert_eq!(&buf[..n], b"work->user");
     }
 
+    /// bridge_work_to_user: decompressor flush residual data.
+    #[tokio::test]
+    async fn test_bridge_work_to_user_decompressor_flush() {
+        use crate::encryption;
+
+        let (mut w_w_test, w_r) = tokio::io::duplex(65536);
+        let (u_w, mut u_r_test) = tokio::io::duplex(65536);
+
+        tokio::spawn(async move {
+            bridge_work_to_user(w_r, u_w, true, None, None).await;
+        });
+
+        // Write compressed data that needs flush to produce final bytes
+        let original = b"AAAA".repeat(64);
+        let mut comp_buf = Vec::new();
+        encryption::compress_into(&original, &mut comp_buf).unwrap();
+        w_w_test.write_all(&comp_buf).await.unwrap();
+        w_w_test.flush().await.unwrap();
+        drop(w_w_test); // EOF triggers flush in bridge_work_to_user
+
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 1024];
+        loop {
+            match u_r_test.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        assert_eq!(out, original);
+    }
+
     /// Encrypted round-trip: user_to_work (Encrypted) + work_to_user (CipherReader)
     /// verifies byte-identical data after encrypt/decrypt cycle.
     #[tokio::test]
