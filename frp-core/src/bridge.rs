@@ -844,6 +844,119 @@ mod tests {
         );
     }
 
+    // ── Extracted helper unit tests (bridge_user_to_work, bridge_work_to_user) ──
+
+    /// bridge_user_to_work: plain basic forwarding.
+    #[tokio::test]
+    async fn test_bridge_user_to_work_plain_basic() {
+        let (mut u_w_test, u_r) = tokio::io::duplex(65536);
+        let (w_w, mut w_r_test) = tokio::io::duplex(65536);
+
+        tokio::spawn(async move {
+            bridge_user_to_work(u_r, WorkWriter::Plain(w_w), false, vec![], None, None).await;
+        });
+
+        u_w_test.write_all(b"hello").await.unwrap();
+        u_w_test.flush().await.unwrap();
+        drop(u_w_test); // EOF
+
+        let mut buf = vec![0u8; 1024];
+        let n = w_r_test.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello");
+    }
+
+    /// bridge_user_to_work: pre_read bytes arrive before main loop data.
+    #[tokio::test]
+    async fn test_bridge_user_to_work_pre_read() {
+        let (mut u_w_test, u_r) = tokio::io::duplex(65536);
+        let (w_w, mut w_r_test) = tokio::io::duplex(65536);
+
+        let pre_read = b"pre-read body".to_vec();
+
+        tokio::spawn(async move {
+            bridge_user_to_work(u_r, WorkWriter::Plain(w_w), false, pre_read, None, None).await;
+        });
+
+        // pre_read should arrive first
+        let mut buf = vec![0u8; 1024];
+        let n = w_r_test.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"pre-read body");
+
+        u_w_test.write_all(b"after").await.unwrap();
+        u_w_test.flush().await.unwrap();
+        drop(u_w_test);
+
+        let n2 = w_r_test.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n2], b"after");
+    }
+
+    /// bridge_work_to_user: basic forwarding.
+    #[tokio::test]
+    async fn test_bridge_work_to_user_basic() {
+        let (mut w_w_test, w_r) = tokio::io::duplex(65536);
+        let (u_w, mut u_r_test) = tokio::io::duplex(65536);
+
+        tokio::spawn(async move {
+            bridge_work_to_user(w_r, u_w, false, None, None).await;
+        });
+
+        w_w_test.write_all(b"work->user").await.unwrap();
+        w_w_test.flush().await.unwrap();
+        drop(w_w_test); // EOF
+
+        let mut buf = vec![0u8; 1024];
+        let n = u_r_test.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"work->user");
+    }
+
+    /// Encrypted round-trip: user_to_work (Encrypted) + work_to_user (CipherReader)
+    /// verifies byte-identical data after encrypt/decrypt cycle.
+    #[tokio::test]
+    async fn test_bridge_helpers_encrypted_roundtrip() {
+        let key = crate::encryption::derive_key("roundtrip_key_42");
+
+        // Create two duplex pairs:
+        //   user_duplex: connects user_r (read by u2w) to test writer
+        //   work_duplex: connects work_w (written by u2w, Encrypted) to work_r (read by w2u, CipherReader)
+        let (mut u_w_test, u_r) = tokio::io::duplex(65536);
+        let (work_duplex_w, work_duplex_r) = tokio::io::duplex(65536);
+        let (u_w_sink, mut u_r_test) = tokio::io::duplex(65536);
+
+        let enc_writer = CipherWriter::new(work_duplex_w, key);
+        let enc_reader = CipherReader::new(work_duplex_r, key);
+
+        let u2w = tokio::spawn(async move {
+            bridge_user_to_work(
+                u_r,
+                WorkWriter::Encrypted(enc_writer),
+                false,
+                vec![],
+                None,
+                None,
+            )
+            .await;
+        });
+
+        let w2u = tokio::spawn(async move {
+            bridge_work_to_user(enc_reader, u_w_sink, false, None, None).await;
+        });
+
+        // Write plaintext, read decrypted output
+        let msg = b"hello encrypted roundtrip";
+        u_w_test.write_all(msg).await.unwrap();
+        u_w_test.flush().await.unwrap();
+        drop(u_w_test); // EOF on user_r → u2w sends data then exits
+
+        // w2u reads from work_duplex_r (same duplex pair as work_duplex_w)
+        // u2w encrypts and writes to work_duplex_w → w2u reads and decrypts
+
+        let mut out = vec![0u8; 1024];
+        let out_n = u_r_test.read(&mut out).await.unwrap();
+        assert_eq!(&out[..out_n], msg);
+
+        let _ = tokio::join!(u2w, w2u);
+    }
+
     #[test]
     fn test_compress_chunk_identity_when_disabled() {
         let mut buf = Vec::new();
