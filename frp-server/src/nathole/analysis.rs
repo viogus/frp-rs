@@ -387,7 +387,7 @@ impl Analyzer {
         v_feature: &NatFeature,
     ) -> (i32, i32, RecommendBehavior, RecommendBehavior) {
         let (mode, index) = {
-            let mut records = self.records.lock().unwrap();
+            let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
             let entry = records
                 .entry(key.to_string())
                 .or_insert_with(|| MakeHoleRecords::new(c_feature, v_feature));
@@ -425,7 +425,7 @@ impl Analyzer {
 
     /// Record a successful hole punch to improve future recommendations.
     pub fn report_success(&self, key: &str, mode: i32, index: i32) {
-        let mut records = self.records.lock().unwrap();
+        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = records.get_mut(key) {
             entry.report_success(mode, index);
         }
@@ -433,7 +433,7 @@ impl Analyzer {
 
     /// Remove expired entries. Returns (removed, total_before).
     pub fn clean(&self) -> (usize, usize) {
-        let mut records = self.records.lock().unwrap();
+        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
         let total = records.len();
         let now = Instant::now();
         records.retain(|_, r| now.duration_since(r.last_update_time) < self.data_reserve_duration);

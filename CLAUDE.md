@@ -46,6 +46,7 @@ Feature flags across crates:
 | `chacha20` | frp-core | XChaCha20-Poly1305 V2 cipher (AES-256-GCM stays) |
 | `http-proxy` | frp-server | HTTP proxy plugin (reqwest) |
 | `tcp-mux` | frp-core/server/client | yamux stream multiplexing (~80KB) |
+| `vnet` | frp-core/server/client | L3 VPN / TUN device routing |
 
 All features default ON. `quic` implies `tls`. `oidc` implies `reqwest`. `ssh` implies `rand`.
 
@@ -69,17 +70,17 @@ Every feature, fix, and test change follows three rules:
    bash scripts/download-go-frp.sh
    ```
 
-## Current Health (2026-07-14)
+## Current Health (2026-07-16)
 
 | Metric | Value |
 |--------|-------|
 | `cargo clippy` (default) | zero warnings |
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
-| `cargo test --workspace --all-features` | 447 passed, 2 ignored (31 suites) |
+| `cargo test --workspace --all-features` | 484 passed, 2 ignored (31 suites) |
 | `cargo build --release` | passes (frps ~4.8MB, frpc ~3.7MB) |
 | `compat-test.sh` (Go frp v0.70.0) | 73/73 passed (incl. XTCP 16, V2 TCP) |
-| `unsafe` blocks | 9 (all with `// SAFETY:` comment) |
+| `unsafe` blocks | 6 in frp-core, 3+ in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
 | `let _ =` error discards | all commented (`vhost.rs`, `tcpmux.rs`) |
 | `exec://` token source | always blocked by `UnsafeFeatures::default()` |
@@ -140,7 +141,7 @@ AppState
   - `NatHoleVisitor` → `handle_nat_hole_visitor()` (XTCP hole punch, fresh-connection path)
 - WebSocket connections on main port also dispatch the same message types after upgrade.
 
-**Control handler** (`control.rs`): the most complex file. Runs a `tokio::select!` loop with:
+**Control handler** (`control/mod.rs`): the most complex file. Runs a `tokio::select!` loop with:
 1. **Biased** `internal_rx.recv()` — prioritized to reduce proxy connection latency
 2. `read_msg_v1(&mut reader)` — inbound messages from the client
 
@@ -168,7 +169,7 @@ Note: Go frp v0.69.1 golib source says salt `"crypto"` but the pre-built binary 
 
 ### Transport Abstraction
 
-`IoStream` (`frp-core/src/transport.rs`) is a unified enum over `TcpStream`, `TlsStream<TcpStream>`, `DuplexStream` (KCP placeholder), and `WebSocketStream`. The `WsByteStream` adapter wraps WebSocket binary messages into `AsyncRead`/`AsyncWrite` so the V1 protocol can operate over WebSocket without changes.
+`IoStream` (`frp-core/src/transport.rs`) is a unified enum over `TcpStream`, `TlsStream<TcpStream>`, `KcpStream`, `WsByteStream`, `QuicConnection`, `MuxStream`, and `DuplexStream` (10 variants). The `WsByteStream` adapter wraps WebSocket binary messages into `AsyncRead`/`AsyncWrite` so the V1 protocol can operate over WebSocket without changes.
 
 `IoStream::into_split()` returns `Box<dyn AsyncRead>` / `Box<dyn AsyncWrite>` — the work connection bridge uses this to erase the concrete stream type.
 

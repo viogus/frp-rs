@@ -1,3 +1,12 @@
+/// STATUS: Stub implementation. Windows TUN device support is planned for a
+/// future release. All operations return errors — callers should handle
+/// gracefully.
+///
+/// Windows Wintun TUN device (stub — requires wintun.dll from WireGuard project).
+///
+/// Full implementation in a follow-up PR. Wintun provides a kernel-level
+/// WireGuard TUN adapter for Windows with a C API. The integration requires
+/// either bundling wintun.dll or detecting a system-installed copy.
 use std::io;
 use std::net::Ipv4Addr;
 use std::pin::Pin;
@@ -5,12 +14,6 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::tun::TunDevice;
-
-/// Windows Wintun TUN device (stub — requires wintun.dll from WireGuard project).
-///
-/// Full implementation in a follow-up PR. Wintun provides a kernel-level
-/// WireGuard TUN adapter for Windows with a C API. The integration requires
-/// either bundling wintun.dll or detecting a system-installed copy.
 pub struct WindowsTun {
     name: String,
     mtu: u16,

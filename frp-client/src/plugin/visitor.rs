@@ -178,6 +178,7 @@ async fn handle_visitor_conn(
         oidc_audience: String::new(),
         oidc_skip_expiry: false,
         oidc_skip_issuer: false,
+        oidc_skip_nbf: false,
         additional_data: None,
         oidc_proxy_url: String::new(),
         additional_auth_scopes: Vec::new(),

@@ -320,7 +320,7 @@ where
                         Some(OpenRequest { reply }) => {
                             let c = bg_conn.clone();
                             let result = poll_fn(move |cx| {
-                                c.lock().unwrap().poll_new_outbound(cx)
+                                c.lock().unwrap_or_else(|e| e.into_inner()).poll_new_outbound(cx)
                             }).await;
                             let stream = match result {
                                 Ok(s) => Some(s.compat()),
@@ -351,7 +351,7 @@ where
                 // can cause a tight re-poll loop (the second poll re-registers the
                 // same waker, and the runtime may re-wake immediately).
                 result = poll_fn(|cx| {
-                    let mut conn = bg_conn.lock().unwrap();
+                    let mut conn = bg_conn.lock().unwrap_or_else(|e| e.into_inner());
                     // First poll: process stream commands → collect SendFrame
                     // into pending_write_frame, read incoming data → route to streams.
                     let first = conn.poll_next_inbound(cx);
@@ -383,7 +383,7 @@ where
                 // fires and detects dead peers even on idle connections.
                 _ = tokio::time::sleep(keepalive) => {
                     let _ = poll_fn(|cx| {
-                        bg_conn.lock().unwrap().poll_next_inbound(cx)
+                        bg_conn.lock().unwrap_or_else(|e| e.into_inner()).poll_next_inbound(cx)
                     }).await;
                 }
             }

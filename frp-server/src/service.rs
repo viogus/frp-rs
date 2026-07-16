@@ -100,6 +100,7 @@ fn build_auth_config(
         oidc_audience: auth.oidc_audience.clone(),
         oidc_skip_expiry: auth.oidc_skip_expiry,
         oidc_skip_issuer: auth.oidc_skip_issuer,
+        oidc_skip_nbf: auth.oidc_skip_nbf,
         additional_data: None,
         oidc_proxy_url: auth.oidc_proxy_url.clone(),
         additional_auth_scopes: auth.additional_auth_scopes.clone(),
@@ -169,6 +170,7 @@ impl Service {
                 auth_cfg.oidc_audience.clone(),
                 auth_cfg.oidc_skip_expiry,
                 auth_cfg.oidc_skip_issuer,
+                auth_cfg.oidc_skip_nbf,
                 Some(auth_cfg.oidc_proxy_url.clone()).filter(|s| !s.is_empty()),
             )
             .await
@@ -196,7 +198,7 @@ impl Service {
         let max_connections: usize = match cfg.max_connections {
             Some(0) => usize::MAX, // 0 = unlimited
             Some(n) => n as usize,
-            None => 10000, // default
+            None => 512, // default
         };
         let mut state = AppState::new(
             auth_cfg,
@@ -267,7 +269,7 @@ impl Service {
         info!(bind_addr = %bind_addr, "frps starting on {}", bind_addr);
 
         #[cfg(feature = "tls")]
-        {
+        if self.cfg.tls_enable {
             let ca_file = if self.cfg.tls_ca_file.is_empty() {
                 None
             } else {
@@ -452,8 +454,12 @@ impl Service {
         if self.cfg.vhost_http_port > 0 {
             let http_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.vhost_http_port);
             let http_state = self.state.clone();
+            let http_shutdown = self.state.shutdown_token.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::vhost::run_vhost_http_listener(http_addr, http_state).await {
+                if let Err(e) =
+                    crate::vhost::run_vhost_http_listener(http_addr, http_state, http_shutdown)
+                        .await
+                {
                     error!(error = %e, "HTTP VHost listener failed: {}", e);
                 }
             });
@@ -465,9 +471,11 @@ impl Service {
             let https_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.vhost_https_port);
             let https_addr2 = https_addr.clone();
             let https_state = self.state.clone();
+            let https_shutdown = self.state.shutdown_token.clone();
             tokio::spawn(async move {
                 if let Err(e) =
-                    crate::vhost::run_vhost_https_listener(https_addr, https_state).await
+                    crate::vhost::run_vhost_https_listener(https_addr, https_state, https_shutdown)
+                        .await
                 {
                     error!(error = %e, "HTTPS VHost listener failed: {}", e);
                 }
@@ -480,8 +488,11 @@ impl Service {
             let tcpmux_addr =
                 format_socket_addr(&self.cfg.bind_addr, self.cfg.tcpmux_httpconnect_port);
             let tcpmux_state = self.state.clone();
+            let tcpmux_shutdown = self.state.shutdown_token.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::tcpmux::run_tcpmux_listener(tcpmux_addr, tcpmux_state).await
+                if let Err(e) =
+                    crate::tcpmux::run_tcpmux_listener(tcpmux_addr, tcpmux_state, tcpmux_shutdown)
+                        .await
                 {
                     error!(error = %e, "TCPMux HTTP CONNECT listener failed: {}", e);
                 }

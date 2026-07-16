@@ -74,6 +74,10 @@ pub(crate) async fn dispatch_internal<W: AsyncWriteExt + Unpin>(
             super::nathole::handle_vnet_packet_forward(ctx, ctl, writer, proxy_name, data).await;
             Ok(())
         }
+        InternalMsg::WriteCloseProxy { proxy_name } => {
+            super::proxy::handle_write_close_proxy(ctx, ctl, writer, proxy_name).await;
+            Ok(())
+        }
         InternalMsg::Shutdown => {
             tracing::warn!(
                 run_id = %ctx.run_id,

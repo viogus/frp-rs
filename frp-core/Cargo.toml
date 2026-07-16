@@ -14,7 +14,6 @@ anyhow.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
-bytes.workspace = true
 axum = { workspace = true, optional = true }
 uuid.workspace = true
 tokio-tungstenite = { workspace = true, optional = true }
@@ -45,7 +44,7 @@ rcgen = { version = "0.13", optional = true, default-features = false, features 
 pprof = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = { workspace = true }
+
 
 [features]
 default = ["quic", "kcp", "websocket", "oidc", "tls", "compression", "chacha20", "vnet", "tcp-mux"]

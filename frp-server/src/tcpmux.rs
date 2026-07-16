@@ -107,12 +107,15 @@ impl TcpMuxManager {
 pub async fn run_tcpmux_listener(
     addr: String,
     state: Arc<AppState>,
+    shutdown_token: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&addr).await?;
     info!(addr = %addr, "TCPMux HTTP CONNECT listener started on {}", addr);
 
     loop {
-        let (mut stream, peer) = listener.accept().await?;
+        tokio::select! {
+            result = listener.accept() => {
+                let (mut stream, peer) = result?;
         frp_core::transport::set_nodelay(&stream);
         let state = state.clone();
 
@@ -246,7 +249,14 @@ pub async fn run_tcpmux_listener(
                 let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
             }
         });
+            }
+            _ = shutdown_token.cancelled() => {
+                info!("TCPMux HTTP CONNECT listener shutting down");
+                break;
+            }
+        }
     }
+    Ok(())
 }
 
 /// Read HTTP request headers up to \r\n\r\n delimiter.

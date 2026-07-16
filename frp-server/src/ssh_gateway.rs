@@ -4,6 +4,10 @@
 //!   ssh -R :80:127.0.0.1:8080 v0@server -p 2200 tcp --proxy_name "web" --remote_port 9090
 //!
 //! The remote command string is parsed into a ProxyConfig.
+//!
+//! NOTE: russh 0.61 transitively depends on rsa 0.10.0-rc.18 which has a known
+//! timing sidechannel (RUSTSEC-2023-0071, Marvin Attack). Only affects the SSH
+//! gateway feature. Monitor upstream for fix.
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -1080,6 +1084,11 @@ impl SshListener {
         let russh_config = std::sync::Arc::new(russh_config);
 
         loop {
+            // Check for graceful shutdown before blocking on accept.
+            if self.state.shutdown_token.is_cancelled() {
+                tracing::info!("SSH tunnel gateway shutting down");
+                return Ok(());
+            }
             let (stream, peer_addr) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {

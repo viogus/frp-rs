@@ -228,6 +228,12 @@ impl AeadStream {
     ///
     /// `read_key` and `write_key` are the derived directional AEAD keys
     /// (32 bytes each). `algorithm` selects AES-256-GCM or XChaCha20-Poly1305.
+    ///
+    /// SAFETY CONTRACT: This type uses `ring::aead::LessSafeKey` which bypasses
+    /// nonce uniqueness checks. The caller MUST ensure nonces are never reused
+    /// with the same key. This stream implementation guarantees uniqueness by
+    /// incrementing a counter — any refactoring of nonce management must
+    /// preserve this invariant.
     pub fn new(
         inner: Box<dyn AsyncReadWriteUnpin>,
         algorithm: AeadAlgorithm,

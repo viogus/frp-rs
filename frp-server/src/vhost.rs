@@ -283,76 +283,100 @@ async fn serve_vhost_request<S>(
 
 /// Run an HTTP VHost listener on the given address.
 /// Accepts connections, reads the Host header, and routes via InternalMsg.
-#[instrument(skip(state), fields(addr = %addr))]
+#[instrument(skip(state, shutdown_token), fields(addr = %addr))]
 pub async fn run_vhost_http_listener(
     addr: String,
     state: Arc<AppState>,
+    shutdown_token: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&addr).await?;
     info!(addr = %addr, "HTTP VHost listener started on {}", addr);
 
     loop {
-        let (stream, peer) = listener.accept().await?;
-        frp_core::transport::set_nodelay(&stream);
-        let state = state.clone();
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, peer) = result?;
+                frp_core::transport::set_nodelay(&stream);
+                let state = state.clone();
 
-        tokio::spawn(async move {
-            serve_vhost_request(
-                stream,
-                peer,
-                state,
-                "HTTP",
-                frp_core::transport::IoStream::Tcp,
-            )
-            .await;
-        });
+                tokio::spawn(async move {
+                    serve_vhost_request(
+                        stream,
+                        peer,
+                        state,
+                        "HTTP",
+                        frp_core::transport::IoStream::Tcp,
+                    )
+                    .await;
+                });
+            }
+            _ = shutdown_token.cancelled() => {
+                info!("HTTP VHost listener shutting down");
+                break;
+            }
+        }
     }
+    Ok(())
 }
 
 /// Run an HTTPS VHost listener on the given address.
 /// Performs TLS handshake, then extracts Host header and routes via InternalMsg.
 #[cfg(feature = "tls")]
-#[instrument(skip(state), fields(addr = %addr))]
+#[instrument(skip(state, shutdown_token), fields(addr = %addr))]
 pub async fn run_vhost_https_listener(
     addr: String,
     state: std::sync::Arc<crate::service::AppState>,
+    shutdown_token: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&addr).await?;
     info!(addr = %addr, "HTTPS VHost listener started on {}", addr);
 
     loop {
-        let (stream, peer) = listener.accept().await?;
-        frp_core::transport::set_nodelay(&stream);
-        let state = state.clone();
-        // Read the current TLS acceptor from shared state. Hot-reload
-        // swaps a new acceptor under write lock; read-lock is cheap.
-        let acceptor = state
-            .tls_acceptor
-            .read_ok()
-            .clone()
-            .expect("TLS acceptor not initialized");
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, peer) = result?;
+                frp_core::transport::set_nodelay(&stream);
+                let state = state.clone();
+                // Read the current TLS acceptor from shared state. Hot-reload
+                // swaps a new acceptor under write lock; read-lock is cheap.
+                let Some(acceptor) = state
+                    .tls_acceptor
+                    .read_ok()
+                    .clone()
+                else {
+                    tracing::error!("TLS acceptor not initialized");
+                    continue;
+                };
 
-        tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(peer = %peer, error = %e, "TLS handshake failed from {}: {}", peer, e);
-                    return;
-                }
-            };
+                tokio::spawn(async move {
+                    let tls_stream = match acceptor.accept(stream).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(peer = %peer, error = %e, "TLS handshake failed from {}: {}", peer, e);
+                            return;
+                        }
+                    };
 
-            serve_vhost_request(tls_stream, peer, state, "HTTPS", |s| {
-                frp_core::transport::IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(s)))
-            })
-            .await;
-        });
+                    serve_vhost_request(tls_stream, peer, state, "HTTPS", |s| {
+                        frp_core::transport::IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(s)))
+                    })
+                    .await;
+                });
+            }
+            _ = shutdown_token.cancelled() => {
+                info!("HTTPS VHost listener shutting down");
+                break;
+            }
+        }
     }
+    Ok(())
 }
 
 #[cfg(not(feature = "tls"))]
 pub async fn run_vhost_https_listener(
     _addr: String,
     _state: std::sync::Arc<crate::service::AppState>,
+    _shutdown_token: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err("TLS feature not enabled".into())
 }
@@ -398,7 +422,12 @@ fn rewrite_host_header(data: &[u8], new_host: &str) -> Vec<u8> {
         .map(|p| host_start + p + 2)
         .unwrap_or(data.len());
 
-    let new_header = format!("Host: {}\r\n", new_host);
+    // Sanitize \r and \n to prevent HTTP header injection.
+    let safe_host: String = new_host
+        .chars()
+        .filter(|&c| c != '\r' && c != '\n')
+        .collect();
+    let new_header = format!("Host: {}\r\n", safe_host);
     let mut result = Vec::with_capacity(data.len() + new_header.len());
     result.extend_from_slice(&data[..host_start]);
     result.extend_from_slice(new_header.as_bytes());

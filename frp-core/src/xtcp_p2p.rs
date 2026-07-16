@@ -771,13 +771,13 @@ pub async fn xtcp_p2p_connect_yamux(
                     // Write activity — drive yamux to flush pending frames
                     // and tick KCP without waiting for the next sleep.
                     let _ = poll_fn(|cx| {
-                        let mut c = bg_conn.lock().unwrap();
+                        let mut c = bg_conn.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = c.poll_next_inbound(cx);
                         std::task::Poll::Ready(())
                     }).await;
                 }
                 result = poll_fn(|cx| {
-                    let mut c = bg_conn.lock().unwrap();
+                    let mut c = bg_conn.lock().unwrap_or_else(|e| e.into_inner());
                     // Double-poll: first poll processes stream commands
                     // into pending_frames; second poll sends them on wire.
                     match c.poll_next_inbound(cx) {
@@ -819,7 +819,7 @@ pub async fn xtcp_p2p_connect_yamux(
                 _ = tokio::time::sleep(keepalive) => {
                     // Periodic KCP tick for retransmission timing.
                     let _ = poll_fn(|cx| {
-                        let mut c = bg_conn.lock().unwrap();
+                        let mut c = bg_conn.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = c.poll_next_inbound(cx);
                         std::task::Poll::Ready(())
                     }).await;
@@ -837,7 +837,11 @@ pub async fn xtcp_p2p_connect_yamux(
         // to the KCP socket.
         tokio::time::timeout(
             Duration::from_secs(10),
-            poll_fn(|cx| conn.lock().unwrap().poll_new_outbound(cx)),
+            poll_fn(|cx| {
+                conn.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .poll_new_outbound(cx)
+            }),
         )
         .await
         .map_err(|_| "yamux: timeout opening stream (10s)".to_string())?

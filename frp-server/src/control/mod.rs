@@ -73,7 +73,6 @@ pub(crate) struct ControlContext {
     pub v2: bool,
     pub run_id: String,
     pub pool_cap: usize,
-    #[allow(dead_code)]
     pub internal_tx: tokio::sync::mpsc::Sender<crate::state::InternalMsg>,
     pub peer: Option<std::net::SocketAddr>,
 }
@@ -122,14 +121,14 @@ pub async fn handle_control<S>(
     // --- Main select loop ---
     loop {
         // Expire stale pending requests
-        while let Some(req) = ctl.pending_requests.front() {
+        while let Some(req) = ctl.pending_requests.pop_front() {
             if req.created_at.elapsed() > pool::PENDING_REQUEST_TIMEOUT {
-                let expired = ctl.pending_requests.pop_front().unwrap();
                 pool_stats
                     .pending_requests
                     .store(ctl.pending_requests.len() as i64, Ordering::Relaxed);
-                debug!(proxy_name = %expired.proxy_name, timeout = ?pool::PENDING_REQUEST_TIMEOUT, "Pending request for proxy '{}' timed out after {:?}", expired.proxy_name, pool::PENDING_REQUEST_TIMEOUT);
+                debug!(proxy_name = %req.proxy_name, timeout = ?pool::PENDING_REQUEST_TIMEOUT, "Pending request for proxy '{}' timed out after {:?}", req.proxy_name, pool::PENDING_REQUEST_TIMEOUT);
             } else {
+                ctl.pending_requests.push_front(req);
                 break;
             }
         }

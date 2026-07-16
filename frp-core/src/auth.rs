@@ -63,6 +63,7 @@ pub struct AuthConfig {
     pub oidc_audience: String,
     pub oidc_skip_expiry: bool,
     pub oidc_skip_issuer: bool,
+    pub oidc_skip_nbf: bool,
     pub additional_data: Option<String>,
     /// HTTP/SOCKS5 proxy URL for OIDC HTTP client connections.
     /// Go frp compat: oidcProxyURL.
@@ -102,6 +103,7 @@ impl AuthConfig {
             oidc_audience: String::new(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+            oidc_skip_nbf: false,
             additional_data: None,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
@@ -120,6 +122,7 @@ impl Default for AuthConfig {
             oidc_audience: String::new(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+            oidc_skip_nbf: false,
             additional_data: None,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
@@ -235,6 +238,7 @@ mod oidc_impl {
         jwks: tokio::sync::RwLock<Option<CachedJwks>>,
         skip_expiry: bool,
         skip_issuer: bool,
+        skip_nbf: bool,
         http: reqwest::Client,
     }
 
@@ -246,6 +250,7 @@ mod oidc_impl {
             audience: String,
             skip_expiry: bool,
             skip_issuer: bool,
+            skip_nbf: bool,
             proxy_url: Option<String>,
         ) -> Result<Self, String> {
             let mut client_builder =
@@ -293,6 +298,7 @@ mod oidc_impl {
                 jwks: tokio::sync::RwLock::new(None),
                 skip_expiry,
                 skip_issuer,
+                skip_nbf,
                 http,
             };
 
@@ -301,6 +307,9 @@ mod oidc_impl {
             }
             if verifier.skip_issuer {
                 tracing::warn!("OIDC: skip_issuer is enabled — tokens from any issuer will be accepted. This weakens authentication security.");
+            }
+            if verifier.skip_nbf {
+                tracing::warn!("OIDC: skip_nbf is enabled — tokens issued in the future will be accepted. This weakens authentication security.");
             }
 
             verifier.refresh_jwks().await?;
@@ -385,6 +394,26 @@ mod oidc_impl {
             let alg = header.alg;
             let kid = header.kid.clone();
 
+            // Restrict to known algorithms. The JWT header `alg` is verified
+            // against the JWK key type by jsonwebtoken (algorithm confusion
+            // protection). This allowlist is defense-in-depth.
+            const ALLOWED_ALGS: &[jsonwebtoken::Algorithm] = &[
+                jsonwebtoken::Algorithm::RS256,
+                jsonwebtoken::Algorithm::RS384,
+                jsonwebtoken::Algorithm::RS512,
+                jsonwebtoken::Algorithm::ES256,
+                jsonwebtoken::Algorithm::ES384,
+                jsonwebtoken::Algorithm::PS256,
+                jsonwebtoken::Algorithm::PS384,
+                jsonwebtoken::Algorithm::PS512,
+                jsonwebtoken::Algorithm::HS256,
+                jsonwebtoken::Algorithm::HS384,
+                jsonwebtoken::Algorithm::HS512,
+            ];
+            if !ALLOWED_ALGS.contains(&alg) {
+                return Err(format!("OIDC: algorithm {alg:?} not allowed"));
+            }
+
             // Ensure JWKS cached, refresh if stale
             {
                 let cache = self.jwks.read().await;
@@ -401,6 +430,7 @@ mod oidc_impl {
 
             let mut validation = jsonwebtoken::Validation::new(alg);
             validation.validate_exp = !self.skip_expiry;
+            validation.validate_nbf = !self.skip_nbf;
             if !self.skip_issuer {
                 validation.set_issuer(&[&self.issuer]);
             }
@@ -977,6 +1007,7 @@ mod tests {
             oidc_audience: "my-audience".into(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+            oidc_skip_nbf: false,
             additional_data: None,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
@@ -1068,6 +1099,7 @@ mod tests {
             oidc_audience: String::new(),
             oidc_skip_expiry: false,
             oidc_skip_issuer: false,
+            oidc_skip_nbf: false,
             additional_data: None,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),

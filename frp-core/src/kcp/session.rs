@@ -65,8 +65,7 @@ impl Write for KcpWriter {
 
 pub struct KcpSession {
     conv: u32,
-    #[allow(dead_code)]
-    peer_addr: std::net::SocketAddr,
+    _peer_addr: std::net::SocketAddr,
     kcp: kcp::Kcp<KcpWriter>,
     fec: Option<Fec>,
     config: KcpConfig,
@@ -117,7 +116,7 @@ impl KcpSession {
 
         Self {
             conv,
-            peer_addr,
+            _peer_addr: peer_addr,
             kcp,
             fec,
             config,
@@ -132,14 +131,9 @@ impl KcpSession {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn conv(&self) -> u32 {
         self.conv
-    }
-
-    #[allow(dead_code)]
-    pub fn peer_addr(&self) -> std::net::SocketAddr {
-        self.peer_addr
     }
 
     /// Called by driver on each tick. Updates KCP clock, returns output packets.
@@ -514,21 +508,13 @@ impl KcpSession {
         }
     }
 
-    /// Returns ms until next update is needed, or 0 if update now.
-    #[allow(dead_code)]
-    pub fn check(&self, _now_ms: u32) -> u32 {
-        // Delegate to underlying kcp crate.
-        // kcp::Kcp::check takes a u32 clock; we just pass it through.
-        0
-    }
-
     /// Check if the KCP connection is dead (too many retransmissions).
     pub fn is_dead_link(&self) -> bool {
         self.kcp.is_dead_link()
     }
 
     /// Mark session for shutdown. Driver will remove it on next tick.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn shutdown(&mut self) {
         self.shutdown = true;
     }
