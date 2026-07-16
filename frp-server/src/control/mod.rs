@@ -53,8 +53,39 @@ pub(super) const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Max work connections to pool beyond what the client requested (Go frp: poolCount + 10).
 const WORK_POOL_EXTRA: usize = 10;
 
+// ---- State containers for handle_control ----
+
+/// Mutable local state owned by the control session. Passed by `&mut` to
+/// all handler functions. Single-task — no synchronisation needed.
+pub(crate) struct ControlState {
+    pub shutting_down: bool,
+    pub work_pool: VecDeque<PoolEntry>,
+    pub pending_requests: VecDeque<PendingRequest>,
+    pub pending_udp: VecDeque<(String, Instant)>,
+    /// (sid, proxy_name, created_at) triples queued while waiting for a work connection.
+    pub pending_nat_hole_sids: VecDeque<(String, String, Instant)>,
+    pub listener_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    pub udp_sockets: std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
+    pub udp_local_to_proxy: std::collections::HashMap<String, String>,
+    pub last_ping: Instant,
+}
+
+/// Immutable/shared context passed to every handler. Owns its data —
+/// no lifetimes needed. Writer/reader are passed separately as generic
+/// params to handlers that need them.
+pub(crate) struct ControlContext {
+    pub state: std::sync::Arc<crate::state::AppState>,
+    pub pool_stats: std::sync::Arc<crate::state::PoolStats>,
+    pub reloadable: crate::state::ReloadableState,
+    pub v2: bool,
+    pub run_id: String,
+    pub pool_cap: usize,
+    pub internal_tx: tokio::sync::mpsc::Sender<crate::state::InternalMsg>,
+    pub peer: Option<std::net::SocketAddr>,
+}
+
 /// A pooled work connection with its pool-entry timestamp for idle expiry.
-struct PoolEntry {
+pub(crate) struct PoolEntry {
     conn: IoStream,
     pooled_at: Instant,
 }
