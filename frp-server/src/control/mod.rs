@@ -3,6 +3,7 @@ mod proxy_ops;
 
 use crate::lock::RwLockExt;
 use crate::nathole::NAT_HOLE_TIMEOUT;
+
 use proxy_ops::err_msg;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -112,11 +113,13 @@ where
 /// Write StartWorkConn with embedded `nat_hole_sid` + a separate NatHoleSid
 /// frame for Go frpc compat. Go frp ignores unknown JSON fields, so the
 /// standalone frame is needed for XTCP notification recognition.
+#[allow(clippy::too_many_arguments)]
 async fn write_start_work_conn_with_nat_hole_sid<W: tokio::io::AsyncWriteExt + Unpin>(
     writer: &mut W,
     proxy_name: &str,
     use_enc: bool,
     use_comp: bool,
+    sk: Option<&str>,
     sid: &str,
     v2: bool,
     context: &str,
@@ -132,6 +135,7 @@ async fn write_start_work_conn_with_nat_hole_sid<W: tokio::io::AsyncWriteExt + U
         use_compression: if use_comp { Some(true) } else { None },
         nat_hole_sid: Some(sid.to_string()),
         nat_hole_visitor_addr: None,
+        sk: sk.map(|s| s.to_string()),
     });
     if let Err(e) = write_ctl_msg(writer, &swc, v2).await {
         warn!(error = %e, "Failed to send StartWorkConn with NatHoleSid{}: {}", context, e);
@@ -279,7 +283,7 @@ pub async fn handle_control<S>(
     }
 
     // --- Set up internal channel ---
-    let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<InternalMsg>();
+    let (internal_tx, mut internal_rx) = mpsc::channel::<InternalMsg>(1024);
 
     // Register control channel. If a previous handler exists for this run_id,
     // send Shutdown to it so it stops listening (Go frp v0.69.1 compat).
@@ -288,7 +292,15 @@ pub async fn handle_control<S>(
         let mut map = state.run_id_to_ctl_tx.write().await;
         if let Some(old_ctl) = map.get(&run_id) {
             warn!(run_id = %run_id, "Duplicate run_id {}: shutting down old control handler", run_id);
-            let _ = old_ctl.tx.send(InternalMsg::Shutdown);
+            match old_ctl.tx.try_send(InternalMsg::Shutdown) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    debug!(run_id = %run_id, "Old control handler channel full; cleanup by timeout");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    debug!(run_id = %run_id, "Old control handler already shut down");
+                }
+            }
         }
         map.insert(
             run_id.clone(),
@@ -541,10 +553,10 @@ pub async fn handle_control<S>(
                         if let Some((sid, proxy_name, _ts)) = pending_nat_hole_sids.pop_front() {
                             debug!(sid = %sid, proxy_name = %proxy_name, "Delivering pending NatHoleSid {} for {} to provider", sid, proxy_name);
                             // Look up proxy flags for StartWorkConn (encryption/compression propagation)
-                            let (use_enc, use_comp) = state.proxy_manager.get(&proxy_name).await
-                                .map(|p| (p.use_encryption, p.use_compression))
-                                .unwrap_or((false, false));
-                            write_start_work_conn_with_nat_hole_sid(&mut stream, &proxy_name, use_enc, use_comp, &sid, v2, " (pending)").await;
+                            let (use_enc, use_comp, sk) = state.proxy_manager.get(&proxy_name).await
+                                .map(|p| (p.use_encryption, p.use_compression, p.sk.clone()))
+                                .unwrap_or((false, false, None));
+                            write_start_work_conn_with_nat_hole_sid(&mut stream, &proxy_name, use_enc, use_comp, sk.as_deref(), &sid, v2, " (pending)").await;
                             // Work conn consumed for XTCP notification — drop it.
                         } else {
                             // Expire stale pending UDP requests first
@@ -652,15 +664,30 @@ pub async fn handle_control<S>(
                                 map.get(&target_run_id).cloned()
                             };
                             if let Some(ctl) = ctl_tx {
-                                let _ = ctl.tx.send(InternalMsg::ProxyUserConn {
-                                    proxy_name: target_proxy,
+                                match ctl.tx.try_send(InternalMsg::ProxyUserConn {
+                                    proxy_name: target_proxy.clone(),
                                     user_conn,
                                     pre_read,
-                                });
+                                }) {
+                                    Ok(()) => continue,
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        // Backend handler is busy. The connection
+                                        // was consumed by try_send and cannot be
+                                        // recovered without restructuring this
+                                        // handler. Drop it (rare — channel has
+                                        // capacity 256).
+                                        debug!(target_run_id = %target_run_id, "Group backend channel full, dropping connection");
+                                        continue;
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        debug!(target_run_id = %target_run_id, "Group backend handler closed, dropping connection");
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                warn!(target_run_id = %target_run_id, target_proxy = %target_proxy, "Group backend run_id {} not found for proxy {}", target_run_id, target_proxy);
                                 continue;
                             }
-                            warn!(target_run_id = %target_run_id, target_proxy = %target_proxy, "Group backend run_id {} not found for proxy {}", target_run_id, target_proxy);
-                            continue;
                         }
                         let (enc, comp, response_headers, proxy_type) = {
                             let p = state.proxy_manager.get(&target_proxy).await;
@@ -726,10 +753,10 @@ pub async fn handle_control<S>(
                             state.pool.hits.fetch_add(1, Ordering::Relaxed);
                             pool_stats.pool_size.store(work_pool.len() as i64, Ordering::Relaxed);
                             // Look up proxy flags for StartWorkConn (encryption/compression propagation)
-                            let (use_enc, use_comp) = state.proxy_manager.get(&proxy_name).await
-                                .map(|p| (p.use_encryption, p.use_compression))
-                                .unwrap_or((false, false));
-                            write_start_work_conn_with_nat_hole_sid(&mut work_conn, &proxy_name, use_enc, use_comp, &sid, v2, " on work conn").await;
+                            let (use_enc, use_comp, sk) = state.proxy_manager.get(&proxy_name).await
+                                .map(|p| (p.use_encryption, p.use_compression, p.sk.clone()))
+                                .unwrap_or((false, false, None));
+                            write_start_work_conn_with_nat_hole_sid(&mut work_conn, &proxy_name, use_enc, use_comp, sk.as_deref(), &sid, v2, " on work conn").await;
                             // Connection consumed — Go frp doesn't reuse after NatHoleSid.
                             drop(work_conn);
                         } else {
@@ -919,7 +946,7 @@ pub async fn handle_control<S>(
                                 // Same client — no forwarding needed (client handles locally)
                                 debug!(proxy_name = %pkt.proxy_name, "vnet packet target is self, skipping forward");
                             } else if let Some(ctl_tx) = state.run_id_to_ctl_tx.read().await.get(&target_run_id) {
-                                let _ = ctl_tx.tx.send(crate::state::InternalMsg::VnetPacketForward {
+                                let _ = ctl_tx.tx.try_send(crate::state::InternalMsg::VnetPacketForward {
                                     proxy_name: pkt.proxy_name.clone(),
                                     data: pkt.data.clone(),
                                 });
@@ -949,11 +976,9 @@ pub async fn handle_control<S>(
                             if let Some(port) = info.remote_port {
                                 state.used_ports.write().await.remove(&port);
                             }
-                            // Clean up STCP sk_index
-                            if let Some(ref sk) = info.sk {
-                                if !sk.is_empty() {
-                                    state.xtcp.sk_index.write().await.remove(sk);
-                                }
+                            // Clean up STCP sk_index (indexed by proxy_name)
+                            if let Some(key) = info.sk_index_key() {
+                                state.xtcp.sk_index.write().await.remove(key);
                             }
                             // Clean up VHost routes
                             state.vhost_manager.unregister(&cp.proxy_name).await;
@@ -988,11 +1013,11 @@ pub async fn handle_control<S>(
                                 serde_json::json!({ "proxy_name": pn, "run_id": rid }),
                             ).await;
                         });
-                        // Send CloseProxyResp back to client (Go frp compat)
-                        let cpr = FrpMessage::CloseProxyResp(msg::CloseProxyResp {
-                            proxy_name: cp.proxy_name.clone(),
-                        });
-                        let _ = write_ctl_msg(&mut writer, &cpr, v2).await;
+                        // Note: Go frp does not send CloseProxyResp (type 7/19 is
+                        // Rust-only). frp-rs client handles both CloseProxy
+                        // and CloseProxyResp identically and already cleans up
+                        // health_cancels immediately after sending CloseProxy,
+                        // so no response is needed here.
                     }
                     Ok(FrpMessage::NatHoleClient(ref client_msg)) => {
                         debug!(
@@ -1146,31 +1171,55 @@ pub async fn handle_control<S>(
                         let sign_key = nvc.sign_key.unwrap_or_default();
                         let timestamp = nvc.timestamp.unwrap_or(0);
 
-                        // Validate proxy exists and sign_key matches
+                        // Validate timestamp freshness (replay attack prevention).
+                        let auth_timeout = state.reloadable.read_ok().auth_cfg.authentication_timeout;
+                        let ts_fresh = frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout);
+
+                        // Validate proxy exists and sign_key matches.
+                        // Uses constant-time comparison (verify_token) instead of
+                        // plain string == to prevent timing side-channel attacks.
                         let ok = if let Some(proxy_info) = state.proxy_manager.get(&nvc.proxy_name).await {
-                            if let Some(ref sk) = proxy_info.sk {
+                            // allow_users check on control channel: match Path A
+                            // (accept loop) semantics. Empty = owner-only (Go frp compat);
+                            // if both owner and visitor have no user (empty string),
+                            // they are the same identity and access is allowed.
+                            let visitor_user = login.user.clone().unwrap_or_default();
+                            let user_ok = if proxy_info.allow_users.is_empty() {
+                                visitor_user == proxy_info.user
+                            } else if proxy_info.allow_users.iter().any(|u| u == "*") {
+                                true
+                            } else {
+                                proxy_info.allow_users.contains(&visitor_user)
+                            };
+                            if !user_ok {
+                                warn!(proxy_name = %nvc.proxy_name, "NewVisitorConn on ctl: user denied for proxy '{}'", nvc.proxy_name);
+                                false
+                            } else if let Some(ref sk) = proxy_info.sk {
                                 if sk.is_empty() {
                                     true // No sk — allow without auth
+                                } else if ts_fresh.is_err() {
+                                    warn!(proxy_name = %nvc.proxy_name, "NewVisitorConn on ctl: timestamp stale for proxy '{}'", nvc.proxy_name);
+                                    false
                                 } else {
-                                    let expected = frp_core::auth::generate_token(sk, timestamp);
-                                    expected == sign_key
+                                    frp_core::auth::verify_token(sk, timestamp, &sign_key)
                                 }
                             } else {
                                 true // No sk configured
                             }
                         } else {
                             // Race: NewVisitorConn may arrive before proxy_manager
-                            // registration completes. Fall back to pre-populated sk_index.
-                            let sk_map = state.xtcp.sk_index.read().await;
-                            sk_map.iter().any(|(sk_key, pn)| {
-                                if pn == &nvc.proxy_name {
-                                    let sk_raw = sk_key.rsplit(':').next().unwrap_or(sk_key);
-                                    let expected = frp_core::auth::generate_token(sk_raw, timestamp);
-                                    expected == sign_key
-                                } else {
-                                    false
-                                }
-                            })
+                            // registration completes. Fall back to sk_index
+                            // (populated after successful registration).
+                            if ts_fresh.is_err() {
+                                false
+                            } else {
+                                let sk_map = state.xtcp.sk_index.read().await;
+                                sk_map
+                                    .get(&nvc.proxy_name)
+                                    .is_some_and(|sk_raw| {
+                                        frp_core::auth::verify_token(sk_raw, timestamp, &sign_key)
+                                    })
+                            }
                         };
 
                         if ok {
@@ -1197,11 +1246,108 @@ pub async fn handle_control<S>(
                         let transaction_id = nhv.transaction_id.clone();
                         let proxy_name = nhv.proxy_name.clone();
 
-                        // Validate proxy exists
-                        if state.proxy_manager.get(&proxy_name).await.is_none() {
+                        // Validate proxy exists and capture info for auth
+                        let proxy_info = match state.proxy_manager.get(&proxy_name).await {
+                            Some(info) => info,
+                            None => {
+                                let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                    transaction_id: transaction_id.clone(),
+                                    error: Some("proxy not found".into()),
+                                    ..Default::default()
+                                });
+                                let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                                continue;
+                            }
+                        };
+
+                        // --- Auth: verify visitor is authorized to access this proxy ---
+                        // Go frp v0.70 allowUsers semantics:
+                        //   - Empty: only the proxy owner can be a visitor
+                        //   - ["*"]: all authenticated users
+                        //   - Specific list: only those users
+                        // Auth is enforced BEFORE pre_check response so Go frp's
+                        // pre_check permission model is preserved.
+                        let visitor_user = login.user.clone().unwrap_or_default();
+
+                        if proxy_info.allow_users.is_empty() {
+                            // Empty = proxy owner only (Go frp compat).
+                            // When both owner and visitor have no user set
+                            // (default empty string), they are the same
+                            // identity and access is allowed.
+                            let owner = &proxy_info.user;
+                            if visitor_user != *owner {
+                                warn!(proxy_name = %proxy_name, user = %visitor_user, owner = %owner, "NatHoleVisitor: user '{}' not proxy owner '{}' for proxy '{}'", visitor_user, owner, proxy_name);
+                                let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                    transaction_id: transaction_id.clone(),
+                                    error: Some("access denied: owner only".into()),
+                                    ..Default::default()
+                                });
+                                let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                                continue;
+                            }
+                        } else if proxy_info.allow_users.iter().any(|u| u == "*") {
+                            // Wildcard — any authenticated user
+                        } else if !proxy_info.allow_users.contains(&visitor_user) {
+                            warn!(proxy_name = %proxy_name, user = %visitor_user, "NatHoleVisitor: user '{}' not in allow_users for proxy '{}'", visitor_user, proxy_name);
                             let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
                                 transaction_id: transaction_id.clone(),
-                                error: Some("proxy not found".into()),
+                                error: Some("access denied".into()),
+                                ..Default::default()
+                            });
+                            let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                            continue;
+                        }
+
+                        // Verify sign_key if the proxy has a shared secret.
+                        // Uses constant-time comparison (verify_token) and timestamp
+                        // freshness check to prevent timing side-channel and replay attacks.
+                        let sign_key = nhv.sign_key.as_deref().unwrap_or("");
+                        let timestamp = nhv.timestamp.unwrap_or(0);
+                        if let Some(ref sk) = proxy_info.sk {
+                            if !sk.is_empty() {
+                                if sign_key.is_empty() {
+                                    warn!(proxy_name = %proxy_name, "NatHoleVisitor: missing sign_key for protected proxy '{}'", proxy_name);
+                                    let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                        transaction_id: transaction_id.clone(),
+                                        error: Some("auth required".into()),
+                                        ..Default::default()
+                                    });
+                                    let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                                    continue;
+                                }
+                                // Validate timestamp freshness (replay attack prevention).
+                                let auth_timeout = state.reloadable.read_ok().auth_cfg.authentication_timeout;
+                                if let Err(freshness_err) = frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout) {
+                                    warn!(proxy_name = %proxy_name, error = %freshness_err, "NatHoleVisitor on ctl: timestamp stale for proxy '{}'", proxy_name);
+                                    let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                        transaction_id: transaction_id.clone(),
+                                        error: Some(freshness_err),
+                                        ..Default::default()
+                                    });
+                                    let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                                    continue;
+                                }
+                                if !frp_core::auth::verify_token(sk, timestamp, sign_key) {
+                                    warn!(proxy_name = %proxy_name, "NatHoleVisitor auth failed on ctl for proxy '{}'", proxy_name);
+                                    let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                        transaction_id: transaction_id.clone(),
+                                        error: Some("auth failed".into()),
+                                        ..Default::default()
+                                    });
+                                    let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                                    continue;
+                                }
+                                debug!(proxy_name = %proxy_name, "NatHoleVisitor auth OK (constant-time) on ctl for proxy '{}'", proxy_name);
+                            }
+                        }
+
+                        // Go frp v0.70 pre_check compat: after auth, return OK without
+                        // creating a session or notifying the provider.
+                        if nhv.pre_check && nhv.mapped_addrs.is_none() {
+                            debug!(proxy_name = %proxy_name, user = %visitor_user, "NatHoleVisitor pre_check on ctl channel: proxy='{}' OK", proxy_name);
+                            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
+                                transaction_id: transaction_id.clone(),
+                                error: None,
                                 ..Default::default()
                             });
                             let _ = write_ctl_msg(&mut writer, &resp, v2).await;
@@ -1221,19 +1367,6 @@ pub async fn handle_control<S>(
                                 continue;
                             }
                         };
-
-                        // Go frp v0.69.1 pre_check compat: validate and return OK,
-                        // no session created, no provider notified.
-                        if nhv.pre_check && nhv.mapped_addrs.is_none() {
-                            debug!(proxy_name = %proxy_name, "NatHoleVisitor pre_check on ctl channel: proxy='{}' OK", proxy_name);
-                            let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
-                                transaction_id: transaction_id.clone(),
-                                error: None,
-                                ..Default::default()
-                            });
-                            let _ = write_ctl_msg(&mut writer, &resp, v2).await;
-                            continue;
-                        }
 
                         let provider_ctl = {
                             let map = state.run_id_to_ctl_tx.read().await;
@@ -1277,7 +1410,7 @@ pub async fn handle_control<S>(
                         };
 
                         // Send NatHoleSid to provider ON A WORK CONNECTION (Go frp compat).
-                        if provider_ctl.tx.send(InternalMsg::NatHoleSidOnWorkConn {
+                        if provider_ctl.tx.try_send(InternalMsg::NatHoleSidOnWorkConn {
                             sid: transaction_id.clone(),
                             proxy_name: proxy_name.clone(),
                         }).is_err() {
@@ -1353,8 +1486,17 @@ pub async fn handle_control<S>(
                                     client_mapped.clone(), client_assisted.clone(),
                                     v_behavior, v_read_timeout, cf.ports_difference,
                                 );
+                                // Use visitor's protocol in c_resp so the provider
+                                // knows which transport to use (Go frp compat:
+                                // provider reads NatHoleResp.protocol to decide
+                                // KCP vs TCP). If empty, Go falls back to TCP
+                                // which is incompatible with visitor's KCP.
+                                let protocol_for_provider = visitor_msg
+                                    .protocol
+                                    .clone()
+                                    .or_else(|| client_msg.protocol.clone());
                                 let c_resp = nathole_ctrl::build_nat_hole_response(
-                                    &client_msg.transaction_id, &tid, client_msg.protocol.clone(), mode,
+                                    &client_msg.transaction_id, &tid, protocol_for_provider, mode,
                                     visitor_mapped.clone(), visitor_assisted.clone(),
                                     c_behavior, c_read_timeout, vf.ports_difference,
                                 );
@@ -1370,11 +1512,15 @@ pub async fn handle_control<S>(
                                     assisted_addrs: if client_assisted.is_empty() { None } else { Some(client_assisted) },
                                     ..Default::default()
                                 };
+                                let protocol_for_provider2 = visitor_msg
+                                    .protocol
+                                    .clone()
+                                    .or_else(|| client_msg.protocol.clone());
                                 let c_resp = msg::NatHoleResp {
                                     transaction_id: client_msg.transaction_id.clone(),
                                     error: None,
                                     sid: Some(tid.clone()),
-                                    protocol: client_msg.protocol.clone(),
+                                    protocol: protocol_for_provider2,
                                     candidate_addrs: if visitor_mapped.is_empty() { None } else { Some(visitor_mapped) },
                                     assisted_addrs: if visitor_assisted.is_empty() { None } else { Some(visitor_assisted) },
                                     ..Default::default()
@@ -1401,7 +1547,10 @@ pub async fn handle_control<S>(
                                 }
                             }
 
-                            // Send NatHoleResp to visitor via control channel
+                            // Send NatHoleResp to visitor via control channel.
+                            // send().await: backpressure is correct — silently
+                            // dropping NatHoleResp would permanently hang the
+                            // visitor (protocol-critical message).
                             let _ = visitor_tx.send(InternalMsg::WriteNatHoleResp {
                                 transaction_id: v_resp.transaction_id.clone(),
                                 error: v_resp.error.clone(),
@@ -1409,7 +1558,7 @@ pub async fn handle_control<S>(
                                 protocol: v_resp.protocol.clone(),
                                 candidate_addrs: v_resp.candidate_addrs.clone(),
                                 assisted_addrs: v_resp.assisted_addrs.clone(),
-                            });
+                            }).await;
 
                             // Send NatHoleResp to provider via control channel
                             if let Some(ref cr) = c_resp {
@@ -1420,7 +1569,7 @@ pub async fn handle_control<S>(
                                     protocol: cr.protocol.clone(),
                                     candidate_addrs: cr.candidate_addrs.clone(),
                                     assisted_addrs: cr.assisted_addrs.clone(),
-                                });
+                                }).await;
                             }
 
                             // Wait for report

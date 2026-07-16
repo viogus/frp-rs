@@ -91,7 +91,7 @@ pub struct PoolStats {
 
 #[derive(Debug, Clone)]
 pub struct ControlTx {
-    pub tx: mpsc::UnboundedSender<InternalMsg>,
+    pub tx: mpsc::Sender<InternalMsg>,
     pub client_addr: Option<SocketAddr>,
     pub login_time: Instant,
     /// Absolute Unix epoch timestamp of login, for dashboard v2 API.
@@ -128,6 +128,10 @@ pub struct OidcState {
 /// XTCP NAT-hole-punch coordination state.
 pub struct XtcpState {
     pub nat_hole: Arc<Controller>,
+    /// Key: `proxy_name` (unique per ProxyManager — no collision when
+    /// multiple STCP/XTCP proxies share the same secret key).
+    /// Value: `raw_sk` — used for fallback auth during the
+    /// NewVisitorConn-before-registration race window.
     pub sk_index: Arc<RwLock<HashMap<String, String>>>,
 }
 

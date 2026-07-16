@@ -550,13 +550,27 @@ impl Service {
                                     tracing::info!(peer = %peer, conv = conv, "KCP handler: spawned for {} conv={}", peer, conv);
                                     let mut ctl = frp_core::transport::IoStream::Kcp(stream);
 
-                                    // Try V2 magic detection
+                                    // Try V2 magic detection with a 30s timeout.
+                                    // Without a timeout, an attacker sending only
+                                    // KCP ACKs (no app data) can hold a session
+                                    // slot indefinitely, exhausting the 1024-slot
+                                    // session table. 30s = same as unaccepted timeout.
+                                    const KCP_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
                                     let mut magic = [0u8; 7];
-                                    let is_v2 = match ctl.read_exact(&mut magic).await {
-                                        Ok(_) => is_v2_magic(&magic),
-                                        Err(e) => {
+                                    let is_v2 = match tokio::time::timeout(
+                                        KCP_AUTH_TIMEOUT,
+                                        ctl.read_exact(&mut magic),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(_)) => is_v2_magic(&magic),
+                                        Ok(Err(e)) => {
                                             tracing::debug!(peer = %peer, error = %e, "KCP: failed to read initial 7 bytes from {}", peer);
                                             false
+                                        }
+                                        Err(_elapsed) => {
+                                            tracing::warn!(peer = %peer, conv = conv, "KCP: auth timeout ({}s) — no data from peer", KCP_AUTH_TIMEOUT.as_secs());
+                                            return;
                                         }
                                     };
                                     tracing::info!(peer = %peer, first_byte = ?format_args!("0x{:02x}", magic[0]), is_v2, "KCP: new session from {} (first_byte=0x{:02x}, is_v2={})", peer, magic[0], is_v2);
@@ -1430,11 +1444,15 @@ impl Service {
                                                 info!(sni_host = %sni_host, proxy_name = %route.proxy_name, addr = %addr,
                                                     "SNI route '{}' → HTTPS proxy '{}' from {}",
                                                     sni_host, route.proxy_name, addr);
+                                                // send().await: backpressure is correct —
+                                                // silently dropping the connection after
+                                                // consuming TLS ClientHello bytes would
+                                                // confuse the client.
                                                 let _ = ctl.tx.send(InternalMsg::ProxyUserConn {
                                                     proxy_name: route.proxy_name.clone(),
                                                     user_conn: IoStream::Tcp(inner_stream),
                                                     pre_read: sni_data,
-                                                }).ok();
+                                                }).await;
                                                 return;
                                             }
                                         }

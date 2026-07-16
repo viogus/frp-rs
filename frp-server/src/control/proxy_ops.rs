@@ -53,7 +53,7 @@ pub(crate) async fn handle_new_proxy(
     run_id: &str,
     state: &Arc<AppState>,
     writer: &mut (impl AsyncWriteExt + Unpin),
-    internal_tx: &mpsc::UnboundedSender<InternalMsg>,
+    internal_tx: &mpsc::Sender<InternalMsg>,
     listener_handles: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
     udp_sockets: &mut std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
     udp_local_to_proxy: &mut std::collections::HashMap<String, String>,
@@ -278,27 +278,23 @@ pub(crate) async fn handle_new_proxy(
                 }
             }
 
-            // Register STCP/XTCP proxies in sk_index (scoped by virtual_net)
-            if np.proxy_type == "stcp" || np.proxy_type == "xtcp" {
-                if let Some(ref sk) = np.sk {
-                    if !sk.is_empty() {
-                        let vn = np.virtual_net.as_deref().unwrap_or("");
-                        let sk_key = if vn.is_empty() {
-                            sk.clone()
-                        } else {
-                            format!("{}:{}", vn, sk)
-                        };
-                        state
-                            .xtcp
-                            .sk_index
-                            .write()
-                            .await
-                            .insert(sk_key, np.proxy_name.clone());
-                        info!(proxy_name = %np.proxy_name, vn = %vn, "STCP/XTCP proxy '{}' registered with sk{}",
-                            np.proxy_name,
-                            if vn.is_empty() { String::new() } else { format!(" (virtual_net: {vn})") });
-                    }
-                }
+            // Insert sk_index AFTER successful registration.
+            // Only registered proxies are visible to STCP/XTCP visitor auth;
+            // no transient auth-bypass window or erroneous rollback on failure.
+            let needs_sk_index = (np.proxy_type == "stcp" || np.proxy_type == "xtcp")
+                && np.sk.as_deref().filter(|s| !s.is_empty()).is_some();
+            if needs_sk_index {
+                let raw = np.sk.clone().unwrap_or_default();
+                let vn = np.virtual_net.as_deref().unwrap_or("");
+                state
+                    .xtcp
+                    .sk_index
+                    .write()
+                    .await
+                    .insert(np.proxy_name.clone(), raw);
+                info!(proxy_name = %np.proxy_name, vn = %vn, "STCP/XTCP sk_index registered for '{}'{}",
+                    np.proxy_name,
+                    if vn.is_empty() { String::new() } else { format!(" (virtual_net: {vn})") });
             }
 
             // Register HTTP proxies with VhostManager
@@ -520,9 +516,12 @@ pub(crate) async fn handle_new_proxy(
                     udp_resp_signals.push(tx);
                     tokio::spawn(async move {
                         let _ = rx.await; // Wait until NewProxyResp is written
+                        // send().await: backpressure is correct — silently
+                        // dropping UdpNeedsWorkConn would permanently break
+                        // the UDP proxy (no work connection = no data flow).
                         let _ = itx_clone.send(InternalMsg::UdpNeedsWorkConn {
                             proxy_name: pn_clone,
-                        });
+                        }).await;
                     });
                 }
                 info!(is_sudp = %is_sudp, proxy_name = %np.proxy_name, port = %port, "{} proxy '{}' listening on port {}", if is_sudp { "SUDP" } else { "UDP" }, np.proxy_name, port);
@@ -577,7 +576,7 @@ pub(crate) async fn listen_and_proxy(
     bind_addr: String,
     port: u16,
     proxy_name: String,
-    internal_tx: mpsc::UnboundedSender<InternalMsg>,
+    internal_tx: mpsc::Sender<InternalMsg>,
 ) {
     let addr = format_socket_addr(&bind_addr, port);
     let listener = match TcpListener::bind(&addr).await {
@@ -595,16 +594,25 @@ pub(crate) async fn listen_and_proxy(
         match listener.accept().await {
             Ok((user_conn, _addr)) => {
                 frp_core::transport::set_nodelay(&user_conn);
-                if internal_tx
-                    .send(InternalMsg::ProxyUserConn {
-                        proxy_name: proxy_name.clone(),
-                        user_conn: IoStream::Tcp(user_conn),
-                        pre_read: vec![],
-                    })
-                    .is_err()
-                {
-                    warn!(proxy_name = %proxy_name, "Control handler gone, stopping proxy listener for '{}'", proxy_name);
-                    break;
+                match internal_tx.try_send(InternalMsg::ProxyUserConn {
+                    proxy_name: proxy_name.clone(),
+                    user_conn: IoStream::Tcp(user_conn),
+                    pre_read: vec![],
+                }) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // Channel is temporarily full — drop this connection
+                        // and continue accepting. Do NOT stop the listener.
+                        tracing::debug!(
+                            proxy_name = %proxy_name,
+                            "Proxy listener backpressure, dropping user connection for '{}'",
+                            proxy_name
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        warn!(proxy_name = %proxy_name, "Control handler gone, stopping proxy listener for '{}'", proxy_name);
+                        break;
+                    }
                 }
             }
             Err(e) => {
@@ -634,16 +642,10 @@ pub(crate) async fn unregister_control(
         if let Some(port) = p.remote_port {
             ports.remove(&port);
         }
-        // Clean up STCP sk_index (with virtual_net scoping)
-        if let Some(ref sk) = p.sk {
-            if !sk.is_empty() {
-                let sk_key = if let Some(ref vn) = p.virtual_net {
-                    format!("{}:{}", vn, sk)
-                } else {
-                    sk.clone()
-                };
-                state.xtcp.sk_index.write().await.remove(&sk_key);
-            }
+        // Clean up STCP sk_index (indexed by proxy_name — exact match, no
+        // risk of removing another proxy's entry even when keys are shared)
+        if let Some(key) = p.sk_index_key() {
+            state.xtcp.sk_index.write().await.remove(key);
         }
     }
     drop(ports);

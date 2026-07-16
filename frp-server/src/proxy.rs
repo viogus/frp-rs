@@ -17,8 +17,9 @@ pub struct ProxyInfo {
     pub use_compression: bool,
     /// Virtual network for STCP/XTCP isolation.
     pub virtual_net: Option<String>,
-    /// Allowed visitor run_ids (STCP/XTCP access control).
-    /// Empty = all visitors allowed. Go frp compat: allow_users.
+    /// Allowed visitor users (STCP/XTCP access control).
+    /// Go frp v0.70 compat: empty = owner only, ["*"] = all,
+    /// otherwise specific user list.
     pub allow_users: Vec<String>,
     /// PROXY protocol version (v1, v2, or empty).
     pub proxy_protocol_version: String,
@@ -29,6 +30,22 @@ pub struct ProxyInfo {
     /// Multiplexer type (e.g., "yamux").
     pub multiplexer: String,
     pub user: String,
+}
+
+impl ProxyInfo {
+    /// Returns the proxy name for use as an `sk_index` key, if this proxy
+    /// has a non-empty secret key (STCP/XTCP). Returns `None` when `sk`
+    /// is empty/missing.
+    ///
+    /// The key is `proxy_name` — unique per ProxyManager, so multiple
+    /// proxies sharing the same secret key never collide.
+    pub fn sk_index_key(&self) -> Option<&str> {
+        if self.sk.as_deref().filter(|s| !s.is_empty()).is_some() {
+            Some(&self.name)
+        } else {
+            None
+        }
+    }
 }
 
 /// Manages all proxy registrations on the server.
@@ -65,14 +82,11 @@ impl ProxyManager {
 
     pub async fn register(&self, run_id: String, info: ProxyInfo) -> Result<(), String> {
         let name = info.name.clone();
-        // Register in group index
-        if let Some(ref group) = info.group {
-            if !group.is_empty() {
-                let mut groups = self.groups.write().await;
-                groups.entry(group.clone()).or_default().push(name.clone());
-            }
-        }
+        let group = info.group.clone();
         // Check-and-insert atomically under write lock (fixes TOCTOU).
+        // Must check BEFORE updating group index — if registration fails
+        // due to name conflict, the group index must not be polluted with
+        // a proxy name that belongs to a different (already-registered) proxy.
         {
             let mut proxies = self.proxies.write().await;
             if proxies.contains_key(&name) {
@@ -85,7 +99,14 @@ impl ProxyManager {
             .await
             .entry(run_id)
             .or_default()
-            .insert(name, info);
+            .insert(name.clone(), info);
+        // Register in group index only after successful insertion.
+        if let Some(ref group) = group {
+            if !group.is_empty() {
+                let mut groups = self.groups.write().await;
+                groups.entry(group.clone()).or_default().push(name);
+            }
+        }
         Ok(())
     }
 
