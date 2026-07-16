@@ -122,9 +122,9 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             xtcp_tx,
             session_alive: _session_alive,
             #[cfg(feature = "vnet")]
-            vnet_tuns: _vnet_tuns,
+                vnet_tuns: _vnet_tuns,
             #[cfg(feature = "vnet")]
-            vnet_routes: _vnet_routes,
+                vnet_routes: _vnet_routes,
         } = cfg;
 
         let label = if pool_id >= 0 {

@@ -331,7 +331,9 @@ async fn test_v2_ping_pong_raw_tcp() {
     // dial_server no longer writes V2 magic (it's done at the control.rs
     // call site after all transport layers are established). This test
     // bypasses control.rs, so write magic explicitly here.
-    frp_core::protocol::write_v2_magic(&mut stream).await.expect("write v2 magic");
+    frp_core::protocol::write_v2_magic(&mut stream)
+        .await
+        .expect("write v2 magic");
 
     // V2 handshake on raw TCP (no yamux)
     v2_handshake::v2_handshake_client(

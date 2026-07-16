@@ -400,11 +400,14 @@ pub async fn bridge_plain(
                     break;
                 }
             };
-            let plaintext =
-                match decompress_chunk_into(&mut decompressor, &buf.raw_buf()[..n], &mut decomp_buf) {
-                    Some(p) => p,
-                    None => break,
-                };
+            let plaintext = match decompress_chunk_into(
+                &mut decompressor,
+                &buf.raw_buf()[..n],
+                &mut decomp_buf,
+            ) {
+                Some(p) => p,
+                None => break,
+            };
             if !plaintext.is_empty() {
                 if user_w.write_all(plaintext).await.is_err() {
                     tracing::warn!(
@@ -540,11 +543,14 @@ pub async fn bridge_plain_rate_limited(
                 Ok(n) => n,
                 Err(_) => break,
             };
-            let plaintext =
-                match decompress_chunk_into(&mut decompressor, &buf.raw_buf()[..n], &mut decomp_buf) {
-                    Some(p) => p,
-                    None => break,
-                };
+            let plaintext = match decompress_chunk_into(
+                &mut decompressor,
+                &buf.raw_buf()[..n],
+                &mut decomp_buf,
+            ) {
+                Some(p) => p,
+                None => break,
+            };
             if !plaintext.is_empty() {
                 if let Some(ref mut lim) = read_limiter {
                     lim.consume(plaintext.len()).await;
@@ -1111,9 +1117,6 @@ mod tests {
             elapsed >= 500,
             "expected >= 500 ms with 1 KB/s limit, got {elapsed} ms"
         );
-        assert!(
-            elapsed <= 3000,
-            "expected <= 3000 ms, got {elapsed} ms"
-        );
+        assert!(elapsed <= 3000, "expected <= 3000 ms, got {elapsed} ms");
     }
 }
