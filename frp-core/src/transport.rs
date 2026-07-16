@@ -1432,9 +1432,6 @@ pub struct DialOptions {
     /// Use V2 protocol framing. Client writes V2 magic bytes and performs
     /// ClientHello/ServerHello handshake. Default: false (V1).
     pub v2: bool,
-    /// When true, V2 magic is NOT written on raw TCP — the caller will write
-    /// it on the yamux stream after wrapping. Default: false.
-    pub caller_handles_mux: bool,
 }
 
 impl Default for DialOptions {
@@ -1455,7 +1452,6 @@ impl Default for DialOptions {
             bind_addr: None,
             proxy_url: None,
             v2: false,
-            caller_handles_mux: false,
         }
     }
 }
@@ -1946,12 +1942,10 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
         connect_direct(&addr, peer, opts).await?
     };
 
-    // Write V2 magic BEFORE any TLS/WS/yamux upgrade (Go frp WriteMagicIfV2).
-    // Skip when tcpMux is enabled — magic goes on the yamux stream instead.
-    if opts.v2 && !opts.caller_handles_mux {
-        crate::protocol::write_v2_magic(&mut stream).await?;
-    }
-
+    // Tls detect / yamux wrapping / V2-V1 detection are all handled by the
+    // accept-side dispatch. The dial side writes V2 magic at the call site
+    // (control.rs) after all transport layers are established, matching Go frp
+    // v0.70's pattern (WriteMagicIfV2 on the fully-upgraded connector result).
     match opts.protocol {
         TransportProtocol::Tcp => {
             if opts.tls_enable {

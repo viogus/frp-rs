@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
@@ -120,24 +120,12 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             bind_addr,
             proxy_url,
             xtcp_tx,
-            session_alive,
+            session_alive: _session_alive,
             #[cfg(feature = "vnet")]
-            vnet_tuns,
+            vnet_tuns: _vnet_tuns,
             #[cfg(feature = "vnet")]
-            vnet_routes,
+            vnet_routes: _vnet_routes,
         } = cfg;
-
-        // Clones for replenishment (before any field is consumed)
-        let repl_udp_sockets = udp_sockets.clone();
-        let repl_udp_enc_cfg = udp_enc_cfg.clone();
-        let repl_proxy_metrics = proxy_metrics.clone();
-        let repl_proxy_url = proxy_url.clone();
-        let repl_xtcp_tx = xtcp_tx.clone();
-        let repl_session_alive = session_alive.clone();
-        #[cfg(feature = "vnet")]
-        let repl_vnet_tuns = vnet_tuns.clone();
-        #[cfg(feature = "vnet")]
-        let repl_vnet_routes = vnet_routes.clone();
 
         let label = if pool_id >= 0 {
             format!("pool-{}", pool_id)
@@ -696,41 +684,9 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
 
         debug!(label = %label, "Work conn {} completed", label);
 
-        // Replenish pool: spawn replacement to maintain pool_count
-        // (Go frp v0.69.1 compat — idle work conns refilled after use)
-        if pool_id >= 0 && repl_session_alive.load(Ordering::Acquire) {
-            spawn_work_conn(WorkConnConfig {
-                server_addr: server_addr.clone(),
-                server_port,
-                protocol: protocol.clone(),
-                run_id: run_id.clone(),
-                proxy_info_map: proxy_info_map.clone(),
-                enc_key,
-                pool_id,
-                auth_token,
-                tls_enable,
-                tls_server_name,
-                tls_ca_file,
-                yamux,
-                quic_conn,
-                v2,
-                oidc_client,
-                udp_sockets: repl_udp_sockets,
-                udp_enc_cfg: repl_udp_enc_cfg,
-                proxy_metrics: repl_proxy_metrics,
-                client_auth_scopes: client_scopes,
-                server_auth_scopes: server_scopes,
-                disable_custom_tls_first_byte,
-                keepalive_secs,
-                bind_addr,
-                proxy_url: repl_proxy_url,
-                xtcp_tx: repl_xtcp_tx,
-                session_alive: repl_session_alive,
-                #[cfg(feature = "vnet")]
-                vnet_tuns: repl_vnet_tuns,
-                #[cfg(feature = "vnet")]
-                vnet_routes: repl_vnet_routes,
-            });
-        }
+        // Pool replenishment is server-driven (ReqWorkConn), matching Go frp
+        // v0.70. The client does NOT auto-spawn replacements — if it did,
+        // concurrent completions could push the pool past server pool_cap
+        // before the server can refuse, wasting TCP/TLS/yamux setup.
     });
 }
