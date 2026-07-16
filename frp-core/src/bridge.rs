@@ -193,6 +193,85 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
     }
 }
 
+/// Bridge work→user direction: read from work (plain or via CipherReader),
+/// decompress, apply read bandwidth limit, write to user.
+async fn bridge_work_to_user(
+    mut work_r: impl AsyncReadExt + Unpin,
+    mut user_w: impl AsyncWriteExt + Unpin,
+    use_compression: bool,
+    mut read_limiter: Option<&mut BandwidthLimiter>,
+    metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
+) {
+    let mut buf = PoolGuard::acquire();
+    let cap = buf.as_mut_slice().len();
+    let mut decomp_buf = Vec::new();
+    let mut decompressor = make_decompressor(use_compression);
+    loop {
+        let n = match work_r.read(buf.as_mut_slice()).await {
+            Ok(0) => break,
+            Ok(n) => {
+                trace_hex!(n, first_hex = %hex::encode(&buf.raw_buf()[..n.min(32)]), "bridge work_to_user: read {} bytes", n);
+                n
+            }
+            Err(_) => break,
+        };
+
+        let plaintext =
+            match decompress_chunk_into(&mut decompressor, &buf.raw_buf()[..n], &mut decomp_buf) {
+                Some(p) => p,
+                None => break,
+            };
+
+        if !plaintext.is_empty() {
+            // Apply read bandwidth limit before writing to user
+            if let Some(ref mut lim) = read_limiter {
+                lim.consume(plaintext.len()).await;
+            }
+
+            if user_w.write_all(plaintext).await.is_err() {
+                break;
+            }
+            if let Some(ref m) = metrics {
+                m.bytes_out
+                    .fetch_add(plaintext.len() as u64, Ordering::Relaxed);
+            }
+            // Conditional flush: batch on full reads unless compressing
+            if (use_compression || n < cap) && user_w.flush().await.is_err() {
+                break;
+            }
+        }
+    }
+
+    // Flush remaining buffered compressed data
+    if let Some(ref mut dec) = decompressor {
+        match dec.flush() {
+            Ok(plaintext) if !plaintext.is_empty() => {
+                if let Err(e) = user_w.write_all(&plaintext).await {
+                    tracing::debug!(error = %e, "bridge flush: user_w.write_all failed");
+                }
+                if let Some(ref m) = metrics {
+                    m.bytes_out
+                        .fetch_add(plaintext.len() as u64, Ordering::Relaxed);
+                }
+                if let Err(e) = user_w.flush().await {
+                    tracing::debug!(error = %e, "bridge flush: user_w.flush failed");
+                }
+            }
+            #[cfg(feature = "compression")]
+            Err(e) => {
+                tracing::warn!(error = %e, "snappy flush error in bridge: {}", e);
+            }
+            _ => {}
+        }
+    }
+
+    // Symmetric shutdown: signal EOF to user side
+    let _ = user_w.flush().await;
+    if let Err(e) = user_w.shutdown().await {
+        tracing::debug!(error = %e, "bridge shutdown: user_w.shutdown failed");
+    }
+}
+
 /// Bridge encrypted data between two IoStreams, splitting them internally.
 #[allow(clippy::too_many_arguments)]
 #[instrument(
