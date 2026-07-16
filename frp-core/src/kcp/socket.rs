@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -20,17 +20,34 @@ use super::stream::KcpStream;
 /// in the write_rx mpsc channel under high packet loss.
 pub(crate) const KCP_WRITE_BACKLOG_THRESHOLD: usize = 1024;
 
+/// Hard limit on total KCP sessions. Prevents an attacker from exhausting
+/// server memory by sending UDP packets with random conv values.
+const MAX_SESSIONS: usize = 1024;
+
+/// Per-IP session limit. Prevents a single host from monopolizing the
+/// session table.
+const MAX_SESSIONS_PER_IP: usize = 64;
+
+/// Maximum time a KCP session can exist without being accepted by the
+/// listener. Sessions that haven't been picked up within this window
+/// are cleaned up by the tick loop.
+const UNACCEPTED_SESSION_TIMEOUT_MS: u32 = 30_000; // 30 seconds
+
 pub(crate) enum WriteRequest {
     Data(Vec<u8>),
     Flush(tokio::sync::oneshot::Sender<()>),
 }
 
 pub(crate) struct KcpSocketHandle {
-    pub write_tx: mpsc::UnboundedSender<(u32, WriteRequest)>,
-    pub register_tx: mpsc::UnboundedSender<(u32, SocketAddr, KcpSession)>,
+    pub write_tx: mpsc::Sender<(u32, WriteRequest)>,
+    pub register_tx: mpsc::Sender<(u32, SocketAddr, KcpSession)>,
     /// Channel to send newly accepted streams back to KcpListener::accept().
     #[allow(dead_code)]
-    pub accept_tx: mpsc::UnboundedSender<KcpStream>,
+    pub accept_tx: mpsc::Sender<KcpStream>,
+    /// Notify the socket driver that a session has been accepted by the
+    /// listener, so it should no longer be subject to the unaccepted-
+    /// session timeout. Carries (conv, peer_addr) to identify the session.
+    pub accept_notify_tx: mpsc::Sender<(u32, SocketAddr)>,
     /// Shared write backlog counter: incremented by KcpSocket on recv from
     /// write_rx, decremented after processing. KcpStream reads this to gate
     /// poll_write before sending.
@@ -46,10 +63,20 @@ pub(crate) struct KcpSocket {
     /// conv → peer addr index for O(1) write-path lookups.
     /// Avoids O(n) `iter().find()` on `sessions` in Data/Flush handlers.
     conv_index: HashMap<u32, SocketAddr>,
-    write_tx: mpsc::UnboundedSender<(u32, WriteRequest)>,
-    write_rx: mpsc::UnboundedReceiver<(u32, WriteRequest)>,
-    register_rx: mpsc::UnboundedReceiver<(u32, SocketAddr, KcpSession)>,
-    accept_tx: mpsc::UnboundedSender<KcpStream>,
+    /// Per-IP session count for admission control (keyed by IpAddr, not
+    /// SocketAddr, so varying source port cannot bypass the per-IP limit).
+    peer_session_counts: HashMap<IpAddr, usize>,
+    /// Session creation timestamps for sessions not yet accepted by the
+    /// listener. Removed on accept (via accept_notify_rx) or on session
+    /// removal (dead/error).
+    session_created_at: HashMap<(u32, SocketAddr), u32>,
+    write_tx: mpsc::Sender<(u32, WriteRequest)>,
+    write_rx: mpsc::Receiver<(u32, WriteRequest)>,
+    register_rx: mpsc::Receiver<(u32, SocketAddr, KcpSession)>,
+    accept_tx: mpsc::Sender<KcpStream>,
+    /// Back-channel: listener sends (conv, addr) when it accepts a stream,
+    /// so the driver can remove it from the unaccepted timeout set.
+    accept_notify_rx: mpsc::Receiver<(u32, SocketAddr)>,
     write_backlog: Arc<AtomicUsize>,
     write_notify: Arc<Notify>,
     start: Instant,
@@ -59,10 +86,15 @@ impl KcpSocket {
     pub fn new(
         socket: Arc<UdpSocket>,
         config: KcpConfig,
-    ) -> (Self, KcpSocketHandle, mpsc::UnboundedReceiver<KcpStream>) {
-        let (write_tx, write_rx) = mpsc::unbounded_channel();
-        let (register_tx, register_rx) = mpsc::unbounded_channel();
-        let (accept_tx, accept_rx) = mpsc::unbounded_channel();
+    ) -> (Self, KcpSocketHandle, mpsc::Receiver<KcpStream>) {
+        const CAP_WRITE: usize = 256;
+        const CAP_REGISTER: usize = 64;
+        const CAP_ACCEPT: usize = 256;
+        const CAP_ACCEPT_NOTIFY: usize = 256;
+        let (write_tx, write_rx) = mpsc::channel(CAP_WRITE);
+        let (register_tx, register_rx) = mpsc::channel(CAP_REGISTER);
+        let (accept_tx, accept_rx) = mpsc::channel(CAP_ACCEPT);
+        let (accept_notify_tx, accept_notify_rx) = mpsc::channel(CAP_ACCEPT_NOTIFY);
         let write_backlog = Arc::new(AtomicUsize::new(0));
         let write_notify = Arc::new(Notify::new());
         let this = Self {
@@ -70,10 +102,13 @@ impl KcpSocket {
             config,
             sessions: HashMap::new(),
             conv_index: HashMap::new(),
+            peer_session_counts: HashMap::new(),
+            session_created_at: HashMap::new(),
             write_tx: write_tx.clone(),
             write_rx,
             register_rx,
             accept_tx: accept_tx.clone(),
+            accept_notify_rx,
             write_backlog: write_backlog.clone(),
             write_notify: write_notify.clone(),
             start: Instant::now(),
@@ -82,6 +117,7 @@ impl KcpSocket {
             write_tx,
             register_tx,
             accept_tx,
+            accept_notify_tx,
             write_backlog,
             write_notify,
         };
@@ -135,11 +171,43 @@ impl KcpSocket {
                     for key in to_remove {
                         self.sessions.remove(&key);
                         self.conv_index.remove(&key.0);
+                        self.session_created_at.remove(&key);
+                        let ip = key.1.ip();
+                        if let Some(count) = self.peer_session_counts.get_mut(&ip) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                self.peer_session_counts.remove(&ip);
+                            }
+                        }
+                    }
+                    // Clean up sessions that were never accepted by the listener.
+                    // These are created from garbage packets that happen to pass
+                    // the first input() check but are never picked up.
+                    let mut expired = Vec::new();
+                    for (key, created_at) in &self.session_created_at {
+                        if now_ms.wrapping_sub(*created_at) > UNACCEPTED_SESSION_TIMEOUT_MS {
+                            expired.push(*key);
+                        }
+                    }
+                    for key in expired {
+                        tracing::debug!(conv = key.0, peer = %key.1, "KCP: removing unaccepted session");
+                        self.sessions.remove(&key);
+                        self.conv_index.remove(&key.0);
+                        self.session_created_at.remove(&key);
+                        let ip = key.1.ip();
+                        if let Some(count) = self.peer_session_counts.get_mut(&ip) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                self.peer_session_counts.remove(&ip);
+                            }
+                        }
                     }
                 }
 
                 Some((conv, req)) = self.write_rx.recv() => {
-                    self.write_backlog.fetch_add(1, Ordering::Relaxed);
+                    // Backlog was incremented by KcpStream before try_send
+                    // for Data requests only (not Flush). Decrement inside
+                    // each arm.
                     match req {
                         WriteRequest::Data(data) => {
                             let len = data.len();
@@ -153,6 +221,15 @@ impl KcpSocket {
                             } else {
                                 tracing::trace!(conv, len, "KCP SOCKET: write queued {} bytes", len);
                             }
+                            // Decrement backlog and wake blocked writers.
+                            // Two cases:
+                            // 1. Gate check (backlog >= 1024): rare with bounded
+                            //    channel (cap 256), but notify when draining.
+                            // 2. try_send Full: channel fills before threshold.
+                            //    Notify after every Data item so writers blocked
+                            //    on backpressure_fut can retry.
+                            let _prev = self.write_backlog.fetch_sub(1, Ordering::Release);
+                            self.write_notify.notify_waiters();
                         }
                         WriteRequest::Flush(tx) => {
                             // Force immediate KCP flush: update → drain output →
@@ -160,6 +237,9 @@ impl KcpSocket {
                             // correctness: caller needs StartWorkConn on wire
                             // before bridge data so Go frpc can process them as
                             // separate messages.
+                            // No backlog decrement — poll_flush does not
+                            // increment the backlog (it uses a oneshot for
+                            // wakeup, not the backlog gate).
                             tracing::trace!(conv, "KCP SOCKET: flush");
                             let addr = self.conv_index.get(&conv).copied();
                             let packets = if let Some(session) = addr
@@ -187,11 +267,6 @@ impl KcpSocket {
                             tracing::trace!(conv, npkts = packets.len(), "KCP SOCKET: flush sent {} packets", packets.len());
                             let _ = tx.send(());
                         }
-                    }
-                    let prev = self.write_backlog.fetch_sub(1, Ordering::Release);
-                    // Wake blocked KcpStream writers when backlog drops below threshold.
-                    if prev == KCP_WRITE_BACKLOG_THRESHOLD {
-                        self.write_notify.notify_waiters();
                     }
                 }
 
@@ -233,13 +308,42 @@ impl KcpSocket {
                                         }
                                     }
                                 } else if key.0 != 0 {
-                                    // New peer detected — create session + stream
-                                    let (read_tx, read_rx) = mpsc::unbounded_channel();
+                                    // New peer — validate packet before admission.
+                                    // FEC-enabled sessions accept <6 byte packets as
+                                    // Ok(()) (too short for header → no-op), which
+                                    // would create a permanent session from garbage.
+                                    // Require at minimum a valid KCP header (24 bytes
+                                    // per kcp crate IKCP_OVERHEAD).
+                                    const MIN_KCP_PACKET: usize = 24;
+                                    if data.len() < MIN_KCP_PACKET {
+                                        tracing::debug!(conv = key.0, peer = %src, len = data.len(), "KCP new peer: packet too short ({}, min {})", data.len(), MIN_KCP_PACKET);
+                                        continue;
+                                    }
+
+                                    // Admission control — reject if global or per-IP
+                                    // limit is reached. Key by IpAddr (not SocketAddr)
+                                    // so varying source port cannot bypass per-IP cap.
+                                    let ip = src.ip();
+                                    let ip_count = self.peer_session_counts.get(&ip).copied().unwrap_or(0);
+                                    if self.sessions.len() >= MAX_SESSIONS {
+                                        tracing::warn!(conv = key.0, peer = %src, total = self.sessions.len(), "KCP: session limit reached ({MAX_SESSIONS}), dropping new conv={}", key.0);
+                                        continue;
+                                    }
+                                    if ip_count >= MAX_SESSIONS_PER_IP {
+                                        tracing::warn!(conv = key.0, peer = %src, ip_sessions = ip_count, "KCP: per-IP session limit reached ({MAX_SESSIONS_PER_IP}), dropping new conv={}", key.0);
+                                        continue;
+                                    }
+
+                                    // Create session and validate the first packet.
+                                    // If input() fails on the very first packet, the
+                                    // data is garbage — don't create a permanent session.
+                                    let (read_tx, read_rx) = mpsc::channel(256);
                                     let mut session = KcpSession::new(
                                         key.0, src, self.config.clone(), read_tx,
                                     );
                                     if let Err(e) = session.input(&data) {
-                                        tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP new peer input error");
+                                        tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP new peer: first input failed, dropping");
+                                        continue;
                                     }
                                     let stream = KcpStream::new(
                                         key.0, src,
@@ -248,15 +352,46 @@ impl KcpSocket {
                                         self.write_backlog.clone(),
                                         self.write_notify.clone(),
                                     );
-                                    let _ = self.accept_tx.send(stream);
+                                    if let Err(mpsc::error::TrySendError::Full(_)) =
+                                        self.accept_tx.try_send(stream)
+                                    {
+                                        tracing::warn!(
+                                            conv = key.0,
+                                            peer = %key.1,
+                                            "KCP: accept channel full, dropping new session"
+                                        );
+                                        // Clean up the partially-created session.
+                                        self.sessions.remove(&key);
+                                        self.conv_index.remove(&key.0);
+                                        let ip = key.1.ip();
+                                        if let Some(count) = self.peer_session_counts.get_mut(&ip) {
+                                            *count = count.saturating_sub(1);
+                                            if *count == 0 {
+                                                self.peer_session_counts.remove(&ip);
+                                            }
+                                        }
+                                        continue;
+                                    }
                                     self.conv_index.insert(key.0, key.1);
                                     self.sessions.insert(key, session);
+                                    *self.peer_session_counts.entry(src.ip()).or_default() += 1;
+                                    let now_ms = self.start.elapsed().as_millis() as u32;
+                                    self.session_created_at.insert(key, now_ms);
                                 }
                             }
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "KCP UDP recv error");
                         }
+                    }
+                }
+
+                Some((conv, addr)) = self.accept_notify_rx.recv() => {
+                    // KcpListener accepted this session — it is no longer
+                    // subject to the unaccepted-session timeout.
+                    let key = (conv, addr);
+                    if self.session_created_at.remove(&key).is_some() {
+                        tracing::debug!(conv, peer = %addr, "KCP: session accepted by listener, removed from expiry set");
                     }
                 }
 

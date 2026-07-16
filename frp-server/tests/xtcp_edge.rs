@@ -170,6 +170,12 @@ async fn test_xtcp_concurrent_3_sessions() {
             drop(precheck_conn);
 
             // --- Full NatHoleVisitor ---
+            // Auth: sign_key = MD5(sk + timestamp), required since P0 fix.
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let sign_key = frp_core::auth::generate_token(&sk, ts);
             let mut visitor_conn = IoStream::Tcp(
                 tokio::net::TcpStream::connect(*addr)
                     .await
@@ -180,8 +186,8 @@ async fn test_xtcp_concurrent_3_sessions() {
                 proxy_name: proxy_name.clone(),
                 pre_check: false,
                 protocol: Some("tcp".to_string()),
-                sign_key: None,
-                timestamp: None,
+                sign_key: Some(sign_key),
+                timestamp: Some(ts),
                 mapped_addrs: Some(vec![format!("1.2.3.{}:{}", i + 1, 5678 + i)]),
                 assisted_addrs: None,
             });
@@ -344,6 +350,11 @@ async fn test_xtcp_multiple_providers_same_server() {
 
     // --- Visitor for proxy A: full NatHoleVisitor ---
     let txn_id = format!("full-a-{}", port);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let sign_key = frp_core::auth::generate_token("sk-prov-a", ts);
     let mut visitor_conn = IoStream::Tcp(
         tokio::net::TcpStream::connect(addr)
             .await
@@ -354,8 +365,8 @@ async fn test_xtcp_multiple_providers_same_server() {
         proxy_name: "xtcp-prov-a".into(),
         pre_check: false,
         protocol: Some("tcp".to_string()),
-        sign_key: None,
-        timestamp: None,
+        sign_key: Some(sign_key),
+        timestamp: Some(ts),
         mapped_addrs: Some(vec!["1.2.3.4:5678".to_string()]),
         assisted_addrs: None,
     });
@@ -598,6 +609,11 @@ async fn test_xtcp_encrypted_proxy_registration() {
 
     // --- Full NatHoleVisitor to trigger StartWorkConn ---
     let txn_id = format!("enc-txn-{}", port);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let sign_key = frp_core::auth::generate_token("encrypted-sk", ts);
     let mut visitor_conn = IoStream::Tcp(
         tokio::net::TcpStream::connect(addr)
             .await
@@ -608,8 +624,8 @@ async fn test_xtcp_encrypted_proxy_registration() {
         proxy_name: "xtcp-encrypted".into(),
         pre_check: false,
         protocol: Some("tcp".to_string()),
-        sign_key: None,
-        timestamp: None,
+        sign_key: Some(sign_key),
+        timestamp: Some(ts),
         mapped_addrs: Some(vec!["5.5.5.5:5555".to_string()]),
         assisted_addrs: None,
     });

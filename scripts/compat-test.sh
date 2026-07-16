@@ -118,16 +118,22 @@ run_go() {
 }
 
 # --- Source-built Go frp for V2 tests ---
-# Pre-built Go frp v0.70.0 binary lacks V2 support. When Go is available,
-# auto-build from source and cache in /tmp/frp-source-build.
-GO_FRP_SOURCE_DIR="${GO_FRP_SOURCE_DIR:-/tmp/frp-source-build}"
+# Pre-built Go frp binary lacks V2 support. When Go is available,
+# auto-build from source and cache keyed by version.
+GO_FRP_SOURCE_DIR="${GO_FRP_SOURCE_DIR:-/tmp/frp-source-build-${GO_FRP_VERSION}}"
 GO_FRPS_V2="$GO_FRP_SOURCE_DIR/frps"
 GO_FRPC_V2="$GO_FRP_SOURCE_DIR/frpc"
+GO_FRP_CLONE_DIR="/tmp/frp-clone-${GO_FRP_VERSION}"
 
 build_go_frp_v2() {
-    # Return 0 if source-built binaries already cached
+    # Verify cached binaries match the expected version
     if [[ -x "$GO_FRPS_V2" ]] && [[ -x "$GO_FRPC_V2" ]]; then
-        return 0
+        local cached_ver
+        cached_ver=$("$GO_FRPS_V2" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || true
+        if [[ "$cached_ver" == "$GO_FRP_VERSION" ]]; then
+            return 0
+        fi
+        log "Cached V2 Go frp version mismatch (cached=${cached_ver:-unknown}, expected=$GO_FRP_VERSION); rebuilding."
     fi
 
     if ! command -v go &>/dev/null; then
@@ -135,27 +141,43 @@ build_go_frp_v2() {
         return 1
     fi
 
-    log "Building Go frp from source (v0.70.0, V2 support)..."
-    local clone_dir="/tmp/frp-clone"
+    log "Building Go frp from source (v${GO_FRP_VERSION}, V2 support)..."
 
-    if [[ ! -d "$clone_dir" ]]; then
-        git clone -q --depth 1 --branch v0.70.0 \
-            https://github.com/fatedier/frp.git "$clone_dir" 2>&1 || {
-            log "SKIP V2: failed to clone Go frp source"
+    # Clone/update repo, verify the tag
+    if [[ -d "$GO_FRP_CLONE_DIR" ]]; then
+        (cd "$GO_FRP_CLONE_DIR" && git fetch -q --depth 1 origin tag "v${GO_FRP_VERSION}" 2>&1) || true
+    else
+        git clone -q --depth 1 --branch "v${GO_FRP_VERSION}" \
+            https://github.com/fatedier/frp.git "$GO_FRP_CLONE_DIR" 2>&1 || {
+            log "SKIP V2: failed to clone Go frp source (tag v${GO_FRP_VERSION})"
             return 1
         }
     fi
 
+    # Verify the checkout is on the expected tag
+    local actual_tag
+    actual_tag=$(cd "$GO_FRP_CLONE_DIR" && git describe --tags --exact-match 2>/dev/null) || true
+    if [[ "$actual_tag" != "v${GO_FRP_VERSION}" ]]; then
+        log "SKIP V2: clone not at expected tag (got=${actual_tag:-none}, expected=v${GO_FRP_VERSION}); re-cloning."
+        rm -rf "$GO_FRP_CLONE_DIR"
+        git clone -q --depth 1 --branch "v${GO_FRP_VERSION}" \
+            https://github.com/fatedier/frp.git "$GO_FRP_CLONE_DIR" 2>&1 || {
+            log "SKIP V2: failed to re-clone Go frp source (tag v${GO_FRP_VERSION})"
+            return 1
+        }
+    fi
+
+    rm -rf "$GO_FRP_SOURCE_DIR"
     mkdir -p "$GO_FRP_SOURCE_DIR"
-    (cd "$clone_dir" && go build -tags "frps,noweb" -o "$GO_FRPS_V2" ./cmd/frps) 2>&1 || {
+    (cd "$GO_FRP_CLONE_DIR" && go build -tags "frps,noweb" -o "$GO_FRPS_V2" ./cmd/frps) 2>&1 || {
         log "SKIP V2: failed to build Go frps from source"
         return 1
     }
-    (cd "$clone_dir" && go build -tags "frpc,noweb" -o "$GO_FRPC_V2" ./cmd/frpc) 2>&1 || {
+    (cd "$GO_FRP_CLONE_DIR" && go build -tags "frpc,noweb" -o "$GO_FRPC_V2" ./cmd/frpc) 2>&1 || {
         log "SKIP V2: failed to build Go frpc from source"
         return 1
     }
-    log "Go frp source build complete: frps=$GO_FRPS_V2 frpc=$GO_FRPC_V2"
+    log "Go frp source build complete (v${GO_FRP_VERSION}): frps=$GO_FRPS_V2 frpc=$GO_FRPC_V2"
     return 0
 }
 
@@ -892,15 +914,10 @@ write_frpc_config_xtcp_visitor() {
             printf 'serverName = "%s"\n' "$server_name"
             printf 'secretKey = "%s"\n' "$sk"
             printf 'bindAddr = "127.0.0.1"\nbindPort = %s\n' "$visitor_port"
-            printf 'fallbackTo = "%s-stcp-visitor"\n' "$server_name"
-            printf 'fallbackTimeoutMs = 2000\n'
-                        if $has_enc; then printf 'transport.useEncryption = true\n'; fi
+            # No fallbackTo — P2P must succeed for the test to pass.
+            # STCP fallback would mask XTCP failures (compat matrix P1).
+            if $has_enc; then printf 'transport.useEncryption = true\n'; fi
             if $has_comp; then printf 'transport.useCompression = true\n'; fi
-            printf '\n[[visitors]]\nname = "%s-stcp-visitor"\ntype = "stcp"\n' "$server_name"
-            printf 'serverName = "%s-stcp"\n' "$server_name"
-            printf 'secretKey = "%s"\n' "$sk"
-            printf 'bindAddr = "127.0.0.1"\nbindPort = -1\n'
-            # STCP fallback visitor is always plain relay — encryption is P2P-only
         } > "$out"
     else
         {
@@ -913,8 +930,8 @@ write_frpc_config_xtcp_visitor() {
             printf 'server_name = "%s"\n' "$server_name"
             printf 'sk = "%s"\n' "$sk"
             printf 'bind_addr = "127.0.0.1"\nbind_port = %s\n' "$visitor_port"
-            printf 'fallback_to = "%s-stcp"\n' "$server_name"
-            printf 'fallback_timeout_ms = 2000\n'
+            # No fallback_to — P2P must succeed for the test to pass.
+            # STCP fallback would mask XTCP failures (compat matrix P1).
             if $has_enc; then printf 'use_encryption = true\n'; fi
             if $has_comp; then printf 'use_compression = true\n'; fi
         } > "$out"

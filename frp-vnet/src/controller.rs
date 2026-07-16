@@ -61,7 +61,7 @@ impl VnetController {
         &self,
         mut tun: Box<dyn TunDevice>,
         ctl_writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
-        mut tun_packet_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        mut tun_packet_rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<()> {
         let mtu = tun.mtu() as usize;
         let mut tun_buf = vec![0u8; mtu];

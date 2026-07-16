@@ -24,7 +24,7 @@ pub(crate) async fn run_health_check(
     interval: Duration,
     timeout: Duration,
     max_failed: u32,
-    health_tx: mpsc::UnboundedSender<String>,
+    health_tx: mpsc::Sender<String>,
     cancel: Arc<AtomicBool>,
 ) {
     info!(check_type = %check_type, proxy_name = %proxy_name, local_addr = %local_addr, interval = ?interval, timeout = ?timeout, "Health check ({}) started for '{}' -> {} (interval: {:?}, timeout: {:?})",
@@ -61,7 +61,7 @@ pub(crate) async fn run_health_check(
         if failures >= max_failed {
             warn!(proxy_name = %proxy_name, max_failed = %max_failed, "Health check: proxy '{}' exceeded max failures ({}), sending CloseProxy",
                 proxy_name, max_failed);
-            let _ = health_tx.send(proxy_name.clone());
+            let _ = health_tx.try_send(proxy_name.clone());
             // Stop this health check task — the proxy is being closed.
             info!(proxy_name = %proxy_name, "Health check stopped for '{}' after CloseProxy", proxy_name);
             return;

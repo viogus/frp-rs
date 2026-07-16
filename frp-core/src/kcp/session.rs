@@ -74,7 +74,7 @@ pub(crate) struct KcpSession {
     /// Received FEC shard groups, keyed by shard_begin (seqid - seqid % total).
     shard_groups: HashMap<u32, ShardGroup>,
     recv_buf: Vec<u8>,
-    read_tx: mpsc::UnboundedSender<Vec<u8>>,
+    read_tx: mpsc::Sender<Vec<u8>>,
     shutdown: bool,
     /// Inter-packet FEC: pending data shard RS payloads (SIZE + raw KCP data).
     pending_shards: Vec<Vec<u8>>,
@@ -87,7 +87,7 @@ impl KcpSession {
         conv: u32,
         peer_addr: std::net::SocketAddr,
         config: KcpConfig,
-        read_tx: mpsc::UnboundedSender<Vec<u8>>,
+        read_tx: mpsc::Sender<Vec<u8>>,
     ) -> Self {
         let fec = if config.data_shards > 0 && config.parity_shards > 0 {
             Some(Fec::new(config.data_shards, config.parity_shards))
@@ -444,17 +444,30 @@ impl KcpSession {
                                 "KCP SESSION: recv_and_push got {} bytes",
                                 n
                             );
-                            if self.read_tx.send(self.recv_buf[..n].to_vec()).is_err() {
-                                self.shutdown = true;
-                                tracing::debug!(
-                                    conv = self.conv,
-                                    "KCP SESSION: read_tx closed, shutting down conv {}",
-                                    self.conv
-                                );
-                                return Err(io::Error::new(
-                                    io::ErrorKind::NotConnected,
-                                    "KCP read channel closed",
-                                ));
+                            match self.read_tx.try_send(self.recv_buf[..n].to_vec()) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    // Reader is slow — drop this frame.
+                                    // KCP retransmission will recover.
+                                    tracing::debug!(
+                                        conv = self.conv,
+                                        n,
+                                        "KCP SESSION: read_tx full, dropping frame ({} bytes)",
+                                        n
+                                    );
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    self.shutdown = true;
+                                    tracing::debug!(
+                                        conv = self.conv,
+                                        "KCP SESSION: read_tx closed, shutting down conv {}",
+                                        self.conv
+                                    );
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::NotConnected,
+                                        "KCP read channel closed",
+                                    ));
+                                }
                             }
                         }
                         Err(e) => return Err(io::Error::other(e)),
@@ -521,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_session_create_no_fec() {
-        let (read_tx, _read_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (read_tx, _read_rx) = tokio::sync::mpsc::channel(16);
         let session = KcpSession::new(
             12345,
             "127.0.0.1:9000".parse().unwrap(),
@@ -535,14 +548,14 @@ mod tests {
     #[test]
     fn test_session_send_recv_roundtrip() {
         let config = test_config();
-        let (read_tx1, _read_rx1) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (read_tx1, _read_rx1) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let mut s1 = KcpSession::new(
             1,
             "127.0.0.1:9001".parse().unwrap(),
             config.clone(),
             read_tx1,
         );
-        let (read_tx2, mut read_rx2) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (read_tx2, mut read_rx2) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let mut s2 = KcpSession::new(1, "127.0.0.1:9000".parse().unwrap(), config, read_tx2);
 
         s1.send(b"hello kcp").unwrap();
@@ -568,7 +581,7 @@ mod tests {
     #[test]
     fn test_session_send_no_fec_produces_packets() {
         let config = test_config();
-        let (read_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (read_tx, _) = tokio::sync::mpsc::channel(16);
         let mut session = KcpSession::new(42, "127.0.0.1:9999".parse().unwrap(), config, read_tx);
 
         session.send(b"test data").unwrap();
@@ -586,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_session_shutdown_produces_no_output() {
-        let (read_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (read_tx, _) = tokio::sync::mpsc::channel(16);
         let mut session =
             KcpSession::new(1, "127.0.0.1:9999".parse().unwrap(), test_config(), read_tx);
 
@@ -619,9 +632,9 @@ mod tests {
     #[test]
     fn test_fec_encode_decode_roundtrip() {
         let config = fec_config();
-        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx1, _rx1) = tokio::sync::mpsc::channel(16);
         let mut sender = KcpSession::new(1, "127.0.0.1:9001".parse().unwrap(), config.clone(), tx1);
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel(16);
         let mut receiver = KcpSession::new(1, "127.0.0.1:9000".parse().unwrap(), config, tx2);
 
         sender.send(b"hello fec").unwrap();
@@ -648,9 +661,9 @@ mod tests {
     fn test_fec_encode_decode_multiple_packets() {
         // Test inter-packet FEC: multiple sends produce data+parity shards.
         let config = fec_config();
-        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx1, _rx1) = tokio::sync::mpsc::channel(16);
         let mut sender = KcpSession::new(2, "127.0.0.1:9001".parse().unwrap(), config.clone(), tx1);
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel(16);
         let mut receiver = KcpSession::new(2, "127.0.0.1:9000".parse().unwrap(), config, tx2);
 
         // Send 3 packets interleaved with update to force KCP to produce
@@ -688,9 +701,9 @@ mod tests {
     #[test]
     fn test_fec_encode_decode_data_ending_with_zero() {
         let config = fec_config();
-        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx1, _rx1) = tokio::sync::mpsc::channel(16);
         let mut sender = KcpSession::new(3, "127.0.0.1:9001".parse().unwrap(), config.clone(), tx1);
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel(16);
         let mut receiver = KcpSession::new(3, "127.0.0.1:9000".parse().unwrap(), config, tx2);
 
         // Data ending with zero bytes. SIZE field protects against
@@ -719,9 +732,9 @@ mod tests {
     #[test]
     fn test_fec_parity_recovery() {
         let config = fec_config(); // non-stream: each send = one output packet
-        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx1, _rx1) = tokio::sync::mpsc::channel(16);
         let mut sender = KcpSession::new(4, "127.0.0.1:9001".parse().unwrap(), config.clone(), tx1);
-        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel(16);
         let mut receiver = KcpSession::new(4, "127.0.0.1:9000".parse().unwrap(), config, tx2);
 
         // Send 3 packets, running update after each to flush individually.
@@ -803,7 +816,7 @@ mod tests {
     fn test_fec_enabled_parity_shards_on_wire() {
         // Verify parity shards appear when data_shards packets are collected.
         let config = fec_config(); // data_shards=3, parity_shards=2
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let mut sender = KcpSession::new(5, "127.0.0.1:9999".parse().unwrap(), config, tx);
 
         // Send 3 packets interleaved with update to force KCP to produce
@@ -856,7 +869,7 @@ mod tests {
         // Non-FEC packets (flag != 0xf1/0xf2) should be treated as raw KCP.
         // Use no-FEC config so the session passes through to kcp directly.
         let config = test_config(); // data_shards=0, parity_shards=0
-        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx1, _rx1) = tokio::sync::mpsc::channel(16);
         let mut receiver = KcpSession::new(
             0, // conv must match raw packet's embedded conv (0 for all-zeros)
             "127.0.0.1:9999".parse().unwrap(),

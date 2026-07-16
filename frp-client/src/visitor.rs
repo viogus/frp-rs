@@ -92,7 +92,7 @@ pub(crate) async fn run_visitor_listener(
     max_retries_an_hour: i32,
     min_retry_interval: i64,
     stun_server: String,
-    visitor_tx: mpsc::UnboundedSender<crate::service::VisitorRequest>,
+    visitor_tx: mpsc::Sender<crate::service::VisitorRequest>,
     fallback_to: String,
 ) {
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
@@ -220,7 +220,7 @@ pub(crate) async fn run_visitor_listener(
                                 },
                                 reply: reply_tx,
                             };
-                            if vtx.send(nhv).is_err() {
+                            if vtx.try_send(nhv).is_err() {
                                 warn!(visitor_name = %visitor_name, "Visitor '{}': failed to send NatHoleVisitor to control loop (channel closed)", visitor_name);
                                 return;
                             }
