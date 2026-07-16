@@ -20,10 +20,9 @@ use frp_core::mux::IncomingStreams;
 use crate::lock::RwLockExt;
 use crate::state::{AppState, ControlTx, InternalMsg, PoolStats};
 
+use super::pool::{PendingRequest, PoolEntry, WORK_POOL_EXTRA};
 use super::proxy_ops::{err_msg, unregister_control};
-use super::{
-    write_ctl_msg, ControlContext, ControlState, PendingRequest, PoolEntry, WORK_POOL_EXTRA,
-};
+use super::{write_ctl_msg, ControlContext, ControlState};
 
 /// Authenticate a new control connection and set up per-client state.
 /// On success returns all state needed by the main select! loop.

@@ -12,7 +12,7 @@ use frp_core::transport::IoStream;
 
 use crate::service::AppState;
 
-use super::PendingRequest;
+use super::pool::PendingRequest;
 
 /// RAII guard that tracks an active bridge connection for graceful shutdown drain.
 struct ActiveGuard(std::sync::Arc<AppState>);
