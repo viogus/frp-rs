@@ -18,7 +18,10 @@ use super::stream::KcpStream;
 /// Max unprocessed write requests before KcpStream::poll_write applies
 /// backpressure (returns Poll::Pending). Prevents unbounded memory growth
 /// in the write_rx mpsc channel under high packet loss.
-pub(crate) const KCP_WRITE_BACKLOG_THRESHOLD: usize = 1024;
+/// Threshold must be strictly less than the write channel capacity (256)
+/// so the backlog gate triggers BEFORE the channel is full. This prevents
+/// the try_send-Full lost-wake race in poll_write and poll_flush.
+pub(crate) const KCP_WRITE_BACKLOG_THRESHOLD: usize = 200;
 
 /// Hard limit on total KCP sessions. Prevents an attacker from exhausting
 /// server memory by sending UDP packets with random conv values.
@@ -221,15 +224,15 @@ impl KcpSocket {
                             } else {
                                 tracing::trace!(conv, len, "KCP SOCKET: write queued {} bytes", len);
                             }
-                            // Decrement backlog and wake blocked writers.
-                            // Two cases:
-                            // 1. Gate check (backlog >= 1024): rare with bounded
-                            //    channel (cap 256), but notify when draining.
-                            // 2. try_send Full: channel fills before threshold.
-                            //    Notify after every Data item so writers blocked
-                            //    on backpressure_fut can retry.
+                            // Decrement backlog and wake ONE blocked writer.
+                            // notify_one() stores a permit if no waiters exist,
+                            // preventing the lost-wake race between poll_write's
+                            // notified_owned() and our decrement. (If we used
+                            // notify_waiters() and no waiter is registered yet,
+                            // the notification is lost, permanently blocking the
+                            // writer.)
                             let _prev = self.write_backlog.fetch_sub(1, Ordering::Release);
-                            self.write_notify.notify_waiters();
+                            self.write_notify.notify_one();
                         }
                         WriteRequest::Flush(tx) => {
                             // Force immediate KCP flush: update → drain output →

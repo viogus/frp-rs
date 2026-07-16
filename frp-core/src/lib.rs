@@ -33,7 +33,41 @@ pub mod system;
 pub mod transport;
 pub mod unsafe_features;
 pub mod v2_handshake;
+#[cfg(feature = "kcp")]
+pub mod xtcp_p2p;
 
+#[cfg(not(feature = "kcp"))]
+pub mod kcp {
+    #[derive(Clone)]
+    pub struct KcpConfig;
+    impl Default for KcpConfig {
+        fn default() -> Self {
+            Self
+        }
+    }
+}
+#[cfg(not(feature = "kcp"))]
+pub mod xtcp_p2p {
+    use tokio::net::{TcpStream, UdpSocket};
+    pub fn conv_from_sid(_sid: &str) -> u32 {
+        0
+    }
+    pub fn derive_detect_key(_sk: &str) -> [u8; 16] {
+        [0u8; 16]
+    }
+    pub async fn xtcp_p2p_connect_yamux(
+        _socket: UdpSocket,
+        _candidates: &[String],
+        _conv: u32,
+        _kcp_config: super::kcp::KcpConfig,
+        _hole_punch_timeout_ms: u64,
+        _yamux_client: bool,
+        _sid: Option<&str>,
+        _key: Option<&[u8; 16]>,
+    ) -> Result<TcpStream, String> {
+        Err("KCP feature not compiled".into())
+    }
+}
 use thiserror::Error;
 
 /// Exit codes for process termination.

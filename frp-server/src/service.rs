@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 
+#[cfg(any(feature = "dashboard", feature = "kcp", feature = "quic"))]
 use tokio_util::sync::CancellationToken;
 
 use tracing::{debug, error, info, instrument, warn};
@@ -20,6 +21,7 @@ use frp_core::transport::{accept_websocket, accept_websocket_from_peeked};
 use frp_core::transport::{detect_and_strip_magic, ConnectionType, IoStream, PreReadStream};
 use frp_core::unsafe_features::UnsafeFeatures;
 
+#[allow(unused_imports)]
 use crate::control;
 use crate::lock::RwLockExt;
 
@@ -42,6 +44,7 @@ fn is_v2_magic(buf: &[u8]) -> bool {
 
 /// Run V2 handshake then read the first message frame. Returns `None` on error
 /// (already logged). `addr` is `None` for listeners that don't capture peer addr.
+#[allow(dead_code)]
 async fn v2_handshake_and_read(
     io: &mut IoStream,
     addr: Option<std::net::SocketAddr>,

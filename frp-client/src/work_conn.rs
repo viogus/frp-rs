@@ -325,10 +325,16 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                             // Fall through to bridging
                         } else {
                             debug!(label = %label, proxy_name = %proxy_name, "XTCP work conn {}: NatHoleSid in StartWorkConn for '{}'", label, proxy_name);
-                            let _ = xtcp_tx.try_send(XtcpNotification {
-                                sid,
-                                proxy_name: proxy_name.clone(),
-                            });
+                            // send().await: backpressure is correct here —
+                            // if the control loop cannot drain XTCP notifications,
+                            // the work connection should wait rather than silently
+                            // drop the notification (which would hang the visitor).
+                            let _ = xtcp_tx
+                                .send(XtcpNotification {
+                                    sid,
+                                    proxy_name: proxy_name.clone(),
+                                })
+                                .await;
                             return; // XTCP notification: work conn consumed
                         }
                     }
@@ -362,12 +368,12 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                                     Ok(sid_msg) => {
                                                         if let Some(sid) = sid_msg.sid {
                                                             debug!(label = %label, proxy_name = %proxy_name, "XTCP work conn {}: NatHoleSid (Go frps) for '{}'", label, proxy_name);
-                                                            let _ = xtcp_tx.try_send(
-                                                                XtcpNotification {
+                                                            let _ = xtcp_tx
+                                                                .send(XtcpNotification {
                                                                     sid,
                                                                     proxy_name: proxy_name.clone(),
-                                                                },
-                                                            );
+                                                                })
+                                                                .await;
                                                             return;
                                                         }
                                                         // sid=None: STCP fallback (Go frps — unlikely)
@@ -437,10 +443,12 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                             if let Some(sid) = sid_msg.sid {
                                                 if !sid.is_empty() {
                                                     debug!(label = %label, proxy_name = %proxy_name, "XTCP work conn {}: NatHoleSid (V2) for '{}'", label, proxy_name);
-                                                    let _ = xtcp_tx.try_send(XtcpNotification {
-                                                        sid,
-                                                        proxy_name: proxy_name.clone(),
-                                                    });
+                                                    let _ = xtcp_tx
+                                                        .send(XtcpNotification {
+                                                            sid,
+                                                            proxy_name: proxy_name.clone(),
+                                                        })
+                                                        .await;
                                                     return;
                                                 }
                                             }

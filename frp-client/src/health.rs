@@ -61,7 +61,10 @@ pub(crate) async fn run_health_check(
         if failures >= max_failed {
             warn!(proxy_name = %proxy_name, max_failed = %max_failed, "Health check: proxy '{}' exceeded max failures ({}), sending CloseProxy",
                 proxy_name, max_failed);
-            let _ = health_tx.try_send(proxy_name.clone());
+            // send().await: must not silently drop CloseProxy —
+            // a dropped CloseProxy means traffic continues to a
+            // dead backend indefinitely, defeating health checks.
+            let _ = health_tx.send(proxy_name.clone()).await;
             // Stop this health check task — the proxy is being closed.
             info!(proxy_name = %proxy_name, "Health check stopped for '{}' after CloseProxy", proxy_name);
             return;

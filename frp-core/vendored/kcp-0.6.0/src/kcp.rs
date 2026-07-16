@@ -784,11 +784,12 @@ impl<Output> Kcp<Output> {
                     if timediff(sn, self.rcv_nxt + self.rcv_wnd as u32) < 0 {
                         self.ack_push(sn, ts);
                         if timediff(sn, self.rcv_nxt) >= 0 {
-                            let mut sbuf = BytesMut::with_capacity(len as usize);
-                            unsafe {
-                                sbuf.set_len(len as usize);
-                            }
-                            buf.read_exact(&mut sbuf).unwrap();
+                            // SAFETY: BytesMut::zeroed allocates and zero-fills,
+                            // so all bytes in [0, len) are initialized.
+                            // This avoids the UB of set_len on uninitialized
+                            // memory (which creates &mut [u8] to undef bytes).
+                            let mut sbuf = BytesMut::zeroed(len as usize);
+                            buf.read_exact(&mut sbuf[..]).unwrap();
                             has_read_data = true;
 
                             let mut segment = KcpSegment::new_with_data(sbuf);

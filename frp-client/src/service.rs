@@ -878,6 +878,12 @@ impl Service {
             // Map sid -> proxy_name for XTCP NatHoleResp routing (provider side).
             let mut pending_xtcp: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
+            // Map sid -> STUN UDP socket for XTCP P2P hole punching.
+            let xtcp_sockets: std::sync::Arc<
+                tokio::sync::Mutex<
+                    std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
+                >,
+            > = Default::default();
             // Map sid -> oneshot sender for visitor NatHoleResp routing (Go frps compat).
             let mut visitor_pending: std::collections::HashMap<
                 String,
@@ -923,7 +929,7 @@ impl Service {
                                 self.handle_nat_hole_client(nhc, &writer, v2).await;
                             }
                             Ok(FrpMessage::NatHoleResp(resp)) => {
-                                self.handle_nat_hole_resp(resp, &mut pending_xtcp, &mut visitor_pending).await;
+                                self.handle_nat_hole_resp(resp, &mut pending_xtcp, &mut visitor_pending, &xtcp_sockets).await;
                             }
                             Ok(FrpMessage::NewProxyResp(resp)) => {
                                 if let Some(err) = resp.error {
@@ -1044,28 +1050,40 @@ impl Service {
                     Some(xtcp_notif) = xtcp_rx.recv() => {
                         let XtcpNotification { sid, proxy_name } = xtcp_notif;
                         info!(proxy_name = %proxy_name, "XTCP provider: received NatHoleSid for '{}'", proxy_name);
-                        // 1. Do STUN discovery — run twice. Go frps v0.69.1 NAT classifier
-                        //    needs ≥2 mapped addresses to determine NAT type and behavior.
+                        // 1. Do STUN discovery on a persistent UDP socket.
+                        //    Go frps needs ≥2 mapped addresses for NAT classification.
                         let mut mapped_addrs = Vec::new();
-                        for _ in 0..2 {
-                            match frp_core::stun::stun_binding(&nat_hole_stun_server).await {
-                                Ok(addr) => {
-                                    debug!(addr = %addr, "XTCP STUN result: {}", addr);
-                                    if !mapped_addrs.contains(&addr) {
-                                        mapped_addrs.push(addr);
+                        let stun_socket = match frp_core::stun::stun_binding_with_socket(&nat_hole_stun_server).await {
+                            Ok((sock, addr1)) => {
+                                debug!(addr = %addr1, "XTCP STUN #1: {}", addr1);
+                                mapped_addrs.push(addr1);
+                                // Second STUN on same socket for NAT classification.
+                                match frp_core::stun::stun_binding_on_socket(&sock, &nat_hole_stun_server).await {
+                                    Ok(addr2) => {
+                                        debug!(addr = %addr2, "XTCP STUN #2: {}", addr2);
+                                        if !mapped_addrs.contains(&addr2) {
+                                            mapped_addrs.push(addr2);
+                                        }
                                     }
+                                    Err(e) => warn!(error = %e, "XTCP STUN #2 failed: {}", e),
                                 }
-                                Err(e) => {
-                                    warn!(error = %e, "XTCP STUN failed: {}", e);
-                                }
+                                Some(sock)
                             }
+                            Err(e) => {
+                                warn!(error = %e, "XTCP STUN failed: {}", e);
+                                None
+                            }
+                        };
+                        // Save socket for later UDP+KCP hole punch.
+                        if let Some(sock) = stun_socket {
+                            xtcp_sockets.lock().await.insert(sid.clone(), std::sync::Arc::new(sock));
                         }
-                        // 2. Send NatHoleClient on control
+                        // 2. Send NatHoleClient on control (Go v0.70 compat: protocol "kcp").
                         let client_msg = FrpMessage::NatHoleClient(msg::NatHoleClient {
                             transaction_id: sid.clone(),
                             proxy_name: proxy_name.clone(),
                             sid: Some(sid.clone()),
-                            protocol: Some("tcp".to_string()),
+                            protocol: Some("kcp".to_string()),
                             mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
                             assisted_addrs: None,
                             visitor_addr: None,
@@ -1262,9 +1280,54 @@ impl Service {
             return;
         }
 
-        // TCP simultaneous open (visitor is punching at the same time)
-        match crate::visitor::tcp_simultaneous_open(&visitor_addr, 5000).await {
-            Ok(p2p_stream) => {
+        // Go v0.70 compat: UDP hole punch + KCP data plane.
+        // Bind socket matching the visitor's address family to avoid
+        // EINVAL on macOS when sending IPv4 from IPv6 socket.
+        let is_v4 = visitor_addr
+            .parse::<std::net::SocketAddr>()
+            .map(|a| a.is_ipv4())
+            .unwrap_or(false);
+        let bind_addr = if is_v4 { "0.0.0.0:0" } else { "[::]:0" };
+        let fallback = if is_v4 { "[::]:0" } else { "0.0.0.0:0" };
+        let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
+            Ok(s) => s,
+            Err(_) => match tokio::net::UdpSocket::bind(fallback).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(proxy_name = %proxy_name, error = %e, "XTCP: failed to bind UDP socket: {}", e);
+                    Self::send_nat_hole_report(writer, v2, sid, "bind failed").await;
+                    return;
+                }
+            },
+        };
+
+        let candidates = vec![visitor_addr];
+        let conv = frp_core::xtcp_p2p::conv_from_sid(&sid);
+        let kcp_cfg = frp_core::kcp::KcpConfig::default();
+        let p2p_key = if !xtcp_sk.is_empty() {
+            Some(frp_core::xtcp_p2p::derive_detect_key(&xtcp_sk))
+        } else {
+            None
+        };
+        let p2p_sid = if sid.is_empty() {
+            None
+        } else {
+            Some(sid.as_str())
+        };
+
+        match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
+            socket,
+            &candidates,
+            conv,
+            kcp_cfg,
+            5000,
+            false, // yamux_client = false (provider/server)
+            p2p_sid,
+            p2p_key.as_ref(),
+        )
+        .await
+        {
+            Ok(mut p2p_stream) => {
                 if let Some(ref local) = local_addr {
                     match tokio::net::TcpStream::connect(local).await {
                         Ok(local_stream) => {
@@ -1274,10 +1337,10 @@ impl Service {
                             let sk = xtcp_sk.clone();
                             let pn = proxy_name.clone();
                             tokio::spawn(async move {
+                                let (local_r, local_w) = local_stream.into_split();
+                                let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
                                 if use_enc {
                                     let key = frp_core::encryption::derive_key(&sk);
-                                    let (p2p_r, p2p_w) = p2p_stream.into_split();
-                                    let (local_r, local_w) = local_stream.into_split();
                                     frp_core::bridge::bridge_encrypted(
                                         local_r,
                                         local_w,
@@ -1291,26 +1354,7 @@ impl Service {
                                         None,
                                     )
                                     .await;
-                                    debug!(proxy_name = %pn, "XTCP provider '{}' encrypted P2P closed", pn);
-                                } else if !use_comp {
-                                    // Plain, no compression. Zero-copy splice
-                                    // disabled for v0.7.0 — see bridge.rs.
-                                    let (local_r, local_w) = local_stream.into_split();
-                                    let (p2p_r, p2p_w) = p2p_stream.into_split();
-                                    frp_core::bridge::bridge_plain(
-                                        local_r,
-                                        local_w,
-                                        p2p_r,
-                                        p2p_w,
-                                        false,
-                                        vec![],
-                                        None,
-                                    )
-                                    .await;
-                                    debug!(proxy_name = %pn, "XTCP provider '{}' P2P closed", pn);
                                 } else {
-                                    let (local_r, local_w) = local_stream.into_split();
-                                    let (p2p_r, p2p_w) = p2p_stream.into_split();
                                     frp_core::bridge::bridge_plain(
                                         local_r,
                                         local_w,
@@ -1321,8 +1365,8 @@ impl Service {
                                         None,
                                     )
                                     .await;
-                                    debug!(proxy_name = %pn, "XTCP provider '{}' P2P closed", pn);
                                 }
+                                debug!(proxy_name = %pn, "XTCP provider '{}' encrypted P2P closed", pn);
                             });
                         }
                         Err(e) => {
@@ -1367,6 +1411,11 @@ impl Service {
         resp: msg::NatHoleResp,
         pending_xtcp: &mut HashMap<String, String>,
         visitor_pending: &mut HashMap<String, oneshot::Sender<Result<msg::NatHoleResp, String>>>,
+        xtcp_sockets: &std::sync::Arc<
+            tokio::sync::Mutex<
+                std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
+            >,
+        >,
     ) {
         // Route to waiting visitor first (Go frps compat path).
         let txn_id = resp.transaction_id.clone();
@@ -1409,82 +1458,133 @@ impl Service {
         let xtcp_use_comp = proxy_info.as_ref().map(|p| p.2).unwrap_or(false);
         let xtcp_sk = proxy_info.as_ref().map(|p| p.3.clone()).unwrap_or_default();
         let proxy_name_clone = proxy_name.clone();
+        let sid_clone = sid.clone();
+        let xtcp_sockets_clone = xtcp_sockets.clone();
         tokio::spawn(async move {
-            for addr in &candidate_addrs {
-                debug!(proxy_name = %proxy_name_clone, addr = %addr, "XTCP provider '{}': trying simultaneous open to {}", proxy_name_clone, addr);
-                match crate::visitor::tcp_simultaneous_open(addr, 5000).await {
-                    Ok(p2p) => {
-                        info!(proxy_name = %proxy_name_clone, addr = %addr, "XTCP provider '{}': P2P connected to {}", proxy_name_clone, addr);
-                        if let Some(ref local) = local_addr {
-                            match tokio::net::TcpStream::connect(local).await {
-                                Ok(local_conn) => {
-                                    frp_core::transport::set_nodelay(&local_conn);
-                                    let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
-                                    if use_enc {
-                                        let key = frp_core::encryption::derive_key(&xtcp_sk);
-                                        let (p2p_r, p2p_w) = p2p.into_split();
-                                        let (local_r, local_w) = local_conn.into_split();
-                                        frp_core::bridge::bridge_encrypted(
-                                            local_r,
-                                            local_w,
-                                            p2p_r,
-                                            p2p_w,
-                                            &key,
-                                            xtcp_use_comp,
-                                            vec![],
-                                            None,
-                                            None,
-                                            None,
-                                        )
-                                        .await;
-                                        debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' encrypted P2P closed", proxy_name_clone);
-                                    } else if !xtcp_use_comp {
-                                        // Plain, no compression. Zero-copy splice
-                                        // disabled for v0.7.0 — see bridge.rs.
-                                        let (local_r, local_w) = local_conn.into_split();
-                                        let (p2p_r, p2p_w) = p2p.into_split();
-                                        frp_core::bridge::bridge_plain(
-                                            local_r,
-                                            local_w,
-                                            p2p_r,
-                                            p2p_w,
-                                            false,
-                                            vec![],
-                                            None,
-                                        )
-                                        .await;
-                                        debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' P2P closed", proxy_name_clone);
-                                    } else {
-                                        let (local_r, local_w) = local_conn.into_split();
-                                        let (p2p_r, p2p_w) = p2p.into_split();
-                                        frp_core::bridge::bridge_plain(
-                                            local_r,
-                                            local_w,
-                                            p2p_r,
-                                            p2p_w,
-                                            xtcp_use_comp,
-                                            vec![],
-                                            None,
-                                        )
-                                        .await;
-                                        debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' P2P closed", proxy_name_clone);
-                                    }
-                                }
+            // Retrieve the STUN socket persisted by the control loop.
+            let stun_socket = {
+                let mut map = xtcp_sockets_clone.lock().await;
+                map.remove(&sid_clone)
+            };
+
+            // Bind socket address family matching the first candidate to avoid
+            // IPv4/IPv6 mismatch (EINVAL on macOS).
+            let is_v4 = candidate_addrs
+                .first()
+                .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
+                .map(|a| a.is_ipv4())
+                .unwrap_or(false);
+            let bind_addr = if is_v4 { "0.0.0.0:0" } else { "[::]:0" };
+            let fallback_bind = if is_v4 { "[::]:0" } else { "0.0.0.0:0" };
+
+            let socket = if let Some(arc_sock) = stun_socket {
+                // Try to unwrap the Arc. If there are other references,
+                // bind a fresh socket (unlikely — we removed from map).
+                match std::sync::Arc::try_unwrap(arc_sock) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        warn!(proxy_name = %proxy_name_clone, "XTCP provider '{}': STUN socket still shared, binding fresh", proxy_name_clone);
+                        match tokio::net::UdpSocket::bind(bind_addr).await {
+                            Ok(s) => s,
+                            Err(_) => match tokio::net::UdpSocket::bind(fallback_bind).await {
+                                Ok(s) => s,
                                 Err(e) => {
-                                    warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': connect local failed: {}", proxy_name_clone, e);
+                                    warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': failed to bind UDP socket", proxy_name_clone);
+                                    return;
                                 }
-                            }
-                        } else {
-                            warn!(proxy_name = %proxy_name_clone, "XTCP provider '{}': no local address", proxy_name_clone);
+                            },
                         }
-                        return;
-                    }
-                    Err(e) => {
-                        debug!(proxy_name = %proxy_name_clone, addr = %addr, error = %e, "XTCP provider '{}': hole punch to {} failed: {}", proxy_name_clone, addr, e);
                     }
                 }
+            } else {
+                match tokio::net::UdpSocket::bind(bind_addr).await {
+                    Ok(s) => s,
+                    Err(_) => match tokio::net::UdpSocket::bind(fallback_bind).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': failed to bind UDP socket", proxy_name_clone);
+                            return;
+                        }
+                    },
+                }
+            };
+
+            // UDP hole punch + KCP data plane (Go v0.70 compat).
+            let conv = frp_core::xtcp_p2p::conv_from_sid(&sid_clone);
+            let kcp_cfg = frp_core::kcp::KcpConfig::default();
+            let p2p_key = if !xtcp_sk.is_empty() {
+                Some(frp_core::xtcp_p2p::derive_detect_key(&xtcp_sk))
+            } else {
+                None
+            };
+            let p2p_sid = if sid_clone.is_empty() {
+                None
+            } else {
+                Some(sid_clone.as_str())
+            };
+            // Provider acts as yamux server: accepts the visitor's stream.
+            match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
+                socket,
+                &candidate_addrs,
+                conv,
+                kcp_cfg,
+                5000,
+                false, // yamux_client = false (provider/server)
+                p2p_sid,
+                p2p_key.as_ref(),
+            )
+            .await
+            {
+                Ok(mut p2p_stream) => {
+                    info!(proxy_name = %proxy_name_clone, "XTCP provider '{}': P2P connected via KCP+yamux", proxy_name_clone);
+                    if let Some(ref local) = local_addr {
+                        match tokio::net::TcpStream::connect(local).await {
+                            Ok(local_conn) => {
+                                frp_core::transport::set_nodelay(&local_conn);
+                                let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
+                                let (local_r, local_w) = local_conn.into_split();
+                                let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
+                                if use_enc {
+                                    let key = frp_core::encryption::derive_key(&xtcp_sk);
+                                    frp_core::bridge::bridge_encrypted(
+                                        local_r,
+                                        local_w,
+                                        p2p_r,
+                                        p2p_w,
+                                        &key,
+                                        xtcp_use_comp,
+                                        vec![],
+                                        None,
+                                        None,
+                                        None,
+                                    )
+                                    .await;
+                                } else {
+                                    frp_core::bridge::bridge_plain(
+                                        local_r,
+                                        local_w,
+                                        p2p_r,
+                                        p2p_w,
+                                        xtcp_use_comp,
+                                        vec![],
+                                        None,
+                                    )
+                                    .await;
+                                }
+                                debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' P2P closed", proxy_name_clone);
+                            }
+                            Err(e) => {
+                                warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': connect local failed", proxy_name_clone);
+                            }
+                        }
+                    } else {
+                        warn!(proxy_name = %proxy_name_clone, "XTCP provider '{}': no local address", proxy_name_clone);
+                    }
+                }
+                Err(e) => {
+                    warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': UDP+KCP+yamux hole punch failed", proxy_name_clone);
+                }
             }
-            warn!(proxy_name = %proxy_name_clone, "XTCP provider '{}': all hole punch attempts failed", proxy_name_clone);
         });
     }
 

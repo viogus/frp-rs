@@ -14,32 +14,47 @@ const MAGIC_COOKIE: u32 = 0x2112A442;
 const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 
+/// Resolve `addr_str` ("host:port" or "ip:port") to a `SocketAddr`, performing
+/// DNS lookup if needed.
+async fn resolve_stun_addr(addr_str: &str) -> Result<SocketAddr, String> {
+    if let Ok(sa) = addr_str.parse::<SocketAddr>() {
+        return Ok(sa);
+    }
+    let addrs = tokio::net::lookup_host(addr_str.to_string())
+        .await
+        .map_err(|e| format!("STUN DNS lookup failed for '{}': {}", addr_str, e))?;
+    addrs
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("STUN DNS: no addresses found for '{}'", addr_str))
+}
+
+/// Bind a UDP socket matching the address family of `target`.
+/// Tries the family-matching bind first, falls back to the other family.
+async fn bind_matching_family(target: SocketAddr) -> Result<UdpSocket, String> {
+    if target.is_ipv4() {
+        match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => Ok(s),
+            Err(_) => UdpSocket::bind("[::]:0")
+                .await
+                .map_err(|e| format!("STUN socket bind: {e}")),
+        }
+    } else {
+        match UdpSocket::bind("[::]:0").await {
+            Ok(s) => Ok(s),
+            Err(_) => UdpSocket::bind("0.0.0.0:0")
+                .await
+                .map_err(|e| format!("STUN socket bind: {e}")),
+        }
+    }
+}
+
 /// Send a STUN Binding Request to `stun_addr` (format: "stun:host:port" or "host:port").
 /// Returns the mapped address as "ip:port".
 pub async fn stun_binding(stun_addr: &str) -> Result<String, String> {
     let addr_str = stun_addr.strip_prefix("stun:").unwrap_or(stun_addr);
-    // Resolve hostname to SocketAddr (Go frp compat: net.ResolveUDPAddr)
-    let addr: SocketAddr = if let Ok(sa) = addr_str.parse::<SocketAddr>() {
-        sa
-    } else {
-        // Try DNS resolution
-        let addrs = tokio::net::lookup_host(addr_str.to_string())
-            .await
-            .map_err(|e| format!("STUN DNS lookup failed for '{}': {}", addr_str, e))?;
-        addrs
-            .into_iter()
-            .next()
-            .ok_or_else(|| format!("STUN DNS: no addresses found for '{}'", addr_str))?
-    };
-
-    // Bind [::]:0 first for dual-stack (IPv4+IPv6 on same socket).
-    // Fall back to 0.0.0.0:0 on IPv4-only hosts where IPv6 bind fails.
-    let socket = match UdpSocket::bind("[::]:0").await {
-        Ok(s) => s,
-        Err(_) => UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| format!("STUN socket bind: {e}"))?,
-    };
+    let addr = resolve_stun_addr(addr_str).await?;
+    let socket = bind_matching_family(addr).await?;
 
     let mut tx_id = [0u8; 12];
     rand::thread_rng().fill(&mut tx_id);
@@ -65,6 +80,73 @@ pub async fn stun_binding(stun_addr: &str) -> Result<String, String> {
     }
 
     parse_binding_response(&buf[..n], &tx_id)
+}
+
+/// Run STUN on an already-bound UDP socket, returning the mapped address.
+/// Useful for XTCP: run STUN twice on the same socket to get ≥2 mapped
+/// addresses for NAT classification, then reuse the socket for hole punching.
+pub async fn stun_binding_on_socket(socket: &UdpSocket, stun_addr: &str) -> Result<String, String> {
+    let addr_str = stun_addr.strip_prefix("stun:").unwrap_or(stun_addr);
+    let addr = resolve_stun_addr(addr_str).await?;
+
+    let mut tx_id = [0u8; 12];
+    rand::thread_rng().fill(&mut tx_id);
+    let request = build_binding_request(&tx_id);
+
+    socket
+        .send_to(&request, addr)
+        .await
+        .map_err(|e| format!("STUN send: {e}"))?;
+
+    let mut buf = [0u8; 256];
+    let (n, _src) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        socket.recv_from(&mut buf),
+    )
+    .await
+    .map_err(|_| "STUN response timeout".to_string())?
+    .map_err(|e| format!("STUN recv: {e}"))?;
+
+    if n < 20 {
+        return Err("STUN response too short".into());
+    }
+
+    parse_binding_response(&buf[..n], &tx_id)
+}
+
+/// Like `stun_binding`, but returns the bound UDP socket along with the
+/// mapped address. The caller can reuse the socket for subsequent NAT hole
+/// punching (XTCP P2P).
+pub async fn stun_binding_with_socket(stun_addr: &str) -> Result<(UdpSocket, String), String> {
+    let addr_str = stun_addr.strip_prefix("stun:").unwrap_or(stun_addr);
+    let addr = resolve_stun_addr(addr_str).await?;
+    let socket = bind_matching_family(addr).await?;
+
+    let mut tx_id = [0u8; 12];
+    rand::thread_rng().fill(&mut tx_id);
+    let request = build_binding_request(&tx_id);
+
+    socket
+        .send_to(&request, addr)
+        .await
+        .map_err(|e| format!("STUN send: {e}"))?;
+    debug!(addr = %addr, "STUN Binding Request sent to {}", addr);
+
+    let mut buf = [0u8; 256];
+    let (n, _src) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        socket.recv_from(&mut buf),
+    )
+    .await
+    .map_err(|_| "STUN response timeout".to_string())?
+    .map_err(|e| format!("STUN recv: {e}"))?;
+
+    if n < 20 {
+        return Err("STUN response too short".into());
+    }
+
+    let mapped = parse_binding_response(&buf[..n], &tx_id)?;
+    Ok((socket, mapped))
 }
 
 fn build_binding_request(tx_id: &[u8; 12]) -> Vec<u8> {

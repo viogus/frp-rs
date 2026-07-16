@@ -459,16 +459,10 @@ impl AeadStream {
         );
         if self.read.scratch.len() != len {
             self.read.scratch.clear();
-            if self.read.scratch.capacity() >= len {
-                // SAFETY: capacity is sufficient; the loop below reads exactly
-                // `len` bytes via poll_read before any data is observed (guarded
-                // by scratch_filled). No uninitialized bytes are ever exposed.
-                unsafe {
-                    self.read.scratch.set_len(len);
-                }
-            } else {
-                self.read.scratch.resize(len, 0);
-            }
+            // Always zero-initialize: passing &mut [u8] of uninitialized
+            // memory to ReadBuf::new() is UB per Rust reference validity
+            // rules, even when guarded by a fill counter.
+            self.read.scratch.resize(len, 0);
             self.read.scratch_filled = 0;
         }
         while self.read.scratch_filled < len {

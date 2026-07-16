@@ -35,7 +35,7 @@ pub struct KcpStream {
     /// Shared write backlog counter with KcpSocket. poll_write gates on this
     /// to prevent unbounded write_rx channel growth under high packet loss.
     write_backlog: Arc<AtomicUsize>,
-    /// Woken by KcpSocket when backlog drains below threshold.
+    /// Woken by KcpSocket when backlog drains below threshold (via notify_one).
     write_notify: Arc<Notify>,
     /// Pending backpressure wait future. Created when write backlog is full;
     /// resolved when KcpSocket drains enough backlog and calls notify_waiters().
@@ -257,13 +257,39 @@ impl AsyncWrite for KcpStream {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // First: poll any pending backpressure future from poll_write.
+        if let Some(ref mut fut) = self.backpressure_fut {
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    self.backpressure_fut = None;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
         // Send a flush request if we don't have one pending.
         if self.flush_rx.is_none() {
+            // Backlog gate: same as poll_write, prevents lost wake by ensuring
+            // capacity exists before try_send.
+            let backlog = self.write_backlog.load(Ordering::Relaxed);
+            if backlog >= KCP_WRITE_BACKLOG_THRESHOLD {
+                let notified = self.write_notify.clone().notified_owned();
+                self.backpressure_fut = Some(Box::pin(notified));
+                if let Some(ref mut fut) = self.backpressure_fut {
+                    match fut.as_mut().poll(cx) {
+                        Poll::Ready(()) => {
+                            self.backpressure_fut = None;
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+            }
+
             let (tx, rx) = tokio::sync::oneshot::channel();
             match self.write_tx.try_send((self.conv, WriteRequest::Flush(tx))) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    // Wait for socket to drain — same backpressure as poll_write.
+                    // Backlog gate should prevent this; defensive fallback.
                     let notified = self.write_notify.clone().notified_owned();
                     self.backpressure_fut = Some(Box::pin(notified));
                     if let Some(ref mut fut) = self.backpressure_fut {
