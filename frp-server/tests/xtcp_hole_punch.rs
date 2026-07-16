@@ -41,7 +41,7 @@ async fn test_xtcp_nat_hole_message_routing() {
     let run_id = resp.run_id.expect("provider should get run_id");
 
     let xtcp_sk = "xtcp-test-sk";
-    let np = FrpMessage::NewProxy(NewProxy {
+    let np = FrpMessage::NewProxy(Box::new(NewProxy {
         proxy_name: "xtcp-test".into(),
         proxy_type: "xtcp".into(),
         sk: Some(xtcp_sk.to_string()),
@@ -76,7 +76,7 @@ async fn test_xtcp_nat_hole_message_routing() {
         vnet_netmask: None,
         #[cfg(feature = "vnet")]
         vnet_mtu: None,
-    });
+    }));
     write_msg_v1(&mut provider_ctl, &np)
         .await
         .expect("send NewProxy");
@@ -204,7 +204,7 @@ async fn test_xtcp_nat_hole_message_routing() {
     };
 
     // --- Provider does "STUN" → sends NatHoleClient on CONTROL conn ---
-    let client_msg = FrpMessage::NatHoleClient(msg::NatHoleClient {
+    let client_msg = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
         transaction_id: txn_id.clone(),
         proxy_name: "xtcp-test".into(),
         sid: Some(sid.clone()),
@@ -215,7 +215,7 @@ async fn test_xtcp_nat_hole_message_routing() {
         ]),
         assisted_addrs: None,
         visitor_addr: None,
-    });
+    }));
     write_msg_v1(&mut provider_ctl, &client_msg)
         .await
         .expect("send NatHoleClient on control");
@@ -300,7 +300,7 @@ async fn test_xtcp_nat_hole_message_routing() {
     println!("Provider sent NatHoleReport for cleanup");
 
     // --- Verify: provider control connection still usable after session ---
-    let np2 = FrpMessage::NewProxy(NewProxy {
+    let np2 = FrpMessage::NewProxy(Box::new(NewProxy {
         proxy_name: "xtcp-test-2".into(),
         proxy_type: "xtcp".into(),
         sk: Some("another-sk".to_string()),
@@ -335,7 +335,7 @@ async fn test_xtcp_nat_hole_message_routing() {
         vnet_netmask: None,
         #[cfg(feature = "vnet")]
         vnet_mtu: None,
-    });
+    }));
     write_msg_v1(&mut provider_ctl, &np2)
         .await
         .expect("send NewProxy after hole punch");
@@ -377,7 +377,7 @@ async fn test_xtcp_ignore_nat_hole_client_no_sid() {
     let _run_id = resp.run_id.expect("run_id");
 
     // Register XTCP proxy
-    let np = FrpMessage::NewProxy(NewProxy {
+    let np = FrpMessage::NewProxy(Box::new(NewProxy {
         proxy_name: "ignore-no-sid".into(),
         proxy_type: "xtcp".into(),
         sk: Some("ignore-no-sid-sk".to_string()),
@@ -412,7 +412,7 @@ async fn test_xtcp_ignore_nat_hole_client_no_sid() {
         vnet_netmask: None,
         #[cfg(feature = "vnet")]
         vnet_mtu: None,
-    });
+    }));
     write_msg_v1(&mut provider_ctl, &np)
         .await
         .expect("send NewProxy");
@@ -424,20 +424,20 @@ async fn test_xtcp_ignore_nat_hole_client_no_sid() {
     }
 
     // Send NatHoleClient WITHOUT sid - server should silently drop it
-    let bogus = FrpMessage::NatHoleClient(msg::NatHoleClient {
+    let bogus = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
         transaction_id: "no-sid-txn".into(),
         proxy_name: "ignore-no-sid".into(),
         sid: None,
         protocol: Some("tcp".to_string()),
         mapped_addrs: Some(vec!["10.0.0.1:9999".to_string()]),
         ..Default::default()
-    });
+    }));
     write_msg_v1(&mut provider_ctl, &bogus)
         .await
         .expect("send bogus NatHoleClient");
 
     // Verify control channel is still operational
-    let np2 = FrpMessage::NewProxy(NewProxy {
+    let np2 = FrpMessage::NewProxy(Box::new(NewProxy {
         proxy_name: "after-no-sid-2".into(),
         proxy_type: "xtcp".into(),
         sk: Some("after-no-sid-sk-2".to_string()),
@@ -472,7 +472,7 @@ async fn test_xtcp_ignore_nat_hole_client_no_sid() {
         vnet_netmask: None,
         #[cfg(feature = "vnet")]
         vnet_mtu: None,
-    });
+    }));
     write_msg_v1(&mut provider_ctl, &np2)
         .await
         .expect("send NewProxy 2");

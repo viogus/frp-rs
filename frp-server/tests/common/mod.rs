@@ -61,7 +61,7 @@ pub async fn raw_login(
         .await
         .map_err(|e| frp_core::Error::Transport(format!("connect to {}: {}", addr, e).into()))?;
 
-    let login = FrpMessage::Login(Login {
+    let login = FrpMessage::Login(Box::new(Login {
         version: Some(frp_core::VERSION.into()),
         hostname: Some("test-host".into()),
         os: Some(std::env::consts::OS.into()),
@@ -75,7 +75,7 @@ pub async fn raw_login(
         metas: None,
         client_spec: None,
         multiplexer: None,
-    });
+    }));
 
     let mut io = IoStream::Tcp(stream);
     write_msg_v1(&mut io, &login).await?;

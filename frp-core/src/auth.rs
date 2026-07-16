@@ -20,7 +20,7 @@ pub fn generate_token(token: &str, timestamp: i64) -> String {
     let mut hasher = Md5::new();
     hasher.update(token.as_bytes());
     hasher.update(timestamp.to_string().as_bytes());
-    hex::encode(hasher.finalize())
+    crate::hex_encode(hasher.finalize().as_slice())
 }
 
 /// Verify a token against a known secret and timestamp.

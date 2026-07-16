@@ -207,7 +207,7 @@ async fn handle_visitor_conn(
     } else {
         login.privilege_key = auth_cfg.generate_login_key(timestamp);
     }
-    write_msg_v1(&mut server_stream, &FrpMessage::Login(login))
+    write_msg_v1(&mut server_stream, &FrpMessage::Login(Box::new(login)))
         .await
         .map_err(|e| format!("write login: {e}"))?;
 

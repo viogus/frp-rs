@@ -31,7 +31,7 @@ async fn test_stcp_visitor_routed_to_provider() {
 
     // --- Step 2: Provider registers STCP proxy ---
     let stcp_sk = "test-stcp-secret-key";
-    let np = FrpMessage::NewProxy(NewProxy {
+    let np = FrpMessage::NewProxy(Box::new(NewProxy {
         proxy_name: "stcp-test".into(),
         proxy_type: "stcp".into(),
         sk: Some(stcp_sk.to_string()),
@@ -66,7 +66,7 @@ async fn test_stcp_visitor_routed_to_provider() {
         vnet_netmask: None,
         #[cfg(feature = "vnet")]
         vnet_mtu: None,
-    });
+    }));
     write_msg_v1(&mut provider, &np)
         .await
         .expect("send NewProxy");

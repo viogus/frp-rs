@@ -7,6 +7,9 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
     },
+    http::HeaderValue,
+    middleware,
+    middleware::Next,
     response::Html,
     routing::{delete, get},
     Json, Router,
@@ -728,6 +731,22 @@ async fn run_traffic_events(state: Arc<AppState>) {
     }
 }
 
+/// Security headers middleware: adds common HTTP security headers to every
+/// dashboard response. Applied as axum middleware so handler return types
+/// are unaffected — no test breakage from response type mismatches.
+async fn add_security_headers(req: axum::extract::Request, next: Next) -> axum::response::Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert("X-Content-Type-Options", HeaderValue::from_static("nosniff"));
+    headers.insert("X-Frame-Options", HeaderValue::from_static("DENY"));
+    headers.insert("X-XSS-Protection", HeaderValue::from_static("1; mode=block"));
+    headers.insert(
+        "Referrer-Policy",
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    response
+}
+
 // --- Dashboard runner ---
 
 pub async fn run_dashboard(
@@ -792,6 +811,10 @@ pub async fn run_dashboard(
     tokio::spawn(async move {
         run_traffic_events(traffic_state).await;
     });
+
+    // Apply security headers middleware (P2-2). Uses axum::middleware::from_fn
+    // so it operates on Response, not handler return types — won't break tests.
+    let app = app.layer(middleware::from_fn(add_security_headers));
 
     let app = app.with_state(state);
 

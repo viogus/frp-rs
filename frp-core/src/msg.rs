@@ -533,17 +533,17 @@ pub enum FrpMessage {
     NewProxyResp(NewProxyResp),
     NewVisitorConnResp(NewVisitorConnResp),
     Pong(Pong),
-    NewProxy(NewProxy),
+    NewProxy(Box<NewProxy>),
     UDPPacket(UDPPacket),
-    StartWorkConn(StartWorkConn),
+    StartWorkConn(Box<StartWorkConn>),
     NewVisitorConn(NewVisitorConn),
     NewWorkConn(NewWorkConn),
     Ping(Ping),
     LoginResp(LoginResp),
-    Login(Login),
+    Login(Box<Login>),
     NatHoleVisitor(NatHoleVisitor),
-    NatHoleClient(NatHoleClient),
-    NatHoleResp(NatHoleResp),
+    NatHoleClient(Box<NatHoleClient>),
+    NatHoleResp(Box<NatHoleResp>),
     NatHoleSid(NatHoleSid),
     NatHoleReport(NatHoleReport),
     Error(Error),
@@ -701,7 +701,7 @@ impl FrpMessage {
     /// Construct an empty FrpMessage from a V1 type byte (for deserialization).
     pub fn from_v1_type_byte(ty: u8) -> Option<FrpMessage> {
         match ty {
-            TYPE_LOGIN => Some(FrpMessage::Login(Login {
+            TYPE_LOGIN => Some(FrpMessage::Login(Box::new(Login {
                 version: None,
                 hostname: None,
                 os: None,
@@ -715,14 +715,14 @@ impl FrpMessage {
                 metas: None,
                 client_spec: None,
                 multiplexer: None,
-            })),
+            }))),
             TYPE_LOGIN_RESP => Some(FrpMessage::LoginResp(LoginResp {
                 version: None,
                 run_id: None,
                 error: None,
                 server_additional_auth_scopes: None,
             })),
-            TYPE_NEW_PROXY => Some(FrpMessage::NewProxy(NewProxy {
+            TYPE_NEW_PROXY => Some(FrpMessage::NewProxy(Box::new(NewProxy {
                 proxy_name: String::new(),
                 proxy_type: String::new(),
                 use_encryption: None,
@@ -753,7 +753,7 @@ impl FrpMessage {
                 vnet_ip: None,
                 vnet_netmask: None,
                 vnet_mtu: None,
-            })),
+            }))),
             TYPE_NEW_PROXY_RESP => Some(FrpMessage::NewProxyResp(NewProxyResp {
                 proxy_name: String::new(),
                 remote_addr: None,
@@ -768,7 +768,7 @@ impl FrpMessage {
                 privilege_key: None,
             })),
             TYPE_REQ_WORK_CONN => Some(FrpMessage::ReqWorkConn(ReqWorkConn {})),
-            TYPE_START_WORK_CONN => Some(FrpMessage::StartWorkConn(StartWorkConn {
+            TYPE_START_WORK_CONN => Some(FrpMessage::StartWorkConn(Box::new(StartWorkConn {
                 proxy_name: String::new(),
                 src_addr: None,
                 src_port: None,
@@ -780,7 +780,7 @@ impl FrpMessage {
                 nat_hole_sid: None,
                 nat_hole_visitor_addr: None,
                 sk: None,
-            })),
+            }))),
             TYPE_PING => Some(FrpMessage::Ping(Ping {
                 privilege_key: None,
                 timestamp: None,
@@ -806,8 +806,8 @@ impl FrpMessage {
                 remote_addr: None,
             })),
             TYPE_NAT_HOLE_VISITOR => Some(FrpMessage::NatHoleVisitor(NatHoleVisitor::default())),
-            TYPE_NAT_HOLE_CLIENT => Some(FrpMessage::NatHoleClient(NatHoleClient::default())),
-            TYPE_NAT_HOLE_RESP => Some(FrpMessage::NatHoleResp(NatHoleResp::default())),
+            TYPE_NAT_HOLE_CLIENT => Some(FrpMessage::NatHoleClient(Box::<NatHoleClient>::default())),
+            TYPE_NAT_HOLE_RESP => Some(FrpMessage::NatHoleResp(Box::<NatHoleResp>::default())),
             TYPE_NAT_HOLE_SID => Some(FrpMessage::NatHoleSid(NatHoleSid {
                 sid: None,
                 provider_addr: None,

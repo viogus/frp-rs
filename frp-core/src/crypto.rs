@@ -436,10 +436,10 @@ impl AeadStream {
             }
             Err(e) => {
                 #[cfg(debug_assertions)]
-                tracing::warn!(frame = %self.read.frame_count, error = %e, nonce = %hex::encode(&self.read.nonce), stream_nonce = %hex::encode(stream_nonce), "[AEAD-READ] frame={} decrypt FAILED: {} (nonce={}, stream_nonce={})",
+                tracing::warn!(frame = %self.read.frame_count, error = %e, nonce = %crate::hex_encode(&self.read.nonce), stream_nonce = %crate::hex_encode(stream_nonce), "[AEAD-READ] frame={} decrypt FAILED: {} (nonce={}, stream_nonce={})",
                     self.read.frame_count, e,
-                    hex::encode(&self.read.nonce),
-                    hex::encode(stream_nonce));
+                    crate::hex_encode(&self.read.nonce),
+                    crate::hex_encode(stream_nonce));
                 #[cfg(not(debug_assertions))]
                 tracing::warn!(frame = %self.read.frame_count, error = %e, "[AEAD-READ] frame={} decrypt FAILED: {}", self.read.frame_count, e);
                 return Poll::Ready(Err(io::Error::new(
@@ -558,7 +558,7 @@ impl AsyncWrite for AeadStream {
         // Send stream nonce first if needed
         if !this.write.header_sent {
             #[cfg(debug_assertions)]
-            tracing::debug!(nonce = %hex::encode(&this.write.nonce), "[AEAD-WRITE] first write: nonce={}", hex::encode(&this.write.nonce));
+            tracing::debug!(nonce = %crate::hex_encode(&this.write.nonce), "[AEAD-WRITE] first write: nonce={}", crate::hex_encode(&this.write.nonce));
             #[cfg(not(debug_assertions))]
             tracing::debug!("[AEAD-WRITE] first write");
             // Queue the nonce write

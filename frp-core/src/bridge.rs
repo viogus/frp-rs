@@ -12,7 +12,7 @@ use crate::transport::IoStream;
 /// Emit a TRACE-level event with a hex-encoded field.
 ///
 /// In release builds (`debug_assertions` off), the entire call is compiled
-/// away so `hex::encode` is never evaluated.  In debug builds the standard
+/// away so `crate::hex_encode` is never evaluated.  In debug builds the standard
 /// `tracing::trace!` static-filter guard still applies.
 macro_rules! trace_hex {
     ($($arg:tt)*) => {
@@ -58,6 +58,12 @@ fn make_decompressor(use_compression: bool) -> Option<encryption::SnappyDecompre
     }
 }
 
+/// Maximum factor by which decompressed output may exceed the bridge buffer
+/// size before it is treated as a decompression bomb.  4x is generous for
+/// normal Snappy ratios (1.5-2x after framing overhead) while blocking
+/// maliciously crafted payloads that would occupy excessive memory.
+const MAX_DECOMPRESS_FACTOR: usize = 4;
+
 /// Feed a chunk through the decompressor into a reusable buffer.
 /// Returns `None` on decompress error — the caller should break its loop.
 #[inline]
@@ -74,6 +80,18 @@ fn decompress_chunk_into<'a>(
                     tracing::warn!(error = %_e, "snappy decompress error in bridge: {}", _e);
                 })
                 .ok()?;
+            // Reject decompression bombs: decompressed output should be
+            // proportional to the bridge buffer size.
+            let limit = MAX_DECOMPRESS_FACTOR * *crate::buffer_pool::BUFFER_SIZE;
+            if buf.len() > limit {
+                #[cfg(feature = "compression")]
+                tracing::warn!(
+                    len = buf.len(),
+                    limit,
+                    "bridge: decompressed output exceeds limit, possible decompression bomb"
+                );
+                return None;
+            }
             Some(buf.as_slice())
         }
         None => Some(data),
@@ -154,7 +172,7 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
         let n = match user_r.read(buf.as_mut_slice()).await {
             Ok(0) => break,
             Ok(n) => {
-                trace_hex!(n, first_hex = %hex::encode(&buf.raw_buf()[..n.min(32)]), "bridge user_to_work: read {} bytes", n);
+                trace_hex!(n, first_hex = %crate::hex_encode(&buf.raw_buf()[..n.min(32)]), "bridge user_to_work: read {} bytes", n);
                 if let Some(ref m) = metrics {
                     m.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
                 }
@@ -224,7 +242,7 @@ async fn bridge_work_to_user(
         let n = match work_r.read(buf.as_mut_slice()).await {
             Ok(0) => break,
             Ok(n) => {
-                trace_hex!(n, first_hex = %hex::encode(&buf.raw_buf()[..n.min(32)]), "bridge work_to_user: read {} bytes", n);
+                trace_hex!(n, first_hex = %crate::hex_encode(&buf.raw_buf()[..n.min(32)]), "bridge work_to_user: read {} bytes", n);
                 n
             }
             Err(e) => {

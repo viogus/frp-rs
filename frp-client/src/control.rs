@@ -298,7 +298,7 @@ impl ControlConnection {
             login.privilege_key = self.auth_cfg.generate_login_key(timestamp);
         }
 
-        let login = FrpMessage::Login(login);
+        let login = FrpMessage::Login(Box::new(login));
 
         if self.v2 {
             io_stream.write_v2_frame(&login).await?;

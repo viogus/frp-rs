@@ -286,6 +286,19 @@ pub fn version_str() -> String {
     format!("frp-rs/{}", VERSION)
 }
 
+/// Hex-encode bytes into a `String`. Inline replacement for the `hex` crate
+/// (removes one dependency, saves ~30-50KB in release binaries).
+/// Uses a 16-byte lookup table and pre-allocates the output string.
+pub fn hex_encode(bytes: &[u8]) -> String {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX_CHARS[(b >> 4) as usize] as char);
+        s.push(HEX_CHARS[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
 /// Format a host:port string correctly for IPv4 and IPv6.
 /// IPv6 addresses are wrapped in brackets: [::1]:7000.
 /// Hostnames and IPv4 addresses use plain format: 0.0.0.0:7000.

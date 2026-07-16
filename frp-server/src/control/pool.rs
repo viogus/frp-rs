@@ -122,7 +122,7 @@ pub(crate) async fn write_start_work_conn_with_nat_hole_sid<W: AsyncWriteExt + U
     v2: bool,
     context: &str,
 ) {
-    let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
+    let swc = FrpMessage::StartWorkConn(Box::new(msg::StartWorkConn {
         proxy_name: proxy_name.to_string(),
         src_addr: None,
         src_port: None,
@@ -134,7 +134,7 @@ pub(crate) async fn write_start_work_conn_with_nat_hole_sid<W: AsyncWriteExt + U
         nat_hole_sid: Some(sid.to_string()),
         nat_hole_visitor_addr: None,
         sk: sk.map(|s| s.to_string()),
-    });
+    }));
     if let Err(e) = write_ctl_msg(writer, &swc, v2).await {
         warn!(error = %e, "Failed to send StartWorkConn with NatHoleSid{}: {}", context, e);
     } else {

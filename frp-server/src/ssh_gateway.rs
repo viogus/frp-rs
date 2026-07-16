@@ -460,7 +460,7 @@ fn build_v1_frame_from_args(
         None
     };
 
-    let msg = FrpMessage::NewProxy(NewProxy {
+    let msg = FrpMessage::NewProxy(Box::new(NewProxy {
         proxy_name: args.proxy_name.clone(),
         proxy_type: args.proxy_type.clone(),
         use_encryption: Some(args.use_encryption),
@@ -497,7 +497,7 @@ fn build_v1_frame_from_args(
         vnet_ip: None,
         vnet_netmask: None,
         vnet_mtu: None,
-    });
+    }));
 
     let type_byte = msg.v1_type_byte();
     let payload = serde_json::to_vec(&msg).map_err(|e| anyhow!("serialize NewProxy: {}", e))?;

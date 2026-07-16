@@ -55,7 +55,7 @@ pub fn create_visitor_conn_msg(
 /// Creates the NewProxy message for registering a proxy with the server.
 /// All relevant fields from ProxyConfig are wired through (Go frp v0.69.1 compat).
 pub fn create_new_proxy_msg(p: &frp_core::config::ProxyConfig, local_addr: &str) -> FrpMessage {
-    let mut result = FrpMessage::NewProxy(msg::NewProxy {
+    let mut result = FrpMessage::NewProxy(Box::new(msg::NewProxy {
         proxy_name: p.name.clone(),
         proxy_type: p.proxy_type.clone(),
         use_encryption: if p.use_encryption { Some(true) } else { None },
@@ -110,7 +110,7 @@ pub fn create_new_proxy_msg(p: &frp_core::config::ProxyConfig, local_addr: &str)
         } else {
             Some(p.vnet_mtu)
         },
-    });
+    }));
 
     // Strip local_str for Go frps compatibility — Go frps v0.69.1
     // NewProxy struct does not have this field. While Go json.Unmarshal

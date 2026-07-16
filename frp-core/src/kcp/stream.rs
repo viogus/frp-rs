@@ -114,7 +114,7 @@ impl AsyncRead for KcpStream {
                 // Capture hex preview before data may be moved into read_buffer.
                 #[cfg(debug_assertions)]
                 let hex_preview = if n > 0 {
-                    Some(hex::encode(&data[..n.min(16)]))
+                    Some(crate::hex_encode(&data[..n.min(16)]))
                 } else {
                     None
                 };
@@ -198,7 +198,7 @@ impl AsyncWrite for KcpStream {
         tracing::trace!(
             "KCP WRITE: {} bytes first_hex={}",
             buf.len(),
-            hex::encode(&buf[..buf.len().min(32)])
+            crate::hex_encode(&buf[..buf.len().min(32)])
         );
 
         let req = WriteRequest::Data(buf.to_vec());
@@ -246,7 +246,7 @@ impl AsyncWrite for KcpStream {
                 n = n,
                 total = self.write_count,
                 global_total = KCP_WRITE_BYTES.load(Ordering::Relaxed),
-                first_hex = %hex::encode(&buf[..n.min(32)]),
+                first_hex = %crate::hex_encode(&buf[..n.min(32)]),
                 "KCP write: {} bytes (stream total={}, global total={})",
                 n,
                 self.write_count,
