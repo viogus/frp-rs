@@ -972,6 +972,7 @@ mod tests {
                 use_compression: None,
                 nat_hole_sid: None,
                 nat_hole_visitor_addr: None,
+                sk: None,
             }),
             FrpMessage::NewVisitorConn(msg::NewVisitorConn {
                 proxy_name: "p".into(),
