@@ -1,5 +1,5 @@
-use std::sync::atomic::Ordering;
 use std::io;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -83,6 +83,11 @@ fn decompress_chunk_into<'a>(
 
 /// Unified bridge writer — Plain delegates to AsyncWrite, Encrypted wraps
 /// CipherWriter and calls write_encrypted (in-place CFB encrypt + write).
+///
+/// `CipherWriter` stores a multi-KiB scratch buffer, making it much larger
+/// than `Plain(W)`. Boxing it would add a heap allocation per bridge call,
+/// so we accept the enum size difference here.
+#[allow(clippy::large_enum_variant)]
 enum WorkWriter<W: AsyncWrite + Unpin> {
     Plain(W),
     Encrypted(CipherWriter<W>),
@@ -367,7 +372,8 @@ pub async fn bridge_encrypted(
         write_limiter,
         metrics.clone(),
     );
-    let work_to_user = bridge_work_to_user(enc_work_r, user_w, use_compression, read_limiter, metrics);
+    let work_to_user =
+        bridge_work_to_user(enc_work_r, user_w, use_compression, read_limiter, metrics);
 
     let _ = tokio::join!(user_to_work, work_to_user);
 }
