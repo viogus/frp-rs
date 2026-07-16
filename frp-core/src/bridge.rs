@@ -345,7 +345,6 @@ pub async fn bridge_encrypted(
     mut write_limiter: Option<&mut BandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
-    let mut enc_work_r = CipherReader::new(work_r, *key);
     let mut enc_work_w = CipherWriter::new(work_w, *key);
 
     // Eagerly flush the IV to unblock the peer's CipherReader.
@@ -358,138 +357,18 @@ pub async fn bridge_encrypted(
         return;
     }
 
-    let had_pre_read = !pre_read.is_empty();
+    let enc_work_r = CipherReader::new(work_r, *key);
 
-    // User → Work: write pre_read first (through CipherWriter), then bridge
-    let user_to_work = async {
-        // Pre-read bytes (VHost HTTP parsing): encrypt via normal write path.
-        if !pre_read.is_empty() && enc_work_w.write_all(&pre_read).await.is_err() {
-            return;
-        }
-        let mut buf = PoolGuard::acquire();
-        let cap = buf.as_mut_slice().len();
-        let mut comp_buf = Vec::new(); // reusable compression buffer
-        loop {
-            let n = match user_r.read(buf.as_mut_slice()).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if let Some(ref m) = metrics {
-                        m.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
-                    }
-                    n
-                }
-                Err(_) => break,
-            };
+    let user_to_work = bridge_user_to_work(
+        user_r,
+        WorkWriter::Encrypted(enc_work_w),
+        use_compression,
+        pre_read,
+        write_limiter,
+        metrics.clone(),
+    );
+    let work_to_user = bridge_work_to_user(enc_work_r, user_w, use_compression, read_limiter, metrics);
 
-            if use_compression {
-                // Compress into reusable buffer, then encrypt in-place.
-                if compress_chunk_into(&buf.raw_buf()[..n], true, &mut comp_buf).is_none() {
-                    break;
-                }
-                if let Some(ref mut lim) = write_limiter {
-                    lim.consume(comp_buf.len()).await;
-                }
-                if enc_work_w.write_encrypted(&mut comp_buf).await.is_err() {
-                    break;
-                }
-                // comp_buf is cleared on next compress_chunk_into call
-            } else {
-                // No compression: encrypt pool buffer slice in-place.
-                let slice = &mut buf.as_mut_slice()[..n];
-                if let Some(ref mut lim) = write_limiter {
-                    lim.consume(slice.len()).await;
-                }
-                if enc_work_w.write_encrypted(slice).await.is_err() {
-                    break;
-                }
-            }
-            // Conditional flush: batch on full reads unless compressing
-            // (matching bridge_plain behavior — CFB is a streaming cipher
-            // and does not require per-chunk flushes).
-            if (use_compression || n < cap) && enc_work_w.flush().await.is_err() {
-                break;
-            }
-        }
-        // Symmetric shutdown: signal EOF to work side (matching bridge_plain).
-        // When pre_read bytes were forwarded (e.g. VHost), leave work_w open
-        // so work_to_user can receive the backend response.
-        if !had_pre_read {
-            if let Err(e) = enc_work_w.shutdown().await {
-                tracing::debug!(error = %e, "bridge_encrypted shutdown: enc_work_w.shutdown failed");
-            }
-        }
-    };
-
-    // Work → User: read from work (decrypted), decompress, write to user
-    let work_to_user = async {
-        let mut buf = PoolGuard::acquire();
-        let cap = buf.as_mut_slice().len();
-        let mut decomp_buf = Vec::new(); // reusable decompression buffer
-        let mut decompressor = make_decompressor(use_compression);
-        loop {
-            let n = match enc_work_r.read(buf.as_mut_slice()).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            let decrypted = &buf.raw_buf()[..n];
-
-            let plaintext =
-                match decompress_chunk_into(&mut decompressor, decrypted, &mut decomp_buf) {
-                    Some(p) => p,
-                    None => break,
-                };
-
-            if !plaintext.is_empty() {
-                // Apply read bandwidth limit before writing to user
-                if let Some(ref mut lim) = read_limiter {
-                    lim.consume(plaintext.len()).await;
-                }
-
-                if user_w.write_all(plaintext).await.is_err() {
-                    break;
-                }
-                // Count bytes written to user (download)
-                if let Some(ref m) = metrics {
-                    m.bytes_out
-                        .fetch_add(plaintext.len() as u64, Ordering::Relaxed);
-                }
-                // Conditional flush: batch on full reads unless compressing
-                // (matching bridge_plain + user_to_work above).
-                if (use_compression || n < cap) && user_w.flush().await.is_err() {
-                    break;
-                }
-            }
-        }
-        // Flush remaining buffered compressed data
-        if let Some(ref mut dec) = decompressor {
-            match dec.flush() {
-                Ok(plaintext) if !plaintext.is_empty() => {
-                    if let Err(e) = user_w.write_all(&plaintext).await {
-                        tracing::debug!(error = %e, "bridge_encrypted flush: user_w.write_all failed");
-                    }
-                    if let Some(ref m) = metrics {
-                        m.bytes_out
-                            .fetch_add(plaintext.len() as u64, Ordering::Relaxed);
-                    }
-                    if let Err(e) = user_w.flush().await {
-                        tracing::debug!(error = %e, "bridge_encrypted flush: user_w.flush failed");
-                    }
-                }
-                #[cfg(feature = "compression")]
-                Err(e) => {
-                    tracing::warn!(error = %e, "snappy flush error in encrypted bridge: {}", e);
-                }
-                _ => {}
-            }
-        }
-        // Symmetric shutdown: signal EOF to user side (matching bridge_plain).
-        if let Err(e) = user_w.shutdown().await {
-            tracing::debug!(error = %e, "bridge_encrypted shutdown: user_w.shutdown failed");
-        }
-    };
-
-    // Use join! (not select!): both directions must complete, matching Go frp's WaitGroup
     let _ = tokio::join!(user_to_work, work_to_user);
 }
 
@@ -513,139 +392,17 @@ pub async fn bridge_plain(
         "bridge_plain: starting, had_pre_read={}",
         had_pre_read
     );
-    let user_to_work = async {
-        if !pre_read.is_empty() && work_w.write_all(&pre_read).await.is_err() {
-            tracing::warn!("bridge_plain: pre_read write_all failed");
-            return;
-        }
-        let mut buf = PoolGuard::acquire();
-        // cap is constant: PoolGuard::acquire() always yields a *BUFFER_SIZE buffer.
-        let cap = buf.as_mut_slice().len();
-        let mut comp_buf = Vec::new(); // reusable compression buffer
-        loop {
-            let n = match user_r.read(buf.as_mut_slice()).await {
-                Ok(0) => {
-                    tracing::debug!("bridge_plain: user_r EOF");
-                    break;
-                }
-                Ok(n) => {
-                    trace_hex!(n, first_hex = %hex::encode(&buf.raw_buf()[..n.min(32)]), "bridge_plain: user_r read {} bytes", n);
-                    if let Some(ref m) = metrics {
-                        m.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
-                    }
-                    n
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "bridge_plain: user_r read error");
-                    break;
-                }
-            };
-            let payload = &buf.raw_buf()[..n];
-            if compress_chunk_into(payload, use_compression, &mut comp_buf).is_none() {
-                break;
-            }
-            let out: &[u8] = if use_compression { &comp_buf } else { payload };
-            if work_w.write_all(out).await.is_err() {
-                tracing::warn!(len = out.len(), "bridge_plain: work_w write_all failed");
-                break;
-            }
-            // Flush when compressing (strict req/resp clients need each echo
-            // pushed through buffering writers), or when the read drained the
-            // source (short read). A full-capacity plain read means more is
-            // likely queued, so batch it.
-            if (use_compression || n < cap) && work_w.flush().await.is_err() {
-                tracing::warn!("bridge_plain: work_w flush failed");
-                break;
-            }
-        }
-        // When pre_read bytes were forwarded (e.g. VHost HTTP handler consumed
-        // the user's request), leave work_w open so work_to_user can receive
-        // the backend response. The frpc side will see EOF from user_w.shutdown()
-        // in work_to_user after the response is complete.
-        let _ = work_w.flush().await;
-        if !had_pre_read {
-            if let Err(e) = work_w.shutdown().await {
-                tracing::debug!(error = %e, "bridge_plain shutdown: work_w.shutdown failed");
-            }
-        }
-        tracing::debug!("bridge_plain: user_to_work done");
-    };
-    let work_to_user = async {
-        tracing::debug!("bridge_plain: work_to_user starting");
-        let mut buf = PoolGuard::acquire();
-        // cap is constant: PoolGuard::acquire() always yields a *BUFFER_SIZE buffer.
-        let cap = buf.as_mut_slice().len();
-        let mut decomp_buf = Vec::new(); // reusable decompression buffer
-        let mut decompressor = make_decompressor(use_compression);
-        loop {
-            let n = match work_r.read(buf.as_mut_slice()).await {
-                Ok(0) => {
-                    tracing::debug!("bridge_plain: work_r EOF");
-                    break;
-                }
-                Ok(n) => {
-                    trace_hex!(n, first_hex = %hex::encode(&buf.raw_buf()[..n.min(32)]), "bridge_plain: work_r read {} bytes", n);
-                    n
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "bridge_plain: work_r read error");
-                    break;
-                }
-            };
-            let plaintext = match decompress_chunk_into(
-                &mut decompressor,
-                &buf.raw_buf()[..n],
-                &mut decomp_buf,
-            ) {
-                Some(p) => p,
-                None => break,
-            };
-            if !plaintext.is_empty() {
-                if user_w.write_all(plaintext).await.is_err() {
-                    tracing::warn!(
-                        len = plaintext.len(),
-                        "bridge_plain: user_w write_all failed"
-                    );
-                    break;
-                }
-                if let Some(ref m) = metrics {
-                    m.bytes_out
-                        .fetch_add(plaintext.len() as u64, Ordering::Relaxed);
-                }
-                if (use_compression || n < cap) && user_w.flush().await.is_err() {
-                    tracing::warn!("bridge_plain: user_w flush failed");
-                    break;
-                }
-            }
-        }
-        tracing::debug!("bridge_plain: work_to_user done");
-        let _ = user_w.flush().await;
-        // Flush remaining buffered compressed data
-        if let Some(ref mut dec) = decompressor {
-            match dec.flush() {
-                Ok(plaintext) if !plaintext.is_empty() => {
-                    if let Err(e) = user_w.write_all(&plaintext).await {
-                        tracing::debug!(error = %e, "bridge_plain flush: user_w.write_all failed");
-                    }
-                    if let Some(ref m) = metrics {
-                        m.bytes_out
-                            .fetch_add(plaintext.len() as u64, Ordering::Relaxed);
-                    }
-                    if let Err(e) = user_w.flush().await {
-                        tracing::debug!(error = %e, "bridge_plain flush: user_w.flush failed");
-                    }
-                }
-                #[cfg(feature = "compression")]
-                Err(e) => {
-                    tracing::warn!(error = %e, "snappy flush error in bridge: {}", e);
-                }
-                _ => {}
-            }
-        }
-        if let Err(e) = user_w.shutdown().await {
-            tracing::debug!(error = %e, "bridge_plain shutdown: user_w.shutdown failed");
-        }
-    };
+
+    let user_to_work = bridge_user_to_work(
+        user_r,
+        WorkWriter::Plain(work_w),
+        use_compression,
+        pre_read,
+        None,
+        metrics.clone(),
+    );
+    let work_to_user = bridge_work_to_user(work_r, user_w, use_compression, None, metrics);
+
     let _ = tokio::join!(user_to_work, work_to_user);
 }
 
@@ -670,115 +427,15 @@ pub async fn bridge_plain_rate_limited(
     mut write_limiter: Option<&mut BandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
-    let had_pre_read = !pre_read.is_empty();
-
-    // User → Work
-    let user_to_work = async {
-        if !pre_read.is_empty() && work_w.write_all(&pre_read).await.is_err() {
-            return;
-        }
-        let mut buf = PoolGuard::acquire();
-        let cap = buf.as_mut_slice().len();
-        let mut comp_buf = Vec::new(); // reusable compression buffer
-        loop {
-            let n = match user_r.read(buf.as_mut_slice()).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if let Some(ref m) = metrics {
-                        m.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
-                    }
-                    n
-                }
-                Err(_) => break,
-            };
-
-            if use_compression {
-                if compress_chunk_into(&buf.raw_buf()[..n], true, &mut comp_buf).is_none() {
-                    break;
-                }
-                if let Some(ref mut lim) = write_limiter {
-                    lim.consume(comp_buf.len()).await;
-                }
-                if work_w.write_all(&comp_buf).await.is_err() {
-                    break;
-                }
-            } else {
-                let slice = &buf.raw_buf()[..n];
-                if let Some(ref mut lim) = write_limiter {
-                    lim.consume(slice.len()).await;
-                }
-                if work_w.write_all(slice).await.is_err() {
-                    break;
-                }
-            }
-            // Conditional flush: batch on full reads unless compressing
-            // (matching bridge_plain behavior).
-            if (use_compression || n < cap) && work_w.flush().await.is_err() {
-                break;
-            }
-        }
-        let _ = work_w.flush().await;
-        if !had_pre_read {
-            let _ = work_w.shutdown().await;
-        }
-    };
-
-    // Work → User
-    let work_to_user = async {
-        let mut buf = PoolGuard::acquire();
-        let cap = buf.as_mut_slice().len();
-        let mut decomp_buf = Vec::new(); // reusable decompression buffer
-        let mut decompressor = make_decompressor(use_compression);
-        loop {
-            let n = match work_r.read(buf.as_mut_slice()).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            let plaintext = match decompress_chunk_into(
-                &mut decompressor,
-                &buf.raw_buf()[..n],
-                &mut decomp_buf,
-            ) {
-                Some(p) => p,
-                None => break,
-            };
-            if !plaintext.is_empty() {
-                if let Some(ref mut lim) = read_limiter {
-                    lim.consume(plaintext.len()).await;
-                }
-                if user_w.write_all(plaintext).await.is_err() {
-                    break;
-                }
-                if let Some(ref m) = metrics {
-                    m.bytes_out
-                        .fetch_add(plaintext.len() as u64, Ordering::Relaxed);
-                }
-                if (use_compression || n < cap) && user_w.flush().await.is_err() {
-                    break;
-                }
-            }
-        }
-        // Flush remaining buffered compressed data
-        if let Some(ref mut dec) = decompressor {
-            match dec.flush() {
-                Ok(plaintext) if !plaintext.is_empty() => {
-                    let _ = user_w.write_all(&plaintext).await;
-                    if let Some(ref m) = metrics {
-                        m.bytes_out
-                            .fetch_add(plaintext.len() as u64, Ordering::Relaxed);
-                    }
-                    let _ = user_w.flush().await;
-                }
-                #[cfg(feature = "compression")]
-                Err(e) => {
-                    tracing::warn!(error = %e, "snappy flush error in rate-limited bridge: {}", e);
-                }
-                _ => {}
-            }
-        }
-        let _ = user_w.shutdown().await;
-    };
+    let user_to_work = bridge_user_to_work(
+        user_r,
+        WorkWriter::Plain(work_w),
+        use_compression,
+        pre_read,
+        write_limiter,
+        metrics.clone(),
+    );
+    let work_to_user = bridge_work_to_user(work_r, user_w, use_compression, read_limiter, metrics);
 
     let _ = tokio::join!(user_to_work, work_to_user);
 }
