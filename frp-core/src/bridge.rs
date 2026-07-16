@@ -334,15 +334,15 @@ pub async fn bridge_encrypted_io(
     fields(use_compression)
 )]
 pub async fn bridge_encrypted(
-    mut user_r: impl AsyncReadExt + Unpin,
-    mut user_w: impl AsyncWriteExt + Unpin,
+    user_r: impl AsyncReadExt + Unpin,
+    user_w: impl AsyncWriteExt + Unpin,
     work_r: impl AsyncReadExt + Unpin,
     work_w: impl AsyncWriteExt + Unpin,
     key: &[u8; 16],
     use_compression: bool,
     pre_read: Vec<u8>,
-    mut read_limiter: Option<&mut BandwidthLimiter>,
-    mut write_limiter: Option<&mut BandwidthLimiter>,
+    read_limiter: Option<&mut BandwidthLimiter>,
+    write_limiter: Option<&mut BandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
     let mut enc_work_w = CipherWriter::new(work_w, *key);
@@ -378,10 +378,10 @@ pub async fn bridge_encrypted(
     fields(use_compression)
 )]
 pub async fn bridge_plain(
-    mut user_r: impl AsyncReadExt + Unpin,
-    mut user_w: impl AsyncWriteExt + Unpin,
-    mut work_r: impl AsyncReadExt + Unpin,
-    mut work_w: impl AsyncWriteExt + Unpin,
+    user_r: impl AsyncReadExt + Unpin,
+    user_w: impl AsyncWriteExt + Unpin,
+    work_r: impl AsyncReadExt + Unpin,
+    work_w: impl AsyncWriteExt + Unpin,
     use_compression: bool,
     pre_read: Vec<u8>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
@@ -417,14 +417,14 @@ pub async fn bridge_plain(
 /// `write_limiter` throttles user→work (upload).
 #[allow(clippy::too_many_arguments)]
 pub async fn bridge_plain_rate_limited(
-    mut user_r: impl AsyncReadExt + Unpin,
-    mut user_w: impl AsyncWriteExt + Unpin,
-    mut work_r: impl AsyncReadExt + Unpin,
-    mut work_w: impl AsyncWriteExt + Unpin,
+    user_r: impl AsyncReadExt + Unpin,
+    user_w: impl AsyncWriteExt + Unpin,
+    work_r: impl AsyncReadExt + Unpin,
+    work_w: impl AsyncWriteExt + Unpin,
     use_compression: bool,
     pre_read: Vec<u8>,
-    mut read_limiter: Option<&mut BandwidthLimiter>,
-    mut write_limiter: Option<&mut BandwidthLimiter>,
+    read_limiter: Option<&mut BandwidthLimiter>,
+    write_limiter: Option<&mut BandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
     let user_to_work = bridge_user_to_work(
