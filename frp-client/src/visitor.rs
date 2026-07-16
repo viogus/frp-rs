@@ -281,6 +281,7 @@ pub(crate) async fn run_visitor_listener(
                                 // (both sides get the same sid from the server).
                                 let sid = resp.sid.clone().unwrap_or_default();
                                 let conv = frp_core::xtcp_p2p::conv_from_sid(&sid);
+                                #[allow(clippy::default_constructed_unit_structs)]
                                 let kcp_cfg = frp_core::kcp::KcpConfig::default();
                                 // Go v0.70 compat: NatHoleSid detect + yamux client.
                                 let p2p_key = if !sk.is_empty() {

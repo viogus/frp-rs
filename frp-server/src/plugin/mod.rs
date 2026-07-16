@@ -5,7 +5,7 @@ pub(crate) use http::HttpPluginManager;
 
 #[cfg(not(feature = "http-proxy"))]
 /// Stub plugin manager that always allows operations.
-pub(crate) struct HttpPluginManager;
+pub struct HttpPluginManager;
 
 #[cfg(not(feature = "http-proxy"))]
 impl HttpPluginManager {

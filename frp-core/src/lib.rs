@@ -38,13 +38,8 @@ pub mod xtcp_p2p;
 
 #[cfg(not(feature = "kcp"))]
 pub mod kcp {
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     pub struct KcpConfig;
-    impl Default for KcpConfig {
-        fn default() -> Self {
-            panic!("KcpConfig requires the 'kcp' feature to be enabled")
-        }
-    }
 }
 #[cfg(not(feature = "kcp"))]
 pub mod xtcp_p2p {
@@ -55,6 +50,7 @@ pub mod xtcp_p2p {
     pub fn derive_detect_key(_sk: &str) -> [u8; 16] {
         panic!("xtcp_p2p::derive_detect_key requires the 'kcp' feature")
     }
+    #[allow(clippy::too_many_arguments)]
     pub async fn xtcp_p2p_connect_yamux(
         _socket: UdpSocket,
         _candidates: &[String],

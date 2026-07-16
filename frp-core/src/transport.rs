@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::kcp::KcpStream;
 #[cfg(feature = "quic")]
 use crate::quic::QuicStream;
+#[cfg(any(feature = "tls", feature = "websocket"))]
 use crate::TransportError;
 #[cfg(feature = "websocket")]
 use futures_util::{sink::Sink, Stream};
@@ -1925,6 +1926,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
     }
 
     // TCP, WebSocket, WSS: connect via upstream proxy if configured, otherwise direct TCP.
+    #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
     let mut stream = if let Some(ref proxy_url) = opts.proxy_url {
         if proxy_url.is_empty() {
             // Empty string = direct connection

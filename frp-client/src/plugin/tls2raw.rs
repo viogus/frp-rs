@@ -11,7 +11,9 @@ use frp_core::config::PluginConfig;
 #[cfg(feature = "tls")]
 use frp_core::transport::build_tls_connector;
 
-use super::{serve_plugin, PluginHandle};
+#[cfg(feature = "tls")]
+use super::serve_plugin;
+use super::PluginHandle;
 
 /// Start a TLS-to-raw plugin.
 ///

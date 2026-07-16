@@ -23,8 +23,10 @@ use frp_core::config::PluginConfig;
 use frp_core::transport::build_tls_acceptor;
 
 #[cfg(feature = "tls")]
+use super::serve_plugin;
+#[cfg(feature = "tls")]
 use super::split_host_port;
-use super::{serve_plugin, PluginHandle};
+use super::PluginHandle;
 
 /// Start an https2http plugin server.
 #[cfg(feature = "tls")]

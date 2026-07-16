@@ -6,7 +6,15 @@ use tokio::net::TcpListener;
 #[cfg(any(feature = "dashboard", feature = "kcp", feature = "quic"))]
 use tokio_util::sync::CancellationToken;
 
-use tracing::{debug, error, info, instrument, warn};
+#[cfg(any(
+    feature = "ssh",
+    feature = "kcp",
+    feature = "quic",
+    feature = "tls",
+    feature = "websocket"
+))]
+use tracing::debug;
+use tracing::{error, info, instrument, warn};
 
 #[cfg(feature = "oidc")]
 use frp_core::auth::OidcVerifier;
@@ -1510,7 +1518,9 @@ impl Service {
                                 // Two-phase detection to avoid false positives from
                                 // health checks, scanners, and other non-frp HTTP
                                 // clients that connect to the frps TLS port.
+                                // Two-phase WebSocket detection.
                                 let mut ws_peek = vec![0u8; 4];
+                                #[cfg(feature = "websocket")]
                                 let got_http = match tokio::time::timeout(
                                     std::time::Duration::from_secs(5),
                                     io.read_exact(&mut ws_peek[..4]),
@@ -1518,6 +1528,11 @@ impl Service {
                                     Ok(Ok(n)) if n >= 4 => &ws_peek[..4] == b"GET ",
                                     _ => false,
                                 };
+                                #[cfg(not(feature = "websocket"))]
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    io.read_exact(&mut ws_peek[..4]),
+                                ).await;
 
                                 // Secondary validation: read more bytes and confirm
                                 // WebSocket upgrade headers are present before committing
@@ -1541,8 +1556,6 @@ impl Service {
                                 } else {
                                     false
                                 };
-                                #[cfg(not(feature = "websocket"))]
-                                let is_ws_tls = false;
 
                                 #[cfg(feature = "websocket")]
                                 if is_ws_tls {
@@ -1766,7 +1779,7 @@ impl Service {
                                         pre_read_bytes.remove(0);
                                     }
                                     info!(addr = %addr, "TLS head byte (0x17) but TLS feature not enabled, falling back to V1");
-                                    let mut stream = IoStream::PreRead(pre_read_bytes, inner_stream);
+                                    let stream = IoStream::PreRead(pre_read_bytes, inner_stream);
                                     crate::handlers::dispatch_v1_message(stream, state, Some(addr), None, Some(addr.to_string())).await;
                                     return;
                                 }

@@ -166,7 +166,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             tls_server_name,
             tls_ca_file,
             yamux,
-            quic_conn,
+            quic_conn: _quic_conn,
             v2,
             oidc_client,
             udp_sockets,
@@ -197,7 +197,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
         // Go frp compat: QUIC work connections open new streams on the
         // existing QUIC connection (multi-stream-per-connection).
         #[cfg(feature = "quic")]
-        let mut work = if let Some(ref quic) = quic_conn {
+        let mut work = if let Some(ref quic) = _quic_conn {
             match quic.open_bi().await {
                 Ok(stream) => {
                     debug!(label = %label, "Work conn {} opened QUIC stream", label);

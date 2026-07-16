@@ -12,6 +12,7 @@
 //!   control channel → retain session handle for opening work connection
 //!   streams on demand.
 
+#[cfg(feature = "tcp-mux")]
 use std::task::Poll;
 use std::time::Duration;
 
