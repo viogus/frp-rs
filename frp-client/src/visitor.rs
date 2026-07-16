@@ -174,28 +174,34 @@ pub(crate) async fn run_visitor_listener(
                             // Go frps v0.69.1 NAT classifier needs ≥2 mapped
                             // addresses. Reuse the same UDP socket for both
                             // STUN calls and subsequent KCP data plane.
-                            let (stun_socket, mapped_addrs) = match frp_core::stun::stun_binding_with_socket(&stun_server).await {
-                                Ok((sock, addr1)) => {
-                                    debug!(visitor_name = %visitor_name, addr = %addr1, "Visitor '{}': STUN #1: {}", visitor_name, addr1);
-                                    let mut addrs = vec![addr1];
-                                    match frp_core::stun::stun_binding_on_socket(&sock, &stun_server).await {
-                                        Ok(addr2) => {
-                                            debug!(visitor_name = %visitor_name, addr = %addr2, "Visitor '{}': STUN #2: {}", visitor_name, addr2);
-                                            if !addrs.contains(&addr2) {
-                                                addrs.push(addr2);
+                            let (stun_socket, mapped_addrs) =
+                                match frp_core::stun::stun_binding_with_socket(&stun_server).await {
+                                    Ok((sock, addr1)) => {
+                                        debug!(visitor_name = %visitor_name, addr = %addr1, "Visitor '{}': STUN #1: {}", visitor_name, addr1);
+                                        let mut addrs = vec![addr1];
+                                        match frp_core::stun::stun_binding_on_socket(
+                                            &sock,
+                                            &stun_server,
+                                        )
+                                        .await
+                                        {
+                                            Ok(addr2) => {
+                                                debug!(visitor_name = %visitor_name, addr = %addr2, "Visitor '{}': STUN #2: {}", visitor_name, addr2);
+                                                if !addrs.contains(&addr2) {
+                                                    addrs.push(addr2);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STUN #2 failed: {}", visitor_name, e);
                                             }
                                         }
-                                        Err(e) => {
-                                            warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STUN #2 failed: {}", visitor_name, e);
-                                        }
+                                        (Some(sock), addrs)
                                     }
-                                    (Some(sock), addrs)
-                                }
-                                Err(e) => {
-                                    warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STUN failed: {}", visitor_name, e);
-                                    (None, vec![])
-                                }
-                            };
+                                    Err(e) => {
+                                        warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STUN failed: {}", visitor_name, e);
+                                        (None, vec![])
+                                    }
+                                };
 
                             // --- Send NatHoleVisitor on control connection ---
                             let txn_id = uuid::Uuid::new_v4().to_string();
@@ -282,17 +288,23 @@ pub(crate) async fn run_visitor_listener(
                                 } else {
                                     None
                                 };
-                                let p2p_sid = if sid.is_empty() { None } else { Some(sid.as_str()) };
+                                let p2p_sid = if sid.is_empty() {
+                                    None
+                                } else {
+                                    Some(sid.as_str())
+                                };
                                 match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
                                     socket,
                                     &candidates,
                                     conv,
                                     kcp_cfg,
                                     fallback_timeout_ms,
-                                    true,  // yamux_client = visitor
+                                    true, // yamux_client = visitor
                                     p2p_sid,
                                     p2p_key.as_ref(),
-                                ).await {
+                                )
+                                .await
+                                {
                                     Ok(mut p2p_stream) => {
                                         info!(visitor_name = %visitor_name, "Visitor '{}': XTCP P2P connected via KCP", visitor_name);
                                         let use_enc = use_encryption && !sk.is_empty();

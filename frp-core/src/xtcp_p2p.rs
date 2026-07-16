@@ -77,7 +77,11 @@ pub fn conv_from_sid(sid: &str) -> u32 {
 /// Deserialization uses `#[serde(default)]` to handle missing fields.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct NatHoleDetectSid {
-    #[serde(rename = "transaction_id", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "transaction_id",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     transaction_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     sid: String,
@@ -178,10 +182,7 @@ pub async fn punch_udp_hole(
     }
 
     // Parse all candidates upfront.
-    let peers: Vec<SocketAddr> = candidates
-        .iter()
-        .filter_map(|a| a.parse().ok())
-        .collect();
+    let peers: Vec<SocketAddr> = candidates.iter().filter_map(|a| a.parse().ok()).collect();
     if peers.is_empty() {
         return Err("no valid candidate addresses".into());
     }
@@ -556,10 +557,7 @@ impl AsyncWrite for XtcpP2pStream {
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.shutdown {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -607,10 +605,7 @@ impl AsyncWrite for XtcpP2pStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.shutdown = true;
         Poll::Ready(Ok(()))
     }
@@ -700,9 +695,9 @@ pub async fn xtcp_p2p_connect_yamux(
     sid: Option<&str>,
     key: Option<&[u8; 16]>,
 ) -> Result<crate::mux::YamuxStream, String> {
+    use futures_util::future::poll_fn;
     use std::sync::Mutex;
     use std::time::Duration;
-    use futures_util::future::poll_fn;
     use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
     use yamux::{Config, Connection, Mode};
 
@@ -740,8 +735,7 @@ pub async fn xtcp_p2p_connect_yamux(
     //    times out because nobody reads UDP data while waiting.
     let tick_ms = KCP_TICK_MS as u64;
     let bg_conn = conn.clone();
-    let (stream_tx, stream_rx) =
-        tokio::sync::oneshot::channel::<Result<yamux::Stream, String>>();
+    let (stream_tx, stream_rx) = tokio::sync::oneshot::channel::<Result<yamux::Stream, String>>();
 
     tokio::spawn(async move {
         let keepalive = Duration::from_millis(tick_ms);
@@ -785,8 +779,7 @@ pub async fn xtcp_p2p_connect_yamux(
                 }
                 Ok(None) => {
                     if let Some(tx) = stream_tx.take() {
-                        let _ = tx
-                            .send(Err("yamux: connection closed before stream".into()));
+                        let _ = tx.send(Err("yamux: connection closed before stream".into()));
                     }
                     tracing::debug!("yamux P2P: connection closed, exiting");
                     break;

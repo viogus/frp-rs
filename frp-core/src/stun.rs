@@ -35,20 +35,16 @@ async fn bind_matching_family(target: SocketAddr) -> Result<UdpSocket, String> {
     if target.is_ipv4() {
         match UdpSocket::bind("0.0.0.0:0").await {
             Ok(s) => Ok(s),
-            Err(_) => {
-                UdpSocket::bind("[::]:0")
-                    .await
-                    .map_err(|e| format!("STUN socket bind: {e}"))
-            }
+            Err(_) => UdpSocket::bind("[::]:0")
+                .await
+                .map_err(|e| format!("STUN socket bind: {e}")),
         }
     } else {
         match UdpSocket::bind("[::]:0").await {
             Ok(s) => Ok(s),
-            Err(_) => {
-                UdpSocket::bind("0.0.0.0:0")
-                    .await
-                    .map_err(|e| format!("STUN socket bind: {e}"))
-            }
+            Err(_) => UdpSocket::bind("0.0.0.0:0")
+                .await
+                .map_err(|e| format!("STUN socket bind: {e}")),
         }
     }
 }
@@ -89,10 +85,7 @@ pub async fn stun_binding(stun_addr: &str) -> Result<String, String> {
 /// Run STUN on an already-bound UDP socket, returning the mapped address.
 /// Useful for XTCP: run STUN twice on the same socket to get ≥2 mapped
 /// addresses for NAT classification, then reuse the socket for hole punching.
-pub async fn stun_binding_on_socket(
-    socket: &UdpSocket,
-    stun_addr: &str,
-) -> Result<String, String> {
+pub async fn stun_binding_on_socket(socket: &UdpSocket, stun_addr: &str) -> Result<String, String> {
     let addr_str = stun_addr.strip_prefix("stun:").unwrap_or(stun_addr);
     let addr = resolve_stun_addr(addr_str).await?;
 
@@ -124,9 +117,7 @@ pub async fn stun_binding_on_socket(
 /// Like `stun_binding`, but returns the bound UDP socket along with the
 /// mapped address. The caller can reuse the socket for subsequent NAT hole
 /// punching (XTCP P2P).
-pub async fn stun_binding_with_socket(
-    stun_addr: &str,
-) -> Result<(UdpSocket, String), String> {
+pub async fn stun_binding_with_socket(stun_addr: &str) -> Result<(UdpSocket, String), String> {
     let addr_str = stun_addr.strip_prefix("stun:").unwrap_or(stun_addr);
     let addr = resolve_stun_addr(addr_str).await?;
     let socket = bind_matching_family(addr).await?;

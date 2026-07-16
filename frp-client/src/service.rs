@@ -879,9 +879,11 @@ impl Service {
             let mut pending_xtcp: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
             // Map sid -> STUN UDP socket for XTCP P2P hole punching.
-            let xtcp_sockets: std::sync::Arc<tokio::sync::Mutex<
-                std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
-            >> = Default::default();
+            let xtcp_sockets: std::sync::Arc<
+                tokio::sync::Mutex<
+                    std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
+                >,
+            > = Default::default();
             // Map sid -> oneshot sender for visitor NatHoleResp routing (Go frps compat).
             let mut visitor_pending: std::collections::HashMap<
                 String,
@@ -1307,7 +1309,11 @@ impl Service {
         } else {
             None
         };
-        let p2p_sid = if sid.is_empty() { None } else { Some(sid.as_str()) };
+        let p2p_sid = if sid.is_empty() {
+            None
+        } else {
+            Some(sid.as_str())
+        };
 
         match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
             socket,
@@ -1315,10 +1321,12 @@ impl Service {
             conv,
             kcp_cfg,
             5000,
-            false,  // yamux_client = false (provider/server)
+            false, // yamux_client = false (provider/server)
             p2p_sid,
             p2p_key.as_ref(),
-        ).await {
+        )
+        .await
+        {
             Ok(mut p2p_stream) => {
                 if let Some(ref local) = local_addr {
                     match tokio::net::TcpStream::connect(local).await {
@@ -1334,15 +1342,29 @@ impl Service {
                                 if use_enc {
                                     let key = frp_core::encryption::derive_key(&sk);
                                     frp_core::bridge::bridge_encrypted(
-                                        local_r, local_w, p2p_r, p2p_w,
-                                        &key, use_comp, vec![],
-                                        None, None, None,
-                                    ).await;
+                                        local_r,
+                                        local_w,
+                                        p2p_r,
+                                        p2p_w,
+                                        &key,
+                                        use_comp,
+                                        vec![],
+                                        None,
+                                        None,
+                                        None,
+                                    )
+                                    .await;
                                 } else {
                                     frp_core::bridge::bridge_plain(
-                                        local_r, local_w, p2p_r, p2p_w,
-                                        use_comp, vec![], None,
-                                    ).await;
+                                        local_r,
+                                        local_w,
+                                        p2p_r,
+                                        p2p_w,
+                                        use_comp,
+                                        vec![],
+                                        None,
+                                    )
+                                    .await;
                                 }
                                 debug!(proxy_name = %pn, "XTCP provider '{}' encrypted P2P closed", pn);
                             });
@@ -1389,9 +1411,11 @@ impl Service {
         resp: msg::NatHoleResp,
         pending_xtcp: &mut HashMap<String, String>,
         visitor_pending: &mut HashMap<String, oneshot::Sender<Result<msg::NatHoleResp, String>>>,
-        xtcp_sockets: &std::sync::Arc<tokio::sync::Mutex<
-            std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
-        >>,
+        xtcp_sockets: &std::sync::Arc<
+            tokio::sync::Mutex<
+                std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
+            >,
+        >,
     ) {
         // Route to waiting visitor first (Go frps compat path).
         let txn_id = resp.transaction_id.clone();
@@ -1493,7 +1517,11 @@ impl Service {
             } else {
                 None
             };
-            let p2p_sid = if sid_clone.is_empty() { None } else { Some(sid_clone.as_str()) };
+            let p2p_sid = if sid_clone.is_empty() {
+                None
+            } else {
+                Some(sid_clone.as_str())
+            };
             // Provider acts as yamux server: accepts the visitor's stream.
             match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
                 socket,
@@ -1501,10 +1529,12 @@ impl Service {
                 conv,
                 kcp_cfg,
                 5000,
-                false,  // yamux_client = false (provider/server)
+                false, // yamux_client = false (provider/server)
                 p2p_sid,
                 p2p_key.as_ref(),
-            ).await {
+            )
+            .await
+            {
                 Ok(mut p2p_stream) => {
                     info!(proxy_name = %proxy_name_clone, "XTCP provider '{}': P2P connected via KCP+yamux", proxy_name_clone);
                     if let Some(ref local) = local_addr {
@@ -1517,15 +1547,29 @@ impl Service {
                                 if use_enc {
                                     let key = frp_core::encryption::derive_key(&xtcp_sk);
                                     frp_core::bridge::bridge_encrypted(
-                                        local_r, local_w, p2p_r, p2p_w,
-                                        &key, xtcp_use_comp, vec![],
-                                        None, None, None,
-                                    ).await;
+                                        local_r,
+                                        local_w,
+                                        p2p_r,
+                                        p2p_w,
+                                        &key,
+                                        xtcp_use_comp,
+                                        vec![],
+                                        None,
+                                        None,
+                                        None,
+                                    )
+                                    .await;
                                 } else {
                                     frp_core::bridge::bridge_plain(
-                                        local_r, local_w, p2p_r, p2p_w,
-                                        xtcp_use_comp, vec![], None,
-                                    ).await;
+                                        local_r,
+                                        local_w,
+                                        p2p_r,
+                                        p2p_w,
+                                        xtcp_use_comp,
+                                        vec![],
+                                        None,
+                                    )
+                                    .await;
                                 }
                                 debug!(proxy_name = %proxy_name_clone, "XTCP provider '{}' P2P closed", proxy_name_clone);
                             }

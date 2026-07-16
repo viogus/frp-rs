@@ -17,8 +17,6 @@ pub mod internal_listener;
 pub mod kcp;
 #[cfg(feature = "kcp")]
 pub mod kcp_compat;
-#[cfg(feature = "kcp")]
-pub mod xtcp_p2p;
 #[cfg(feature = "mem-profile")]
 pub mod mem_profile;
 pub mod metrics;
@@ -35,6 +33,8 @@ pub mod system;
 pub mod transport;
 pub mod unsafe_features;
 pub mod v2_handshake;
+#[cfg(feature = "kcp")]
+pub mod xtcp_p2p;
 
 use thiserror::Error;
 
