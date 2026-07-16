@@ -516,12 +516,14 @@ pub(crate) async fn handle_new_proxy(
                     udp_resp_signals.push(tx);
                     tokio::spawn(async move {
                         let _ = rx.await; // Wait until NewProxyResp is written
-                        // send().await: backpressure is correct — silently
-                        // dropping UdpNeedsWorkConn would permanently break
-                        // the UDP proxy (no work connection = no data flow).
-                        let _ = itx_clone.send(InternalMsg::UdpNeedsWorkConn {
-                            proxy_name: pn_clone,
-                        }).await;
+                                          // send().await: backpressure is correct — silently
+                                          // dropping UdpNeedsWorkConn would permanently break
+                                          // the UDP proxy (no work connection = no data flow).
+                        let _ = itx_clone
+                            .send(InternalMsg::UdpNeedsWorkConn {
+                                proxy_name: pn_clone,
+                            })
+                            .await;
                     });
                 }
                 info!(is_sudp = %is_sudp, proxy_name = %np.proxy_name, port = %port, "{} proxy '{}' listening on port {}", if is_sudp { "SUDP" } else { "UDP" }, np.proxy_name, port);

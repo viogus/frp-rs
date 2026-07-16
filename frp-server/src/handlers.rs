@@ -329,7 +329,9 @@ pub(crate) async fn handle_nat_hole_visitor(
 
         // Validate timestamp freshness (replay attack prevention).
         let auth_timeout = state.reloadable.read_ok().auth_cfg.authentication_timeout;
-        if let Err(freshness_err) = frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout) {
+        if let Err(freshness_err) =
+            frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout)
+        {
             warn!(proxy_name = %proxy_name, error = %freshness_err, "NatHoleVisitor: timestamp rejected for proxy '{}'", proxy_name);
             let mut writer = stream.into_split().1;
             let resp = FrpMessage::NatHoleResp(msg::NatHoleResp {
@@ -521,10 +523,7 @@ pub(crate) async fn handle_nat_hole_visitor(
         // Go frp provider reads NatHoleResp.protocol to decide
         // KCP vs TCP transport. If empty, Go falls back to TCP
         // which is incompatible with visitor's KCP.
-        let protocol_for_provider = msg
-            .protocol
-            .clone()
-            .or_else(|| client_msg.protocol.clone());
+        let protocol_for_provider = msg.protocol.clone().or_else(|| client_msg.protocol.clone());
         let c_resp = nathole_ctrl::build_nat_hole_response(
             &client_msg.transaction_id,
             &sid,
@@ -557,10 +556,7 @@ pub(crate) async fn handle_nat_hole_visitor(
             },
             ..Default::default()
         };
-        let protocol_for_provider = msg
-            .protocol
-            .clone()
-            .or_else(|| client_msg.protocol.clone());
+        let protocol_for_provider = msg.protocol.clone().or_else(|| client_msg.protocol.clone());
         let c_resp = msg::NatHoleResp {
             transaction_id: client_msg.transaction_id.clone(),
             error: None,
@@ -599,14 +595,17 @@ pub(crate) async fn handle_nat_hole_visitor(
     // should wait rather than silently drop the NatHoleResp
     // (which would cause a permanent visitor hang).
     if let Some(ref cr) = c_resp {
-        let _ = ctl_tx.tx.send(InternalMsg::WriteNatHoleResp {
-            transaction_id: cr.transaction_id.clone(),
-            error: cr.error.clone(),
-            sid: cr.sid.clone(),
-            protocol: cr.protocol.clone(),
-            candidate_addrs: cr.candidate_addrs.clone(),
-            assisted_addrs: cr.assisted_addrs.clone(),
-        }).await;
+        let _ = ctl_tx
+            .tx
+            .send(InternalMsg::WriteNatHoleResp {
+                transaction_id: cr.transaction_id.clone(),
+                error: cr.error.clone(),
+                sid: cr.sid.clone(),
+                protocol: cr.protocol.clone(),
+                candidate_addrs: cr.candidate_addrs.clone(),
+                assisted_addrs: cr.assisted_addrs.clone(),
+            })
+            .await;
     }
 
     info!(sid = %sid, "NatHole session {}: NatHoleResp sent to both sides", sid);
