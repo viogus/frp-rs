@@ -1,0 +1,465 @@
+//! Work connection pool lifecycle management.
+//!
+//! Handles NewWorkConn, VisitorConn, ProxyUserConn, and UDP work connection
+//! InternalMsg dispatch, pool assignment, and XTCP NatHoleSid delivery.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::Ordering;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+use tokio::time::{Duration, Instant};
+use tracing::{debug, info, warn};
+
+use frp_core::msg::{self, FrpMessage};
+use frp_core::transport::IoStream;
+
+use crate::service::InternalMsg;
+
+use super::bridge;
+use super::{write_ctl_msg, ControlContext, ControlState};
+
+// ---- Constants ----
+
+/// Max age of a pending request before it is dropped (Go frp: 10s default).
+pub(super) const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Max work connections to pool beyond what the client requested (Go frp: poolCount + 10).
+pub(crate) const WORK_POOL_EXTRA: usize = 10;
+
+// ---- Types ----
+
+/// A pooled work connection with its pool-entry timestamp for idle expiry.
+pub(crate) struct PoolEntry {
+    pub(crate) conn: IoStream,
+    pub(crate) pooled_at: Instant,
+}
+
+/// A pending request from a proxy listener waiting for a work connection.
+pub(crate) struct PendingRequest {
+    pub(crate) proxy_name: String,
+    pub(crate) user_conn: IoStream,
+    pub(crate) pre_read: Vec<u8>,
+    pub(crate) use_encryption: bool,
+    pub(crate) use_compression: bool,
+    pub(crate) created_at: Instant,
+    pub(crate) response_headers: HashMap<String, String>,
+    pub(crate) proxy_type: String,
+}
+
+// ---- Helpers ----
+
+/// Assign `req` to a pooled work connection if one is available (pool hit),
+/// otherwise record a miss, send `ReqWorkConn`, and queue the request.
+/// Returns `Err(())` if the `ReqWorkConn` write failed — caller must break.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn assign_or_queue<W>(
+    work_pool: &mut VecDeque<PoolEntry>,
+    pending_requests: &mut VecDeque<PendingRequest>,
+    ctx: &ControlContext,
+    writer: &mut W,
+    req: PendingRequest,
+) -> Result<(), ()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if let Some(entry) = work_pool.pop_front() {
+        ctx.state.pool.hits.fetch_add(1, Ordering::Relaxed);
+        ctx.pool_stats
+            .pool_size
+            .store(work_pool.len() as i64, Ordering::Relaxed);
+        // Proactive replenish: tell client to send replacement work conn.
+        // Matches Go frp v0.70 GetWorkConn which always sends ReqWorkConn
+        // after consuming from the pool channel (server/control.go:264).
+        if let Err(e) = write_ctl_msg(
+            writer,
+            &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
+            ctx.v2,
+        )
+        .await
+        {
+            warn!(error = %e, "Failed to send ReqWorkConn for pool replenish: {}", e);
+            return Err(());
+        }
+        bridge::assign_work_to_proxy(
+            entry.conn,
+            req,
+            ctx.reloadable.encryption_key,
+            ctx.state.clone(),
+            ctx.v2,
+        )
+        .await;
+    } else {
+        ctx.state.pool.misses.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = write_ctl_msg(
+            writer,
+            &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
+            ctx.v2,
+        )
+        .await
+        {
+            warn!(error = %e, "Failed to send ReqWorkConn: {}", e);
+            return Err(());
+        }
+        pending_requests.push_back(req);
+        ctx.pool_stats
+            .pending_requests
+            .store(pending_requests.len() as i64, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Write StartWorkConn with embedded `nat_hole_sid` + a separate NatHoleSid
+/// frame for Go frpc compat. Go frp ignores unknown JSON fields, so the
+/// standalone frame is needed for XTCP notification recognition.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_start_work_conn_with_nat_hole_sid<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    proxy_name: &str,
+    use_enc: bool,
+    use_comp: bool,
+    sk: Option<&str>,
+    sid: &str,
+    v2: bool,
+    context: &str,
+) {
+    let swc = FrpMessage::StartWorkConn(msg::StartWorkConn {
+        proxy_name: proxy_name.to_string(),
+        src_addr: None,
+        src_port: None,
+        dst_addr: None,
+        dst_port: None,
+        error: None,
+        use_encryption: if use_enc { Some(true) } else { None },
+        use_compression: if use_comp { Some(true) } else { None },
+        nat_hole_sid: Some(sid.to_string()),
+        nat_hole_visitor_addr: None,
+        sk: sk.map(|s| s.to_string()),
+    });
+    if let Err(e) = write_ctl_msg(writer, &swc, v2).await {
+        warn!(error = %e, "Failed to send StartWorkConn with NatHoleSid{}: {}", context, e);
+    } else {
+        debug!(sid = %sid, "Sent StartWorkConn with embedded NatHoleSid {} to provider{}", sid, context);
+        // Standalone NatHoleSid V1 frame for Go frpc compat.
+        let nhs = FrpMessage::NatHoleSid(msg::NatHoleSid {
+            sid: Some(sid.to_string()),
+            provider_addr: None,
+        });
+        if let Err(e) = write_ctl_msg(writer, &nhs, v2).await {
+            debug!(error = %e, "Failed to send separate NatHoleSid frame (non-fatal): {}", e);
+        }
+    }
+}
+
+// ---- InternalMsg Handlers ----
+
+/// Handle a new work connection arriving for this control session.
+///
+/// Priority order: (1) deliver pending NatHoleSid, (2) assign to waiting UDP
+/// proxy, (3) assign to oldest pending TCP request, (4) pool if below cap,
+/// (5) drop if pool is full.
+pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
+    ctx: &mut ControlContext,
+    ctl: &mut ControlState,
+    _writer: &mut W,
+    mut stream: IoStream,
+) -> Result<(), ()> {
+    debug!(run_id = %ctx.run_id, "Got work conn for run_id {}", ctx.run_id);
+    // Expire stale pending NatHoleSid entries first.
+    while let Some((_, _, ts)) = ctl.pending_nat_hole_sids.front() {
+        if ts.elapsed() > PENDING_REQUEST_TIMEOUT {
+            let (sid, _pn, _) = ctl.pending_nat_hole_sids.pop_front().unwrap();
+            debug!(sid = %sid, "Pending NatHoleSid {} timed out", sid);
+        } else {
+            break;
+        }
+    }
+    // Check NatHoleSid delivery first (Go frp XTCP compat).
+    // Pending sids take priority — they unblock waiting visitors.
+    if let Some((sid, proxy_name, _ts)) = ctl.pending_nat_hole_sids.pop_front() {
+        debug!(sid = %sid, proxy_name = %proxy_name, "Delivering pending NatHoleSid {} for {} to provider", sid, proxy_name);
+        // Look up proxy flags for StartWorkConn (encryption/compression propagation)
+        let (use_enc, use_comp, sk) = ctx
+            .state
+            .proxy_manager
+            .get(&proxy_name)
+            .await
+            .map(|p| (p.use_encryption, p.use_compression, p.sk.clone()))
+            .unwrap_or((false, false, None));
+        write_start_work_conn_with_nat_hole_sid(
+            &mut stream,
+            &proxy_name,
+            use_enc,
+            use_comp,
+            sk.as_deref(),
+            &sid,
+            ctx.v2,
+            " (pending)",
+        )
+        .await;
+        // Work conn consumed for XTCP notification — drop it.
+    } else {
+        // Expire stale pending UDP requests first
+        while let Some((_, ts)) = ctl.pending_udp.front() {
+            if ts.elapsed() > PENDING_REQUEST_TIMEOUT {
+                let (pn, _) = ctl.pending_udp.pop_front().unwrap();
+                debug!(proxy_name = %pn, "Pending UDP work conn for '{}' timed out", pn);
+            } else {
+                break;
+            }
+        }
+        // Check if a UDP proxy needs this work connection
+        if let Some((proxy_name, _)) = ctl.pending_udp.pop_front() {
+            info!(proxy_name = %proxy_name, "Assigning work conn to UDP proxy '{}'", proxy_name);
+            let local_addr = ctx
+                .state
+                .proxy_manager
+                .get(&proxy_name)
+                .await
+                .and_then(|info| info.local_addr)
+                .and_then(|s| msg::UdpAddr::from_string(&s));
+            bridge::assign_udp_work_conn(
+                stream,
+                &proxy_name,
+                &ctl.udp_sockets,
+                local_addr,
+                ctx.v2,
+                ctx.state.udp_packet_size,
+            )
+            .await;
+        } else {
+            // Drain expired TCP requests
+            while let Some(req) = ctl.pending_requests.front() {
+                if req.created_at.elapsed() > PENDING_REQUEST_TIMEOUT {
+                    ctl.pending_requests.pop_front();
+                    ctx.pool_stats
+                        .pending_requests
+                        .store(ctl.pending_requests.len() as i64, Ordering::Relaxed);
+                } else {
+                    break;
+                }
+            }
+            if let Some(req) = ctl.pending_requests.pop_front() {
+                ctx.state.pool.hits.fetch_add(1, Ordering::Relaxed);
+                ctx.pool_stats
+                    .pending_requests
+                    .store(ctl.pending_requests.len() as i64, Ordering::Relaxed);
+                ctx.pool_stats
+                    .pool_size
+                    .store(ctl.work_pool.len() as i64, Ordering::Relaxed);
+                let enc_key = ctx.reloadable.encryption_key;
+                bridge::assign_work_to_proxy(stream, req, enc_key, ctx.state.clone(), ctx.v2).await;
+            } else if ctl.work_pool.len() < ctx.pool_cap {
+                ctl.work_pool.push_back(PoolEntry {
+                    conn: stream,
+                    pooled_at: Instant::now(),
+                });
+                ctx.pool_stats
+                    .pool_size
+                    .store(ctl.work_pool.len() as i64, Ordering::Relaxed);
+                debug!(run_id = %ctx.run_id, pool_size = %ctl.work_pool.len(), pool_cap = %ctx.pool_cap, "Work conn pooled for {} (pool size: {}/{})", ctx.run_id, ctl.work_pool.len(), ctx.pool_cap);
+            } else {
+                ctx.state.pool.drops.fetch_add(1, Ordering::Relaxed);
+                debug!(run_id = %ctx.run_id, pool_size = %ctl.work_pool.len(), pool_cap = %ctx.pool_cap, "Work pool full for {} ({}/{}), dropping work conn", ctx.run_id, ctl.work_pool.len(), ctx.pool_cap);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handle a visitor connection for STCP (secret TCP) proxy.
+pub(crate) async fn handle_visitor_conn<W: AsyncWriteExt + Unpin>(
+    ctx: &mut ControlContext,
+    ctl: &mut ControlState,
+    writer: &mut W,
+    proxy_name: String,
+    visitor_conn: IoStream,
+) -> Result<(), ()> {
+    // NewUserConn plugin hook — control-enabled plugins can reject
+    let user_content = serde_json::json!({
+        "proxy_name": proxy_name,
+        "run_id": ctx.run_id,
+    });
+    if let Err(reason) = ctx
+        .state
+        .plugin_manager
+        .notify("new_user_conn", user_content)
+        .await
+    {
+        debug!(proxy_name = %proxy_name, reason = %reason, "NewUserConn plugin hook rejected (VisitorConn): {}", reason);
+        return Ok(());
+    }
+    debug!(proxy_name = %proxy_name, run_id = %ctx.run_id, "STCP visitor conn for proxy {} on run_id {}", proxy_name, ctx.run_id);
+    let (enc, comp, response_headers, proxy_type) = {
+        let p = ctx.state.proxy_manager.get(&proxy_name).await;
+        let e = p.as_ref().map(|p| p.use_encryption).unwrap_or(false);
+        let c = p.as_ref().map(|p| p.use_compression).unwrap_or(false);
+        let rh = p
+            .as_ref()
+            .map(|p| p.response_headers.clone())
+            .unwrap_or_default();
+        let pt = p.as_ref().map(|p| p.proxy_type.clone()).unwrap_or_default();
+        (e, c, rh, pt)
+    };
+    assign_or_queue(
+        &mut ctl.work_pool,
+        &mut ctl.pending_requests,
+        ctx,
+        writer,
+        PendingRequest {
+            proxy_name,
+            user_conn: visitor_conn,
+            pre_read: Vec::new(),
+            use_encryption: enc,
+            use_compression: comp,
+            created_at: Instant::now(),
+            response_headers,
+            proxy_type,
+        },
+    )
+    .await
+}
+
+/// Handle a user connection arriving for a proxy.
+///
+/// Includes plugin hook, group load balancing with cross-run_id forwarding,
+/// and pool assignment.
+pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
+    ctx: &mut ControlContext,
+    ctl: &mut ControlState,
+    writer: &mut W,
+    proxy_name: String,
+    user_conn: IoStream,
+    pre_read: Vec<u8>,
+) -> Result<(), ()> {
+    // NewUserConn plugin hook — control-enabled plugins can reject
+    let user_content = serde_json::json!({
+        "proxy_name": proxy_name,
+        "run_id": ctx.run_id,
+    });
+    if let Err(reason) = ctx
+        .state
+        .plugin_manager
+        .notify("new_user_conn", user_content)
+        .await
+    {
+        debug!(proxy_name = %proxy_name, reason = %reason, "NewUserConn plugin hook rejected (ProxyUserConn): {}", reason);
+        return Ok(());
+    }
+    debug!(proxy_name = %proxy_name, run_id = %ctx.run_id, "User conn for proxy {} on run_id {}", proxy_name, ctx.run_id);
+    // Group load balancing: if proxy belongs to a group,
+    // select a backend (possibly on a different run_id).
+    let (target_proxy, target_run_id) = {
+        let p = ctx.state.proxy_manager.get(&proxy_name).await;
+        let group = p
+            .as_ref()
+            .and_then(|p| p.group.clone())
+            .filter(|g| !g.is_empty());
+        let group_key = p
+            .as_ref()
+            .and_then(|p| p.group_key.clone())
+            .unwrap_or_default();
+        if let Some(ref group_name) = group {
+            if let Some(backend) = ctx
+                .state
+                .proxy_manager
+                .select_group_backend(group_name, &group_key)
+                .await
+            {
+                let backend_run_id = ctx
+                    .state
+                    .proxy_manager
+                    .get_run_id(&backend)
+                    .await
+                    .unwrap_or_default();
+                info!(proxy_name = %proxy_name, backend = %backend, backend_run_id = %backend_run_id, "Group LB: {} -> backend {} (run_id {})", proxy_name, backend, backend_run_id);
+                (backend, backend_run_id)
+            } else {
+                (proxy_name.clone(), ctx.run_id.clone())
+            }
+        } else {
+            (proxy_name.clone(), ctx.run_id.clone())
+        }
+    };
+    // If backend is on a different run_id, forward to that handler
+    if target_run_id != ctx.run_id {
+        let ctl_tx = {
+            let map = ctx.state.run_id_to_ctl_tx.read().await;
+            map.get(&target_run_id).cloned()
+        };
+        if let Some(ctl) = ctl_tx {
+            match ctl.tx.try_send(InternalMsg::ProxyUserConn {
+                proxy_name: target_proxy.clone(),
+                user_conn,
+                pre_read,
+            }) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Backend handler is busy. The connection
+                    // was consumed by try_send and cannot be
+                    // recovered without restructuring this
+                    // handler. Drop it (rare — channel has
+                    // capacity 256).
+                    debug!(target_run_id = %target_run_id, "Group backend channel full, dropping connection");
+                    return Ok(());
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    debug!(target_run_id = %target_run_id, "Group backend handler closed, dropping connection");
+                    return Ok(());
+                }
+            }
+        } else {
+            warn!(target_run_id = %target_run_id, target_proxy = %target_proxy, "Group backend run_id {} not found for proxy {}", target_run_id, target_proxy);
+            return Ok(());
+        }
+    }
+    let (enc, comp, response_headers, proxy_type) = {
+        let p = ctx.state.proxy_manager.get(&target_proxy).await;
+        let e = p.as_ref().map(|p| p.use_encryption).unwrap_or(false);
+        let c = p.as_ref().map(|p| p.use_compression).unwrap_or(false);
+        let rh = p
+            .as_ref()
+            .map(|p| p.response_headers.clone())
+            .unwrap_or_default();
+        let pt = p.as_ref().map(|p| p.proxy_type.clone()).unwrap_or_default();
+        (e, c, rh, pt)
+    };
+    assign_or_queue(
+        &mut ctl.work_pool,
+        &mut ctl.pending_requests,
+        ctx,
+        writer,
+        PendingRequest {
+            proxy_name: target_proxy,
+            user_conn,
+            pre_read,
+            use_encryption: enc,
+            use_compression: comp,
+            created_at: Instant::now(),
+            response_headers,
+            proxy_type,
+        },
+    )
+    .await
+}
+
+/// Handle a UDP proxy requesting a work connection.
+pub(crate) async fn handle_udp_work_conn<W: AsyncWriteExt + Unpin>(
+    ctx: &mut ControlContext,
+    ctl: &mut ControlState,
+    writer: &mut W,
+    proxy_name: String,
+) -> Result<(), ()> {
+    debug!(proxy_name = %proxy_name, "UDP proxy '{}' needs work connection", proxy_name);
+    if let Err(e) = write_ctl_msg(
+        writer,
+        &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
+        ctx.v2,
+    )
+    .await
+    {
+        warn!(error = %e, "Failed to send ReqWorkConn for UDP: {}", e);
+        return Err(());
+    }
+    ctl.pending_udp.push_back((proxy_name, Instant::now()));
+    Ok(())
+}

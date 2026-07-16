@@ -100,151 +100,55 @@ pub async fn write_msg_v1<W: AsyncWriteExt + Unpin>(
     write_v1_frame(writer, msg).await
 }
 
+/// Shared deserialization helper: `serde_json::from_slice` + `FrpMessage` wrap.
+/// `$version_suffix` distinguishes V1 ("") from V2 (" (v2)") in error messages.
+macro_rules! deser_msg {
+    ($payload:expr, $MsgType:ident, $version_suffix:literal) => {{
+        let v: msg::$MsgType = serde_json::from_slice($payload).map_err(|e| {
+            crate::Error::Protocol(
+                format!(
+                    "deserialize {}{}: {}",
+                    stringify!($MsgType),
+                    $version_suffix,
+                    e
+                )
+                .into(),
+            )
+        })?;
+        FrpMessage::$MsgType(v)
+    }};
+}
+
 /// Deserialize a V2 message from its type ID and JSON payload bytes.
 /// V2 uses numeric type IDs (u16) instead of V1's ASCII type bytes.
 pub fn deserialize_v2(type_id: u16, json_bytes: &[u8]) -> Result<FrpMessage, crate::Error> {
     let msg = match type_id {
-        msg::V2_TYPE_LOGIN => {
-            let v: msg::Login = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize Login (v2): {e}").into())
-            })?;
-            FrpMessage::Login(v)
-        }
-        msg::V2_TYPE_LOGIN_RESP => {
-            let v: msg::LoginResp = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize LoginResp (v2): {e}").into())
-            })?;
-            FrpMessage::LoginResp(v)
-        }
-        msg::V2_TYPE_NEW_PROXY => {
-            let v: msg::NewProxy = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NewProxy (v2): {e}").into())
-            })?;
-            FrpMessage::NewProxy(v)
-        }
-        msg::V2_TYPE_NEW_PROXY_RESP => {
-            let v: msg::NewProxyResp = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NewProxyResp (v2): {e}").into())
-            })?;
-            FrpMessage::NewProxyResp(v)
-        }
-        msg::V2_TYPE_CLOSE_PROXY => {
-            let v: msg::CloseProxy = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize CloseProxy (v2): {e}").into())
-            })?;
-            FrpMessage::CloseProxy(v)
-        }
-        msg::V2_TYPE_NEW_WORK_CONN => {
-            let v: msg::NewWorkConn = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NewWorkConn (v2): {e}").into())
-            })?;
-            FrpMessage::NewWorkConn(v)
-        }
-        msg::V2_TYPE_REQ_WORK_CONN => {
-            let v: msg::ReqWorkConn = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize ReqWorkConn (v2): {e}").into())
-            })?;
-            FrpMessage::ReqWorkConn(v)
-        }
-        msg::V2_TYPE_START_WORK_CONN => {
-            let v: msg::StartWorkConn = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize StartWorkConn (v2): {e}").into())
-            })?;
-            FrpMessage::StartWorkConn(v)
-        }
-        msg::V2_TYPE_NEW_VISITOR_CONN => {
-            let v: msg::NewVisitorConn = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NewVisitorConn (v2): {e}").into())
-            })?;
-            FrpMessage::NewVisitorConn(v)
-        }
-        msg::V2_TYPE_NEW_VISITOR_CONN_RESP => {
-            let v: msg::NewVisitorConnResp = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NewVisitorConnResp (v2): {e}").into())
-            })?;
-            FrpMessage::NewVisitorConnResp(v)
-        }
-        msg::V2_TYPE_PING => {
-            let v: msg::Ping = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize Ping (v2): {e}").into())
-            })?;
-            FrpMessage::Ping(v)
-        }
-        msg::V2_TYPE_PONG => {
-            let v: msg::Pong = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize Pong (v2): {e}").into())
-            })?;
-            FrpMessage::Pong(v)
-        }
-        msg::V2_TYPE_UDP_PACKET => {
-            let v: msg::UDPPacket = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize UDPPacket (v2): {e}").into())
-            })?;
-            FrpMessage::UDPPacket(v)
-        }
-        msg::V2_TYPE_NAT_HOLE_VISITOR => {
-            let v: msg::NatHoleVisitor = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NatHoleVisitor (v2): {e}").into())
-            })?;
-            FrpMessage::NatHoleVisitor(v)
-        }
-        msg::V2_TYPE_NAT_HOLE_CLIENT => {
-            let v: msg::NatHoleClient = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NatHoleClient (v2): {e}").into())
-            })?;
-            FrpMessage::NatHoleClient(v)
-        }
-        msg::V2_TYPE_NAT_HOLE_RESP => {
-            let v: msg::NatHoleResp = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NatHoleResp (v2): {e}").into())
-            })?;
-            FrpMessage::NatHoleResp(v)
-        }
-        msg::V2_TYPE_NAT_HOLE_SID => {
-            let v: msg::NatHoleSid = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NatHoleSid (v2): {e}").into())
-            })?;
-            FrpMessage::NatHoleSid(v)
-        }
-        msg::V2_TYPE_NAT_HOLE_REPORT => {
-            let v: msg::NatHoleReport = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NatHoleReport (v2): {e}").into())
-            })?;
-            FrpMessage::NatHoleReport(v)
-        }
-        msg::V2_TYPE_CLOSE_PROXY_RESP => {
-            let v: msg::CloseProxyResp = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize CloseProxyResp (v2): {e}").into())
-            })?;
-            FrpMessage::CloseProxyResp(v)
-        }
-        msg::V2_TYPE_ERROR => {
-            let v: msg::Error = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize Error (v2): {e}").into())
-            })?;
-            FrpMessage::Error(v)
-        }
+        msg::V2_TYPE_LOGIN => deser_msg!(json_bytes, Login, " (v2)"),
+        msg::V2_TYPE_LOGIN_RESP => deser_msg!(json_bytes, LoginResp, " (v2)"),
+        msg::V2_TYPE_NEW_PROXY => deser_msg!(json_bytes, NewProxy, " (v2)"),
+        msg::V2_TYPE_NEW_PROXY_RESP => deser_msg!(json_bytes, NewProxyResp, " (v2)"),
+        msg::V2_TYPE_CLOSE_PROXY => deser_msg!(json_bytes, CloseProxy, " (v2)"),
+        msg::V2_TYPE_CLOSE_PROXY_RESP => deser_msg!(json_bytes, CloseProxyResp, " (v2)"),
+        msg::V2_TYPE_ERROR => deser_msg!(json_bytes, Error, " (v2)"),
+        msg::V2_TYPE_NEW_WORK_CONN => deser_msg!(json_bytes, NewWorkConn, " (v2)"),
+        msg::V2_TYPE_REQ_WORK_CONN => deser_msg!(json_bytes, ReqWorkConn, " (v2)"),
+        msg::V2_TYPE_START_WORK_CONN => deser_msg!(json_bytes, StartWorkConn, " (v2)"),
+        msg::V2_TYPE_NEW_VISITOR_CONN => deser_msg!(json_bytes, NewVisitorConn, " (v2)"),
+        msg::V2_TYPE_NEW_VISITOR_CONN_RESP => deser_msg!(json_bytes, NewVisitorConnResp, " (v2)"),
+        msg::V2_TYPE_PING => deser_msg!(json_bytes, Ping, " (v2)"),
+        msg::V2_TYPE_PONG => deser_msg!(json_bytes, Pong, " (v2)"),
+        msg::V2_TYPE_UDP_PACKET => deser_msg!(json_bytes, UDPPacket, " (v2)"),
+        msg::V2_TYPE_NAT_HOLE_VISITOR => deser_msg!(json_bytes, NatHoleVisitor, " (v2)"),
+        msg::V2_TYPE_NAT_HOLE_CLIENT => deser_msg!(json_bytes, NatHoleClient, " (v2)"),
+        msg::V2_TYPE_NAT_HOLE_RESP => deser_msg!(json_bytes, NatHoleResp, " (v2)"),
+        msg::V2_TYPE_NAT_HOLE_SID => deser_msg!(json_bytes, NatHoleSid, " (v2)"),
+        msg::V2_TYPE_NAT_HOLE_REPORT => deser_msg!(json_bytes, NatHoleReport, " (v2)"),
         #[cfg(feature = "vnet")]
-        msg::V2_TYPE_VNET_ROUTE_ADVERTISE => {
-            let v: msg::VnetRouteAdvertise = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize VnetRouteAdvertise (v2): {e}").into())
-            })?;
-            FrpMessage::VnetRouteAdvertise(v)
-        }
+        msg::V2_TYPE_VNET_ROUTE_ADVERTISE => deser_msg!(json_bytes, VnetRouteAdvertise, " (v2)"),
         #[cfg(feature = "vnet")]
-        msg::V2_TYPE_VNET_PACKET => {
-            let v: msg::VnetPacket = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize VnetPacket (v2): {e}").into())
-            })?;
-            FrpMessage::VnetPacket(v)
-        }
+        msg::V2_TYPE_VNET_PACKET => deser_msg!(json_bytes, VnetPacket, " (v2)"),
         #[cfg(feature = "vnet")]
-        msg::V2_TYPE_VNET_ROUTE_REMOVE => {
-            let v: msg::VnetRouteRemove = serde_json::from_slice(json_bytes).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize VnetRouteRemove (v2): {e}").into())
-            })?;
-            FrpMessage::VnetRouteRemove(v)
-        }
+        msg::V2_TYPE_VNET_ROUTE_REMOVE => deser_msg!(json_bytes, VnetRouteRemove, " (v2)"),
         _ => {
             return Err(crate::Error::Protocol(
                 format!("unknown V2 message type ID: {type_id}").into(),
@@ -256,91 +160,21 @@ pub fn deserialize_v2(type_id: u16, json_bytes: &[u8]) -> Result<FrpMessage, cra
 
 pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate::Error> {
     let msg = match type_byte {
-        msg::TYPE_LOGIN => {
-            let v: msg::Login = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize Login: {e}").into()))?;
-            FrpMessage::Login(v)
-        }
-        msg::TYPE_LOGIN_RESP => {
-            let v: msg::LoginResp = serde_json::from_slice(payload).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize LoginResp: {e}").into())
-            })?;
-            FrpMessage::LoginResp(v)
-        }
-        msg::TYPE_NEW_PROXY => {
-            let v: msg::NewProxy = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize NewProxy: {e}").into()))?;
-            FrpMessage::NewProxy(v)
-        }
-        msg::TYPE_NEW_PROXY_RESP => {
-            let v: msg::NewProxyResp = serde_json::from_slice(payload).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NewProxyResp: {e}").into())
-            })?;
-            FrpMessage::NewProxyResp(v)
-        }
-        msg::TYPE_CLOSE_PROXY => {
-            let v: msg::CloseProxy = serde_json::from_slice(payload).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize CloseProxy: {e}").into())
-            })?;
-            FrpMessage::CloseProxy(v)
-        }
-        msg::TYPE_CLOSE_PROXY_RESP => {
-            let v: msg::CloseProxyResp = serde_json::from_slice(payload).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize CloseProxyResp: {e}").into())
-            })?;
-            FrpMessage::CloseProxyResp(v)
-        }
-        msg::TYPE_ERROR => {
-            let v: msg::Error = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize Error: {e}").into()))?;
-            FrpMessage::Error(v)
-        }
-        msg::TYPE_NEW_WORK_CONN => {
-            let v: msg::NewWorkConn = serde_json::from_slice(payload).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NewWorkConn: {e}").into())
-            })?;
-            FrpMessage::NewWorkConn(v)
-        }
-        msg::TYPE_REQ_WORK_CONN => {
-            let v: msg::ReqWorkConn = serde_json::from_slice(payload).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize ReqWorkConn: {e}").into())
-            })?;
-            FrpMessage::ReqWorkConn(v)
-        }
-        msg::TYPE_START_WORK_CONN => {
-            let v: msg::StartWorkConn = serde_json::from_slice(payload).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize StartWorkConn: {e}").into())
-            })?;
-            FrpMessage::StartWorkConn(v)
-        }
-        msg::TYPE_PING => {
-            let v: msg::Ping = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize Ping: {e}").into()))?;
-            FrpMessage::Ping(v)
-        }
-        msg::TYPE_PONG => {
-            let v: msg::Pong = serde_json::from_slice(payload)
-                .map_err(|e| crate::Error::Protocol(format!("deserialize Pong: {e}").into()))?;
-            FrpMessage::Pong(v)
-        }
-        msg::TYPE_NEW_VISITOR_CONN => {
-            let v: msg::NewVisitorConn = serde_json::from_slice(payload).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NewVisitorConn: {e}").into())
-            })?;
-            FrpMessage::NewVisitorConn(v)
-        }
-        msg::TYPE_NEW_VISITOR_CONN_RESP => {
-            let v: msg::NewVisitorConnResp = serde_json::from_slice(payload).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NewVisitorConnResp: {e}").into())
-            })?;
-            FrpMessage::NewVisitorConnResp(v)
-        }
-        msg::TYPE_UDP_PACKET => {
-            let v: msg::UDPPacket = serde_json::from_slice(payload).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize UDPPacket: {e}").into())
-            })?;
-            FrpMessage::UDPPacket(v)
-        }
+        msg::TYPE_LOGIN => deser_msg!(payload, Login, ""),
+        msg::TYPE_LOGIN_RESP => deser_msg!(payload, LoginResp, ""),
+        msg::TYPE_NEW_PROXY => deser_msg!(payload, NewProxy, ""),
+        msg::TYPE_NEW_PROXY_RESP => deser_msg!(payload, NewProxyResp, ""),
+        msg::TYPE_CLOSE_PROXY => deser_msg!(payload, CloseProxy, ""),
+        msg::TYPE_CLOSE_PROXY_RESP => deser_msg!(payload, CloseProxyResp, ""),
+        msg::TYPE_ERROR => deser_msg!(payload, Error, ""),
+        msg::TYPE_NEW_WORK_CONN => deser_msg!(payload, NewWorkConn, ""),
+        msg::TYPE_REQ_WORK_CONN => deser_msg!(payload, ReqWorkConn, ""),
+        msg::TYPE_START_WORK_CONN => deser_msg!(payload, StartWorkConn, ""),
+        msg::TYPE_PING => deser_msg!(payload, Ping, ""),
+        msg::TYPE_PONG => deser_msg!(payload, Pong, ""),
+        msg::TYPE_NEW_VISITOR_CONN => deser_msg!(payload, NewVisitorConn, ""),
+        msg::TYPE_NEW_VISITOR_CONN_RESP => deser_msg!(payload, NewVisitorConnResp, ""),
+        msg::TYPE_UDP_PACKET => deser_msg!(payload, UDPPacket, ""),
         msg::TYPE_NAT_HOLE_VISITOR => {
             tracing::debug!(
                 payload_text = %String::from_utf8_lossy(payload),
@@ -361,51 +195,16 @@ pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate
             );
             FrpMessage::NatHoleVisitor(v)
         }
-        msg::TYPE_NAT_HOLE_CLIENT => {
-            let v: msg::NatHoleClient = serde_json::from_slice(payload).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NatHoleClient: {e}").into())
-            })?;
-            FrpMessage::NatHoleClient(v)
-        }
-        msg::TYPE_NAT_HOLE_RESP => {
-            let v: msg::NatHoleResp = serde_json::from_slice(payload).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NatHoleResp: {e}").into())
-            })?;
-            FrpMessage::NatHoleResp(v)
-        }
-        msg::TYPE_NAT_HOLE_SID => {
-            let v: msg::NatHoleSid = serde_json::from_slice(payload).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NatHoleSid: {e}").into())
-            })?;
-            FrpMessage::NatHoleSid(v)
-        }
-        msg::TYPE_NAT_HOLE_REPORT => {
-            let v: msg::NatHoleReport = serde_json::from_slice(payload).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize NatHoleReport: {e}").into())
-            })?;
-            FrpMessage::NatHoleReport(v)
-        }
+        msg::TYPE_NAT_HOLE_CLIENT => deser_msg!(payload, NatHoleClient, ""),
+        msg::TYPE_NAT_HOLE_RESP => deser_msg!(payload, NatHoleResp, ""),
+        msg::TYPE_NAT_HOLE_SID => deser_msg!(payload, NatHoleSid, ""),
+        msg::TYPE_NAT_HOLE_REPORT => deser_msg!(payload, NatHoleReport, ""),
         #[cfg(feature = "vnet")]
-        msg::TYPE_VNET_ROUTE_ADVERTISE => {
-            let v: msg::VnetRouteAdvertise = serde_json::from_slice(payload).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize VnetRouteAdvertise: {e}").into())
-            })?;
-            FrpMessage::VnetRouteAdvertise(v)
-        }
+        msg::TYPE_VNET_ROUTE_ADVERTISE => deser_msg!(payload, VnetRouteAdvertise, ""),
         #[cfg(feature = "vnet")]
-        msg::TYPE_VNET_PACKET => {
-            let v: msg::VnetPacket = serde_json::from_slice(payload).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize VnetPacket: {e}").into())
-            })?;
-            FrpMessage::VnetPacket(v)
-        }
+        msg::TYPE_VNET_PACKET => deser_msg!(payload, VnetPacket, ""),
         #[cfg(feature = "vnet")]
-        msg::TYPE_VNET_ROUTE_REMOVE => {
-            let v: msg::VnetRouteRemove = serde_json::from_slice(payload).map_err(|e| {
-                crate::Error::Protocol(format!("deserialize VnetRouteRemove: {e}").into())
-            })?;
-            FrpMessage::VnetRouteRemove(v)
-        }
+        msg::TYPE_VNET_ROUTE_REMOVE => deser_msg!(payload, VnetRouteRemove, ""),
         _ => {
             return Err(crate::Error::Protocol(
                 format!("unknown V1 type byte: 0x{type_byte:02x}").into(),
@@ -418,7 +217,7 @@ pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate
 pub const V2_MAGIC_LEN: usize = 7;
 pub const V2_MAGIC_BYTES: [u8; 7] = [0x46, 0x52, 0x50, 0x00, 0x02, 0x0D, 0x0A];
 pub const V2_FRAME_TYPE_MESSAGE: u16 = 16;
-pub const V2_MAX_FRAME_PAYLOAD: u32 = 64 * 1024;
+pub const V2_MAX_FRAME_PAYLOAD: u32 = 1024 * 1024;
 
 /// V2 frame header size (Go wire.Conn format): type(2) + flags(2) + length(4) = 8 bytes.
 /// Does NOT include magic bytes — magic is only at connection start.
