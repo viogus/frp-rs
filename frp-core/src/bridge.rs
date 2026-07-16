@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
+use std::io;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::bandwidth::BandwidthLimiter;
 use crate::buffer_pool::PoolGuard;
@@ -77,6 +78,42 @@ fn decompress_chunk_into<'a>(
             Some(buf.as_slice())
         }
         None => Some(data),
+    }
+}
+
+/// Unified bridge writer — Plain delegates to AsyncWrite, Encrypted wraps
+/// CipherWriter and calls write_encrypted (in-place CFB encrypt + write).
+enum WorkWriter<W: AsyncWrite + Unpin> {
+    Plain(W),
+    Encrypted(CipherWriter<W>),
+}
+
+impl<W: AsyncWrite + Unpin> WorkWriter<W> {
+    /// Write data (encrypts in-place for Encrypted variant).
+    async fn write_bridge_all(&mut self, data: &mut [u8]) -> io::Result<()> {
+        match self {
+            Self::Plain(w) => w.write_all(data).await,
+            Self::Encrypted(w) => w.write_encrypted(data).await.map(|_| ()),
+        }
+    }
+
+    /// Flush buffered data.
+    async fn flush_bridge(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(w) => w.flush().await,
+            Self::Encrypted(w) => AsyncWriteExt::flush(w).await,
+        }
+    }
+
+    /// Shutdown the write half.
+    async fn shutdown_bridge(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(w) => {
+                let _ = AsyncWriteExt::flush(w).await;
+                w.shutdown().await
+            }
+            Self::Encrypted(w) => AsyncWriteExt::shutdown(w).await,
+        }
     }
 }
 
