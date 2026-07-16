@@ -1502,7 +1502,7 @@ impl Service {
                                         }
                                         // 0x16 (standard TLS ClientHello) — genuine TLS,
                                         // can't fall back to V1.
-                                        warn!(addr = %addr, "TLS connection from {} but TLS not configured", addr);
+                                        debug!(addr = %addr, "TLS connection from {} but TLS not configured (likely internet scanner)", addr);
                                         return;
                                     }
                                 };
