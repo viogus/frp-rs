@@ -1,4 +1,5 @@
 mod bridge;
+mod dispatch;
 mod login;
 mod nathole;
 mod pool;
@@ -43,7 +44,7 @@ async fn write_ctl_msg<W: AsyncWriteExt + Unpin>(
 }
 use frp_core::transport::IoStream;
 
-use crate::service::{AppState, InternalMsg};
+use crate::service::AppState;
 
 // ---- State containers for handle_control ----
 
@@ -168,48 +169,10 @@ pub async fn handle_control<S>(
             // Prefer internal messages to reduce latency for proxy connections
             internal = internal_rx.recv() => {
                 match internal {
-                    Some(InternalMsg::NewWorkConn(stream)) => {
-                        if pool::handle_new_work_conn(&mut ctx, &mut ctl, &mut writer, stream).await.is_err() {
+                    Some(msg) => {
+                        if dispatch::dispatch_internal(&mut ctx, &mut ctl, &mut writer, msg).await.is_err() {
                             break;
                         }
-                    }
-                    Some(InternalMsg::VisitorConn { proxy_name, visitor_conn }) => {
-                        if pool::handle_visitor_conn(&mut ctx, &mut ctl, &mut writer, proxy_name, visitor_conn).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(InternalMsg::ProxyUserConn { proxy_name, user_conn, pre_read }) => {
-                        if pool::handle_proxy_user_conn(&mut ctx, &mut ctl, &mut writer, proxy_name, user_conn, pre_read).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(InternalMsg::UdpNeedsWorkConn { proxy_name }) => {
-                        if pool::handle_udp_work_conn(&mut ctx, &mut ctl, &mut writer, proxy_name).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(InternalMsg::WriteNatHoleSid { sid, provider_addr }) => {
-                        nathole::handle_write_sid(&ctx, &mut ctl, &mut writer, sid, provider_addr).await;
-                    }
-                    Some(InternalMsg::WriteNatHoleResp { transaction_id, error, sid, protocol, candidate_addrs, assisted_addrs }) => {
-                        nathole::handle_write_resp(&ctx, &mut ctl, &mut writer, transaction_id, error, sid, protocol, candidate_addrs, assisted_addrs).await;
-                    }
-                    Some(InternalMsg::WriteNatHoleReport { sid }) => {
-                        nathole::handle_write_report(&ctx, &mut ctl, &mut writer, sid).await;
-                    }
-                    Some(InternalMsg::NatHoleSidOnWorkConn { sid, proxy_name }) => {
-                        if nathole::handle_sid_on_work_conn(&mut ctx, &mut ctl, &mut writer, sid, proxy_name).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(InternalMsg::Shutdown) => {
-                        warn!(run_id = %run_id, "Shutdown received for run_id {} (replaced by new control connection)", run_id);
-                        ctl.shutting_down = true;
-                        break;
-                    }
-                    #[cfg(feature = "vnet")]
-                    Some(InternalMsg::VnetPacketForward { proxy_name, data }) => {
-                        nathole::handle_vnet_packet_forward(&ctx, &mut ctl, &mut writer, proxy_name, data).await;
                     }
                     None => {
                         info!(peer = ?peer, "Control channel closed for {:?}", peer);
@@ -288,63 +251,13 @@ pub async fn handle_control<S>(
 
             msg = read_ctl_msg(&mut reader, v2) => {
                 match msg {
-                    Ok(FrpMessage::UDPPacket(up)) => {
-                        if proxy::handle_udp_packet(&mut ctx, &mut ctl, &mut writer, up).await.is_err() {
+                    Ok(msg) => {
+                        if dispatch::dispatch_frp_message(&mut ctx, &mut ctl, &mut writer, msg, &login_user).await.is_err() {
                             break;
                         }
-                    }
-                    Ok(FrpMessage::NewProxy(np)) => {
-                        if proxy::handle_new_proxy(&mut ctx, &mut ctl, &mut writer, np).await.is_err() {
-                            break;
-                        }
-                    }
-                    #[cfg(feature = "vnet")]
-                    Ok(FrpMessage::VnetRouteAdvertise(adv)) => {
-                        nathole::handle_vnet_route_advertise(&ctx, &mut ctl, &mut writer, adv).await;
-                    }
-                    #[cfg(feature = "vnet")]
-                    Ok(FrpMessage::VnetPacket(pkt)) => {
-                        nathole::handle_vnet_packet(&ctx, &mut ctl, &mut writer, pkt).await;
-                    }
-                    #[cfg(feature = "vnet")]
-                    Ok(FrpMessage::VnetRouteRemove(rem)) => {
-                        nathole::handle_vnet_route_remove(&ctx, &mut ctl, &mut writer, rem).await;
-                    }
-                    Ok(FrpMessage::CloseProxy(cp)) => {
-                        if proxy::handle_close_proxy(&mut ctx, &mut ctl, &mut writer, cp).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(FrpMessage::NatHoleClient(client_msg)) => {
-                        nathole::handle_nat_hole_client(&ctx, &mut ctl, &mut writer, client_msg).await;
-                    }
-                    Ok(FrpMessage::NatHoleSid(sid_msg)) => {
-                        nathole::handle_nat_hole_sid(&ctx, &mut ctl, &mut writer, sid_msg).await;
-                    }
-                    Ok(FrpMessage::NatHoleResp(resp_msg)) => {
-                        nathole::handle_nat_hole_resp(&ctx, &mut ctl, &mut writer, resp_msg).await;
-                    }
-                    Ok(FrpMessage::NatHoleReport(report_msg)) => {
-                        nathole::handle_nat_hole_report(&ctx, &mut ctl, &mut writer, report_msg).await;
-                    }
-                    Ok(FrpMessage::Ping(ping_msg)) => {
-                        if proxy::handle_ping(&mut ctx, &mut ctl, &mut writer, ping_msg).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(FrpMessage::NewVisitorConn(nvc)) => {
-                        nathole::handle_new_visitor_conn(&ctx, &mut ctl, &mut writer, nvc, &login_user).await;
-                    }
-                    Ok(FrpMessage::NatHoleVisitor(nhv)) => {
-                        if nathole::handle_nat_hole_visitor_on_ctl(&mut ctx, &mut ctl, &mut writer, nhv, &login_user).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(_) => {
-                        debug!(peer = ?peer, "Unhandled message from {:?}", peer);
                     }
                     Err(e) => {
-                        info!(peer = ?peer, error = %e, run_id = %run_id, "Control connection {:?} closed: {} (run_id={})", peer, e, run_id);
+                        info!(peer = ?peer, error = %e, run_id = %run_id, "Control connection closed");
                         break;
                     }
                 }
