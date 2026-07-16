@@ -93,6 +93,15 @@ where
         pool_stats
             .pool_size
             .store(work_pool.len() as i64, Ordering::Relaxed);
+        // Proactive replenish: tell client to send replacement work conn.
+        // Matches Go frp v0.70 GetWorkConn which always sends ReqWorkConn
+        // after consuming from the pool channel (server/control.go:264).
+        if let Err(e) =
+            write_ctl_msg(writer, &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}), v2).await
+        {
+            warn!(error = %e, "Failed to send ReqWorkConn for pool replenish: {}", e);
+            return Err(());
+        }
         bridge::assign_work_to_proxy(entry.conn, req, enc_key, state.clone(), v2).await;
     } else {
         state.pool.misses.fetch_add(1, Ordering::Relaxed);

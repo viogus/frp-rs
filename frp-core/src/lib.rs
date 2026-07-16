@@ -42,18 +42,18 @@ pub mod kcp {
     pub struct KcpConfig;
     impl Default for KcpConfig {
         fn default() -> Self {
-            Self
+            panic!("KcpConfig requires the 'kcp' feature to be enabled")
         }
     }
 }
 #[cfg(not(feature = "kcp"))]
 pub mod xtcp_p2p {
-    use tokio::net::{TcpStream, UdpSocket};
+    use tokio::net::UdpSocket;
     pub fn conv_from_sid(_sid: &str) -> u32 {
-        0
+        panic!("xtcp_p2p::conv_from_sid requires the 'kcp' feature")
     }
     pub fn derive_detect_key(_sk: &str) -> [u8; 16] {
-        [0u8; 16]
+        panic!("xtcp_p2p::derive_detect_key requires the 'kcp' feature")
     }
     pub async fn xtcp_p2p_connect_yamux(
         _socket: UdpSocket,
@@ -64,7 +64,7 @@ pub mod xtcp_p2p {
         _yamux_client: bool,
         _sid: Option<&str>,
         _key: Option<&[u8; 16]>,
-    ) -> Result<TcpStream, String> {
+    ) -> Result<tokio::net::TcpStream, String> {
         Err("KCP feature not compiled".into())
     }
 }

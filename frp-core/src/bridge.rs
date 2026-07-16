@@ -191,7 +191,7 @@ pub async fn bridge_encrypted(
 
             if use_compression {
                 // Compress into reusable buffer, then encrypt in-place.
-                if compress_chunk_into(&buf.data()[..n], true, &mut comp_buf).is_none() {
+                if compress_chunk_into(&buf.raw_buf()[..n], true, &mut comp_buf).is_none() {
                     break;
                 }
                 if let Some(ref mut lim) = write_limiter {
@@ -240,7 +240,7 @@ pub async fn bridge_encrypted(
                 Ok(n) => n,
                 Err(_) => break,
             };
-            let decrypted = &buf.data()[..n];
+            let decrypted = &buf.raw_buf()[..n];
 
             let plaintext =
                 match decompress_chunk_into(&mut decompressor, decrypted, &mut decomp_buf) {
@@ -337,7 +337,7 @@ pub async fn bridge_plain(
                     break;
                 }
                 Ok(n) => {
-                    trace_hex!(n, first_hex = %hex::encode(&buf.data()[..n.min(32)]), "bridge_plain: user_r read {} bytes", n);
+                    trace_hex!(n, first_hex = %hex::encode(&buf.raw_buf()[..n.min(32)]), "bridge_plain: user_r read {} bytes", n);
                     if let Some(ref m) = metrics {
                         m.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
                     }
@@ -348,7 +348,7 @@ pub async fn bridge_plain(
                     break;
                 }
             };
-            let payload = &buf.data()[..n];
+            let payload = &buf.raw_buf()[..n];
             if compress_chunk_into(payload, use_compression, &mut comp_buf).is_none() {
                 break;
             }
@@ -392,7 +392,7 @@ pub async fn bridge_plain(
                     break;
                 }
                 Ok(n) => {
-                    trace_hex!(n, first_hex = %hex::encode(&buf.data()[..n.min(32)]), "bridge_plain: work_r read {} bytes", n);
+                    trace_hex!(n, first_hex = %hex::encode(&buf.raw_buf()[..n.min(32)]), "bridge_plain: work_r read {} bytes", n);
                     n
                 }
                 Err(e) => {
@@ -400,11 +400,14 @@ pub async fn bridge_plain(
                     break;
                 }
             };
-            let plaintext =
-                match decompress_chunk_into(&mut decompressor, &buf.data()[..n], &mut decomp_buf) {
-                    Some(p) => p,
-                    None => break,
-                };
+            let plaintext = match decompress_chunk_into(
+                &mut decompressor,
+                &buf.raw_buf()[..n],
+                &mut decomp_buf,
+            ) {
+                Some(p) => p,
+                None => break,
+            };
             if !plaintext.is_empty() {
                 if user_w.write_all(plaintext).await.is_err() {
                     tracing::warn!(
@@ -498,7 +501,7 @@ pub async fn bridge_plain_rate_limited(
             };
 
             if use_compression {
-                if compress_chunk_into(&buf.data()[..n], true, &mut comp_buf).is_none() {
+                if compress_chunk_into(&buf.raw_buf()[..n], true, &mut comp_buf).is_none() {
                     break;
                 }
                 if let Some(ref mut lim) = write_limiter {
@@ -508,7 +511,7 @@ pub async fn bridge_plain_rate_limited(
                     break;
                 }
             } else {
-                let slice = &buf.data()[..n];
+                let slice = &buf.raw_buf()[..n];
                 if let Some(ref mut lim) = write_limiter {
                     lim.consume(slice.len()).await;
                 }
@@ -540,11 +543,14 @@ pub async fn bridge_plain_rate_limited(
                 Ok(n) => n,
                 Err(_) => break,
             };
-            let plaintext =
-                match decompress_chunk_into(&mut decompressor, &buf.data()[..n], &mut decomp_buf) {
-                    Some(p) => p,
-                    None => break,
-                };
+            let plaintext = match decompress_chunk_into(
+                &mut decompressor,
+                &buf.raw_buf()[..n],
+                &mut decomp_buf,
+            ) {
+                Some(p) => p,
+                None => break,
+            };
             if !plaintext.is_empty() {
                 if let Some(ref mut lim) = read_limiter {
                     lim.consume(plaintext.len()).await;
@@ -1014,5 +1020,103 @@ mod tests {
         let mut buf = Vec::new();
         let out = decompress_chunk_into(&mut dec, b"raw", &mut buf).unwrap();
         assert_eq!(out, b"raw");
+    }
+
+    /// Rate-limited plain bridge: bidirectional data flow with high limit.
+    #[tokio::test]
+    async fn test_bridge_plain_rate_limited_smoke() {
+        let (mut u_w_test, u_r_bridge) = tokio::io::duplex(65536);
+        let (w_w_bridge, mut w_r_test) = tokio::io::duplex(65536);
+        let (mut w_w_test, w_r_bridge) = tokio::io::duplex(65536);
+        let (u_w_bridge, mut u_r_test) = tokio::io::duplex(65536);
+
+        // 1 GB/s — effectively unlimited for small data
+        let mut wlim = BandwidthLimiter::new(1_000_000_000);
+        let mut rlim = BandwidthLimiter::new(1_000_000_000);
+
+        tokio::spawn(async move {
+            bridge_plain_rate_limited(
+                u_r_bridge,
+                u_w_bridge,
+                w_r_bridge,
+                w_w_bridge,
+                false,
+                vec![],
+                Some(&mut rlim),
+                Some(&mut wlim),
+                None,
+            )
+            .await;
+        });
+
+        // User → Work
+        u_w_test.write_all(b"user->work").await.unwrap();
+        u_w_test.flush().await.unwrap();
+        let mut buf = vec![0u8; 1024];
+        let n = w_r_test.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"user->work");
+
+        // Work → User
+        w_w_test.write_all(b"work->user").await.unwrap();
+        w_w_test.flush().await.unwrap();
+        let n2 = u_r_test.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n2], b"work->user");
+    }
+
+    /// Rate-limited plain bridge: low bandwidth caps transfer speed.
+    #[tokio::test]
+    async fn test_bridge_plain_rate_limited_bandwidth() {
+        let (mut u_w_test, u_r_bridge) = tokio::io::duplex(65536);
+        let (w_w_bridge, mut w_r_test) = tokio::io::duplex(65536);
+        let (w_w_test, w_r_bridge) = tokio::io::duplex(65536);
+        let (u_w_bridge, _u_r_test) = tokio::io::duplex(65536);
+
+        // 1 KB/s — very slow. Burst = 1 KB so first KB instant, rest throttled.
+        let mut wlim = BandwidthLimiter::new(1024);
+
+        let start = std::time::Instant::now();
+
+        let handle = tokio::spawn(async move {
+            bridge_plain_rate_limited(
+                u_r_bridge,
+                u_w_bridge,
+                w_r_bridge,
+                w_w_bridge,
+                false,
+                vec![],
+                None,
+                Some(&mut wlim),
+                None,
+            )
+            .await;
+        });
+
+        // Send 2 KB. 1 KB burst + 1 KB deficit → ~1 s wait.
+        let data = vec![0x41u8; 2 * 1024];
+        u_w_test.write_all(&data).await.unwrap();
+        u_w_test.flush().await.unwrap();
+        drop(u_w_test); // EOF on user_r
+        drop(w_w_test); // EOF on work_r
+
+        // Drain work side
+        let mut buf = vec![0u8; 4 * 1024];
+        let mut total = 0;
+        loop {
+            match w_r_test.read(&mut buf[total..]).await {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(_) => break,
+            }
+        }
+
+        handle.await.unwrap();
+        let elapsed = start.elapsed().as_millis();
+
+        assert_eq!(total, 2 * 1024, "all 2 KB should be transferred");
+        assert!(
+            elapsed >= 500,
+            "expected >= 500 ms with 1 KB/s limit, got {elapsed} ms"
+        );
+        assert!(elapsed <= 3000, "expected <= 3000 ms, got {elapsed} ms");
     }
 }

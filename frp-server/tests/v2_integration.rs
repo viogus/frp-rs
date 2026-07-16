@@ -87,6 +87,11 @@ async fn test_v2_tcp_proxy() {
         .expect("yamux client init");
     let mut control = IoStream::Yamux(control_yamux);
 
+    // V2 magic on yamux stream (dial_server no longer writes it —
+    // control.rs writes it after mux wrap; this test bypasses control.rs).
+    frp_core::protocol::write_v2_magic(&mut control)
+        .await
+        .expect("write v2 magic on yamux");
     // V2 ClientHello / ServerHello handshake on the yamux control stream
     v2_handshake::v2_handshake_client(
         &mut control,
@@ -323,6 +328,13 @@ async fn test_v2_ping_pong_raw_tcp() {
         .await
         .expect("dial server");
 
+    // dial_server no longer writes V2 magic (it's done at the control.rs
+    // call site after all transport layers are established). This test
+    // bypasses control.rs, so write magic explicitly here.
+    frp_core::protocol::write_v2_magic(&mut stream)
+        .await
+        .expect("write v2 magic");
+
     // V2 handshake on raw TCP (no yamux)
     v2_handshake::v2_handshake_client(
         &mut stream,
@@ -442,6 +454,10 @@ async fn test_v2_ping_pong_yamux() {
             .expect("yamux client init");
     let mut control = IoStream::Yamux(control_yamux);
 
+    // V2 magic on yamux stream (dial_server no longer writes it).
+    frp_core::protocol::write_v2_magic(&mut control)
+        .await
+        .expect("write v2 magic on yamux");
     // V2 handshake on yamux stream
     v2_handshake::v2_handshake_client(
         &mut control,

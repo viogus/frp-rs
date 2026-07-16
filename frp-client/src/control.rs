@@ -132,7 +132,6 @@ impl ControlConnection {
             bind_addr: self.bind_addr.clone(),
             proxy_url: opt_if_empty!(self.proxy_url),
             v2: self.v2,
-            caller_handles_mux: propose_mux,
             ..Default::default()
         };
 
@@ -234,17 +233,12 @@ impl ControlConnection {
         // V2: ClientHello/ServerHello handshake on yamux-wrapped stream.
         let mut crypto_ctx = None;
         if self.v2 {
-            // Write V2 magic on transports that haven't already done so:
-            // - TCP mux: yamux stream needs explicit magic (caller_handles_mux=true in dial opts)
-            // - QUIC: dial_quic() doesn't write magic (per-stream independence)
-            // - TCP non-mux/KCP/WS/WSS: magic already written by dial_server() (opts.v2=true)
-            #[cfg(feature = "quic")]
-            let needs_v2_magic =
-                propose_mux || matches!(self.transport_protocol, TransportProtocol::Quic);
-            #[cfg(not(feature = "quic"))]
-            let needs_v2_magic = propose_mux;
-
-            if needs_v2_magic {
+            // Write V2 magic on the fully-established transport stream.
+            // dial_server() no longer writes magic — control.rs is the single
+            // call site for all transports, matching Go frp v0.70 where
+            // WriteMagicIfV2 happens on the connector result after TLS/WS/mux
+            // (client/control_session.go:140-141).
+            if self.v2 {
                 frp_core::protocol::write_v2_magic(&mut io_stream).await?;
             }
             let transport_name = match self.transport_protocol {

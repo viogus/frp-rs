@@ -276,7 +276,7 @@ async fn recv_second_attempt(
     timeout_ms: u64,
     sid: Option<&str>,
     key: Option<&[u8; 16]>,
-    _peers: &[SocketAddr],
+    peers: &[SocketAddr],
 ) -> Result<SocketAddr, String> {
     let mut buf = [0u8; 1024];
     let deadline2 = tokio::time::timeout(
@@ -291,7 +291,10 @@ async fn recv_second_attempt(
             let data = &buf[..n];
 
             if data == HOLE_PUNCH_MAGIC {
-                return Ok(peer);
+                if peers.contains(&peer) {
+                    return Ok(peer);
+                }
+                return Err(format!("magic response from non-candidate {}", peer));
             }
 
             if let (Some(sid_str), Some(enc_key)) = (sid, key) {
@@ -563,6 +566,14 @@ impl AsyncWrite for XtcpP2pStream {
                 io::ErrorKind::NotConnected,
                 "XTCP P2P stream shut down",
             )));
+        }
+
+        // Drain any pending_send buffered during the current tick window
+        // (maybe_tick skips drive_kcp when elapsed < KCP_TICK_MS, so poll_write
+        // data may sit in pending_send without reaching KCP's snd_queue).
+        if !self.pending_send.is_empty() {
+            let data = std::mem::take(&mut self.pending_send);
+            let _ = self.session.send(&data);
         }
 
         // Force-flush: update KCP and send all output immediately.
