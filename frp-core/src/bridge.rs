@@ -69,7 +69,7 @@ fn decompress_chunk_into<'a>(
     match dec {
         Some(d) => {
             d.feed_into(data, buf)
-                .inspect_err(|e| {
+                .inspect_err(|_e| {
                     #[cfg(feature = "compression")]
                     tracing::warn!(error = %e, "snappy decompress error in bridge: {}", e);
                 })
