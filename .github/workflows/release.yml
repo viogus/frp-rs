@@ -86,13 +86,28 @@ jobs:
           echo "/tmp/zig-linux-x86_64-0.14.0" >> "$GITHUB_PATH"
 
       - name: Build (full)
-        run: cargo zigbuild --target ${{ matrix.target }} --release
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            cargo build --target ${{ matrix.target }} --release
+          else
+            cargo zigbuild --target ${{ matrix.target }} --release
+          fi
 
       - name: Build (tiny)
-        run: cargo zigbuild --target ${{ matrix.target }} --release --no-default-features --features tiny
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            cargo build --target ${{ matrix.target }} --release --no-default-features --features tiny
+          else
+            cargo zigbuild --target ${{ matrix.target }} --release --no-default-features --features tiny
+          fi
 
       - name: Build (micro)
-        run: cargo zigbuild --target ${{ matrix.target }} --release --no-default-features --features micro
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            cargo build --target ${{ matrix.target }} --release --no-default-features --features micro
+          else
+            cargo zigbuild --target ${{ matrix.target }} --release --no-default-features --features micro
+          fi
 
       - name: Package
         run: |
