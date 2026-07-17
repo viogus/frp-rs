@@ -269,7 +269,10 @@ impl Service {
         info!(bind_addr = %bind_addr, "frps starting on {}", bind_addr);
 
         #[cfg(feature = "tls")]
-        if self.cfg.tls_enable {
+        {
+            // Always initialize a TLS acceptor — Go frp auto-generates a
+            // self-signed cert even without explicit TLS config, because
+            // Go frpc may send TLS ClientHello (0x16/0x17) by default.
             let ca_file = if self.cfg.tls_ca_file.is_empty() {
                 None
             } else {
