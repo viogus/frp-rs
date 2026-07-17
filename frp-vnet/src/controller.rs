@@ -7,7 +7,7 @@
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use data_encoding::BASE64;
@@ -60,7 +60,7 @@ impl VnetController {
     pub async fn run(
         &self,
         mut tun: Box<dyn TunDevice>,
-        ctl_writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
+        ctl_writer: Arc<Mutex<frp_core::transport::WriteHalf>>,
         mut tun_packet_rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<()> {
         let mtu = tun.mtu() as usize;

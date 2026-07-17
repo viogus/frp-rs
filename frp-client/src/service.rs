@@ -27,7 +27,7 @@ use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg, write_msg};
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
-use frp_core::transport::TransportProtocol;
+use frp_core::transport::{TransportProtocol, WriteHalf};
 
 use frp_core::metrics::ProxyMetricsRegistry;
 
@@ -691,7 +691,7 @@ impl Service {
 
             // Split control stream for reading and writing
             let (mut reader, raw_writer) = control_stream.into_split();
-            let writer = Arc::new(Mutex::new(raw_writer.into_boxed()));
+            let writer = Arc::new(Mutex::new(raw_writer));
 
             // Spawn VnetControllers for all vnet proxies now that the
             // control connection writer is available.
@@ -1250,7 +1250,7 @@ impl Service {
     async fn handle_nat_hole_client(
         &self,
         nhc: msg::NatHoleClient,
-        writer: &Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>,
+        writer: &Arc<Mutex<WriteHalf>>,
         v2: bool,
     ) {
         debug!(proxy_name = %nhc.proxy_name, "Received NatHoleClient for proxy '{}'", nhc.proxy_name);
@@ -1397,7 +1397,7 @@ impl Service {
     /// Build and send a NatHoleReport for `sid`; log at debug on failure.
     /// `reason` labels the failure context in the log line.
     async fn send_nat_hole_report(
-        writer: &Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>,
+        writer: &Arc<Mutex<WriteHalf>>,
         v2: bool,
         sid: String,
         reason: &str,
@@ -1655,7 +1655,7 @@ impl Service {
         &self,
         config_path: &str,
         strict: bool,
-        writer: &Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>,
+        writer: &Arc<Mutex<WriteHalf>>,
     ) -> Result<String, String> {
         let delta = crate::reload::do_reload(&self.proxy_info_map, config_path, strict).await?;
 
