@@ -146,9 +146,9 @@ pub struct XtcpState {
 /// Token bucket rate limiter for connection accept loops.
 /// Uses f64 token accounting — zero allocation per check.
 pub struct RateLimiter {
-    rate: f64,           // tokens per second; 0.0 = unlimited
-    tokens: f64,         // current token balance (max: burst)
-    burst: f64,          // max tokens that can accumulate
+    rate: f64,   // tokens per second; 0.0 = unlimited
+    tokens: f64, // current token balance (max: burst)
+    burst: f64,  // max tokens that can accumulate
     last_refill: Instant,
 }
 
