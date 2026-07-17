@@ -691,7 +691,7 @@ impl Service {
 
             // Split control stream for reading and writing
             let (mut reader, raw_writer) = control_stream.into_split();
-            let writer = Arc::new(Mutex::new(raw_writer));
+            let writer = Arc::new(Mutex::new(raw_writer.into_boxed()));
 
             // Spawn VnetControllers for all vnet proxies now that the
             // control connection writer is available.

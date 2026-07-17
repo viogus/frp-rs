@@ -914,6 +914,232 @@ pub enum IoStream {
     BufferedRead(Vec<u8>, usize, Box<IoStream>),
 }
 
+// -----------------------------------------------------------------
+// ReadHalf / WriteHalf — static-dispatch halves of IoStream::into_split()
+// -----------------------------------------------------------------
+
+/// Read half of an [`IoStream`] after [`IoStream::into_split`].
+///
+/// Each variant wraps the corresponding split-half for its inner stream
+/// type. Enum dispatch replaces the old `Box<dyn AsyncRead>` — zero heap
+/// allocation, match-based static dispatch instead of vtable.
+pub enum ReadHalf {
+    Tcp(tokio::io::ReadHalf<tokio::net::TcpStream>),
+    #[cfg(feature = "tls")]
+    Tls(tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>),
+    #[cfg(feature = "kcp")]
+    Kcp(tokio::io::ReadHalf<crate::kcp::KcpStream>),
+    #[cfg(feature = "quic")]
+    Quic(quinn::RecvStream),
+    #[cfg(feature = "websocket")]
+    WebSocket(tokio::io::ReadHalf<WsByteStream>),
+    Yamux(tokio::io::ReadHalf<YamuxStream>),
+    Cipher(tokio::io::ReadHalf<Box<crate::cipher_stream::CipherStream<IoStream>>>),
+    Aead(tokio::io::ReadHalf<Box<crate::crypto::AeadStream>>),
+    SshChannel(tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>),
+}
+
+impl ReadHalf {
+    /// Convert back to boxed trait object for cold-path callers (auth, NAT
+    /// hole session storage) that need `Box<dyn AsyncRead + Unpin + Send>`.
+    pub fn into_boxed(self) -> Box<dyn tokio::io::AsyncRead + Unpin + Send> {
+        match self {
+            ReadHalf::Tcp(r) => Box::new(r),
+            #[cfg(feature = "tls")]
+            ReadHalf::Tls(r) => Box::new(r),
+            #[cfg(feature = "kcp")]
+            ReadHalf::Kcp(r) => Box::new(r),
+            #[cfg(feature = "quic")]
+            ReadHalf::Quic(r) => Box::new(r),
+            #[cfg(feature = "websocket")]
+            ReadHalf::WebSocket(r) => Box::new(r),
+            ReadHalf::Yamux(r) => Box::new(r),
+            ReadHalf::Cipher(r) => Box::new(r),
+            ReadHalf::Aead(r) => Box::new(r),
+            ReadHalf::SshChannel(r) => Box::new(r),
+        }
+    }
+}
+
+/// Write half of an [`IoStream`] after [`IoStream::into_split`].
+pub enum WriteHalf {
+    Tcp(tokio::io::WriteHalf<tokio::net::TcpStream>),
+    #[cfg(feature = "tls")]
+    Tls(tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>),
+    #[cfg(feature = "kcp")]
+    Kcp(tokio::io::WriteHalf<crate::kcp::KcpStream>),
+    #[cfg(feature = "quic")]
+    Quic(quinn::SendStream),
+    #[cfg(feature = "websocket")]
+    WebSocket(tokio::io::WriteHalf<WsByteStream>),
+    Yamux(tokio::io::WriteHalf<YamuxStream>),
+    Cipher(tokio::io::WriteHalf<Box<crate::cipher_stream::CipherStream<IoStream>>>),
+    Aead(tokio::io::WriteHalf<Box<crate::crypto::AeadStream>>),
+    SshChannel(tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>),
+}
+
+impl WriteHalf {
+    /// Convert back to boxed trait object for cold-path callers (auth, NAT
+    /// hole session storage) that need `Box<dyn AsyncWrite + Unpin + Send>`.
+    pub fn into_boxed(self) -> Box<dyn tokio::io::AsyncWrite + Unpin + Send> {
+        match self {
+            WriteHalf::Tcp(w) => Box::new(w),
+            #[cfg(feature = "tls")]
+            WriteHalf::Tls(w) => Box::new(w),
+            #[cfg(feature = "kcp")]
+            WriteHalf::Kcp(w) => Box::new(w),
+            #[cfg(feature = "quic")]
+            WriteHalf::Quic(w) => Box::new(w),
+            #[cfg(feature = "websocket")]
+            WriteHalf::WebSocket(w) => Box::new(w),
+            WriteHalf::Yamux(w) => Box::new(w),
+            WriteHalf::Cipher(w) => Box::new(w),
+            WriteHalf::Aead(w) => Box::new(w),
+            WriteHalf::SshChannel(w) => Box::new(w),
+        }
+    }
+}
+
+impl std::fmt::Debug for ReadHalf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadHalf::Tcp(_) => f.debug_struct("ReadHalf::Tcp").finish_non_exhaustive(),
+            #[cfg(feature = "tls")]
+            ReadHalf::Tls(_) => f.debug_struct("ReadHalf::Tls").finish_non_exhaustive(),
+            #[cfg(feature = "kcp")]
+            ReadHalf::Kcp(_) => f.debug_struct("ReadHalf::Kcp").finish_non_exhaustive(),
+            #[cfg(feature = "quic")]
+            ReadHalf::Quic(_) => f.debug_struct("ReadHalf::Quic").finish_non_exhaustive(),
+            #[cfg(feature = "websocket")]
+            ReadHalf::WebSocket(_) => f
+                .debug_struct("ReadHalf::WebSocket")
+                .finish_non_exhaustive(),
+            ReadHalf::Yamux(_) => f.debug_struct("ReadHalf::Yamux").finish_non_exhaustive(),
+            ReadHalf::Cipher(_) => f.debug_struct("ReadHalf::Cipher").finish_non_exhaustive(),
+            ReadHalf::Aead(_) => f.debug_struct("ReadHalf::Aead").finish_non_exhaustive(),
+            ReadHalf::SshChannel(_) => f
+                .debug_struct("ReadHalf::SshChannel")
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl std::fmt::Debug for WriteHalf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteHalf::Tcp(_) => f.debug_struct("WriteHalf::Tcp").finish_non_exhaustive(),
+            #[cfg(feature = "tls")]
+            WriteHalf::Tls(_) => f.debug_struct("WriteHalf::Tls").finish_non_exhaustive(),
+            #[cfg(feature = "kcp")]
+            WriteHalf::Kcp(_) => f.debug_struct("WriteHalf::Kcp").finish_non_exhaustive(),
+            #[cfg(feature = "quic")]
+            WriteHalf::Quic(_) => f.debug_struct("WriteHalf::Quic").finish_non_exhaustive(),
+            #[cfg(feature = "websocket")]
+            WriteHalf::WebSocket(_) => f
+                .debug_struct("WriteHalf::WebSocket")
+                .finish_non_exhaustive(),
+            WriteHalf::Yamux(_) => f.debug_struct("WriteHalf::Yamux").finish_non_exhaustive(),
+            WriteHalf::Cipher(_) => f.debug_struct("WriteHalf::Cipher").finish_non_exhaustive(),
+            WriteHalf::Aead(_) => f.debug_struct("WriteHalf::Aead").finish_non_exhaustive(),
+            WriteHalf::SshChannel(_) => f
+                .debug_struct("WriteHalf::SshChannel")
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for ReadHalf {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            ReadHalf::Tcp(r) => Pin::new(r).poll_read(cx, buf),
+            #[cfg(feature = "tls")]
+            ReadHalf::Tls(r) => Pin::new(r).poll_read(cx, buf),
+            #[cfg(feature = "kcp")]
+            ReadHalf::Kcp(r) => Pin::new(r).poll_read(cx, buf),
+            #[cfg(feature = "quic")]
+            ReadHalf::Quic(r) => Pin::new(r).poll_read(cx, buf),
+            #[cfg(feature = "websocket")]
+            ReadHalf::WebSocket(r) => Pin::new(r).poll_read(cx, buf),
+            ReadHalf::Yamux(r) => Pin::new(r).poll_read(cx, buf),
+            ReadHalf::Cipher(r) => Pin::new(r).poll_read(cx, buf),
+            ReadHalf::Aead(r) => Pin::new(r).poll_read(cx, buf),
+            ReadHalf::SshChannel(r) => Pin::new(r).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for WriteHalf {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            WriteHalf::Tcp(w) => Pin::new(w).poll_write(cx, buf),
+            #[cfg(feature = "tls")]
+            WriteHalf::Tls(w) => Pin::new(w).poll_write(cx, buf),
+            #[cfg(feature = "kcp")]
+            WriteHalf::Kcp(w) => Pin::new(w).poll_write(cx, buf),
+            #[cfg(feature = "quic")]
+            WriteHalf::Quic(w) => Pin::new(w)
+                .poll_write(cx, buf)
+                .map_err(std::io::Error::other),
+            #[cfg(feature = "websocket")]
+            WriteHalf::WebSocket(w) => Pin::new(w).poll_write(cx, buf),
+            WriteHalf::Yamux(w) => Pin::new(w).poll_write(cx, buf),
+            WriteHalf::Cipher(w) => Pin::new(w).poll_write(cx, buf),
+            WriteHalf::Aead(w) => Pin::new(w).poll_write(cx, buf),
+            WriteHalf::SshChannel(w) => Pin::new(w).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            WriteHalf::Tcp(w) => Pin::new(w).poll_flush(cx),
+            #[cfg(feature = "tls")]
+            WriteHalf::Tls(w) => Pin::new(w).poll_flush(cx),
+            #[cfg(feature = "kcp")]
+            WriteHalf::Kcp(w) => Pin::new(w).poll_flush(cx),
+            #[cfg(feature = "quic")]
+            WriteHalf::Quic(w) => Pin::new(w).poll_flush(cx).map_err(std::io::Error::other),
+            #[cfg(feature = "websocket")]
+            WriteHalf::WebSocket(w) => Pin::new(w).poll_flush(cx),
+            WriteHalf::Yamux(w) => Pin::new(w).poll_flush(cx),
+            WriteHalf::Cipher(w) => Pin::new(w).poll_flush(cx),
+            WriteHalf::Aead(w) => Pin::new(w).poll_flush(cx),
+            WriteHalf::SshChannel(w) => Pin::new(w).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            WriteHalf::Tcp(w) => Pin::new(w).poll_shutdown(cx),
+            #[cfg(feature = "tls")]
+            WriteHalf::Tls(w) => Pin::new(w).poll_shutdown(cx),
+            #[cfg(feature = "kcp")]
+            WriteHalf::Kcp(w) => Pin::new(w).poll_shutdown(cx),
+            #[cfg(feature = "quic")]
+            WriteHalf::Quic(w) => Pin::new(w).poll_shutdown(cx),
+            #[cfg(feature = "websocket")]
+            WriteHalf::WebSocket(w) => Pin::new(w).poll_shutdown(cx),
+            WriteHalf::Yamux(w) => Pin::new(w).poll_shutdown(cx),
+            WriteHalf::Cipher(w) => Pin::new(w).poll_shutdown(cx),
+            WriteHalf::Aead(w) => Pin::new(w).poll_shutdown(cx),
+            WriteHalf::SshChannel(w) => Pin::new(w).poll_shutdown(cx),
+        }
+    }
+}
+
 impl std::fmt::Debug for IoStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1298,49 +1524,47 @@ impl IoStream {
     }
 
     /// Split the stream into owned read and write halves.
-    pub fn into_split(
-        self,
-    ) -> (
-        Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-        Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
-    ) {
+    pub fn into_split(self) -> (ReadHalf, WriteHalf) {
         match self {
             IoStream::Tcp(s) => {
                 let (r, w) = tokio::io::split(s);
-                (Box::new(r), Box::new(w))
+                (ReadHalf::Tcp(r), WriteHalf::Tcp(w))
             }
             #[cfg(feature = "tls")]
             IoStream::Tls(s) => {
                 let (r, w) = tokio::io::split(s);
-                (Box::new(r), Box::new(w))
+                (ReadHalf::Tls(r), WriteHalf::Tls(w))
             }
             #[cfg(feature = "kcp")]
             IoStream::Kcp(stream) => {
                 let (r, w) = tokio::io::split(stream);
-                (Box::new(r), Box::new(w))
+                (ReadHalf::Kcp(r), WriteHalf::Kcp(w))
             }
             #[cfg(feature = "quic")]
-            IoStream::Quic(stream) => stream.into_split(),
+            IoStream::Quic(stream) => {
+                let (r, w) = stream.into_split();
+                (ReadHalf::Quic(r), WriteHalf::Quic(w))
+            }
             #[cfg(feature = "websocket")]
             IoStream::WebSocket(adapter) => {
                 let (r, w) = tokio::io::split(adapter);
-                (Box::new(r), Box::new(w))
+                (ReadHalf::WebSocket(r), WriteHalf::WebSocket(w))
             }
             IoStream::Yamux(stream) => {
                 let (r, w) = tokio::io::split(stream);
-                (Box::new(r), Box::new(w))
+                (ReadHalf::Yamux(r), WriteHalf::Yamux(w))
             }
             IoStream::Cipher(stream) => {
                 let (r, w) = tokio::io::split(stream);
-                (Box::new(r), Box::new(w))
+                (ReadHalf::Cipher(r), WriteHalf::Cipher(w))
             }
             IoStream::Aead(stream) => {
                 let (r, w) = tokio::io::split(stream);
-                (Box::new(r), Box::new(w))
+                (ReadHalf::Aead(r), WriteHalf::Aead(w))
             }
             IoStream::SshChannel(s) => {
                 let (r, w) = tokio::io::split(s);
-                (Box::new(r), Box::new(w))
+                (ReadHalf::SshChannel(r), WriteHalf::SshChannel(w))
             }
             IoStream::PreRead(pre_read, s) => {
                 assert!(
@@ -1348,7 +1572,7 @@ impl IoStream {
                     "into_split called before pre_read bytes consumed"
                 );
                 let (r, w) = tokio::io::split(s);
-                (Box::new(r), Box::new(w))
+                (ReadHalf::Tcp(r), WriteHalf::Tcp(w))
             }
             IoStream::BufferedRead(buf, pos, inner) => {
                 assert!(
