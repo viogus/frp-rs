@@ -1980,6 +1980,288 @@ TOML
 }
 
 # =============================================================================
+# Test: Go frpc -> Rust frps, HTTP proxy with basic auth
+# =============================================================================
+test_g2r_http_basic_auth() {
+    local name="go-to-rust-http-basic-auth"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local vhost_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-http-auth"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start HTTP echo server
+    start_http_echo_server "$echo_port" "http-auth-ok:"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "HTTP echo server did not start"
+        return
+    }
+
+    # Start Rust frps with VHost HTTP port + subdomain_host
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $frps_port
+vhost_http_port = $vhost_port
+subdomain_host = "test.local"
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+TOML
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+    wait_for_port_safe 127.0.0.1 "$vhost_port" 5 || {
+        fail_test "$name" "VHost HTTP port $vhost_port not reachable"
+        return
+    }
+
+    # Start Go frpc with HTTP proxy + basic auth
+    cat > "$TEST_DIR/$name/frpc.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-$name.log"
+log.level = "debug"
+
+[[proxies]]
+name = "http-auth"
+type = "http"
+localIP = "127.0.0.1"
+localPort = $echo_port
+customDomains = ["auth-test.local"]
+httpUser = "admin"
+httpPassword = "s3cret"
+TOML
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    sleep 3
+
+    # Test 1: request WITHOUT auth → expect 401
+    local unauth_result
+    unauth_result=$(python3 -c "
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect(('127.0.0.1', $vhost_port))
+s.sendall(b'GET / HTTP/1.1\r\nHost: auth-test.local\r\nConnection: close\r\n\r\n')
+resp = s.recv(4096).decode()
+s.close()
+if '401' in resp or 'Unauthorized' in resp or 'unauthorized' in resp.lower():
+    print('OK')
+else:
+    print('FAIL: expected 401, got: ' + resp[:200])
+" 2>&1)
+    if [[ "$unauth_result" != "OK" ]]; then
+        fail_test "$name" "unauth: $unauth_result"
+        return
+    fi
+
+    # Test 2: request WITH auth → expect 200
+    local auth_result
+    auth_result=$(python3 -c "
+import socket, sys
+from base64 import b64encode
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect(('127.0.0.1', $vhost_port))
+auth = b64encode(b'admin:s3cret').decode()
+s.sendall(f'GET / HTTP/1.1\r\nHost: auth-test.local\r\nAuthorization: Basic {auth}\r\nConnection: close\r\n\r\n'.encode())
+resp = s.recv(4096).decode()
+s.close()
+if '200 OK' in resp:
+    print('OK')
+else:
+    print('FAIL: expected 200, got: ' + resp[:200])
+" 2>&1)
+    if [[ "$auth_result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "auth: $auth_result"
+    fi
+}
+
+# =============================================================================
+# Test: Go frpc -> Rust frps, HTTP proxy with host header rewrite
+# =============================================================================
+test_g2r_http_host_header_rewrite() {
+    local name="go-to-rust-http-host-header-rewrite"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local vhost_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-http-rewrite"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start HTTP echo server
+    start_http_echo_server "$echo_port" "http-rewrite-ok:"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "HTTP echo server did not start"
+        return
+    }
+
+    # Start Rust frps with VHost HTTP port
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $frps_port
+vhost_http_port = $vhost_port
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+TOML
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+    wait_for_port_safe 127.0.0.1 "$vhost_port" 5 || {
+        fail_test "$name" "VHost HTTP port $vhost_port not reachable"
+        return
+    }
+
+    # Start Go frpc with HTTP proxy + host header rewrite
+    cat > "$TEST_DIR/$name/frpc.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-$name.log"
+log.level = "debug"
+
+[[proxies]]
+name = "http-rewrite"
+type = "http"
+localIP = "127.0.0.1"
+localPort = $echo_port
+customDomains = ["rewrite-test.local"]
+hostHeaderRewrite = "backend.internal"
+TOML
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    sleep 3
+
+    # Send HTTP request; the proxy rewrites Host → backend.internal before
+    # forwarding. The echo server returns 200 OK regardless. This test
+    # validates that the Go frpc→Rust frps HTTP path works with
+    # hostHeaderRewrite in the proxy config.
+    local result
+    result=$(send_http_test "$vhost_port" "rewrite-test.local" "http-rewrite-ok:" 5)
+    if [[ "$result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
+# Test: Go frpc -> Rust frps, HTTP proxy with subdomain routing
+# =============================================================================
+test_g2r_http_subdomain() {
+    local name="go-to-rust-http-subdomain"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local vhost_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-g2r-http-subdomain"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start HTTP echo server
+    start_http_echo_server "$echo_port" "http-subdomain-ok:"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "HTTP echo server did not start"
+        return
+    }
+
+    # Start Rust frps with VHost HTTP port + subdomain_host
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $frps_port
+vhost_http_port = $vhost_port
+subdomain_host = "test.local"
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+TOML
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+    wait_for_port_safe 127.0.0.1 "$vhost_port" 5 || {
+        fail_test "$name" "VHost HTTP port $vhost_port not reachable"
+        return
+    }
+
+    # Start Go frpc with HTTP proxy using subdomain (NOT customDomains)
+    cat > "$TEST_DIR/$name/frpc.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-$name.log"
+log.level = "debug"
+
+[[proxies]]
+name = "http-sub"
+type = "http"
+localIP = "127.0.0.1"
+localPort = $echo_port
+subdomain = "mysub"
+TOML
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    sleep 3
+
+    # Send HTTP request with Host: mysub.test.local (subdomain + subdomain_host)
+    local result
+    result=$(send_http_test "$vhost_port" "mysub.test.local" "http-subdomain-ok:" 5)
+    if [[ "$result" == "OK" ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
 # Test: Go frpc -> Rust frps, STCP relay
 # =============================================================================
 test_g2r_stcp() {
@@ -3330,6 +3612,9 @@ run_test test_g2r_http
 run_test test_r2g_http
 run_test test_g2r_https
 run_test test_r2g_https
+run_test test_g2r_http_basic_auth
+run_test test_g2r_http_host_header_rewrite
+run_test test_g2r_http_subdomain
 # Phase 4b: tcpmux HTTP CONNECT
 run_test test_g2r_tcpmux
 run_test test_r2g_tcpmux

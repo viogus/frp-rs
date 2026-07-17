@@ -77,9 +77,9 @@ Every feature, fix, and test change follows three rules:
 | `cargo clippy` (default) | zero warnings |
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
-| `cargo test --workspace --all-features` | 484 passed, 2 ignored (34 suites) |
+| `cargo test --workspace --all-features` | 485 passed, 2 ignored (35 suites) |
 | `cargo build --release` | passes (frps ~4.8MB, frpc ~3.7MB) |
-| `compat-test.sh` (Go frp v0.70.0) | 57/57 passed (XTCP 16 skipped, V2 TCP guarded) |
+| `compat-test.sh` (Go frp v0.70.0) | 60/60 passed (XTCP 16 skipped, V2 TCP guarded) |
 | `unsafe` blocks | 6 in frp-core, 3+ in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
 | `hex` crate | removed — inline `hex_encode` in frp-core |
@@ -242,9 +242,9 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 
 Known areas lacking e2e cross-compat test coverage:
 
-- **UDP proxy**: no Go frp cross-compat for UDP tunneling
-- **HTTP/HTTPS proxy**: no e2e tests with real HTTP backends
-- **Reload configuration**: no automated test for `SIGUSR1` reload path
+- ~~UDP proxy: no Go frp cross-compat~~ — covered (test_g2r_udp + test_r2g_udp, both in Phase 4)
+- HTTP/HTTPS proxy e2e: basic VHost routing tested; 3 new compat tests added (basic auth, host_header_rewrite, subdomain); response_headers, route_by_http_user, locations cross-compat still untested
+- Reload configuration: automated test added (reload_integration.rs, SIGUSR1 client-side reload path)
 - **XTCP NAT traversal**: tested pairwise on localhost, not across real NAT devices
 
 ### Dependency Policy (mandatory)
