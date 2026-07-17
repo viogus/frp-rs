@@ -7,7 +7,8 @@
     <a href="#getting-started">Getting Started</a> •
     <a href="#configuration">Configuration</a> •
     <a href="#protocol">Protocol</a> •
-    <a href="#project-structure">Project Structure</a>
+    <a href="#project-structure">Project Structure</a> •
+    <a href="#frp-rs-核心优势">核心优势 (中文)</a>
   </p>
 </div>
 
@@ -103,6 +104,22 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 **Memory safety.** All protocol parsing, FEC encoding, and encryption run in safe Rust. No buffer overflows, no use-after-free, no null pointer derefs at the wire boundary.
 
 **Go frp wire compatible.** Drop `frps` in place of Go frps, `frpc` in place of Go frpc. Same config files, same protocol, same encryption. Zero migration cost.
+
+### frp-rs 核心优势
+
+**兼容性。** 完全兼容 Go frp v0.70.0 协议。所有传输层（TCP、WebSocket、TLS、KCP、QUIC）、全部代理类型（TCP/UDP/HTTP/HTTPS/STCP/XTCP/SUDP）、全部 9 种客户端插件（http_proxy、socks5、static_file、unix_domain_socket、http2https、https2http、https2https、http2http、tls2raw）均已通过跨兼容测试。73 项兼容性测试在每次提交时自动运行，包括 XTCP NAT 穿透的 16 场景两两矩阵测试。可直接替换 Go frps 或 Go frpc，配置文件、加密方式、认证机制完全一致，零迁移成本。
+
+**体积。** 基于 Rust 原生编译，无运行时、无 GC。全功能版本（full）frps 仅 ~4.8 MB，frpc ~3.7 MB，约为 Go frp 的 1/3。内存占用同样大幅降低：空闲状态下全功能版本 ~2-4 MB，微核心版本（micro）仅 ~1-2 MB。无 GC 暂停保证负载下尾部延迟稳定。
+
+**功能裁剪。** 三级构建体系，按需组合，适配从云端到嵌入式的全场景：
+
+| 版本 | 体积 (frps/frpc) | 保留能力 | 适用场景 |
+|------|-----------------|---------|---------|
+| **full** | ~4.8MB / ~3.7MB | 全部传输层、OIDC、SSH、dashboard、压缩、XChaCha20、HTTP 代理、TCP mux | 通用部署 |
+| **tiny** | ~2.7MB / ~2.3MB | 去掉 QUIC/KCP/WebSocket/SSH/OIDC/dashboard，保留 TLS/压缩/TCP mux | 边缘设备、嵌入式 |
+| **micro** | ~1.6MB / ~1.7MB | 仅核心 TCP 代理，无 TLS/压缩/HTTP 代理/TCP mux | 极小镜像、安全敏感 |
+
+每个 feature 均可独立开关，18 个编译期 feature flag 精细控制二进制内容。无需修改代码，Cargo feature 即按需裁剪。
 
 ---
 
