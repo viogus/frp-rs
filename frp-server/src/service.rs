@@ -329,13 +329,12 @@ impl Service {
                                 warn!(addr = %addr, "Max connections reached, rejecting WebSocket from {}", addr);
                                 continue;
                             }
-                            // Rate limit check (shared across all listeners)
                             let rate_wait = {
                                 let mut rl = state.accept_rate_limiter.lock().unwrap();
                                 rl.try_acquire().err()
                             };
                             if let Some(wait) = rate_wait {
-                                warn!(addr = %addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying WebSocket");
+                                warn!(addr = %addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying WebSocket {}ms", wait.as_millis());
                                 tokio::time::sleep(wait).await;
                                 continue;
                             }
@@ -580,13 +579,12 @@ impl Service {
                                             warn!(addr = %addr, "Max connections reached, rejecting KCP from {}", addr);
                                             continue;
                                         }
-                                        // Rate limit check (shared across all listeners)
                                         let rate_wait = {
                                             let mut rl = state.accept_rate_limiter.lock().unwrap();
                                             rl.try_acquire().err()
                                         };
                                         if let Some(wait) = rate_wait {
-                                            warn!(addr = %addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying KCP");
+                                            warn!(addr = %addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying KCP {}ms", wait.as_millis());
                                             tokio::time::sleep(wait).await;
                                             continue;
                                         }
@@ -1078,13 +1076,12 @@ impl Service {
                                             warn!(addr = %quic_addr, "Max connections reached, rejecting QUIC from {}", quic_addr);
                                             continue;
                                         }
-                                        // Rate limit check (shared across all listeners)
                                         let rate_wait = {
                                             let mut rl = state.accept_rate_limiter.lock().unwrap();
                                             rl.try_acquire().err()
                                         };
                                         if let Some(wait) = rate_wait {
-                                            warn!(addr = %quic_addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying QUIC");
+                                            warn!(addr = %quic_addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying QUIC {}ms", wait.as_millis());
                                             tokio::time::sleep(wait).await;
                                             continue;
                                         }
@@ -1436,7 +1433,8 @@ impl Service {
                         warn!(addr = %addr, "Max connections reached, rejecting connection from {}", addr);
                         continue;
                     }
-                    // Rate limit check (shared across all listeners)
+                    // Rate limit: extract into non-async scope so MutexGuard
+                    // doesn't live across any .await boundary.
                     let rate_wait = {
                         let mut rl = state.accept_rate_limiter.lock().unwrap();
                         rl.try_acquire().err()
