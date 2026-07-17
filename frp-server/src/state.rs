@@ -143,6 +143,53 @@ pub struct XtcpState {
     pub sk_index: Arc<RwLock<HashMap<String, String>>>,
 }
 
+/// Token bucket rate limiter for connection accept loops.
+/// Uses f64 token accounting — zero allocation per check.
+pub struct RateLimiter {
+    rate: f64,           // tokens per second; 0.0 = unlimited
+    tokens: f64,         // current token balance (max: burst)
+    burst: f64,          // max tokens that can accumulate
+    last_refill: Instant,
+}
+
+impl RateLimiter {
+    /// `max_per_sec`: 0 = unlimited. Burst = min(max_per_sec, 1024).
+    pub fn new(max_per_sec: u32) -> Self {
+        let rate = max_per_sec as f64;
+        Self {
+            rate,
+            tokens: if rate > 0.0 { rate.min(1024.0) } else { 0.0 },
+            burst: rate.min(1024.0),
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Configured rate in tokens per second (0 = unlimited).
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+
+    /// Try to consume one token. Returns `Ok(())` if allowed, or the
+    /// duration to wait before a token becomes available.
+    pub fn try_acquire(&mut self) -> Result<(), Duration> {
+        if self.rate == 0.0 {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let elapsed = (now - self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
+        self.last_refill = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            Ok(())
+        } else {
+            // Time until one token refills
+            let wait = Duration::from_secs_f64((1.0 - self.tokens) / self.rate);
+            Err(wait)
+        }
+    }
+}
+
 pub struct AppState {
     pub proxy_manager: Arc<ProxyManager>,
     /// Hot-reloadable config (auth, encryption, allow_ports).
@@ -192,6 +239,9 @@ pub struct AppState {
     pub tls_acceptor: Arc<std::sync::RwLock<Option<tokio_rustls::TlsAcceptor>>>,
     /// Semaphore to limit concurrent connections. None = unlimited.
     pub conn_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Token bucket rate limiter for the accept loop.
+    /// Limits connections-per-second across all listeners.
+    pub accept_rate_limiter: Arc<std::sync::Mutex<RateLimiter>>,
     /// Per-IP failed login attempt counter: IP -> (count, window_start).
     /// Window resets after 60 seconds. Max 5 failed attempts per window.
     pub login_throttle: Arc<
@@ -246,6 +296,7 @@ impl AppState {
         nat_hole_analysis_data_reserve_hours: u64,
         detailed_errors_to_client: bool,
         max_connections: usize,
+        max_accept_rate: u32,
         server_config_snapshot: frp_core::config::ServerConfigSnapshot,
     ) -> Self {
         Self {
@@ -295,6 +346,7 @@ impl AppState {
             } else {
                 None
             },
+            accept_rate_limiter: Arc::new(std::sync::Mutex::new(RateLimiter::new(max_accept_rate))),
             login_throttle: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "tls")]
             tls_acceptor: Arc::new(std::sync::RwLock::new(None)),

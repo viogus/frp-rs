@@ -130,6 +130,10 @@ pub struct ServerConfig {
     /// Set to 0 to disable the connection limit entirely.
     #[serde(default, alias = "maxConnections")]
     pub max_connections: Option<u32>,
+    /// Maximum accept rate in connections per second across all listeners.
+    /// 0 = unlimited (default). Uses a token bucket with burst = min(rate, 1024).
+    #[serde(default, alias = "maxAcceptRate")]
+    pub max_accept_rate: Option<u32>,
 }
 
 /// Immutable snapshot of server config fields exposed via the dashboard v2
@@ -314,6 +318,7 @@ impl Default for ServerConfig {
             nat_hole_analysis_data_reserve_hours: default_nathole_analysis_data_reserve_hours(),
             observability: ObservabilityConfig::default(),
             max_connections: None,
+            max_accept_rate: None,
             graceful_shutdown_timeout: default_graceful_timeout(),
         }
     }
@@ -1844,6 +1849,7 @@ fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "tcp_mux",
         "tcp_mux_keepalive_interval",
         "max_connections",
+        "max_accept_rate",
         "graceful_shutdown_timeout",
         "sshTunnelGateway",
         "bindPort",

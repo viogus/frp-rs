@@ -200,6 +200,7 @@ impl Service {
             Some(n) => n as usize,
             None => 512, // default
         };
+        let max_accept_rate = cfg.max_accept_rate.unwrap_or(0);
         let mut state = AppState::new(
             auth_cfg,
             if cfg.proxy_bind_addr.is_empty() {
@@ -228,6 +229,7 @@ impl Service {
             cfg.nat_hole_analysis_data_reserve_hours,
             cfg.detailed_errors_to_client,
             max_connections,
+            max_accept_rate,
             frp_core::config::ServerConfigSnapshot::from_config(&cfg),
         );
 
@@ -302,6 +304,7 @@ impl Service {
         #[cfg(not(feature = "tls"))]
         let _tls_acceptor: Option<()> = None;
 
+        let max_accept_rate = self.cfg.max_accept_rate.unwrap_or(0);
         let listener = TcpListener::bind(&bind_addr).await?;
         info!(bind_addr = %bind_addr, "frps listener started on {}", bind_addr);
 
@@ -324,6 +327,16 @@ impl Service {
                                 .and_then(|s| s.clone().try_acquire_owned().ok());
                             if permit.is_none() && state.conn_semaphore.is_some() {
                                 warn!(addr = %addr, "Max connections reached, rejecting WebSocket from {}", addr);
+                                continue;
+                            }
+                            // Rate limit check (shared across all listeners)
+                            let rate_wait = {
+                                let mut rl = state.accept_rate_limiter.lock().unwrap();
+                                rl.try_acquire().err()
+                            };
+                            if let Some(wait) = rate_wait {
+                                warn!(addr = %addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying WebSocket");
+                                tokio::time::sleep(wait).await;
                                 continue;
                             }
                             tokio::spawn(async move {
@@ -565,6 +578,16 @@ impl Service {
                                             .and_then(|s| s.clone().try_acquire_owned().ok());
                                         if permit.is_none() && state.conn_semaphore.is_some() {
                                             warn!(addr = %addr, "Max connections reached, rejecting KCP from {}", addr);
+                                            continue;
+                                        }
+                                        // Rate limit check (shared across all listeners)
+                                        let rate_wait = {
+                                            let mut rl = state.accept_rate_limiter.lock().unwrap();
+                                            rl.try_acquire().err()
+                                        };
+                                        if let Some(wait) = rate_wait {
+                                            warn!(addr = %addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying KCP");
+                                            tokio::time::sleep(wait).await;
                                             continue;
                                         }
                                         tokio::spawn(async move {
@@ -1055,6 +1078,16 @@ impl Service {
                                             warn!(addr = %quic_addr, "Max connections reached, rejecting QUIC from {}", quic_addr);
                                             continue;
                                         }
+                                        // Rate limit check (shared across all listeners)
+                                        let rate_wait = {
+                                            let mut rl = state.accept_rate_limiter.lock().unwrap();
+                                            rl.try_acquire().err()
+                                        };
+                                        if let Some(wait) = rate_wait {
+                                            warn!(addr = %quic_addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying QUIC");
+                                            tokio::time::sleep(wait).await;
+                                            continue;
+                                        }
                                         tokio::spawn(async move {
                                             let _permit = permit;
                                             // Accept first bidirectional stream (control channel).
@@ -1401,6 +1434,16 @@ impl Service {
                         .and_then(|s| s.clone().try_acquire_owned().ok());
                     if permit.is_none() && state.conn_semaphore.is_some() {
                         warn!(addr = %addr, "Max connections reached, rejecting connection from {}", addr);
+                        continue;
+                    }
+                    // Rate limit check (shared across all listeners)
+                    let rate_wait = {
+                        let mut rl = state.accept_rate_limiter.lock().unwrap();
+                        rl.try_acquire().err()
+                    };
+                    if let Some(wait) = rate_wait {
+                        warn!(addr = %addr, wait_ms = wait.as_millis(), "accept rate limit reached ({} conn/s), delaying {}ms", max_accept_rate, wait.as_millis());
+                        tokio::time::sleep(wait).await;
                         continue;
                     }
                     tokio::spawn(async move {
