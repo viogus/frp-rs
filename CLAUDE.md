@@ -243,7 +243,7 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 Known areas lacking e2e cross-compat test coverage:
 
 - ~~UDP proxy: no Go frp cross-compat~~ — covered (test_g2r_udp + test_r2g_udp, both in Phase 4)
-- HTTP/HTTPS proxy e2e: basic VHost routing tested; 3 new compat tests added (basic auth, host_header_rewrite, subdomain); response_headers, route_by_http_user, locations cross-compat still untested
+- HTTP/HTTPS proxy: basic VHost + basic auth + host_header_rewrite + subdomain tested (7 compat tests); response_headers, route_by_http_user, locations cross-compat still untested
 - Reload configuration: automated test added (reload_integration.rs, SIGUSR1 client-side reload path)
 - **XTCP NAT traversal**: tested pairwise on localhost, not across real NAT devices
 

@@ -2,7 +2,7 @@
 
 All notable changes to frp-rs.
 
-## v0.7.0 (2026-07-16)
+## v0.7.0 (2026-07-17)
 
 ### Security
 
@@ -76,6 +76,8 @@ All notable changes to frp-rs.
 - Add 100ms delay to echo server before close (reduces timing races)
 - Default test suite: 40 passing + 2 guarded (XTCP 16-test matrix, V2 protocol)
 - Integration tests: add auth tokens to all server tests
+- HTTP compat: 3 new Go→Rust tests (basic auth, host_header_rewrite, subdomain) — 60/60 total
+- Reload: new integration test (reload_integration.rs) — SIGUSR1 client-side config reload e2e
 
 ## [0.3.2] - 2026-06-30
 
