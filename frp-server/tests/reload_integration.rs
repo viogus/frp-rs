@@ -37,12 +37,14 @@ mod unix_tests {
     /// Returns a `JoinHandle` and a shutdown signal sender.
     /// The echo server accepts connections, reads up to 1024 bytes, writes
     /// them back, and closes each connection.
-    fn start_tcp_echo_server(port: u16) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
+    fn start_tcp_echo_server(
+        port: u16,
+    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
         use std::net::TcpListener;
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
-            let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-                .expect("echo server bind failed");
+            let listener =
+                TcpListener::bind(format!("127.0.0.1:{}", port)).expect("echo server bind failed");
             listener.set_nonblocking(true).ok();
             loop {
                 // Check for shutdown signal
