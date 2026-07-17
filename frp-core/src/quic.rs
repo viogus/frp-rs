@@ -77,14 +77,9 @@ impl QuicStream {
         }
     }
 
-    /// Split into boxed read and write halves for use with `IoStream::into_split()`.
-    pub fn into_split(
-        self,
-    ) -> (
-        Box<dyn AsyncRead + Unpin + Send>,
-        Box<dyn AsyncWrite + Unpin + Send>,
-    ) {
-        (Box::new(self.recv), Box::new(self.send))
+    /// Split into read and write halves for use with `IoStream::into_split()`.
+    pub fn into_split(self) -> (quinn::RecvStream, quinn::SendStream) {
+        (self.recv, self.send)
     }
 }
 

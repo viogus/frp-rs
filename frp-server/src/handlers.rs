@@ -381,7 +381,12 @@ pub(crate) async fn handle_nat_hole_visitor(
     let (session, report_rx) = match state
         .xtcp
         .nat_hole
-        .create_session_with_writer(sid.clone(), proxy_name.clone(), msg.clone(), writer)
+        .create_session_with_writer(
+            sid.clone(),
+            proxy_name.clone(),
+            msg.clone(),
+            writer.into_boxed(),
+        )
         .await
     {
         Ok(s) => s,
