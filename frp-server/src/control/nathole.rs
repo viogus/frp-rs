@@ -93,13 +93,15 @@ pub(crate) async fn handle_sid_on_work_conn<W: AsyncWriteExt + Unpin>(
             .unwrap_or((false, false, None));
         pool::write_start_work_conn_with_nat_hole_sid(
             &mut work_conn,
-            &proxy_name,
-            use_enc,
-            use_comp,
-            sk.as_deref(),
-            &sid,
-            ctx.v2,
-            " on work conn",
+            &pool::NatHoleWorkConnParams {
+                proxy_name: &proxy_name,
+                use_enc,
+                use_comp,
+                sk: sk.as_deref(),
+                sid: &sid,
+                v2: ctx.v2,
+                context: " on work conn",
+            },
         )
         .await;
         // Connection consumed — Go frp doesn't reuse after NatHoleSid.
