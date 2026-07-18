@@ -851,6 +851,7 @@ impl Service {
                 let min_retry_interval = v.min_retry_interval;
                 let stun_server = nat_hole_stun_server.clone();
                 let fallback_to = v.fallback_to.clone();
+                let disable_assisted_addrs = v.disable_assisted_addrs;
                 let vtx = self.visitor_tx.clone();
                 let handle = tokio::spawn(async move {
                     crate::visitor::run_visitor_listener(crate::visitor::VisitorListenerConfig {
@@ -874,6 +875,7 @@ impl Service {
                         stun_server,
                         visitor_tx: vtx,
                         fallback_to,
+                        disable_assisted_addrs,
                     })
                     .await;
                 });
@@ -1085,13 +1087,18 @@ impl Service {
                             xtcp_sockets.lock().await.insert(sid.clone(), std::sync::Arc::new(sock));
                         }
                         // 2. Send NatHoleClient on control (Go v0.70 compat: protocol "kcp").
+                        let addrs_for_assist = if mapped_addrs.is_empty() {
+                            None
+                        } else {
+                            Some(mapped_addrs.clone())
+                        };
                         let client_msg = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
                             transaction_id: sid.clone(),
                             proxy_name: proxy_name.clone(),
                             sid: Some(sid.clone()),
                             protocol: Some("kcp".to_string()),
                             mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
-                            assisted_addrs: None,
+                            assisted_addrs: addrs_for_assist,
                             visitor_addr: None,
                         }));
                         if let Err(e) = write_msg(&mut *writer.lock().await, &client_msg, v2).await {

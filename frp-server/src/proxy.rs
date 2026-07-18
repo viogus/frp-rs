@@ -27,6 +27,9 @@ pub struct ProxyInfo {
     pub response_headers: std::collections::HashMap<String, String>,
     /// Custom domains for HTTP vhost routing.
     pub custom_domains: Vec<String>,
+    /// Per-user routing: extract username from Authorization header and route
+    /// to proxy `{route_by_http_user}.{username}` (Go frp compat).
+    pub route_by_http_user: String,
     /// Multiplexer type (e.g., "yamux").
     pub multiplexer: String,
     pub user: String,

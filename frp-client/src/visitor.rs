@@ -27,6 +27,7 @@ pub(crate) struct VisitorListenerConfig {
     pub stun_server: String,
     pub visitor_tx: mpsc::Sender<crate::service::VisitorRequest>,
     pub fallback_to: String,
+    pub disable_assisted_addrs: bool,
 }
 /// Run an STCP/XTCP visitor listener.
 /// Binds a local port, accepts connections, and tunnels them
@@ -53,6 +54,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
         stun_server,
         visitor_tx,
         fallback_to,
+        disable_assisted_addrs,
     } = config;
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
@@ -81,6 +83,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                 let stun_server = stun_server.clone();
                 let vtx = visitor_tx.clone();
                 let fb_to = fallback_to.clone();
+                let daa = disable_assisted_addrs;
 
                 tokio::spawn(async move {
                     // Dial options for STCP fallback (fresh connections only).
@@ -186,9 +189,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     mapped_addrs: if mapped_addrs.is_empty() {
                                         None
                                     } else {
+                                        Some(mapped_addrs.clone())
+                                    },
+                                    assisted_addrs: if daa || mapped_addrs.is_empty() {
+                                        None
+                                    } else {
                                         Some(mapped_addrs)
                                     },
-                                    ..Default::default()
                                 },
                                 reply: reply_tx,
                             };

@@ -230,6 +230,7 @@ pub(crate) async fn handle_new_proxy(
                 proxy_protocol_version: np.proxy_protocol_version.clone().unwrap_or_default(),
                 response_headers: np.response_headers.clone().unwrap_or_default(),
                 custom_domains: np.custom_domains.clone().unwrap_or_default(),
+                route_by_http_user: np.route_by_http_user.clone().unwrap_or_default(),
                 multiplexer: np.multiplexer.clone().unwrap_or_default(),
                 user: state
                     .run_id_to_ctl_tx
@@ -328,6 +329,7 @@ pub(crate) async fn handle_new_proxy(
                 let hhr = np.host_header_rewrite.as_deref().unwrap_or("");
                 let http_user = np.http_user.as_deref().unwrap_or("");
                 let http_pwd = np.http_pwd.as_deref().unwrap_or("");
+                let rubu = np.route_by_http_user.as_deref().unwrap_or("");
                 state
                     .vhost_manager
                     .register(
@@ -338,6 +340,7 @@ pub(crate) async fn handle_new_proxy(
                         hhr,
                         http_user,
                         http_pwd,
+                        rubu,
                     )
                     .await;
                 info!(proxy_name = %np.proxy_name, domains = ?domains, locations = ?locations, hhr = ?hhr, "VHost routes registered for '{}': domains={:?}, locations={:?}, rewrite={:?}",
@@ -370,6 +373,7 @@ pub(crate) async fn handle_new_proxy(
                 let hhr = np.host_header_rewrite.as_deref().unwrap_or("");
                 let http_user = np.http_user.as_deref().unwrap_or("");
                 let http_pwd = np.http_pwd.as_deref().unwrap_or("");
+                let rubu = np.route_by_http_user.as_deref().unwrap_or("");
                 state
                     .vhost_manager
                     .register(
@@ -380,6 +384,7 @@ pub(crate) async fn handle_new_proxy(
                         hhr,
                         http_user,
                         http_pwd,
+                        rubu,
                     )
                     .await;
                 info!(

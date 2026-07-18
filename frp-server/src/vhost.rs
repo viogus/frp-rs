@@ -21,6 +21,9 @@ pub struct VhostRoute {
     /// HTTP Basic Auth credentials (empty = no auth).
     pub http_user: String,
     pub http_pwd: String,
+    /// Per-user routing: extract username from Authorization header and route
+    /// to proxy `{route_by_http_user}.{username}` (Go frp compat).
+    pub route_by_http_user: String,
 }
 
 /// Manages HTTP VHost routing table (domain + location → proxy).
@@ -61,6 +64,7 @@ impl VhostManager {
         host_header_rewrite: &str,
         http_user: &str,
         http_pwd: &str,
+        route_by_http_user: &str,
     ) {
         let route = VhostRoute {
             proxy_name: proxy_name.to_string(),
@@ -69,6 +73,7 @@ impl VhostManager {
             host_header_rewrite: host_header_rewrite.to_string(),
             http_user: http_user.to_string(),
             http_pwd: http_pwd.to_string(),
+            route_by_http_user: route_by_http_user.to_string(),
         };
 
         let mut routes = self.routes.write().await;
@@ -245,6 +250,38 @@ async fn serve_vhost_request<S>(
             }
         }
 
+        // Per-user routing (Go frp compat): when route_by_http_user is set,
+        // extract the Basic Auth username and look up proxy
+        // `{route_by_http_user}.{username}` in the proxy manager.
+        let (target_proxy_name, target_run_id) = if !route.route_by_http_user.is_empty() {
+            if let Some((username, _password)) = extract_basic_auth(&request_text) {
+                let user_proxy = format!("{}.{}", route.route_by_http_user, username);
+                debug!(
+                    host = %host, route_by_http_user = %route.route_by_http_user,
+                    username = %username, user_proxy = %user_proxy,
+                    "{} VHost: trying user-based routing to '{}'", scheme, user_proxy
+                );
+                if let Some(user_info) = state.proxy_manager.get(&user_proxy).await {
+                    (user_proxy, user_info.run_id)
+                } else {
+                    // User-specific proxy not found — fall through to
+                    // the route's own proxy (matching Go frp behavior
+                    // when the target proxy doesn't exist).
+                    debug!(
+                        user_proxy = %user_proxy,
+                        "{} VHost: user-based proxy '{}' not found, falling back to '{}'",
+                        scheme, user_proxy, route.proxy_name
+                    );
+                    (route.proxy_name.clone(), route.run_id.clone())
+                }
+            } else {
+                // No Authorization header — fall through to route's proxy.
+                (route.proxy_name.clone(), route.run_id.clone())
+            }
+        } else {
+            (route.proxy_name.clone(), route.run_id.clone())
+        };
+
         // Apply host_header_rewrite if configured
         let pre_read = if !route.host_header_rewrite.is_empty() {
             rewrite_host_header(&pre_read, &route.host_header_rewrite)
@@ -254,14 +291,14 @@ async fn serve_vhost_request<S>(
 
         let internal_tx = {
             let map = state.run_id_to_ctl_tx.read().await;
-            map.get(&route.run_id).cloned()
+            map.get(&target_run_id).cloned()
         };
 
         if let Some(ctl_tx) = internal_tx {
             let _ = ctl_tx
                 .tx
                 .try_send(InternalMsg::ProxyUserConn {
-                    proxy_name: route.proxy_name.clone(),
+                    proxy_name: target_proxy_name,
                     user_conn: wrap(stream),
                     pre_read,
                 })

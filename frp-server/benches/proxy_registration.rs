@@ -30,6 +30,7 @@ fn make_info(name: &str, run_id: &str, group: Option<&str>) -> ProxyInfo {
         proxy_protocol_version: String::new(),
         response_headers: HashMap::new(),
         custom_domains: Vec::new(),
+        route_by_http_user: String::new(),
         multiplexer: String::new(),
     }
 }
