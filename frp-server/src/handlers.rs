@@ -385,7 +385,7 @@ pub(crate) async fn handle_nat_hole_visitor(
             sid.clone(),
             proxy_name.clone(),
             msg.clone(),
-            writer.into_boxed(),
+            writer.into(),
         )
         .await
     {

@@ -96,8 +96,6 @@ pub mod gf256 {
 pub struct Fec {
     data_shards: usize,
     parity_shards: usize,
-    #[allow(dead_code)]
-    total_shards: usize,
     /// Pre-computed Vandermonde encoding matrix rows for parity shards.
     encode_matrix: Vec<Vec<u8>>,
 }
@@ -151,7 +149,6 @@ impl Fec {
         Self {
             data_shards,
             parity_shards,
-            total_shards,
             encode_matrix,
         }
     }

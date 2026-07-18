@@ -45,6 +45,7 @@ pub(crate) struct KcpSocketHandle {
     pub write_tx: mpsc::Sender<(u32, WriteRequest)>,
     pub register_tx: mpsc::Sender<(u32, SocketAddr, KcpSession)>,
     /// Channel to send newly accepted streams back to KcpListener::accept().
+    /// Held here to keep the sender alive; streams are sent internally by KcpSocket.
     #[allow(dead_code)]
     pub accept_tx: mpsc::Sender<KcpStream>,
     /// Notify the socket driver that a session has been accepted by the

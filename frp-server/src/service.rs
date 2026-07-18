@@ -52,7 +52,7 @@ fn is_v2_magic(buf: &[u8]) -> bool {
 
 /// Run V2 handshake then read the first message frame. Returns `None` on error
 /// (already logged). `addr` is `None` for listeners that don't capture peer addr.
-#[allow(dead_code)]
+#[cfg(feature = "websocket")]
 async fn v2_handshake_and_read(
     io: &mut IoStream,
     addr: Option<std::net::SocketAddr>,
