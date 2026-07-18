@@ -1283,7 +1283,6 @@ fn load_config_from_file<C: serde::de::DeserializeOwned>(
     Ok(cfg)
 }
 
-#[allow(clippy::collapsible_match)]
 fn normalize_server_config(value: &mut toml::Value) {
     use toml::Value;
     if let Some(table) = value.as_table_mut() {

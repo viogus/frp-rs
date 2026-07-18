@@ -3,8 +3,6 @@
 //! Uses bpaf combinators to match Go frp v0.69.1 CLI surface.
 //! All flags accept both hyphen (`--log-file`) and underscore (`--log_file`) forms.
 
-#![allow(clippy::collapsible_match)]
-
 use bpaf::Parser;
 use bpaf::*;
 
