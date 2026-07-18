@@ -12,17 +12,32 @@ mod unix_tests {
     use std::time::Duration;
 
     /// Resolve binary path for a workspace member.
-    /// Prefers CARGO_BIN_EXE_<name> env var (set by Cargo), falls back to
-    /// constructing the path from the workspace root.
+    /// Prefers `<NAME>_BIN` env var (e.g. `FRPS_BIN`), then `CARGO_BIN_EXE_<name>`
+    /// (set by Cargo), then `./frps`/`./frpc` in current dir (downloaded release),
+    /// then falls back to constructing the path from the workspace root.
     fn workspace_bin(name: &str) -> PathBuf {
-        let env_key = format!("CARGO_BIN_EXE_{}", name.to_uppercase().replace('-', "_"));
+        // 1. <NAME>_BIN env var (pre-built release binary)
+        let env_key = format!("{}_BIN", name.to_uppercase().replace('-', "_"));
         if let Ok(path) = std::env::var(&env_key) {
             let p = PathBuf::from(&path);
             if p.exists() {
                 return p;
             }
         }
-        // Fallback: construct path relative to the workspace root.
+        // 2. CARGO_BIN_EXE_<name> (set by Cargo)
+        let cargo_env_key = format!("CARGO_BIN_EXE_{}", name.to_uppercase().replace('-', "_"));
+        if let Ok(path) = std::env::var(&cargo_env_key) {
+            let p = PathBuf::from(&path);
+            if p.exists() {
+                return p;
+            }
+        }
+        // 3. ../<name> in workspace root (downloaded release)
+        let local = PathBuf::from(format!("../{}", name));
+        if local.exists() {
+            return local;
+        }
+        // 4. Fallback: construct path relative to the workspace root.
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let workspace_root = manifest_dir.parent().unwrap();
         let profile = if cfg!(debug_assertions) {
