@@ -645,15 +645,17 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
             let c_read_timeout = timeout_ms - c_behavior.send_delay_ms;
 
             let v_resp = nathole_ctrl::build_nat_hole_response(
-                &tid,
-                &tid,
-                visitor_msg.protocol.clone(),
-                mode,
-                client_mapped.clone(),
-                client_assisted.clone(),
-                v_behavior,
-                v_read_timeout,
-                cf.ports_difference,
+                nathole_ctrl::NatHoleResponseParams {
+                    transaction_id: tid.clone(),
+                    sid: tid.clone(),
+                    protocol: visitor_msg.protocol.clone(),
+                    mode,
+                    candidate_addrs: client_mapped.clone(),
+                    assisted_addrs: client_assisted.clone(),
+                    behavior: v_behavior,
+                    read_timeout_ms: v_read_timeout,
+                    ports_difference: cf.ports_difference,
+                },
             );
             // Use visitor's protocol in c_resp so the provider
             // knows which transport to use (Go frp compat:
@@ -665,15 +667,17 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                 .clone()
                 .or_else(|| client_msg.protocol.clone());
             let c_resp = nathole_ctrl::build_nat_hole_response(
-                &client_msg.transaction_id,
-                &tid,
-                protocol_for_provider,
-                mode,
-                visitor_mapped.clone(),
-                visitor_assisted.clone(),
-                c_behavior,
-                c_read_timeout,
-                vf.ports_difference,
+                nathole_ctrl::NatHoleResponseParams {
+                    transaction_id: client_msg.transaction_id.clone(),
+                    sid: tid.clone(),
+                    protocol: protocol_for_provider,
+                    mode,
+                    candidate_addrs: visitor_mapped.clone(),
+                    assisted_addrs: visitor_assisted.clone(),
+                    behavior: c_behavior,
+                    read_timeout_ms: c_read_timeout,
+                    ports_difference: vf.ports_difference,
+                },
             );
             (v_resp, Some(c_resp))
         } else {

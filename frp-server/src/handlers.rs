@@ -508,15 +508,17 @@ pub(crate) async fn handle_nat_hole_visitor(
         let v_ports_diff = vf.ports_difference;
 
         let v_resp = nathole_ctrl::build_nat_hole_response(
-            &transaction_id,
-            &sid,
-            msg.protocol.clone(),
-            mode,
-            client_mapped.clone(), // visitor gets PROVIDER's addresses
-            client_assisted.clone(),
-            v_behavior,
-            v_read_timeout,
-            c_ports_diff,
+            nathole_ctrl::NatHoleResponseParams {
+                transaction_id: transaction_id.clone(),
+                sid: sid.clone(),
+                protocol: msg.protocol.clone(),
+                mode,
+                candidate_addrs: client_mapped.clone(), // visitor gets PROVIDER's addresses
+                assisted_addrs: client_assisted.clone(),
+                behavior: v_behavior,
+                read_timeout_ms: v_read_timeout,
+                ports_difference: c_ports_diff,
+            },
         );
 
         // Use visitor's protocol for provider's response too —
@@ -525,15 +527,17 @@ pub(crate) async fn handle_nat_hole_visitor(
         // which is incompatible with visitor's KCP.
         let protocol_for_provider = msg.protocol.clone().or_else(|| client_msg.protocol.clone());
         let c_resp = nathole_ctrl::build_nat_hole_response(
-            &client_msg.transaction_id,
-            &sid,
-            protocol_for_provider,
-            mode,
-            visitor_mapped.clone(), // provider gets VISITOR's addresses
-            visitor_assisted.clone(),
-            c_behavior,
-            c_read_timeout,
-            v_ports_diff,
+            nathole_ctrl::NatHoleResponseParams {
+                transaction_id: client_msg.transaction_id.clone(),
+                sid: sid.clone(),
+                protocol: protocol_for_provider,
+                mode,
+                candidate_addrs: visitor_mapped.clone(), // provider gets VISITOR's addresses
+                assisted_addrs: visitor_assisted.clone(),
+                behavior: c_behavior,
+                read_timeout_ms: c_read_timeout,
+                ports_difference: v_ports_diff,
+            },
         );
 
         (v_resp, Some(c_resp))
