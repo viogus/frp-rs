@@ -854,26 +854,28 @@ impl Service {
                 let vtx = self.visitor_tx.clone();
                 let handle = tokio::spawn(async move {
                     crate::visitor::run_visitor_listener(
-                        sa,
-                        sp,
-                        pt,
-                        server_name,
-                        secret_key,
-                        bind_addr,
-                        use_enc,
-                        use_comp,
-                        name,
-                        tls_enable,
-                        tls_server_name,
-                        tls_ca_file,
-                        visitor_type,
-                        fallback_timeout_ms,
-                        keep_tunnel_open,
-                        max_retries_an_hour,
-                        min_retry_interval,
-                        stun_server,
-                        vtx,
-                        fallback_to,
+                        crate::visitor::VisitorListenerConfig {
+                            server_addr: sa,
+                            server_port: sp,
+                            protocol: pt,
+                            server_name,
+                            secret_key,
+                            bind_addr,
+                            use_encryption: use_enc,
+                            use_compression: use_comp,
+                            name,
+                            tls_enable,
+                            tls_server_name,
+                            tls_ca_file,
+                            visitor_type,
+                            fallback_timeout_ms,
+                            keep_tunnel_open,
+                            max_retries_an_hour,
+                            min_retry_interval,
+                            stun_server,
+                            visitor_tx: vtx,
+                            fallback_to,
+                        },
                     )
                     .await;
                 });
@@ -1187,9 +1189,18 @@ impl Service {
                 cancels.insert(pn.clone(), cancel.clone());
             }
             tokio::spawn(async move {
-                crate::health::run_health_check(
-                    pn, la, hc_type, hc_url, hc_headers, interval, timeout, max_failed, tx, cancel,
-                )
+                crate::health::run_health_check(crate::health::HealthCheckConfig {
+                    proxy_name: pn,
+                    local_addr: la,
+                    check_type: hc_type,
+                    check_url: hc_url,
+                    hc_headers,
+                    interval,
+                    timeout,
+                    max_failed,
+                    health_tx: tx,
+                    cancel,
+                })
                 .await;
             });
         }

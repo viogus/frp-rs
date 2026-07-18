@@ -5,7 +5,7 @@
 
 use tokio::io::AsyncWriteExt;
 
-use frp_core::msg::FrpMessage;
+use frp_core::msg::{self, FrpMessage};
 
 use crate::service::InternalMsg;
 
@@ -55,12 +55,15 @@ pub(crate) async fn dispatch_internal<W: AsyncWriteExt + Unpin>(
                 ctx,
                 ctl,
                 writer,
-                transaction_id,
-                error,
-                sid,
-                protocol,
-                candidate_addrs,
-                assisted_addrs,
+                msg::NatHoleResp {
+                    transaction_id,
+                    error,
+                    sid,
+                    protocol,
+                    candidate_addrs,
+                    assisted_addrs,
+                    ..Default::default()
+                },
             )
             .await;
             Ok(())

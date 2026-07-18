@@ -5,32 +5,55 @@ use tracing::{debug, info, warn};
 use frp_core::msg::{self, FrpMessage};
 use frp_core::transport::{dial_server, DialOptions, TransportProtocol};
 
+/// Configuration for an STCP/XTCP visitor listener.
+pub(crate) struct VisitorListenerConfig {
+    pub server_addr: String,
+    pub server_port: u16,
+    pub protocol: TransportProtocol,
+    pub server_name: String,
+    pub secret_key: String,
+    pub bind_addr: String,
+    pub use_encryption: bool,
+    pub use_compression: bool,
+    pub name: String,
+    pub tls_enable: bool,
+    pub tls_server_name: String,
+    pub tls_ca_file: Option<String>,
+    pub visitor_type: String,
+    pub fallback_timeout_ms: u64,
+    pub keep_tunnel_open: bool,
+    pub max_retries_an_hour: i32,
+    pub min_retry_interval: i64,
+    pub stun_server: String,
+    pub visitor_tx: mpsc::Sender<crate::service::VisitorRequest>,
+    pub fallback_to: String,
+}
 /// Run an STCP/XTCP visitor listener.
 /// Binds a local port, accepts connections, and tunnels them
 /// through the frps server to the remote STCP proxy.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_visitor_listener(
-    server_addr: String,
-    server_port: u16,
-    protocol: TransportProtocol,
-    server_name: String,
-    secret_key: String,
-    bind_addr: String,
-    use_encryption: bool,
-    use_compression: bool,
-    name: String,
-    tls_enable: bool,
-    tls_server_name: String,
-    tls_ca_file: Option<String>,
-    visitor_type: String,
-    fallback_timeout_ms: u64,
-    keep_tunnel_open: bool,
-    max_retries_an_hour: i32,
-    min_retry_interval: i64,
-    stun_server: String,
-    visitor_tx: mpsc::Sender<crate::service::VisitorRequest>,
-    fallback_to: String,
-) {
+pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
+    let VisitorListenerConfig {
+        server_addr,
+        server_port,
+        protocol,
+        server_name,
+        secret_key,
+        bind_addr,
+        use_encryption,
+        use_compression,
+        name,
+        tls_enable,
+        tls_server_name,
+        tls_ca_file,
+        visitor_type,
+        fallback_timeout_ms,
+        keep_tunnel_open,
+        max_retries_an_hour,
+        min_retry_interval,
+        stun_server,
+        visitor_tx,
+        fallback_to,
+    } = config;
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
         Err(e) => {

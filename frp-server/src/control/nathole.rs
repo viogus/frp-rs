@@ -40,28 +40,14 @@ pub(crate) async fn handle_write_sid<W: AsyncWriteExt + Unpin>(
 }
 
 /// Write NatHoleResp to the visitor via the control channel.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_write_resp<W: AsyncWriteExt + Unpin>(
     ctx: &ControlContext,
     _ctl: &mut ControlState,
     writer: &mut W,
-    transaction_id: String,
-    error: Option<String>,
-    sid: Option<String>,
-    protocol: Option<String>,
-    candidate_addrs: Option<Vec<String>>,
-    assisted_addrs: Option<Vec<String>>,
+    resp: msg::NatHoleResp,
 ) {
-    debug!(transaction_id = %transaction_id, "Writing NatHoleResp to visitor via control channel for {}", transaction_id);
-    let forward = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
-        transaction_id,
-        error,
-        sid,
-        protocol,
-        candidate_addrs,
-        assisted_addrs,
-        ..Default::default()
-    }));
+    debug!(transaction_id = %resp.transaction_id, "Writing NatHoleResp to visitor via control channel for {}", resp.transaction_id);
+    let forward = FrpMessage::NatHoleResp(Box::new(resp));
     if let Err(e) = write_ctl_msg(writer, &forward, ctx.v2).await {
         warn!(error = %e, "Failed to write NatHoleResp to visitor: {}", e);
     }
