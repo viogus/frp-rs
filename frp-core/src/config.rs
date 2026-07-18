@@ -79,10 +79,10 @@ pub struct ServerConfig {
     /// Go frp compat: UserConnTimeout. Default: 10.
     #[serde(default = "default_user_conn_timeout")]
     pub user_conn_timeout: u64,
-    /// When false (default), internal error details are replaced with generic
-    /// messages in client-facing error responses. When true, full Rust error
-    /// details are included. Go frp compat: detailedErrorsToClient. Default: false.
-    #[serde(default)]
+    /// When true (default), internal error details are included in client-facing
+    /// error responses. When false, generic messages replace full details.
+    /// Go frp compat: detailedErrorsToClient. Default: true.
+    #[serde(default = "default_true")]
     pub detailed_errors_to_client: bool,
     /// Maximum time in seconds to wait for active connections to drain
     /// during graceful shutdown. After this timeout, remaining connections
@@ -95,7 +95,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tcp_mux_passthrough: bool,
     /// UDP packet buffer size in bytes. Controls the receive buffer for UDP
-    /// proxy datagrams. Default: 65535 (max UDP datagram size).
+    /// proxy datagrams. Default: 1500 (Go frp compat).
     /// Go frp compat: udp_packet_size.
     #[serde(default = "default_udp_packet_size")]
     pub udp_packet_size: usize,
@@ -119,7 +119,7 @@ pub struct ServerConfig {
     pub ssh_tunnel_gateway: SshTunnelGatewayConfig,
     /// NAT hole analysis data retention in hours.
     /// Controls how long historical NAT behavior records are kept.
-    /// Go frp compat: natholeAnalysisDataReserveHours. Default: 1 (hour).
+    /// Go frp compat: natholeAnalysisDataReserveHours. Default: 168 (7 days, Go frp compat).
     #[serde(default = "default_nathole_analysis_data_reserve_hours")]
     pub nat_hole_analysis_data_reserve_hours: u64,
     /// OpenTelemetry / observability settings.
@@ -194,10 +194,10 @@ fn default_user_conn_timeout() -> u64 {
     10
 }
 fn default_udp_packet_size() -> usize {
-    65535
+    1500
 }
 fn default_nathole_analysis_data_reserve_hours() -> u64 {
-    1
+    168
 }
 fn default_graceful_timeout() -> u64 {
     30
@@ -309,7 +309,7 @@ impl Default for ServerConfig {
             vhost_http_timeout: default_vhost_http_timeout(),
             user_conn_timeout: default_user_conn_timeout(),
             tcp_mux_passthrough: false,
-            detailed_errors_to_client: false,
+            detailed_errors_to_client: true,
             udp_packet_size: default_udp_packet_size(),
             http_plugins: Vec::new(),
             feature: FeatureConfig::default(),
@@ -327,11 +327,14 @@ impl Default for ServerConfig {
 fn default_bind_addr() -> String {
     "0.0.0.0".into()
 }
+fn default_visitor_bind_addr() -> String {
+    "127.0.0.1".into()
+}
 fn default_bind_port() -> u16 {
     7000
 }
 fn default_fallback_timeout_ms() -> u64 {
-    5000
+    1000
 }
 
 // ---------------------------------------------------------------
@@ -850,10 +853,10 @@ impl Default for ClientConfig {
             disable_custom_tls_first_byte: false,
             log: LogConfig::default(),
             login_fail_exit: true,
-            pool_count: 0,
+            pool_count: 1,
             heartbeat_interval: default_heartbeat_interval(),
             dns_server: String::new(),
-            dial_server_keepalive: 0,
+            dial_server_keepalive: 7200,
             connect_server_local_ip: String::new(),
             tcp_mux: default_tcp_mux(),
             v2: false,
@@ -998,13 +1001,13 @@ pub struct VisitorConfig {
     #[serde(default, alias = "serverUser")]
     pub server_user: String,
     /// Local address to bind for accepting connections.
-    #[serde(default = "default_bind_addr")]
+    #[serde(default = "default_visitor_bind_addr")]
     pub bind_addr: String,
     /// Local port for the visitor listener (0 = disabled).
     #[serde(default, alias = "bindPort")]
     pub bind_port: u16,
     /// Fallback timeout in milliseconds before switching from XTCP to STCP.
-    /// Go frp compat: fallbackTimeoutMs. Default: 5000 (5 seconds).
+    /// Go frp compat: fallbackTimeoutMs. Default: 1000 (1 second, Go frp compat)
     #[serde(default = "default_fallback_timeout_ms")]
     pub fallback_timeout_ms: u64,
     /// Fallback visitor name if this one fails.
@@ -1031,7 +1034,7 @@ pub struct VisitorConfig {
     #[serde(default = "default_max_retries_an_hour", alias = "maxRetriesAnHour")]
     pub max_retries_an_hour: i32,
     /// Minimum interval in seconds between XTCP retry attempts.
-    /// Go frp compat: minRetryInterval. Default: 30.
+    /// Go frp compat: minRetryInterval. Default: 90 (Go frp compat)
     #[serde(default = "default_min_retry_interval", alias = "minRetryInterval")]
     pub min_retry_interval: i64,
 }
@@ -1040,7 +1043,7 @@ fn default_max_retries_an_hour() -> i32 {
     8
 }
 fn default_min_retry_interval() -> i64 {
-    30
+    90
 }
 fn default_vnet_netmask() -> String {
     "255.255.255.0".to_string()

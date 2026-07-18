@@ -77,8 +77,9 @@ pub struct AuthConfig {
     /// are rejected. Set to 0 to disable timestamp verification (accepts
     /// any timestamp, weakening replay protection).
     ///
-    /// Go frp v0.69.1 default: 900 (15 minutes). This implementation defaults
-    /// to 15 seconds for tighter replay protection.
+    /// Go frp v0.70.0 default: 900 (15 minutes). This implementation defaults
+    /// to 300 seconds (5 minutes) — token auth path does not check freshness
+    /// (matching Go behavior); OIDC path uses this timeout for JWT validation.
     /// Go frp compat: authentication_timeout.
     pub authentication_timeout: i64,
     /// Whether to wrap control connection in AES-128-CFB after LoginResp.
@@ -126,7 +127,7 @@ impl Default for AuthConfig {
             additional_data: None,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
-            authentication_timeout: 15,
+            authentication_timeout: 300,
             use_encryption: false,
         }
     }
@@ -165,15 +166,12 @@ impl AuthConfig {
                     Some(t) => t,
                     None => return Err("timestamp required for authentication".into()),
                 };
-                if self.authentication_timeout > 0 {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64;
-                    if (ts - now).abs() > self.authentication_timeout {
-                        return Err("timestamp outside acceptable window".into());
-                    }
-                }
+                // Go frp compat: token auth does NOT check timestamp freshness.
+                // Go frp's VerifyLogin only checks MD5(token+timestamp) equality;
+                // timestamp is included in the hash itself, so replay protection
+                // relies on the server rejecting duplicate timestamps (not freshness).
+                // frp-rs strips authentication_timeout from token path to match
+                // Go behavior — OIDC path keeps the check.
                 let expected = generate_token(&self.token, ts);
                 if !constant_time_eq(key.as_bytes(), expected.as_bytes()) {
                     return Err("invalid authentication token".into());
@@ -1173,12 +1171,20 @@ mod tests {
         assert_eq!(result.unwrap(), "file-token-no-gate");
     }
 
-    // --- Authentication timeout (replay protection) tests ---
+    // --- Authentication timeout tests ---
+    //
+    // Go frp compat: token auth does NOT check timestamp freshness.
+    // Go frp's VerifyLogin only checks MD5(token+timestamp) equality.
+    // frp-rs matches Go behavior — the timestamp is part of the hash
+    // itself, so replay protection relies on the server rejecting
+    // duplicate timestamps, not on freshness.
+    //
+    // authentication_timeout now only applies to the OIDC auth path.
 
     #[test]
-    fn test_auth_timeout_default_is_15() {
+    fn test_auth_timeout_default_is_300() {
         let cfg = AuthConfig::default();
-        assert_eq!(cfg.authentication_timeout, 15);
+        assert_eq!(cfg.authentication_timeout, 300);
     }
 
     #[test]
@@ -1192,37 +1198,37 @@ mod tests {
     }
 
     #[test]
-    fn test_auth_timeout_rejects_future_timestamp() {
+    fn test_token_auth_accepts_future_timestamp() {
+        // Go frp compat: token auth does not check timestamp freshness.
+        // A future timestamp with the correct token hash is accepted.
         let mut cfg = AuthConfig::with_token("secret");
-        cfg.authentication_timeout = 15;
+        cfg.authentication_timeout = 15; // timeout ignored for token auth
         let far_future = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64
             + 60; // 60 seconds in the future
         let key = generate_token("secret", far_future);
-        let result = cfg.validate_login(Some(&key), Some(far_future));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("timestamp"));
+        assert!(cfg.validate_login(Some(&key), Some(far_future)).is_ok());
     }
 
     #[test]
-    fn test_auth_timeout_rejects_past_timestamp() {
+    fn test_token_auth_accepts_past_timestamp() {
+        // Go frp compat: token auth does not check timestamp freshness.
+        // A past timestamp with the correct token hash is accepted.
         let mut cfg = AuthConfig::with_token("secret");
-        cfg.authentication_timeout = 15;
+        cfg.authentication_timeout = 15; // timeout ignored for token auth
         let far_past = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64
             - 60; // 60 seconds in the past
         let key = generate_token("secret", far_past);
-        let result = cfg.validate_login(Some(&key), Some(far_past));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("timestamp"));
+        assert!(cfg.validate_login(Some(&key), Some(far_past)).is_ok());
     }
 
     #[test]
-    fn test_auth_timeout_accepts_current_timestamp() {
+    fn test_token_auth_accepts_current_timestamp() {
         let mut cfg = AuthConfig::with_token("secret");
         cfg.authentication_timeout = 15;
         let now = std::time::SystemTime::now()
@@ -1234,36 +1240,21 @@ mod tests {
     }
 
     #[test]
-    fn test_auth_timeout_boundary_inside_window() {
+    fn test_token_auth_accepts_far_future_timestamp() {
+        // Go frp compat: any timestamp is accepted as long as the token hash matches.
         let mut cfg = AuthConfig::with_token("secret");
-        cfg.authentication_timeout = 15;
+        cfg.authentication_timeout = 15; // timeout ignored for token auth
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        // Exactly at the boundary (should be accepted: |ts-now| <= 15)
-        let at_boundary = now + 15;
-        let key = generate_token("secret", at_boundary);
-        assert!(cfg.validate_login(Some(&key), Some(at_boundary)).is_ok());
+        let far_boundary = now + 3600; // 1 hour in the future
+        let key = generate_token("secret", far_boundary);
+        assert!(cfg.validate_login(Some(&key), Some(far_boundary)).is_ok());
     }
 
     #[test]
-    fn test_auth_timeout_boundary_outside_window() {
-        let mut cfg = AuthConfig::with_token("secret");
-        cfg.authentication_timeout = 15;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        // Just outside the boundary
-        let outside = now + 16;
-        let key = generate_token("secret", outside);
-        let result = cfg.validate_login(Some(&key), Some(outside));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_auth_timeout_still_rejects_wrong_token_inside_window() {
+    fn test_token_auth_rejects_wrong_token() {
         // Replay protection: even with a valid timestamp, wrong token fails
         let mut cfg = AuthConfig::with_token("secret");
         cfg.authentication_timeout = 15;
@@ -1271,7 +1262,6 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        // Token generated with wrong secret
         let wrong_key = generate_token("wrong-secret", now);
         let result = cfg.validate_login(Some(&wrong_key), Some(now));
         assert!(result.is_err());
