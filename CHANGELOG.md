@@ -2,7 +2,7 @@
 
 All notable changes to frp-rs.
 
-## v0.7.0 (2026-07-17)
+## v0.7.0 (2026-07-19)
 
 ### Security
 
@@ -40,6 +40,17 @@ All notable changes to frp-rs.
 - Remove unused deps: `bytes`, `libc` (dead direct dependencies)
 - Security: constant-time comparison for admin auth (`constant_time_eq_str`)
 - Doc: document `simple_glob` single-`*` limitation, sequential proxy registration, test coverage gaps
+- Config defaults aligned with Go frp v0.70.0: `pool_count` (0→1), `dial_server_keepalive` (0→7200), `fallback_timeout_ms` (5000→1000), `min_retry_interval` (30→90), visitor `bind_addr` (0.0.0.0→127.0.0.1), `detailed_errors_to_client` (false→true), `nat_hole_analysis_data_reserve_hours` (1→168)
+- Token auth: remove timestamp freshness check (Go only checks hash equality), `authentication_timeout` 15→300 (OIDC only)
+- XTCP: wire `disable_assisted_addrs` — visitor sends STUN addresses as assisted_addrs for NAT classification
+- HTTP: wire `route_by_http_user` — flows through ProxyInfo→VhostRoute→serve_vhost_request, matching Go behavior
+- Server: wire `bandwidth_limit` in bridge + dashboard_v2; wire `response_headers` via ResponseHeaderInjector for HTTP/HTTPS
+- DNS resolved IP now used for KCP/QUIC dials
+- XTCP PreCheck: two-phase `NatHoleVisitor` validates before STUN
+- `bandwidth_limit_mode`: empty/unspecified applies both directions (client+server gates)
+- `frpc --log-file`: add CLI flag with CLI-overrides-config pattern
+- KCP XOR: documented as unimplemented (KcpConfig lacks crypt field in Go frp)
+- Group health checks: documented compat gap (TODO)
 
 ### Added
 
@@ -50,6 +61,11 @@ All notable changes to frp-rs.
 - OS route injection for peer subnet reachability (Linux, macOS)
 - Feature-gated behind `vnet` flag (full=on, tiny/micro=off)
 - KCP: removed vendored `rust_tokio_kcp` (~5900 lines), replaced with 1502-line direct tokio-KCP module (`frp-core/src/kcp/`)
+
+### Performance
+
+- Replace `Box<dyn>` with `ReadHalf`/`WriteHalf` enums in `into_split()` — zero heap allocs per split, static dispatch (#161)
+- Remove `.into_boxed()` in client control writer hot path — zero alloc in send path
 
 ### Fixed
 
@@ -65,6 +81,10 @@ All notable changes to frp-rs.
 - Bridge diagnostic logs downgraded from ERROR to debug/trace/warn
 - Clippy: fix warnings for Rust 1.96.0 (manual_inspect, io_other_error, manual_div_ceil, vec_init_then_push, collapsible_if)
 - VNet: fix missing IntoRawFd import, remove stale `#[cfg(vnet)]` gates from NewProxy
+- Server `udp_packet_size`: default 1500 (erroneously matched Go's `d.DefaultUDPPacketSize` not `DefaultUDPPacketSize`) restored to 65535
+- Remove unused `collapsible_match` allow attributes (#163)
+- Remove dead code, replace `into_boxed()` with `From` impl
+- Support pre-built frps/frpc in integration tests (honor `FRPS_BIN`/`FRPC_BIN` env vars)
 
 ### Compat Tests
 
