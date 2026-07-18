@@ -243,12 +243,14 @@ fn resolve_log_settings(
             )
             .to_string()
     });
-    let file = cfg.and_then(|c| {
-        if c.log.file.is_empty() {
-            None
-        } else {
-            Some(c.log.file.clone())
-        }
+    let file = cli.log_file.clone().or_else(|| {
+        cfg.and_then(|c| {
+            if c.log.file.is_empty() {
+                None
+            } else {
+                Some(c.log.file.clone())
+            }
+        })
     });
     let ansi = !cli.disable_log_color;
     (level, file, ansi)

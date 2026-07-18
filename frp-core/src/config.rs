@@ -194,7 +194,7 @@ fn default_user_conn_timeout() -> u64 {
     10
 }
 fn default_udp_packet_size() -> usize {
-    1500
+    65535
 }
 fn default_nathole_analysis_data_reserve_hours() -> u64 {
     1

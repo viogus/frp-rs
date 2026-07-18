@@ -32,6 +32,8 @@ pub struct ProxyInfo {
     pub route_by_http_user: String,
     /// Multiplexer type (e.g., "yamux").
     pub multiplexer: String,
+    pub bandwidth_limit: String,
+    pub bandwidth_limit_mode: String,
     pub user: String,
 }
 

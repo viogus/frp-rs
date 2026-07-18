@@ -6,6 +6,9 @@
 //! SIZE = 2 + len(PAYLOAD) (matches Go's `len(b[payloadOffset:])`).
 //! FEC is inter-packet: dataShards consecutive KCP output packets form one
 //! RS group; parity shards are generated from the equal-length RS blocks.
+//!
+//! XOR encryption (`kcp_compat::XorBlock`) is NOT yet wired — `KcpConfig`
+//! lacks a `crypt` field. When added, apply per-packet in `update()`/`input()`.
 
 use std::collections::HashMap;
 use std::io::{self, Write};

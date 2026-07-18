@@ -2132,7 +2132,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
     match opts.protocol {
         #[cfg(feature = "kcp")]
         TransportProtocol::Kcp => {
-            let addr = format!("{}:{}", opts.server_addr, opts.server_port);
+            let addr = format!("{target_ip}:{}", opts.server_port);
             let stream = crate::kcp::dial_kcp(&addr, crate::kcp::default_kcp_config())
                 .await
                 .map_err(|e| crate::Error::Transport(format!("KCP dial: {e}").into()))?;
@@ -2140,7 +2140,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
         }
         #[cfg(feature = "quic")]
         TransportProtocol::Quic => {
-            let addr = format!("{}:{}", opts.server_addr, opts.server_port);
+            let addr = format!("{target_ip}:{}", opts.server_port);
             let server_name = if !opts.tls_server_name.is_empty() {
                 &opts.tls_server_name
             } else {

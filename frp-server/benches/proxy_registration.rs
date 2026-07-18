@@ -32,6 +32,8 @@ fn make_info(name: &str, run_id: &str, group: Option<&str>) -> ProxyInfo {
         custom_domains: Vec::new(),
         route_by_http_user: String::new(),
         multiplexer: String::new(),
+        bandwidth_limit: String::new(),
+        bandwidth_limit_mode: String::new(),
     }
 }
 

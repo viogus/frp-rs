@@ -431,8 +431,8 @@ fn proxy_base_spec(info: &crate::proxy::ProxyInfo) -> V2ProxyBaseSpec {
         transport: Some(V2ProxyTransport {
             use_encryption: info.use_encryption,
             use_compression: info.use_compression,
-            bandwidth_limit: String::new(),
-            bandwidth_limit_mode: String::new(),
+            bandwidth_limit: info.bandwidth_limit.clone(),
+            bandwidth_limit_mode: info.bandwidth_limit_mode.clone(),
         }),
         load_balancer: info
             .group

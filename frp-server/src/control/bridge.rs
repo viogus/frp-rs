@@ -5,6 +5,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tracing::{debug, warn};
 
+use frp_core::bandwidth::BandwidthLimiter;
 use frp_core::metrics::ConnGuard;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, read_msg_v2, write_msg_v1, write_msg_v2};
@@ -416,6 +417,22 @@ pub(crate) async fn assign_work_to_proxy(
     let comp_key = req.use_compression;
     let proxy_type = req.proxy_type.clone();
 
+    // Parse bandwidth limit from proxy info
+    let bw_rate = proxy_info
+        .as_ref()
+        .and_then(|p| {
+            if p.bandwidth_limit.is_empty() {
+                None
+            } else {
+                frp_core::config::parse_bandwidth_limit(&p.bandwidth_limit)
+            }
+        })
+        .unwrap_or(0);
+    let bw_mode = proxy_info
+        .as_ref()
+        .map(|p| p.bandwidth_limit_mode.clone())
+        .unwrap_or_default();
+
     tokio::spawn(async move {
         let _guard = guard;
         let _drain = drain_guard;
@@ -426,10 +443,45 @@ pub(crate) async fn assign_work_to_proxy(
         // Go frpc v0.69.1 ignores swc.use_encryption (not in its struct) and
         // uses its own proxy config, so the server MUST match.
         let use_enc = enc_key;
+
+        // Create bandwidth limiters per direction.
+        // "client" mode throttles client egress → data from work to user (read_limiter).
+        // "server" mode throttles server egress → data from user to work (write_limiter).
+        let mut read_lim = if bw_rate > 0 && (bw_mode == "client" || bw_mode == "both") {
+            Some(BandwidthLimiter::new(bw_rate))
+        } else {
+            None
+        };
+        let mut write_lim = if bw_rate > 0 && (bw_mode == "server" || bw_mode == "both") {
+            Some(BandwidthLimiter::new(bw_rate))
+        } else {
+            None
+        };
+
         // For encrypted bridges, pre_read bytes are passed into bridge_encrypted
         // which writes them through the CipherWriter (matching Go frp streaming CFB).
         if use_enc {
             let key = encryption_key;
+            if !req.response_headers.is_empty() && req.proxy_type.starts_with("http") {
+                let headers = req.response_headers;
+                let (u_r, u_w) = req.user_conn.into_split();
+                let (w_r, w_w) = work_conn.into_split();
+                let injector = ResponseHeaderInjector::new(w_r, headers);
+                frp_core::bridge::bridge_encrypted(
+                    u_r,
+                    u_w,
+                    injector,
+                    w_w,
+                    &key,
+                    comp_key,
+                    pre_read,
+                    None,
+                    None,
+                    Some(metrics.clone()),
+                )
+                .await;
+                return;
+            }
             match work_conn {
                 IoStream::Tcp(work) => {
                     let (u_r, u_w) = req.user_conn.into_split();
@@ -442,8 +494,8 @@ pub(crate) async fn assign_work_to_proxy(
                         &key,
                         comp_key,
                         pre_read,
-                        None,
-                        None,
+                        read_lim.as_mut(),
+                        write_lim.as_mut(),
                         Some(metrics.clone()),
                     )
                     .await;
@@ -460,8 +512,8 @@ pub(crate) async fn assign_work_to_proxy(
                         &key,
                         comp_key,
                         pre_read,
-                        None,
-                        None,
+                        read_lim.as_mut(),
+                        write_lim.as_mut(),
                         Some(metrics.clone()),
                     )
                     .await;
@@ -478,8 +530,8 @@ pub(crate) async fn assign_work_to_proxy(
                         &key,
                         comp_key,
                         pre_read,
-                        None,
-                        None,
+                        read_lim.as_mut(),
+                        write_lim.as_mut(),
                         Some(metrics.clone()),
                     )
                     .await;
@@ -496,8 +548,8 @@ pub(crate) async fn assign_work_to_proxy(
                         &key,
                         comp_key,
                         pre_read,
-                        None,
-                        None,
+                        read_lim.as_mut(),
+                        write_lim.as_mut(),
                         Some(metrics.clone()),
                     )
                     .await;
@@ -514,8 +566,8 @@ pub(crate) async fn assign_work_to_proxy(
                         &key,
                         comp_key,
                         pre_read,
-                        None,
-                        None,
+                        read_lim.as_mut(),
+                        write_lim.as_mut(),
                         Some(metrics.clone()),
                     )
                     .await;
@@ -531,8 +583,8 @@ pub(crate) async fn assign_work_to_proxy(
                         &key,
                         comp_key,
                         pre_read,
-                        None,
-                        None,
+                        read_lim.as_mut(),
+                        write_lim.as_mut(),
                         Some(metrics.clone()),
                     )
                     .await;
@@ -556,8 +608,8 @@ pub(crate) async fn assign_work_to_proxy(
                         &key,
                         comp_key,
                         pre_read,
-                        None,
-                        None,
+                        read_lim.as_mut(),
+                        write_lim.as_mut(),
                         Some(metrics.clone()),
                     )
                     .await;
@@ -573,8 +625,8 @@ pub(crate) async fn assign_work_to_proxy(
                         &key,
                         comp_key,
                         pre_read,
-                        None,
-                        None,
+                        read_lim.as_mut(),
+                        write_lim.as_mut(),
                         Some(metrics.clone()),
                     )
                     .await;
@@ -590,8 +642,8 @@ pub(crate) async fn assign_work_to_proxy(
                         &key,
                         comp_key,
                         pre_read,
-                        None,
-                        None,
+                        read_lim.as_mut(),
+                        write_lim.as_mut(),
                         Some(metrics.clone()),
                     )
                     .await;
@@ -624,6 +676,38 @@ pub(crate) async fn assign_work_to_proxy(
                     Err(e) => {
                         debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
                     }
+                }
+            } else if read_lim.is_some() || write_lim.is_some() {
+                // Bandwidth limiting active: use rate-limited plain bridge.
+                let (u_r, u_w) = req.user_conn.into_split();
+                let (w_r, w_w) = work_conn.into_split();
+                if !req.response_headers.is_empty() && req.proxy_type.starts_with("http") {
+                    let injector = ResponseHeaderInjector::new(w_r, req.response_headers);
+                    frp_core::bridge::bridge_plain_rate_limited(
+                        u_r,
+                        u_w,
+                        injector,
+                        w_w,
+                        comp_key,
+                        bridge_pre_read,
+                        read_lim.as_mut(),
+                        write_lim.as_mut(),
+                        Some(metrics.clone()),
+                    )
+                    .await;
+                } else {
+                    frp_core::bridge::bridge_plain_rate_limited(
+                        u_r,
+                        u_w,
+                        w_r,
+                        w_w,
+                        comp_key,
+                        bridge_pre_read,
+                        read_lim.as_mut(),
+                        write_lim.as_mut(),
+                        Some(metrics.clone()),
+                    )
+                    .await;
                 }
             } else if !comp_key && bridge_pre_read.is_empty() && req.response_headers.is_empty() {
                 // Fast path: pure plain relay with no compression, no VHost

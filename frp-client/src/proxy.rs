@@ -172,16 +172,19 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
     // Build bandwidth limiters per direction.
     // "client" throttles upload (local→server, write to work).
     // "server" throttles download (server→local, read from work).
-    let mut read_lim = if bandwidth_limit > 0
-        && (bandwidth_limit_mode == "server" || bandwidth_limit_mode == "both")
-    {
+    // Empty/unspecified: apply both (backward compat).
+    let apply_read = bandwidth_limit_mode == "server"
+        || bandwidth_limit_mode == "both"
+        || bandwidth_limit_mode.is_empty();
+    let apply_write = bandwidth_limit_mode == "client"
+        || bandwidth_limit_mode == "both"
+        || bandwidth_limit_mode.is_empty();
+    let mut read_lim = if bandwidth_limit > 0 && apply_read {
         Some(BandwidthLimiter::new(bandwidth_limit))
     } else {
         None
     };
-    let mut write_lim = if bandwidth_limit > 0
-        && (bandwidth_limit_mode == "client" || bandwidth_limit_mode == "both")
-    {
+    let mut write_lim = if bandwidth_limit > 0 && apply_write {
         Some(BandwidthLimiter::new(bandwidth_limit))
     } else {
         None

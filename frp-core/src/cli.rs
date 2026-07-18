@@ -394,6 +394,7 @@ pub struct FrpcRunArgs {
     pub strict_config: bool,
     pub allow_unsafe: Vec<String>,
     pub show_version: bool,
+    pub log_file: Option<String>,
     pub log_level: Option<String>,
     pub disable_log_color: bool,
 }
@@ -544,6 +545,10 @@ fn run_mode() -> impl Parser<FrpcRunArgs> {
         })
         .fallback(vec![]);
     let show_version = long("version").short('v').switch();
+    let log_file = long("log-file")
+        .long("log_file")
+        .argument::<String>("FILE")
+        .optional();
     let log_level = long("log-level")
         .long("log_level")
         .short('L')
@@ -556,6 +561,7 @@ fn run_mode() -> impl Parser<FrpcRunArgs> {
         strict_config,
         allow_unsafe,
         show_version,
+        log_file,
         log_level,
         disable_log_color
     })

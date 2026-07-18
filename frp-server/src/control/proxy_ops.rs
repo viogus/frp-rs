@@ -232,6 +232,8 @@ pub(crate) async fn handle_new_proxy(
                 custom_domains: np.custom_domains.clone().unwrap_or_default(),
                 route_by_http_user: np.route_by_http_user.clone().unwrap_or_default(),
                 multiplexer: np.multiplexer.clone().unwrap_or_default(),
+                bandwidth_limit: np.bandwidth_limit.clone().unwrap_or_default(),
+                bandwidth_limit_mode: np.bandwidth_limit_mode.clone().unwrap_or_default(),
                 user: state
                     .run_id_to_ctl_tx
                     .read()

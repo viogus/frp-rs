@@ -121,6 +121,65 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         // Wrap in Option — P2P success arm moves it out via take().
                         let mut user_conn = Some(user_conn);
 
+                        // --- PreCheck: validate proxy existence/permissions before STUN ---
+                        // Go frp two-phase approach: first send pre_check=true to validate
+                        // auth/permissions, THEN do STUN + full request. Skipping this
+                        // wastes STUN calls on auth/proxy-not-found failures.
+                        {
+                            let (reply_tx, reply_rx) = oneshot::channel();
+                            let ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64;
+                            let sign_key = if sk.is_empty() {
+                                None
+                            } else {
+                                Some(frp_core::auth::generate_token(&sk, ts))
+                            };
+                            let pre_check_req = crate::service::VisitorRequest {
+                                nhv: msg::NatHoleVisitor {
+                                    transaction_id: uuid::Uuid::new_v4().to_string(),
+                                    proxy_name: sn.clone(),
+                                    pre_check: true,
+                                    protocol: Some("kcp".to_string()),
+                                    sign_key,
+                                    timestamp: Some(ts),
+                                    mapped_addrs: None,
+                                    assisted_addrs: None,
+                                },
+                                reply: reply_tx,
+                            };
+                            if vtx.try_send(pre_check_req).is_err() {
+                                warn!(visitor_name = %visitor_name, "Visitor '{}': failed to send pre_check to control loop (channel closed)", visitor_name);
+                                return;
+                            }
+                            debug!(visitor_name = %visitor_name, sn = %sn, "Visitor '{}': sent NatHoleVisitor pre_check for '{}'", visitor_name, sn);
+
+                            match tokio::time::timeout(Duration::from_secs(15), reply_rx).await {
+                                Ok(Ok(Ok(resp))) => {
+                                    if let Some(err) = resp.error {
+                                        warn!(visitor_name = %visitor_name, error = %err, "Visitor '{}': pre_check failed: {}", visitor_name, err);
+                                        return;
+                                    }
+                                    debug!(visitor_name = %visitor_name, sn = %sn, "Visitor '{}': pre_check OK for '{}'", visitor_name, sn);
+                                }
+                                Ok(Ok(Err(e))) => {
+                                    warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': pre_check error: {}", visitor_name, e);
+                                    return;
+                                }
+                                Ok(Err(_)) => {
+                                    warn!(visitor_name = %visitor_name, "Visitor '{}': pre_check channel closed (control loop dropped)", visitor_name);
+                                    return;
+                                }
+                                Err(_elapsed) => {
+                                    // Timeout on pre_check: server may not support
+                                    // pre_check on control channel. Proceed with full
+                                    // request anyway (graceful degradation).
+                                    warn!(visitor_name = %visitor_name, "Visitor '{}': pre_check timed out after 15s, proceeding with full request", visitor_name);
+                                }
+                            }
+                        }
+
                         for attempt in 0..=max_retries {
                             if attempt > 0 {
                                 debug!(

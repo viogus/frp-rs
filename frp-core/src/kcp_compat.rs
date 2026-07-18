@@ -5,6 +5,12 @@
 //! 2. FEC — Reed-Solomon forward error correction over GF(2^8)
 //!
 //! This module provides equivalent encode/decode for Go↔Rust KCP compatibility.
+//!
+//! STATUS: Only `Fec` is wired into `KcpSession` (`kcp/session.rs`).
+//! `XorBlock` and `KcpCompatSession` (FEC+XOR combined) are implemented but
+//! not yet wired — `KcpConfig` (`kcp/config.rs`) has no `crypt` field.
+//! When a `crypt` key is added to `KcpConfig` and threaded through to
+//! `KcpSession::new()`, apply `XorBlock` per-packet in `update()`/`input()`.
 
 /// GF(2^8) finite field arithmetic.
 /// Operations use irreducible polynomial x^8 + x^4 + x^3 + x^2 + 1 (0x11D).
