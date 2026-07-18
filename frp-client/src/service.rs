@@ -853,30 +853,28 @@ impl Service {
                 let fallback_to = v.fallback_to.clone();
                 let vtx = self.visitor_tx.clone();
                 let handle = tokio::spawn(async move {
-                    crate::visitor::run_visitor_listener(
-                        crate::visitor::VisitorListenerConfig {
-                            server_addr: sa,
-                            server_port: sp,
-                            protocol: pt,
-                            server_name,
-                            secret_key,
-                            bind_addr,
-                            use_encryption: use_enc,
-                            use_compression: use_comp,
-                            name,
-                            tls_enable,
-                            tls_server_name,
-                            tls_ca_file,
-                            visitor_type,
-                            fallback_timeout_ms,
-                            keep_tunnel_open,
-                            max_retries_an_hour,
-                            min_retry_interval,
-                            stun_server,
-                            visitor_tx: vtx,
-                            fallback_to,
-                        },
-                    )
+                    crate::visitor::run_visitor_listener(crate::visitor::VisitorListenerConfig {
+                        server_addr: sa,
+                        server_port: sp,
+                        protocol: pt,
+                        server_name,
+                        secret_key,
+                        bind_addr,
+                        use_encryption: use_enc,
+                        use_compression: use_comp,
+                        name,
+                        tls_enable,
+                        tls_server_name,
+                        tls_ca_file,
+                        visitor_type,
+                        fallback_timeout_ms,
+                        keep_tunnel_open,
+                        max_retries_an_hour,
+                        min_retry_interval,
+                        stun_server,
+                        visitor_tx: vtx,
+                        fallback_to,
+                    })
                     .await;
                 });
                 visitor_handles.push(handle);

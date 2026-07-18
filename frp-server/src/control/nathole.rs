@@ -644,8 +644,8 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
             let v_read_timeout = timeout_ms - v_behavior.send_delay_ms;
             let c_read_timeout = timeout_ms - c_behavior.send_delay_ms;
 
-            let v_resp = nathole_ctrl::build_nat_hole_response(
-                nathole_ctrl::NatHoleResponseParams {
+            let v_resp =
+                nathole_ctrl::build_nat_hole_response(nathole_ctrl::NatHoleResponseParams {
                     transaction_id: tid.clone(),
                     sid: tid.clone(),
                     protocol: visitor_msg.protocol.clone(),
@@ -655,8 +655,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                     behavior: v_behavior,
                     read_timeout_ms: v_read_timeout,
                     ports_difference: cf.ports_difference,
-                },
-            );
+                });
             // Use visitor's protocol in c_resp so the provider
             // knows which transport to use (Go frp compat:
             // provider reads NatHoleResp.protocol to decide
@@ -666,8 +665,8 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                 .protocol
                 .clone()
                 .or_else(|| client_msg.protocol.clone());
-            let c_resp = nathole_ctrl::build_nat_hole_response(
-                nathole_ctrl::NatHoleResponseParams {
+            let c_resp =
+                nathole_ctrl::build_nat_hole_response(nathole_ctrl::NatHoleResponseParams {
                     transaction_id: client_msg.transaction_id.clone(),
                     sid: tid.clone(),
                     protocol: protocol_for_provider,
@@ -677,8 +676,7 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                     behavior: c_behavior,
                     read_timeout_ms: c_read_timeout,
                     ports_difference: vf.ports_difference,
-                },
-            );
+                });
             (v_resp, Some(c_resp))
         } else {
             analysis_index = None;
