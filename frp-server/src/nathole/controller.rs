@@ -427,20 +427,33 @@ pub fn gen_analysis_key(c: &NatFeature, v: &NatFeature) -> String {
     )
 }
 
+/// Parameters for building a NatHoleResp message.
+pub struct NatHoleResponseParams {
+    pub transaction_id: String,
+    pub sid: String,
+    pub protocol: Option<String>,
+    pub mode: i32,
+    pub candidate_addrs: Vec<String>,
+    pub assisted_addrs: Vec<String>,
+    pub behavior: RecommendBehavior,
+    pub read_timeout_ms: i32,
+    pub ports_difference: i32,
+}
+
 /// Build a NatHoleResp with detect_behavior filled in.
 /// Go frp v0.69.1 compat: newNatHoleResponse in controller.go
-#[allow(clippy::too_many_arguments)]
-pub fn build_nat_hole_response(
-    transaction_id: &str,
-    sid: &str,
-    protocol: Option<String>,
-    mode: i32,
-    candidate_addrs: Vec<String>,
-    assisted_addrs: Vec<String>,
-    behavior: RecommendBehavior,
-    read_timeout_ms: i32,
-    ports_difference: i32,
-) -> msg::NatHoleResp {
+pub fn build_nat_hole_response(params: NatHoleResponseParams) -> msg::NatHoleResp {
+    let NatHoleResponseParams {
+        transaction_id,
+        sid,
+        protocol,
+        mode,
+        candidate_addrs,
+        assisted_addrs,
+        behavior,
+        read_timeout_ms,
+        ports_difference,
+    } = params;
     let compact_candidates: Vec<String> = {
         let mut seen = std::collections::HashSet::new();
         candidate_addrs
@@ -481,9 +494,9 @@ pub fn build_nat_hole_response(
     };
 
     msg::NatHoleResp {
-        transaction_id: transaction_id.to_string(),
+        transaction_id,
         error: None,
-        sid: Some(sid.to_string()),
+        sid: Some(sid),
         protocol,
         candidate_addrs: if compact_candidates.is_empty() {
             None

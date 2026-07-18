@@ -685,17 +685,17 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                             let use_enc = swc.use_encryption.unwrap_or(info.use_encryption);
                             let use_comp = swc.use_compression.unwrap_or(info.use_compression);
                             let enc = if use_enc { Some(&enc_key) } else { None };
-                            proxy::bridge_streams(
+                            proxy::bridge_streams(proxy::BridgeStreamsParams {
                                 local,
                                 work,
-                                proxy_name,
-                                use_enc,
-                                use_comp,
-                                enc,
-                                info.bandwidth_limit,
-                                &info.bandwidth_limit_mode,
-                                proxy_metrics,
-                            )
+                                name: proxy_name,
+                                use_encryption: use_enc,
+                                use_compression: use_comp,
+                                enc_key: enc,
+                                bandwidth_limit: info.bandwidth_limit,
+                                bandwidth_limit_mode: &info.bandwidth_limit_mode,
+                                metrics: proxy_metrics,
+                            })
                             .await;
                         }
                         Err(e) => {

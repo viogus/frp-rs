@@ -7,6 +7,20 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+/// Configuration for a health check task.
+pub(crate) struct HealthCheckConfig {
+    pub proxy_name: String,
+    pub local_addr: String,
+    pub check_type: String,
+    pub check_url: String,
+    pub hc_headers: HashMap<String, String>,
+    pub interval: Duration,
+    pub timeout: Duration,
+    pub max_failed: u32,
+    pub health_tx: mpsc::Sender<String>,
+    pub cancel: Arc<AtomicBool>,
+}
+
 /// Run a health check for a proxy.
 /// Supports "tcp" (connect only) and "http" (GET + check 2xx status).
 /// When the local service exceeds max_failed consecutive failures, sends
@@ -14,19 +28,19 @@ use tracing::{debug, info, warn};
 /// to the server.
 /// The `cancel` flag is set externally when the proxy is closed; the task
 /// checks it before each health check interval and exits when true.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_health_check(
-    proxy_name: String,
-    local_addr: String,
-    check_type: String,
-    check_url: String,
-    hc_headers: HashMap<String, String>,
-    interval: Duration,
-    timeout: Duration,
-    max_failed: u32,
-    health_tx: mpsc::Sender<String>,
-    cancel: Arc<AtomicBool>,
-) {
+pub(crate) async fn run_health_check(config: HealthCheckConfig) {
+    let HealthCheckConfig {
+        proxy_name,
+        local_addr,
+        check_type,
+        check_url,
+        hc_headers,
+        interval,
+        timeout,
+        max_failed,
+        health_tx,
+        cancel,
+    } = config;
     info!(check_type = %check_type, proxy_name = %proxy_name, local_addr = %local_addr, interval = ?interval, timeout = ?timeout, "Health check ({}) started for '{}' -> {} (interval: {:?}, timeout: {:?})",
         check_type, proxy_name, local_addr, interval, timeout);
 

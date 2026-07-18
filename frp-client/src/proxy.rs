@@ -132,22 +132,36 @@ pub async fn connect_local(addr: &str) -> Result<TcpStream, frp_core::Error> {
 }
 
 /// Bridge data between two streams with optional encryption, compression,
+/// Parameters for `bridge_streams`.
+pub struct BridgeStreamsParams<'a> {
+    pub local: tokio::net::TcpStream,
+    pub work: IoStream,
+    pub name: &'a str,
+    pub use_encryption: bool,
+    pub use_compression: bool,
+    pub enc_key: Option<&'a [u8; 16]>,
+    pub bandwidth_limit: u64,
+    pub bandwidth_limit_mode: &'a str,
+    pub metrics: Arc<ProxyMetricsRegistry>,
+}
+
+/// Bridge user↔work connections with optional encryption, compression,
 /// and bandwidth limiting.
 ///
 /// `bandwidth_limit` is in bytes/sec (0 = unlimited).
 /// `bandwidth_limit_mode` is "client" (upload), "server" (download), or "both".
-#[allow(clippy::too_many_arguments)]
-pub async fn bridge_streams(
-    local: tokio::net::TcpStream,
-    work: IoStream,
-    name: &str,
-    use_encryption: bool,
-    use_compression: bool,
-    enc_key: Option<&[u8; 16]>,
-    bandwidth_limit: u64,
-    bandwidth_limit_mode: &str,
-    metrics: Arc<ProxyMetricsRegistry>,
-) {
+pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
+    let BridgeStreamsParams {
+        local,
+        work,
+        name,
+        use_encryption,
+        use_compression,
+        enc_key,
+        bandwidth_limit,
+        bandwidth_limit_mode,
+        metrics,
+    } = params;
     debug!(name = %name, encrypted = %use_encryption, compressed = %use_compression, bw_limit = %bandwidth_limit, bw_mode = %bandwidth_limit_mode,
         "Bridging streams for proxy: {} (encrypted: {}, compressed: {}, bw_limit: {} {})",
         name, use_encryption, use_compression, bandwidth_limit, bandwidth_limit_mode);

@@ -14,6 +14,21 @@ cargo run --bin frpc -- -c frpc.toml
 RUST_LOG=debug cargo run --bin frps -- -c frps.toml  # Enable debug logging
 ```
 
+### Integration Tests Without Building
+
+Integration tests (`frp-server/tests/`) need an `frps` binary. Without `cargo build`, use a pre-built release:
+
+```bash
+bash scripts/download-frp-rs.sh         # Download latest release to workspace root
+cargo test --workspace --all-features    # Tests find ../frps and ../frpc
+```
+
+Or set `FRPS_BIN`/`FRPC_BIN` env vars to point at any pre-built binary:
+
+```bash
+FRPS_BIN=/path/to/frps FRPC_BIN=/path/to/frpc cargo test --workspace --all-features
+```
+
 ### Binary Variants
 
 Three size tiers via feature flags:

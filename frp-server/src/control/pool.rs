@@ -51,7 +51,6 @@ pub(crate) struct PendingRequest {
 /// Assign `req` to a pooled work connection if one is available (pool hit),
 /// otherwise record a miss, send `ReqWorkConn`, and queue the request.
 /// Returns `Err(())` if the `ReqWorkConn` write failed — caller must break.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn assign_or_queue<W>(
     work_pool: &mut VecDeque<PoolEntry>,
     pending_requests: &mut VecDeque<PendingRequest>,
@@ -108,43 +107,47 @@ where
     Ok(())
 }
 
+/// Parameters for a NAT hole-punched StartWorkConn message.
+pub(crate) struct NatHoleWorkConnParams<'a> {
+    pub proxy_name: &'a str,
+    pub use_enc: bool,
+    pub use_comp: bool,
+    pub sk: Option<&'a str>,
+    pub sid: &'a str,
+    pub v2: bool,
+    pub context: &'a str,
+}
+
 /// Write StartWorkConn with embedded `nat_hole_sid` + a separate NatHoleSid
 /// frame for Go frpc compat. Go frp ignores unknown JSON fields, so the
 /// standalone frame is needed for XTCP notification recognition.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_start_work_conn_with_nat_hole_sid<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
-    proxy_name: &str,
-    use_enc: bool,
-    use_comp: bool,
-    sk: Option<&str>,
-    sid: &str,
-    v2: bool,
-    context: &str,
+    params: &NatHoleWorkConnParams<'_>,
 ) {
     let swc = FrpMessage::StartWorkConn(Box::new(msg::StartWorkConn {
-        proxy_name: proxy_name.to_string(),
+        proxy_name: params.proxy_name.to_string(),
         src_addr: None,
         src_port: None,
         dst_addr: None,
         dst_port: None,
         error: None,
-        use_encryption: if use_enc { Some(true) } else { None },
-        use_compression: if use_comp { Some(true) } else { None },
-        nat_hole_sid: Some(sid.to_string()),
+        use_encryption: if params.use_enc { Some(true) } else { None },
+        use_compression: if params.use_comp { Some(true) } else { None },
+        nat_hole_sid: Some(params.sid.to_string()),
         nat_hole_visitor_addr: None,
-        sk: sk.map(|s| s.to_string()),
+        sk: params.sk.map(|s| s.to_string()),
     }));
-    if let Err(e) = write_ctl_msg(writer, &swc, v2).await {
-        warn!(error = %e, "Failed to send StartWorkConn with NatHoleSid{}: {}", context, e);
+    if let Err(e) = write_ctl_msg(writer, &swc, params.v2).await {
+        warn!(error = %e, "Failed to send StartWorkConn with NatHoleSid{}: {}", params.context, e);
     } else {
-        debug!(sid = %sid, "Sent StartWorkConn with embedded NatHoleSid {} to provider{}", sid, context);
+        debug!(sid = %params.sid, "Sent StartWorkConn with embedded NatHoleSid {} to provider{}", params.sid, params.context);
         // Standalone NatHoleSid V1 frame for Go frpc compat.
         let nhs = FrpMessage::NatHoleSid(msg::NatHoleSid {
-            sid: Some(sid.to_string()),
+            sid: Some(params.sid.to_string()),
             provider_addr: None,
         });
-        if let Err(e) = write_ctl_msg(writer, &nhs, v2).await {
+        if let Err(e) = write_ctl_msg(writer, &nhs, params.v2).await {
             debug!(error = %e, "Failed to send separate NatHoleSid frame (non-fatal): {}", e);
         }
     }
@@ -187,13 +190,15 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
             .unwrap_or((false, false, None));
         write_start_work_conn_with_nat_hole_sid(
             &mut stream,
-            &proxy_name,
-            use_enc,
-            use_comp,
-            sk.as_deref(),
-            &sid,
-            ctx.v2,
-            " (pending)",
+            &NatHoleWorkConnParams {
+                proxy_name: &proxy_name,
+                use_enc,
+                use_comp,
+                sk: sk.as_deref(),
+                sid: &sid,
+                v2: ctx.v2,
+                context: " (pending)",
+            },
         )
         .await;
         // Work conn consumed for XTCP notification — drop it.

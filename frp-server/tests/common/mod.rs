@@ -201,17 +201,29 @@ impl FrpsHandle {
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
 
-        // Try to find the frps binary
-        let frps_bin = std::env::var("CARGO_BIN_EXE_frps").unwrap_or_else(|_| {
-            // Fallback: look in target directory.
-            // Tests run from the crate root (frp-server/), so target/ is one level up.
-            let profile = if cfg!(debug_assertions) {
-                "debug"
-            } else {
-                "release"
-            };
-            format!("../target/{}/frps", profile)
-        });
+        // Resolve frps binary. Order of precedence:
+        //   1. FRPS_BIN env var (pre-built release binary)
+        //   2. CARGO_BIN_EXE_frps (set by cargo when frps is a dependency)
+        //   3. ../frps in workspace root (downloaded release)
+        //   4. ../target/{profile}/frps (built from source)
+        let frps_bin = std::env::var("FRPS_BIN")
+            .or_else(|_| std::env::var("CARGO_BIN_EXE_frps"))
+            .or_else(|_| {
+                let local = "../frps";
+                if std::path::Path::new(local).exists() {
+                    Ok(local.to_string())
+                } else {
+                    Err(std::env::VarError::NotPresent)
+                }
+            })
+            .unwrap_or_else(|_| {
+                let profile = if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                };
+                format!("../target/{}/frps", profile)
+            });
 
         let child = Command::new(&frps_bin)
             .arg("-c")

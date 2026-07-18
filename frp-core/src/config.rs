@@ -1283,16 +1283,13 @@ fn load_config_from_file<C: serde::de::DeserializeOwned>(
     Ok(cfg)
 }
 
-#[allow(clippy::collapsible_match)]
 fn normalize_server_config(value: &mut toml::Value) {
     use toml::Value;
     if let Some(table) = value.as_table_mut() {
         // Handle [common] section: merge into top level
-        if let Some(common) = table.remove("common") {
-            if let Value::Table(common_table) = common {
-                for (k, v) in common_table {
-                    table.entry(k).or_insert(v);
-                }
+        if let Some(Value::Table(common_table)) = table.remove("common") {
+            for (k, v) in common_table {
+                table.entry(k).or_insert(v);
             }
         }
 

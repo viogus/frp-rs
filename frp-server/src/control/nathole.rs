@@ -40,28 +40,14 @@ pub(crate) async fn handle_write_sid<W: AsyncWriteExt + Unpin>(
 }
 
 /// Write NatHoleResp to the visitor via the control channel.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_write_resp<W: AsyncWriteExt + Unpin>(
     ctx: &ControlContext,
     _ctl: &mut ControlState,
     writer: &mut W,
-    transaction_id: String,
-    error: Option<String>,
-    sid: Option<String>,
-    protocol: Option<String>,
-    candidate_addrs: Option<Vec<String>>,
-    assisted_addrs: Option<Vec<String>>,
+    resp: msg::NatHoleResp,
 ) {
-    debug!(transaction_id = %transaction_id, "Writing NatHoleResp to visitor via control channel for {}", transaction_id);
-    let forward = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
-        transaction_id,
-        error,
-        sid,
-        protocol,
-        candidate_addrs,
-        assisted_addrs,
-        ..Default::default()
-    }));
+    debug!(transaction_id = %resp.transaction_id, "Writing NatHoleResp to visitor via control channel for {}", resp.transaction_id);
+    let forward = FrpMessage::NatHoleResp(Box::new(resp));
     if let Err(e) = write_ctl_msg(writer, &forward, ctx.v2).await {
         warn!(error = %e, "Failed to write NatHoleResp to visitor: {}", e);
     }
@@ -107,13 +93,15 @@ pub(crate) async fn handle_sid_on_work_conn<W: AsyncWriteExt + Unpin>(
             .unwrap_or((false, false, None));
         pool::write_start_work_conn_with_nat_hole_sid(
             &mut work_conn,
-            &proxy_name,
-            use_enc,
-            use_comp,
-            sk.as_deref(),
-            &sid,
-            ctx.v2,
-            " on work conn",
+            &pool::NatHoleWorkConnParams {
+                proxy_name: &proxy_name,
+                use_enc,
+                use_comp,
+                sk: sk.as_deref(),
+                sid: &sid,
+                v2: ctx.v2,
+                context: " on work conn",
+            },
         )
         .await;
         // Connection consumed — Go frp doesn't reuse after NatHoleSid.
@@ -656,17 +644,18 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
             let v_read_timeout = timeout_ms - v_behavior.send_delay_ms;
             let c_read_timeout = timeout_ms - c_behavior.send_delay_ms;
 
-            let v_resp = nathole_ctrl::build_nat_hole_response(
-                &tid,
-                &tid,
-                visitor_msg.protocol.clone(),
-                mode,
-                client_mapped.clone(),
-                client_assisted.clone(),
-                v_behavior,
-                v_read_timeout,
-                cf.ports_difference,
-            );
+            let v_resp =
+                nathole_ctrl::build_nat_hole_response(nathole_ctrl::NatHoleResponseParams {
+                    transaction_id: tid.clone(),
+                    sid: tid.clone(),
+                    protocol: visitor_msg.protocol.clone(),
+                    mode,
+                    candidate_addrs: client_mapped.clone(),
+                    assisted_addrs: client_assisted.clone(),
+                    behavior: v_behavior,
+                    read_timeout_ms: v_read_timeout,
+                    ports_difference: cf.ports_difference,
+                });
             // Use visitor's protocol in c_resp so the provider
             // knows which transport to use (Go frp compat:
             // provider reads NatHoleResp.protocol to decide
@@ -676,17 +665,18 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                 .protocol
                 .clone()
                 .or_else(|| client_msg.protocol.clone());
-            let c_resp = nathole_ctrl::build_nat_hole_response(
-                &client_msg.transaction_id,
-                &tid,
-                protocol_for_provider,
-                mode,
-                visitor_mapped.clone(),
-                visitor_assisted.clone(),
-                c_behavior,
-                c_read_timeout,
-                vf.ports_difference,
-            );
+            let c_resp =
+                nathole_ctrl::build_nat_hole_response(nathole_ctrl::NatHoleResponseParams {
+                    transaction_id: client_msg.transaction_id.clone(),
+                    sid: tid.clone(),
+                    protocol: protocol_for_provider,
+                    mode,
+                    candidate_addrs: visitor_mapped.clone(),
+                    assisted_addrs: visitor_assisted.clone(),
+                    behavior: c_behavior,
+                    read_timeout_ms: c_read_timeout,
+                    ports_difference: vf.ports_difference,
+                });
             (v_resp, Some(c_resp))
         } else {
             analysis_index = None;
