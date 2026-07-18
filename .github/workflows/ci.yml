@@ -36,6 +36,9 @@ jobs:
         run: cargo build --bin frps --bin frpc
       - name: Run tests
         run: cargo test --workspace
+        env:
+          FRPS_BIN: ${{ github.workspace }}/target/debug/frps
+          FRPC_BIN: ${{ github.workspace }}/target/debug/frpc
       - name: Check benchmarks compile
         run: cargo bench --workspace --no-run
       - name: Check tiny feature set compiles
