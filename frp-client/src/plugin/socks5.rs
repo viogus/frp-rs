@@ -209,7 +209,7 @@ async fn handle_socks5_conn(
 
 /// Pure parser: decode a SOCKS5 address (ATYP + addr + port) from bytes.
 /// Returns (host_string, port, bytes_consumed).
-#[allow(dead_code)]
+#[cfg(test)]
 fn parse_socks5_addr(buf: &[u8]) -> Result<(String, u16, usize), String> {
     if buf.is_empty() {
         return Err("empty buffer".into());

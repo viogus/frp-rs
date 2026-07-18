@@ -1,74 +1,9 @@
-use std::net::SocketAddr;
-use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
 use frp_core::msg::{self, FrpMessage};
 use frp_core::transport::{dial_server, DialOptions, TransportProtocol};
-
-/// Attempt TCP simultaneous open to `peer_addr`.
-///
-/// Binds a local port with SO_REUSEADDR (required for simultaneous open),
-/// then dials the peer. When both sides do this at roughly the same time,
-/// the kernel's TCP stack matches the SYN packets and establishes a P2P
-/// connection through most NAT types.
-///
-/// Returns the connected TcpStream on success, or an error on timeout (5s)
-/// or other failures.
-#[allow(dead_code)]
-pub(crate) async fn tcp_simultaneous_open(
-    peer_addr: &str,
-    timeout_ms: u64,
-) -> Result<TcpStream, String> {
-    let peer: SocketAddr = peer_addr
-        .parse()
-        .map_err(|e| format!("invalid peer address '{}': {}", peer_addr, e))?;
-
-    // Use socket family matching peer address (IPv4 or IPv6)
-    let local = if peer.is_ipv4() {
-        TcpSocket::new_v4().map_err(|e| format!("TcpSocket::new_v4: {}", e))?
-    } else {
-        TcpSocket::new_v6().map_err(|e| format!("TcpSocket::new_v6: {}", e))?
-    };
-
-    // SO_REUSEADDR is required for TCP simultaneous open:
-    // both sides bind to the same port they use to connect.
-    local
-        .set_reuseaddr(true)
-        .map_err(|e| format!("set_reuseaddr: {}", e))?;
-    #[cfg(unix)]
-    local.set_reuseport(true).ok();
-
-    // Bind to any available port
-    let wildcard: &str = if peer.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    local
-        .bind(wildcard.parse().unwrap())
-        .map_err(|e| format!("bind: {}", e))?;
-
-    debug!(peer = %peer, "TCP simultaneous open: bound to local, dialing {}", peer);
-
-    // Dial with configured timeout
-    match tokio::time::timeout(Duration::from_millis(timeout_ms), local.connect(peer)).await {
-        Ok(Ok(stream)) => {
-            debug!(peer = %peer, "TCP simultaneous open to {} succeeded", peer);
-            frp_core::transport::set_nodelay(&stream);
-            Ok(stream)
-        }
-        Ok(Err(e)) => {
-            debug!(peer = %peer, error = %e, "TCP simultaneous open to {} failed: {}", peer, e);
-            Err(format!("connect failed: {}", e))
-        }
-        Err(_) => {
-            debug!(peer = %peer, timeout_ms = %timeout_ms, "TCP simultaneous open to {} timed out after {}ms", peer, timeout_ms);
-            Err("hole punch timeout".into())
-        }
-    }
-}
 
 /// Run an STCP/XTCP visitor listener.
 /// Binds a local port, accepts connections, and tunnels them

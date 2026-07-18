@@ -940,10 +940,13 @@ pub enum ReadHalf {
 }
 
 impl ReadHalf {
-    /// Convert back to boxed trait object for cold-path callers (auth, NAT
-    /// hole session storage) that need `Box<dyn AsyncRead + Unpin + Send>`.
-    pub fn into_boxed(self) -> Box<dyn tokio::io::AsyncRead + Unpin + Send> {
-        match self {
+    // NOTE: into_boxed() removed after PR #161. Use `From` impl below for
+    // cold-path conversions (NAT hole session storage, auth).
+}
+
+impl From<ReadHalf> for Box<dyn tokio::io::AsyncRead + Unpin + Send> {
+    fn from(r: ReadHalf) -> Self {
+        match r {
             ReadHalf::Tcp(r) => Box::new(r),
             #[cfg(feature = "tls")]
             ReadHalf::Tls(r) => Box::new(r),
@@ -979,10 +982,13 @@ pub enum WriteHalf {
 }
 
 impl WriteHalf {
-    /// Convert back to boxed trait object for cold-path callers (auth, NAT
-    /// hole session storage) that need `Box<dyn AsyncWrite + Unpin + Send>`.
-    pub fn into_boxed(self) -> Box<dyn tokio::io::AsyncWrite + Unpin + Send> {
-        match self {
+    // NOTE: into_boxed() removed after PR #161. Use `From` impl below for
+    // cold-path conversions (NAT hole session storage).
+}
+
+impl From<WriteHalf> for Box<dyn tokio::io::AsyncWrite + Unpin + Send> {
+    fn from(w: WriteHalf) -> Self {
+        match w {
             WriteHalf::Tcp(w) => Box::new(w),
             #[cfg(feature = "tls")]
             WriteHalf::Tls(w) => Box::new(w),

@@ -154,6 +154,9 @@ impl YamuxSession {
 }
 
 struct OpenRequest {
+    /// Sender for the opened stream. When `tcp-mux` is disabled, this field is
+    /// never read from the receiving side — but it must exist so that dropping
+    /// `OpenRequest` cancels the waiting receiver.
     #[allow(dead_code)]
     reply: oneshot::Sender<Option<YamuxStream>>,
 }
