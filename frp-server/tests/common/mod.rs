@@ -245,8 +245,17 @@ impl FrpsHandle {
                 .await
                 .expect("frps dashboard_port not ready");
         }
-        // Extra time for dashboard routes to register
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Poll /healthz until the dashboard HTTP server is actually serving
+        // requests (not just accepting TCP connections). Without this, CI
+        // can hit IncompleteMessage when axum hasn't started processing yet.
+        if dashboard_port > 0 {
+            wait_http_ok(
+                &format!("http://127.0.0.1:{}/healthz", dashboard_port),
+                Duration::from_secs(15),
+            )
+            .await
+            .expect("frps dashboard not healthy");
+        }
 
         Self {
             child,
@@ -283,4 +292,32 @@ pub async fn wait_tcp_port(port: u16, timeout: Duration) -> Result<(), String> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(format!("port {} not ready after {:?}", port, timeout))
+}
+
+/// Poll a URL until it returns HTTP 200 OK (or timeout).
+/// Ensures the HTTP server is actually processing requests, not just
+/// accepting TCP connections. Uses a throwaway client to avoid pool
+/// interference with test clients.
+#[allow(dead_code)]
+pub async fn wait_http_ok(url: &str, timeout: Duration) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|e| format!("failed to build health-check client: {e}"))?;
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        match client.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(()),
+            Ok(resp) => {
+                // Server is up but returning an error status — wait for it
+                // to become healthy (e.g. readiness probe during startup).
+                let _ = resp.bytes().await;
+            }
+            Err(_) => {
+                // Server not ready yet (connection refused, incomplete, etc.)
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(format!("{url} not healthy after {timeout:?}"))
 }
