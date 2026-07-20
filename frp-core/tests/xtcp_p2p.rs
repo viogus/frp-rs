@@ -194,15 +194,17 @@ fn test_conv_from_sid_deterministic() {
     assert!(c1 > 0, "conv should be non-zero");
 }
 
-/// Verify different SIDs produce different convs (or at least the function
-/// doesn't panic for common inputs).
+/// conv_from_sid always returns 1 (Go kcp-go compat). All inputs must
+/// produce a non-zero conv.
 #[test]
 fn test_conv_from_sid_different() {
     let c1 = xtcp_p2p::conv_from_sid("session-a");
     let c2 = xtcp_p2p::conv_from_sid("session-b");
-    // Different inputs may collide (hash), but both must be non-zero.
     assert!(c1 > 0);
     assert!(c2 > 0);
+    // Both are 1 (Go kcp-go compat): each XtcpP2pStream has its own UDP
+    // socket, so conv collisions across sessions are harmless.
+    assert_eq!(c1, c2);
 }
 
 /// Yamux-over-XTCP-P2P roundtrip: hole-punch, create yamux connections,

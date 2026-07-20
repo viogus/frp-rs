@@ -59,16 +59,21 @@ pub const DEFAULT_HOLE_PUNCH_TIMEOUT_MS: u64 = 5000;
 ///
 /// The NAT hole-punch session ID (`sid`) is known to both visitor (via
 /// `NatHoleResp.sid`) and provider (via `XtcpNotification` / `NatHoleResp`).
-pub fn conv_from_sid(sid: &str) -> u32 {
-    // Use MD5 for deterministic cross-process hashing.
-    // DefaultHasher (SipHash) uses a per-process random key — two processes
-    // hashing the same sid get different values, causing KCP conv mismatch
-    // and "conv inconsistent" errors on P2P hole-punched connections.
-    use md5::{Digest, Md5};
-    let digest = Md5::digest(sid.as_bytes());
-    let mut buf = [0u8; 4];
-    buf.copy_from_slice(&digest[..4]);
-    (u32::from_be_bytes(buf)).max(1)
+pub fn conv_from_sid(_sid: &str) -> u32 {
+    // Go frp v0.70 uses kcp-go's auto-assigned conv (global atomic counter
+    // starting from 0, with atomic.AddUint32 returning 1 on first call).
+    // The XTCP P2P KCP session is the first (and only) KCP session created
+    // by Go frp for P2P, so it always gets conv=1.
+    //
+    // Hard-coding conv=1 on the Rust side ensures KCP conv matches Go's
+    // without fragile conv learning (input_conv). Each XtcpP2pStream has
+    // its own UDP socket, so conv collisions are harmless for multiplexed
+    // P2P sessions.
+    //
+    // Previously used MD5(sid) for deterministic cross-process conv, but
+    // this diverges from Go's auto-assigned conv and requires input_conv
+    // which is vulnerable to stray KCP packets on shared-VPS CI.
+    1u32
 }
 
 // ---------------------------------------------------------------------------
