@@ -421,28 +421,34 @@ async fn test_xtcp_multiple_providers_same_server() {
         .expect("send NatHoleClient A");
 
     // --- Provider A reads NatHoleResp ---
-    match read_msg_v1(&mut provider_a_ctl)
-        .await
-        .expect("read provider A NatHoleResp")
-    {
-        FrpMessage::NatHoleResp(resp) => {
-            assert!(
-                resp.error.is_none(),
-                "provider A NatHoleResp error: {:?}",
-                resp.error
-            );
-            assert_eq!(resp.sid.as_deref(), Some(sid.as_str()));
-            if let Some(ref candidates) = resp.candidate_addrs {
+    // Drain any pool-replenish ReqWorkConn messages that the server
+    // sends on the control channel after consuming a work connection.
+    loop {
+        match read_msg_v1(&mut provider_a_ctl)
+            .await
+            .expect("read provider A control")
+        {
+            FrpMessage::ReqWorkConn(_) => continue,
+            FrpMessage::NatHoleResp(resp) => {
                 assert!(
-                    candidates.iter().any(|a| a.contains("1.2.3.4")),
-                    "provider A's candidate_addrs should contain visitor addresses"
+                    resp.error.is_none(),
+                    "provider A NatHoleResp error: {:?}",
+                    resp.error
                 );
+                assert_eq!(resp.sid.as_deref(), Some(sid.as_str()));
+                if let Some(ref candidates) = resp.candidate_addrs {
+                    assert!(
+                        candidates.iter().any(|a| a.contains("1.2.3.4")),
+                        "provider A's candidate_addrs should contain visitor addresses"
+                    );
+                }
+                break;
             }
+            other => panic!(
+                "expected NatHoleResp on provider A control, got: {:?}",
+                other.v1_type_byte()
+            ),
         }
-        other => panic!(
-            "expected NatHoleResp on provider A control, got: {:?}",
-            other.v1_type_byte()
-        ),
     }
 
     // --- Visitor reads NatHoleResp for proxy A ---
