@@ -788,6 +788,44 @@ pub async fn xtcp_p2p_connect_yamux(
     let bg_conn = conn.clone();
     let (stream_tx, stream_rx) = tokio::sync::oneshot::channel::<Result<yamux::Stream, String>>();
 
+    // Helper: poll yamux once and forward any inbound stream or error
+    // to the caller via stream_tx. Returns true if the driver should
+    // exit (error, EOF, or caller dropped).
+    fn handle_poll_result(
+        r: Option<Result<yamux::Stream, yamux::ConnectionError>>,
+        stream_tx: &mut Option<
+            tokio::sync::oneshot::Sender<Result<yamux::Stream, String>>,
+        >,
+    ) -> bool {
+        match r {
+            Some(Ok(stream)) => {
+                if let Some(tx) = stream_tx.take() {
+                    if tx.send(Ok(stream)).is_err() {
+                        tracing::debug!("yamux P2P: caller dropped, exiting");
+                        return true;
+                    }
+                } else {
+                    tracing::debug!("yamux P2P: unexpected inbound stream, ignoring");
+                }
+            }
+            Some(Err(e)) => {
+                if let Some(tx) = stream_tx.take() {
+                    let _ = tx.send(Err(format!("yamux: {e}")));
+                }
+                tracing::debug!("yamux P2P: connection error, exiting");
+                return true;
+            }
+            None => {
+                if let Some(tx) = stream_tx.take() {
+                    let _ = tx.send(Err("yamux: connection closed before stream".into()));
+                }
+                tracing::debug!("yamux P2P: connection closed, exiting");
+                return true;
+            }
+        }
+        false
+    }
+
     tokio::spawn(async move {
         let keepalive = Duration::from_millis(tick_ms);
         let mut stream_tx = Some(stream_tx);
@@ -800,59 +838,36 @@ pub async fn xtcp_p2p_connect_yamux(
                 _ = write_notify.notified() => {
                     // Write activity — drive yamux to flush pending frames
                     // and tick KCP without waiting for the next sleep.
-                    let _ = poll_fn(|cx| {
+                    // MUST forward any accepted stream — yamux may need
+                    // multiple poll_next_inbound calls to return a stream
+                    // (first processes SYN, second creates the stream).
+                    // Discarding the result causes the 10 s caller timeout.
+                    let r = poll_fn(|cx| {
                         let mut c = bg_conn.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = c.poll_next_inbound(cx);
-                        std::task::Poll::Ready(())
+                        c.poll_next_inbound(cx)
                     }).await;
+                    if handle_poll_result(r, &mut stream_tx) {
+                        break;
+                    }
                 }
                 result = poll_fn(|cx| {
                     let mut c = bg_conn.lock().unwrap_or_else(|e| e.into_inner());
-                    // Double-poll: first poll processes stream commands
-                    // into pending_frames; second poll sends them on wire.
-                    match c.poll_next_inbound(cx) {
-                        Poll::Ready(r) => Poll::Ready(r),
-                        Poll::Pending => Poll::Pending,
-                    }
+                    c.poll_next_inbound(cx)
                 }) => {
-                    match result {
-                        Some(Ok(stream)) => {
-                            if let Some(tx) = stream_tx.take() {
-                                // Send first accepted stream back to connect function.
-                                // If receiver is gone, connection closed — exit.
-                                if tx.send(Ok(stream)).is_err() {
-                                    tracing::debug!("yamux P2P: caller dropped, exiting");
-                                    break;
-                                }
-                            } else {
-                                tracing::debug!("yamux P2P: unexpected inbound stream, ignoring");
-                            }
-                        }
-                        Some(Err(e)) => {
-                            // If the caller hasn't received a stream yet, send the
-                            // error so it doesn't wait for the full timeout.
-                            if let Some(tx) = stream_tx.take() {
-                                let _ = tx.send(Err(format!("yamux: {e}")));
-                            }
-                            tracing::debug!("yamux P2P: connection error, exiting");
-                            break;
-                        }
-                        None => {
-                            if let Some(tx) = stream_tx.take() {
-                                let _ = tx.send(Err("yamux: connection closed before stream".into()));
-                            }
-                            tracing::debug!("yamux P2P: connection closed, exiting");
-                            break;
-                        }
+                    if handle_poll_result(result, &mut stream_tx) {
+                        break;
                     }
                 }
                 _ = tokio::time::sleep(keepalive) => {
-                    // Periodic KCP tick for retransmission timing.
-                    let _ = poll_fn(|cx| {
+                    // Periodic KCP tick — same as write_notify: stream
+                    // accepted here must be forwarded, not dropped.
+                    let r = poll_fn(|cx| {
                         let mut c = bg_conn.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = c.poll_next_inbound(cx);
-                        std::task::Poll::Ready(())
+                        c.poll_next_inbound(cx)
                     }).await;
+                    if handle_poll_result(r, &mut stream_tx) {
+                        break;
+                    }
                 }
             }
         }
