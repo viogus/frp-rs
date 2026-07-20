@@ -84,6 +84,9 @@ pub fn init_tracing_otel(
     } else {
         (None, None)
     };
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    // Layer order (innermost → outermost): Registry ← OTel Layer ← EnvFilter ← Fmt Layer
+    // OpenTelemetryLayer requires direct Registry, so it must be applied first.
     if let Some(path) = file {
         let fa = tracing_appender::rolling::daily(
             Path::new(&path).parent().unwrap_or(Path::new(".")),
@@ -91,15 +94,15 @@ pub fn init_tracing_otel(
                 .file_name()
                 .unwrap_or(std::ffi::OsStr::new(default_log_name)),
         );
-        let reg = tracing_subscriber::registry()
-            .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level)));
-        if let Some(layer) = otel_layer {
+        let reg = tracing_subscriber::registry();
+        if let Some(ref layer) = otel_layer {
             if let Some(p) = _provider {
                 let _ = Box::leak(Box::new(p));
             }
         }
-        if otel_layer.is_some() {
-            reg.with(otel_layer.unwrap())
+        if let Some(layer) = otel_layer {
+            reg.with(layer)
+                .with(filter)
                 .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                 .with(
                     tracing_subscriber::fmt::layer()
@@ -108,7 +111,8 @@ pub fn init_tracing_otel(
                 )
                 .init();
         } else {
-            reg.with(tracing_subscriber::fmt::layer().with_ansi(ansi))
+            reg.with(filter)
+                .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                 .with(
                     tracing_subscriber::fmt::layer()
                         .with_ansi(false)
@@ -117,19 +121,20 @@ pub fn init_tracing_otel(
                 .init();
         }
     } else {
-        let reg = tracing_subscriber::registry()
-            .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level)));
-        if let Some(layer) = otel_layer {
+        let reg = tracing_subscriber::registry();
+        if let Some(ref layer) = otel_layer {
             if let Some(p) = _provider {
                 let _ = Box::leak(Box::new(p));
             }
         }
-        if otel_layer.is_some() {
-            reg.with(otel_layer.unwrap())
+        if let Some(layer) = otel_layer {
+            reg.with(layer)
+                .with(filter)
                 .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                 .init();
         } else {
-            reg.with(tracing_subscriber::fmt::layer().with_ansi(ansi))
+            reg.with(filter)
+                .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                 .init();
         }
     }
