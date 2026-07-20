@@ -192,13 +192,15 @@ pub async fn punch_udp_hole(
         return Err("no valid candidate addresses".into());
     }
 
-    // --- Send phase: always send "frp" magic (Rust↔Rust compat) ---
-    for peer in &peers {
-        let _ = socket.send_to(HOLE_PUNCH_MAGIC, *peer).await;
-    }
-
-    // --- Send phase: Go-compat NatHoleSid ---
-    if let (Some(sid_str), Some(enc_key)) = (sid, key) {
+    // --- Send phase: Go-compat NatHoleSid (only when key+sid present) ---
+    // Go frp v0.70 sends only encrypted NatHoleSid probes; it does NOT
+    // understand "frp" magic. Sending "frp" (3 bytes) to a Go peer causes
+    // "decode sid message error: ciphertext too short" because Go tries
+    // crypto.Decode on the 3-byte magic (< 16-byte AES IV).
+    let go_compat = sid.is_some() && key.is_some();
+    if go_compat {
+        let sid_str = sid.unwrap();
+        let enc_key = key.unwrap();
         let detect_msg = NatHoleDetectSid::new(sid_str, false);
         let encoded = match encode_detect_msg(&detect_msg, enc_key) {
             Ok(e) => e,
@@ -209,6 +211,11 @@ pub async fn punch_udp_hole(
         };
         for peer in &peers {
             let _ = socket.send_to(&encoded, *peer).await;
+        }
+    } else {
+        // Simple "frp" magic (Rust↔Rust with no encryption key).
+        for peer in &peers {
+            let _ = socket.send_to(HOLE_PUNCH_MAGIC, *peer).await;
         }
     }
 
@@ -250,14 +257,20 @@ pub async fn punch_udp_hole(
                             return Ok(peer);
                         }
                         // Got response:false probe → echo back (Go receiver role).
+                        // Go frp v0.70 receiver returns raddr immediately after
+                        // echoing; it does NOT wait for a response:true from the
+                        // sender (the sender never sends response:true — it only
+                        // waits for an echo). If we enter recv_second_attempt,
+                        // we deadlock waiting for a message that never comes.
                         let mut echo = msg;
                         echo.response = true;
                         if let Ok(encoded) = encode_detect_msg(&echo, enc_key) {
                             let _ = socket.send_to(&encoded, peer).await;
                             tracing::debug!(peer = %peer, "XTCP P2P: echoed NatHoleSid response to {}", peer);
                         }
-                        // Continue waiting for response:true.
-                        return recv_second_attempt(socket, timeout_ms, sid, key, &peers).await;
+                        // Hole punch complete after echoing the probe.
+                        // The sender will receive our echo and proceed.
+                        return Ok(peer);
                     }
                     Err(_) => {
                         // Not NatHoleSid either — unknown data.
@@ -307,13 +320,17 @@ async fn recv_second_attempt(
                     if msg.sid == sid_str && msg.response {
                         return Ok(peer);
                     }
-                    // Echo response:false probes.
+                    // Echo response:false probe → return immediately.
+                    // Same as Go receiver: after echoing, the hole punch is
+                    // complete. Don't wait for response:true — the sender side
+                    // never sends one (it's waiting for our echo).
                     if msg.sid == sid_str && !msg.response {
                         let mut echo = msg;
                         echo.response = true;
                         if let Ok(encoded) = encode_detect_msg(&echo, enc_key) {
                             let _ = socket.send_to(&encoded, peer).await;
                         }
+                        return Ok(peer);
                     }
                 }
             }
@@ -445,6 +462,14 @@ impl XtcpP2pStream {
             match self.socket.try_recv_from(&mut buf) {
                 Ok((n, src)) => {
                     if src == self.peer_addr {
+                        // Skip hole-punch magic ("frp") that may arrive
+                        // after hole punch completes (stray packets still
+                        // in-flight). KCP's input() rejects packets < 24
+                        // bytes (header size); 3-byte "frp" causes an
+                        // error that kills the KCP session → yamux timeout.
+                        if &buf[..n] == HOLE_PUNCH_MAGIC {
+                            continue;
+                        }
                         self.session.input(&buf[..n])?;
                     } else {
                         // Drop packets from unexpected sources after
