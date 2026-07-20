@@ -298,7 +298,7 @@ pub(crate) async fn handle_nat_hole_report(
             if let Some(mut accept_writer) = ctx.state.xtcp.nat_hole.take_writer(sid).await {
                 let forward = FrpMessage::NatHoleReport(msg::NatHoleReport {
                     sid: Some(sid.clone()),
-                    success: None,
+                    success: report_msg.success,
                 });
                 let _ = write_ctl_msg(&mut accept_writer, &forward, ctx.v2).await;
             }
