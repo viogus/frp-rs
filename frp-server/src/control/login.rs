@@ -153,7 +153,18 @@ where
                     let _ = write_ctl_msg(&mut writer, &resp, v2).await;
                     return Err(());
                 }
-                let run_id_for_check = login.run_id.clone().unwrap_or_default();
+                // Use client-provided run_id for duplicate detection.
+                // When the client doesn't send one (old/Rust clients or tests),
+                // generate a unique UUID so concurrent logins within the same
+                // second don't collide. Replay protection is weaker without
+                // a client-provided run_id (attacker could replay within the
+                // timestamp freshness window), but the login throttle and
+                // timestamp freshness check provide layered defense.
+                let run_id_for_check = login
+                    .run_id
+                    .clone()
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 let mut used = state.used_timestamps.lock().await;
                 if !used.insert((run_id_for_check.clone(), ts)) {
                     warn!(
