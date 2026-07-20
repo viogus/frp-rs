@@ -528,6 +528,7 @@ async fn test_xtcp_multiple_providers_same_server() {
     // --- Send NatHoleReport for cleanup ---
     let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
         sid: Some(sid.clone()),
+        success: None,
     });
     write_msg_v1(&mut provider_a_ctl, &report)
         .await

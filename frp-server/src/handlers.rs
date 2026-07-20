@@ -269,9 +269,29 @@ pub(crate) async fn handle_nat_hole_visitor(
 
     // --- Go frp v0.69.1 compat: pre_check validates proxy and permissions
     // without creating a session. Visitor proceeds to STUN after receiving OK.
-    // Check mapped_addrs.is_none() to distinguish from clients that send
-    // pre_check=true with full data (treating it as a full request).
-    if msg.pre_check && msg.mapped_addrs.is_none() {
+    // Go frp controller.go: checks proxy exists + user in allow_users
+    // (fresh-TCP path uses visitorUser="", so only "*" wildcard passes).
+    if msg.pre_check {
+        // Validate allow_users: on fresh TCP, visitorUser is not known.
+        // Only allow if allow_users is unrestricted (empty or "*" wildcard).
+        let allowed =
+            proxy_info.allow_users.is_empty() || proxy_info.allow_users.iter().any(|u| u == "*");
+        if !allowed {
+            debug!(
+                proxy_name = %proxy_name,
+                allow_users = ?proxy_info.allow_users,
+                "NatHoleVisitor pre_check for proxy '{}': denied (allow_users restricts access, use '*' wildcard for fresh-TCP pre_check)",
+                proxy_name
+            );
+            let (_, mut writer) = stream.into_split().unwrap();
+            let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
+                transaction_id: transaction_id.clone(),
+                error: Some("access denied: restricted to authenticated users".into()),
+                ..Default::default()
+            }));
+            let _ = write_msg(&mut writer, &resp, v2).await;
+            return;
+        }
         debug!(
             proxy_name = %proxy_name,
             "NatHoleVisitor pre_check for proxy '{}': OK",

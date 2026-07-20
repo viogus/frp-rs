@@ -504,18 +504,29 @@ pub struct NatHoleResp {
     pub detect_behavior: Option<NatHoleDetectBehavior>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NatHoleSid {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_addr: Option<String>,
+/// Serde helper: skip serializing `false` bool values (match Go omitempty).
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NatHoleSid {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub response: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NatHoleReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
 }
 
 // ---------------------------------------------------------------
@@ -814,11 +825,8 @@ impl FrpMessage {
                 Some(FrpMessage::NatHoleClient(Box::<NatHoleClient>::default()))
             }
             TYPE_NAT_HOLE_RESP => Some(FrpMessage::NatHoleResp(Box::<NatHoleResp>::default())),
-            TYPE_NAT_HOLE_SID => Some(FrpMessage::NatHoleSid(NatHoleSid {
-                sid: None,
-                provider_addr: None,
-            })),
-            TYPE_NAT_HOLE_REPORT => Some(FrpMessage::NatHoleReport(NatHoleReport { sid: None })),
+            TYPE_NAT_HOLE_SID => Some(FrpMessage::NatHoleSid(NatHoleSid::default())),
+            TYPE_NAT_HOLE_REPORT => Some(FrpMessage::NatHoleReport(NatHoleReport::default())),
             TYPE_CLOSE_PROXY_RESP => Some(FrpMessage::CloseProxyResp(CloseProxyResp {
                 proxy_name: String::new(),
             })),

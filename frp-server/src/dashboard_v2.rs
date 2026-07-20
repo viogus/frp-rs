@@ -561,8 +561,7 @@ async fn handle_v2_system_info(State(state): State<Arc<AppState>>) -> Json<V2Sys
         }
     }
 
-    #[allow(unused_mut)]
-    let mut config = V2SystemInfoConfig {
+    let config = V2SystemInfoConfig {
         bind_port: snap.bind_port,
         vhost_http_port: snap.vhost_http_port,
         vhost_https_port: snap.vhost_https_port,
@@ -578,14 +577,13 @@ async fn handle_v2_system_info(State(state): State<Arc<AppState>>) -> Json<V2Sys
         allow_ports_str: snap.allow_ports_str.clone(),
         tls_force: snap.tls_force,
     };
-    // Ensure the struct has all fields when features are off
     #[cfg(not(feature = "kcp"))]
     {
-        let _ = &mut config;
+        let _ = &config;
     }
     #[cfg(not(feature = "quic"))]
     {
-        let _ = &mut config;
+        let _ = &config;
     }
 
     Json(V2SystemInfoResp {

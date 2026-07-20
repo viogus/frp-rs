@@ -856,9 +856,9 @@ mod tests {
             FrpMessage::NatHoleResp(Box::<msg::NatHoleResp>::default()),
             FrpMessage::NatHoleSid(msg::NatHoleSid {
                 sid: None,
-                provider_addr: None,
+                ..Default::default()
             }),
-            FrpMessage::NatHoleReport(msg::NatHoleReport { sid: None }),
+            FrpMessage::NatHoleReport(msg::NatHoleReport::default()),
             FrpMessage::CloseProxyResp(msg::CloseProxyResp {
                 proxy_name: "p".into(),
             }),

@@ -271,17 +271,21 @@ impl Controller {
                     .last_activity
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = Instant::now();
-                // Report success to analyzer
-                let v_resp = session.v_resp.lock().await;
-                if let Some(ref resp) = *v_resp {
-                    if let Some(ref db) = resp.detect_behavior {
-                        let v_feat = session.v_nat_feature.lock().await;
-                        let c_feat = session.c_nat_feature.lock().await;
-                        if let (Some(ref vf), Some(ref cf)) = (&*v_feat, &*c_feat) {
-                            let key = gen_analysis_key(cf, vf);
-                            let index = *session.selected_index.lock().await;
-                            self.analyzer
-                                .report_success(&key, db.mode, index.unwrap_or(0));
+                // Report success to analyzer — only when the provider
+                // reports the hole punch actually succeeded (Go frp compat:
+                // HandleReport only calls ReportSuccess when m.Success is true).
+                if msg.success != Some(false) {
+                    let v_resp = session.v_resp.lock().await;
+                    if let Some(ref resp) = *v_resp {
+                        if let Some(ref db) = resp.detect_behavior {
+                            let v_feat = session.v_nat_feature.lock().await;
+                            let c_feat = session.c_nat_feature.lock().await;
+                            if let (Some(ref vf), Some(ref cf)) = (&*v_feat, &*c_feat) {
+                                let key = gen_analysis_key(cf, vf);
+                                let index = *session.selected_index.lock().await;
+                                self.analyzer
+                                    .report_success(&key, db.mode, index.unwrap_or(0));
+                            }
                         }
                     }
                 }
@@ -302,6 +306,7 @@ impl Controller {
             if let Some(tx) = session.report_tx.lock().await.take() {
                 let _ = tx.send(msg::NatHoleReport {
                     sid: Some(sid.to_string()),
+                    success: None,
                 });
             }
             return Some(session.proxy_name.clone());
@@ -344,7 +349,7 @@ impl Controller {
 
     /// Forward NatHoleSid to the visitor via control channel.
     /// Returns true if forwarded via ctl path.
-    pub async fn forward_sid_via_ctl(&self, sid: &str, provider_addr: Option<String>) -> bool {
+    pub async fn forward_sid_via_ctl(&self, sid: &str) -> bool {
         let tx = {
             let sessions = self.sessions.read().await;
             sessions.get(sid).and_then(|s| s.visitor_ctl_tx.clone())
@@ -356,7 +361,6 @@ impl Controller {
             let _ = tx
                 .send(InternalMsg::WriteNatHoleSid {
                     sid: sid.to_string(),
-                    provider_addr,
                 })
                 .await;
             return true;
