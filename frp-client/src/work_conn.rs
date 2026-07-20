@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -179,7 +180,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             bind_addr,
             proxy_url,
             xtcp_tx,
-            session_alive: _session_alive,
+            session_alive,
             #[cfg(feature = "vnet")]
                 vnet_tuns: _vnet_tuns,
             #[cfg(feature = "vnet")]
@@ -530,7 +531,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                         "Work conn {} bridging UDP for '{}' (enc={}, comp={})",
                         label, proxy_name, use_enc, use_comp);
 
-                    let (mut w_r, mut w_w) = work.into_split();
+                    let (mut w_r, mut w_w) = work.into_split().unwrap();
 
                     // Shared last_remote_addr: the server tells us the remote user's address
                     // in each UDPPacket. We must echo it back so the server can route
@@ -543,15 +544,19 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     let pn_r = proxy_name.clone();
                     let enc_key_r = enc_key;
                     let last_remote_r = last_remote.clone();
+                    let session_alive_r = session_alive.clone();
                     tokio::spawn(async move {
                         debug!(proxy_name = %pn_r, "UDP reader '{}' started", pn_r);
                         loop {
-                            let result = if v2 {
-                                read_msg_v2(&mut w_r).await
-                            } else {
-                                read_msg_v1(&mut w_r).await
-                            };
-                            match result {
+                            tokio::select! {
+                                result = async {
+                                    if v2 {
+                                        read_msg_v2(&mut w_r).await
+                                    } else {
+                                        read_msg_v1(&mut w_r).await
+                                    }
+                                } => {
+                                    match result {
                                 Ok(FrpMessage::UDPPacket(up)) => {
                                     // Save the original remote address for the response
                                     if let Some(ref ra) = up.remote_addr {
@@ -584,6 +589,14 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                     break;
                                 }
                             }
+                                }
+                                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                                    if !session_alive_r.load(Ordering::Acquire) {
+                                        debug!(proxy_name = %pn_r, "UDP reader '{}': session dead, stopping", pn_r);
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     });
 
@@ -592,12 +605,15 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     let pn_w = proxy_name.clone();
                     let local_addr_str = info.local_addr.clone();
                     let last_remote_w = last_remote.clone();
+                    let session_alive_w = session_alive.clone();
                     tokio::spawn(async move {
                         debug!(proxy_name = %pn_w, "UDP writer '{}' started", pn_w);
                         let mut buf = vec![0u8; 65535];
                         let mut payload = Vec::with_capacity(65535);
                         loop {
-                            match sock.recv_from(&mut buf).await {
+                            tokio::select! {
+                                result = sock.recv_from(&mut buf) => {
+                                    match result {
                                 Ok((n, src)) => {
                                     debug!(proxy_name = %pn_w, byte_count = n, src_addr = %src, "UDP writer '{}': recv'd {} bytes from local {}", pn_w, n, src);
                                     payload.clear();
@@ -638,9 +654,22 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                     break;
                                 }
                             }
+                                }
+                                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                                    if !session_alive_w.load(Ordering::Acquire) {
+                                        debug!(proxy_name = %pn_w, "UDP writer '{}': session dead, stopping", pn_w);
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     });
                 } else {
+                    // Check if session is still alive before bridging
+                    if !session_alive.load(Ordering::Acquire) {
+                        debug!(label = %label, "Work conn {}: session dead, skipping bridge", label);
+                        return;
+                    }
                     // TCP/HTTP/STCP: connect to local TCP service and bridge
                     match proxy::connect_local(&info.local_addr).await {
                         Ok(mut local) => {

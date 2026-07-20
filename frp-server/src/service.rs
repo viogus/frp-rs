@@ -105,6 +105,7 @@ fn build_auth_config(
         oidc_proxy_url: auth.oidc_proxy_url.clone(),
         additional_auth_scopes: auth.additional_auth_scopes.clone(),
         authentication_timeout: auth.authentication_timeout,
+        token_auth_timeout: true,
         use_encryption: auth.use_encryption,
     }
 }
@@ -314,13 +315,17 @@ impl Service {
             let ws_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.websocket_port);
             let ws_addr2 = ws_addr.clone();
             let ws_state = self.state.clone();
+            let (ws_bind_tx, ws_bind_rx) = tokio::sync::oneshot::channel::<()>();
             tokio::spawn(async move {
-                if let Ok(listener) = TcpListener::bind(&ws_addr2).await {
-                    info!(addr = %ws_addr2, "WebSocket listener ready on {}", ws_addr2);
+                match TcpListener::bind(&ws_addr2).await {
+                    Ok(listener) => {
+                        let _ = ws_bind_tx.send(());
+                        info!(addr = %ws_addr2, "WebSocket listener ready on {}", ws_addr2);
                     loop {
                         tokio::select! {
                             result = listener.accept() => {
-                                if let Ok((stream, addr)) = result {
+                                match result {
+                                    Ok((stream, addr)) => {
                             info!(addr = %addr, "New WebSocket connection from {}", addr);
                             let state = ws_state.clone();
                             let permit = state.conn_semaphore.as_ref()
@@ -455,14 +460,27 @@ impl Service {
                                     }
                                 }
                             });
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "WS accept error, retrying...");
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                        continue;
+                                    }
                                 }
                             }
                             _ = ws_state.shutdown_token.cancelled() => break,
                         }
                     }
                 }
+                Err(e) => {
+                    tracing::error!(addr = %ws_addr2, error = %e, "WebSocket listener bind failed: {}", e);
+                }
+            }
             });
-            info!(addr = %ws_addr, "WebSocket listener started on {}", ws_addr);
+            match ws_bind_rx.await {
+                Ok(_) => info!(addr = %ws_addr, "WebSocket listener started on {}", ws_addr),
+                Err(_) => tracing::error!(addr = %ws_addr, "WebSocket listener failed to start"),
+            }
         }
 
         // Start HTTP VHost listener if configured
@@ -551,6 +569,7 @@ impl Service {
             let kcp_state = self.state.clone();
             let kcp_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.kcp_bind_port);
             let kcp_addr2 = kcp_addr.clone();
+            let (kcp_bind_tx, kcp_bind_rx) = tokio::sync::oneshot::channel::<()>();
             tokio::spawn(async move {
                 let mut listener = match frp_core::kcp::KcpListener::bind(
                     &kcp_addr2,
@@ -558,7 +577,10 @@ impl Service {
                 )
                 .await
                 {
-                    Ok(l) => l,
+                    Ok(l) => {
+                        let _ = kcp_bind_tx.send(());
+                        l
+                    },
                     Err(e) => {
                         tracing::error!(error = %e, "KCP listener bind failed: {}", e);
                         return;
@@ -580,7 +602,7 @@ impl Service {
                                             continue;
                                         }
                                         let rate_wait = {
-                                            let mut rl = state.accept_rate_limiter.lock().unwrap();
+                                            let mut rl = state.accept_rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
                                             rl.try_acquire().err()
                                         };
                                         if let Some(wait) = rate_wait {
@@ -1012,8 +1034,9 @@ impl Service {
                                 });
                             }
                             Err(e) => {
-                                tracing::error!(error = %e, "KCP accept error: {}", e);
-                                break 'kcp_accept;
+                                tracing::warn!(error = %e, "KCP accept error, retrying...");
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                continue;
                             }
                         }
                         }
@@ -1021,7 +1044,10 @@ impl Service {
                     }
                 }
             });
-            tracing::info!(addr = %kcp_addr, "KCP listener starting on {}", kcp_addr);
+            match kcp_bind_rx.await {
+                Ok(_) => tracing::info!(addr = %kcp_addr, "KCP listener started on {}", kcp_addr),
+                Err(_) => tracing::error!(addr = %kcp_addr, "KCP listener failed to start"),
+            }
         }
 
         // Start QUIC listener if configured (requires TLS cert/key)
@@ -1030,6 +1056,7 @@ impl Service {
             let quic_state = self.state.clone();
             let quic_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.quic_bind_port);
             let quic_addr2 = quic_addr.clone();
+            let (quic_bind_tx, quic_bind_rx) = tokio::sync::oneshot::channel::<()>();
             let cert_path = self.cfg.tls_cert_file.clone();
             let key_path = self.cfg.tls_key_file.clone();
             tokio::spawn(async move {
@@ -1056,7 +1083,10 @@ impl Service {
                 };
                 let listener =
                     match frp_core::quic::QuicListener::new(sockaddr, &cert_pem, &key_pem) {
-                        Ok(l) => l,
+                        Ok(l) => {
+                            let _ = quic_bind_tx.send(());
+                            l
+                        }
                         Err(e) => {
                             tracing::error!(error = %e, "QUIC listener bind failed: {}", e);
                             return;
@@ -1077,7 +1107,7 @@ impl Service {
                                             continue;
                                         }
                                         let rate_wait = {
-                                            let mut rl = state.accept_rate_limiter.lock().unwrap();
+                                            let mut rl = state.accept_rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
                                             rl.try_acquire().err()
                                         };
                                         if let Some(wait) = rate_wait {
@@ -1102,9 +1132,9 @@ impl Service {
                                         });
                                     }
                             Err(e) => {
-                                tracing::error!(error = %e, "QUIC accept error: {e}");
-                                tracing::info!("QUIC accept loop shut down due to error");
-                                break 'quic_accept;
+                                tracing::warn!(error = %e, "QUIC accept error, retrying...");
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                continue;
                             }
                         }
                         }
@@ -1116,7 +1146,10 @@ impl Service {
                 }
                 tracing::info!("QUIC accept loop shut down gracefully");
             });
-            tracing::info!(addr = %quic_addr2, "QUIC listener starting on {}", quic_addr2);
+            match quic_bind_rx.await {
+                Ok(_) => tracing::info!(addr = %quic_addr2, "QUIC listener started on {}", quic_addr2),
+                Err(_) => tracing::error!(addr = %quic_addr2, "QUIC listener failed to start"),
+            }
         }
 
         /// Handle a QUIC stream (control or work connection).

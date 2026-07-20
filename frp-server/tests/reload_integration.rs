@@ -136,8 +136,8 @@ mod unix_tests {
         Ok(buf[..n].to_vec())
     }
 
-    #[test]
-    fn test_reload_add_proxy() {
+    #[tokio::test]
+    async fn test_reload_add_proxy() {
         // No tracing init needed — test uses eprintln! for diagnostics.
 
         // Skip if binaries not built.
@@ -230,7 +230,7 @@ remote_port = {proxy_a_remote}
             .expect("failed to start frpc");
 
         // Wait for proxy A to be ready
-        std::thread::sleep(Duration::from_secs(2));
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
         // ---- Step 6: Test proxy A works ----
         let echo_result = tcp_echo(proxy_a_remote, b"hello-from-a", 5);
@@ -282,7 +282,7 @@ remote_port = {proxy_b_remote}
         assert!(kill_status.success(), "kill -USR1 failed");
 
         // Wait for reload to take effect
-        std::thread::sleep(Duration::from_secs(2));
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
         // ---- Step 9: Verify proxy A still works (no interruption) ----
         let echo_a_after = tcp_echo(proxy_a_remote, b"hello-a-after", 5);

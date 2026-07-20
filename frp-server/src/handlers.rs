@@ -219,7 +219,7 @@ pub(crate) async fn handle_nat_hole_visitor(
         Some(info) => info,
         None => {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy '{}' not found", proxy_name);
-            let mut writer = stream.into_split().1;
+            let mut writer = stream.into_split().unwrap().1;
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("proxy not found".into()),
@@ -236,7 +236,7 @@ pub(crate) async fn handle_nat_hole_visitor(
         Some(id) => id,
         None => {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: no run_id found for proxy '{}'", proxy_name);
-            let mut writer = stream.into_split().1;
+            let mut writer = stream.into_split().unwrap().1;
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("provider offline".into()),
@@ -256,7 +256,7 @@ pub(crate) async fn handle_nat_hole_visitor(
         Some(ctl) => ctl,
         None => {
             warn!(run_id = %run_id, "No provider control handler for run_id {}", run_id);
-            let mut writer = stream.into_split().1;
+            let mut writer = stream.into_split().unwrap().1;
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("provider disconnected".into()),
@@ -277,7 +277,7 @@ pub(crate) async fn handle_nat_hole_visitor(
             "NatHoleVisitor pre_check for proxy '{}': OK",
             proxy_name
         );
-        let (_, mut writer) = stream.into_split();
+        let (_, mut writer) = stream.into_split().unwrap();
         let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
             transaction_id: transaction_id.clone(),
             error: None,
@@ -302,7 +302,7 @@ pub(crate) async fn handle_nat_hole_visitor(
         // replay attacks.
         if sign_key.is_empty() {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: missing sign_key, rejecting");
-            let mut writer = stream.into_split().1;
+            let mut writer = stream.into_split().unwrap().1;
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("auth required".into()),
@@ -317,7 +317,7 @@ pub(crate) async fn handle_nat_hole_visitor(
             // XTCP proxy without a shared secret: no way to authenticate
             // visitors on fresh connections. Reject.
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy has no sk configured — rejecting fresh connection");
-            let mut writer = stream.into_split().1;
+            let mut writer = stream.into_split().unwrap().1;
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("proxy has no shared secret".into()),
@@ -333,7 +333,7 @@ pub(crate) async fn handle_nat_hole_visitor(
             frp_core::auth::validate_timestamp_freshness(timestamp, auth_timeout)
         {
             warn!(proxy_name = %proxy_name, error = %freshness_err, "NatHoleVisitor: timestamp rejected for proxy '{}'", proxy_name);
-            let mut writer = stream.into_split().1;
+            let mut writer = stream.into_split().unwrap().1;
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some(freshness_err),
@@ -345,7 +345,7 @@ pub(crate) async fn handle_nat_hole_visitor(
 
         if !frp_core::auth::verify_token(proxy_sk, timestamp, sign_key) {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor auth failed for proxy '{}'", proxy_name);
-            let mut writer = stream.into_split().1;
+            let mut writer = stream.into_split().unwrap().1;
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("auth failed".into()),
@@ -363,7 +363,7 @@ pub(crate) async fn handle_nat_hole_visitor(
         // channel path (control/mod.rs NatHoleVisitor handler).
         if !proxy_info.allow_users.is_empty() {
             warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy has allow_users configured — rejecting fresh connection (use control channel)");
-            let mut writer = stream.into_split().1;
+            let mut writer = stream.into_split().unwrap().1;
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
                 error: Some("access denied: use control channel for user-based auth".into()),
@@ -374,7 +374,7 @@ pub(crate) async fn handle_nat_hole_visitor(
         }
     }
 
-    let (reader, writer) = stream.into_split();
+    let (reader, writer) = stream.into_split().unwrap();
     let sid = transaction_id.clone();
 
     // --- Step 1: Create session and notify provider ---

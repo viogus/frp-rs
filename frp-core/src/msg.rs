@@ -281,7 +281,6 @@ pub struct NewWorkConn {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ReqWorkConn {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

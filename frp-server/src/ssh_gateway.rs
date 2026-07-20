@@ -22,18 +22,7 @@ use tokio::sync::mpsc;
 use crate::lock::RwLockExt;
 use crate::proxy::allocate_port_multi;
 use crate::service::AppState;
-
-/// Constant-time slice comparison for SSH password verification.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut acc = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        acc |= x ^ y;
-    }
-    acc == 0
-}
+use frp_core::auth::constant_time_eq;
 
 /// Parsed result from an SSH remote command string.
 #[derive(Debug, PartialEq)]
@@ -975,27 +964,6 @@ mod tests {
         assert_eq!(tokens, vec!["tcp", "--proxy_name"]);
     }
 
-    #[test]
-    fn test_constant_time_eq_same() {
-        assert!(constant_time_eq(b"hello", b"hello"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_different() {
-        assert!(!constant_time_eq(b"hello", b"world"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_different_length() {
-        assert!(!constant_time_eq(b"hello", b"hell"));
-        assert!(!constant_time_eq(b"hell", b"hello"));
-    }
-
-    #[test]
-    fn test_constant_time_eq_empty() {
-        assert!(constant_time_eq(b"", b""));
-        assert!(!constant_time_eq(b"", b"a"));
-    }
 }
 
 use std::borrow::Cow;

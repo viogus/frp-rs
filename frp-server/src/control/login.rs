@@ -5,6 +5,7 @@
 //! initialisation.
 
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -53,11 +54,31 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // --- Login throttle: max 5 failed attempts per 60s per IP ---
-    if let Some(ref peer_addr) = peer {
-        if !state.check_login_throttle(*peer_addr).await {
-            warn!(peer = %peer_addr, "Login throttle: too many failed attempts from {}", peer_addr);
-            return Err(());
+    // For transports with a peer address (TCP), use the real IP.
+    // For transports without SocketAddr (TLS/WS/KCP/QUIC), hash the
+    // privilege_key into a synthetic IP to prevent brute-force attacks
+    // on the login endpoint. This ensures all login paths are throttled.
+    let throttle_key = match peer {
+        Some(ref peer_addr) => *peer_addr,
+        None => {
+            let key = login.privilege_key.as_deref().unwrap_or("");
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut hasher);
+            let hash = hasher.finish();
+            std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::new(
+                    (hash >> 24) as u8,
+                    (hash >> 16) as u8,
+                    (hash >> 8) as u8,
+                    hash as u8,
+                ),
+                0,
+            ))
         }
+    };
+    if !state.check_login_throttle(throttle_key).await {
+        warn!(peer = ?peer, "Login throttle: too many failed attempts from {:?}", peer);
+        return Err(());
     }
 
     // --- Authenticate ---
@@ -113,6 +134,53 @@ where
             let _ = write_ctl_msg(&mut writer, &resp, v2).await;
             return Err(());
         }
+
+        // --- Replay protection: timestamp freshness + duplicate detection ---
+        if auth_cfg.token_auth_timeout && auth_cfg.authentication_timeout > 0 {
+            if let Some(ts) = login.timestamp {
+                if let Err(e) = frp_core::auth::validate_timestamp_freshness(
+                    ts,
+                    auth_cfg.authentication_timeout,
+                ) {
+                    warn!(peer = ?peer, error = %e, "Login timestamp outside acceptable window: {}", e);
+                    let (_, mut writer) = tokio::io::split(stream);
+                    let resp = FrpMessage::LoginResp(msg::LoginResp {
+                        version: Some(frp_core::VERSION.into()),
+                        run_id: None,
+                        error: Some(e),
+                        server_additional_auth_scopes: None,
+                    });
+                    let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                    return Err(());
+                }
+                let run_id_for_check = login.run_id.clone().unwrap_or_default();
+                let mut used = state.used_timestamps.lock().await;
+                if !used.insert((run_id_for_check.clone(), ts)) {
+                    warn!(
+                        peer = ?peer, run_id = %run_id_for_check, ts = %ts,
+                        "Replay attack detected: duplicate (run_id, timestamp) pair for run_id={} ts={}",
+                        run_id_for_check, ts,
+                    );
+                    let (_, mut writer) = tokio::io::split(stream);
+                    let resp = FrpMessage::LoginResp(msg::LoginResp {
+                        version: Some(frp_core::VERSION.into()),
+                        run_id: None,
+                        error: Some("replay attack detected: duplicate timestamp".into()),
+                        server_additional_auth_scopes: None,
+                    });
+                    let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+                    return Err(());
+                }
+                // Clean old entries: remove timestamps outside the freshness window
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let threshold = now - auth_cfg.authentication_timeout;
+                used.retain(|(_, t)| *t >= threshold);
+            }
+        }
+
         None
     };
 
@@ -251,7 +319,7 @@ where
     // (matching Go frp flow: ClientHello/ServerHello + Login/LoginResp in
     // plaintext, then AEAD for all subsequent messages).
     // V1 or V2 without AEAD: wrap in AES-128-CFB (CipherStream) for backward compat.
-    let (reader, writer): (
+    let (reader, mut writer): (
         Box<dyn AsyncRead + Unpin + Send>,
         Box<dyn AsyncWrite + Unpin + Send>,
     ) = if let (true, Some(ctx)) = (v2, crypto_ctx.as_ref()) {
@@ -297,45 +365,43 @@ where
         // encryption, not control plane encryption.
         info!(peer = ?peer, run_id = %run_id, "Wrapping control stream in CipherStream (AES-128-CFB)");
         let enc_key = encryption::derive_key(&reloadable.auth_cfg.token);
-        let mut cipher = frp_core::cipher_stream::CipherStream::new(Box::new(stream), enc_key);
-
-        // --- Send ReqWorkConn BEFORE tokio::io::split ---
-        // Matching Go frps service.go:496 ctl.Start() which sends ReqWorkConn
-        // immediately after LoginResp. This triggers our first encrypted write
-        // (IV + ReqWorkConn), unblocking Go frpc's crypto.Reader.Read().
-        {
-            let max_pool = state.server_config_snapshot.max_pool_count;
-            let raw_pool = login.pool_count.unwrap_or(1).max(1) as i64;
-            let pool_count = if max_pool > 0 {
-                raw_pool.min(max_pool)
-            } else {
-                raw_pool
-            } as usize;
-            info!(peer = ?peer, pool_count = pool_count, max_pool_count = max_pool, "Sending ReqWorkConn x{} through cipher (before split)", pool_count);
-            for i in 0..pool_count {
-                if let Err(e) = write_ctl_msg(
-                    &mut cipher,
-                    &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
-                    v2,
-                )
-                .await
-                {
-                    warn!(peer = ?peer, error = %e, i = i, "Failed to send ReqWorkConn #{}/{}: {}", i, pool_count, e);
-                    unregister_control(&state, &run_id, false).await;
-                    return Err(());
-                }
-            }
-            if let Err(e) = cipher.flush().await {
-                warn!(peer = ?peer, error = %e, "Failed to flush after ReqWorkConn: {}", e);
-            }
-            info!(peer = ?peer, pool_count = pool_count, "ReqWorkConn x{} sent (pre-split)", pool_count);
-        }
-
+        let cipher = frp_core::cipher_stream::CipherStream::new(Box::new(stream), enc_key);
+        // ReqWorkConn pre-warming is done AFTER the if/else block below,
+        // so BOTH V1 and V2+AEAD paths benefit from pre-warmed work conns.
         let (r, w) = tokio::io::split(cipher);
         (Box::new(r), Box::new(w))
     };
 
-    info!(peer = ?peer, run_id = %run_id, "Control stream encrypted, entering message loop");
+    // --- ReqWorkConn pre-warming (BOTH V1 and V2+AEAD paths) ---
+    // Go frps service.go:496 ctl.Start() sends ReqWorkConn immediately
+    // after LoginResp. For V1 this was previously done inside the
+    // CipherStream block (before split); for V2+AEAD it was missing.
+    // Sending ReqWorkConn now, after encryption setup (split), ensures
+    // both protocols benefit from pre-warmed work connections.
+    {
+        let max_pool = state.server_config_snapshot.max_pool_count;
+        let raw_pool = login.pool_count.unwrap_or(1).max(1) as i64;
+        let pool_count = if max_pool > 0 {
+            raw_pool.min(max_pool)
+        } else {
+            raw_pool
+        } as usize;
+        info!(peer = ?peer, pool_count = pool_count, max_pool_count = max_pool, "Sending ReqWorkConn x{} through encrypted stream", pool_count);
+        for i in 0..pool_count {
+            // writer is already the encrypted write half (CipherStream or AeadStream).
+            if let Err(e) = write_ctl_msg(
+                &mut writer,
+                &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
+                v2,
+            )
+            .await
+            {
+                warn!(peer = ?peer, error = %e, i = i, "Failed to send ReqWorkConn #{}/{}: {}", i, pool_count, e);
+                // Non-fatal — the pool will be replenished on demand.
+                break;
+            }
+        }
+    }
 
     // --- Per-client state ---
     let max_pool = state.server_config_snapshot.max_pool_count;

@@ -294,7 +294,7 @@ async fn handle_proxy_detail(
         use_compression: proxy.use_compression,
         custom_domains: proxy.custom_domains.clone(),
         multiplexer: proxy.multiplexer.clone(),
-        group: proxy.group.unwrap_or_default(),
+        group: proxy.group.clone().unwrap_or_default(),
         traffic,
     }))
 }

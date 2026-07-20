@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
@@ -247,6 +247,11 @@ pub struct AppState {
     pub login_throttle: Arc<
         tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
     >,
+    /// Set of (run_id, timestamp) pairs for replay attack detection.
+    /// Entries are cleaned on each insert (entries older than the timeout
+    /// are removed). Protected by a tokio::sync::Mutex (async-safe).
+    pub used_timestamps:
+        tokio::sync::Mutex<HashSet<(String, i64)>>,
     /// CancellationToken for graceful shutdown. Cancelled on SIGTERM/SIGINT.
     /// Main accept loop and control handlers watch this to stop accepting new
     /// connections while letting existing bridge tasks drain.
@@ -348,6 +353,7 @@ impl AppState {
             },
             accept_rate_limiter: Arc::new(std::sync::Mutex::new(RateLimiter::new(max_accept_rate))),
             login_throttle: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            used_timestamps: tokio::sync::Mutex::new(HashSet::new()),
             #[cfg(feature = "tls")]
             tls_acceptor: Arc::new(std::sync::RwLock::new(None)),
             shutdown_token: CancellationToken::new(),

@@ -205,6 +205,9 @@ fn default_graceful_timeout() -> u64 {
 fn default_authentication_timeout() -> i64 {
     15
 }
+fn default_token_auth_timeout() -> bool {
+    true
+}
 
 /// Parse a bandwidth limit string like "1MB", "500KB", "100K".
 /// Returns bytes per second, or None if unparseable.
@@ -423,6 +426,12 @@ pub struct AuthServerConfig {
         alias = "authenticationTimeout"
     )]
     pub authentication_timeout: i64,
+    /// When true (default), token auth validates timestamp freshness and
+    /// rejects duplicate (run_id, timestamp) pairs to prevent replay attacks.
+    /// Set to false to disable timestamp/replay checking.
+    /// Go frp compat: tokenAuthTimeout.
+    #[serde(default = "default_token_auth_timeout", alias = "tokenAuthTimeout")]
+    pub token_auth_timeout: bool,
     /// Whether to encrypt proxy data-plane bridges (AES-128-CFB).
     /// Go frp compat: use_encryption. Default: false (TLS alone is sufficient).
     /// NOTE: Control-plane encryption (AES-128-CFB after LoginResp) is ALWAYS
@@ -446,6 +455,7 @@ impl Default for AuthServerConfig {
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
             authentication_timeout: 15,
+            token_auth_timeout: true,
             use_encryption: false,
         }
     }
@@ -714,6 +724,13 @@ pub struct AuthClientConfig {
         alias = "authenticationTimeout"
     )]
     pub authentication_timeout: i64,
+    /// When true (default), token auth validates timestamp freshness and
+    /// rejects duplicate (run_id, timestamp) pairs to prevent replay attacks.
+    /// This field is primarily configured on the server; the client includes
+    /// it for config passthrough.
+    /// Go frp compat: tokenAuthTimeout.
+    #[serde(default = "default_token_auth_timeout", alias = "tokenAuthTimeout")]
+    pub token_auth_timeout: bool,
 }
 
 impl Default for AuthClientConfig {
@@ -733,6 +750,7 @@ impl Default for AuthClientConfig {
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
             authentication_timeout: 15,
+            token_auth_timeout: true,
         }
     }
 }

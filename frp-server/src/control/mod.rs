@@ -272,12 +272,20 @@ pub async fn handle_control<S>(
             _ = ping_tick.tick() => {
                 // Send periodic Ping to keep the control connection alive.
                 // Go frpc expects server Pings; without them it times out and reconnects.
+                // Only include privilege_key when HeartBeats is in additional_auth_scopes
+                // (matching Go frp behavior: skip auth on heartbeat messages unless
+                // the client requires it via additionalAuthScopes).
+                let privilege_key = if reloadable.additional_auth_scopes.iter().any(|s| s == "HeartBeats") {
+                    Some(reloadable.auth_cfg.token.clone())
+                } else {
+                    None
+                };
                 let ping = FrpMessage::Ping(msg::Ping {
                     timestamp: Some(std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as i64),
-                    privilege_key: Some(reloadable.auth_cfg.token.clone()),
+                    privilege_key,
                 });
                 if let Err(e) = write_ctl_msg(&mut writer, &ping, v2).await {
                     warn!(peer = ?peer, error = %e, "Failed to send Ping: {}", e);
