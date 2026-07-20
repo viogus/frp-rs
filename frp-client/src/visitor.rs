@@ -207,9 +207,10 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                         {
                                             Ok(addr2) => {
                                                 debug!(visitor_name = %visitor_name, addr = %addr2, "Visitor '{}': STUN #2: {}", visitor_name, addr2);
-                                                if !addrs.contains(&addr2) {
-                                                    addrs.push(addr2);
-                                                }
+                                                // Go frps NAT classifier needs ≥2 addresses.
+                                                // Always push — Go frp doesn't dedup, and
+                                                // fewer than 2 causes "not enough addresses".
+                                                addrs.push(addr2);
                                             }
                                             Err(e) => {
                                                 warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STUN #2 failed: {}", visitor_name, e);

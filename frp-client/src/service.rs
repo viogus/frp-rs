@@ -1069,9 +1069,9 @@ impl Service {
                                 match frp_core::stun::stun_binding_on_socket(&sock, &nat_hole_stun_server).await {
                                     Ok(addr2) => {
                                         debug!(addr = %addr2, "XTCP STUN #2: {}", addr2);
-                                        if !mapped_addrs.contains(&addr2) {
-                                            mapped_addrs.push(addr2);
-                                        }
+                                        // Go frps NAT classifier needs ≥2 addresses.
+                                        // Always push — Go frp doesn't dedup.
+                                        mapped_addrs.push(addr2);
                                     }
                                     Err(e) => warn!(error = %e, "XTCP STUN #2 failed: {}", e),
                                 }
