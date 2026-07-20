@@ -107,7 +107,7 @@ pub(crate) async fn handle_sid_on_work_conn<W: AsyncWriteExt + Unpin>(
         // Replenish the work connection pool: after consuming a pooled
         // work conn, tell the client to send a replacement.
         // Matches Go frp v0.70 GetWorkConn behavior (server/control.go:264).
-        if let Err(e) = crate::control::write_ctl_msg(
+        if let Err(e) = write_ctl_msg(
             writer,
             &FrpMessage::ReqWorkConn(msg::ReqWorkConn {}),
             ctx.v2,

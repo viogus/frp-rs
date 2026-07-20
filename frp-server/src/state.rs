@@ -247,10 +247,20 @@ pub struct AppState {
     pub login_throttle: Arc<
         tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
     >,
-    /// Set of (run_id, timestamp) pairs for replay attack detection.
-    /// Entries are cleaned on each insert (entries older than the timeout
-    /// are removed). Protected by a tokio::sync::Mutex (async-safe).
-    pub used_timestamps: tokio::sync::Mutex<HashSet<(String, i64)>>,
+    /// Timestamp-indexed run_id set for replay attack detection.
+    ///
+    /// Key: Unix timestamp (seconds). Value: set of run_ids that logged in
+    /// at that timestamp. Duplicate (run_id, ts) pairs within the freshness
+    /// window are rejected as replay attacks.
+    ///
+    /// Cleanup uses `BTreeMap::split_off` (O(log n)) instead of a full
+    /// `HashSet::retain` scan (O(n)), avoiding lock-hold latency under
+    /// heavy reconnect churn.
+    ///
+    /// Memory bound: at `R` logins/sec and default 15s timeout, ~15·R entries,
+    /// or ~1,500 entries (~60 KB) at 100 QPS.
+    /// Protected by a tokio::sync::Mutex (async-safe).
+    pub used_timestamps: tokio::sync::Mutex<std::collections::BTreeMap<i64, HashSet<String>>>,
     /// CancellationToken for graceful shutdown. Cancelled on SIGTERM/SIGINT.
     /// Main accept loop and control handlers watch this to stop accepting new
     /// connections while letting existing bridge tasks drain.
@@ -352,7 +362,7 @@ impl AppState {
             },
             accept_rate_limiter: Arc::new(std::sync::Mutex::new(RateLimiter::new(max_accept_rate))),
             login_throttle: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            used_timestamps: tokio::sync::Mutex::new(HashSet::new()),
+            used_timestamps: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
             #[cfg(feature = "tls")]
             tls_acceptor: Arc::new(std::sync::RwLock::new(None)),
             shutdown_token: CancellationToken::new(),

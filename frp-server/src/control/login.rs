@@ -166,7 +166,8 @@ where
                     .filter(|id| !id.is_empty())
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 let mut used = state.used_timestamps.lock().await;
-                if !used.insert((run_id_for_check.clone(), ts)) {
+                let entry = used.entry(ts).or_default();
+                if !entry.insert(run_id_for_check.clone()) {
                     warn!(
                         peer = ?peer, run_id = %run_id_for_check, ts = %ts,
                         "Replay attack detected: duplicate (run_id, timestamp) pair for run_id={} ts={}",
@@ -182,13 +183,15 @@ where
                     let _ = write_ctl_msg(&mut writer, &resp, v2).await;
                     return Err(());
                 }
-                // Clean old entries: remove timestamps outside the freshness window
+                // Clean old entries: split_off (O(log n)) is faster than a full
+                // retain scan (O(n)) and avoids holding the lock for a linear scan.
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs() as i64;
                 let threshold = now - auth_cfg.authentication_timeout;
-                used.retain(|(_, t)| *t >= threshold);
+                let kept = used.split_off(&threshold);
+                *used = kept;
             }
         }
 

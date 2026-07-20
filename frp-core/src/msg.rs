@@ -280,6 +280,11 @@ pub struct NewWorkConn {
     pub privilege_key: Option<String>,
 }
 
+/// Request the client to send another work connection.
+///
+/// `deny_unknown_fields` is intentionally omitted for forward
+/// compatibility with Go frp protocol evolution — new fields added
+/// by future Go frp versions must not cause deserialization failures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReqWorkConn {}
 
