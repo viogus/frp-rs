@@ -1348,7 +1348,7 @@ impl Service {
         let candidates = vec![visitor_addr];
         let conv = frp_core::xtcp_p2p::conv_from_sid(&sid);
         #[allow(clippy::default_constructed_unit_structs)]
-        let kcp_cfg = frp_core::kcp::KcpConfig::default();
+        let kcp_cfg = frp_core::kcp::default_kcp_config();
         let p2p_key = if !xtcp_sk.is_empty() {
             Some(frp_core::xtcp_p2p::derive_detect_key(&xtcp_sk))
         } else {
@@ -1557,7 +1557,7 @@ impl Service {
             // UDP hole punch + KCP data plane (Go v0.70 compat).
             let conv = frp_core::xtcp_p2p::conv_from_sid(&sid_clone);
             #[allow(clippy::default_constructed_unit_structs)]
-            let kcp_cfg = frp_core::kcp::KcpConfig::default();
+            let kcp_cfg = frp_core::kcp::default_kcp_config();
             let p2p_key = if !xtcp_sk.is_empty() {
                 Some(frp_core::xtcp_p2p::derive_detect_key(&xtcp_sk))
             } else {
