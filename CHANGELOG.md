@@ -2,7 +2,7 @@
 
 All notable changes to frp-rs.
 
-## v0.7.0 (2026-07-19)
+## v0.7.0 (2026-07-21)
 
 ### Security
 
@@ -39,6 +39,9 @@ All notable changes to frp-rs.
 - Known config keys: add `max_connections`, `graceful_shutdown_timeout` to type checker
 - Remove unused deps: `bytes`, `libc` (dead direct dependencies)
 - Security: constant-time comparison for admin auth (`constant_time_eq_str`)
+- Login replay protection: timestamp freshness validation + (run_id, timestamp) duplicate detection with UUID fallback
+- Login throttle: count ALL attempts atomically in single operation (fix TOCTOU-prone two-phase check)
+- HTTP proxy CONNECT: per-line read limit (16KB), total header limit (64KB) to prevent request smuggling
 - Doc: document `simple_glob` single-`*` limitation, sequential proxy registration, test coverage gaps
 - Config defaults aligned with Go frp v0.70.0: `pool_count` (0→1), `dial_server_keepalive` (0→7200), `fallback_timeout_ms` (5000→1000), `min_retry_interval` (30→90), visitor `bind_addr` (0.0.0.0→127.0.0.1), `detailed_errors_to_client` (false→true), `nat_hole_analysis_data_reserve_hours` (1→168)
 - Token auth: remove timestamp freshness check (Go only checks hash equality), `authentication_timeout` 15→300 (OIDC only)
@@ -66,6 +69,10 @@ All notable changes to frp-rs.
 
 - Replace `Box<dyn>` with `ReadHalf`/`WriteHalf` enums in `into_split()` — zero heap allocs per split, static dispatch (#161)
 - Remove `.into_boxed()` in client control writer hot path — zero alloc in send path
+- ReqWorkConn pre-warming for both V1 and V2+AEAD paths (reduces proxy connection latency)
+- Pool replenishment for XTCP work connections (Go frp v0.70 compat — prevents pool exhaustion under XTCP load)
+- `used_timestamps`: BTreeMap `split_off` O(log n) cleanup (was O(n) retain scan)
+- ProxyManager: return `Arc<ProxyInfo>` to avoid expensive clones in hot path
 
 ### Fixed
 
@@ -85,6 +92,23 @@ All notable changes to frp-rs.
 - Remove unused `collapsible_match` allow attributes (#163)
 - Remove dead code, replace `into_boxed()` with `From` impl
 - Support pre-built frps/frpc in integration tests (honor `FRPS_BIN`/`FRPC_BIN` env vars)
+- XTCP P2P: KCP conv=1 for Go kcp-go cross-language compat (root cause of 8/16 failing XTCP compat; now 16/16 PASS)
+- XTCP P2P: yamux background driver — poll_read after poll_flush no longer drops accepted streams
+- XTCP P2P: Go-compatible KCP config (nodelay, window 128→256, MTU 1350→1400, FEC defaults)
+- XTCP P2P: Go↔Rust hole-punch deadlock and yamux 30s timeout fix
+- XTCP P2P: remove STUN address dedup (Go frp sends raw STUN results without dedup)
+- XTCP P2P: MD5 hash for KCP conv derivation (was DefaultHasher; matches Go kcp-go)
+- XTCP P2P: pre_check before sign_key dispatch order (matches Go frp handler.go)
+- Micro/tiny: add `default_kcp_config` to no-kcp fallback module (fix build for frp-client NAT hole handlers)
+- Supersession safety: old handler cleanup captures proxy names before removing from registry
+- KCP/QUIC accept errors: continue with backoff instead of breaking accept loop
+- Listener bind: report success/failure via oneshot channels (no more silent failures)
+- OTel layer ordering: bare Registry before EnvFilter (fix log level propagation)
+- UDP reader/writer: check `session_alive` to prevent indefinite hangs after session close
+- Shared logging: extract to `frp-core::logging` (~300 lines deduplicated across frps/frpc)
+- VhostManager: single RwLock consolidation (eliminates TOCTOU between table operations)
+- `IoStream::into_split()`: return `Result` instead of panicking on unsupported stream type
+- Test: replace 300ms sleep with /healthz polling in `FrpsHandle::start` (faster, more reliable)
 
 ### Compat Tests
 
