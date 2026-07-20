@@ -857,11 +857,8 @@ pub async fn xtcp_p2p_connect_yamux(
         let mut loop_count: u64 = 0;
         loop {
             loop_count += 1;
-            if loop_count % 100 == 0 {
-                tracing::debug!(
-                    count = loop_count,
-                    "yamux P2P: bg driver loop still alive"
-                );
+            if loop_count.is_multiple_of(100) {
+                tracing::debug!(count = loop_count, "yamux P2P: bg driver loop still alive");
             }
             // Acquire the lock (async — yields if contended).
             let mut c = bg_conn.lock().await;
@@ -930,10 +927,7 @@ pub async fn xtcp_p2p_connect_yamux(
                     // poll_next_inbound. Drop lock, loop, try again.
                     drop(c);
                     if loop_count <= 5 {
-                        tracing::debug!(
-                            loop_count,
-                            "yamux P2P: bg driver tick (no stream yet)"
-                        );
+                        tracing::debug!(loop_count, "yamux P2P: bg driver tick (no stream yet)");
                     }
                 }
             }

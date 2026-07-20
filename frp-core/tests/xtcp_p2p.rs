@@ -263,10 +263,13 @@ async fn test_xtcp_p2p_yamux_roundtrip() {
     // Write data to trigger SYN send. After this flush, the bg driver
     // on side A will process the SYN frame and send it via KCP.
     let payload = b"hello xtcp p2p over yamux!";
-    tokio::time::timeout(tokio::time::Duration::from_secs(10), stream_a.write_all(payload))
-        .await
-        .unwrap()
-        .expect("A write");
+    tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        stream_a.write_all(payload),
+    )
+    .await
+    .unwrap()
+    .expect("A write");
     stream_a.flush().await.expect("A flush");
 
     // Now wait for the provider to accept the stream.
@@ -278,24 +281,33 @@ async fn test_xtcp_p2p_yamux_roundtrip() {
 
     // A → B (data already written, just read on B)
     let mut buf = vec![0u8; payload.len()];
-    tokio::time::timeout(tokio::time::Duration::from_secs(10), stream_b.read_exact(&mut buf))
-        .await
-        .unwrap()
-        .expect("B read");
+    tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        stream_b.read_exact(&mut buf),
+    )
+    .await
+    .unwrap()
+    .expect("B read");
     assert_eq!(&buf, payload, "B should receive A's data");
 
     // B → A
     let reply = b"hello from B over yamux!";
-    tokio::time::timeout(tokio::time::Duration::from_secs(10), stream_b.write_all(reply))
-        .await
-        .unwrap()
-        .expect("B write");
+    tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        stream_b.write_all(reply),
+    )
+    .await
+    .unwrap()
+    .expect("B write");
     stream_b.flush().await.expect("B flush");
 
     let mut buf = vec![0u8; reply.len()];
-    tokio::time::timeout(tokio::time::Duration::from_secs(10), stream_a.read_exact(&mut buf))
-        .await
-        .unwrap()
-        .expect("A read");
+    tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        stream_a.read_exact(&mut buf),
+    )
+    .await
+    .unwrap()
+    .expect("A read");
     assert_eq!(&buf, reply, "A should receive B's reply");
 }
