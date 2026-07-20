@@ -182,13 +182,7 @@ pub(crate) async fn handle_nat_hole_sid(
     debug!(sid = ?sid_msg.sid, "Received NatHoleSid from provider: {:?}", sid_msg.sid);
     if let Some(ref sid) = sid_msg.sid {
         // Try control-channel path first (Go frp compat).
-        if ctx
-            .state
-            .xtcp
-            .nat_hole
-            .forward_sid_via_ctl(sid)
-            .await
-        {
+        if ctx.state.xtcp.nat_hole.forward_sid_via_ctl(sid).await {
             debug!(sid = %sid, "Forwarded NatHoleSid via control channel for {}", sid);
         } else if let Some(mut accept_writer) = ctx.state.xtcp.nat_hole.take_writer(sid).await {
             // Fallback: accept-loop writer path

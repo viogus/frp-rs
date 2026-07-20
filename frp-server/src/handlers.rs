@@ -274,8 +274,8 @@ pub(crate) async fn handle_nat_hole_visitor(
     if msg.pre_check {
         // Validate allow_users: on fresh TCP, visitorUser is not known.
         // Only allow if allow_users is unrestricted (empty or "*" wildcard).
-        let allowed = proxy_info.allow_users.is_empty()
-            || proxy_info.allow_users.iter().any(|u| u == "*");
+        let allowed =
+            proxy_info.allow_users.is_empty() || proxy_info.allow_users.iter().any(|u| u == "*");
         if !allowed {
             debug!(
                 proxy_name = %proxy_name,
