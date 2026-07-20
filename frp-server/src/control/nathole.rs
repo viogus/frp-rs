@@ -448,6 +448,20 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
         return Ok(());
     }
 
+    // Go frp v0.70 pre_check compat: validate proxy and permissions,
+    // return OK without sign_key/timestamp auth or creating a session.
+    // Must be BEFORE the sign_key block — precheck skips shared-secret auth.
+    if nhv.pre_check && nhv.mapped_addrs.is_none() {
+        debug!(proxy_name = %proxy_name, user = %login_user, "NatHoleVisitor pre_check on ctl channel: proxy='{}' OK", proxy_name);
+        let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
+            transaction_id: transaction_id.clone(),
+            error: None,
+            ..Default::default()
+        }));
+        let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
+        return Ok(());
+    }
+
     // Verify sign_key if the proxy has a shared secret.
     // Uses constant-time comparison (verify_token) and timestamp
     // freshness check to prevent timing side-channel and replay attacks.
@@ -496,19 +510,6 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
             }
             debug!(proxy_name = %proxy_name, "NatHoleVisitor auth OK (constant-time) on ctl for proxy '{}'", proxy_name);
         }
-    }
-
-    // Go frp v0.70 pre_check compat: after auth, return OK without
-    // creating a session or notifying the provider.
-    if nhv.pre_check && nhv.mapped_addrs.is_none() {
-        debug!(proxy_name = %proxy_name, user = %login_user, "NatHoleVisitor pre_check on ctl channel: proxy='{}' OK", proxy_name);
-        let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
-            transaction_id: transaction_id.clone(),
-            error: None,
-            ..Default::default()
-        }));
-        let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
-        return Ok(());
     }
 
     // Look up provider run_id and control channel
