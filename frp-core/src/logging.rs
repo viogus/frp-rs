@@ -95,10 +95,9 @@ pub fn init_tracing_otel(
                 .unwrap_or(std::ffi::OsStr::new(default_log_name)),
         );
         let reg = tracing_subscriber::registry();
-        if let Some(ref layer) = otel_layer {
-            if let Some(p) = _provider {
-                let _ = Box::leak(Box::new(p));
-            }
+        // Leak the OTel provider so it lives for the process lifetime.
+        if let Some(p) = _provider {
+            let _ = Box::leak(Box::new(p));
         }
         if let Some(layer) = otel_layer {
             reg.with(layer)
@@ -122,10 +121,9 @@ pub fn init_tracing_otel(
         }
     } else {
         let reg = tracing_subscriber::registry();
-        if let Some(ref layer) = otel_layer {
-            if let Some(p) = _provider {
-                let _ = Box::leak(Box::new(p));
-            }
+        // Leak the OTel provider so it lives for the process lifetime.
+        if let Some(p) = _provider {
+            let _ = Box::leak(Box::new(p));
         }
         if let Some(layer) = otel_layer {
             reg.with(layer)
