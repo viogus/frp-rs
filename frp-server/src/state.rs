@@ -250,8 +250,7 @@ pub struct AppState {
     /// Set of (run_id, timestamp) pairs for replay attack detection.
     /// Entries are cleaned on each insert (entries older than the timeout
     /// are removed). Protected by a tokio::sync::Mutex (async-safe).
-    pub used_timestamps:
-        tokio::sync::Mutex<HashSet<(String, i64)>>,
+    pub used_timestamps: tokio::sync::Mutex<HashSet<(String, i64)>>,
     /// CancellationToken for graceful shutdown. Cancelled on SIGTERM/SIGINT.
     /// Main accept loop and control handlers watch this to stop accepting new
     /// connections while letting existing bridge tasks drain.

@@ -297,8 +297,11 @@ pub(crate) async fn cleanup<W: AsyncWriteExt + Unpin>(
     // During supersession, the new handler may have already registered
     // proxies under the same run_id — we must only remove proxies that
     // existed when THIS handler started shutting down.
-    let proxy_names: Vec<String> = ctx.state.proxy_manager
-        .list_client_proxy_names(&ctx.run_id).await;
+    let proxy_names: Vec<String> = ctx
+        .state
+        .proxy_manager
+        .list_client_proxy_names(&ctx.run_id)
+        .await;
 
     for (_, handle) in ctl.listener_handles.drain() {
         handle.abort();

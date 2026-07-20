@@ -91,7 +91,9 @@ impl VhostManager {
             domains_for_proxy.push(domain.clone());
         }
         if !domains_for_proxy.is_empty() {
-            tables.by_proxy.insert(proxy_name.to_string(), domains_for_proxy);
+            tables
+                .by_proxy
+                .insert(proxy_name.to_string(), domains_for_proxy);
         }
 
         let mut locs_for_proxy = Vec::new();
@@ -100,7 +102,9 @@ impl VhostManager {
             locs_for_proxy.push(loc.clone());
         }
         if !locs_for_proxy.is_empty() {
-            tables.by_proxy_locations.insert(proxy_name.to_string(), locs_for_proxy);
+            tables
+                .by_proxy_locations
+                .insert(proxy_name.to_string(), locs_for_proxy);
         }
     }
 

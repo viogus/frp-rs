@@ -321,161 +321,161 @@ impl Service {
                     Ok(listener) => {
                         let _ = ws_bind_tx.send(());
                         info!(addr = %ws_addr2, "WebSocket listener ready on {}", ws_addr2);
-                    loop {
-                        tokio::select! {
-                            result = listener.accept() => {
-                                match result {
-                                    Ok((stream, addr)) => {
-                            info!(addr = %addr, "New WebSocket connection from {}", addr);
-                            let state = ws_state.clone();
-                            let permit = state.conn_semaphore.as_ref()
-                                .and_then(|s| s.clone().try_acquire_owned().ok());
-                            if permit.is_none() && state.conn_semaphore.is_some() {
-                                warn!(addr = %addr, "Max connections reached, rejecting WebSocket from {}", addr);
-                                continue;
-                            }
-                            let rate_wait = {
-                                let mut rl = state.accept_rate_limiter.lock().unwrap();
-                                rl.try_acquire().err()
-                            };
-                            if let Some(wait) = rate_wait {
-                                warn!(addr = %addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying WebSocket {}ms", wait.as_millis());
-                                tokio::time::sleep(wait).await;
-                                continue;
-                            }
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                match frp_core::transport::accept_websocket(IoStream::Tcp(stream)).await {
-                                    Ok(mut ws) => {
-                                        info!(addr = %addr, "WebSocket upgrade completed for {}", addr);
+                        loop {
+                            tokio::select! {
+                                result = listener.accept() => {
+                                    match result {
+                                        Ok((stream, addr)) => {
+                                info!(addr = %addr, "New WebSocket connection from {}", addr);
+                                let state = ws_state.clone();
+                                let permit = state.conn_semaphore.as_ref()
+                                    .and_then(|s| s.clone().try_acquire_owned().ok());
+                                if permit.is_none() && state.conn_semaphore.is_some() {
+                                    warn!(addr = %addr, "Max connections reached, rejecting WebSocket from {}", addr);
+                                    continue;
+                                }
+                                let rate_wait = {
+                                    let mut rl = state.accept_rate_limiter.lock().unwrap();
+                                    rl.try_acquire().err()
+                                };
+                                if let Some(wait) = rate_wait {
+                                    warn!(addr = %addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying WebSocket {}ms", wait.as_millis());
+                                    tokio::time::sleep(wait).await;
+                                    continue;
+                                }
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    match frp_core::transport::accept_websocket(IoStream::Tcp(stream)).await {
+                                        Ok(mut ws) => {
+                                            info!(addr = %addr, "WebSocket upgrade completed for {}", addr);
 
-                                        // Try V2 magic detection
-                                        let mut magic = [0u8; 7];
-                                        let is_v2 = match ws.read_exact(&mut magic).await {
-                                            Ok(_) => is_v2_magic(&magic),
-                                            Err(_) => false,
-                                        };
-
-                                        if is_v2 {
-                                            // V2 path: ClientHello/ServerHello handshake
-                                            let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut ws, Some(addr), "WS V2").await {
-                                                Some(v) => v,
-                                                None => return,
+                                            // Try V2 magic detection
+                                            let mut magic = [0u8; 7];
+                                            let is_v2 = match ws.read_exact(&mut magic).await {
+                                                Ok(_) => is_v2_magic(&magic),
+                                                Err(_) => false,
                                             };
-                                            crate::handlers::dispatch_v2_message(ws, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
-                                        } else if magic[0] == 0x16 {
-                                            #[cfg(feature = "tls")]
-                                            {
-                                                let tls_acceptor = match state.tls_acceptor.read_ok().clone() {
-                                                    Some(a) => a,
-                                                    None => {
-                                                        tracing::warn!(addr = %addr, "TLS ClientHello in WS frame but TLS not configured");
-                                                        return;
-                                                    }
-                                                };
-                                                let stream = frp_core::transport::IoStream::BufferedRead(
-                                                    magic.to_vec(), 0, Box::new(ws),
-                                                );
-                                                let tls_stream = match tls_acceptor.accept(stream).await {
-                                                    Ok(s) => s,
-                                                    Err(e) => {
-                                                        tracing::warn!(addr = %addr, error = %e, "TLS handshake failed on WS from {}: {}", addr, e);
-                                                        return;
-                                                    }
-                                                };
-                                                tracing::info!(addr = %addr, "TLS-over-WebSocket connection from {}", addr);
 
-                                                // When tcp_mux is enabled, wrap TLS stream in yamux before
-                                                // reading the first message (matches Go frp — Go frpc uses
-                                                // tcp_mux by default over all transports).
-                                                if state.tcp_mux {
-                                                    let mux_cfg = mux::TcpMuxConfig {
-                                                        keepalive_interval: std::time::Duration::from_secs(
-                                                            state.tcp_mux_keepalive.max(1) as u64
-                                                        ),
+                                            if is_v2 {
+                                                // V2 path: ClientHello/ServerHello handshake
+                                                let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut ws, Some(addr), "WS V2").await {
+                                                    Some(v) => v,
+                                                    None => return,
+                                                };
+                                                crate::handlers::dispatch_v2_message(ws, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
+                                            } else if magic[0] == 0x16 {
+                                                #[cfg(feature = "tls")]
+                                                {
+                                                    let tls_acceptor = match state.tls_acceptor.read_ok().clone() {
+                                                        Some(a) => a,
+                                                        None => {
+                                                            tracing::warn!(addr = %addr, "TLS ClientHello in WS frame but TLS not configured");
+                                                            return;
+                                                        }
                                                     };
-                                                    match mux::server_mux(tls_stream, &mux_cfg).await {
-                                                        Ok((control_stream, incoming)) => {
-                                                            let mut io = IoStream::Yamux(control_stream);
-                                                            tracing::info!(addr = ?addr, "Yamux over WS+TLS session established for {:?}", addr);
+                                                    let stream = frp_core::transport::IoStream::BufferedRead(
+                                                        magic.to_vec(), 0, Box::new(ws),
+                                                    );
+                                                    let tls_stream = match tls_acceptor.accept(stream).await {
+                                                        Ok(s) => s,
+                                                        Err(e) => {
+                                                            tracing::warn!(addr = %addr, error = %e, "TLS handshake failed on WS from {}: {}", addr, e);
+                                                            return;
+                                                        }
+                                                    };
+                                                    tracing::info!(addr = %addr, "TLS-over-WebSocket connection from {}", addr);
 
-                                                            // V2 detection on yamux stream
-                                                            let mut magic = [0u8; 7];
-                                                            let is_v2 = match io.read_exact(&mut magic).await {
-                                                                Ok(_) => is_v2_magic(&magic),
-                                                                Err(_) => false,
-                                                            };
-                                                            if is_v2 {
-                                                                let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut io, Some(addr), "WS+TLS+yamux V2").await {
-                                                                    Some(v) => v,
-                                                                    None => return,
+                                                    // When tcp_mux is enabled, wrap TLS stream in yamux before
+                                                    // reading the first message (matches Go frp — Go frpc uses
+                                                    // tcp_mux by default over all transports).
+                                                    if state.tcp_mux {
+                                                        let mux_cfg = mux::TcpMuxConfig {
+                                                            keepalive_interval: std::time::Duration::from_secs(
+                                                                state.tcp_mux_keepalive.max(1) as u64
+                                                            ),
+                                                        };
+                                                        match mux::server_mux(tls_stream, &mux_cfg).await {
+                                                            Ok((control_stream, incoming)) => {
+                                                                let mut io = IoStream::Yamux(control_stream);
+                                                                tracing::info!(addr = ?addr, "Yamux over WS+TLS session established for {:?}", addr);
+
+                                                                // V2 detection on yamux stream
+                                                                let mut magic = [0u8; 7];
+                                                                let is_v2 = match io.read_exact(&mut magic).await {
+                                                                    Ok(_) => is_v2_magic(&magic),
+                                                                    Err(_) => false,
                                                                 };
-                                                                crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, Some(incoming), None, crypto_ctx).await;
-                                                            } else {
-                                                                // V1 over WS+TLS+yamux
-                                                                let io = frp_core::transport::IoStream::BufferedRead(
-                                                                    magic.to_vec(), 0, Box::new(io),
-                                                                );
-                                                                crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None).await;
+                                                                if is_v2 {
+                                                                    let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut io, Some(addr), "WS+TLS+yamux V2").await {
+                                                                        Some(v) => v,
+                                                                        None => return,
+                                                                    };
+                                                                    crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, Some(incoming), None, crypto_ctx).await;
+                                                                } else {
+                                                                    // V1 over WS+TLS+yamux
+                                                                    let io = frp_core::transport::IoStream::BufferedRead(
+                                                                        magic.to_vec(), 0, Box::new(io),
+                                                                    );
+                                                                    crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None).await;
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::warn!(addr = ?addr, error = %e, "Failed to start yamux over WS+TLS for {:?}: {}", addr, e);
                                                             }
                                                         }
-                                                        Err(e) => {
-                                                            tracing::warn!(addr = ?addr, error = %e, "Failed to start yamux over WS+TLS for {:?}: {}", addr, e);
+                                                    } else {
+                                                        let mut io = IoStream::Tls(Box::new(tls_stream));
+
+                                                        let mut chicken = [0u8; 7];
+                                                        let is_tls_v2 = match io.read_exact(&mut chicken).await {
+                                                            Ok(_) => is_v2_magic(&chicken),
+                                                            Err(_) => false,
+                                                        };
+                                                        if is_tls_v2 {
+                                                            let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut io, Some(addr), "WS+TLS+V2").await {
+                                                                Some(v) => v,
+                                                                None => return,
+                                                            };
+                                                            crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
+                                                        } else {
+                                                            let io = frp_core::transport::IoStream::BufferedRead(
+                                                                chicken.to_vec(), 0, Box::new(io),
+                                                            );
+                                                            crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), None, None).await;
                                                         }
                                                     }
-                                                } else {
-                                                    let mut io = IoStream::Tls(Box::new(tls_stream));
-
-                                                    let mut chicken = [0u8; 7];
-                                                    let is_tls_v2 = match io.read_exact(&mut chicken).await {
-                                                        Ok(_) => is_v2_magic(&chicken),
-                                                        Err(_) => false,
-                                                    };
-                                                    if is_tls_v2 {
-                                                        let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut io, Some(addr), "WS+TLS+V2").await {
-                                                            Some(v) => v,
-                                                            None => return,
-                                                        };
-                                                        crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
-                                                    } else {
-                                                        let io = frp_core::transport::IoStream::BufferedRead(
-                                                            chicken.to_vec(), 0, Box::new(io),
-                                                        );
-                                                        crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), None, None).await;
-                                                    }
                                                 }
+                                                #[cfg(not(feature = "tls"))]
+                                                {
+                                                    tracing::warn!(addr = %addr, "TLS ClientHello in WebSocket frame but TLS feature not enabled, dropping connection from {}", addr);
+                                                }
+                                            } else {
+                                                // V1 fallback: replay consumed 7 bytes
+                                                let ws = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
+                                                crate::handlers::dispatch_v1_message(ws, state.clone(), Some(addr), None, None).await;
                                             }
-                                            #[cfg(not(feature = "tls"))]
-                                            {
-                                                tracing::warn!(addr = %addr, "TLS ClientHello in WebSocket frame but TLS feature not enabled, dropping connection from {}", addr);
-                                            }
-                                        } else {
-                                            // V1 fallback: replay consumed 7 bytes
-                                            let ws = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
-                                            crate::handlers::dispatch_v1_message(ws, state.clone(), Some(addr), None, None).await;
+                                        }
+                                        Err(e) => {
+                                            warn!(addr = %addr, error = %e, "WebSocket upgrade failed for {}: {}", addr, e);
                                         }
                                     }
-                                    Err(e) => {
-                                        warn!(addr = %addr, error = %e, "WebSocket upgrade failed for {}: {}", addr, e);
+                                });
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "WS accept error, retrying...");
+                                            tokio::time::sleep(Duration::from_millis(100)).await;
+                                            continue;
+                                        }
                                     }
                                 }
-                            });
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "WS accept error, retrying...");
-                                        tokio::time::sleep(Duration::from_millis(100)).await;
-                                        continue;
-                                    }
-                                }
+                                _ = ws_state.shutdown_token.cancelled() => break,
                             }
-                            _ = ws_state.shutdown_token.cancelled() => break,
                         }
                     }
+                    Err(e) => {
+                        tracing::error!(addr = %ws_addr2, error = %e, "WebSocket listener bind failed: {}", e);
+                    }
                 }
-                Err(e) => {
-                    tracing::error!(addr = %ws_addr2, error = %e, "WebSocket listener bind failed: {}", e);
-                }
-            }
             });
             match ws_bind_rx.await {
                 Ok(_) => info!(addr = %ws_addr, "WebSocket listener started on {}", ws_addr),
@@ -580,7 +580,7 @@ impl Service {
                     Ok(l) => {
                         let _ = kcp_bind_tx.send(());
                         l
-                    },
+                    }
                     Err(e) => {
                         tracing::error!(error = %e, "KCP listener bind failed: {}", e);
                         return;
@@ -1147,7 +1147,9 @@ impl Service {
                 tracing::info!("QUIC accept loop shut down gracefully");
             });
             match quic_bind_rx.await {
-                Ok(_) => tracing::info!(addr = %quic_addr2, "QUIC listener started on {}", quic_addr2),
+                Ok(_) => {
+                    tracing::info!(addr = %quic_addr2, "QUIC listener started on {}", quic_addr2)
+                }
                 Err(_) => tracing::error!(addr = %quic_addr2, "QUIC listener failed to start"),
             }
         }

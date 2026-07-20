@@ -26,15 +26,40 @@ async fn main() {
 // ── Logging / tracing init ────────────────────────────────────────────────────
 
 fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
-    let level = logging::resolve_log_level(cli.log_level.clone(), cfg.map(|c| c.log.level.as_str()), "debug");
-    let file = logging::resolve_log_file(cli.log_file.clone(), cfg.map(|c| c.log.file.as_str()).unwrap_or(""));
+    let level = logging::resolve_log_level(
+        cli.log_level.clone(),
+        cfg.map(|c| c.log.level.as_str()),
+        "debug",
+    );
+    let file = logging::resolve_log_file(
+        cli.log_file.clone(),
+        cfg.map(|c| c.log.file.as_str()).unwrap_or(""),
+    );
     let ansi = logging::resolve_ansi(cli.disable_log_color);
     #[cfg(not(feature = "otel"))]
     logging::init_tracing(&level, file, ansi, "frps.log");
     #[cfg(feature = "otel")]
     {
-        let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok().or_else(|| cfg.and_then(|c| if c.observability.otlp_endpoint.is_empty() { None } else { Some(c.observability.otlp_endpoint.clone()) }));
-        let svc_name = cfg.and_then(|c| if c.observability.service_name.is_empty() { None } else { Some(c.observability.service_name.clone()) }).unwrap_or_else(|| "frps".to_string());
+        let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .ok()
+            .or_else(|| {
+                cfg.and_then(|c| {
+                    if c.observability.otlp_endpoint.is_empty() {
+                        None
+                    } else {
+                        Some(c.observability.otlp_endpoint.clone())
+                    }
+                })
+            });
+        let svc_name = cfg
+            .and_then(|c| {
+                if c.observability.service_name.is_empty() {
+                    None
+                } else {
+                    Some(c.observability.service_name.clone())
+                }
+            })
+            .unwrap_or_else(|| "frps".to_string());
         logging::init_tracing_otel(&level, file, ansi, &svc_name, otlp_endpoint, "frps.log");
     }
 }

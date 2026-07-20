@@ -963,7 +963,6 @@ mod tests {
         let tokens = shell_split(r#"tcp --proxy_name """#);
         assert_eq!(tokens, vec!["tcp", "--proxy_name"]);
     }
-
 }
 
 use std::borrow::Cow;

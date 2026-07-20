@@ -1150,12 +1150,14 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_resolve_dynamic_token_plain() {
         assert_eq!(resolve_dynamic_token("my-token"), "my-token");
         assert_eq!(resolve_dynamic_token(""), "");
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_resolve_dynamic_token_file() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("frp-test-token-{}.txt", std::process::id()));
@@ -1166,6 +1168,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_resolve_dynamic_token_file_multiline() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("frp-test-token-multi-{}.txt", std::process::id()));
@@ -1176,6 +1179,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_resolve_dynamic_token_file_missing() {
         let result = resolve_dynamic_token("file:///nonexistent/path/token.txt");
         assert!(result.is_empty());
@@ -1217,12 +1221,15 @@ mod tests {
     fn test_resolve_dynamic_token_file_allowed_with_feature() {
         // file:// works when TokenSourceFile is in the allowlist.
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("frp-test-token-file-allowed-{}.txt", std::process::id()));
+        let path = dir.join(format!(
+            "frp-test-token-file-allowed-{}.txt",
+            std::process::id()
+        ));
         std::fs::write(&path, "file-token-allowed\n").unwrap();
         let url = format!("file://{}", path.display());
-        let uf = crate::unsafe_features::UnsafeFeatures::new(
-            &[crate::unsafe_features::TOKEN_SOURCE_FILE],
-        );
+        let uf = crate::unsafe_features::UnsafeFeatures::new(&[
+            crate::unsafe_features::TOKEN_SOURCE_FILE,
+        ]);
         let result = resolve_dynamic_token_checked(&url, &uf);
         std::fs::remove_file(&path).ok();
         assert_eq!(result.unwrap(), "file-token-allowed");

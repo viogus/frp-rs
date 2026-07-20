@@ -7,75 +7,167 @@
 use std::path::Path;
 use tracing_subscriber::EnvFilter;
 
-pub fn resolve_log_level(cli_level: Option<String>, cfg_level: Option<&str>, _debug_default: &str) -> String {
+pub fn resolve_log_level(
+    cli_level: Option<String>,
+    cfg_level: Option<&str>,
+    _debug_default: &str,
+) -> String {
     cli_level.unwrap_or_else(|| {
-        cfg_level.unwrap_or({
-            #[cfg(feature = "debug-logs")]
-            { _debug_default }
-            #[cfg(not(feature = "debug-logs"))]
-            { "info" }
-        }).to_string()
+        cfg_level
+            .unwrap_or({
+                #[cfg(feature = "debug-logs")]
+                {
+                    _debug_default
+                }
+                #[cfg(not(feature = "debug-logs"))]
+                {
+                    "info"
+                }
+            })
+            .to_string()
     })
 }
 
 pub fn resolve_log_file(cli_file: Option<String>, cfg_file: &str) -> Option<String> {
-    cli_file.or_else(|| if cfg_file.is_empty() { None } else { Some(cfg_file.to_string()) })
+    cli_file.or_else(|| {
+        if cfg_file.is_empty() {
+            None
+        } else {
+            Some(cfg_file.to_string())
+        }
+    })
 }
 
-pub fn resolve_ansi(disable_log_color: bool) -> bool { !disable_log_color }
+pub fn resolve_ansi(disable_log_color: bool) -> bool {
+    !disable_log_color
+}
 
 pub fn init_tracing(level: &str, file: Option<String>, ansi: bool, default_log_name: &str) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_ansi(ansi);
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(ansi);
     if let Some(path) = file {
         let file_appender = tracing_appender::rolling::daily(
             Path::new(&path).parent().unwrap_or(Path::new(".")),
-            Path::new(&path).file_name().unwrap_or(std::ffi::OsStr::new(default_log_name)),
+            Path::new(&path)
+                .file_name()
+                .unwrap_or(std::ffi::OsStr::new(default_log_name)),
         );
         builder.with_writer(file_appender).init();
-    } else { builder.init(); }
+    } else {
+        builder.init();
+    }
 }
 
 #[cfg(feature = "otel")]
-pub fn init_tracing_otel(level: &str, file: Option<String>, ansi: bool, service_name: &str, otlp_endpoint: Option<String>, default_log_name: &str) {
+pub fn init_tracing_otel(
+    level: &str,
+    file: Option<String>,
+    ansi: bool,
+    service_name: &str,
+    otlp_endpoint: Option<String>,
+    default_log_name: &str,
+) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     let (otel_layer, _provider) = if let Some(ref ep) = otlp_endpoint {
         match build_otel_layer(ep, service_name) {
             Ok((l, p)) => (Some(l), Some(p)),
-            Err(e) => { eprintln!("WARNING: OTel init failed (endpoint={ep}): {e}. Tracing without OTLP export."); (None, None) }
-        }
-    } else { (None, None) };
-    if let Some(path) = file {
-        let fa = tracing_appender::rolling::daily(Path::new(&path).parent().unwrap_or(Path::new(".")), Path::new(&path).file_name().unwrap_or(std::ffi::OsStr::new(default_log_name)));
-        let reg = tracing_subscriber::registry().with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level)));
-        if let Some(layer) = otel_layer { if let Some(p) = _provider { let _ = Box::leak(Box::new(p)); } }
-        if otel_layer.is_some() {
-            reg.with(otel_layer.unwrap()).with(tracing_subscriber::fmt::layer().with_ansi(ansi)).with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(fa)).init();
-        } else {
-            reg.with(tracing_subscriber::fmt::layer().with_ansi(ansi)).with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(fa)).init();
+            Err(e) => {
+                eprintln!(
+                    "WARNING: OTel init failed (endpoint={ep}): {e}. Tracing without OTLP export."
+                );
+                (None, None)
+            }
         }
     } else {
-        let reg = tracing_subscriber::registry().with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level)));
-        if let Some(layer) = otel_layer { if let Some(p) = _provider { let _ = Box::leak(Box::new(p)); } }
+        (None, None)
+    };
+    if let Some(path) = file {
+        let fa = tracing_appender::rolling::daily(
+            Path::new(&path).parent().unwrap_or(Path::new(".")),
+            Path::new(&path)
+                .file_name()
+                .unwrap_or(std::ffi::OsStr::new(default_log_name)),
+        );
+        let reg = tracing_subscriber::registry()
+            .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level)));
+        if let Some(layer) = otel_layer {
+            if let Some(p) = _provider {
+                let _ = Box::leak(Box::new(p));
+            }
+        }
         if otel_layer.is_some() {
-            reg.with(otel_layer.unwrap()).with(tracing_subscriber::fmt::layer().with_ansi(ansi)).init();
+            reg.with(otel_layer.unwrap())
+                .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(fa),
+                )
+                .init();
         } else {
-            reg.with(tracing_subscriber::fmt::layer().with_ansi(ansi)).init();
+            reg.with(tracing_subscriber::fmt::layer().with_ansi(ansi))
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(fa),
+                )
+                .init();
+        }
+    } else {
+        let reg = tracing_subscriber::registry()
+            .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level)));
+        if let Some(layer) = otel_layer {
+            if let Some(p) = _provider {
+                let _ = Box::leak(Box::new(p));
+            }
+        }
+        if otel_layer.is_some() {
+            reg.with(otel_layer.unwrap())
+                .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
+                .init();
+        } else {
+            reg.with(tracing_subscriber::fmt::layer().with_ansi(ansi))
+                .init();
         }
     }
 }
 
 #[cfg(feature = "otel")]
-pub fn build_otel_layer(endpoint: &str, service_name: &str) -> Result<(tracing_opentelemetry::OpenTelemetryLayer<tracing_subscriber::Registry, opentelemetry_sdk::trace::Tracer>, opentelemetry_sdk::trace::TracerProvider), Box<dyn std::error::Error>> {
+pub fn build_otel_layer(
+    endpoint: &str,
+    service_name: &str,
+) -> Result<
+    (
+        tracing_opentelemetry::OpenTelemetryLayer<
+            tracing_subscriber::Registry,
+            opentelemetry_sdk::trace::Tracer,
+        >,
+        opentelemetry_sdk::trace::TracerProvider,
+    ),
+    Box<dyn std::error::Error>,
+> {
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry::KeyValue;
     use opentelemetry_otlp::WithExportConfig as _;
     use opentelemetry_sdk::Resource;
-    let exporter = opentelemetry_otlp::SpanExporter::builder().with_http().with_endpoint(endpoint.to_string()).build()?;
-    let provider = opentelemetry_sdk::trace::TracerProvider::builder().with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio).with_resource(Resource::new(vec![KeyValue::new("service.name", service_name.to_string())])).build();
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_endpoint(endpoint.to_string())
+        .build()?;
+    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+        .with_resource(Resource::new(vec![KeyValue::new(
+            "service.name",
+            service_name.to_string(),
+        )]))
+        .build();
     let tracer = provider.tracer("frp-rs");
     Ok((tracing_opentelemetry::layer().with_tracer(tracer), provider))
 }
 
-pub fn is_token_error(msg: &str) -> bool { msg.contains("token") || msg.contains("auth") }
+pub fn is_token_error(msg: &str) -> bool {
+    msg.contains("token") || msg.contains("auth")
+}
