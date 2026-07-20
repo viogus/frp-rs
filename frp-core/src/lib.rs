@@ -13,6 +13,7 @@ pub mod crypto;
 pub mod encryption;
 pub mod feature_gate;
 pub mod internal_listener;
+pub mod logging;
 #[cfg(feature = "kcp")]
 pub mod kcp;
 #[cfg(feature = "kcp")]
