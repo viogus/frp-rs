@@ -280,24 +280,41 @@ pub(crate) async fn handle_ping<W: AsyncWriteExt + Unpin>(
 /// Drain all listener handles, emit dashboard events, unregister control,
 /// and remove the client from the proxy manager. Called once after the
 /// main select! loop exits.
+///
+/// ## Supersession safety
+///
+/// During supersession (client reconnects with the same run_id), the NEW
+/// handler may have already registered proxies before the OLD handler's
+/// cleanup runs. We capture proxy names at the start and only remove
+/// those specific proxies, preventing the old handler from deleting the
+/// new handler's proxies.
 pub(crate) async fn cleanup<W: AsyncWriteExt + Unpin>(
     ctx: &mut ControlContext,
     ctl: &mut ControlState,
     _writer: &mut W,
 ) {
+    // Capture proxy names belonging to this client BEFORE any cleanup.
+    // During supersession, the new handler may have already registered
+    // proxies under the same run_id — we must only remove proxies that
+    // existed when THIS handler started shutting down.
+    let proxy_names: Vec<String> = ctx
+        .state
+        .proxy_manager
+        .list_client_proxy_names(&ctx.run_id)
+        .await;
+
     for (_, handle) in ctl.listener_handles.drain() {
         handle.abort();
     }
     // Emit ProxyDown for all proxies owned by this client (before removing them)
     #[cfg(feature = "dashboard")]
     {
-        let proxies = ctx.state.proxy_manager.list_client(&ctx.run_id).await;
-        for p in &proxies {
+        for pn in &proxy_names {
             let _ = ctx
                 .state
                 .event_tx
                 .send(crate::event::ServerEvent::ProxyDown {
-                    proxy_name: p.name.clone(),
+                    proxy_name: pn.clone(),
                     run_id: ctx.run_id.clone(),
                 });
         }
@@ -313,6 +330,11 @@ pub(crate) async fn cleanup<W: AsyncWriteExt + Unpin>(
             });
     }
     proxy_ops::unregister_control(&ctx.state, &ctx.run_id, ctl.shutting_down).await;
-    ctx.state.proxy_manager.remove_client(&ctx.run_id).await;
+    // Remove only the proxies that existed at cleanup start.
+    // Do NOT use remove_client() — it removes ALL proxies for this run_id,
+    // which in supersession would delete the new handler's proxies.
+    for name in &proxy_names {
+        ctx.state.proxy_manager.remove(name).await;
+    }
     info!(run_id = %ctx.run_id, "Control connection {} removed", ctx.run_id);
 }

@@ -3,7 +3,23 @@ use md5::{Digest, Md5};
 /// Constant-time slice comparison for auth token verification.
 /// XOR-accumulates every byte pair so execution time depends only on
 /// the longer input length, not on where the first difference occurs.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
+/// Constant-time string comparison — execution time depends only on the
+/// shorter input length, not on where the first difference occurs.
+/// Prevents timing side-channel attacks on credential comparisons.
+pub fn constant_time_eq_str(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
     if a.len() != b.len() {
         return false;
     }
@@ -82,6 +98,11 @@ pub struct AuthConfig {
     /// (matching Go behavior); OIDC path uses this timeout for JWT validation.
     /// Go frp compat: authentication_timeout.
     pub authentication_timeout: i64,
+    /// When true (default), token auth validates timestamp freshness and
+    /// rejects duplicate (run_id, timestamp) pairs to prevent replay attacks.
+    /// Set to false to disable timestamp/replay checking (less secure, but
+    /// compatible with clients whose clocks are unreliable).
+    pub token_auth_timeout: bool,
     /// Whether to wrap control connection in AES-128-CFB after LoginResp.
     /// Go frp compat: use_encryption. Default: false (TLS alone is sufficient).
     pub use_encryption: bool,
@@ -109,6 +130,7 @@ impl AuthConfig {
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
             authentication_timeout: 0,
+            token_auth_timeout: true,
             use_encryption: false,
         }
     }
@@ -128,6 +150,7 @@ impl Default for AuthConfig {
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
             authentication_timeout: 300,
+            token_auth_timeout: true,
             use_encryption: false,
         }
     }
@@ -859,14 +882,12 @@ pub fn zeroize_string(s: &mut String) {
 /// Resolve a token that may use a URL scheme for dynamic sourcing.
 ///
 /// **Prefer [`resolve_dynamic_token_checked`]** — it enforces the
-/// `UnsafeFeatures` allowlist for `exec://` sources (`file://` is always
-/// allowed, matching Go frp).
-/// This function exists for backward compatibility with callers that do
-/// not yet thread `UnsafeFeatures` through (frp-server/frp-client service.rs).
+/// `UnsafeFeatures` allowlist for `exec://` and `file://` sources.
 ///
-/// When called without UnsafeFeatures, `exec://` and `file://` sources
-/// execute unconditionally (legacy behavior). Use [`resolve_dynamic_token_checked`]
-/// to enforce the allowlist.
+/// # Deprecated
+/// Use [`resolve_dynamic_token_checked`] instead to ensure `UnsafeFeatures`
+/// gating is enforced. This function silently allows both `exec://` and
+/// `file://` without checking the unsafe features allowlist.
 ///
 /// Supported schemes:
 /// - `file:///absolute/path` — reads the first line of the file
@@ -874,6 +895,10 @@ pub fn zeroize_string(s: &mut String) {
 /// - plain string — returned as-is
 ///
 /// Go frp compat: file:// and exec:// token sources.
+#[deprecated(
+    since = "0.7.0",
+    note = "Use resolve_dynamic_token_checked() which enforces the UnsafeFeatures allowlist for exec:// and file:// sources. This function silently allows both without checking."
+)]
 pub fn resolve_dynamic_token(token: &str) -> String {
     // Prefer checked variant when available; for backward compat, None
     // means legacy mode (no enforcement).
@@ -910,8 +935,15 @@ fn resolve_dynamic_token_inner(
     unsafe_features: Option<&crate::unsafe_features::UnsafeFeatures>,
 ) -> Result<String, String> {
     if let Some(path) = token.strip_prefix("file://") {
-        // file:// does NOT require TokenSourceExec — reading a file is not
-        // command execution. Go frp allows file:// unconditionally.
+        if unsafe_features
+            .is_some_and(|uf| !uf.is_enabled(crate::unsafe_features::TOKEN_SOURCE_FILE))
+        {
+            return Err(
+                "file:// token source blocked: TokenSourceFile not in UnsafeFeatures allowlist. \
+                 Set [common].unsafe_features = [\"TokenSourceFile\"] to enable."
+                    .into(),
+            );
+        }
         match std::fs::read_to_string(path) {
             Ok(content) => Ok(content.lines().next().unwrap_or("").trim().to_string()),
             Err(e) => Err(format!(
@@ -1010,6 +1042,7 @@ mod tests {
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
             authentication_timeout: 0,
+            token_auth_timeout: true,
             use_encryption: false,
         };
         // AuthConfig::validate_login for OIDC returns error when no server-side verifier
@@ -1102,18 +1135,29 @@ mod tests {
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
             authentication_timeout: 0,
+            token_auth_timeout: true,
             use_encryption: false,
         };
         assert!(cfg.generate_login_key(100).is_none());
     }
 
     #[test]
+    fn test_auth_config_default_token_auth_timeout() {
+        let cfg = AuthConfig::default();
+        assert!(cfg.token_auth_timeout);
+        let cfg2 = AuthConfig::with_token("test");
+        assert!(cfg2.token_auth_timeout);
+    }
+
+    #[test]
+    #[allow(deprecated)]
     fn test_resolve_dynamic_token_plain() {
         assert_eq!(resolve_dynamic_token("my-token"), "my-token");
         assert_eq!(resolve_dynamic_token(""), "");
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_resolve_dynamic_token_file() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("frp-test-token-{}.txt", std::process::id()));
@@ -1124,6 +1168,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_resolve_dynamic_token_file_multiline() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("frp-test-token-multi-{}.txt", std::process::id()));
@@ -1134,6 +1179,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_resolve_dynamic_token_file_missing() {
         let result = resolve_dynamic_token("file:///nonexistent/path/token.txt");
         assert!(result.is_empty());
@@ -1157,18 +1203,36 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_dynamic_token_file_allowed_without_unsafe_feature() {
-        // I3: file:// must NOT require TokenSourceExec — reading a file is not
-        // command execution. Matches Go frp (file:// works unconditionally).
+    fn test_resolve_dynamic_token_file_blocked_when_not_allowed() {
+        // file:// must require TokenSourceFile in the UnsafeFeatures allowlist.
         let dir = std::env::temp_dir();
         let path = dir.join(format!("frp-test-token-i3-{}.txt", std::process::id()));
-        std::fs::write(&path, "file-token-no-gate\n").unwrap();
+        std::fs::write(&path, "file-token-should-be-blocked\n").unwrap();
         let url = format!("file://{}", path.display());
-        // Default UnsafeFeatures has TokenSourceExec DISABLED.
+        // Default UnsafeFeatures has TokenSourceFile DISABLED.
         let uf = crate::unsafe_features::UnsafeFeatures::default();
         let result = resolve_dynamic_token_checked(&url, &uf);
         std::fs::remove_file(&path).ok();
-        assert_eq!(result.unwrap(), "file-token-no-gate");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("TokenSourceFile"));
+    }
+
+    #[test]
+    fn test_resolve_dynamic_token_file_allowed_with_feature() {
+        // file:// works when TokenSourceFile is in the allowlist.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "frp-test-token-file-allowed-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, "file-token-allowed\n").unwrap();
+        let url = format!("file://{}", path.display());
+        let uf = crate::unsafe_features::UnsafeFeatures::new(&[
+            crate::unsafe_features::TOKEN_SOURCE_FILE,
+        ]);
+        let result = resolve_dynamic_token_checked(&url, &uf);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(result.unwrap(), "file-token-allowed");
     }
 
     // --- Authentication timeout tests ---

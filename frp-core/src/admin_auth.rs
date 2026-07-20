@@ -8,19 +8,7 @@ use axum::{
 };
 use std::sync::Arc;
 
-/// Constant-time string comparison — execution time depends only on the
-/// shorter input length, not on where the first difference occurs.
-/// Prevents timing side-channel attacks on credential comparisons.
-fn constant_time_eq_str(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut acc = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        acc |= x ^ y;
-    }
-    acc == 0
-}
+use crate::auth::constant_time_eq_str;
 
 #[derive(Clone)]
 struct AuthState {

@@ -326,8 +326,8 @@ pub async fn bridge_encrypted_io(
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
     tracing::debug!(use_compression, "bridge_encrypted_io: starting");
-    let (u_r, u_w) = user.into_split();
-    let (w_r, w_w) = work.into_split();
+    let (u_r, u_w) = user.into_split().unwrap();
+    let (w_r, w_w) = work.into_split().unwrap();
     bridge_encrypted(
         u_r,
         u_w,

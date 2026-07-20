@@ -26,16 +26,21 @@ pub struct VhostRoute {
     pub route_by_http_user: String,
 }
 
+/// Internal tables held under a single RwLock.
+struct VhostTables {
+    /// domain → route (host-based routing)
+    routes: HashMap<String, VhostRoute>,
+    /// path prefix → route (location-based routing)
+    location_routes: HashMap<String, VhostRoute>,
+    /// proxy_name → domains
+    by_proxy: HashMap<String, Vec<String>>,
+    /// proxy_name → location prefixes
+    by_proxy_locations: HashMap<String, Vec<String>>,
+}
+
 /// Manages HTTP VHost routing table (domain + location → proxy).
 pub struct VhostManager {
-    /// domain → route (host-based routing)
-    routes: RwLock<HashMap<String, VhostRoute>>,
-    /// path prefix → route (location-based routing, sorted by prefix length desc)
-    location_routes: RwLock<HashMap<String, VhostRoute>>,
-    /// proxy_name → domains
-    by_proxy: RwLock<HashMap<String, Vec<String>>>,
-    /// proxy_name → location prefixes
-    by_proxy_locations: RwLock<HashMap<String, Vec<String>>>,
+    inner: RwLock<VhostTables>,
 }
 
 impl Default for VhostManager {
@@ -47,10 +52,12 @@ impl Default for VhostManager {
 impl VhostManager {
     pub fn new() -> Self {
         Self {
-            routes: RwLock::new(HashMap::new()),
-            location_routes: RwLock::new(HashMap::new()),
-            by_proxy: RwLock::new(HashMap::new()),
-            by_proxy_locations: RwLock::new(HashMap::new()),
+            inner: RwLock::new(VhostTables {
+                routes: HashMap::new(),
+                location_routes: HashMap::new(),
+                by_proxy: HashMap::new(),
+                by_proxy_locations: HashMap::new(),
+            }),
         }
     }
 
@@ -76,60 +83,58 @@ impl VhostManager {
             route_by_http_user: route_by_http_user.to_string(),
         };
 
-        let mut routes = self.routes.write().await;
-        let mut location_routes = self.location_routes.write().await;
-        let mut by_proxy = self.by_proxy.write().await;
-        let mut by_proxy_locations = self.by_proxy_locations.write().await;
+        let mut tables = self.inner.write().await;
 
         let mut domains_for_proxy = Vec::new();
         for domain in domains {
-            routes.insert(domain.clone(), route.clone());
+            tables.routes.insert(domain.clone(), route.clone());
             domains_for_proxy.push(domain.clone());
         }
         if !domains_for_proxy.is_empty() {
-            by_proxy.insert(proxy_name.to_string(), domains_for_proxy);
+            tables
+                .by_proxy
+                .insert(proxy_name.to_string(), domains_for_proxy);
         }
 
         let mut locs_for_proxy = Vec::new();
         for loc in locations {
-            location_routes.insert(loc.clone(), route.clone());
+            tables.location_routes.insert(loc.clone(), route.clone());
             locs_for_proxy.push(loc.clone());
         }
         if !locs_for_proxy.is_empty() {
-            by_proxy_locations.insert(proxy_name.to_string(), locs_for_proxy);
+            tables
+                .by_proxy_locations
+                .insert(proxy_name.to_string(), locs_for_proxy);
         }
     }
 
     pub async fn unregister(&self, proxy_name: &str) {
-        let mut routes = self.routes.write().await;
-        let mut location_routes = self.location_routes.write().await;
-        let mut by_proxy = self.by_proxy.write().await;
-        let mut by_proxy_locations = self.by_proxy_locations.write().await;
+        let mut tables = self.inner.write().await;
 
-        if let Some(domains) = by_proxy.remove(proxy_name) {
+        if let Some(domains) = tables.by_proxy.remove(proxy_name) {
             for domain in &domains {
-                routes.remove(domain);
+                tables.routes.remove(domain);
             }
         }
-        if let Some(locs) = by_proxy_locations.remove(proxy_name) {
+        if let Some(locs) = tables.by_proxy_locations.remove(proxy_name) {
             for loc in &locs {
-                location_routes.remove(loc);
+                tables.location_routes.remove(loc);
             }
         }
     }
 
     /// Look up by domain (exact match).
     pub async fn lookup(&self, domain: &str) -> Option<VhostRoute> {
-        self.routes.read().await.get(domain).cloned()
+        self.inner.read().await.routes.get(domain).cloned()
     }
 
     /// Look up by URL path (longest prefix match among registered locations).
     /// Returns the VhostRoute whose location prefix best matches the given path.
     pub async fn lookup_by_path(&self, path: &str) -> Option<VhostRoute> {
-        let routes = self.location_routes.read().await;
+        let tables = self.inner.read().await;
         // Find longest matching prefix
         let mut best: Option<(&str, &VhostRoute)> = None;
-        for (prefix, route) in routes.iter() {
+        for (prefix, route) in tables.location_routes.iter() {
             if path.starts_with(prefix.as_str()) {
                 match best {
                     Some((best_prefix, _)) if prefix.len() > best_prefix.len() => {
@@ -262,7 +267,7 @@ async fn serve_vhost_request<S>(
                     "{} VHost: trying user-based routing to '{}'", scheme, user_proxy
                 );
                 if let Some(user_info) = state.proxy_manager.get(&user_proxy).await {
-                    (user_proxy, user_info.run_id)
+                    (user_proxy, user_info.run_id.clone())
                 } else {
                     // User-specific proxy not found — fall through to
                     // the route's own proxy (matching Go frp behavior

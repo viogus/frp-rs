@@ -449,7 +449,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
 
                         let user = user_conn;
                         let (user_r, user_w) = user.into_split();
-                        let (srv_r, srv_w) = server_conn.into_split();
+                        let (srv_r, srv_w) = server_conn.into_split().unwrap();
                         frp_core::bridge::bridge_plain(
                             user_r,
                             user_w,
@@ -505,7 +505,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
 
                         let user = user_conn;
                         let (user_r, user_w) = user.into_split();
-                        let (srv_r, srv_w) = server_conn.into_split();
+                        let (srv_r, srv_w) = server_conn.into_split().unwrap();
                         let use_enc_relay = use_encryption && !sk.is_empty();
                         if use_enc_relay {
                             let key = frp_core::encryption::derive_key(&sk);

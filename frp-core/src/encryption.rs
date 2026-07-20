@@ -1,3 +1,26 @@
+//! Encryption primitives for the frp control connection and data plane.
+//!
+//! # Security Note: V1 CFB is confidentiality-only
+//!
+//! AES-128-CFB (V1 protocol) provides **confidentiality only** — it has no
+//! integrity protection. An attacker who can modify ciphertext can predictably
+//! flip bits in the decrypted plaintext (CFB malleability). This is acceptable
+//! for the frp V1 control channel because:
+//! - The channel carries structured JSON messages — bit flips produce invalid
+//!   JSON, which is caught by serde deserialization.
+//! - The attacker must be on-path (MITM between client and server).
+//! - TLS wraps the transport when available, providing AEAD at the transport
+//!   layer.
+//!
+//! **Prefer V2 protocol** which uses AEAD (AES-256-GCM or XChaCha20-Poly1305)
+//! with HKDF-SHA256 key derivation. V2 provides authenticated encryption
+//! (confidentiality + integrity) and is the recommended protocol for new
+//! deployments. See `frp_core::crypto` and `frp_core::v2_handshake`.
+//!
+//! PBKDF2-SHA1 with 64 iterations and salt "frp" matches the Go frp v0.69.1
+//! binary for wire compatibility. Do not increase iterations — it would break
+//! interop with Go frp.
+
 use cfb_mode::cipher::KeyIvInit;
 use rand::RngCore;
 

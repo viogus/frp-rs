@@ -7,18 +7,7 @@ use frp_core::config::PluginConfig;
 use super::{serve_plugin, PluginHandle};
 
 use crate::util::opt_if_empty;
-
-/// Constant-time slice comparison for auth credential verification.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut acc = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        acc |= x ^ y;
-    }
-    acc == 0
-}
+use frp_core::auth::constant_time_eq;
 
 // ---------------------------------------------------------------
 // SOCKS5 plugin (RFC 1928)

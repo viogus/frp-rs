@@ -17,6 +17,7 @@ pub mod internal_listener;
 pub mod kcp;
 #[cfg(feature = "kcp")]
 pub mod kcp_compat;
+pub mod logging;
 #[cfg(feature = "mem-profile")]
 pub mod mem_profile;
 pub mod metrics;
@@ -40,6 +41,9 @@ pub mod xtcp_p2p;
 pub mod kcp {
     #[derive(Clone, Default)]
     pub struct KcpConfig;
+    pub fn default_kcp_config() -> KcpConfig {
+        KcpConfig
+    }
 }
 #[cfg(not(feature = "kcp"))]
 pub mod xtcp_p2p {
