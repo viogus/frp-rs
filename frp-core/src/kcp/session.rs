@@ -444,11 +444,6 @@ impl KcpSession {
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     self.shutdown = true;
-                    tracing::debug!(
-                        conv = self.conv,
-                        "KCP SESSION: read_tx closed, shutting down conv {}",
-                        self.conv
-                    );
                     return Err(io::Error::new(
                         io::ErrorKind::NotConnected,
                         "KCP read channel closed",
