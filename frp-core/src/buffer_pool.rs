@@ -52,7 +52,7 @@ impl BufferPool {
     /// return at length BUFFER_SIZE (release preserves length); the miss path
     /// allocates via `Vec::with_capacity`, returning length 0.
     pub fn acquire(&self) -> Vec<u8> {
-        let mut inner = self.inner.lock().expect("buffer pool lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner
             .pop_front()
             .unwrap_or_else(|| Vec::with_capacity(*BUFFER_SIZE))
@@ -66,7 +66,7 @@ impl BufferPool {
     /// callers always overwrite via read() before use and only read the
     /// [..n] prefix, so stale bytes are never observed.
     pub fn release(&self, buf: Vec<u8>) {
-        let mut inner = self.inner.lock().expect("buffer pool lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.len() < MAX_POOLED_BUFFERS {
             inner.push_back(buf);
         }

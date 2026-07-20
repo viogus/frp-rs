@@ -39,8 +39,8 @@ pub(crate) async fn dispatch_internal<W: AsyncWriteExt + Unpin>(
         InternalMsg::NatHoleSidOnWorkConn { sid, proxy_name } => {
             super::nathole::handle_sid_on_work_conn(ctx, ctl, writer, sid, proxy_name).await
         }
-        InternalMsg::WriteNatHoleSid { sid, provider_addr } => {
-            super::nathole::handle_write_sid(ctx, ctl, writer, sid, provider_addr).await;
+        InternalMsg::WriteNatHoleSid { sid } => {
+            super::nathole::handle_write_sid(ctx, ctl, writer, sid).await;
             Ok(())
         }
         InternalMsg::WriteNatHoleResp {

@@ -394,10 +394,7 @@ pub(crate) async fn assign_work_to_proxy(
     // this frame without the old ECONNRESET race.
     // V2-aware: use V2 or V1 framing based on protocol version.
     if req.proxy_type == "xtcp" {
-        let dummy = FrpMessage::NatHoleSid(msg::NatHoleSid {
-            sid: None,
-            provider_addr: None,
-        });
+        let dummy = FrpMessage::NatHoleSid(msg::NatHoleSid::default());
         if v2 {
             let _ = work_conn.write_v2_frame(&dummy).await;
         } else {

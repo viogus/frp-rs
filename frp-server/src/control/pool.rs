@@ -145,7 +145,7 @@ pub(crate) async fn write_start_work_conn_with_nat_hole_sid<W: AsyncWriteExt + U
         // Standalone NatHoleSid V1 frame for Go frpc compat.
         let nhs = FrpMessage::NatHoleSid(msg::NatHoleSid {
             sid: Some(params.sid.to_string()),
-            provider_addr: None,
+            ..Default::default()
         });
         if let Err(e) = write_ctl_msg(writer, &nhs, params.v2).await {
             debug!(error = %e, "Failed to send separate NatHoleSid frame (non-fatal): {}", e);

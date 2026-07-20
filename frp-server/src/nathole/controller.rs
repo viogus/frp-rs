@@ -302,6 +302,7 @@ impl Controller {
             if let Some(tx) = session.report_tx.lock().await.take() {
                 let _ = tx.send(msg::NatHoleReport {
                     sid: Some(sid.to_string()),
+                    success: None,
                 });
             }
             return Some(session.proxy_name.clone());
@@ -344,7 +345,7 @@ impl Controller {
 
     /// Forward NatHoleSid to the visitor via control channel.
     /// Returns true if forwarded via ctl path.
-    pub async fn forward_sid_via_ctl(&self, sid: &str, provider_addr: Option<String>) -> bool {
+    pub async fn forward_sid_via_ctl(&self, sid: &str) -> bool {
         let tx = {
             let sessions = self.sessions.read().await;
             sessions.get(sid).and_then(|s| s.visitor_ctl_tx.clone())
@@ -356,7 +357,6 @@ impl Controller {
             let _ = tx
                 .send(InternalMsg::WriteNatHoleSid {
                     sid: sid.to_string(),
-                    provider_addr,
                 })
                 .await;
             return true;

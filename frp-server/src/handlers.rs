@@ -269,9 +269,8 @@ pub(crate) async fn handle_nat_hole_visitor(
 
     // --- Go frp v0.69.1 compat: pre_check validates proxy and permissions
     // without creating a session. Visitor proceeds to STUN after receiving OK.
-    // Check mapped_addrs.is_none() to distinguish from clients that send
-    // pre_check=true with full data (treating it as a full request).
-    if msg.pre_check && msg.mapped_addrs.is_none() {
+    // Go frp controller.go only checks m.PreCheck with no extra conditions.
+    if msg.pre_check {
         debug!(
             proxy_name = %proxy_name,
             "NatHoleVisitor pre_check for proxy '{}': OK",

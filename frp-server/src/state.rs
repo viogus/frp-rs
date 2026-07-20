@@ -59,7 +59,6 @@ pub enum InternalMsg {
     /// Forward NatHoleSid to visitor via control channel (Go frp compat).
     WriteNatHoleSid {
         sid: String,
-        provider_addr: Option<String>,
     },
     /// Forward NatHoleReport to visitor via control channel (Go frp compat).
     WriteNatHoleReport {

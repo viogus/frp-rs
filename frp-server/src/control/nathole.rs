@@ -27,12 +27,11 @@ pub(crate) async fn handle_write_sid<W: AsyncWriteExt + Unpin>(
     _ctl: &mut ControlState,
     writer: &mut W,
     sid: String,
-    provider_addr: Option<String>,
 ) {
     debug!(sid = %sid, "Writing NatHoleSid to visitor via control channel for {}", sid);
     let forward = FrpMessage::NatHoleSid(msg::NatHoleSid {
         sid: Some(sid),
-        provider_addr,
+        ..Default::default()
     });
     if let Err(e) = write_ctl_msg(writer, &forward, ctx.v2).await {
         warn!(error = %e, "Failed to write NatHoleSid to visitor: {}", e);
@@ -61,7 +60,10 @@ pub(crate) async fn handle_write_report<W: AsyncWriteExt + Unpin>(
     sid: String,
 ) {
     debug!(sid = %sid, "Writing NatHoleReport to visitor via control channel for {}", sid);
-    let forward = FrpMessage::NatHoleReport(msg::NatHoleReport { sid: Some(sid) });
+    let forward = FrpMessage::NatHoleReport(msg::NatHoleReport {
+        sid: Some(sid),
+        success: None,
+    });
     if let Err(e) = write_ctl_msg(writer, &forward, ctx.v2).await {
         warn!(error = %e, "Failed to write NatHoleReport to visitor: {}", e);
     }
@@ -179,13 +181,12 @@ pub(crate) async fn handle_nat_hole_sid(
 ) {
     debug!(sid = ?sid_msg.sid, "Received NatHoleSid from provider: {:?}", sid_msg.sid);
     if let Some(ref sid) = sid_msg.sid {
-        let provider_addr = ctx.peer.as_ref().map(|a| a.to_string());
         // Try control-channel path first (Go frp compat).
         if ctx
             .state
             .xtcp
             .nat_hole
-            .forward_sid_via_ctl(sid, provider_addr.clone())
+            .forward_sid_via_ctl(sid)
             .await
         {
             debug!(sid = %sid, "Forwarded NatHoleSid via control channel for {}", sid);
@@ -193,7 +194,7 @@ pub(crate) async fn handle_nat_hole_sid(
             // Fallback: accept-loop writer path
             let forward = FrpMessage::NatHoleSid(msg::NatHoleSid {
                 sid: Some(sid.clone()),
-                provider_addr,
+                ..Default::default()
             });
             if write_ctl_msg(&mut accept_writer, &forward, ctx.v2)
                 .await
@@ -297,6 +298,7 @@ pub(crate) async fn handle_nat_hole_report(
             if let Some(mut accept_writer) = ctx.state.xtcp.nat_hole.take_writer(sid).await {
                 let forward = FrpMessage::NatHoleReport(msg::NatHoleReport {
                     sid: Some(sid.clone()),
+                    success: None,
                 });
                 let _ = write_ctl_msg(&mut accept_writer, &forward, ctx.v2).await;
             }
@@ -463,7 +465,8 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
     // Go frp v0.70 pre_check compat: validate proxy and permissions,
     // return OK without sign_key/timestamp auth or creating a session.
     // Must be BEFORE the sign_key block — precheck skips shared-secret auth.
-    if nhv.pre_check && nhv.mapped_addrs.is_none() {
+    // Go frp controller.go only checks m.PreCheck with no extra conditions.
+    if nhv.pre_check {
         debug!(proxy_name = %proxy_name, user = %login_user, "NatHoleVisitor pre_check on ctl channel: proxy='{}' OK", proxy_name);
         let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
             transaction_id: transaction_id.clone(),

@@ -138,7 +138,11 @@ fn decode_detect_msg(data: &[u8], key: &[u8; 16]) -> Result<NatHoleDetectSid, St
     }
     // Type byte is at offset 0; we don't validate it strictly since some
     // Go messages may use different framing.
-    let json_len = u64::from_be_bytes(frame[1..9].try_into().unwrap()) as usize;
+    let json_len = u64::from_be_bytes(
+        frame[1..9]
+            .try_into()
+            .map_err(|_| "invalid frame: missing length bytes".to_string())?,
+    ) as usize;
     if frame.len() < 9 + json_len {
         return Err(format!(
             "frame truncated: need {} bytes, have {}",
@@ -194,7 +198,9 @@ pub async fn punch_udp_hole(
 
     // --- Send phase: always send "frp" magic (Rust↔Rust compat) ---
     for peer in &peers {
-        let _ = socket.send_to(HOLE_PUNCH_MAGIC, *peer).await;
+        if let Err(e) = socket.send_to(HOLE_PUNCH_MAGIC, *peer).await {
+            tracing::debug!(%peer, error = %e, "XTCP P2P: failed to send hole-punch magic");
+        }
     }
 
     // --- Send phase: Go-compat NatHoleSid ---
@@ -208,7 +214,9 @@ pub async fn punch_udp_hole(
             }
         };
         for peer in &peers {
-            let _ = socket.send_to(&encoded, *peer).await;
+            if let Err(e) = socket.send_to(&encoded, *peer).await {
+                tracing::debug!(%peer, error = %e, "XTCP P2P: failed to send NatHoleSid message");
+            }
         }
     }
 
@@ -253,7 +261,9 @@ pub async fn punch_udp_hole(
                         let mut echo = msg;
                         echo.response = true;
                         if let Ok(encoded) = encode_detect_msg(&echo, enc_key) {
-                            let _ = socket.send_to(&encoded, peer).await;
+                            if let Err(e) = socket.send_to(&encoded, peer).await {
+                                tracing::debug!(%peer, error = %e, "XTCP P2P: failed to echo NatHoleSid response");
+                            }
                             tracing::debug!(peer = %peer, "XTCP P2P: echoed NatHoleSid response to {}", peer);
                         }
                         // Continue waiting for response:true.
@@ -312,7 +322,9 @@ async fn recv_second_attempt(
                         let mut echo = msg;
                         echo.response = true;
                         if let Ok(encoded) = encode_detect_msg(&echo, enc_key) {
-                            let _ = socket.send_to(&encoded, peer).await;
+                            if let Err(e) = socket.send_to(&encoded, peer).await {
+                                tracing::debug!(%peer, error = %e, "XTCP P2P: failed to echo NatHoleSid response");
+                            }
                         }
                     }
                 }

@@ -1317,7 +1317,7 @@ impl Service {
         // Send NatHoleSid FIRST — so visitor can start punching concurrently
         let sid_msg = FrpMessage::NatHoleSid(msg::NatHoleSid {
             sid: Some(sid.clone()),
-            provider_addr: None,
+            ..Default::default()
         });
         if let Err(e) = write_msg(&mut *writer.lock().await, &sid_msg, v2).await {
             warn!(error = %e, "Failed to send NatHoleSid: {}", e);
@@ -1440,7 +1440,10 @@ impl Service {
         sid: String,
         reason: &str,
     ) {
-        let report = FrpMessage::NatHoleReport(msg::NatHoleReport { sid: Some(sid) });
+        let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+            sid: Some(sid),
+            success: None,
+        });
         if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
             debug!(error = %e, "Failed to send NatHoleReport ({reason})");
         }

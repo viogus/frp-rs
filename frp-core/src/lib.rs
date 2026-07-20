@@ -46,10 +46,10 @@ pub mod kcp {
 pub mod xtcp_p2p {
     use tokio::net::UdpSocket;
     pub fn conv_from_sid(_sid: &str) -> u32 {
-        panic!("xtcp_p2p::conv_from_sid requires the 'kcp' feature")
+        0
     }
     pub fn derive_detect_key(_sk: &str) -> [u8; 16] {
-        panic!("xtcp_p2p::derive_detect_key requires the 'kcp' feature")
+        [0u8; 16]
     }
     #[allow(clippy::too_many_arguments)]
     pub async fn xtcp_p2p_connect_yamux(
