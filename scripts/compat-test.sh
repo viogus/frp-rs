@@ -899,9 +899,9 @@ write_frpc_config_xtcp_provider() {
 write_frpc_config_xtcp_visitor() {
     local impl="$1" server_host="$2" server_port="$3" token="$4" visitor_port="$5" \
           server_name="$6" sk="$7" out="$8" features="${9:-}"
-    local has_enc=false has_comp=false
+    local has_enc=false has_comp=false has_kcp=false
     for feat in $features; do
-        case "$feat" in enc) has_enc=true ;; compression) has_comp=true ;; esac
+        case "$feat" in enc) has_enc=true ;; compression) has_comp=true ;; kcp) has_kcp=true ;; esac
     done
     if [[ "$impl" == "go" ]]; then
         {
@@ -916,6 +916,9 @@ write_frpc_config_xtcp_visitor() {
             printf 'bindAddr = "127.0.0.1"\nbindPort = %s\n' "$visitor_port"
             # No fallbackTo — P2P must succeed for the test to pass.
             # STCP fallback would mask XTCP failures (compat matrix P1).
+            # Go frp v0.70 defaults to protocol="quic" for XTCP P2P tunnel.
+            # Rust only supports KCP. Force Go to use KCP for Go↔Rust compat.
+            if $has_kcp; then printf 'protocol = "kcp"\n'; fi
             if $has_enc; then printf 'transport.useEncryption = true\n'; fi
             if $has_comp; then printf 'transport.useCompression = true\n'; fi
         } > "$out"
@@ -2810,9 +2813,9 @@ test_xtcp_r2r_basic() { run_xtcp_test "xtcp-r2r-basic" rust rust rust ""; }
 test_xtcp_g2r_basic() { run_xtcp_test "xtcp-g2r-basic" rust go go ""; }
 test_xtcp_r2g_basic() { run_xtcp_test "xtcp-r2g-basic" go rust rust ""; }
 test_xtcp_go_frps_go_prov_rust_vis() { run_xtcp_test "xtcp-go-frps-go-prov-rust-vis" go go rust ""; }
-test_xtcp_go_frps_rust_prov_go_vis() { run_xtcp_test "xtcp-go-frps-rust-prov-go-vis" go rust go ""; }
+test_xtcp_go_frps_rust_prov_go_vis() { run_xtcp_test "xtcp-go-frps-rust-prov-go-vis" go rust go "kcp"; }
 test_xtcp_rust_frps_go_prov_rust_vis() { run_xtcp_test "xtcp-rust-frps-go-prov-rust-vis" rust go rust ""; }
-test_xtcp_rust_frps_rust_prov_go_vis() { run_xtcp_test "xtcp-rust-frps-rust-prov-go-vis" rust rust go ""; }
+test_xtcp_rust_frps_rust_prov_go_vis() { run_xtcp_test "xtcp-rust-frps-rust-prov-go-vis" rust rust go "kcp"; }
 
 # ── XTCP encrypted variants ──
 
@@ -2821,9 +2824,9 @@ test_xtcp_r2r_enc() { run_xtcp_test "xtcp-r2r-enc" rust rust rust "enc compressi
 test_xtcp_g2r_enc() { run_xtcp_test "xtcp-g2r-enc" rust go go "enc compression"; }
 test_xtcp_r2g_enc() { run_xtcp_test "xtcp-r2g-enc" go rust rust "enc compression"; }
 test_xtcp_go_frps_go_prov_rust_vis_enc() { run_xtcp_test "xtcp-go-frps-go-prov-rust-vis-enc" go go rust "enc compression"; }
-test_xtcp_go_frps_rust_prov_go_vis_enc() { run_xtcp_test "xtcp-go-frps-rust-prov-go-vis-enc" go rust go "enc compression"; }
+test_xtcp_go_frps_rust_prov_go_vis_enc() { run_xtcp_test "xtcp-go-frps-rust-prov-go-vis-enc" go rust go "kcp enc compression"; }
 test_xtcp_rust_frps_go_prov_rust_vis_enc() { run_xtcp_test "xtcp-rust-frps-go-prov-rust-vis-enc" rust go rust "enc compression"; }
-test_xtcp_rust_frps_rust_prov_go_vis_enc() { run_xtcp_test "xtcp-rust-frps-rust-prov-go-vis-enc" rust rust go "enc compression"; }
+test_xtcp_rust_frps_rust_prov_go_vis_enc() { run_xtcp_test "xtcp-rust-frps-rust-prov-go-vis-enc" rust rust go "kcp enc compression"; }
 
 # =============================================================================
 # Test: Multi-proxy (2 TCP proxies on same client)
