@@ -204,3 +204,96 @@ fn test_conv_from_sid_different() {
     assert!(c1 > 0);
     assert!(c2 > 0);
 }
+
+/// Yamux-over-XTCP-P2P roundtrip: hole-punch, create yamux connections,
+/// open stream, send data both ways. Verifies the full yamux data plane
+/// over KCP-in-UDP (Go v0.70 compat path).
+#[cfg(feature = "tcp-mux")]
+#[tokio::test]
+async fn test_xtcp_p2p_yamux_roundtrip() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (a, b, _addr_a, _addr_b) = bind_pair().await;
+
+    let candidate_a = vec![a.local_addr().unwrap().to_string()];
+    let candidate_b = vec![b.local_addr().unwrap().to_string()];
+
+    let conv = 77u32;
+    let kcp_config = frp_core::kcp::KcpConfig {
+        data_shards: 0,
+        parity_shards: 0,
+        ..frp_core::kcp::default_kcp_config()
+    };
+
+    // Spawn provider (server) in a background task so it's ready to
+    // accept when the visitor (client) sends data.
+    // Clone candidates to satisfy 'static requirement of tokio::spawn.
+    let can_a_for_spawn = candidate_a.clone();
+    let cfg_for_spawn = kcp_config.clone();
+    let server = tokio::spawn(async move {
+        frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
+            b,
+            &can_a_for_spawn,
+            conv,
+            cfg_for_spawn,
+            5000,
+            false, // yamux_server = provider (accepts stream)
+            None,  // no sid → simple "frp" magic
+            None,  // no key
+        )
+        .await
+    });
+
+    // Visitor (client): punch, create yamux, open stream.
+    let mut stream_a = frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
+        a,
+        &candidate_b,
+        conv,
+        kcp_config.clone(),
+        5000,
+        true, // yamux_client = visitor (opens stream)
+        None,
+        None,
+    )
+    .await
+    .expect("side A yamux connect");
+
+    // Write data to trigger SYN send. After this flush, the bg driver
+    // on side A will process the SYN frame and send it via KCP.
+    let payload = b"hello xtcp p2p over yamux!";
+    tokio::time::timeout(tokio::time::Duration::from_secs(10), stream_a.write_all(payload))
+        .await
+        .unwrap()
+        .expect("A write");
+    stream_a.flush().await.expect("A flush");
+
+    // Now wait for the provider to accept the stream.
+    let mut stream_b = tokio::time::timeout(tokio::time::Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .expect("server task join")
+        .expect("side B yamux connect");
+
+    // A → B (data already written, just read on B)
+    let mut buf = vec![0u8; payload.len()];
+    tokio::time::timeout(tokio::time::Duration::from_secs(10), stream_b.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .expect("B read");
+    assert_eq!(&buf, payload, "B should receive A's data");
+
+    // B → A
+    let reply = b"hello from B over yamux!";
+    tokio::time::timeout(tokio::time::Duration::from_secs(10), stream_b.write_all(reply))
+        .await
+        .unwrap()
+        .expect("B write");
+    stream_b.flush().await.expect("B flush");
+
+    let mut buf = vec![0u8; reply.len()];
+    tokio::time::timeout(tokio::time::Duration::from_secs(10), stream_a.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .expect("A read");
+    assert_eq!(&buf, reply, "A should receive B's reply");
+}

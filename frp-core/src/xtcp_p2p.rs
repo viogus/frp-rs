@@ -540,6 +540,22 @@ impl AsyncRead for XtcpP2pStream {
         // Poll the read channel for app data from KCP.
         match self.read_rx.poll_recv(cx) {
             Poll::Ready(Some(data)) => {
+                // Diagnostic: log every yamux frame received (infrequent after handshake).
+                if data.len() >= 12 {
+                    let frame_type = data[1];
+                    let frame_flags = u16::from_be_bytes([data[2], data[3]]);
+                    let frame_sid = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                    let frame_len = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+                    tracing::debug!(
+                        peer = %self.peer_addr,
+                        total_bytes = data.len(),
+                        yamux_type = frame_type,
+                        yamux_flags = format_args!("0x{frame_flags:04x}"),
+                        yamux_stream_id = frame_sid,
+                        yamux_len = frame_len,
+                        "XTCP P2P: poll_read got yamux frame"
+                    );
+                }
                 let n = data.len().min(buf.remaining());
                 buf.put_slice(&data[..n]);
                 if n < data.len() {
@@ -594,6 +610,24 @@ impl AsyncWrite for XtcpP2pStream {
         // Drive KCP to flush.
         self.maybe_tick()?;
 
+        // Diagnostic: log every yamux frame write (infrequent after handshake).
+        // Yamux header: [ver:1B, type:1B, flags:2B BE, stream_id:4B BE, len:4B BE]
+        if buf.len() >= 12 {
+            let frame_type = buf[1];
+            let frame_flags = u16::from_be_bytes([buf[2], buf[3]]);
+            let frame_sid = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            let frame_len = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+            tracing::debug!(
+                peer = %self.peer_addr,
+                total_bytes = buf.len(),
+                yamux_type = frame_type,
+                yamux_flags = format_args!("0x{frame_flags:04x}"),
+                yamux_stream_id = frame_sid,
+                yamux_len = frame_len,
+                "XTCP P2P: poll_write yamux frame sent"
+            );
+        }
+
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -608,6 +642,7 @@ impl AsyncWrite for XtcpP2pStream {
         // Drain any pending_send buffered during the current tick window
         // (maybe_tick skips drive_kcp when elapsed < KCP_TICK_MS, so poll_write
         // data may sit in pending_send without reaching KCP's snd_queue).
+        let pending_drain_len = self.pending_send.len();
         if !self.pending_send.is_empty() {
             let data = std::mem::take(&mut self.pending_send);
             let _ = self.session.send(&data);
@@ -619,6 +654,17 @@ impl AsyncWrite for XtcpP2pStream {
             Ok(pkts) => pkts,
             Err(e) => return Poll::Ready(Err(e)),
         };
+
+        if pending_drain_len > 0 || !out_packets.is_empty() {
+            let total_sent: usize = out_packets.iter().map(|p| p.len()).sum();
+            tracing::debug!(
+                peer = %self.peer_addr,
+                pending_bytes = pending_drain_len,
+                kcp_packets = out_packets.len(),
+                total_udp_bytes = total_sent,
+                "XTCP P2P: poll_flush sent KCP data"
+            );
+        }
 
         for pkt in &out_packets {
             match self.socket.try_send_to(pkt, self.peer_addr) {
