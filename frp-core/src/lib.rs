@@ -41,6 +41,9 @@ pub mod xtcp_p2p;
 pub mod kcp {
     #[derive(Clone, Default)]
     pub struct KcpConfig;
+    pub fn default_kcp_config() -> KcpConfig {
+        KcpConfig
+    }
 }
 #[cfg(not(feature = "kcp"))]
 pub mod xtcp_p2p {

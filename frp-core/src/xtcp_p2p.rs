@@ -59,16 +59,21 @@ pub const DEFAULT_HOLE_PUNCH_TIMEOUT_MS: u64 = 5000;
 ///
 /// The NAT hole-punch session ID (`sid`) is known to both visitor (via
 /// `NatHoleResp.sid`) and provider (via `XtcpNotification` / `NatHoleResp`).
-pub fn conv_from_sid(sid: &str) -> u32 {
-    // Use MD5 for deterministic cross-process hashing.
-    // DefaultHasher (SipHash) uses a per-process random key — two processes
-    // hashing the same sid get different values, causing KCP conv mismatch
-    // and "conv inconsistent" errors on P2P hole-punched connections.
-    use md5::{Digest, Md5};
-    let digest = Md5::digest(sid.as_bytes());
-    let mut buf = [0u8; 4];
-    buf.copy_from_slice(&digest[..4]);
-    (u32::from_be_bytes(buf)).max(1)
+pub fn conv_from_sid(_sid: &str) -> u32 {
+    // Go frp v0.70 uses kcp-go's auto-assigned conv (global atomic counter
+    // starting from 0, with atomic.AddUint32 returning 1 on first call).
+    // The XTCP P2P KCP session is the first (and only) KCP session created
+    // by Go frp for P2P, so it always gets conv=1.
+    //
+    // Hard-coding conv=1 on the Rust side ensures KCP conv matches Go's
+    // without fragile conv learning (input_conv). Each XtcpP2pStream has
+    // its own UDP socket, so conv collisions are harmless for multiplexed
+    // P2P sessions.
+    //
+    // Previously used MD5(sid) for deterministic cross-process conv, but
+    // this diverges from Go's auto-assigned conv and requires input_conv
+    // which is vulnerable to stray KCP packets on shared-VPS CI.
+    1u32
 }
 
 // ---------------------------------------------------------------------------
@@ -196,15 +201,15 @@ pub async fn punch_udp_hole(
         return Err("no valid candidate addresses".into());
     }
 
-    // --- Send phase: always send "frp" magic (Rust↔Rust compat) ---
-    for peer in &peers {
-        if let Err(e) = socket.send_to(HOLE_PUNCH_MAGIC, *peer).await {
-            tracing::debug!(%peer, error = %e, "XTCP P2P: failed to send hole-punch magic");
-        }
-    }
-
-    // --- Send phase: Go-compat NatHoleSid ---
-    if let (Some(sid_str), Some(enc_key)) = (sid, key) {
+    // --- Send phase: Go-compat NatHoleSid (only when key+sid present) ---
+    // Go frp v0.70 sends only encrypted NatHoleSid probes; it does NOT
+    // understand "frp" magic. Sending "frp" (3 bytes) to a Go peer causes
+    // "decode sid message error: ciphertext too short" because Go tries
+    // crypto.Decode on the 3-byte magic (< 16-byte AES IV).
+    let go_compat = sid.is_some() && key.is_some();
+    if go_compat {
+        let sid_str = sid.unwrap();
+        let enc_key = key.unwrap();
         let detect_msg = NatHoleDetectSid::new(sid_str, false);
         let encoded = match encode_detect_msg(&detect_msg, enc_key) {
             Ok(e) => e,
@@ -216,6 +221,13 @@ pub async fn punch_udp_hole(
         for peer in &peers {
             if let Err(e) = socket.send_to(&encoded, *peer).await {
                 tracing::debug!(%peer, error = %e, "XTCP P2P: failed to send NatHoleSid message");
+            }
+        }
+    } else {
+        // Simple "frp" magic (Rust↔Rust with no encryption key).
+        for peer in &peers {
+            if let Err(e) = socket.send_to(HOLE_PUNCH_MAGIC, *peer).await {
+                tracing::debug!(%peer, error = %e, "XTCP P2P: failed to send hole-punch magic");
             }
         }
     }
@@ -258,6 +270,11 @@ pub async fn punch_udp_hole(
                             return Ok(peer);
                         }
                         // Got response:false probe → echo back (Go receiver role).
+                        // Go frp v0.70 receiver returns raddr immediately after
+                        // echoing; it does NOT wait for a response:true from the
+                        // sender (the sender never sends response:true — it only
+                        // waits for an echo). If we enter recv_second_attempt,
+                        // we deadlock waiting for a message that never comes.
                         let mut echo = msg;
                         echo.response = true;
                         if let Ok(encoded) = encode_detect_msg(&echo, enc_key) {
@@ -266,8 +283,9 @@ pub async fn punch_udp_hole(
                             }
                             tracing::debug!(peer = %peer, "XTCP P2P: echoed NatHoleSid response to {}", peer);
                         }
-                        // Continue waiting for response:true.
-                        return recv_second_attempt(socket, timeout_ms, sid, key, &peers).await;
+                        // Hole punch complete after echoing the probe.
+                        // The sender will receive our echo and proceed.
+                        return Ok(peer);
                     }
                     Err(_) => {
                         // Not NatHoleSid either — unknown data.
@@ -317,7 +335,10 @@ async fn recv_second_attempt(
                     if msg.sid == sid_str && msg.response {
                         return Ok(peer);
                     }
-                    // Echo response:false probes.
+                    // Echo response:false probe → return immediately.
+                    // Same as Go receiver: after echoing, the hole punch is
+                    // complete. Don't wait for response:true — the sender side
+                    // never sends one (it's waiting for our echo).
                     if msg.sid == sid_str && !msg.response {
                         let mut echo = msg;
                         echo.response = true;
@@ -326,6 +347,7 @@ async fn recv_second_attempt(
                                 tracing::debug!(%peer, error = %e, "XTCP P2P: failed to echo NatHoleSid response");
                             }
                         }
+                        return Ok(peer);
                     }
                 }
             }
@@ -457,6 +479,14 @@ impl XtcpP2pStream {
             match self.socket.try_recv_from(&mut buf) {
                 Ok((n, src)) => {
                     if src == self.peer_addr {
+                        // Skip hole-punch magic ("frp") that may arrive
+                        // after hole punch completes (stray packets still
+                        // in-flight). KCP's input() rejects packets < 24
+                        // bytes (header size); 3-byte "frp" causes an
+                        // error that kills the KCP session → yamux timeout.
+                        if &buf[..n] == HOLE_PUNCH_MAGIC {
+                            continue;
+                        }
                         self.session.input(&buf[..n])?;
                     } else {
                         // Drop packets from unexpected sources after
@@ -527,6 +557,22 @@ impl AsyncRead for XtcpP2pStream {
         // Poll the read channel for app data from KCP.
         match self.read_rx.poll_recv(cx) {
             Poll::Ready(Some(data)) => {
+                // Diagnostic: log every yamux frame received (infrequent after handshake).
+                if data.len() >= 12 {
+                    let frame_type = data[1];
+                    let frame_flags = u16::from_be_bytes([data[2], data[3]]);
+                    let frame_sid = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                    let frame_len = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+                    tracing::debug!(
+                        peer = %self.peer_addr,
+                        total_bytes = data.len(),
+                        yamux_type = frame_type,
+                        yamux_flags = format_args!("0x{frame_flags:04x}"),
+                        yamux_stream_id = frame_sid,
+                        yamux_len = frame_len,
+                        "XTCP P2P: poll_read got yamux frame"
+                    );
+                }
                 let n = data.len().min(buf.remaining());
                 buf.put_slice(&data[..n]);
                 if n < data.len() {
@@ -581,6 +627,24 @@ impl AsyncWrite for XtcpP2pStream {
         // Drive KCP to flush.
         self.maybe_tick()?;
 
+        // Diagnostic: log every yamux frame write (infrequent after handshake).
+        // Yamux header: [ver:1B, type:1B, flags:2B BE, stream_id:4B BE, len:4B BE]
+        if buf.len() >= 12 {
+            let frame_type = buf[1];
+            let frame_flags = u16::from_be_bytes([buf[2], buf[3]]);
+            let frame_sid = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            let frame_len = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+            tracing::debug!(
+                peer = %self.peer_addr,
+                total_bytes = buf.len(),
+                yamux_type = frame_type,
+                yamux_flags = format_args!("0x{frame_flags:04x}"),
+                yamux_stream_id = frame_sid,
+                yamux_len = frame_len,
+                "XTCP P2P: poll_write yamux frame sent"
+            );
+        }
+
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -595,6 +659,7 @@ impl AsyncWrite for XtcpP2pStream {
         // Drain any pending_send buffered during the current tick window
         // (maybe_tick skips drive_kcp when elapsed < KCP_TICK_MS, so poll_write
         // data may sit in pending_send without reaching KCP's snd_queue).
+        let pending_drain_len = self.pending_send.len();
         if !self.pending_send.is_empty() {
             let data = std::mem::take(&mut self.pending_send);
             let _ = self.session.send(&data);
@@ -607,11 +672,21 @@ impl AsyncWrite for XtcpP2pStream {
             Err(e) => return Poll::Ready(Err(e)),
         };
 
+        if pending_drain_len > 0 || !out_packets.is_empty() {
+            let total_sent: usize = out_packets.iter().map(|p| p.len()).sum();
+            tracing::debug!(
+                peer = %self.peer_addr,
+                pending_bytes = pending_drain_len,
+                kcp_packets = out_packets.len(),
+                total_udp_bytes = total_sent,
+                "XTCP P2P: poll_flush sent KCP data"
+            );
+        }
+
         for pkt in &out_packets {
             match self.socket.try_send_to(pkt, self.peer_addr) {
                 Ok(_) => {}
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // Try blocking send for critical flush
                     tracing::debug!(
                         peer = %self.peer_addr,
                         "XTCP P2P: UDP send would block on flush"
@@ -621,11 +696,18 @@ impl AsyncWrite for XtcpP2pStream {
             }
         }
 
-        // Also drain any incoming data.
+        // Also drain any incoming data and push decoded KCP app data
+        // to the read channel. MUST call recv_and_push after input —
+        // otherwise KCP decodes data internally but never exposes it
+        // to poll_read, and the subsequent maybe_tick() would skip
+        // drive_kcp() because poll_flush reset last_update (before fix).
         let mut buf = [0u8; 2048];
         loop {
             match self.socket.try_recv_from(&mut buf) {
                 Ok((n, src)) if src == self.peer_addr => {
+                    if &buf[..n] == HOLE_PUNCH_MAGIC {
+                        continue;
+                    }
                     if let Err(e) = self.session.input(&buf[..n]) {
                         tracing::debug!(error = %e, "XTCP P2P: input error on flush");
                     }
@@ -635,8 +717,13 @@ impl AsyncWrite for XtcpP2pStream {
                 Err(_) => break,
             }
         }
+        if let Err(e) = self.session.recv_and_push() {
+            tracing::debug!(error = %e, "XTCP P2P: recv_and_push error on flush");
+        }
 
-        self.last_update = Instant::now();
+        // Do NOT reset last_update here. poll_flush is called on every yamux
+        // I/O drive; resetting would prevent maybe_tick from ever reaching
+        // KCP_TICK_MS, permanently stalling the data receive path.
         Poll::Ready(Ok(()))
     }
 
@@ -731,7 +818,6 @@ pub async fn xtcp_p2p_connect_yamux(
     key: Option<&[u8; 16]>,
 ) -> Result<crate::mux::YamuxStream, String> {
     use futures_util::future::poll_fn;
-    use std::sync::Mutex;
     use std::time::Duration;
     use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
     use yamux::{Config, Connection, Mode};
@@ -748,13 +834,11 @@ pub async fn xtcp_p2p_connect_yamux(
     )
     .await?;
 
-    // 2. Extract write notifier before yamux consumes the KCP stream.
-    let write_notify = kcp_stream.write_notifier();
-
-    // 3. Compat KCP stream to futures traits for yamux.
+    // 2. Compat KCP stream to futures traits for yamux.
     let compat_stream = kcp_stream.compat();
 
-    // 4. Create yamux Connection.
+    // 3. Create yamux Connection behind a tokio Mutex so lock
+    //    contention yields instead of blocking the worker thread.
     let mut yamux_cfg = Config::default();
     yamux_cfg.set_max_connection_receive_window(Some(128 * 1024 * 1024));
     yamux_cfg.set_max_num_streams(256);
@@ -765,12 +849,16 @@ pub async fn xtcp_p2p_connect_yamux(
         Mode::Server
     };
     let conn = Connection::new(compat_stream, yamux_cfg, mode);
-    let conn = Arc::new(Mutex::new(conn));
+    tracing::info!(
+        conv,
+        role = if yamux_client { "client" } else { "server" },
+        "yamux P2P: Connection created"
+    );
+    let conn = Arc::new(tokio::sync::Mutex::new(conn));
 
-    // 4. Background task MUST start before the initial stream accept/open.
-    //    Yamux I/O drives KCP ticks (poll_read/poll_write → maybe_tick).
-    //    Without the background task, KCP stalls and the initial handshake
-    //    times out because nobody reads UDP data while waiting.
+    // 4. Background driver: periodically poll yamux to drive KCP ticks.
+    //    Uses a noop-waker poll so each call is a single non-blocking
+    //    probe — no circular waker dependency, no select! deadlock.
     let tick_ms = KCP_TICK_MS as u64;
     let bg_conn = conn.clone();
     let (stream_tx, stream_rx) = tokio::sync::oneshot::channel::<Result<yamux::Stream, String>>();
@@ -778,68 +866,81 @@ pub async fn xtcp_p2p_connect_yamux(
     tokio::spawn(async move {
         let keepalive = Duration::from_millis(tick_ms);
         let mut stream_tx = Some(stream_tx);
+        let mut loop_count: u64 = 0;
         loop {
-            // select! with write_notify avoids pure timeout-based busy-poll:
-            // write activity wakes the driver immediately; the sleep branch
-            // provides the periodic KCP tick for retransmission timing.
-            tokio::select! {
-                biased;
-                _ = write_notify.notified() => {
-                    // Write activity — drive yamux to flush pending frames
-                    // and tick KCP without waiting for the next sleep.
-                    let _ = poll_fn(|cx| {
-                        let mut c = bg_conn.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = c.poll_next_inbound(cx);
-                        std::task::Poll::Ready(())
-                    }).await;
-                }
-                result = poll_fn(|cx| {
-                    let mut c = bg_conn.lock().unwrap_or_else(|e| e.into_inner());
-                    // Double-poll: first poll processes stream commands
-                    // into pending_frames; second poll sends them on wire.
+            loop_count += 1;
+            if loop_count.is_multiple_of(100) {
+                tracing::debug!(count = loop_count, "yamux P2P: bg driver loop still alive");
+            }
+            // Acquire the lock (async — yields if contended).
+            let mut c = bg_conn.lock().await;
+            // Use timeout + poll_fn with a real tokio waker, matching the
+            // server_mux pattern in mux.rs. The timeout ensures periodic
+            // KCP ticks (via poll_read → maybe_tick → drive_kcp) even when
+            // poll_next_inbound returns Pending (which is always, because
+            // XtcpP2pStream's waker is self-referential — data is pushed by
+            // maybe_tick which runs inside poll_read itself).
+            let result = tokio::time::timeout(
+                keepalive,
+                poll_fn(|cx| {
                     match c.poll_next_inbound(cx) {
                         Poll::Ready(r) => Poll::Ready(r),
-                        Poll::Pending => Poll::Pending,
+                        Poll::Pending => {
+                            // Double-poll: first poll processes stream
+                            // commands into pending_frames; second poll
+                            // sends them on the wire (matches mux.rs).
+                            c.poll_next_inbound(cx)
+                        }
                     }
-                }) => {
-                    match result {
-                        Some(Ok(stream)) => {
-                            if let Some(tx) = stream_tx.take() {
-                                // Send first accepted stream back to connect function.
-                                // If receiver is gone, connection closed — exit.
-                                if tx.send(Ok(stream)).is_err() {
-                                    tracing::debug!("yamux P2P: caller dropped, exiting");
-                                    break;
-                                }
-                            } else {
-                                tracing::debug!("yamux P2P: unexpected inbound stream, ignoring");
-                            }
-                        }
-                        Some(Err(e)) => {
-                            // If the caller hasn't received a stream yet, send the
-                            // error so it doesn't wait for the full timeout.
-                            if let Some(tx) = stream_tx.take() {
-                                let _ = tx.send(Err(format!("yamux: {e}")));
-                            }
-                            tracing::debug!("yamux P2P: connection error, exiting");
-                            break;
-                        }
-                        None => {
-                            if let Some(tx) = stream_tx.take() {
-                                let _ = tx.send(Err("yamux: connection closed before stream".into()));
-                            }
-                            tracing::debug!("yamux P2P: connection closed, exiting");
+                }),
+            )
+            .await;
+            match result {
+                Ok(Some(Ok(stream))) => {
+                    drop(c);
+                    tracing::info!(
+                        stream_id = stream.id().val(),
+                        "yamux P2P: accepted inbound stream"
+                    );
+                    if let Some(tx) = stream_tx.take() {
+                        if tx.send(Ok(stream)).is_err() {
+                            tracing::debug!("yamux P2P: caller dropped, exiting");
                             break;
                         }
                     }
                 }
-                _ = tokio::time::sleep(keepalive) => {
-                    // Periodic KCP tick for retransmission timing.
-                    let _ = poll_fn(|cx| {
-                        let mut c = bg_conn.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = c.poll_next_inbound(cx);
-                        std::task::Poll::Ready(())
-                    }).await;
+                Ok(Some(Err(e))) => {
+                    drop(c);
+                    if let Some(tx) = stream_tx.take() {
+                        let _ = tx.send(Err(format!("yamux: {e}")));
+                    }
+                    tracing::warn!(
+                        error = %e,
+                        kind = ?e,
+                        loop_count,
+                        "yamux P2P: connection error, exiting"
+                    );
+                    break;
+                }
+                Ok(None) => {
+                    drop(c);
+                    if let Some(tx) = stream_tx.take() {
+                        let _ = tx.send(Err("yamux: connection closed before stream".into()));
+                    }
+                    tracing::warn!(
+                        loop_count,
+                        "yamux P2P: connection closed before stream (EOF)"
+                    );
+                    break;
+                }
+                Err(_elapsed) => {
+                    // Timeout: keepalive expired without a stream.
+                    // KCP tick was driven by poll_read→maybe_tick inside
+                    // poll_next_inbound. Drop lock, loop, try again.
+                    drop(c);
+                    if loop_count <= 5 {
+                        tracing::debug!(loop_count, "yamux P2P: bg driver tick (no stream yet)");
+                    }
                 }
             }
         }
@@ -848,23 +949,24 @@ pub async fn xtcp_p2p_connect_yamux(
 
     // 5. Open or accept the first yamux stream.
     let stream = if yamux_client {
-        // Visitor: open a new outbound stream on the shared connection.
-        // The background task continuously drives poll_next_inbound,
-        // which flushes yamux frames (including the SYN for this stream)
-        // to the KCP socket.
-        tokio::time::timeout(
+        // Visitor: acquire lock, open outbound stream, release.
+        let mut c = conn.lock().await;
+        tracing::info!("yamux P2P: opening outbound stream...");
+        let stream = tokio::time::timeout(
             Duration::from_secs(10),
-            poll_fn(|cx| {
-                conn.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .poll_new_outbound(cx)
-            }),
+            poll_fn(|cx| c.poll_new_outbound(cx)),
         )
         .await
         .map_err(|_| "yamux: timeout opening stream (10s)".to_string())?
-        .map_err(|e| format!("yamux open stream: {e}"))?
+        .map_err(|e| format!("yamux open stream: {e}"))?;
+        tracing::info!(
+            stream_id = stream.id().val(),
+            "yamux P2P: outbound stream opened"
+        );
+        stream
     } else {
         // Provider: wait for the background task to accept the first stream.
+        tracing::info!("yamux P2P: waiting for inbound stream...");
         tokio::time::timeout(Duration::from_secs(10), stream_rx)
             .await
             .map_err(|_| "yamux: timeout waiting for stream (10s)".to_string())?
