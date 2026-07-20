@@ -1,3 +1,6 @@
+//! frp client daemon (`frpc`) — registers proxies with an frp server, accepts
+//! work connections, and bridges traffic to local services.
+
 #[cfg(feature = "admin")]
 pub mod admin;
 pub mod control;

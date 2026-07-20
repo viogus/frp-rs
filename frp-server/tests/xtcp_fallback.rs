@@ -494,28 +494,33 @@ async fn test_xtcp_nat_hole_report_cleanup() {
         .expect("send NatHoleClient on control");
 
     // --- Provider reads NatHoleResp ---
-    match read_msg_v1(&mut provider_ctl)
-        .await
-        .expect("read provider NatHoleResp")
-    {
-        FrpMessage::NatHoleResp(resp) => {
-            assert!(
-                resp.error.is_none(),
-                "provider NatHoleResp error: {:?}",
-                resp.error
-            );
-            assert_eq!(resp.sid.as_deref(), Some(sid.as_str()));
-            if let Some(ref candidates) = resp.candidate_addrs {
+    // Drain any pool-replenish ReqWorkConn messages before the response.
+    loop {
+        match read_msg_v1(&mut provider_ctl)
+            .await
+            .expect("read provider control")
+        {
+            FrpMessage::ReqWorkConn(_) => continue,
+            FrpMessage::NatHoleResp(resp) => {
                 assert!(
-                    candidates.iter().any(|a| a.contains("1.2.3.4")),
-                    "provider's candidate_addrs should contain visitor addresses"
+                    resp.error.is_none(),
+                    "provider NatHoleResp error: {:?}",
+                    resp.error
                 );
+                assert_eq!(resp.sid.as_deref(), Some(sid.as_str()));
+                if let Some(ref candidates) = resp.candidate_addrs {
+                    assert!(
+                        candidates.iter().any(|a| a.contains("1.2.3.4")),
+                        "provider's candidate_addrs should contain visitor addresses"
+                    );
+                }
+                break;
             }
+            other => panic!(
+                "expected NatHoleResp on provider control, got: {:?}",
+                other.v1_type_byte()
+            ),
         }
-        other => panic!(
-            "expected NatHoleResp on provider control, got: {:?}",
-            other.v1_type_byte()
-        ),
     }
 
     // --- Visitor reads NatHoleResp ---

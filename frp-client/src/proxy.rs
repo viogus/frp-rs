@@ -215,7 +215,7 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
     // is active, otherwise use the fast copy_bidirectional path.
     if use_compression || read_lim.is_some() || write_lim.is_some() {
         let (l_r, l_w) = tokio::io::split(local);
-        let (w_r, w_w) = work.into_split();
+        let (w_r, w_w) = work.into_split().unwrap();
         bridge::bridge_plain_rate_limited(
             l_r,
             l_w,

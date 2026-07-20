@@ -222,34 +222,39 @@ async fn test_xtcp_nat_hole_message_routing() {
     println!("Provider sent NatHoleClient on control with STUN addresses");
 
     // --- Provider reads NatHoleResp from server on control conn ---
-    match read_msg_v1(&mut provider_ctl)
-        .await
-        .expect("read NatHoleResp from provider control")
-    {
-        FrpMessage::NatHoleResp(resp) => {
-            assert!(
-                resp.error.is_none(),
-                "provider NatHoleResp error: {:?}",
-                resp.error
-            );
-            assert_eq!(resp.sid.as_deref(), Some(sid.as_str()));
-            // Provider should get VISITOR's mapped addresses as candidates
-            if let Some(ref candidates) = resp.candidate_addrs {
+    // Drain any pool-replenish ReqWorkConn messages before the response.
+    loop {
+        match read_msg_v1(&mut provider_ctl)
+            .await
+            .expect("read provider control")
+        {
+            FrpMessage::ReqWorkConn(_) => continue,
+            FrpMessage::NatHoleResp(resp) => {
                 assert!(
-                    candidates.iter().any(|a| a.contains("1.2.3.4")),
-                    "provider's candidate_addrs should contain visitor addresses, got: {:?}",
-                    candidates
+                    resp.error.is_none(),
+                    "provider NatHoleResp error: {:?}",
+                    resp.error
                 );
+                assert_eq!(resp.sid.as_deref(), Some(sid.as_str()));
+                // Provider should get VISITOR's mapped addresses as candidates
+                if let Some(ref candidates) = resp.candidate_addrs {
+                    assert!(
+                        candidates.iter().any(|a| a.contains("1.2.3.4")),
+                        "provider's candidate_addrs should contain visitor addresses, got: {:?}",
+                        candidates
+                    );
+                }
+                println!(
+                    "Provider received NatHoleResp with visitor addresses: detect_behavior={:?}",
+                    resp.detect_behavior
+                );
+                break;
             }
-            println!(
-                "Provider received NatHoleResp with visitor addresses: detect_behavior={:?}",
-                resp.detect_behavior
-            );
+            other => panic!(
+                "expected NatHoleResp on provider control, got: {:?}",
+                other.v1_type_byte()
+            ),
         }
-        other => panic!(
-            "expected NatHoleResp on provider control, got: {:?}",
-            other.v1_type_byte()
-        ),
     }
 
     // --- Visitor reads NatHoleResp with provider's candidate addresses ---

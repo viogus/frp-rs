@@ -9,11 +9,14 @@ use std::collections::HashSet;
 /// Constant for the exec-based token source feature.
 pub const TOKEN_SOURCE_EXEC: &str = "TokenSourceExec";
 
+/// Constant for the file-based token source feature.
+pub const TOKEN_SOURCE_FILE: &str = "TokenSourceFile";
+
 /// Client-side unsafe features that require explicit opt-in.
-pub const CLIENT_UNSAFE_FEATURES: &[&str] = &[TOKEN_SOURCE_EXEC];
+pub const CLIENT_UNSAFE_FEATURES: &[&str] = &[TOKEN_SOURCE_EXEC, TOKEN_SOURCE_FILE];
 
 /// Server-side unsafe features that require explicit opt-in.
-pub const SERVER_UNSAFE_FEATURES: &[&str] = &[TOKEN_SOURCE_EXEC];
+pub const SERVER_UNSAFE_FEATURES: &[&str] = &[TOKEN_SOURCE_EXEC, TOKEN_SOURCE_FILE];
 
 /// Set of allowed unsafe features.
 ///
@@ -56,6 +59,7 @@ mod tests {
     fn test_empty_disallows_all() {
         let uf = UnsafeFeatures::default();
         assert!(!uf.is_enabled(TOKEN_SOURCE_EXEC));
+        assert!(!uf.is_enabled(TOKEN_SOURCE_FILE));
         assert!(!uf.is_enabled("Other"));
     }
 
@@ -63,6 +67,7 @@ mod tests {
     fn test_client_allowlist() {
         let uf = UnsafeFeatures::new(CLIENT_UNSAFE_FEATURES);
         assert!(uf.is_enabled(TOKEN_SOURCE_EXEC));
+        assert!(uf.is_enabled(TOKEN_SOURCE_FILE));
         assert!(!uf.is_enabled("OtherFeature"));
     }
 
@@ -70,6 +75,7 @@ mod tests {
     fn test_server_allowlist() {
         let uf = UnsafeFeatures::new(SERVER_UNSAFE_FEATURES);
         assert!(uf.is_enabled(TOKEN_SOURCE_EXEC));
+        assert!(uf.is_enabled(TOKEN_SOURCE_FILE));
     }
 
     #[test]

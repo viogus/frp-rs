@@ -17,6 +17,7 @@ pub mod internal_listener;
 pub mod kcp;
 #[cfg(feature = "kcp")]
 pub mod kcp_compat;
+pub mod logging;
 #[cfg(feature = "mem-profile")]
 pub mod mem_profile;
 pub mod metrics;

@@ -175,7 +175,7 @@ pub(crate) async fn assign_udp_work_conn(
     }
     debug!(proxy_name = %proxy_name, "UDP work conn assigned to '{}', starting bridge tasks", proxy_name);
 
-    let (mut w_r, mut w_w) = work_conn.into_split();
+    let (mut w_r, mut w_w) = work_conn.into_split().unwrap();
 
     // Task: read UDPPacket from work conn → send to UDP socket
     let sock_w = sock.clone();
@@ -464,8 +464,8 @@ pub(crate) async fn assign_work_to_proxy(
             let key = encryption_key;
             if !req.response_headers.is_empty() && req.proxy_type.starts_with("http") {
                 let headers = req.response_headers;
-                let (u_r, u_w) = req.user_conn.into_split();
-                let (w_r, w_w) = work_conn.into_split();
+                let (u_r, u_w) = req.user_conn.into_split().unwrap();
+                let (w_r, w_w) = work_conn.into_split().unwrap();
                 let injector = ResponseHeaderInjector::new(w_r, headers);
                 frp_core::bridge::bridge_encrypted(
                     u_r,
@@ -484,7 +484,7 @@ pub(crate) async fn assign_work_to_proxy(
             }
             match work_conn {
                 IoStream::Tcp(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(
                         u_r,
@@ -502,7 +502,7 @@ pub(crate) async fn assign_work_to_proxy(
                 }
                 #[cfg(feature = "tls")]
                 IoStream::Tls(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(
                         u_r,
@@ -520,7 +520,7 @@ pub(crate) async fn assign_work_to_proxy(
                 }
                 #[cfg(feature = "kcp")]
                 IoStream::Kcp(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(
                         u_r,
@@ -538,7 +538,7 @@ pub(crate) async fn assign_work_to_proxy(
                 }
                 #[cfg(feature = "websocket")]
                 IoStream::WebSocket(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(
                         u_r,
@@ -556,7 +556,7 @@ pub(crate) async fn assign_work_to_proxy(
                 }
                 #[cfg(feature = "quic")]
                 IoStream::Quic(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
                     let (w_r, w_w) = work.into_split();
                     frp_core::bridge::bridge_encrypted(
                         u_r,
@@ -573,7 +573,7 @@ pub(crate) async fn assign_work_to_proxy(
                     .await;
                 }
                 IoStream::Yamux(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(
                         u_r,
@@ -598,7 +598,7 @@ pub(crate) async fn assign_work_to_proxy(
                     return;
                 }
                 IoStream::SshChannel(work) => {
-                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(
                         u_r,
@@ -615,7 +615,7 @@ pub(crate) async fn assign_work_to_proxy(
                     .await;
                 }
                 IoStream::PreRead(_, work) => {
-                    let (u_r, u_w) = req.user_conn.into_split();
+                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(
                         u_r,
@@ -632,8 +632,8 @@ pub(crate) async fn assign_work_to_proxy(
                     .await;
                 }
                 IoStream::BufferedRead(_, _, inner) => {
-                    let (u_r, u_w) = req.user_conn.into_split();
-                    let (w_r, w_w) = inner.into_split();
+                    let (u_r, u_w) = req.user_conn.into_split().unwrap();
+                    let (w_r, w_w) = inner.into_split().unwrap();
                     frp_core::bridge::bridge_encrypted(
                         u_r,
                         u_w,
@@ -679,8 +679,8 @@ pub(crate) async fn assign_work_to_proxy(
                 }
             } else if read_lim.is_some() || write_lim.is_some() {
                 // Bandwidth limiting active: use rate-limited plain bridge.
-                let (u_r, u_w) = req.user_conn.into_split();
-                let (w_r, w_w) = work_conn.into_split();
+                let (u_r, u_w) = req.user_conn.into_split().unwrap();
+                let (w_r, w_w) = work_conn.into_split().unwrap();
                 if !req.response_headers.is_empty() && req.proxy_type.starts_with("http") {
                     let injector = ResponseHeaderInjector::new(w_r, req.response_headers);
                     frp_core::bridge::bridge_plain_rate_limited(
@@ -716,8 +716,8 @@ pub(crate) async fn assign_work_to_proxy(
                 relay_plain_fast(req.user_conn, work_conn, &metrics).await;
             } else {
                 // Slow path: compression, VHost pre-read, or header injection.
-                let (u_r, u_w) = req.user_conn.into_split();
-                let (w_r, w_w) = work_conn.into_split();
+                let (u_r, u_w) = req.user_conn.into_split().unwrap();
+                let (w_r, w_w) = work_conn.into_split().unwrap();
                 if !req.response_headers.is_empty() && req.proxy_type.starts_with("http") {
                     let injector = ResponseHeaderInjector::new(w_r, req.response_headers);
                     frp_core::bridge::bridge_plain(

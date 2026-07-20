@@ -103,6 +103,11 @@ pub struct Service {
     /// Per-proxy health check cancel flags. Keyed by proxy name.
     /// Set to true on CloseProxy/CloseProxyResp; entry removed in try_reload.
     health_cancels: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// Channel sender for health check failures. Cloned by try_reload()
+    /// to spawn health checks for new/changed proxies after reload.
+    health_tx: mpsc::Sender<String>,
+    /// Receiver side of health channel — consumed by run().
+    health_rx: std::sync::Mutex<Option<mpsc::Receiver<String>>>,
     /// Shared TUN devices for vnet proxies, keyed by proxy name.
     /// Work connection tasks take ownership of the TUN device via Option::take().
     #[cfg(feature = "vnet")]
@@ -174,6 +179,7 @@ impl Service {
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
             authentication_timeout: 0, // client side doesn't validate timestamps
+            token_auth_timeout: true,
             use_encryption: false,
         };
 
@@ -310,9 +316,10 @@ impl Service {
         }
         let proxy_info_map = Arc::new(RwLock::new(map));
 
-        let (reload_tx, reload_rx) = mpsc::channel::<ReloadRequest>(4);
+        let (reload_tx, reload_rx) = mpsc::channel::<ReloadRequest>(64);
         let (xtcp_tx, xtcp_rx) = mpsc::channel::<XtcpNotification>(64);
         let (visitor_tx, visitor_rx) = mpsc::channel::<VisitorRequest>(64);
+        let (health_tx, health_rx) = mpsc::channel::<String>(16);
 
         let nat_hole_stun_server = if cfg.nat_hole_stun_server.is_empty() {
             "stun:stun.l.google.com:19302".to_string()
@@ -347,6 +354,8 @@ impl Service {
             visitor_tx,
             visitor_rx: std::sync::Mutex::new(Some(visitor_rx)),
             health_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            health_tx,
+            health_rx: std::sync::Mutex::new(Some(health_rx)),
             #[cfg(feature = "vnet")]
             vnet_tuns,
             #[cfg(feature = "vnet")]
@@ -379,15 +388,24 @@ impl Service {
 
     /// Request a config reload. Safe to call from signal handler.
     /// Returns immediately; actual reload happens asynchronously in run().
+    /// Logs a warning if the reload channel is full or closed — the reload
+    /// will be retried on the next try_send (periodic or on next event).
     pub fn request_reload(&self) {
-        let _ = self.reload_tx.try_send(ReloadRequest {
+        match self.reload_tx.try_send(ReloadRequest {
             strict: false,
             reply: {
                 let (tx, _) = tokio::sync::oneshot::channel();
                 tx
             },
-        });
-        tracing::info!("Config reload requested (SIGUSR1)");
+        }) {
+            Ok(()) => tracing::info!("Config reload requested (SIGUSR1)"),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("Config reload channel full (capacity 64) — reload queued; will be processed when prior reload completes");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("Config reload channel closed — reload not possible (service may be shutting down)");
+            }
+        }
     }
 
     #[instrument(skip(self), fields(server_addr = %self.cfg.server_addr, server_port = %self.cfg.server_port))]
@@ -450,16 +468,20 @@ impl Service {
             warn!("No proxies configured");
         }
 
-        // Channel for health checks to signal unhealthy proxies.
-        // Health checks send the proxy name; the control loop sends CloseProxy to the server.
-        let (health_tx, mut health_rx) = mpsc::channel::<String>(16);
+        // Take the receiver from self (created in constructor, consumed once).
+        let mut health_rx = self
+            .health_rx
+            .lock()
+            .unwrap()
+            .take()
+            .expect("health_rx already taken — run() called twice?");
 
         // Cancellation flags for health check tasks — set to true when a proxy
         // is closed (via CloseProxy from server, admin, or health check failure).
         // Stored on self so try_reload() can cancel health checks for removed proxies.
         let health_cancels = self.health_cancels.clone();
 
-        self.spawn_health_checks(&proxies, &health_tx, &health_cancels)
+        self.spawn_health_checks(&proxies, &self.health_tx, &health_cancels)
             .await;
 
         // Start admin HTTP server if configured
@@ -690,7 +712,7 @@ impl Service {
             }
 
             // Split control stream for reading and writing
-            let (mut reader, raw_writer) = control_stream.into_split();
+            let (mut reader, raw_writer) = control_stream.into_split()?;
             let writer = Arc::new(Mutex::new(raw_writer));
 
             // Spawn VnetControllers for all vnet proxies now that the
@@ -1729,61 +1751,86 @@ impl Service {
             }
         }
 
-        // Step 3: Send CloseProxy/NewProxy with correct local addresses.
+        // Step 3: Collect all messages, then send them atomically while
+        // holding the writer lock (no other .await work between writes).
+        // NOTICE: Do NOT hold the writer lock across any non-write .await.
         let mut changes: Vec<String> = Vec::new();
-        let mut w = writer.lock().await;
 
-        // Send CloseProxy for removed proxies (fire-and-forget)
+        struct ReloadMsg {
+            label: String,
+            msg: FrpMessage,
+        }
+        let mut msgs: Vec<ReloadMsg> = Vec::new();
+
+        // CloseProxy for removed proxies
         for name in &delta.removed {
-            let close = FrpMessage::CloseProxy(msg::CloseProxy {
-                proxy_name: name.clone(),
+            msgs.push(ReloadMsg {
+                label: format!("send CloseProxy for '{name}'"),
+                msg: FrpMessage::CloseProxy(msg::CloseProxy {
+                    proxy_name: name.clone(),
+                }),
             });
-            write_msg(&mut *w, &close, v2)
-                .await
-                .map_err(|e| format!("send CloseProxy for '{name}': {e}"))?;
             changes.push(format!("proxy '{name}' removed"));
-            tracing::info!(name = %name, "Reload: sent CloseProxy for removed '{}'", name);
         }
 
-        // Send CloseProxy + NewProxy for changed proxies
+        // CloseProxy + NewProxy for changed proxies
         for name in &delta.changed {
             if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
-                let close = FrpMessage::CloseProxy(msg::CloseProxy {
-                    proxy_name: name.clone(),
-                });
-                write_msg(&mut *w, &close, v2)
-                    .await
-                    .map_err(|e| format!("send CloseProxy for changed '{name}': {e}"))?;
-
                 let local_addr = plugin_addrs
                     .get(name)
                     .cloned()
                     .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
-                let np = crate::proxy::create_new_proxy_msg(p, &local_addr);
-                write_msg(&mut *w, &np, v2)
-                    .await
-                    .map_err(|e| format!("send NewProxy for changed '{name}': {e}"))?;
+                msgs.push(ReloadMsg {
+                    label: format!("send CloseProxy for changed '{name}'"),
+                    msg: FrpMessage::CloseProxy(msg::CloseProxy {
+                        proxy_name: name.clone(),
+                    }),
+                });
+                msgs.push(ReloadMsg {
+                    label: format!("send NewProxy for changed '{name}'"),
+                    msg: crate::proxy::create_new_proxy_msg(p, &local_addr),
+                });
                 changes.push(format!("proxy '{name}' updated"));
-                tracing::info!(name = %name, local_addr = %local_addr, "Reload: sent CloseProxy+NewProxy for changed '{}'", name);
             }
         }
 
-        // Send NewProxy for added proxies
+        // NewProxy for added proxies
         for name in &delta.added {
             if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
                 let local_addr = plugin_addrs
                     .get(name)
                     .cloned()
                     .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
-                let np = crate::proxy::create_new_proxy_msg(p, &local_addr);
-                write_msg(&mut *w, &np, v2)
-                    .await
-                    .map_err(|e| format!("send NewProxy for added '{name}': {e}"))?;
+                msgs.push(ReloadMsg {
+                    label: format!("send NewProxy for added '{name}'"),
+                    msg: crate::proxy::create_new_proxy_msg(p, &local_addr),
+                });
                 changes.push(format!("proxy '{name}' added"));
-                tracing::info!(name = %name, local_addr = %local_addr, "Reload: sent NewProxy for added '{}'", name);
             }
         }
-        drop(w);
+
+        // Acquire writer lock once and send all messages in a tight loop.
+        // Lock is dropped after the last write — no other .await happens
+        // between lock acquisition and drop.
+        {
+            let mut w = writer.lock().await;
+            for rm in &msgs {
+                write_msg(&mut *w, &rm.msg, v2)
+                    .await
+                    .map_err(|e| format!("{}: {e}", rm.label))?;
+            }
+        }
+
+        // Log summary (no longer interleaved with sends, but functionally identical).
+        for name in &delta.removed {
+            tracing::info!(name = %name, "Reload: sent CloseProxy for removed '{}'", name);
+        }
+        for name in &delta.changed {
+            tracing::info!(name = %name, "Reload: sent CloseProxy+NewProxy for changed '{}'", name);
+        }
+        for name in &delta.added {
+            tracing::info!(name = %name, "Reload: sent NewProxy for added '{}'", name);
+        }
 
         // Step 4: Update proxy_info_map so admin API and work conn lookups
         // reflect the new proxy set with correct plugin bound addresses.
@@ -1830,6 +1877,23 @@ impl Service {
                         },
                     );
                 }
+            }
+        }
+
+        // Step 5: Spawn health checks for added and changed proxies that
+        // have health_check configured. The health_cancels entries for
+        // changed proxies were removed in step 1 — re-add them here.
+        if !delta.added.is_empty() || !delta.changed.is_empty() {
+            let hc_proxies: Vec<frp_core::config::ProxyConfig> = delta
+                .new_config
+                .proxies
+                .iter()
+                .filter(|p| delta.added.contains(&p.name) || delta.changed.contains(&p.name))
+                .cloned()
+                .collect();
+            if !hc_proxies.is_empty() {
+                self.spawn_health_checks(&hc_proxies, &self.health_tx, &self.health_cancels)
+                    .await;
             }
         }
 

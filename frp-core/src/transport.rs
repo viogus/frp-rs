@@ -1530,61 +1530,65 @@ impl IoStream {
     }
 
     /// Split the stream into owned read and write halves.
-    pub fn into_split(self) -> (ReadHalf, WriteHalf) {
+    pub fn into_split(self) -> std::io::Result<(ReadHalf, WriteHalf)> {
         match self {
             IoStream::Tcp(s) => {
                 let (r, w) = tokio::io::split(s);
-                (ReadHalf::Tcp(r), WriteHalf::Tcp(w))
+                Ok((ReadHalf::Tcp(r), WriteHalf::Tcp(w)))
             }
             #[cfg(feature = "tls")]
             IoStream::Tls(s) => {
                 let (r, w) = tokio::io::split(s);
-                (ReadHalf::Tls(r), WriteHalf::Tls(w))
+                Ok((ReadHalf::Tls(r), WriteHalf::Tls(w)))
             }
             #[cfg(feature = "kcp")]
             IoStream::Kcp(stream) => {
                 let (r, w) = tokio::io::split(stream);
-                (ReadHalf::Kcp(r), WriteHalf::Kcp(w))
+                Ok((ReadHalf::Kcp(r), WriteHalf::Kcp(w)))
             }
             #[cfg(feature = "quic")]
             IoStream::Quic(stream) => {
                 let (r, w) = stream.into_split();
-                (ReadHalf::Quic(r), WriteHalf::Quic(w))
+                Ok((ReadHalf::Quic(r), WriteHalf::Quic(w)))
             }
             #[cfg(feature = "websocket")]
             IoStream::WebSocket(adapter) => {
                 let (r, w) = tokio::io::split(adapter);
-                (ReadHalf::WebSocket(r), WriteHalf::WebSocket(w))
+                Ok((ReadHalf::WebSocket(r), WriteHalf::WebSocket(w)))
             }
             IoStream::Yamux(stream) => {
                 let (r, w) = tokio::io::split(stream);
-                (ReadHalf::Yamux(r), WriteHalf::Yamux(w))
+                Ok((ReadHalf::Yamux(r), WriteHalf::Yamux(w)))
             }
             IoStream::Cipher(stream) => {
                 let (r, w) = tokio::io::split(stream);
-                (ReadHalf::Cipher(r), WriteHalf::Cipher(w))
+                Ok((ReadHalf::Cipher(r), WriteHalf::Cipher(w)))
             }
             IoStream::Aead(stream) => {
                 let (r, w) = tokio::io::split(stream);
-                (ReadHalf::Aead(r), WriteHalf::Aead(w))
+                Ok((ReadHalf::Aead(r), WriteHalf::Aead(w)))
             }
             IoStream::SshChannel(s) => {
                 let (r, w) = tokio::io::split(s);
-                (ReadHalf::SshChannel(r), WriteHalf::SshChannel(w))
+                Ok((ReadHalf::SshChannel(r), WriteHalf::SshChannel(w)))
             }
             IoStream::PreRead(pre_read, s) => {
-                assert!(
-                    pre_read.is_empty(),
-                    "into_split called before pre_read bytes consumed"
-                );
+                if !pre_read.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "into_split called with buffered bytes",
+                    ));
+                }
                 let (r, w) = tokio::io::split(s);
-                (ReadHalf::Tcp(r), WriteHalf::Tcp(w))
+                Ok((ReadHalf::Tcp(r), WriteHalf::Tcp(w)))
             }
             IoStream::BufferedRead(buf, pos, inner) => {
-                assert!(
-                    pos >= buf.len(),
-                    "into_split called before buffered bytes consumed"
-                );
+                if pos < buf.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "into_split called with buffered bytes",
+                    ));
+                }
                 inner.into_split()
             }
         }
@@ -1925,38 +1929,69 @@ async fn connect_via_proxy(
             .map_err(|e| crate::Error::Transport(format!("proxy CONNECT write: {e}").into()))?;
 
             let mut reader = BufReader::new(&mut stream);
-            let mut status_line = String::new();
+
+            const HTTP_PROXY_MAX_LINE: usize = 16 * 1024; // 16 KiB per line
+            const HTTP_PROXY_MAX_TOTAL: usize = 64 * 1024; // 64 KiB total headers
+
+            let mut total_read = 0usize;
+
+            // Read status line with size limit
+            let mut status_buf = Vec::new();
             timeout(
                 Duration::from_secs(dial_timeout_secs),
-                reader.read_line(&mut status_line),
+                reader.read_until(b'\n', &mut status_buf),
             )
             .await
             .map_err(|_| crate::Error::Transport("proxy CONNECT read timeout".into()))?
             .map_err(|e| crate::Error::Transport(format!("proxy CONNECT read: {e}").into()))?;
 
+            total_read += status_buf.len();
+            if status_buf.len() > HTTP_PROXY_MAX_LINE {
+                return Err(crate::Error::Transport(
+                    "proxy CONNECT status line too long".into(),
+                ));
+            }
+            if total_read > HTTP_PROXY_MAX_TOTAL {
+                return Err(crate::Error::Transport(
+                    "proxy CONNECT headers too large".into(),
+                ));
+            }
+
+            let status_line = String::from_utf8_lossy(&status_buf);
             if !status_line.contains("200") {
                 return Err(crate::Error::Transport(
                     format!("proxy CONNECT rejected: {}", status_line.trim()).into(),
                 ));
             }
 
-            // Read remaining headers until \r\n\r\n
-            let mut buf = Vec::new();
+            // Read remaining headers until \r\n\r\n with per-line and total limits
             loop {
-                let mut line = String::new();
+                let mut line_buf = Vec::new();
                 timeout(
                     Duration::from_secs(dial_timeout_secs),
-                    reader.read_line(&mut line),
+                    reader.read_until(b'\n', &mut line_buf),
                 )
                 .await
                 .map_err(|_| crate::Error::Transport("proxy CONNECT headers timeout".into()))?
                 .map_err(|e| {
                     crate::Error::Transport(format!("proxy CONNECT headers: {e}").into())
                 })?;
-                if line == "\r\n" || line.is_empty() {
+
+                total_read += line_buf.len();
+                if line_buf.len() > HTTP_PROXY_MAX_LINE {
+                    return Err(crate::Error::Transport(
+                        "proxy CONNECT header line too long".into(),
+                    ));
+                }
+                if total_read > HTTP_PROXY_MAX_TOTAL {
+                    return Err(crate::Error::Transport(
+                        "proxy CONNECT headers too large".into(),
+                    ));
+                }
+
+                if line_buf == b"\r\n" || line_buf.is_empty() {
                     break;
                 }
-                buf.push(line);
             }
         }
         "socks5" => {

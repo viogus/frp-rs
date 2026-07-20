@@ -1,5 +1,22 @@
 //! AES-128-CFB streaming cipher for control connection and bridge encryption.
 //!
+//! # Security Note: CFB is confidentiality-only (no integrity)
+//!
+//! AES-128-CFB (V1 protocol) provides **confidentiality only** — it does NOT
+//! provide integrity/authentication. CFB mode is malleable: an attacker who
+//! can modify ciphertext can predictably flip bits in the decrypted plaintext
+//! without detection. This is acceptable for the frp V1 control channel because:
+//!
+//! - The channel carries structured JSON messages — bit flips produce invalid
+//!   JSON, caught by serde deserialization.
+//! - The attacker must be on-path (MITM between client and server).
+//! - TLS wraps the transport when available, providing AEAD at the transport
+//!   layer.
+//!
+//! **Prefer V2 protocol** which uses AEAD (AES-256-GCM or XChaCha20-Poly1305).
+//! V2 provides authenticated encryption (confidentiality + integrity) and is
+//! the recommended protocol for new deployments.
+//!
 //! Matches Go frp v0.69.1 `crypto.NewReader` / `crypto.NewWriter` behavior.
 //! Each direction exchanges a 16-byte random IV: writer prepends it on first
 //! write, reader consumes it on first read. Both directions are independent.

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::RwLock;
 
@@ -55,8 +56,8 @@ impl ProxyInfo {
 
 /// Manages all proxy registrations on the server.
 pub struct ProxyManager {
-    proxies: RwLock<HashMap<String, ProxyInfo>>,
-    by_client: RwLock<HashMap<String, HashMap<String, ProxyInfo>>>,
+    proxies: RwLock<HashMap<String, Arc<ProxyInfo>>>,
+    by_client: RwLock<HashMap<String, HashMap<String, Arc<ProxyInfo>>>>,
     /// group name → sorted list of proxy names (for round-robin selection)
     groups: RwLock<HashMap<String, Vec<String>>>,
     /// Per-group round-robin counters. Incremented on each selection.
@@ -88,6 +89,7 @@ impl ProxyManager {
     pub async fn register(&self, run_id: String, info: ProxyInfo) -> Result<(), String> {
         let name = info.name.clone();
         let group = info.group.clone();
+        let info = Arc::new(info);
         // Check-and-insert atomically under write lock (fixes TOCTOU).
         // Must check BEFORE updating group index — if registration fails
         // due to name conflict, the group index must not be polluted with
@@ -115,7 +117,7 @@ impl ProxyManager {
         Ok(())
     }
 
-    pub async fn get(&self, name: &str) -> Option<ProxyInfo> {
+    pub async fn get(&self, name: &str) -> Option<Arc<ProxyInfo>> {
         self.proxies.read().await.get(name).cloned()
     }
 
@@ -256,7 +258,7 @@ impl ProxyManager {
             .filter(|g| !g.is_empty())
     }
 
-    pub async fn list_client(&self, run_id: &str) -> Vec<ProxyInfo> {
+    pub async fn list_client(&self, run_id: &str) -> Vec<Arc<ProxyInfo>> {
         self.by_client
             .read()
             .await
@@ -283,7 +285,7 @@ impl ProxyManager {
             .map(|p| p.run_id.clone())
     }
 
-    pub async fn list(&self) -> Vec<ProxyInfo> {
+    pub async fn list(&self) -> Vec<Arc<ProxyInfo>> {
         self.proxies.read().await.values().cloned().collect()
     }
 }

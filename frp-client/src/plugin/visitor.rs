@@ -183,6 +183,7 @@ async fn handle_visitor_conn(
         oidc_proxy_url: String::new(),
         additional_auth_scopes: Vec::new(),
         authentication_timeout: 0,
+        token_auth_timeout: true,
         use_encryption: false,
     };
     let mut login = msg::Login {
@@ -249,7 +250,7 @@ async fn handle_visitor_conn(
 
     // 5. Bridge user_conn ↔ server_stream
     let (mut u_r, mut u_w) = tokio::io::split(user_conn);
-    let (mut s_r, mut s_w) = server_stream.into_split();
+    let (mut s_r, mut s_w) = server_stream.into_split().unwrap();
 
     let a = tokio::spawn(async move {
         let n = tokio::io::copy(&mut u_r, &mut s_w).await;

@@ -12,7 +12,7 @@ tiny = ["frp-client/tls", "frp-client/tcp-mux"]
 # Micro: absolutely minimal — just TCP + V1/V2 core, no optional deps
 micro = []
 # Enable debug/trace logging for development. Default: info only.
-debug-logs = []
+debug-logs = ["frp-core/debug-logs"]
 # OpenTelemetry: structured tracing + OTLP export
 # Dep justification (CLAUDE.md policy):
 # - opentelemetry: OTel API (traces) — std, no alternative for OTLP export
@@ -21,7 +21,7 @@ debug-logs = []
 # - tracing-opentelemetry: bridge from tracing spans to OTel — no alternative
 # All optional; zero binary size impact when `otel` feature disabled.
 # Estimated binary size impact with otel: +2-3 MB (http-proto only, no tonic).
-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "frp-core/otel"]
 # Measurement-only counting global allocator. OFF in all shipped builds.
 mem-profile = ["frp-client/mem-profile"]
 profiling = ["frp-client/profiling"]

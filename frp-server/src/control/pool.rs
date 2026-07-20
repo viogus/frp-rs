@@ -220,7 +220,7 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
                 .proxy_manager
                 .get(&proxy_name)
                 .await
-                .and_then(|info| info.local_addr)
+                .and_then(|info| info.local_addr.clone())
                 .and_then(|s| msg::UdpAddr::from_string(&s));
             bridge::assign_udp_work_conn(
                 stream,
