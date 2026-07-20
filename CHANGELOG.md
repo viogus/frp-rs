@@ -109,6 +109,17 @@ All notable changes to frp-rs.
 - VhostManager: single RwLock consolidation (eliminates TOCTOU between table operations)
 - `IoStream::into_split()`: return `Result` instead of panicking on unsupported stream type
 - Test: replace 300ms sleep with /healthz polling in `FrpsHandle::start` (faster, more reliable)
+- Wire compat: `NatHoleSid` — add `transaction_id`, `response`, `nonce` fields matching Go frp v0.70.0 (Go uses these for MakeHole UDP detection)
+- Wire compat: `NatHoleReport` — add `success: Option<bool>` field matching Go `msg.NatHoleReport`
+- Go compat: pre-check remove extra `mapped_addrs.is_none()` condition (Go frp only checks `PreCheck` boolean)
+- Go compat: Fresh-TCP pre_check validate `allow_users` before returning OK
+- Go compat: `handle_report` only report success to analyzer when `success != Some(false)`
+- Go compat: NatHoleReport forwarding pass through `success` field
+- XTCP: replace `try_into().unwrap()` with `.map_err()` on untrusted UDP frames (no panics on malformed packets)
+- XTCP: log all `send_to` failures instead of silently dropping UDP send errors
+- Buffer pool: recover poisoned mutex instead of panicking
+- Feature stubs: return defaults instead of panicking when features disabled
+- Cleanup: remove `#[allow(unused_mut)]` in v2_handshake and dashboard_v2
 
 ### Compat Tests
 
