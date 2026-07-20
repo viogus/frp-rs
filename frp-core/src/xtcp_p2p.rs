@@ -786,6 +786,11 @@ pub async fn xtcp_p2p_connect_yamux(
         Mode::Server
     };
     let conn = Connection::new(compat_stream, yamux_cfg, mode);
+    tracing::info!(
+        conv,
+        role = if yamux_client { "client" } else { "server" },
+        "yamux P2P: Connection created"
+    );
     let conn = Arc::new(tokio::sync::Mutex::new(conn));
 
     // 4. Background driver: periodically poll yamux to drive KCP ticks.
@@ -798,7 +803,15 @@ pub async fn xtcp_p2p_connect_yamux(
     tokio::spawn(async move {
         let keepalive = Duration::from_millis(tick_ms);
         let mut stream_tx = Some(stream_tx);
+        let mut loop_count: u64 = 0;
         loop {
+            loop_count += 1;
+            if loop_count % 100 == 0 {
+                tracing::debug!(
+                    count = loop_count,
+                    "yamux P2P: bg driver loop still alive"
+                );
+            }
             // Acquire the lock (async — yields if contended).
             let mut c = bg_conn.lock().await;
             // Use timeout + poll_fn with a real tokio waker, matching the
@@ -825,6 +838,10 @@ pub async fn xtcp_p2p_connect_yamux(
             match result {
                 Ok(Some(Ok(stream))) => {
                     drop(c);
+                    tracing::info!(
+                        stream_id = stream.id().val(),
+                        "yamux P2P: accepted inbound stream"
+                    );
                     if let Some(tx) = stream_tx.take() {
                         if tx.send(Ok(stream)).is_err() {
                             tracing::debug!("yamux P2P: caller dropped, exiting");
@@ -837,7 +854,12 @@ pub async fn xtcp_p2p_connect_yamux(
                     if let Some(tx) = stream_tx.take() {
                         let _ = tx.send(Err(format!("yamux: {e}")));
                     }
-                    tracing::debug!("yamux P2P: connection error, exiting");
+                    tracing::warn!(
+                        error = %e,
+                        kind = ?e,
+                        loop_count,
+                        "yamux P2P: connection error, exiting"
+                    );
                     break;
                 }
                 Ok(None) => {
@@ -845,7 +867,10 @@ pub async fn xtcp_p2p_connect_yamux(
                     if let Some(tx) = stream_tx.take() {
                         let _ = tx.send(Err("yamux: connection closed before stream".into()));
                     }
-                    tracing::debug!("yamux P2P: connection closed, exiting");
+                    tracing::warn!(
+                        loop_count,
+                        "yamux P2P: connection closed before stream (EOF)"
+                    );
                     break;
                 }
                 Err(_elapsed) => {
@@ -853,6 +878,12 @@ pub async fn xtcp_p2p_connect_yamux(
                     // KCP tick was driven by poll_read→maybe_tick inside
                     // poll_next_inbound. Drop lock, loop, try again.
                     drop(c);
+                    if loop_count <= 5 {
+                        tracing::debug!(
+                            loop_count,
+                            "yamux P2P: bg driver tick (no stream yet)"
+                        );
+                    }
                 }
             }
         }
@@ -863,15 +894,22 @@ pub async fn xtcp_p2p_connect_yamux(
     let stream = if yamux_client {
         // Visitor: acquire lock, open outbound stream, release.
         let mut c = conn.lock().await;
-        tokio::time::timeout(
+        tracing::info!("yamux P2P: opening outbound stream...");
+        let stream = tokio::time::timeout(
             Duration::from_secs(10),
             poll_fn(|cx| c.poll_new_outbound(cx)),
         )
         .await
         .map_err(|_| "yamux: timeout opening stream (10s)".to_string())?
-        .map_err(|e| format!("yamux open stream: {e}"))?
+        .map_err(|e| format!("yamux open stream: {e}"))?;
+        tracing::info!(
+            stream_id = stream.id().val(),
+            "yamux P2P: outbound stream opened"
+        );
+        stream
     } else {
         // Provider: wait for the background task to accept the first stream.
+        tracing::info!("yamux P2P: waiting for inbound stream...");
         tokio::time::timeout(Duration::from_secs(10), stream_rx)
             .await
             .map_err(|_| "yamux: timeout waiting for stream (10s)".to_string())?
