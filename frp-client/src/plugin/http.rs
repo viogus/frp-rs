@@ -1,5 +1,6 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::{sleep, Duration};
 use tracing::debug;
 
 use frp_core::config::PluginConfig;
@@ -110,6 +111,8 @@ async fn handle_http_proxy_conn(mut client: TcpStream, auth: HttpProxyAuth) -> R
 
     // Check auth
     if !auth.check(&proxy_auth) {
+        // Go frp compat: 200ms delay to slow brute-force attacks.
+        sleep(Duration::from_millis(200)).await;
         let resp = b"HTTP/1.1 407 Proxy Authentication Required\r\n\
                        Proxy-Authenticate: Basic realm=\"frp\"\r\n\
                        Content-Length: 0\r\n\r\n";

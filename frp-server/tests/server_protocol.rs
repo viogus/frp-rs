@@ -216,11 +216,13 @@ async fn test_new_proxy_registration_auto_port() {
             );
             assert!(resp.remote_addr.is_some(), "expected remote_addr");
             let remote_addr = resp.remote_addr.unwrap();
-            // remote_addr is something like ":10000" — parse the port
+            // remote_addr is "host:port" (e.g. "0.0.0.0:10000") — parse the port
             let assigned_port: u16 = remote_addr
-                .trim_start_matches(':')
+                .rsplit(':')
+                .next()
+                .expect("remote_addr should contain a port number")
                 .parse()
-                .expect("remote_addr should contain a port number");
+                .expect("remote_addr should contain a valid port number");
             assert!(
                 (10000..=50000).contains(&assigned_port),
                 "assigned port {} out of range 10000-50000",

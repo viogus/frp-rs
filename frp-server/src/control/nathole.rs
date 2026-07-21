@@ -812,8 +812,16 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
             }
         }
 
-        // Wait for report
-        match tokio::time::timeout(Duration::from_secs(30), report_rx).await {
+        // Wait for report.
+        // Go frp v0.69.1 compat: sleep ReadTimeoutMs + 30000ms after sending
+        // NatHoleResp to keep the session alive for hole-punch completion and
+        // NatHoleReport. Use a dynamic timeout from the provider's detect_behavior.
+        let wait_ms = c_resp
+            .as_ref()
+            .and_then(|cr| cr.detect_behavior.as_ref())
+            .map(|db| (db.read_timeout_ms.max(0) as u64) + 30000)
+            .unwrap_or(30000);
+        match tokio::time::timeout(Duration::from_millis(wait_ms), report_rx).await {
             Ok(Ok(_)) => debug!(tid = %tid, "NatHole ctl session {}: completed", tid),
             Ok(Err(_)) | Err(_) => {
                 debug!(tid = %tid, "NatHole ctl session {}: cleanup", tid);

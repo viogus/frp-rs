@@ -349,6 +349,10 @@ pub struct AppState {
     pub proxy_metrics: Arc<ProxyMetricsRegistry>,
     /// Per-client proxy count limit. 0 = unlimited.
     pub max_ports_per_client: u64,
+    /// Per-client port usage count: run_id → number of ports currently used.
+    /// Incremented when a proxy registers a remote port, decremented on close.
+    /// Matches Go frp's portsUsedNum tracking.
+    pub client_ports_used: Arc<RwLock<std::collections::HashMap<String, u64>>>,
     /// When false (default), internal error details are not sent to clients.
     pub detailed_errors_to_client: bool,
     /// Shared TLS acceptor for hot-reload. Cert renewal tools (certbot, cert-manager)
@@ -468,6 +472,7 @@ impl AppState {
             tcpmux_manager: Arc::new(TcpMuxManager::new()),
             proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
             max_ports_per_client,
+            client_ports_used: Arc::new(RwLock::new(std::collections::HashMap::new())),
             sudp_port,
             tcp_group_ctl: TcpGroupCtl::new(),
             vhost_http_timeout,

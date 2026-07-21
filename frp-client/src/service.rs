@@ -12,6 +12,15 @@ pub(crate) struct VisitorRequest {
     pub nhv: msg::NatHoleVisitor,
     pub reply: oneshot::Sender<Result<msg::NatHoleResp, String>>,
 }
+
+/// Event from a health check task to the control loop.
+/// Close: the proxy exceeded max failures and should be closed on the server.
+/// Recover: the proxy recovered and should be re-registered.
+#[derive(Debug, Clone)]
+pub(crate) enum HealthEvent {
+    Close(String),   // proxy_name
+    Recover(String), // proxy_name
+}
 use rand::Rng;
 use std::time::Instant;
 use tokio::time::{interval, Duration};
@@ -104,11 +113,13 @@ pub struct Service {
     /// Per-proxy health check cancel flags. Keyed by proxy name.
     /// Set to true on CloseProxy/CloseProxyResp; entry removed in try_reload.
     health_cancels: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
-    /// Channel sender for health check failures. Cloned by try_reload()
+    /// Proxy configs for health-checked proxies, used to re-register on health recovery.
+    health_proxy_configs: Arc<std::sync::Mutex<HashMap<String, frp_core::config::ProxyConfig>>>,
+    /// Channel sender for health check events (Close/Recover). Cloned by try_reload()
     /// to spawn health checks for new/changed proxies after reload.
-    health_tx: mpsc::Sender<String>,
+    health_tx: mpsc::Sender<HealthEvent>,
     /// Receiver side of health channel — consumed by run().
-    health_rx: std::sync::Mutex<Option<mpsc::Receiver<String>>>,
+    health_rx: std::sync::Mutex<Option<mpsc::Receiver<HealthEvent>>>,
     /// Shared TUN devices for vnet proxies, keyed by proxy name.
     /// Work connection tasks take ownership of the TUN device via Option::take().
     #[cfg(feature = "vnet")]
@@ -321,7 +332,7 @@ impl Service {
         let (reload_tx, reload_rx) = mpsc::channel::<ReloadRequest>(64);
         let (xtcp_tx, xtcp_rx) = mpsc::channel::<XtcpNotification>(64);
         let (visitor_tx, visitor_rx) = mpsc::channel::<VisitorRequest>(64);
-        let (health_tx, health_rx) = mpsc::channel::<String>(16);
+        let (health_tx, health_rx) = mpsc::channel::<HealthEvent>(16);
 
         let nat_hole_stun_server = if cfg.nat_hole_stun_server.is_empty() {
             "stun:stun.l.google.com:19302".to_string()
@@ -337,6 +348,14 @@ impl Service {
         let vnet_tun_tx = Arc::new(Mutex::new(HashMap::new()));
         #[cfg(feature = "vnet")]
         let vnet_tun_names = Arc::new(Mutex::new(HashMap::new()));
+
+        let health_proxy_configs = Arc::new(std::sync::Mutex::new(
+            cfg.proxies
+                .iter()
+                .filter(|p| !p.health_check_type.is_empty())
+                .map(|p| (p.name.clone(), p.clone()))
+                .collect(),
+        ));
 
         Ok(Self {
             cfg,
@@ -356,6 +375,7 @@ impl Service {
             visitor_tx,
             visitor_rx: std::sync::Mutex::new(Some(visitor_rx)),
             health_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            health_proxy_configs,
             health_tx,
             health_rx: std::sync::Mutex::new(Some(health_rx)),
             #[cfg(feature = "vnet")]
@@ -408,15 +428,17 @@ impl Service {
         }
 
         // Phase 2: exponential backoff
-        // Base: 1s, Factor: 2, Jitter: additive 10%, Cap: 20s
-        let mut duration_ms = 1000u64; // 1 second base
-        if consecutive_err_count > 1 {
-            for _ in 1..consecutive_err_count {
-                duration_ms = duration_ms.saturating_mul(2);
-                if duration_ms >= 20_000 {
-                    duration_ms = 20_000;
-                    break;
-                }
+        // Go frp: InitDurationIfFail(1s) * Factor(2) → 2s on first error, then compounds.
+        // Matches Go frp dev wait.FastBackoffImpl.Backoff():
+        //   consecutiveErrCount=1 → InitDurationIfFail(1s) * Factor(2) = 2s + jitter
+        //   consecutiveErrCount=2 → previousDuration(2s) * Factor(2) = 4s + jitter
+        //   etc.
+        let mut duration_ms = 1000u64; // InitDurationIfFail = 1 second base
+        for _ in 0..consecutive_err_count {
+            duration_ms = duration_ms.saturating_mul(2);
+            if duration_ms >= 20_000 {
+                duration_ms = 20_000;
+                break;
             }
         }
         // Additive jitter: duration_ms + random(0, 0.1 * duration_ms)
@@ -563,6 +585,8 @@ impl Service {
         let mut fast_retry_timestamps: Vec<Instant> = Vec::new();
         // Track visitor listener tasks so they can be cancelled on reconnect.
         let mut visitor_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        // Carry over run_id across reconnections (Go frp compat: previousRunID).
+        let mut previous_run_id = String::new();
         loop {
             let mut ctl = ControlConnection::new(
                 self.cfg.server_addr.clone(),
@@ -581,11 +605,13 @@ impl Service {
                 self.cfg.tcp_mux,
                 self.cfg.disable_custom_tls_first_byte,
                 self.cfg.dial_server_keepalive.max(0) as u64,
+                self.cfg.tcp_mux_keepalive_interval,
                 opt_if_empty!(self.cfg.connect_server_local_ip),
                 self.cfg.v2,
                 self.oidc_client.clone(),
                 self.cfg.metas.clone(),
                 self.cfg.proxy_url.clone(),
+                previous_run_id.clone(),
             );
 
             #[cfg(feature = "quic")]
@@ -626,6 +652,7 @@ impl Service {
             let yamux = yamux_session.map(std::sync::Arc::new);
             #[cfg(feature = "quic")]
             let quic_conn = quic_conn.map(std::sync::Arc::new);
+            previous_run_id = run_id.clone();
             let v2 = self.cfg.v2;
             info!(run_id = %run_id, "Logged in. run_id: {}", run_id);
 
@@ -984,7 +1011,13 @@ impl Service {
                                 debug!("Received ReqWorkConn, creating work connection");
                                 spawn_wc!(-1); // on-demand, not pool
                             }
-                            Ok(FrpMessage::Pong(_)) => {
+                            Ok(FrpMessage::Pong(pong)) => {
+                                if let Some(ref err) = pong.error {
+                                    if !err.is_empty() {
+                                        warn!(error = %err, "Pong contains error: {}", err);
+                                        break;
+                                    }
+                                }
                                 debug!("Pong received");
                                 last_pong = Instant::now();
                             }
@@ -999,12 +1032,9 @@ impl Service {
                             }
                             Ok(FrpMessage::CloseProxyResp(cpr)) => {
                                 info!(proxy_name = %cpr.proxy_name, "Server confirmed proxy close: {}", cpr.proxy_name);
-                                // Cancel health check task and remove map entry.
-                                let mut cancels = health_cancels.lock().unwrap_or_else(|e| e.into_inner());
-                                if let Some(cancel) = cancels.get(&cpr.proxy_name) {
-                                    cancel.store(true, Ordering::Relaxed);
-                                }
-                                cancels.remove(&cpr.proxy_name);
+                                // Do NOT cancel/remove health check here. This response comes from
+                                // our CloseProxy (health check failure → CloseProxy → server → CloseProxyResp).
+                                // The health check monitor keeps running for recovery detection (Go frp compat).
                             }
                             Ok(FrpMessage::Error(err)) => {
                                 warn!(error = %err.error, "Server error: {}", err.error);
@@ -1101,26 +1131,48 @@ impl Service {
                         }
                         let ping = FrpMessage::Ping(ping_msg);
                         if let Err(e) = write_msg(&mut *writer.lock().await, &ping, v2).await {
-                            warn!(error = %e, "Ping failed: {}. Reconnecting...", e);
-                            break;
+                            warn!(error = %e, "Ping write failed: {}", e);
+                            // Non-fatal: heartbeat timeout will detect actual dead connection.
+                        } else {
+                            debug!("Ping sent");
                         }
-                        debug!("Ping sent");
                     }
 
-                    Some(proxy_name) = health_rx.recv() => {
-                        info!(proxy_name = %proxy_name, "Health check sending CloseProxy for unhealthy proxy: {}", proxy_name);
-                        let close = FrpMessage::CloseProxy(msg::CloseProxy {
-                            proxy_name: proxy_name.clone(),
-                        });
-                        if let Err(e) = write_msg(&mut *writer.lock().await, &close, v2).await {
-                            warn!(proxy_name = %proxy_name, error = %e, "Failed to send CloseProxy for {}: {}", proxy_name, e);
+                    Some(event) = health_rx.recv() => {
+                        match event {
+                            HealthEvent::Close(proxy_name) => {
+                                info!(proxy_name = %proxy_name, "Health check sending CloseProxy for unhealthy proxy: {}", proxy_name);
+                                let close = FrpMessage::CloseProxy(msg::CloseProxy {
+                                    proxy_name: proxy_name.clone(),
+                                });
+                                if let Err(e) = write_msg(&mut *writer.lock().await, &close, v2).await {
+                                    warn!(proxy_name = %proxy_name, error = %e, "Failed to send CloseProxy for {}: {}", proxy_name, e);
+                                }
+                                // Keep health check running -- monitor for recovery (Go frp compat).
+                            }
+                            HealthEvent::Recover(proxy_name) => {
+                                info!(proxy_name = %proxy_name, "Health check recovered for '{}', re-registering", proxy_name);
+                                // Look up proxy config and send NewProxy to re-register.
+                                let need_send = {
+                                    let configs = self.health_proxy_configs.lock().unwrap_or_else(|e| e.into_inner());
+                                    configs.get(&proxy_name).cloned()
+                                };
+                                if let Some(cfg) = need_send {
+                                    let local_addr = self.proxy_info_map.read().await
+                                        .get(&proxy_name)
+                                        .map(|info| info.local_addr.clone())
+                                        .unwrap_or_else(|| format!("{}:{}", cfg.local_ip, cfg.local_port));
+                                    let new_proxy = crate::proxy::create_new_proxy_msg(&cfg, &local_addr);
+                                    if let Err(e) = write_msg(&mut *writer.lock().await, &new_proxy, v2).await {
+                                        warn!(proxy_name = %proxy_name, error = %e, "Failed to re-register proxy on health recovery: {}", e);
+                                    } else {
+                                        info!(proxy_name = %proxy_name, "Health recovery: re-registered proxy '{}'", proxy_name);
+                                    }
+                                } else {
+                                    warn!(proxy_name = %proxy_name, "Health check recovered but no config found for '{}'", proxy_name);
+                                }
+                            }
                         }
-                        // Cancel health check task and remove map entry.
-                        let mut cancels = health_cancels.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(cancel) = cancels.get(&proxy_name) {
-                            cancel.store(true, Ordering::Relaxed);
-                        }
-                        cancels.remove(&proxy_name);
                     }
 
                     Some(req) = reload_rx.recv() => {
@@ -1158,23 +1210,43 @@ impl Service {
                                 None
                             }
                         };
+                        // Get the local port from the STUN socket for assisted_addrs.
+                        // Go frp compat: assisted_addrs = local IPs + STUN port, NOT STUN
+                        // mapped addresses. The server uses assisted_addrs as localIPs
+                        // parameter to ClassifyNATFeature — STUN addresses would never
+                        // match local interfaces, causing misclassification.
+                        let local_port = stun_socket
+                            .as_ref()
+                            .and_then(|sock| sock.local_addr().ok())
+                            .map(|addr| addr.port());
                         // Save socket for later UDP+KCP hole punch.
                         if let Some(sock) = stun_socket {
                             xtcp_sockets.lock().await.insert(sid.clone(), std::sync::Arc::new(sock));
                         }
+                        // Build assisted_addrs from local IPs + STUN port.
+                        // Go frp v0.69.1: ListLocalIPsForNatHole returns non-loopback
+                        // IPv4 addresses filtered from all network interfaces.
+                        let assisted_addrs: Option<Vec<String>> = local_port.and_then(|port| {
+                            let local_ips = list_local_ips_for_nat_hole(10);
+                            if local_ips.is_empty() {
+                                None
+                            } else {
+                                Some(
+                                    local_ips
+                                        .iter()
+                                        .map(|ip| format!("{}:{}", ip, port))
+                                        .collect(),
+                                )
+                            }
+                        });
                         // 2. Send NatHoleClient on control (Go v0.70 compat: protocol "kcp").
-                        let addrs_for_assist = if mapped_addrs.is_empty() {
-                            None
-                        } else {
-                            Some(mapped_addrs.clone())
-                        };
                         let client_msg = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
                             transaction_id: sid.clone(),
                             proxy_name: proxy_name.clone(),
                             sid: Some(sid.clone()),
                             protocol: Some("kcp".to_string()),
                             mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
-                            assisted_addrs: addrs_for_assist,
+                            assisted_addrs,
                             visitor_addr: None,
                         }));
                         if let Err(e) = write_msg(&mut *writer.lock().await, &client_msg, v2).await {
@@ -1248,7 +1320,7 @@ impl Service {
     async fn spawn_health_checks(
         &self,
         proxies: &[frp_core::config::ProxyConfig],
-        health_tx: &mpsc::Sender<String>,
+        health_tx: &mpsc::Sender<HealthEvent>,
         health_cancels: &Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
     ) {
         for p in proxies {
@@ -1273,7 +1345,20 @@ impl Service {
             let max_failed = p.health_check_max_failed.max(1);
             let tx = health_tx.clone();
             let hc_url = if hc_type == "http" {
-                p.health_check_url.clone()
+                let url = p.health_check_url.clone();
+                if !url.is_empty() && !url.contains("://") {
+                    // Go frp compat: auto-construct URL as "http://{local_ip}:{local_port}/{path}"
+                    let host = la.split(':').next().unwrap_or("127.0.0.1");
+                    let port = la.split(':').nth(1).unwrap_or("0");
+                    let path = if url.starts_with('/') {
+                        url.clone()
+                    } else {
+                        format!("/{}", url)
+                    };
+                    format!("http://{}:{}{}", host, port, path)
+                } else {
+                    url
+                }
             } else {
                 String::new()
             };
@@ -1560,6 +1645,17 @@ impl Service {
         info!(proxy_name = %proxy_name, candidate_count = %candidate_addrs.len(), "XTCP provider '{}': received {} candidate addresses from server",
             proxy_name, candidate_addrs.len());
 
+        // Go frp v0.69.1 compat: use ReadTimeoutMs from the server's
+        // NatHoleResp.detect_behavior as the hole-punch timeout, not a
+        // hardcoded 5000ms. The server computes this as max(SendDelayMs) + 5000
+        // (+30000 if listen_random_ports) minus the side's own send_delay.
+        // Default to 5000ms if detect_behavior is not available.
+        let hole_punch_timeout = resp
+            .detect_behavior
+            .as_ref()
+            .map(|db| db.read_timeout_ms.max(0) as u64)
+            .unwrap_or(5000);
+
         // Spawn hole punch task (don't block control loop)
         let proxy_info = self.proxy_info_map.read().await.get(&proxy_name).map(|p| {
             (
@@ -1576,6 +1672,7 @@ impl Service {
         let proxy_name_clone = proxy_name.clone();
         let sid_clone = sid.clone();
         let xtcp_sockets_clone = xtcp_sockets.clone();
+        let hp_timeout = hole_punch_timeout;
         tokio::spawn(async move {
             // Retrieve the STUN socket persisted by the control loop.
             let stun_socket = {
@@ -1645,7 +1742,7 @@ impl Service {
                 &candidate_addrs,
                 conv,
                 kcp_cfg,
-                5000,
+                hp_timeout,
                 false, // yamux_client = false (provider/server)
                 p2p_sid,
                 p2p_key.as_ref(),
@@ -1969,6 +2066,28 @@ impl Service {
             }
         }
 
+        // Step 6: Update health_proxy_configs to match the new proxy set.
+        // This ensures that on HealthEvent::Recover, the correct config is
+        // used to re-register the proxy after reload.
+        {
+            let mut configs = self
+                .health_proxy_configs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for name in &delta.removed {
+                configs.remove(name);
+            }
+            for name in delta.changed.iter().chain(delta.added.iter()) {
+                if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
+                    if p.health_check_type.is_empty() {
+                        configs.remove(name);
+                    } else {
+                        configs.insert(name.clone(), p.clone());
+                    }
+                }
+            }
+        }
+
         let summary = changes.join("; ");
         tracing::info!(summary = %summary, "Config reload summary: {}", summary);
         Ok(format!("reload success: {summary}"))
@@ -2001,6 +2120,129 @@ fn add_os_route(subnet: &str, tun_name: &str) {
     }
 }
 
+/// List local non-loopback IPv4 addresses for NAT hole punching.
+/// Go frp v0.69.1 compat: nathole.ListLocalIPsForNatHole.
+///
+/// Enumerates local network interfaces and returns up to `max_items`
+/// non-loopback, non-link-local IPv4 addresses. On Linux, reads from
+/// /proc/net/fib_trie, with a fallback to `ip -o -4 addr show`. On
+/// macOS, uses `/sbin/ifconfig`. On other platforms (e.g. Windows),
+/// returns an empty vec.
+fn list_local_ips_for_nat_hole(max_items: usize) -> Vec<String> {
+    let mut ips: Vec<String> = Vec::new();
+
+    // Linux: parse /proc/net/fib_trie for local IPs
+    #[cfg(target_os = "linux")]
+    {
+        if ips.len() < max_items {
+            if let Ok(content) = std::fs::read_to_string("/proc/net/fib_trie") {
+                let mut in_local = false;
+                for line in content.lines() {
+                    if ips.len() >= max_items {
+                        break;
+                    }
+                    let trimmed = line.trim();
+                    if trimmed == "Local:" {
+                        in_local = true;
+                        continue;
+                    }
+                    if in_local && trimmed.is_empty() {
+                        break;
+                    }
+                    if in_local {
+                        // Lines with "|" under "Local:" section contain local IPs
+                        if let Some(ip_part) = trimmed
+                            .strip_prefix('|')
+                            .or_else(|| trimmed.strip_prefix("+-"))
+                        {
+                            for word in ip_part.split_whitespace() {
+                                if let Ok(ip) = word.parse::<std::net::Ipv4Addr>() {
+                                    if !ip.is_loopback()
+                                        && !ip.is_link_local()
+                                        && !ip.is_multicast()
+                                    {
+                                        ips.push(ip.to_string());
+                                    }
+                                    break; // first valid IP per line
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Linux fallback: `ip -o -4 addr show`
+    #[cfg(target_os = "linux")]
+    {
+        if ips.is_empty() {
+            if let Ok(output) = std::process::Command::new("ip")
+                .args(["-o", "-4", "addr", "show"])
+                .output()
+            {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines() {
+                        if ips.len() >= max_items {
+                            break;
+                        }
+                        // Format: "1: lo    inet 127.0.0.1/8 scope host lo"
+                        // We want the "inet" line with the IP address
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        for part in &parts {
+                            if let Some(ip_str) = part.split('/').next() {
+                                if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+                                    if !ip.is_loopback()
+                                        && !ip.is_link_local()
+                                        && !ip.is_multicast()
+                                    {
+                                        ips.push(ip.to_string());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // macOS fallback: parse ifconfig output
+    #[cfg(target_os = "macos")]
+    {
+        if ips.is_empty() {
+            if let Ok(output) = std::process::Command::new("/sbin/ifconfig").output() {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines() {
+                        if ips.len() >= max_items {
+                            break;
+                        }
+                        let trimmed = line.trim();
+                        if let Some(ip_str) = trimmed.strip_prefix("inet ") {
+                            let fields: Vec<&str> = ip_str.split_whitespace().collect();
+                            if let Some(addr) = fields.first() {
+                                if let Ok(ip) = addr.parse::<std::net::Ipv4Addr>() {
+                                    if !ip.is_loopback()
+                                        && !ip.is_link_local()
+                                        && !ip.is_multicast()
+                                    {
+                                        ips.push(ip.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ips
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2022,24 +2264,24 @@ mod tests {
     #[test]
     fn fast_backoff_delay_phase2_base_first() {
         // After fast retries (counts_in_fast_retry_window > 3), consecutive_err_count=1
-        // -> base 1s + 10% additive jitter -> 1000-1100ms
+        // Go frp: InitDurationIfFail(1s) * Factor(2) = 2s + 10% additive jitter -> 2000-2200ms
         for _ in 0..100 {
             let delay = Service::fast_backoff_delay(1, 4);
             let ms = delay.as_millis();
-            assert!(ms >= 1000, "delay {ms}ms below 1s for phase2 first");
-            assert!(ms <= 1100, "delay {ms}ms above 1.1s for phase2 first");
+            assert!(ms >= 2000, "delay {ms}ms below 2s for phase2 first");
+            assert!(ms <= 2200, "delay {ms}ms above 2.2s for phase2 first");
         }
     }
 
     #[test]
     fn fast_backoff_delay_phase2_exponential() {
-        // consecutive_err_count=4, counts_in_fast_retry_window=5 -> 1s*2^3=8s + 10% jitter
-        // Range: 8000-8800ms
+        // consecutive_err_count=4, counts_in_fast_retry_window=5 -> 1s*2^4=16s + 10% jitter
+        // Range: 16000-17600ms
         for _ in 0..100 {
             let delay = Service::fast_backoff_delay(4, 5);
             let ms = delay.as_millis();
-            assert!(ms >= 8000, "delay {ms}ms below 8s for err=4");
-            assert!(ms <= 8800, "delay {ms}ms above 8.8s for err=4");
+            assert!(ms >= 16000, "delay {ms}ms below 16s for err=4");
+            assert!(ms <= 17600, "delay {ms}ms above 17.6s for err=4");
         }
     }
 
@@ -2063,9 +2305,9 @@ mod tests {
                 .sum::<f64>()
                 / 50.0
         }
-        let m1 = mean_delay(1, 4); // phase2, 1s
-        let m2 = mean_delay(2, 5); // phase2, 2s
-        let m5 = mean_delay(5, 6); // phase2, 16s
+        let m1 = mean_delay(1, 4); // phase2, 2s
+        let m2 = mean_delay(2, 5); // phase2, 4s
+        let m5 = mean_delay(5, 6); // phase2, 20s (capped)
         assert!(m2 > m1, "mean delay should grow: {m2} > {m1}");
         assert!(m5 > m2, "mean delay should grow: {m5} > {m2}");
     }

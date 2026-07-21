@@ -308,7 +308,7 @@ impl Default for ServerConfig {
             allow_port_start: default_allow_port_start(),
             allow_port_end: default_allow_port_end(),
             allow_ports: String::new(),
-            max_ports_per_client: 50,
+            max_ports_per_client: 0,
             vhost_http_timeout: default_vhost_http_timeout(),
             user_conn_timeout: default_user_conn_timeout(),
             tcp_mux_passthrough: false,
@@ -868,6 +868,11 @@ pub struct ClientConfig {
     pub connect_server_local_ip: String,
     #[serde(default = "default_tcp_mux")]
     pub tcp_mux: bool,
+    /// TCP mux keepalive interval in seconds. Controls how often yamux
+    /// sends keepalive pings to detect dead peers. Default: 30.
+    /// Go frp compat: transport.tcpMuxKeepaliveInterval.
+    #[serde(default, alias = "tcpMuxKeepaliveInterval")]
+    pub tcp_mux_keepalive_interval: i64,
     #[serde(default)]
     pub v2: bool,
     #[serde(default)]
@@ -914,6 +919,7 @@ impl Default for ClientConfig {
             dial_server_keepalive: 7200,
             connect_server_local_ip: String::new(),
             tcp_mux: default_tcp_mux(),
+            tcp_mux_keepalive_interval: 30,
             v2: false,
             proxies: vec![],
             visitors: vec![],
@@ -1991,6 +1997,8 @@ fn known_client_keys() -> std::collections::HashSet<&'static str> {
         "connect_server_local_ip",
         "connectServerLocalIP",
         "tcp_mux",
+        "tcp_mux_keepalive_interval",
+        "tcpMuxKeepaliveInterval",
         "v2",
         "proxies",
         "visitors",

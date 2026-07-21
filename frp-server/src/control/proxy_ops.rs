@@ -155,19 +155,22 @@ pub(crate) async fn handle_new_proxy(
         return;
     }
 
-    // Check per-client proxy limit
+    // Check per-client port limit (matching Go frp's GetUsedPortsNum logic).
+    // Count actual used ports, not proxy names, and add 1 for this new proxy.
     if state.max_ports_per_client > 0 {
-        let count = state
-            .proxy_manager
-            .list_client_proxy_names(run_id)
+        let used = state
+            .client_ports_used
+            .read()
             .await
-            .len();
-        if count >= state.max_ports_per_client as usize {
+            .get(run_id)
+            .copied()
+            .unwrap_or(0);
+        if used + 1 > state.max_ports_per_client {
             reject_new_proxy(
                 writer,
                 &np.proxy_name,
                 format!(
-                    "maximum number of proxies ({}) reached for this client",
+                    "maximum number of ports ({}) reached for this client",
                     state.max_ports_per_client
                 ),
                 v2,
@@ -250,6 +253,7 @@ pub(crate) async fn handle_new_proxy(
                 &mut ports,
                 remote_port,
                 &state.reloadable.read_ok().allow_ports,
+                &state.proxy_bind_addr,
             )
         }
     } else {
@@ -258,6 +262,7 @@ pub(crate) async fn handle_new_proxy(
             &mut ports,
             remote_port,
             &state.reloadable.read_ok().allow_ports,
+            &state.proxy_bind_addr,
         )
     };
 
@@ -312,6 +317,15 @@ pub(crate) async fn handle_new_proxy(
                 .await;
                 return;
             }
+
+            // Track port usage per client (matching Go frp's portsUsedNum).
+            state
+                .client_ports_used
+                .write()
+                .await
+                .entry(run_id.to_string())
+                .and_modify(|c| *c += 1)
+                .or_insert(1);
 
             #[cfg(feature = "vnet")]
             if np.proxy_type == "vnet" {
@@ -647,7 +661,7 @@ pub(crate) async fn handle_new_proxy(
                 });
             }
 
-            let remote_addr_str = format!(":{}", port);
+            let remote_addr_str = format!("{}:{}", state.proxy_bind_addr, port);
             let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
                 proxy_name: np.proxy_name.clone(),
                 remote_addr: Some(remote_addr_str),
@@ -773,6 +787,8 @@ pub(crate) async fn unregister_control(
         }
     }
     drop(ports);
+    // Clear per-client port usage tracking (matching Go frp's portsUsedNum cleanup).
+    state.client_ports_used.write().await.remove(run_id);
     // VHost unregister outside port lock to avoid holding it across awaits
     for p in &proxies {
         state.vhost_manager.unregister(&p.name).await;

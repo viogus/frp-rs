@@ -213,30 +213,33 @@ impl MakeHoleRecords {
         let mut scores = Vec::new();
 
         // Helper: append mode-0 entries with PublicNetwork-aware scoring.
-        // Go frp: if c.PublicNetwork → client always receiver (sender=0, receiver=1).
-        //         if v.PublicNetwork → client always sender (sender=1, receiver=0).
-        //         else → all scores 0.
+        // Go frp v0.69.1 compat: getBehaviorScoresByMode2 checks each entry's
+        // first-behavior role (c_behavior.role) and assigns senderScore or
+        // receiverScore accordingly. When a peer is on a public network, it
+        // should be the receiver (give receiver roles higher score).
+        //   c.PublicNetwork → sender=0, receiver=1 (client should be receiver)
+        //   v.PublicNetwork → sender=1, receiver=0 (visitor should be receiver)
+        //   neither → all scores 0
         let append_mode0 = |scores: &mut Vec<BehaviorScore>, c_pub: bool, v_pub: bool| {
-            for i in 0..MODE_COUNTS[0] as i32 {
-                if c_pub {
-                    scores.push(BehaviorScore {
-                        mode: 0,
-                        index: i,
-                        score: 0,
-                    });
-                } else if v_pub {
-                    scores.push(BehaviorScore {
-                        mode: 0,
-                        index: i,
-                        score: 1,
-                    });
+            let (sender_score, receiver_score) = if c_pub {
+                (0, 1)
+            } else if v_pub {
+                (1, 0)
+            } else {
+                (0, 0)
+            };
+            let table = mode0_table();
+            for (i, (c_behavior, _)) in table.iter().enumerate() {
+                let score = if c_behavior.role == "sender" {
+                    sender_score
                 } else {
-                    scores.push(BehaviorScore {
-                        mode: 0,
-                        index: i,
-                        score: 0,
-                    });
-                }
+                    receiver_score
+                };
+                scores.push(BehaviorScore {
+                    mode: 0,
+                    index: i as i32,
+                    score,
+                });
             }
         };
 

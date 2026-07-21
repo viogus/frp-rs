@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
@@ -46,6 +47,7 @@ pub struct ControlConnection {
     tcp_mux: bool,
     disable_custom_tls_first_byte: bool,
     keepalive_secs: u64,
+    tcp_mux_keepalive_interval: i64,
     bind_addr: Option<String>,
     v2: bool,
     oidc_client: Option<Arc<OidcClient>>,
@@ -75,11 +77,13 @@ impl ControlConnection {
         tcp_mux: bool,
         disable_custom_tls_first_byte: bool,
         keepalive_secs: u64,
+        tcp_mux_keepalive_interval: i64,
         bind_addr: Option<String>,
         v2: bool,
         oidc_client: Option<Arc<OidcClient>>,
         metas: std::collections::HashMap<String, String>,
         proxy_url: String,
+        previous_run_id: String,
     ) -> Self {
         Self {
             server_addr,
@@ -89,7 +93,7 @@ impl ControlConnection {
             pool_count,
             user,
             client_id,
-            run_id: String::new(),
+            run_id: previous_run_id,
             tls_enable,
             tls_server_name,
             tls_ca_file,
@@ -99,6 +103,7 @@ impl ControlConnection {
             tcp_mux,
             disable_custom_tls_first_byte,
             keepalive_secs,
+            tcp_mux_keepalive_interval,
             bind_addr,
             v2,
             oidc_client,
@@ -162,7 +167,12 @@ impl ControlConnection {
                 // The server wraps its side on accept, so the client must wrap
                 // before sending ClientHello.
                 if propose_mux {
-                    let mux_cfg = mux::TcpMuxConfig::default();
+                    let mux_cfg = mux::TcpMuxConfig {
+                        keepalive_interval: Duration::from_secs(
+                            self.tcp_mux_keepalive_interval.max(1) as u64,
+                        ),
+                        max_stream_window_size: 6 * 1024 * 1024,
+                    };
                     match raw_stream {
                         IoStream::Tcp(tcp_stream) => {
                             let (control_stream, session) =
@@ -200,7 +210,12 @@ impl ControlConnection {
             // The server wraps its side on accept, so the client must wrap
             // before sending ClientHello.
             if propose_mux {
-                let mux_cfg = mux::TcpMuxConfig::default();
+                let mux_cfg = mux::TcpMuxConfig {
+                    keepalive_interval: Duration::from_secs(
+                        self.tcp_mux_keepalive_interval.max(1) as u64
+                    ),
+                    max_stream_window_size: 6 * 1024 * 1024,
+                };
                 match raw_stream {
                     IoStream::Tcp(tcp_stream) => {
                         let (control_stream, session) =
@@ -275,7 +290,11 @@ impl ControlConnection {
             os: Some(std::env::consts::OS.into()),
             arch: Some(std::env::consts::ARCH.into()),
             user: opt_if_empty!(self.user),
-            run_id: None,
+            run_id: if self.run_id.is_empty() {
+                None
+            } else {
+                Some(self.run_id.clone())
+            },
             client_id: opt_if_empty!(self.client_id),
             pool_count: Some(self.pool_count),
             timestamp: Some(timestamp),
@@ -308,9 +327,43 @@ impl ControlConnection {
         info!("Login sent, waiting for response...");
 
         let resp_msg = if self.v2 {
-            io_stream.read_v2_frame().await?
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                io_stream.read_v2_frame(),
+            )
+            .await
+            {
+                Ok(Ok(msg)) => msg,
+                Ok(Err(e)) => {
+                    return Err(frp_core::Error::Protocol(
+                        format!("Login response read error: {e}").into(),
+                    ))
+                }
+                Err(_) => {
+                    return Err(frp_core::Error::Protocol(
+                        "Login response timeout (10s)".into(),
+                    ))
+                }
+            }
         } else {
-            io_stream.read_v1_frame().await?
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                io_stream.read_v1_frame(),
+            )
+            .await
+            {
+                Ok(Ok(msg)) => msg,
+                Ok(Err(e)) => {
+                    return Err(frp_core::Error::Protocol(
+                        format!("Login response read error: {e}").into(),
+                    ))
+                }
+                Err(_) => {
+                    return Err(frp_core::Error::Protocol(
+                        "Login response timeout (10s)".into(),
+                    ))
+                }
+            }
         };
 
         // If AEAD crypto negotiated, wrap stream after LoginResp (matching Go frp flow).

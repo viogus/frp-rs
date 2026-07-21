@@ -1,4 +1,8 @@
-//! KCP configuration — matches Go frp v0.69.1 wire parameters.
+//! KCP configuration — conservative kcp-go defaults.
+//!
+//! These are the raw kcp-go library defaults (nodelay=0, interval=40, no FEC).
+//! For the aggressive Go frp v0.69.1 defaults (nodelay=1, interval=20, resend=2,
+//! nc=1, FEC enabled), use `default_kcp_config()` instead.
 
 /// KCP no-delay configuration.
 #[derive(Debug, Clone)]
@@ -14,6 +18,7 @@ pub struct KcpNoDelayConfig {
 }
 
 impl Default for KcpNoDelayConfig {
+    /// kcp-go library defaults: nodelay=0, interval=40, resend=0, nc=0.
     fn default() -> Self {
         Self {
             nodelay: false,
@@ -44,6 +49,7 @@ pub struct KcpConfig {
 }
 
 impl Default for KcpConfig {
+    /// Conservative defaults: no FEC, no nodelay, mtu=1350, wnd=1024.
     fn default() -> Self {
         Self {
             mtu: 1350,
