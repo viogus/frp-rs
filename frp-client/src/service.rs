@@ -13,6 +13,7 @@ pub(crate) struct VisitorRequest {
     pub reply: oneshot::Sender<Result<msg::NatHoleResp, String>>,
 }
 use rand::Rng;
+use std::time::Instant;
 use tokio::time::{interval, Duration};
 use tracing::{debug, info, instrument, warn};
 
@@ -367,23 +368,62 @@ impl Service {
         })
     }
 
-    /// Compute reconnect delay with exponential backoff and jitter.
-    /// Formula: min(24s × 1.5^(failed_count-1), 720s) × jitter[0.8, 1.2].
-    /// Matches Go frp v0.69.1 reconnect behavior:
-    /// `reconnectInterval * math.Pow(1.5, failedCount-1)`.
-    fn reconnect_delay_secs(failed_count: u32) -> u64 {
-        if failed_count == 0 {
-            return 24; // base interval for first reconnect
-        }
-        let base = (24.0_f64 * 1.5_f64.powi(failed_count as i32 - 1)).min(720.0);
-        let mut rng = rand::thread_rng();
-        let jitter: f64 = rng.gen_range(0.8..1.2);
-        ((base) * jitter) as u64
+    /// Count errors in the 60s fast-retry sliding window, pruning expired timestamps.
+    /// Matches Go frp dev FastBackoffManager.FastRetryWindow = time.Minute.
+    fn prune_fast_retry_count(timestamps: &mut Vec<Instant>) -> u32 {
+        let now = Instant::now();
+        let cutoff = now - Duration::from_secs(60);
+        timestamps.retain(|ts| *ts >= cutoff);
+        timestamps.len() as u32
     }
 
-    async fn reconnect_delay(failed_count: u32) {
-        let secs = Self::reconnect_delay_secs(failed_count);
-        tokio::time::sleep(Duration::from_secs(secs)).await;
+    /// Compute reconnect delay with the Go frp dev two-phase fast-backoff.
+    /// Phase 1 (first 3 retries within 60s window): 200ms base, 0.5 jitter, no cap.
+    /// Phase 2 (after that): 1s base, 2x factor, 0.1 jitter, cap 20s.
+    ///
+    /// Matches Go frp dev wait.FastBackoffManager:
+    ///   FastBackoffOptions{
+    ///       Duration:        time.Second,
+    ///       Factor:          2,
+    ///       Jitter:          0.1,
+    ///       MaxDuration:     20 * time.Second,
+    ///       FastRetryCount:  3,
+    ///       FastRetryDelay:  200 * time.Millisecond,
+    ///       FastRetryJitter: 0.5,
+    ///       FastRetryWindow: time.Minute,
+    ///   }
+    fn fast_backoff_delay(
+        consecutive_err_count: u32,
+        counts_in_fast_retry_window: u32,
+    ) -> Duration {
+        let mut rng = rand::thread_rng();
+
+        // Phase 1: fast retries
+        if counts_in_fast_retry_window <= 3 {
+            // Jitter is additive: 200ms + random(0, 0.5 * 200ms)
+            let base_ms = 200;
+            let jitter_ms = rng.gen_range(0..=100);
+            return Duration::from_millis((base_ms + jitter_ms) as u64);
+        }
+
+        // Phase 2: exponential backoff
+        // Base: 1s, Factor: 2, Jitter: additive 10%, Cap: 20s
+        let mut duration_ms = 1000u64; // 1 second base
+        if consecutive_err_count > 1 {
+            for _ in 1..consecutive_err_count {
+                duration_ms = duration_ms.saturating_mul(2);
+                if duration_ms >= 20_000 {
+                    duration_ms = 20_000;
+                    break;
+                }
+            }
+        }
+        // Additive jitter: duration_ms + random(0, 0.1 * duration_ms)
+        let jitter_ms = (rng.gen::<f64>() * 0.1 * duration_ms as f64) as u64;
+        duration_ms = duration_ms.saturating_add(jitter_ms);
+        let duration_ms = duration_ms.min(20_000);
+
+        Duration::from_millis(duration_ms)
     }
 
     /// Request a config reload. Safe to call from signal handler.
@@ -513,11 +553,13 @@ impl Service {
         self.spawn_admin_server(&_reload_tx, &_stop_tx);
 
         // Main session loop with reconnection.
-        // Exponential backoff: 24s × 1.5^(failedCount-1) with jitter [0.8, 1.2], capped at 720s.
-        // Matches Go frp v0.69.1 reconnect behavior:
-        // `reconnectInterval * math.Pow(1.5, failedCount-1)`.
+        // Go frp dev two-phase fast-backoff:
+        //   Phase 1 (first 3 retries within 60s window): 200ms + 0.5 jitter
+        //   Phase 2 (after that): 1s × 2ⁿ + 0.1 jitter, cap 20s
+        // Matches Go frp dev wait.FastBackoffManager.
         let mut did_login_once = false;
-        let mut failed_count: u32 = 0;
+        let mut consecutive_err_count: u32 = 0;
+        let mut fast_retry_timestamps: Vec<Instant> = Vec::new();
         // Track visitor listener tasks so they can be cancelled on reconnect.
         let mut visitor_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         loop {
@@ -551,7 +593,8 @@ impl Service {
             let (mut control_stream, run_id, yamux_session) = match ctl.login().await {
                 Ok(r) => {
                     did_login_once = true;
-                    failed_count = 0;
+                    consecutive_err_count = 0;
+                    fast_retry_timestamps.clear();
                     *self.server_auth_scopes.write().await = ctl.server_auth_scopes.clone();
                     // After login, wrap control stream in AES-128-CFB encryption.
                     // Go frps v0.69.1 always encrypts the control connection for V1.
@@ -567,12 +610,15 @@ impl Service {
                     (stream.into_encrypted(enc_key), run_id, yamux)
                 }
                 Err(e) => {
-                    failed_count += 1;
-                    warn!(attempt = %failed_count, error = %e, "Login failed (attempt {}): {}", failed_count, e);
+                    consecutive_err_count += 1;
+                    fast_retry_timestamps.push(Instant::now());
+                    let window_count = Self::prune_fast_retry_count(&mut fast_retry_timestamps);
+                    warn!(attempt = %consecutive_err_count, error = %e, "Login failed (attempt {}): {}", consecutive_err_count, e);
                     if self.cfg.login_fail_exit && !did_login_once {
                         return Err(e.into());
                     }
-                    Self::reconnect_delay(failed_count).await;
+                    let delay = Self::fast_backoff_delay(consecutive_err_count, window_count);
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
             };
@@ -1166,12 +1212,15 @@ impl Service {
                 return Ok(());
             }
 
-            // Session dropped — reconnect with exponential backoff.
+            // Session dropped — reconnect with Go frp dev two-phase fast-backoff.
             // login_fail_exit only applies to initial login, not session drops.
-            failed_count += 1;
-            warn!(delay = %Self::reconnect_delay_secs(failed_count), attempt = %failed_count, "Session ended, reconnecting in {}s (attempt {})...",
-                Self::reconnect_delay_secs(failed_count), failed_count);
-            Self::reconnect_delay(failed_count).await;
+            consecutive_err_count += 1;
+            fast_retry_timestamps.push(Instant::now());
+            let window_count = Self::prune_fast_retry_count(&mut fast_retry_timestamps);
+            let delay = Self::fast_backoff_delay(consecutive_err_count, window_count);
+            warn!(delay_ms = %delay.as_millis(), attempt = %consecutive_err_count, "Session ended, reconnecting in {}ms (attempt {})...",
+                delay.as_millis(), consecutive_err_count);
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -1937,68 +1986,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reconnect_delay_secs_failed_count_zero() {
-        // failed_count=0 → returns base interval of 24s → jitter [19, 28]
-        for _ in 0..100 {
-            let delay = Service::reconnect_delay_secs(0);
-            assert!(delay >= 19, "delay {} too low for n=0", delay);
-            assert!(delay <= 29, "delay {} too high for n=0", delay);
+    fn fast_backoff_delay_phase1_fast_retry() {
+        // First 3 retries (counts_in_fast_retry_window <= 3) use 200ms + 0.5 jitter
+        // Expected range: 200ms-300ms
+        for i in 1..=3u32 {
+            for _ in 0..100 {
+                let delay = Service::fast_backoff_delay(i, i);
+                let ms = delay.as_millis();
+                assert!(ms >= 200, "delay {ms}ms too low for fast retry {i}");
+                assert!(ms <= 300, "delay {ms}ms too high for fast retry {i}");
+            }
         }
     }
 
     #[test]
-    fn reconnect_delay_secs_failed_count_one() {
-        // failed_count=1 → base=24s × 1.5^0=24s → jitter [19, 28]
+    fn fast_backoff_delay_phase2_base_first() {
+        // After fast retries (counts_in_fast_retry_window > 3), consecutive_err_count=1
+        // -> base 1s + 10% additive jitter -> 1000-1100ms
         for _ in 0..100 {
-            let delay = Service::reconnect_delay_secs(1);
-            assert!(delay >= 19, "delay {} too low for n=1", delay);
-            assert!(delay <= 29, "delay {} too high for n=1", delay);
+            let delay = Service::fast_backoff_delay(1, 4);
+            let ms = delay.as_millis();
+            assert!(ms >= 1000, "delay {ms}ms below 1s for phase2 first");
+            assert!(ms <= 1100, "delay {ms}ms above 1.1s for phase2 first");
         }
     }
 
     #[test]
-    fn reconnect_delay_secs_exponential_growth() {
-        // failed_count=2 → base=24s × 1.5^1=36s → jitter [28, 43]
+    fn fast_backoff_delay_phase2_exponential() {
+        // consecutive_err_count=4, counts_in_fast_retry_window=5 -> 1s*2^3=8s + 10% jitter
+        // Range: 8000-8800ms
         for _ in 0..100 {
-            let delay = Service::reconnect_delay_secs(2);
-            assert!(delay >= 28, "delay {} too low for n=2", delay);
-            assert!(delay <= 44, "delay {} too high for n=2", delay);
+            let delay = Service::fast_backoff_delay(4, 5);
+            let ms = delay.as_millis();
+            assert!(ms >= 8000, "delay {ms}ms below 8s for err=4");
+            assert!(ms <= 8800, "delay {ms}ms above 8.8s for err=4");
         }
     }
 
     #[test]
-    fn reconnect_delay_secs_caps_at_720s() {
-        // failed_count=100 → base=min(24×1.5^99, 720)=720 → jitter [576, 864]
+    fn fast_backoff_delay_phase2_caps_at_20s() {
+        // High consecutive_err_count should cap at 20s
         for _ in 0..100 {
-            let delay = Service::reconnect_delay_secs(100);
-            assert!(delay >= 576, "delay {} below 80% of cap", delay);
-            assert!(delay <= 864, "delay {} above 120% of cap", delay);
+            let delay = Service::fast_backoff_delay(20, 20);
+            let ms = delay.as_millis();
+            assert!(ms >= 20000, "delay {ms}ms below 20s cap");
+            assert!(ms <= 21000, "delay {ms}ms above 21s cap (20s + 10% jitter)");
         }
     }
 
     #[test]
-    fn reconnect_delay_secs_cap_exact() {
-        // failed_count=30 → base=min(720, 720)=720 → jitter [0.8, 1.2]
-        for _ in 0..100 {
-            let delay = Service::reconnect_delay_secs(30);
-            assert!(delay >= 576, "delay {} below 80% of cap", delay);
-            assert!(delay <= 864, "delay {} above 120% of cap", delay);
-        }
-    }
-
-    #[test]
-    fn reconnect_delay_secs_monotonic_in_mean() {
-        // Mean delay should increase with failed_count
-        fn mean_delay(n: u32) -> f64 {
+    fn fast_backoff_delay_monotonic_in_mean() {
+        // Mean delay should increase with consecutive_err_count
+        fn mean_delay(consecutive: u32, window: u32) -> f64 {
             (0..50)
-                .map(|_| Service::reconnect_delay_secs(n) as f64)
+                .map(|_| Service::fast_backoff_delay(consecutive, window).as_millis() as f64)
                 .sum::<f64>()
                 / 50.0
         }
-        let m1 = mean_delay(1);
-        let m2 = mean_delay(2);
-        let m5 = mean_delay(5);
-        assert!(m2 > m1, "mean delay should grow: {} > {}", m2, m1);
-        assert!(m5 > m2, "mean delay should grow: {} > {}", m5, m2);
+        let m1 = mean_delay(1, 4); // phase2, 1s
+        let m2 = mean_delay(2, 5); // phase2, 2s
+        let m5 = mean_delay(5, 6); // phase2, 16s
+        assert!(m2 > m1, "mean delay should grow: {m2} > {m1}");
+        assert!(m5 > m2, "mean delay should grow: {m5} > {m2}");
     }
 }

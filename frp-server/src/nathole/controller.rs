@@ -274,7 +274,7 @@ impl Controller {
                 // Report success to analyzer — only when the provider
                 // reports the hole punch actually succeeded (Go frp compat:
                 // HandleReport only calls ReportSuccess when m.Success is true).
-                if msg.success != Some(false) {
+                if msg.success.unwrap_or(false) {
                     let v_resp = session.v_resp.lock().await;
                     if let Some(ref resp) = *v_resp {
                         if let Some(ref db) = resp.detect_behavior {

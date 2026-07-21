@@ -601,6 +601,15 @@ pub(crate) async fn handle_nat_hole_visitor(
     *session.v_resp.lock().await = Some(v_resp.clone());
 
     // --- Step 6: Send NatHoleResp to both sides ---
+
+    // Go frp dev compat: if the visitor has the "sender" role, wait 1s
+    // before sending NatHoleResp. This gives the sender time to complete
+    // STUN and start sending detect messages before the receiver gets
+    // the response and starts detecting.
+    if v_resp.detect_behavior.as_ref().is_some_and(|db| db.role.as_deref() == Some("sender")) {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
     // Send to visitor via writer
     {
         let mut writer_guard = session.visitor_writer.lock().await;
@@ -608,6 +617,14 @@ pub(crate) async fn handle_nat_hole_visitor(
             if let Err(e) = write_msg(w, &FrpMessage::NatHoleResp(Box::new(v_resp)), v2).await {
                 warn!(error = %e, "failed to write NatHoleResp to visitor");
             }
+        }
+    }
+
+    // Go frp dev compat: if the provider has the "sender" role, wait 1s
+    // before sending NatHoleResp (see comment above for rationale).
+    if let Some(ref cr) = c_resp {
+        if cr.detect_behavior.as_ref().is_some_and(|db| db.role.as_deref() == Some("sender")) {
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 

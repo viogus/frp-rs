@@ -128,6 +128,30 @@ impl VhostManager {
         self.inner.read().await.routes.get(domain).cloned()
     }
 
+    /// Look up by domain with wildcard support (Go frp dev compat).
+    /// Tries exact match first, then progressively replaces the leftmost
+    /// label with "*" (e.g. "a.b.c" → "*.b.c" → "*.c"), then tries
+    /// the catch-all "*" wildcard.
+    pub async fn lookup_wildcard(&self, domain: &str) -> Option<VhostRoute> {
+        let routes = self.inner.read().await;
+        // 1. Exact match
+        if let Some(route) = routes.routes.get(domain) {
+            return Some(route.clone());
+        }
+        // 2. Replace leftmost label with "*" progressively
+        let mut parts: Vec<&str> = domain.split('.').collect();
+        while parts.len() > 1 {
+            parts[0] = "*";
+            let wildcard_host = parts.join(".");
+            if let Some(route) = routes.routes.get(&wildcard_host) {
+                return Some(route.clone());
+            }
+            parts = parts[1..].to_vec();
+        }
+        // 3. Catch-all "*"
+        routes.routes.get("*").cloned()
+    }
+
     /// Look up by URL path (longest prefix match among registered locations).
     /// Returns the VhostRoute whose location prefix best matches the given path.
     pub async fn lookup_by_path(&self, path: &str) -> Option<VhostRoute> {
@@ -155,8 +179,8 @@ impl VhostManager {
     /// for the caller to verify path prefix).
     /// If no domain match, tries location-only routing.
     pub async fn lookup_combined(&self, domain: &str, path: &str) -> Option<VhostRoute> {
-        // Try host-based routing first
-        if let Some(route) = self.lookup(domain).await {
+        // Try host-based routing first (with wildcard support)
+        if let Some(route) = self.lookup_wildcard(domain).await {
             // If the route has locations, verify path matches one of them
             if route.locations.is_empty() {
                 return Some(route);

@@ -221,15 +221,31 @@ wait_for_port() {
 wait_for_port_safe() {
     local host="$1" port="$2" timeout="${3:-15}"
     local deadline=$(($(date +%s) + timeout))
-    while true; do
-        if lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
-            return 0
-        fi
-        if [[ $(date +%s) -gt $deadline ]]; then
-            return 1
-        fi
-        sleep 0.1
-    done
+    if command -v lsof >/dev/null 2>&1; then
+        while true; do
+            if lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
+                return 0
+            fi
+            if [[ $(date +%s) -gt $deadline ]]; then
+                return 1
+            fi
+            sleep 0.1
+        done
+    elif command -v nc >/dev/null 2>&1; then
+        while true; do
+            if nc -z "$host" "$port" 2>/dev/null; then
+                return 0
+            fi
+            if [[ $(date +%s) -gt $deadline ]]; then
+                return 1
+            fi
+            sleep 0.1
+        done
+    else
+        echo "WARNING: neither lsof nor nc available; sleeping ${timeout}s" >&2
+        sleep "$timeout"
+        return 0
+    fi
 }
 
 wait_for_port_gone() {
@@ -754,6 +770,8 @@ write_frpc_config() {
                 printf 'tls_ca_file = "%s/ca.crt"\n' "$CERT_DIR"
                 printf 'tls_server_name = "localhost"\n'
                 printf 'disable_custom_tls_first_byte = true\n'
+            else
+                printf 'tls_enable = false\n'
             fi
             printf '\n[[proxies]]\nname = "%s"\ntype = "tcp"\nlocal_ip = "127.0.0.1"\n' "$name"
             printf 'local_port = %s\nremote_port = %s\n' "$echo_port" "$proxy_port"

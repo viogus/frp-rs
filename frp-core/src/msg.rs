@@ -449,8 +449,8 @@ pub struct NatHoleDetectBehavior {
     /// Delay before sending (ms).
     #[serde(default)]
     pub send_delay_ms: i32,
-    /// Read timeout (ms).
-    #[serde(default)]
+    /// Read timeout (ms). JSON key is "read_timeout" (Go frp compat).
+    #[serde(default, rename = "read_timeout", alias = "read_timeout_ms")]
     pub read_timeout_ms: i32,
     /// Number of random ports to send from.
     #[serde(default)]

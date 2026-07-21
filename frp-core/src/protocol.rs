@@ -287,7 +287,7 @@ pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate
 pub const V2_MAGIC_LEN: usize = 7;
 pub const V2_MAGIC_BYTES: [u8; 7] = [0x46, 0x52, 0x50, 0x00, 0x02, 0x0D, 0x0A];
 pub const V2_FRAME_TYPE_MESSAGE: u16 = 16;
-pub const V2_MAX_FRAME_PAYLOAD: u32 = 1024 * 1024;
+pub const V2_MAX_FRAME_PAYLOAD: u32 = 64 * 1024;
 
 /// V2 frame header size (Go wire.Conn format): type(2) + flags(2) + length(4) = 8 bytes.
 /// Does NOT include magic bytes — magic is only at connection start.
@@ -394,7 +394,9 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
     );
 
     if flags != 0 {
-        tracing::trace!(flags = %flags, "V2 frame with non-zero flags: {flags}");
+        return Err(crate::Error::Protocol(
+            format!("unsupported V2 frame flags: {flags}").into(),
+        ));
     }
     if payload_len > V2_MAX_FRAME_PAYLOAD as usize {
         return Err(crate::Error::Protocol(
@@ -706,9 +708,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_v2_frame_raw_accepts_nonzero_flags() {
+    async fn test_v2_frame_raw_rejects_nonzero_flags() {
         let (mut client, mut server) = duplex(65536);
-        // Write frame with flags=1 (Go frp compat: non-zero flags are accepted)
+        // Write frame with flags=1 (Go frp dev compat: non-zero flags are rejected)
         let mut header = [0u8; 8];
         header[0..2].copy_from_slice(&V2_FRAME_TYPE_MESSAGE.to_be_bytes());
         header[2..4].copy_from_slice(&1u16.to_be_bytes()); // flags=1
@@ -719,12 +721,9 @@ mod tests {
 
         let result = read_v2_frame_raw(&mut server).await;
         assert!(
-            result.is_ok(),
-            "non-zero flags should be accepted (Go frp compat)"
+            result.is_err(),
+            "non-zero flags should be rejected (Go frp dev compat)"
         );
-        let (_, flags, payload) = result.unwrap();
-        assert_eq!(flags, 1);
-        assert_eq!(payload, b"data");
     }
 
     #[tokio::test]
