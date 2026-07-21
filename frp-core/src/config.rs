@@ -851,6 +851,11 @@ pub struct ClientConfig {
     /// interval. Default: 30. Go frp compat: transport.heartbeatInterval.
     #[serde(default = "default_heartbeat_interval", alias = "heartbeatInterval")]
     pub heartbeat_interval: i64,
+    /// Heartbeat timeout in seconds. Disconnect if no Pong received within
+    /// this interval. Default: 90. Go frp compat: transport.heartbeatTimeout.
+    /// Set to -1 when tcp_mux is enabled (yamux provides keepalive).
+    #[serde(default = "default_heartbeat_timeout", alias = "heartbeatTimeout")]
+    pub heartbeat_timeout: i64,
     #[serde(default)]
     pub dns_server: String,
     /// TCP keepalive interval in seconds for outbound connections to the
@@ -904,6 +909,7 @@ impl Default for ClientConfig {
             login_fail_exit: true,
             pool_count: 1,
             heartbeat_interval: default_heartbeat_interval(),
+            heartbeat_timeout: default_heartbeat_timeout(),
             dns_server: String::new(),
             dial_server_keepalive: 7200,
             connect_server_local_ip: String::new(),
@@ -928,6 +934,9 @@ impl ClientConfig {
             // unnecessary — rely on yamux keepalive instead (Go compat).
             if self.heartbeat_interval == default_heartbeat_interval() {
                 self.heartbeat_interval = -1;
+            }
+            if self.heartbeat_timeout == default_heartbeat_timeout() {
+                self.heartbeat_timeout = -1;
             }
         }
     }

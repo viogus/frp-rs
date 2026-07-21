@@ -2,6 +2,31 @@
 
 use tokio::sync::oneshot;
 
+/// Tracks the lifecycle phase of a registered proxy.
+/// Mirrors Go frp client proxy/proxy_wrapper.go ProxyPhase* constants.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProxyPhase {
+    New,
+    WaitStart,
+    StartErr(String),
+    Running,
+    CheckFailed,
+    Closed,
+}
+
+impl ProxyPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProxyPhase::New => "new",
+            ProxyPhase::WaitStart => "wait start",
+            ProxyPhase::StartErr(_) => "start error",
+            ProxyPhase::Running => "running",
+            ProxyPhase::CheckFailed => "check failed",
+            ProxyPhase::Closed => "closed",
+        }
+    }
+}
+
 /// Runtime state for a registered proxy.
 /// Used by work_conn, reload, and service modules regardless of admin feature.
 #[derive(Debug, Clone)]
@@ -23,6 +48,8 @@ pub struct ProxyRuntimeInfo {
     pub err: String,
     /// Snapshot of original proxy config (JSON) for reload change detection.
     pub config_snapshot: String,
+    /// Current lifecycle phase of this proxy.
+    pub phase: ProxyPhase,
 }
 
 /// Request to reload configuration. Sent via channel from admin API or signal handler.

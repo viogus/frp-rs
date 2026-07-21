@@ -36,7 +36,7 @@ use frp_core::metrics::ProxyMetricsRegistry;
 use crate::admin::AdminState;
 use crate::control::ControlConnection;
 use crate::plugin::{self, PluginContext, PluginHandle};
-use crate::proxy_runtime::{ProxyRuntimeInfo, ReloadRequest};
+use crate::proxy_runtime::{ProxyPhase, ProxyRuntimeInfo, ReloadRequest};
 use crate::util::opt_if_empty;
 use crate::work_conn::XtcpNotification;
 
@@ -312,6 +312,7 @@ impl Service {
                     remote_addr: String::new(),
                     err: String::new(),
                     config_snapshot: snapshot,
+                    phase: ProxyPhase::New,
                 },
             );
         }
@@ -658,6 +659,7 @@ impl Service {
                         if let Some(info) = map.get_mut(&p.name) {
                             info.remote_addr = remote;
                             info.err.clear();
+                            info.phase = ProxyPhase::Running;
                         }
 
                         #[cfg(feature = "vnet")]
@@ -735,6 +737,7 @@ impl Service {
                         let mut map = self.proxy_info_map.write().await;
                         if let Some(info) = map.get_mut(&p.name) {
                             info.err = e.to_string();
+                            info.phase = ProxyPhase::StartErr(e.to_string());
                         }
                     }
                 }
@@ -969,6 +972,12 @@ impl Service {
             info!(interval = %ping_secs, "Heartbeat interval: {}s", ping_secs);
             let mut ping_interval = interval(Duration::from_secs(ping_secs));
 
+            // Track last Pong for heartbeat timeout detection (Go frp compat).
+            let mut last_pong = Instant::now();
+            let hb_timeout = self.cfg.heartbeat_timeout;
+            let hb_timeout_dur = Duration::from_secs(hb_timeout.max(0) as u64);
+            let mut hb_tick = interval(Duration::from_secs(1));
+
             loop {
                 tokio::select! {
                     msg = read_msg(&mut reader, v2) => {
@@ -979,6 +988,7 @@ impl Service {
                             }
                             Ok(FrpMessage::Pong(_)) => {
                                 debug!("Pong received");
+                                last_pong = Instant::now();
                             }
                             Ok(FrpMessage::CloseProxy(cp)) => {
                                 info!(proxy_name = %cp.proxy_name, "Server closed proxy: {}", cp.proxy_name);
@@ -1199,6 +1209,15 @@ impl Service {
                         info!("Admin stop requested, shutting down");
                         shutdown_flag.store(true, Ordering::SeqCst);
                         break;
+                    }
+
+                    // Heartbeat timeout watchdog: triggers reconnect if no Pong
+                    // received within heartbeat_timeout seconds (Go frp compat).
+                    _ = hb_tick.tick(), if hb_timeout > 0 => {
+                        if last_pong.elapsed() > hb_timeout_dur {
+                            warn!("Heartbeat timeout ({}s), reconnecting...", hb_timeout);
+                            break;
+                        }
                     }
                 }
             }
@@ -1926,6 +1945,7 @@ impl Service {
                             remote_addr: String::new(),
                             err,
                             config_snapshot: snapshot,
+                            phase: ProxyPhase::New,
                         },
                     );
                 }
