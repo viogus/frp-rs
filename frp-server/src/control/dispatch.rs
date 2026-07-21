@@ -81,13 +81,14 @@ pub(crate) async fn dispatch_internal<W: AsyncWriteExt + Unpin>(
             super::proxy::handle_write_close_proxy(ctx, ctl, writer, proxy_name).await;
             Ok(())
         }
-        InternalMsg::Shutdown => {
+        InternalMsg::Shutdown { done } => {
             tracing::warn!(
                 run_id = %ctx.run_id,
                 "Shutdown received for run_id {} (replaced by new control connection)",
                 ctx.run_id
             );
             ctl.shutting_down = true;
+            ctl.shutdown_done = Some(done);
             // Return Err to trigger loop break via is_err() in mod.rs,
             // so that cleanup runs after the select! loop exits.
             Err(())

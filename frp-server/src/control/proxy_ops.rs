@@ -639,10 +639,19 @@ pub(crate) async fn unregister_control(
 ) {
     // When shutting down due to supersession (duplicate run_id), the new
     // handler has already inserted its ControlTx. Skip removal to avoid
-    // deleting the replacement's entry.
+    // deleting the replacement's entry. Also skip registry mark-offline
+    // because the new handler already registered with its own control_id.
     if !skip_ctl_unregister {
+        let control_id = {
+            let map = state.run_id_to_ctl_tx.read().await;
+            map.get(run_id).map(|c| c.control_id).unwrap_or(0)
+        };
         let mut map = state.run_id_to_ctl_tx.write().await;
         map.remove(run_id);
+        // Mark the client offline in the registry, generation-aware.
+        state
+            .client_registry
+            .mark_offline_by_run_id_and_control_id(run_id, control_id);
     }
     // Release allocated ports and clean up sk/vhost entries for this client
     let proxies = state.proxy_manager.list_client(run_id).await;

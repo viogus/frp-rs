@@ -52,6 +52,9 @@ use crate::service::AppState;
 /// all handler functions. Single-task — no synchronisation needed.
 pub(crate) struct ControlState {
     pub shutting_down: bool,
+    /// Signaled after cleanup completes so the new control generation
+    /// (same run_id) can proceed past its handoff barrier.
+    pub shutdown_done: Option<tokio::sync::oneshot::Sender<()>>,
     pub work_pool: VecDeque<pool::PoolEntry>,
     pub pending_requests: VecDeque<pool::PendingRequest>,
     pub pending_udp: VecDeque<(String, Instant)>,
@@ -305,4 +308,10 @@ pub async fn handle_control<S>(
 
     // Cleanup
     proxy::cleanup(&mut ctx, &mut ctl, &mut writer).await;
+
+    // Signal the new control generation (waiting on the handoff barrier)
+    // that the old handler's cleanup is complete.
+    if let Some(done) = ctl.shutdown_done.take() {
+        let _ = done.send(());
+    }
 }

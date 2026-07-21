@@ -15,6 +15,7 @@ use frp_core::transport::IoStream;
 
 use crate::nathole::controller::Controller;
 use crate::proxy::ProxyManager;
+use crate::registry::ClientRegistry;
 use crate::tcpmux::TcpMuxManager;
 use crate::vhost::VhostManager;
 
@@ -44,7 +45,11 @@ pub enum InternalMsg {
     },
     /// Sent when a new control connection claims the same run_id.
     /// The old handler should stop listening and clean up.
-    Shutdown,
+    /// The `done` oneshot is signaled after cleanup completes,
+    /// allowing the new handler to wait for handoff.
+    Shutdown {
+        done: tokio::sync::oneshot::Sender<()>,
+    },
     // NatHoleClient variant removed — dead code. Go frp compat uses
     // NatHoleSidOnWorkConn path (server is pure relay, provider does STUN).
     /// Send NatHoleSid to provider on a work connection (Go frp v0.69.1 XTCP compat).
@@ -105,6 +110,9 @@ pub struct ControlTx {
     pub login_time_unix: i64,
     pub pool_stats: Arc<PoolStats>,
     pub user: String,
+    /// Monotonically increasing control generation ID.
+    /// Distinguished old vs new control connections with the same run_id.
+    pub control_id: u64,
 }
 
 /// Hot-reloadable server configuration subset, updated atomically on SIGUSR1.
@@ -197,6 +205,14 @@ pub struct AppState {
     pub reloadable: Arc<std::sync::RwLock<ReloadableState>>,
     pub used_ports: Arc<RwLock<std::collections::HashSet<u16>>>,
     pub run_id_to_ctl_tx: Arc<RwLock<HashMap<String, ControlTx>>>,
+    /// Client registry tracking connected frpc instances with metadata.
+    pub client_registry: Arc<ClientRegistry>,
+    /// Monotonically increasing counter for control generation IDs.
+    pub control_id_counter: AtomicU64,
+    /// Per-runID mutex for serializing control lifecycle transitions
+    /// (Add/Activate/completeLogin/Remove). Inherited from old to new control
+    /// to prevent concurrent lifecycle operations for the same run_id.
+    pub run_mu_map: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     pub proxy_bind_addr: String,
     pub vhost_manager: Arc<VhostManager>,
     pub vhost_http_port: u16,
@@ -322,6 +338,9 @@ impl AppState {
             })),
             used_ports: Arc::new(RwLock::new(std::collections::HashSet::new())),
             run_id_to_ctl_tx: Arc::new(RwLock::new(HashMap::new())),
+            client_registry: Arc::new(ClientRegistry::new()),
+            control_id_counter: AtomicU64::new(1),
+            run_mu_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
             proxy_bind_addr,
             vhost_manager: Arc::new(VhostManager::new()),
             vhost_http_port: 0, // set by Service::run() before starting listeners
@@ -422,5 +441,17 @@ impl AppState {
         }
         *count += 1; // Reserve this attempt atomically
         true
+    }
+
+    /// Get or create the per-run_id serialization mutex.
+    ///
+    /// This mutex ensures that only one lifecycle transition (admit/activate/
+    /// completeLogin/remove) happens at a time for a given run_id. It is
+    /// inherited by new control connections when they supersede old ones.
+    pub fn get_run_mu(&self, run_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.run_mu_map.lock().unwrap();
+        map.entry(run_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 }

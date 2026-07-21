@@ -35,6 +35,9 @@ pub struct ClientInfo {
     pub disconnected_at: Option<Instant>,
     /// Whether this client is currently online.
     pub online: bool,
+    /// Monotonically increasing control generation ID for distinguishing
+    /// old vs new control connections with the same run_id.
+    pub control_id: u64,
 }
 
 impl ClientInfo {
@@ -84,6 +87,35 @@ impl ClientRegistry {
         remote_addr: &str,
         wire_protocol: &str,
     ) -> (String, bool) {
+        self.register_with_control_id(
+            user,
+            raw_client_id,
+            run_id,
+            hostname,
+            version,
+            remote_addr,
+            wire_protocol,
+            0,
+        )
+    }
+
+    /// Generation-aware registration used by `ControlManager`.
+    ///
+    /// Like `register()` but stores the `control_id` for generation-aware
+    /// offline marking. A `control_id` of 0 means "no generation tracking"
+    /// (backward compat with `register()`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_with_control_id(
+        &self,
+        user: &str,
+        raw_client_id: &str,
+        run_id: &str,
+        hostname: &str,
+        version: &str,
+        remote_addr: &str,
+        wire_protocol: &str,
+        control_id: u64,
+    ) -> (String, bool) {
         if run_id.is_empty() {
             return (String::new(), false);
         }
@@ -123,6 +155,7 @@ impl ClientRegistry {
             last_connected_at: now,
             disconnected_at: None,
             online: false,
+            control_id: 0,
         });
 
         // If reconnecting with a new run_id, remove old run_index entry
@@ -134,6 +167,7 @@ impl ClientRegistry {
         // keep the original value for reconnecting clients.
         info.raw_client_id = raw_client_id.to_string();
         info.run_id = run_id.to_string();
+        info.control_id = control_id;
         info.hostname = hostname.to_string();
         info.ip = remote_addr.to_string();
         info.version = version.to_string();
@@ -151,20 +185,29 @@ impl ClientRegistry {
     /// If the client has no `raw_client_id`, the entry is removed entirely.
     /// Otherwise, the entry persists with `online=false` and `disconnected_at` set.
     pub fn mark_offline_by_run_id(&self, run_id: &str) {
+        self.mark_offline_by_run_id_and_control_id(run_id, 0);
+    }
+
+    /// Generation-aware offline marking used by `ControlManager`.
+    ///
+    /// Only marks the client offline if the registry entry's control_id
+    /// matches. When `control_id` is 0, the check is skipped (backward
+    /// compat with `mark_offline_by_run_id`).
+    pub fn mark_offline_by_run_id_and_control_id(&self, run_id: &str, control_id: u64) {
         let mut run_index = self.run_index.write_ok();
-        let key = match run_index.remove(run_id) {
-            Some(k) => k,
+        let key = match run_index.get(run_id) {
+            Some(k) => k.clone(),
             None => return,
         };
-        drop(run_index);
-
         let mut clients = self.clients.write_ok();
         if let Some(info) = clients.get_mut(&key) {
-            if info.run_id == run_id {
+            if info.run_id == run_id && (control_id == 0 || info.control_id == control_id) {
                 if info.raw_client_id.is_empty() {
                     clients.remove(&key);
+                    run_index.remove(run_id);
                 } else {
                     info.run_id = String::new();
+                    info.control_id = 0;
                     info.online = false;
                     info.disconnected_at = Some(Instant::now());
                 }
@@ -314,7 +357,44 @@ mod tests {
             last_connected_at: Instant::now(),
             disconnected_at: None,
             online: true,
+            control_id: 0,
         };
         assert_eq!(info.client_id(), "run-123");
+    }
+
+    #[test]
+    fn test_register_with_control_id() {
+        let r = mk_registry();
+        let (key, conflict) = r.register_with_control_id(
+            "user1", "clientA", "run-001", "host1", "0.70.0", "1.2.3.4", "v2", 42,
+        );
+        assert!(!conflict);
+        assert_eq!(key, "user1.clientA");
+        let info = r.get_by_key("user1.clientA").unwrap();
+        assert_eq!(info.control_id, 42);
+    }
+
+    #[test]
+    fn test_mark_offline_control_id_match() {
+        let r = mk_registry();
+        r.register_with_control_id("u", "c1", "run-1", "h", "0.70.0", "1.2.3.4", "v1", 7);
+        // Wrong control_id — should NOT mark offline
+        r.mark_offline_by_run_id_and_control_id("run-1", 3);
+        let info = r.get_by_key("u.c1").unwrap();
+        assert!(info.online);
+        // Correct control_id — should mark offline
+        r.mark_offline_by_run_id_and_control_id("run-1", 7);
+        let info = r.get_by_key("u.c1").unwrap();
+        assert!(!info.online);
+    }
+
+    #[test]
+    fn test_mark_offline_control_id_zero_matches_any() {
+        let r = mk_registry();
+        r.register_with_control_id("u", "c1", "run-1", "h", "0.70.0", "1.2.3.4", "v1", 7);
+        // control_id=0 should skip the check and mark offline
+        r.mark_offline_by_run_id_and_control_id("run-1", 0);
+        let info = r.get_by_key("u.c1").unwrap();
+        assert!(!info.online);
     }
 }

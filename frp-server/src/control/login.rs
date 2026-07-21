@@ -7,10 +7,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant, Interval};
 use tracing::{debug, info, warn};
 
@@ -245,24 +246,49 @@ where
 
     // --- Set up internal channel ---
     let (internal_tx, internal_rx) = mpsc::channel::<InternalMsg>(1024);
-
-    // Register control channel. If a previous handler exists for this run_id,
-    // send Shutdown to it so it stops listening (Go frp v0.69.1 compat).
     let pool_stats = Arc::new(PoolStats::default());
-    {
-        let mut map = state.run_id_to_ctl_tx.write().await;
+
+    // ── Control Manager: Admit phase ──────────────────────────────────
+    // Assign a monotonically increasing control_id to distinguish this
+    // control generation from any previous one with the same run_id.
+    let control_id = state.control_id_counter.fetch_add(1, Ordering::SeqCst);
+
+    // Acquire per-runID mutex to serialize lifecycle transitions.
+    // This prevents two concurrent logins for the same run_id from racing.
+    let run_mu = state.get_run_mu(&run_id);
+    let run_guard = run_mu.lock().await;
+
+    // Check for existing control and set up handoff barrier.
+    // The new handler waits for the old handler's cleanup to complete
+    // before proceeding (Go frp dev control.go lifecycle).
+    let handoff_barrier: Option<oneshot::Receiver<()>> = {
+        let map = state.run_id_to_ctl_tx.read().await;
         if let Some(old_ctl) = map.get(&run_id) {
-            warn!(run_id = %run_id, "Duplicate run_id {}: shutting down old control handler", run_id);
-            match old_ctl.tx.try_send(InternalMsg::Shutdown) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    debug!(run_id = %run_id, "Old control handler channel full; cleanup by timeout");
-                }
+            warn!(run_id = %run_id, "Duplicate run_id {}: shutting down old control handler for replacement", run_id);
+            let (tx, rx) = oneshot::channel();
+            match old_ctl.tx.try_send(InternalMsg::Shutdown { done: tx }) {
+                Ok(()) => Some(rx),
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     debug!(run_id = %run_id, "Old control handler already shut down");
+                    None
+                }
+                Err(mpsc::error::TrySendError::Full(shutdown_msg)) => {
+                    debug!(run_id = %run_id, "Old control handler channel full; sending async");
+                    let old_tx = old_ctl.tx.clone();
+                    tokio::spawn(async move {
+                        let _ = old_tx.send(shutdown_msg).await;
+                    });
+                    Some(rx)
                 }
             }
+        } else {
+            None
         }
+    };
+
+    // Insert new ControlTx while holding run_mu.
+    {
+        let mut map = state.run_id_to_ctl_tx.write().await;
         map.insert(
             run_id.clone(),
             ControlTx {
@@ -275,57 +301,113 @@ where
                     .unwrap_or(0),
                 pool_stats: pool_stats.clone(),
                 user: login.user.clone().unwrap_or_default(),
+                control_id,
             },
         );
     }
 
-    // --- Send login response (plain, before encryption) ---
-    {
-        let additional_auth_scopes = reloadable.additional_auth_scopes.clone();
+    // Wait for handoff barrier. RunMu is released during this wait so the
+    // old handler's cleanup (which may need to acquire run_mu via Remove)
+    // does not deadlock. This matches Go frp dev's WaitForHandoff() which
+    // is called outside the per-runID serialization lock.
+    if let Some(barrier) = handoff_barrier {
+        info!(run_id = %run_id, "Waiting for old control handler shutdown...");
+        let _ = barrier.await;
+        info!(run_id = %run_id, "Old control handler shutdown complete");
+    }
+
+    // ── Activate phase: register in ClientRegistry ──────────────────
+    let peer_str = peer.map(|a| a.to_string()).unwrap_or_default();
+    let wire_protocol = if v2 { "v2" } else { "v1" };
+    let (_registry_key, conflict) = state.client_registry.register_with_control_id(
+        login.user.as_deref().unwrap_or(""),
+        login.client_id.as_deref().unwrap_or(""),
+        &run_id,
+        login.hostname.as_deref().unwrap_or(""),
+        login.version.as_deref().unwrap_or(""),
+        &peer_str,
+        wire_protocol,
+        control_id,
+    );
+    if conflict {
+        warn!(
+            run_id = %run_id,
+            "Client already online with same user/client_id — rejecting activation"
+        );
+        let (_, mut writer) = tokio::io::split(stream);
         let resp = FrpMessage::LoginResp(msg::LoginResp {
             version: Some(frp_core::VERSION.into()),
-            run_id: Some(run_id.clone()),
-            error: None,
-            server_additional_auth_scopes: if additional_auth_scopes.is_empty() {
-                None
-            } else {
-                Some(additional_auth_scopes)
-            },
+            run_id: None,
+            error: Some("client already online".into()),
+            server_additional_auth_scopes: None,
         });
-        // Hex-dump the raw LoginResp V1 frame for Go compat debugging
-        let type_byte = resp.v1_type_byte();
-        let payload = serde_json::to_vec(&resp).unwrap_or_default();
-        let frame_len = 9 + payload.len();
-        info!(
-            peer = ?peer, run_id = %run_id,
-            type_byte = format_args!("{:#04x}", type_byte),
-            payload_len = payload.len(),
-            payload_text = %String::from_utf8_lossy(&payload),
-            "LoginResp V1 frame: type={:#04x} len={} frame_total={} json={}",
-            type_byte, payload.len(), frame_len,
-            String::from_utf8_lossy(&payload),
-        );
-        if let Err(e) = write_ctl_msg(&mut stream, &resp, v2).await {
-            warn!(peer = ?peer, error = %e, "Failed to send login response to {:?}: {}", peer, e);
-            unregister_control(&state, &run_id, false).await;
-            return Err(());
+        let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+        unregister_control(&state, &run_id, false).await;
+        // Clean up OIDC subject
+        if oidc_subject.is_some() {
+            state.oidc.subjects.write().await.remove(&run_id);
         }
-        // Flush TLS stream to ensure LoginResp reaches KCP before we wrap in CipherStream
-        if let Err(e) = stream.flush().await {
-            warn!(peer = ?peer, error = %e, "Failed to flush after LoginResp: {}", e);
-        }
-        info!(peer = ?peer, run_id = %run_id, "LoginResp sent to {:?}, flushed", peer);
+        return Err(());
+    }
 
-        // Emit WebSocket event for dashboard subscribers
-        #[cfg(feature = "dashboard")]
-        {
-            let _ = state
-                .event_tx
-                .send(crate::event::ServerEvent::ClientConnected {
-                    run_id: run_id.clone(),
-                    client_addr: peer.map(|a| a.to_string()),
-                });
+    // ── CompleteLogin phase: write LoginResp within run_mu ──────────
+    let additional_auth_scopes = reloadable.additional_auth_scopes.clone();
+    let resp = FrpMessage::LoginResp(msg::LoginResp {
+        version: Some(frp_core::VERSION.into()),
+        run_id: Some(run_id.clone()),
+        error: None,
+        server_additional_auth_scopes: if additional_auth_scopes.is_empty() {
+            None
+        } else {
+            Some(additional_auth_scopes)
+        },
+    });
+    // Hex-dump the raw LoginResp V1 frame for Go compat debugging
+    let type_byte = resp.v1_type_byte();
+    let payload = serde_json::to_vec(&resp).unwrap_or_default();
+    let frame_len = 9 + payload.len();
+    info!(
+        peer = ?peer, run_id = %run_id,
+        type_byte = format_args!("{:#04x}", type_byte),
+        payload_len = payload.len(),
+        payload_text = %String::from_utf8_lossy(&payload),
+        "LoginResp V1 frame: type={:#04x} len={} frame_total={} json={}",
+        type_byte, payload.len(), frame_len,
+        String::from_utf8_lossy(&payload),
+    );
+    if let Err(e) = write_ctl_msg(&mut stream, &resp, v2).await {
+        warn!(peer = ?peer, error = %e, "Failed to send login response to {:?}: {}", peer, e);
+        unregister_control(&state, &run_id, false).await;
+        // Clean up registry entry
+        state
+            .client_registry
+            .mark_offline_by_run_id_and_control_id(&run_id, control_id);
+        // Clean up OIDC subject
+        if oidc_subject.is_some() {
+            state.oidc.subjects.write().await.remove(&run_id);
         }
+        return Err(());
+    }
+    // Flush TLS stream to ensure LoginResp reaches KCP before we wrap in CipherStream
+    if let Err(e) = stream.flush().await {
+        warn!(peer = ?peer, error = %e, "Failed to flush after LoginResp: {}", e);
+    }
+    info!(peer = ?peer, run_id = %run_id, "LoginResp sent to {:?}, flushed", peer);
+
+    // Release run_mu after completeLogin succeeds.
+    // The control handler's main loop runs without the per-runID lock,
+    // allowing the next superseding login to proceed via Add/Activate again.
+    drop(run_guard);
+
+    // Emit WebSocket event for dashboard subscribers
+    #[cfg(feature = "dashboard")]
+    {
+        let _ = state
+            .event_tx
+            .send(crate::event::ServerEvent::ClientConnected {
+                run_id: run_id.clone(),
+                client_addr: peer.map(|a| a.to_string()),
+            });
     }
 
     // --- Wrap in encryption (matches client after login) ---
@@ -458,6 +540,7 @@ where
         },
         ControlState {
             shutting_down,
+            shutdown_done: None,
             work_pool,
             pending_requests,
             pending_udp,
