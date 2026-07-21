@@ -500,8 +500,10 @@ pub(crate) async fn handle_nat_hole_visitor(
     let visitor_assisted = msg.assisted_addrs.unwrap_or_default();
 
     // --- Step 4: Classify both NAT features ---
-    let v_feature = classify::classify_nat_feature(&visitor_mapped, &[]).ok();
-    let c_feature = classify::classify_nat_feature(&client_mapped, &[]).ok();
+    let visitor_local_ips = classify::parse_ips(&visitor_assisted);
+    let client_local_ips = classify::parse_ips(&client_assisted);
+    let v_feature = classify::classify_nat_feature(&visitor_mapped, &visitor_local_ips).ok();
+    let c_feature = classify::classify_nat_feature(&client_mapped, &client_local_ips).ok();
 
     // Store features on session
     if let Some(ref vf) = v_feature {

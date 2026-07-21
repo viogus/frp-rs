@@ -151,6 +151,32 @@ pub fn classify_feature_count(features: &[NatFeature]) -> (i32, i32, i32) {
     (easy, hard, regular)
 }
 
+/// Extract IP addresses from "ip:port" strings (Go frp nathole.go parseIPs).
+/// Drops IPv6 bracketed addresses since the NAT classifier only considers
+/// IPv4 for local IP matching.
+pub fn parse_ips(addrs: &[String]) -> Vec<String> {
+    addrs
+        .iter()
+        .filter_map(|addr| {
+            // Only extract IPv4 IPs (Go frp ListLocalIPsForNatHole skips IPv6)
+            if addr.contains(':') {
+                let ip = if let Some(rest) = addr.strip_prefix('[') {
+                    // Bracketed IPv6: [::1]:port — skip
+                    let _ = rest.split_once("]:")?;
+                    None
+                } else {
+                    // IPv4: ip:port
+                    addr.rsplit_once(':').map(|(ip, _)| ip)
+                };
+                ip.filter(|s| s.contains('.')) // Only IPv4
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +266,44 @@ mod tests {
         assert_eq!(easy, 1);
         assert_eq!(hard, 2);
         assert_eq!(regular, 1);
+    }
+
+    #[test]
+    fn test_parse_ips_extracts_ipv4() {
+        let addrs = vec![
+            "192.168.1.1:3478".into(),
+            "10.0.0.2:8080".into(),
+            "172.16.0.1:9000".into(),
+        ];
+        let ips = parse_ips(&addrs);
+        assert_eq!(ips.len(), 3);
+        assert!(ips.contains(&"192.168.1.1".into()));
+        assert!(ips.contains(&"10.0.0.2".into()));
+        assert!(ips.contains(&"172.16.0.1".into()));
+    }
+
+    #[test]
+    fn test_parse_ips_skips_ipv6() {
+        let addrs = vec![
+            "192.168.1.1:3478".into(),
+            "[::1]:8080".into(),
+            "[2001:db8::1]:9000".into(),
+        ];
+        let ips = parse_ips(&addrs);
+        assert_eq!(ips.len(), 1);
+        assert_eq!(ips[0], "192.168.1.1");
+    }
+
+    #[test]
+    fn test_parse_ips_empty_input() {
+        assert!(parse_ips(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_parse_ips_drops_non_ip_strings() {
+        let addrs = vec!["not-an-address".into(), "127.0.0.1:80".into()];
+        let ips = parse_ips(&addrs);
+        assert_eq!(ips.len(), 1);
+        assert_eq!(ips[0], "127.0.0.1");
     }
 }
