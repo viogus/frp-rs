@@ -14,7 +14,11 @@ pub use listener::{dial_kcp, KcpListener};
 pub use session::KcpSession;
 pub use stream::KcpStream;
 
-/// Build a KcpConfig matching Go frp v0.69.1 defaults.
+/// Build a KcpConfig matching Go frp v0.69.1 aggressive defaults.
+///
+/// Go frp uses nodelay=1, interval=20, resend=2, nc=1 with FEC (10,3).
+/// This differs from `KcpConfig::default()` which uses conservative kcp-go
+/// library defaults (nodelay=0, interval=40, no FEC).
 pub fn default_kcp_config() -> KcpConfig {
     KcpConfig {
         nodelay: KcpNoDelayConfig {

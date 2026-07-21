@@ -121,10 +121,13 @@ fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     // receive window. yamux-rs 0.14 hardcodes the initial per-stream
     // window at 256 KiB (DEFAULT_CREDIT) but grows it dynamically via
     // BDP-based auto-tuning. To allow each stream to grow to the
-    // configured max_stream_window_size, set the connection receive
-    // window large enough: max_stream_window_size * max_num_streams.
+    // configured max_stream_window_size without allowing all 256
+    // streams to simultaneously consume their full window (which
+    // would risk OOM at 1.5 GiB), set the connection receive window
+    // to max_stream_window_size * 64 = 384 MiB — still generous but
+    // far below the 1.5 GiB OOM risk zone.
     let stream_window = tcp_mux_cfg.max_stream_window_size as usize;
-    cfg.set_max_connection_receive_window(Some(stream_window * 256));
+    cfg.set_max_connection_receive_window(Some(stream_window * 64));
     cfg.set_max_num_streams(256);
     // NOTE: yamux 0.14.0 does not expose set_keepalive_interval on Config.
     // Keepalive is instead implemented via timeout-based poll loops in

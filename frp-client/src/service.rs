@@ -2066,6 +2066,28 @@ impl Service {
             }
         }
 
+        // Step 6: Update health_proxy_configs to match the new proxy set.
+        // This ensures that on HealthEvent::Recover, the correct config is
+        // used to re-register the proxy after reload.
+        {
+            let mut configs = self
+                .health_proxy_configs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for name in &delta.removed {
+                configs.remove(name);
+            }
+            for name in delta.changed.iter().chain(delta.added.iter()) {
+                if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
+                    if p.health_check_type.is_empty() {
+                        configs.remove(name);
+                    } else {
+                        configs.insert(name.clone(), p.clone());
+                    }
+                }
+            }
+        }
+
         let summary = changes.join("; ");
         tracing::info!(summary = %summary, "Config reload summary: {}", summary);
         Ok(format!("reload success: {summary}"))
@@ -2103,7 +2125,9 @@ fn add_os_route(subnet: &str, tun_name: &str) {
 ///
 /// Enumerates local network interfaces and returns up to `max_items`
 /// non-loopback, non-link-local IPv4 addresses. On Linux, reads from
-/// /proc/net/fib_trie. Falls back to `ip -o -4 addr show` command.
+/// /proc/net/fib_trie, with a fallback to `ip -o -4 addr show`. On
+/// macOS, uses `/sbin/ifconfig`. On other platforms (e.g. Windows),
+/// returns an empty vec.
 fn list_local_ips_for_nat_hole(max_items: usize) -> Vec<String> {
     let mut ips: Vec<String> = Vec::new();
 
@@ -2149,27 +2173,33 @@ fn list_local_ips_for_nat_hole(max_items: usize) -> Vec<String> {
         }
     }
 
-    // Fallback: try `ip -o -4 addr show`
-    if ips.is_empty() {
-        if let Ok(output) = std::process::Command::new("ip")
-            .args(["-o", "-4", "addr", "show"])
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    if ips.len() >= max_items {
-                        break;
-                    }
-                    // Format: "1: lo    inet 127.0.0.1/8 scope host lo"
-                    // We want the "inet" line with the IP address
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    for part in &parts {
-                        if let Some(ip_str) = part.split('/').next() {
-                            if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
-                                if !ip.is_loopback() && !ip.is_link_local() && !ip.is_multicast() {
-                                    ips.push(ip.to_string());
-                                    break;
+    // Linux fallback: `ip -o -4 addr show`
+    #[cfg(target_os = "linux")]
+    {
+        if ips.is_empty() {
+            if let Ok(output) = std::process::Command::new("ip")
+                .args(["-o", "-4", "addr", "show"])
+                .output()
+            {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines() {
+                        if ips.len() >= max_items {
+                            break;
+                        }
+                        // Format: "1: lo    inet 127.0.0.1/8 scope host lo"
+                        // We want the "inet" line with the IP address
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        for part in &parts {
+                            if let Some(ip_str) = part.split('/').next() {
+                                if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+                                    if !ip.is_loopback()
+                                        && !ip.is_link_local()
+                                        && !ip.is_multicast()
+                                    {
+                                        ips.push(ip.to_string());
+                                        break;
+                                    }
                                 }
                             }
                         }
