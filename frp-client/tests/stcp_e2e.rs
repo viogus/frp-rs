@@ -41,6 +41,7 @@ async fn test_stcp_e2e_relay() {
         token: "test-token".into(),
         login_fail_exit: false,
         tcp_mux: false,
+        tls_enable: false,
         pool_count: 2, // pre-spawn work connections for the STCP relay
         proxies: vec![ProxyConfig {
             name: stcp_name.into(),

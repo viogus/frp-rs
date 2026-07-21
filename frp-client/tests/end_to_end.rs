@@ -143,6 +143,7 @@ async fn test_e2e_tcp_proxy_over_websocket() {
         token: "test-token".into(),
         login_fail_exit: false,
         pool_count: 1,
+        tls_enable: false,
         proxies: vec![ProxyConfig {
             name: "e2e-ws".into(),
             proxy_type: "tcp".into(),
@@ -403,6 +404,7 @@ async fn test_e2e_tcp_proxy_over_yamux() {
         login_fail_exit: false,
         pool_count: 1,
         tcp_mux: true,
+        tls_enable: false,
         proxies: vec![ProxyConfig {
             name: "e2e-yamux".into(),
             proxy_type: "tcp".into(),
