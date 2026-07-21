@@ -839,8 +839,9 @@ pub async fn xtcp_p2p_connect_yamux(
 
     // 3. Create yamux Connection behind a tokio Mutex so lock
     //    contention yields instead of blocking the worker thread.
+    //    Go frp sets MaxStreamWindowSize = 6 MB in the xtcp path.
     let mut yamux_cfg = Config::default();
-    yamux_cfg.set_max_connection_receive_window(Some(128 * 1024 * 1024));
+    yamux_cfg.set_max_connection_receive_window(Some(6 * 1024 * 1024 * 256));
     yamux_cfg.set_max_num_streams(256);
 
     let mode = if yamux_client {

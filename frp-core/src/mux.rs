@@ -96,12 +96,19 @@ impl tokio::io::AsyncWrite for YamuxStream {
 pub struct TcpMuxConfig {
     /// Keepalive interval (seconds). Matches Go frp's `tcp_mux_keepalive_interval`.
     pub keepalive_interval: Duration,
+    /// Max stream receive window size in bytes.
+    /// Go frp sets MaxStreamWindowSize = 6 * 1024 * 1024 (6 MB).
+    /// yamux-rs 0.14 uses 256 KiB initial per-stream window with
+    /// dynamic BDP-based growth. This value is used to set the
+    /// connection-level receive window cap to allow growth to this size.
+    pub max_stream_window_size: u32,
 }
 
 impl Default for TcpMuxConfig {
     fn default() -> Self {
         Self {
             keepalive_interval: Duration::from_secs(30),
+            max_stream_window_size: 6 * 1024 * 1024,
         }
     }
 }
@@ -110,11 +117,14 @@ impl Default for TcpMuxConfig {
 fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     let mut cfg = Config::default();
     // Match Go frp's hashicorp/yamux settings for compatibility.
-    // yamux-rs default: 1 GiB connection window, 512 streams.
-    // Use smaller values closer to Go yamux defaults:
-    //   256 streams * 256 KiB min per stream = 64 MiB minimum window.
-    //   Use 128 MiB for safety margin.
-    cfg.set_max_connection_receive_window(Some(128 * 1024 * 1024));
+    // Go frp sets MaxStreamWindowSize = 6 MB which controls per-stream
+    // receive window. yamux-rs 0.14 hardcodes the initial per-stream
+    // window at 256 KiB (DEFAULT_CREDIT) but grows it dynamically via
+    // BDP-based auto-tuning. To allow each stream to grow to the
+    // configured max_stream_window_size, set the connection receive
+    // window large enough: max_stream_window_size * max_num_streams.
+    let stream_window = tcp_mux_cfg.max_stream_window_size as usize;
+    cfg.set_max_connection_receive_window(Some(stream_window * 256));
     cfg.set_max_num_streams(256);
     // NOTE: yamux 0.14.0 does not expose set_keepalive_interval on Config.
     // Keepalive is instead implemented via timeout-based poll loops in

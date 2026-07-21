@@ -429,22 +429,39 @@ pub struct ProxyEntry {
 }
 
 /// Allocate a port across multiple ranges.
-/// If `port` > 0, try to allocate exactly that port. If already used, return None.
-/// If `port` == 0, scan all ranges in order and return the first available port.
+/// If `port` > 0, try to allocate exactly that port. If already used or
+/// not bindable at the OS level, return None.
+/// If `port` == 0, scan all ranges in order and return the first available
+/// port that is both not in `used_ports` and not bound by another process
+/// on the system.
+///
+/// The `bind_addr` parameter specifies the IP address to use for the OS-level
+/// TCP bind probe, matching Go frp's `Manager.isPortAvailable` behavior.
 pub fn allocate_port_multi(
     used_ports: &mut std::collections::HashSet<u16>,
     port: u16,
     ranges: &[(u16, u16)],
+    bind_addr: &str,
 ) -> Option<u16> {
+    let bind_addr = if bind_addr.is_empty() { "0.0.0.0" } else { bind_addr };
+
     if port > 0 {
-        if used_ports.insert(port) {
+        if used_ports.contains(&port) {
+            return None;
+        }
+        if is_port_bindable(bind_addr, port) {
+            used_ports.insert(port);
             return Some(port);
         }
         return None;
     }
     for &(start, end) in ranges {
         for p in start..=end {
-            if used_ports.insert(p) {
+            if used_ports.contains(&p) {
+                continue;
+            }
+            if is_port_bindable(bind_addr, p) {
+                used_ports.insert(p);
                 return Some(p);
             }
         }
@@ -454,4 +471,116 @@ pub fn allocate_port_multi(
         "Port exhaustion: no available ports in configured allow_ports ranges",
     );
     None
+}
+
+/// Check whether a port is available at the OS level by attempting a TCP bind.
+/// Immediately drops the listener if successful (just a probe).
+/// Matches Go frp's `Manager.isPortAvailable` behavior.
+fn is_port_bindable(bind_addr: &str, port: u16) -> bool {
+    let addr = frp_core::format_socket_addr(bind_addr, port);
+    match std::net::TcpListener::bind(&addr) {
+        Ok(listener) => {
+            // Probe succeeded — port is available. Drop immediately.
+            drop(listener);
+            true
+        }
+        Err(e) => {
+            tracing::debug!(
+                port = %port,
+                bind_addr = %bind_addr,
+                error = %e,
+                "Port {port} on bind address '{bind_addr}' is not available at OS level: {e}",
+            );
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_allocate_port_multi_explicit_unavailable() {
+        // A port already in used_ports should be rejected immediately
+        let mut used = std::collections::HashSet::new();
+        used.insert(8080);
+        assert_eq!(
+            allocate_port_multi(&mut used, 8080, &[], "0.0.0.0"),
+            None,
+            "port already in used_ports must return None"
+        );
+    }
+
+    #[test]
+    fn test_allocate_port_multi_explicit_available() {
+        // Allocate a port that's not in used_ports and verify it succeeds.
+        // "0.0.0.0" with port 0 is invalid, so use a specific port that's
+        // very likely available (above the ephemeral range).
+        let mut used = std::collections::HashSet::new();
+        let result = allocate_port_multi(&mut used, 51999, &[], "127.0.0.1");
+        assert_eq!(result, Some(51999), "port not in used_ports must be allocatable");
+        // Second allocation of same port should fail
+        assert_eq!(
+            allocate_port_multi(&mut used, 51999, &[], "127.0.0.1"),
+            None,
+            "same port cannot be allocated twice"
+        );
+    }
+
+    #[test]
+    fn test_allocate_port_multi_range_scan() {
+        let mut used = std::collections::HashSet::new();
+        // Pre-fill one port in the range
+        used.insert(62002);
+        let ranges = [(62001, 62005)];
+        // Should skip 62001 (bindable), then 62002 (in set), then
+        // find 62003 (bindable).
+        let result = allocate_port_multi(&mut used, 0, &ranges, "127.0.0.1");
+        assert!(result.is_some(), "should allocate a port from the range");
+        let p = result.unwrap();
+        assert!((62001..=62005).contains(&p), "port must be in range");
+        assert_ne!(p, 62002, "should not allocate port already in used_ports");
+    }
+
+    #[test]
+    fn test_allocate_port_multi_empty_ranges() {
+        let mut used = std::collections::HashSet::new();
+        assert_eq!(
+            allocate_port_multi(&mut used, 0, &[], "0.0.0.0"),
+            None,
+            "empty ranges should return None"
+        );
+    }
+
+    #[test]
+    fn test_allocate_port_multi_explicit_port_zero() {
+        // port=0 should scan ranges, not allocate port 0
+        let mut used = std::collections::HashSet::new();
+        let result = allocate_port_multi(&mut used, 0, &[(51990, 51990)], "127.0.0.1");
+        assert_eq!(result, Some(51990), "explicit port 0 should scan ranges");
+    }
+
+    #[test]
+    fn test_allocate_port_multi_empty_bind_addr_defaults() {
+        let mut used = std::collections::HashSet::new();
+        let result = allocate_port_multi(&mut used, 51991, &[], "");
+        // Empty bind_addr defaults to 0.0.0.0 — should work on any machine
+        assert_eq!(result, Some(51991), "empty bind_addr defaults to 0.0.0.0");
+    }
+
+    #[test]
+    fn test_is_port_bindable_free_port() {
+        assert!(is_port_bindable("127.0.0.1", 51992), "free port should be bindable");
+    }
+
+    #[test]
+    fn test_is_port_bindable_bound_port() {
+        // Bind a port, then check it's not bindable
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(!is_port_bindable("127.0.0.1", port), "bound port should not be bindable");
+        // Drop the listener to avoid test pollution
+        drop(listener);
+    }
 }

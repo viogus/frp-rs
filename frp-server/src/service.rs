@@ -393,6 +393,8 @@ impl Service {
                                                             keepalive_interval: std::time::Duration::from_secs(
                                                                 state.tcp_mux_keepalive.max(1) as u64
                                                             ),
+                                                        
+                                                        ..Default::default()
                                                         };
                                                         match mux::server_mux(tls_stream, &mux_cfg).await {
                                                             Ok((control_stream, incoming)) => {
@@ -728,6 +730,8 @@ impl Service {
                                                         keepalive_interval: std::time::Duration::from_secs(
                                                             state.tcp_mux_keepalive.max(1) as u64
                                                         ),
+                                                    
+                                                    ..Default::default()
                                                     };
                                                     match frp_core::mux::server_mux(tls_io, &mux_cfg).await {
                                                         Ok((control_stream, incoming)) => {
@@ -934,6 +938,8 @@ impl Service {
                                                 keepalive_interval: std::time::Duration::from_secs(
                                                     state.tcp_mux_keepalive.max(1) as u64
                                                 ),
+                                            
+                                            ..Default::default()
                                             };
                                             match frp_core::mux::server_mux(stream, &mux_cfg).await {
                                                 Ok((control_stream, incoming)) => {
@@ -1712,6 +1718,8 @@ impl Service {
                                                     keepalive_interval: std::time::Duration::from_secs(
                                                         state.tcp_mux_keepalive.max(1) as u64
                                                     ),
+                                                
+                                                ..Default::default()
                                                 };
                                                 match mux::server_mux(ws, &mux_cfg).await {
                                                     Ok((control_stream, incoming)) => {
@@ -1777,6 +1785,8 @@ impl Service {
                                         keepalive_interval: std::time::Duration::from_secs(
                                             state.tcp_mux_keepalive.max(1) as u64
                                         ),
+                                    
+                                    ..Default::default()
                                     };
                                     match mux::server_mux(io, &mux_cfg).await {
                                         Ok((control_stream, incoming)) => {
@@ -1981,6 +1991,8 @@ impl Service {
                                                         keepalive_interval: std::time::Duration::from_secs(
                                                             state.tcp_mux_keepalive.max(1) as u64
                                                         ),
+                                                    
+                                                    ..Default::default()
                                                     };
                                                     match mux::server_mux(tls_stream, &mux_cfg).await {
                                                         Ok((control_stream, incoming)) => {
@@ -2104,6 +2116,8 @@ impl Service {
                                         keepalive_interval: std::time::Duration::from_secs(
                                             state.tcp_mux_keepalive.max(1) as u64
                                         ),
+                                    
+                                    ..Default::default()
                                     };
                                     match mux::server_mux(inner_stream, &mux_cfg).await {
                                         Ok((control_stream, incoming)) => {
@@ -2210,6 +2224,8 @@ impl Service {
                                         keepalive_interval: std::time::Duration::from_secs(
                                             state.tcp_mux_keepalive.max(1) as u64
                                         ),
+                                    
+                                    ..Default::default()
                                     };
                                     match mux::server_mux(stream, &mux_cfg).await {
                                         Ok((control_stream, incoming)) => {

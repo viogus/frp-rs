@@ -559,6 +559,11 @@ mod oidc_impl {
 
     /// Client-side OIDC token fetcher. Uses OAuth2 client_credentials grant
     /// to obtain access tokens from the IDP and caches them until expiry.
+    ///
+    /// Go frp compat: when the token endpoint omits `expires_in`, the cache is
+    /// skipped entirely (nonCachingTokenSource) because we cannot know when the
+    /// token expires. Without a known expiry, caching risks accepting a revoked
+    /// token. Each call fetches a fresh token instead.
     pub struct OidcClient {
         token_endpoint: String,
         client_id: String,
@@ -567,6 +572,9 @@ mod oidc_impl {
         scope: String,
         additional_params: Vec<(String, String)>,
         cached: tokio::sync::Mutex<Option<CachedOidcToken>>,
+        /// Set to true when the token endpoint omits `expires_in`.
+        /// When true, get_token() bypasses the cache and always fetches a fresh token.
+        non_caching: std::sync::atomic::AtomicBool,
         http: reqwest::Client,
     }
 
@@ -684,6 +692,7 @@ mod oidc_impl {
                 scope,
                 additional_params,
                 cached: tokio::sync::Mutex::new(None),
+                non_caching: std::sync::atomic::AtomicBool::new(false),
                 http,
             })
         }
@@ -735,19 +744,38 @@ mod oidc_impl {
                 .ok_or_else(|| "OIDC client: access_token not found in response".to_string())?
                 .to_string();
 
-            // Parse expires_in from response (default 3600s = 1 hour).
-            // Subtract 60s refresh buffer to avoid edge-of-expiry failures.
-            let expires_in: u64 = body["expires_in"]
-                .as_u64()
-                .unwrap_or(3600)
-                .saturating_sub(60);
-
-            Ok((token, expires_in))
+            // Parse expires_in from response (some providers omit this field).
+            // Go frp compat: when expires_in is absent, fall back to
+            // nonCachingTokenSource — we cannot know when the token expires
+            // so every call fetches a fresh one.
+            let expires_in_present = body.get("expires_in").and_then(|v| v.as_u64());
+            match expires_in_present {
+                Some(secs) => {
+                    // Subtract 60s refresh buffer to avoid edge-of-expiry failures.
+                    let expires_in = secs.saturating_sub(60);
+                    Ok((token, expires_in))
+                }
+                None => {
+                    // Provider omitted expires_in: switch to non-caching mode.
+                    self.non_caching.store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::debug!(
+                        "OIDC token endpoint omitted expires_in: switching to non-caching mode"
+                    );
+                    Ok((token, 0))
+                }
+            }
         }
 
         /// Get a valid access token — uses cached if not expired, fetches new otherwise.
         /// Automatically refreshes when token is within 60s of expiry.
+        /// Falls back to non-caching (always fetch) when expires_in was omitted.
         async fn get_token(&self) -> Result<String, String> {
+            // Go frp compat: non-caching mode — always fetch a fresh token.
+            if self.non_caching.load(std::sync::atomic::Ordering::Relaxed) {
+                let (token, _expires_in) = self.fetch_token().await?;
+                return Ok(token);
+            }
+
             let mut cache = self.cached.lock().await;
             if let Some(ref cached) = *cache {
                 if cached.expires_at > std::time::Instant::now() {

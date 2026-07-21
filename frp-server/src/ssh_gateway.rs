@@ -629,17 +629,15 @@ impl Handler for SshSession {
             }
         };
 
-        // Check per-client proxy limit
+        // Check per-client port limit (matching Go frp's GetUsedPortsNum logic).
         if self.state.max_ports_per_client > 0 {
-            let count = self
-                .state
-                .proxy_manager
-                .list_client_proxy_names(&self.run_id)
-                .await
-                .len();
-            if count >= self.state.max_ports_per_client as usize {
+            let used = self.state.client_ports_used.read().await
+                .get(&self.run_id)
+                .copied()
+                .unwrap_or(0);
+            if used + 1 > self.state.max_ports_per_client {
                 return Err(anyhow!(
-                    "maximum number of proxies ({}) reached for this client",
+                    "maximum number of ports ({}) reached for this client",
                     self.state.max_ports_per_client
                 ));
             }
@@ -651,7 +649,7 @@ impl Handler for SshSession {
             let mut used = state.used_ports.write().await;
             // Re-allocate the actual proxy remote_port (not the SSH listen port)
             let ranges = state.reloadable.read_ok().allow_ports.clone();
-            allocate_port_multi(&mut used, args.remote_port, &ranges)
+            allocate_port_multi(&mut used, args.remote_port, &ranges, &state.proxy_bind_addr)
                 .ok_or_else(|| anyhow!("no port available for remote_port {}", args.remote_port))?
         };
 
@@ -703,7 +701,7 @@ impl Handler for SshSession {
         let allocated = {
             let mut used = state.used_ports.write().await;
             let ranges = state.reloadable.read_ok().allow_ports.clone();
-            allocate_port_multi(&mut used, 0, &ranges)
+            allocate_port_multi(&mut used, 0, &ranges, &state.proxy_bind_addr)
                 .ok_or_else(|| anyhow!("no port available in configured ranges"))?
         };
 

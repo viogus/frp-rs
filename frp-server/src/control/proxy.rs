@@ -127,6 +127,14 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
     if let Some(info) = ctx.state.proxy_manager.get(&cp.proxy_name).await {
         if let Some(port) = info.remote_port {
             ctx.state.used_ports.write().await.remove(&port);
+            // Decrement per-client port count (matching Go frp's portsUsedNum).
+            let mut port_counts = ctx.state.client_ports_used.write().await;
+            if let Some(count) = port_counts.get_mut(&ctx.run_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    port_counts.remove(&ctx.run_id);
+                }
+            }
         }
         // Clean up STCP sk_index (indexed by proxy_name)
         if let Some(key) = info.sk_index_key() {

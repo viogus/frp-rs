@@ -16,10 +16,10 @@ pub struct KcpNoDelayConfig {
 impl Default for KcpNoDelayConfig {
     fn default() -> Self {
         Self {
-            nodelay: false,
-            interval: 40,
-            resend: 0,
-            nc: false,
+            nodelay: true,
+            interval: 20,
+            resend: 2,
+            nc: true,
         }
     }
 }
@@ -49,8 +49,8 @@ impl Default for KcpConfig {
             mtu: 1350,
             nodelay: KcpNoDelayConfig::default(),
             wnd_size: (1024, 1024),
-            data_shards: 0,
-            parity_shards: 0,
+            data_shards: 10,
+            parity_shards: 3,
             stream: true,
             flush_write: true,
         }

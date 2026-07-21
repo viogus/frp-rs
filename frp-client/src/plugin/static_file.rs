@@ -1,6 +1,7 @@
 use std::io::Read;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::{sleep, Duration};
 use tracing::debug;
 
 use frp_core::config::PluginConfig;
@@ -99,6 +100,8 @@ async fn handle_static_file_conn(
     }
 
     if !auth.check(&authorization) {
+        // Go frp compat: 200ms delay to slow brute-force attacks.
+        sleep(Duration::from_millis(200)).await;
         let resp = b"HTTP/1.1 401 Unauthorized\r\n\
                        WWW-Authenticate: Basic realm=\"frp\"\r\n\
                        Content-Length: 0\r\nConnection: close\r\n\r\n";

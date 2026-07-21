@@ -7,12 +7,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::service::HealthEvent;
+
 // NOTE: Go frp does NOT support group-level health checks. Go frp's validation
 // (pkg/config/v1/validation/proxy.go) only accepts "", "tcp", and "http" for
 // health check types. The proxy Group field is used solely for server-side load
 // balancing, not health checking. Per-proxy health checks are fully supported.
 // If group-level health checking is desired as a frp-rs extension, implement:
-//   1. GroupHealthState struct: name→healthy tracking per group, group→proxy_names mapping.
+//   1. GroupHealthState struct: name->healthy mapping per group, group->proxy_names mapping.
 //   2. Shared Arc<Mutex<HashMap<group_name, GroupHealthState>>> across health check tasks.
 //   3. HealthCheckConfig::group_name + group_state fields.
 //   4. Modified failure/recovery logic in run_health_check.
@@ -28,17 +30,18 @@ pub(crate) struct HealthCheckConfig {
     pub interval: Duration,
     pub timeout: Duration,
     pub max_failed: u32,
-    pub health_tx: mpsc::Sender<String>,
+    pub health_tx: mpsc::Sender<HealthEvent>,
     pub cancel: Arc<AtomicBool>,
 }
 
 /// Run a health check for a proxy.
 /// Supports "tcp" (connect only) and "http" (GET + check 2xx status).
-/// When the local service exceeds max_failed consecutive failures, sends
-/// the proxy name on `health_tx` so the control loop can send CloseProxy
-/// to the server.
-/// The `cancel` flag is set externally when the proxy is closed; the task
-/// checks it before each health check interval and exits when true.
+///
+/// Go frp compat: the monitor keeps running after max_failed and sends
+/// recovery events when the service comes back. Matches Go frp's health.Monitor:
+///   - On max_failed: calls statusFailedFn (sends Close event), keeps running
+///   - On recovery after failure: calls statusNormalFn (sends Recover event)
+///   - Only stops when `cancel` is set (proxy removed, not on health failure).
 pub(crate) async fn run_health_check(config: HealthCheckConfig) {
     let HealthCheckConfig {
         proxy_name,
@@ -56,6 +59,7 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
         check_type, proxy_name, local_addr, interval, timeout);
 
     let mut failures: u32 = 0;
+    let mut was_failed = false;
 
     loop {
         // Check cancellation before each sleep/check cycle.
@@ -75,6 +79,12 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
         match result {
             Ok(()) => {
                 failures = 0;
+                if was_failed {
+                    // Service recovered. Notify control loop to re-register.
+                    info!(proxy_name = %proxy_name, "Health check recovered for '{}', sending Recover event", proxy_name);
+                    let _ = health_tx.send(HealthEvent::Recover(proxy_name.clone())).await;
+                    was_failed = false;
+                }
                 debug!(proxy_name = %proxy_name, "Health check OK for '{}'", proxy_name);
             }
             Err(e) => {
@@ -83,16 +93,12 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
             }
         }
 
-        if failures >= max_failed {
-            warn!(proxy_name = %proxy_name, max_failed = %max_failed, "Health check: proxy '{}' exceeded max failures ({}), sending CloseProxy",
+        if failures >= max_failed && !was_failed {
+            was_failed = true;
+            warn!(proxy_name = %proxy_name, max_failed = %max_failed, "Health check: proxy '{}' exceeded max failures ({}), sending Close event",
                 proxy_name, max_failed);
-            // send().await: must not silently drop CloseProxy —
-            // a dropped CloseProxy means traffic continues to a
-            // dead backend indefinitely, defeating health checks.
-            let _ = health_tx.send(proxy_name.clone()).await;
-            // Stop this health check task — the proxy is being closed.
-            info!(proxy_name = %proxy_name, "Health check stopped for '{}' after CloseProxy", proxy_name);
-            return;
+            let _ = health_tx.send(HealthEvent::Close(proxy_name.clone())).await;
+            // Keep running -- monitor for recovery (Go frp compat).
         }
     }
 }
