@@ -158,7 +158,13 @@ pub(crate) async fn handle_new_proxy(
     // Check per-client port limit (matching Go frp's GetUsedPortsNum logic).
     // Count actual used ports, not proxy names, and add 1 for this new proxy.
     if state.max_ports_per_client > 0 {
-        let used = state.client_ports_used.read().await.get(run_id).copied().unwrap_or(0);
+        let used = state
+            .client_ports_used
+            .read()
+            .await
+            .get(run_id)
+            .copied()
+            .unwrap_or(0);
         if used + 1 > state.max_ports_per_client {
             reject_new_proxy(
                 writer,
@@ -313,7 +319,10 @@ pub(crate) async fn handle_new_proxy(
             }
 
             // Track port usage per client (matching Go frp's portsUsedNum).
-            state.client_ports_used.write().await
+            state
+                .client_ports_used
+                .write()
+                .await
                 .entry(run_id.to_string())
                 .and_modify(|c| *c += 1)
                 .or_insert(1);

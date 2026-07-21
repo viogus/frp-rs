@@ -2167,10 +2167,7 @@ fn list_local_ips_for_nat_hole(max_items: usize) -> Vec<String> {
                     for part in &parts {
                         if let Some(ip_str) = part.split('/').next() {
                             if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
-                                if !ip.is_loopback()
-                                    && !ip.is_link_local()
-                                    && !ip.is_multicast()
-                                {
+                                if !ip.is_loopback() && !ip.is_link_local() && !ip.is_multicast() {
                                     ips.push(ip.to_string());
                                     break;
                                 }

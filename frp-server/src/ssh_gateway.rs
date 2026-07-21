@@ -631,7 +631,11 @@ impl Handler for SshSession {
 
         // Check per-client port limit (matching Go frp's GetUsedPortsNum logic).
         if self.state.max_ports_per_client > 0 {
-            let used = self.state.client_ports_used.read().await
+            let used = self
+                .state
+                .client_ports_used
+                .read()
+                .await
                 .get(&self.run_id)
                 .copied()
                 .unwrap_or(0);

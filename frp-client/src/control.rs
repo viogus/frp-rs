@@ -168,11 +168,11 @@ impl ControlConnection {
                 // before sending ClientHello.
                 if propose_mux {
                     let mux_cfg = mux::TcpMuxConfig {
-                    keepalive_interval: Duration::from_secs(
-                        self.tcp_mux_keepalive_interval.max(1) as u64,
-                    ),
-                    max_stream_window_size: 6 * 1024 * 1024,
-                };
+                        keepalive_interval: Duration::from_secs(
+                            self.tcp_mux_keepalive_interval.max(1) as u64,
+                        ),
+                        max_stream_window_size: 6 * 1024 * 1024,
+                    };
                     match raw_stream {
                         IoStream::Tcp(tcp_stream) => {
                             let (control_stream, session) =
@@ -212,7 +212,7 @@ impl ControlConnection {
             if propose_mux {
                 let mux_cfg = mux::TcpMuxConfig {
                     keepalive_interval: Duration::from_secs(
-                        self.tcp_mux_keepalive_interval.max(1) as u64,
+                        self.tcp_mux_keepalive_interval.max(1) as u64
                     ),
                     max_stream_window_size: 6 * 1024 * 1024,
                 };

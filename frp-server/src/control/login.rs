@@ -402,13 +402,18 @@ where
         String::from_utf8_lossy(&payload),
     );
     // Go frp compat: write LoginResp with 5-second deadline
-    let resp_send = tokio::time::timeout(Duration::from_secs(5), write_ctl_msg(&mut stream, &resp, v2));
+    let resp_send = tokio::time::timeout(
+        Duration::from_secs(5),
+        write_ctl_msg(&mut stream, &resp, v2),
+    );
     if let Err(e) = match resp_send.await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e),
         Err(_elapsed) => {
             warn!(peer = ?peer, "LoginResp write timed out after 5s for {:?}", peer);
-            Err(frp_core::Error::Protocol("LoginResp write timed out".into()))
+            Err(frp_core::Error::Protocol(
+                "LoginResp write timed out".into(),
+            ))
         }
     } {
         warn!(peer = ?peer, error = %e, "Failed to send login response to {:?}: {}", peer, e);

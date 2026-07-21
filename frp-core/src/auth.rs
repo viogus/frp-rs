@@ -757,7 +757,8 @@ mod oidc_impl {
                 }
                 None => {
                     // Provider omitted expires_in: switch to non-caching mode.
-                    self.non_caching.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.non_caching
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     tracing::debug!(
                         "OIDC token endpoint omitted expires_in: switching to non-caching mode"
                     );

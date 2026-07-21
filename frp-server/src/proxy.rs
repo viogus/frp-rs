@@ -443,7 +443,11 @@ pub fn allocate_port_multi(
     ranges: &[(u16, u16)],
     bind_addr: &str,
 ) -> Option<u16> {
-    let bind_addr = if bind_addr.is_empty() { "0.0.0.0" } else { bind_addr };
+    let bind_addr = if bind_addr.is_empty() {
+        "0.0.0.0"
+    } else {
+        bind_addr
+    };
 
     if port > 0 {
         if used_ports.contains(&port) {
@@ -519,7 +523,11 @@ mod tests {
         // very likely available (above the ephemeral range).
         let mut used = std::collections::HashSet::new();
         let result = allocate_port_multi(&mut used, 51999, &[], "127.0.0.1");
-        assert_eq!(result, Some(51999), "port not in used_ports must be allocatable");
+        assert_eq!(
+            result,
+            Some(51999),
+            "port not in used_ports must be allocatable"
+        );
         // Second allocation of same port should fail
         assert_eq!(
             allocate_port_multi(&mut used, 51999, &[], "127.0.0.1"),
@@ -571,7 +579,10 @@ mod tests {
 
     #[test]
     fn test_is_port_bindable_free_port() {
-        assert!(is_port_bindable("127.0.0.1", 51992), "free port should be bindable");
+        assert!(
+            is_port_bindable("127.0.0.1", 51992),
+            "free port should be bindable"
+        );
     }
 
     #[test]
@@ -579,7 +590,10 @@ mod tests {
         // Bind a port, then check it's not bindable
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        assert!(!is_port_bindable("127.0.0.1", port), "bound port should not be bindable");
+        assert!(
+            !is_port_bindable("127.0.0.1", port),
+            "bound port should not be bindable"
+        );
         // Drop the listener to avoid test pollution
         drop(listener);
     }
