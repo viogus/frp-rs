@@ -406,12 +406,10 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
                     return Ok(());
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    // Backend handler is busy — report failure for health tracking.
-                    ctx.state
-                        .proxy_manager
-                        .report_backend_failure(&target_proxy)
-                        .await;
-                    debug!(target_run_id = %target_run_id, "Group backend channel full, dropping connection");
+                    // Backend handler is overloaded, not unhealthy — do NOT count
+                    // channel-full as a backend failure (would cause premature
+                    // health degradation under high load).
+                    debug!(target_run_id = %target_run_id, "Group backend channel full (overloaded), dropping connection");
                     return Ok(());
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {

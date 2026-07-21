@@ -326,15 +326,22 @@ where
         );
     }
 
-    // Wait for handoff barrier. RunMu is released during this wait so the
-    // old handler's cleanup (which may need to acquire run_mu via Remove)
-    // does not deadlock. This matches Go frp dev's WaitForHandoff() which
-    // is called outside the per-runID serialization lock.
+    // Release run_mu before waiting for the handoff barrier — the old
+    // handler's cleanup may need to acquire run_mu (via unregister_control
+    // or future code paths). This matches Go frp dev's WaitForHandoff()
+    // which is called outside the per-runID serialization lock.
+    drop(run_guard);
+
     if let Some(barrier) = handoff_barrier {
         info!(run_id = %run_id, "Waiting for old control handler shutdown...");
         let _ = barrier.await;
         info!(run_id = %run_id, "Old control handler shutdown complete");
     }
+
+    // Re-acquire run_mu for the Activate and CompleteLogin phases.
+    // This matches Go frp dev's Activate (which re-enters the ControlManager
+    // serialization lock after WaitForHandoff returns).
+    let run_guard = run_mu.lock().await;
 
     // ── Activate phase: register in ClientRegistry ──────────────────
     let peer_str = peer.map(|a| a.to_string()).unwrap_or_default();
@@ -354,14 +361,13 @@ where
             run_id = %run_id,
             "Client already online with same user/client_id — rejecting activation"
         );
-        let (_, mut writer) = tokio::io::split(stream);
         let resp = FrpMessage::LoginResp(msg::LoginResp {
             version: Some(frp_core::VERSION.into()),
             run_id: None,
             error: Some("client already online".into()),
             server_additional_auth_scopes: None,
         });
-        let _ = write_ctl_msg(&mut writer, &resp, v2).await;
+        let _ = write_ctl_msg(&mut stream, &resp, v2).await;
         unregister_control(&state, &run_id, false).await;
         // Clean up OIDC subject
         if oidc_subject.is_some() {

@@ -590,7 +590,12 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
 fn list_local_ips() -> Vec<String> {
     let mut ips = Vec::new();
 
-    // Linux: parse /proc/net/fib_trie for local IPv4 addresses.
+    // Linux-specific: parse /proc/net/fib_trie for local IPv4 addresses.
+    // On non-Linux platforms (macOS, Windows), this path is skipped and we
+    // fall through to the UDP connect fallback below, which only discovers
+    // the default-route IP. For full multi-homed NAT hole punching on macOS,
+    // a getifaddrs-based approach would be needed.
+    //
     // Lines like "|-- 192.168.1.100" followed by "/32 host LOCAL" indicate
     // local interface IPs assigned to this machine.
     if let Ok(content) = std::fs::read_to_string("/proc/net/fib_trie") {

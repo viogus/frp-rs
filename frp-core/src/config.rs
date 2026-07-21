@@ -928,6 +928,14 @@ impl ClientConfig {
     /// Apply conditional defaults matching Go frp dev (fatedier/frp@d486018)
     /// `ClientCommonConfig.Complete()` + `ClientTransportConfig.Complete()`.
     /// Call after deserialization, before consuming the config.
+    ///
+    /// NOTE: This compares against the serde default value (30) to decide
+    /// whether to disable heartbeats when tcp_mux is true. A user who
+    /// explicitly sets `heartbeat_interval = 30` will also have it overridden
+    /// to -1 because we cannot distinguish "serde default" from "user intent"
+    /// with the current integer type. Go frp uses `util.EmptyOr()` which
+    /// distinguishes "not set" from "explicitly set to 30" via pointer nils.
+    /// Future: switch to `Option<i64>` for these fields to match Go semantics.
     pub fn complete(&mut self) {
         if self.tcp_mux {
             // When tcpMux is enabled, heartbeat of application layer is

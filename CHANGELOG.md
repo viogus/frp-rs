@@ -27,7 +27,7 @@ Full-source audit of Go frp dev branch against frp-rs, fixing 18 findings (7 CRI
 
 **Client (2 medium):**
 - Heartbeat timeout detection: track last_pong, trigger reconnect on timeout
-- Proxy phase state machine: New → WaitStart → Running → StartErr → CheckFailed → Closed
+- Proxy phase state machine foundation: New → WaitStart → StartErr → Running → CheckFailed → Closed enum with phase field (currently transitions New/Running/StartErr; WaitStart/CheckFailed/Closed reserved for future retry worker)
 
 **Server misc (5 medium):**
 - TCP group shared listener per group with round-robin dispatch

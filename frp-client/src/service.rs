@@ -972,11 +972,9 @@ impl Service {
             info!(interval = %ping_secs, "Heartbeat interval: {}s", ping_secs);
             let mut ping_interval = interval(Duration::from_secs(ping_secs));
 
-            // Track last Pong for heartbeat timeout detection (Go frp compat).
             let mut last_pong = Instant::now();
             let hb_timeout = self.cfg.heartbeat_timeout;
             let hb_timeout_dur = Duration::from_secs(hb_timeout.max(0) as u64);
-            let mut hb_tick = interval(Duration::from_secs(1));
 
             loop {
                 tokio::select! {
@@ -1213,7 +1211,9 @@ impl Service {
 
                     // Heartbeat timeout watchdog: triggers reconnect if no Pong
                     // received within heartbeat_timeout seconds (Go frp compat).
-                    _ = hb_tick.tick(), if hb_timeout > 0 => {
+                    // Uses sleep instead of interval so the timer is only
+                    // active when hb_timeout > 0 (disabled when tcp_mux is on).
+                    _ = tokio::time::sleep(Duration::from_secs(1)), if hb_timeout > 0 => {
                         if last_pong.elapsed() > hb_timeout_dur {
                             warn!("Heartbeat timeout ({}s), reconnecting...", hb_timeout);
                             break;

@@ -158,18 +158,15 @@ pub fn parse_ips(addrs: &[String]) -> Vec<String> {
     addrs
         .iter()
         .filter_map(|addr| {
-            // Only extract IPv4 IPs (Go frp ListLocalIPsForNatHole skips IPv6)
-            if addr.contains(':') {
-                let ip = if let Some(rest) = addr.strip_prefix('[') {
-                    // Bracketed IPv6: [::1]:port — skip
-                    let _ = rest.split_once("]:")?;
-                    None
+            // Use split_host_port which correctly handles IPv4, bracketed IPv6,
+            // and unbracketed IPv6 addresses.
+            if let Ok((ip, _port)) = split_host_port(addr) {
+                if !ip.contains(':') {
+                    // Only collect IPv4 addresses (Go frp skips IPv6)
+                    Some(ip.to_string())
                 } else {
-                    // IPv4: ip:port
-                    addr.rsplit_once(':').map(|(ip, _)| ip)
-                };
-                ip.filter(|s| s.contains('.')) // Only IPv4
-                    .map(|s| s.to_string())
+                    None
+                }
             } else {
                 None
             }
