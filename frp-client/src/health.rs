@@ -7,17 +7,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-// TODO: group health check (Go frp compat gap)
-// When health_check_type == "group", failures should be handled per-group:
-//   - Each proxy in the group runs its own TCP/HTTP check independently.
-//   - When a proxy fails, mark it unhealthy in shared group state (not
-//     immediately sending CloseProxy — only the individual proxy's failures
-//     are tracked; the group stays alive as long as >=1 member is healthy).
-//   - When ALL proxies in the group become unhealthy, send CloseProxy for
-//     every proxy in the group via the health_tx channel.
-//   - When any proxy recovers (health check passes again), mark it healthy
-//     and re-register group proxies if the group was fully down.
-// Needed to implement:
+// NOTE: Go frp does NOT support group-level health checks. Go frp's validation
+// (pkg/config/v1/validation/proxy.go) only accepts "", "tcp", and "http" for
+// health check types. The proxy Group field is used solely for server-side load
+// balancing, not health checking. Per-proxy health checks are fully supported.
+// If group-level health checking is desired as a frp-rs extension, implement:
 //   1. GroupHealthState struct: name→healthy tracking per group, group→proxy_names mapping.
 //   2. Shared Arc<Mutex<HashMap<group_name, GroupHealthState>>> across health check tasks.
 //   3. HealthCheckConfig::group_name + group_state fields.
