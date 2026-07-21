@@ -487,6 +487,26 @@ fn default_log_level() -> String {
 fn default_health_check_url() -> String {
     "/".into()
 }
+
+fn default_local_ip() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_bandwidth_limit_mode() -> String {
+    "client".into()
+}
+
+fn default_health_check_timeout_seconds() -> u64 {
+    3
+}
+
+fn default_health_check_max_failed() -> u32 {
+    1
+}
+
+fn default_health_check_interval_seconds() -> u64 {
+    10
+}
 fn default_max_days() -> i32 {
     3
 }
@@ -863,12 +883,12 @@ impl Default for ClientConfig {
             nat_hole_stun_server: String::new(),
             start: Vec::new(),
             includes: Vec::new(),
-            tls_enable: false,
+            tls_enable: true,
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             tls_ca_file: String::new(),
             tls_server_name: String::new(),
-            disable_custom_tls_first_byte: false,
+            disable_custom_tls_first_byte: true,
             log: LogConfig::default(),
             login_fail_exit: true,
             pool_count: 1,
@@ -908,7 +928,7 @@ pub struct ProxyConfig {
     pub name: String,
     #[serde(rename = "type")]
     pub proxy_type: String,
-    #[serde(default, alias = "localIp")]
+    #[serde(default = "default_local_ip", alias = "localIp")]
     pub local_ip: String,
     #[serde(default)]
     pub local_port: u16,
@@ -946,7 +966,7 @@ pub struct ProxyConfig {
     pub allow_users: Vec<String>,
     #[serde(default, alias = "bandwidthLimit")]
     pub bandwidth_limit: String,
-    #[serde(default, alias = "bandwidthLimitMode")]
+    #[serde(default = "default_bandwidth_limit_mode", alias = "bandwidthLimitMode")]
     pub bandwidth_limit_mode: String,
     #[serde(default)]
     pub annotations: std::collections::HashMap<String, String>,
@@ -965,11 +985,11 @@ pub struct ProxyConfig {
     /// Custom HTTP headers for health check requests (Go frp compat: healthCheckHttpHeaders).
     #[serde(default, alias = "healthCheckHttpHeaders")]
     pub health_check_http_headers: std::collections::HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default = "default_health_check_interval_seconds")]
     pub health_check_interval_seconds: u64,
-    #[serde(default)]
+    #[serde(default = "default_health_check_timeout_seconds")]
     pub health_check_timeout_seconds: u64,
-    #[serde(default)]
+    #[serde(default = "default_health_check_max_failed")]
     pub health_check_max_failed: u32,
     /// Virtual network name for STCP/XTCP proxy isolation.
     /// Proxies in different virtual nets cannot reach each other.

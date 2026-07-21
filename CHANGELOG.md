@@ -44,6 +44,8 @@ All notable changes to frp-rs.
 - HTTP proxy CONNECT: per-line read limit (16KB), total header limit (64KB) to prevent request smuggling
 - Doc: document `simple_glob` single-`*` limitation, sequential proxy registration, test coverage gaps
 - Config defaults aligned with Go frp v0.70.0: `pool_count` (0→1), `dial_server_keepalive` (0→7200), `fallback_timeout_ms` (5000→1000), `min_retry_interval` (30→90), visitor `bind_addr` (0.0.0.0→127.0.0.1), `detailed_errors_to_client` (false→true), `nat_hole_analysis_data_reserve_hours` (1→168)
+- Config defaults aligned with Go frp dev (fe79598): `tls_enable` (false→true), `disable_custom_tls_first_byte` (false→true), `local_ip` (""→"127.0.0.1"), `bandwidth_limit_mode` (""→"client"), health check defaults (timeout=3, max_failed=1, interval=10)
+- ⚠️ **Migration:** `tls_enable` now defaults to `true` (matches Go frp dev). Existing non-TLS deployments must explicitly set `tls_enable = false` in their config, or connections will fail with TLS negotiation errors.
 - Token auth: remove timestamp freshness check (Go only checks hash equality), `authentication_timeout` 15→300 (OIDC only)
 - XTCP: wire `disable_assisted_addrs` — visitor sends STUN addresses as assisted_addrs for NAT classification
 - HTTP: wire `route_by_http_user` — flows through ProxyInfo→VhostRoute→serve_vhost_request, matching Go behavior
@@ -113,6 +115,16 @@ All notable changes to frp-rs.
 - Wire compat: `NatHoleReport` — add `success: Option<bool>` field matching Go `msg.NatHoleReport`
 - Go compat: pre-check remove extra `mapped_addrs.is_none()` condition (Go frp only checks `PreCheck` boolean)
 - Go compat: Fresh-TCP pre_check validate `allow_users` before returning OK
+- Go frp dev compat: V2 max frame payload 64 KiB (was 1 MiB), reject non-zero V2 frame flags
+- Go frp dev compat: `read_timeout_ms` JSON key → `read_timeout` (matches Go `NatHoleDetectBehavior`)
+- Go frp dev compat: client two-phase fast-backoff reconnect (200ms phase 1, 1s×2ⁿ phase 2)
+- Go frp dev compat: 60s sliding window for fast-retry counter (matches `FastBackoffManager.FastRetryWindow`)
+- Go frp dev compat: 1s sender delay before NatHoleResp when role is "sender"
+- Go frp dev compat: VHost wildcard domain routing (progressive `*` label widening)
+- Go frp dev compat: SNI HTTPS routing via `lookup_wildcard` (was exact match)
+- Go frp dev compat: gate analyzer `report_success` on `NatHoleReport.success == Some(true)`
+- Compat tests: `wait_for_port_safe` falls back to `nc -z` when `lsof` is unavailable
+- Compat tests: Rust frpc non-TLS configs explicitly set `tls_enable = false`
 - Go compat: `handle_report` only report success to analyzer when `success != Some(false)`
 - Go compat: NatHoleReport forwarding pass through `success` field
 - XTCP: replace `try_into().unwrap()` with `.map_err()` on untrusted UDP frames (no panics on malformed packets)

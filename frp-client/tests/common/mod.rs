@@ -143,6 +143,7 @@ impl TestHarness {
             login_fail_exit: false,
             pool_count: 1,
             tcp_mux: false,
+            tls_enable: false,
             v2,
             proxies: vec![ProxyConfig {
                 name: "e2e-test".into(),

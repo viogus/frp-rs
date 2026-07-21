@@ -1536,7 +1536,7 @@ impl Service {
                                 if !sni_data.is_empty() {
                                     if let Some(sni_host) = crate::vhost::extract_sni_from_client_hello(&sni_data) {
                                         debug!(addr = %addr, sni_host = %sni_host, "SNI from {}: {}", addr, sni_host);
-                                        if let Some(route) = state.vhost_manager.lookup(&sni_host).await {
+                                        if let Some(route) = state.vhost_manager.lookup_wildcard(&sni_host).await {
                                             let ctl_tx = {
                                                 let map = state.run_id_to_ctl_tx.read().await;
                                                 map.get(&route.run_id).cloned()
