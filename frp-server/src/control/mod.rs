@@ -83,7 +83,10 @@ pub(crate) struct ControlContext {
 /// Handle a control connection from a frpc client.
 /// The login message has already been consumed from the stream.
 /// `peer` is passed separately because generic stream types don't have peer_addr().
-#[instrument(skip(stream, state, incoming, crypto_ctx, login), fields(run_id = %login.run_id.clone().unwrap_or_default(), peer = ?peer))]
+/// `internal` marks connections from internal sources (SSH gateway) — when combined
+/// with AlwaysAuthPass in the login ClientSpec, authentication is bypassed.
+#[allow(clippy::too_many_arguments)]
+#[instrument(skip(stream, state, incoming, crypto_ctx, login), fields(run_id = %login.run_id.clone().unwrap_or_default(), peer = ?peer, internal))]
 pub async fn handle_control<S>(
     stream: S,
     login: msg::Login,
@@ -92,6 +95,7 @@ pub async fn handle_control<S>(
     incoming: Option<IncomingStreams>,
     v2: bool,
     crypto_ctx: Option<frp_core::v2_handshake::CryptoContext>,
+    internal: bool,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -106,7 +110,11 @@ pub async fn handle_control<S>(
         mut writer,
         mut incoming,
         mut ping_tick,
-    ) = match login::authenticate(stream, &login, state, peer, incoming, v2, crypto_ctx).await {
+    ) = match login::authenticate(
+        stream, &login, state, peer, incoming, v2, crypto_ctx, internal,
+    )
+    .await
+    {
         Ok(tuple) => tuple,
         Err(()) => return,
     };

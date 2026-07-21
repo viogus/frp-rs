@@ -706,8 +706,17 @@ pub(crate) async fn dispatch_v2_message(
     };
     match msg {
         FrpMessage::Login(login) => {
-            control::handle_control(io, *login, state, Some(addr), incoming, true, crypto_ctx)
-                .await;
+            control::handle_control(
+                io,
+                *login,
+                state,
+                Some(addr),
+                incoming,
+                true,
+                crypto_ctx,
+                false,
+            )
+            .await;
         }
         FrpMessage::NewWorkConn(nwc) => {
             handle_work_conn_inner(io, nwc, state).await;
@@ -736,7 +745,7 @@ pub(crate) async fn dispatch_v1_message(
 ) {
     match frp_core::protocol::read_msg_v1(&mut io).await {
         Ok(FrpMessage::Login(login)) => {
-            control::handle_control(io, *login, state, addr, incoming, false, None).await;
+            control::handle_control(io, *login, state, addr, incoming, false, None, false).await;
         }
         Ok(FrpMessage::NewWorkConn(nwc)) => {
             handle_work_conn_inner(io, nwc, state).await;

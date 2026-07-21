@@ -134,6 +134,107 @@ pub struct PoolMetrics {
     pub idle_timeout: Duration,
 }
 
+/// State for a TCP group's shared listener.
+pub(crate) struct TcpGroupEntry {
+    pub port: u16,
+    pub group_key: String,
+    pub bind_addr: String,
+    /// Shared listener task handle. None when stopped.
+    #[allow(dead_code)]
+    pub handle: Option<tokio::task::JoinHandle<()>>,
+    pub cancel_token: CancellationToken,
+}
+
+/// TCP group shared listener management (Go frp dev compat).
+/// Groups of TCP proxies share a single listener port with round-robin
+/// dispatch across group members. The first proxy to register in a group
+/// creates the shared listener; subsequent members reuse the port.
+pub(crate) struct TcpGroupCtl {
+    groups: RwLock<HashMap<String, TcpGroupEntry>>,
+}
+
+impl TcpGroupCtl {
+    pub fn new() -> Self {
+        Self {
+            groups: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Get the port for an existing group, validating that params match.
+    /// Returns None if the group doesn't exist.
+    pub async fn get_group_port(
+        &self,
+        group: &str,
+        group_key: &str,
+        port: u16,
+        bind_addr: &str,
+    ) -> Option<u16> {
+        let groups = self.groups.read().await;
+        let entry = groups.get(group)?;
+        // Validate that params match the existing group
+        if entry.group_key != group_key {
+            return None;
+        }
+        if entry.bind_addr != bind_addr {
+            return None;
+        }
+        // Port must match the group's actual bind port
+        if port != 0 && port != entry.port {
+            return None;
+        }
+        Some(entry.port)
+    }
+
+    /// Register a new TCP group. Returns Err if group already exists.
+    pub async fn create_group(
+        &self,
+        group: &str,
+        group_key: &str,
+        port: u16,
+        bind_addr: &str,
+        handle: tokio::task::JoinHandle<()>,
+        cancel_token: CancellationToken,
+    ) -> Result<(), String> {
+        let mut groups = self.groups.write().await;
+        if groups.contains_key(group) {
+            return Err(format!("TCP group '{}' already exists", group));
+        }
+        groups.insert(
+            group.to_string(),
+            TcpGroupEntry {
+                port,
+                group_key: group_key.to_string(),
+                bind_addr: bind_addr.to_string(),
+                handle: Some(handle),
+                cancel_token,
+            },
+        );
+        Ok(())
+    }
+
+    /// Remove a group and stop its shared listener.
+    /// Returns the port that was used by the group, if any.
+    pub async fn remove_group(&self, group: &str) {
+        let mut groups = self.groups.write().await;
+        if let Some(entry) = groups.remove(group) {
+            // Cancel the shared listener
+            entry.cancel_token.cancel();
+        }
+    }
+
+    /// Check if a group exists and has a running listener.
+    #[allow(dead_code)]
+    pub async fn group_exists(&self, group: &str) -> bool {
+        self.groups.read().await.contains_key(group)
+    }
+
+    /// Get the port for a group, if it exists.
+    #[allow(dead_code)]
+    pub async fn group_port(&self, group: &str) -> Option<u16> {
+        self.groups.read().await.get(group).map(|e| e.port)
+    }
+}
+
 /// OIDC verification state.
 pub struct OidcState {
     pub verifier: Option<Arc<OidcVerifier>>,
@@ -228,6 +329,9 @@ pub struct AppState {
     /// Shared UDP port for SUDP proxies. When > 0, all SUDP proxies
     /// use this port instead of their individual remote_port.
     pub sudp_port: u16,
+    /// TCP group shared listener management (Go frp dev compat).
+    /// Groups proxies that share the same remote port with round-robin dispatch.
+    pub(crate) tcp_group_ctl: TcpGroupCtl,
     pub vhost_http_timeout: u64,
     pub user_conn_timeout: u64,
     pub tcp_mux_passthrough: bool,
@@ -365,6 +469,7 @@ impl AppState {
             proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
             max_ports_per_client,
             sudp_port,
+            tcp_group_ctl: TcpGroupCtl::new(),
             vhost_http_timeout,
             user_conn_timeout,
             tcp_mux_passthrough,

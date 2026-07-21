@@ -29,6 +29,8 @@ use super::{write_ctl_msg, ControlContext, ControlState};
 /// Authenticate a new control connection and set up per-client state.
 /// On success returns all state needed by the main select! loop.
 /// On failure sends LoginResp with an error and returns `Err(())`.
+/// When `internal` is true and the login's ClientSpec.AlwaysAuthPass is set,
+/// authentication is bypassed (Go frp SSH gateway compat).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn authenticate<S>(
     mut stream: S,
@@ -38,6 +40,7 @@ pub(crate) async fn authenticate<S>(
     incoming: Option<IncomingStreams>,
     v2: bool,
     crypto_ctx: Option<frp_core::v2_handshake::CryptoContext>,
+    internal: bool,
 ) -> Result<
     (
         ControlContext,
@@ -83,7 +86,24 @@ where
     }
 
     // --- Authenticate ---
-    let oidc_subject: Option<String> = if let Some(ref verifier) = state.oidc.verifier {
+    // Internal connections (SSH gateway) with AlwaysAuthPass bypass all auth.
+    let is_auth_bypass = internal
+        && login
+            .client_spec
+            .as_ref()
+            .and_then(|cs| cs.always_auth_pass)
+            .unwrap_or(false);
+    if is_auth_bypass {
+        info!(
+            peer = ?peer,
+            run_id = ?login.run_id,
+            "Internal connection with AlwaysAuthPass, bypassing authentication",
+        );
+    }
+
+    let oidc_subject: Option<String> = if is_auth_bypass {
+        None
+    } else if let Some(ref verifier) = state.oidc.verifier {
         let token = login.privilege_key.as_deref().unwrap_or("");
         match verifier.verify_login(token).await {
             Ok(oidc_token) => {

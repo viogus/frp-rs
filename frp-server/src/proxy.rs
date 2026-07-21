@@ -2,6 +2,38 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::RwLock;
+use tokio::time::{Duration, Instant};
+
+/// Maximum consecutive failures before a group backend is marked unhealthy.
+const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+/// Cooldown period after which an unhealthy backend is re-tried.
+const HEALTH_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Health state for a group proxy backend.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum HealthState {
+    Healthy,
+    Unhealthy,
+}
+
+/// Per-backend health tracking for group load balancing.
+#[derive(Debug, Clone)]
+pub(crate) struct GroupMemberHealth {
+    pub state: HealthState,
+    pub consecutive_failures: u32,
+    pub last_failure: Option<Instant>,
+}
+
+impl GroupMemberHealth {
+    pub fn healthy() -> Self {
+        Self {
+            state: HealthState::Healthy,
+            consecutive_failures: 0,
+            last_failure: None,
+        }
+    }
+}
 
 /// A registered proxy on the server side.
 #[derive(Debug, Clone)]
@@ -62,6 +94,9 @@ pub struct ProxyManager {
     groups: RwLock<HashMap<String, Vec<String>>>,
     /// Per-group round-robin counters. Incremented on each selection.
     group_counters: Mutex<HashMap<String, u64>>,
+    /// Per-proxy health state for group load balancing.
+    /// Keyed by proxy name (same as `proxies` keys).
+    group_health: RwLock<HashMap<String, GroupMemberHealth>>,
 }
 
 impl Default for ProxyManager {
@@ -77,6 +112,7 @@ impl ProxyManager {
             by_client: RwLock::new(HashMap::new()),
             groups: RwLock::new(HashMap::new()),
             group_counters: Mutex::new(HashMap::new()),
+            group_health: RwLock::new(HashMap::new()),
         }
     }
 
@@ -142,6 +178,8 @@ impl ProxyManager {
                     }
                 }
             }
+            // Clean up health tracking for this proxy
+            self.group_health.write().await.remove(name);
             drop(proxies);
             let mut by_client = self.by_client.write().await;
             if let Some(client_proxies) = by_client.get_mut(&info.run_id) {
@@ -218,9 +256,47 @@ impl ProxyManager {
         }
     }
 
+    /// Report a successful connection to a backend, resetting its health.
+    pub async fn report_backend_success(&self, name: &str) {
+        let mut health = self.group_health.write().await;
+        if let Some(entry) = health.get_mut(name) {
+            entry.consecutive_failures = 0;
+            entry.state = HealthState::Healthy;
+            entry.last_failure = None;
+        }
+    }
+
+    /// Report a connection failure to a backend. After `MAX_CONSECUTIVE_FAILURES`
+    /// (3), the backend is marked `Unhealthy`. It recovers after `HEALTH_COOLDOWN`
+    /// (30s) or on the next successful connection via `report_backend_success`.
+    pub async fn report_backend_failure(&self, name: &str) {
+        let mut health = self.group_health.write().await;
+        let entry = health
+            .entry(name.to_string())
+            .or_insert_with(GroupMemberHealth::healthy);
+        entry.consecutive_failures += 1;
+        entry.last_failure = Some(Instant::now());
+        if entry.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            tracing::warn!(
+                proxy_name = %name,
+                failures = entry.consecutive_failures,
+                "Group backend '{}' marked unhealthy after {} consecutive failures",
+                name,
+                entry.consecutive_failures,
+            );
+            entry.state = HealthState::Unhealthy;
+        }
+    }
+
+    /// Remove health tracking for a proxy (called on proxy removal).
+    pub async fn remove_backend_health(&self, name: &str) {
+        self.group_health.write().await.remove(name);
+    }
+
     /// Select a backend from a group for load balancing.
+    /// Skips backends marked unhealthy (unless all backends are unhealthy).
     /// Uses group_key for affinity: same key → same backend (hash-based).
-    /// Without group_key, true round-robin selection across group members.
+    /// Without group_key, true round-robin selection across healthy members.
     /// Matches Go frp v0.69.1 group load balancing behavior.
     pub async fn select_group_backend(&self, group: &str, group_key: &str) -> Option<String> {
         let groups = self.groups.read().await;
@@ -228,21 +304,61 @@ impl ProxyManager {
         if members.is_empty() {
             return None;
         }
+
+        // Filter out unhealthy members, but only if at least one is healthy.
+        // If all members are unhealthy, fall through to allow best-effort routing.
+        let health = self.group_health.read().await;
+        let now = Instant::now();
+        let healthy_indices: Vec<usize> = members
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| {
+                match health.get(m) {
+                    Some(h) if h.state == HealthState::Unhealthy => {
+                        // Check if cooldown has expired → recover automatically
+                        if let Some(t) = h.last_failure {
+                            if now.duration_since(t) >= HEALTH_COOLDOWN {
+                                Some(i)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => Some(i), // No health entry or Healthy
+                }
+            })
+            .collect();
+        drop(health);
+
+        // Use the healthy indices list; if empty, fall back to all members
+        let pool_indices: &[usize] = if healthy_indices.is_empty() {
+            // All members are unhealthy or none filtered — use full member list
+            &(0..members.len()).collect::<Vec<_>>()
+        } else {
+            &healthy_indices
+        };
+
+        if pool_indices.is_empty() {
+            return None;
+        }
+
         if !group_key.is_empty() {
             // Sticky session: hash the key to pick a backend
             let hash = group_key
                 .bytes()
                 .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
-            let idx = hash as usize % members.len();
+            let idx = pool_indices[hash as usize % pool_indices.len()];
             Some(members[idx].clone())
         } else {
-            // True round-robin: increment counter, modulo member count.
+            // True round-robin: increment counter, modulo pool count.
             let mut counters = self
                 .group_counters
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let counter = counters.entry(group.to_string()).or_insert(0);
-            let idx = (*counter as usize) % members.len();
+            let idx = pool_indices[(*counter as usize) % pool_indices.len()];
             *counter += 1;
             Some(members[idx].clone())
         }
@@ -256,6 +372,21 @@ impl ProxyManager {
             .get(name)
             .and_then(|p| p.group.clone())
             .filter(|g| !g.is_empty())
+    }
+
+    /// Number of members in a group. Returns 0 if group doesn't exist.
+    pub async fn group_len(&self, group: &str) -> usize {
+        self.groups
+            .read()
+            .await
+            .get(group)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// Check if a group has any members.
+    pub async fn group_exists(&self, group: &str) -> bool {
+        self.group_len(group).await > 0
     }
 
     pub async fn list_client(&self, run_id: &str) -> Vec<Arc<ProxyInfo>> {

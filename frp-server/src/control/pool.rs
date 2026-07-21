@@ -397,22 +397,37 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
                 user_conn,
                 pre_read,
             }) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    // Reset health on successful dispatch
+                    ctx.state
+                        .proxy_manager
+                        .report_backend_success(&target_proxy)
+                        .await;
+                    return Ok(());
+                }
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    // Backend handler is busy. The connection
-                    // was consumed by try_send and cannot be
-                    // recovered without restructuring this
-                    // handler. Drop it (rare — channel has
-                    // capacity 256).
+                    // Backend handler is busy — report failure for health tracking.
+                    ctx.state
+                        .proxy_manager
+                        .report_backend_failure(&target_proxy)
+                        .await;
                     debug!(target_run_id = %target_run_id, "Group backend channel full, dropping connection");
                     return Ok(());
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
+                    ctx.state
+                        .proxy_manager
+                        .report_backend_failure(&target_proxy)
+                        .await;
                     debug!(target_run_id = %target_run_id, "Group backend handler closed, dropping connection");
                     return Ok(());
                 }
             }
         } else {
+            ctx.state
+                .proxy_manager
+                .report_backend_failure(&target_proxy)
+                .await;
             warn!(target_run_id = %target_run_id, target_proxy = %target_proxy, "Group backend run_id {} not found for proxy {}", target_run_id, target_proxy);
             return Ok(());
         }
