@@ -1,0 +1,139 @@
+{
+  "subsystem": "xtcp-stcp-nat",
+  "go_commit": "d486018",
+  "analyzed_at": "2026-07-21",
+  "findings": [
+    {
+      "severity": "CRITICAL",
+      "title": "PublicNetwork feature never detected: server calls classify_nat_feature with empty local_ips",
+      "go_ref": "pkg/nathole/controller.go:304-312 — ClassifyNATFeature(cm.MappedAddrs, parseIPs(cm.AssistedAddrs)) uses assisted addrs as local_ips",
+      "rust_file": "frp-server/src/control/nathole.rs",
+      "rust_line": 641,
+      "description": "The Rust server's control-channel NatHoleVisitor handler calls `classify::classify_nat_feature(&visitor_mapped, &[], &[])` and `classify_nat_feature(&client_mapped, &[], &[])` with empty local_ips slice. The Go controller passes the assisted addresses (parsed as local IPs) as the second argument: ClassifyNATFeature(cm.MappedAddrs, parseIPs(cm.AssistedAddrs)). Without local_ips, `public_network` is always `false`, which breaks mode0 PublicNetwork-aware scoring (Go analysis.go switches sender/receiver scores when a peer is on a public network). The same issue exists in the accept-loop path in handlers.rs (line 643 area).",
+      "fix_suggestion": "Parse assisted_addrs as local IPs and pass them to classify_nat_feature as the second argument, matching Go's pattern: classify_nat_feature(&mapped_addrs, &parsed_assisted_ips). The Go code calls parseIPs() on AssistedAddrs to extract IPs, then passes them as localIPs param."
+    },
+    {
+      "severity": "CRITICAL",
+      "title": "Rust STUN does not implement CHANGED_ADDRESS / OTHER_ADDR attribute parsing",
+      "go_ref": "pkg/nathole/discovery.go:114-143 — Go sends second STUN request to resp.otherAddr (changed address), getting a second mapped address from a different server IP",
+      "rust_file": "frp-core/src/stun.rs",
+      "rust_line": 183,
+      "description": "Go frp discovery.go sends STUN Binding Requests to both the primary STUN server AND the 'other address' (CHANGED_ADDRESS attribute) to get a second mapped address for improved NAT classification. The Rust STUN implementation only parses MAPPED_ADDRESS (0x0001) and XOR_MAPPED_ADDRESS (0x0020) attributes. It does not parse OTHER-ADDRESS / CHANGED-ADDRESS (0x802c). Rust visitor.rs compensates by sending a second STUN request to the SAME server, but this only proves the NAT mapping is consistent to the same destination IP, not that it changes with different destination IPs. This means NAT classification on the Rust side sees only one external IP, potentially missing port-change-only NAT detection.",
+      "fix_suggestion": "1) Add parsing for STUN attribute type 0x802c (OTHER-ADDRESS) in stun.rs parse_binding_response. 2) In visitor.rs, use the other-address from the first STUN response for the second STUN request (matching Go discovery.go:137-138). The Rust visitor.rs currently sends both STUN requests to the same server address."
+    },
+    {
+      "severity": "CRITICAL",
+      "title": "Rust visitor sends mapped_addrs as assisted_addrs instead of local-IP-based assisted addresses",
+      "go_ref": "pkg/nathole/nathole.go:143-152 — Go Prepare() builds assistedAddrs from local IPs + STUN port, separate from mapped addrs",
+      "rust_file": "frp-client/src/visitor.rs",
+      "rust_line": 254,
+      "description": "The Rust visitor sends `assisted_addrs: if daa || mapped_addrs.is_empty() { None } else { Some(mapped_addrs) }` — when disable_assisted_addrs is false, it sends the SAME STUN mapped addresses as assisted addresses. Go frp's Prepare() builds assisted addresses from local IPs (ListLocalIPsForNatHole(10)) combined with the STUN port, creating addresses like `local_ip:stun_port` for LAN-based hole punching. The Rust approach sends duplicate data that provides no additional routing information. Go frp's server classifies NAT using `parseIPs(AssistedAddrs)` as local IPs for public_network detection — sending mapped external IPs there would never match local IPs.",
+      "fix_suggestion": "Implement local IP discovery in the Rust visitor (equivalent of Go's ListLocalIPsForNatHole(10)), filtering IPv4 non-loopback addresses, and combine them with the STUN socket port to form proper assisted addresses. Only then map them to assisted_addrs in NatHoleVisitor."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Rust NatHoleClient.sid is Option<String> vs Go's required string — wire compatible but semantically different",
+      "go_ref": "pkg/msg/msg.go NatHoleClient struct uses `Sid string json:\"sid,omitempty\"`",
+      "rust_file": "frp-core/src/msg.rs",
+      "rust_line": 0,
+      "description": "Go's NatHoleClient has `Sid string` tagged omitempty — empty string is omitted from JSON. Rust has `sid: Option<String>` with skip_serializing_if. When Rust sends NatHoleClient with sid=None, Go receives empty string (zero value), which is fine for Go's `if m.Sid == \"\"` checks. However, when Rust receives Go's NatHoleClient that has sid populated, Rust deserializes it as Some(sid). This is wire-compatible, but the Rust code has a struct NatHoleClient with sid where Sid is missing for Go sessions — this could cause Rust server-side bugs.",
+      "fix_suggestion": "Change Rust NatHoleClient.sid to a plain String (not Option) to match Go's semantics exactly."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Rust gen_analysis_key uses canonical string format while Go uses MD5 hash — incompatible between implementations",
+      "go_ref": "pkg/nathole/controller.go:74-91 — genAnalysisKey() writes to md5.New(), incorporating first IP, NAT type, behavior, and regular_ports_change",
+      "rust_file": "frp-server/src/nathole/controller.rs",
+      "rust_line": 422,
+      "description": "Go frp genAnalysisKey() computes `md5(visitor_first_ip + v_nat_type + v_behavior + v_regular + client_first_ip + c_nat_type + c_behavior + c_regular)` as a hex-encoded 32-character string. Rust gen_analysis_key() produces `\"nat_type:behavior:regular|nat_type:behavior:regular\"` as a canonical string. Both are consumed only within their own Analyzer instances (server-local), so this does not break cross-implementation wire protocol. However, if a future deployment mixes Go and Rust frpc against a shared Go+Rust frps cluster, the analysis data would be fragmented.",
+      "fix_suggestion": "Recommend only as a future compatibility enhancement. For now, both implementations work independently because the analyzer is per-server-process."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Rust handle_nat_hole_resp creates a synthetic NatHoleClient from NatHoleResp and calls handle_client — may double-signal the session notify channel",
+      "go_ref": "pkg/nathole/controller.go — Go server does NOT call HandleClient when receiving NatHoleResp; it only stores the response for later sending via Send()",
+      "rust_file": "frp-server/src/control/nathole.rs",
+      "rust_line": 262,
+      "description": "The Rust `handle_nat_hole_resp` function creates a synthetic `NatHoleClient` message from the provider's `NatHoleResp` and calls `ctx.state.xtcp.nat_hole.handle_client(...)` on it. This is intended to store the provider's candidate addresses for the session, but it also triggers `session.notify_ch.send(())` which signals the waiting spawn task. If the real `NatHoleClient` from the provider already arrived and triggered the notify, the second `handle_client` call will see the oneshot already `take()`n (so `send()` returns Err). Additionally, `handle_nat_hole_resp` is called from the provider's control connection handler, while `handle_client` is normally called from the provider's control connection too — this creates an artificial two-path notification for the same event.",
+      "fix_suggestion": "Instead of calling handle_client (which sends on notify_ch), create a dedicated method on Controller that only stores the provider addresses without signalling the notify channel. Or gate the notify_ch send behind a flag/check."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Rust build_nat_hole_response uses rsplit(':') which is incorrect for IPv6 candidate addresses",
+      "go_ref": "pkg/nathole/controller.go:379-402 — getRangePorts uses net.SplitHostPort which handles IPv6 correctly",
+      "rust_file": "frp-server/src/nathole/controller.rs",
+      "rust_line": 478,
+      "description": "The Rust `build_nat_hole_response` function parses port from the last candidate address using `last_addr.rsplit(':').next()`. This is incorrect for IPv6 addresses like `[2001:db8::1]:12345` — `rsplit(':')` would split on the colons inside the IPv6 address and return the wrong port. The Go equivalent uses `net.SplitHostPort()` which correctly handles bracketed IPv6. The classifier's `split_host_port` in classify.rs handles IPv6 correctly, but the controller.rs code path does not.",
+      "fix_suggestion": "Reuse the `split_host_port` function from classify.rs (or make it a public utility in the nathole module) instead of inline rsplit(':')."
+    },
+    {
+      "severity": "LOW",
+      "title": "PreCheck timeout degrades gracefully (proceeds with full request) instead of failing — Go returns error immediately",
+      "go_ref": "pkg/nathole/nathole.go:88-115 — PreCheck returns error on timeout or invalid response, does not fall through",
+      "rust_file": "frp-client/src/visitor.rs",
+      "rust_line": 174,
+      "description": "Rust visitor's PreCheck phase (lines 128-181) sends a pre_check NatHoleVisitor and waits up to 15s for a response. If it times out, the code falls through with a warning and proceeds with the full STUN + NatHoleVisitor exchange. Go's PreCheck returns an error immediately. The Rust approach is more resilient but means Rust frpc will do STUN and hole-punch attempts even against servers that don't support PreCheck, which wastes resources. This is a design difference, not a bug, but it means Rust behavior diverges from Go.",
+      "fix_suggestion": "Document this as an intentional design choice (graceful degradation for older servers)."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rust STUN timeout (5s) differs from Go responseTimeout (3s)",
+      "go_ref": "pkg/nathole/discovery.go:26 — var responseTimeout = 3 * time.Second",
+      "rust_file": "frp-core/src/stun.rs",
+      "rust_line": 70,
+      "description": "Go uses a 3-second responseTimeout for STUN requests. Rust uses 5 seconds across all stun_binding* functions. Both should be sufficient for local network STUN servers. The longer timeout in Rust is more tolerant of slow networks but increases the worst-case STUN delay.",
+      "fix_suggestion": "Reduce Rust STUN timeout to 3s for wire-compatible timing, or make it configurable."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rust NatHoleDetectSid sends empty nonce string vs Go random digit string",
+      "go_ref": "pkg/nathole/nathole.go:353 — Nonce: strings.Repeat(\"0\", rand.IntN(20)) (Go uses 0-19 zeros as nonce in side-channel detection)",
+      "rust_file": "frp-core/src/xtcp_p2p.rs",
+      "rust_line": 110,
+      "description": "The Rust `NatHoleDetectSid::new()` sets `nonce: String::new()` (always empty). Go's `sendSidMessage` sets `Nonce: strings.Repeat(\"0\", rand.IntN(20))` which is a random-length string of zeros (0-19 chars). The nonce is only used for side-channel detection (response matching) and has no security significance. Both sides treat an empty nonce as valid. Wire compatible but not timing-compatible.",
+      "fix_suggestion": "Add random nonce generation matching Go's behavior for reproducibility."
+    },
+    {
+      "severity": "LOW",
+      "title": "NAT_HOLE_TIMEOUT constant same value (10) as Go but used differently",
+      "go_ref": "pkg/nathole/controller.go:39 — var NatHoleTimeout int64 = 10",
+      "rust_file": "frp-server/src/nathole/mod.rs",
+      "rust_line": 9,
+      "description": "Both Go and Rust define NAT_HOLE_TIMEOUT = 10 (seconds). Go uses this as `time.Duration(NatHoleTimeout) * time.Second` in select timeout. Rust uses it as `Duration::from_secs(NAT_HOLE_TIMEOUT)` in the spawn task timeout for waiting on the provider's NatHoleClient. Implementations match.",
+      "fix_suggestion": "No fix needed — this is correctly implemented."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rust sk_index race condition fix documented (CLAUDE.md line 242) — Go does not have this issue",
+      "go_ref": "server/proxy/proxy.go:200 — startVisitorListener pre-registers listener during Run(), before registration returns",
+      "rust_file": "frp-server/src/control/nathole.rs",
+      "rust_line": 367,
+      "description": "CLAUDE.md documents that STCP/XTCP visitors may send NewVisitorConn before the server's proxy_manager.register() completes. Go frp avoids this by pre-registering the visitor listener during proxy.Run() (startVisitorListener → rc.VisitorManager.Listen()) before the proxy registration returns to the control. Rust uses sk_index as a fallback in both handlers.rs and control/nathole.rs when proxy_manager.get() returns None. This is not a bug — it's a documented design divergence with Rust's sk_index fallback.",
+      "fix_suggestion": "No fix needed — the race condition fix is already implemented via sk_index fallback."
+    },
+    {
+      "severity": "LOW",
+      "title": "Go discovery_test.go has 382 lines of STUN tests — Rust stun.rs has no end-to-end STUN integration test",
+      "go_ref": "pkg/nathole/discovery_test.go — Tests STUN exchange with real UDP sockets, NAT classification after discovery, malformed/error responses, timeout behavior, and client socket lifecycle",
+      "rust_file": "frp-core/src/stun.rs",
+      "rust_line": 259,
+      "description": "Go frp dev added 382 lines of integration tests for the STUN discovery flow in discovery_test.go, covering: Discover reuses local port, NAT classification after STUN, legacy MAPPED-ADDRESS vs XOR-MAPPED-ADDRESS precedence, STUN errors, timeouts, and socket deadline interaction. Rust stun.rs has unit tests for attribute parsing, XOR-MAPPED-ADDRESS, and binding response parsing, but NO end-to-end test that exercises the full discover→classify pipeline with a real UDP socket. The discovery_test.go file was added in the Go dev branch and is the most important new testing surface.",
+      "fix_suggestion": "Add a Rust integration test for the full STUN discovery + NAT classification pipeline, matching Go's TestDiscoverReusesLocalPortAndPreservesNATClassification and TestDoSTUNRequestMapsLegacyAndModernAddresses. Use a local UDP STUN server similar to Go's serveOneSTUNRequest/listenTestUDP4 pattern."
+    }
+  ],
+  "summary": {
+    "total_findings": 13,
+    "critical": 3,
+    "medium": 4,
+    "low": 6,
+    "key_areas": {
+      "STUN_implementation": "CRITICAL: Rust STUN missing CHANGED_ADDRESS parsing and server-side classify_nat_feature never passes local_ips — both degrade NAT classification quality",
+      "assisted_addresses": "CRITICAL: Rust sends mapped_addrs as assisted_addrs instead of local-IP-based addresses — breaks LAN hole-punch detection",
+      "NAT_analysis": "MEDIUM: gen_analysis_key format differs (string vs MD5 hash) but server-local, so cross-implementation interop is not affected",
+      "XTCP_hole_punch": "MEDIUM: handle_nat_hole_resp double-signals the session notify via synthetic NatHoleClient. Port-range calculation broken for IPv6.",
+      "STCP_flow": "LOW: STCP visitor auth and sk_index lookup are properly implemented with documented race condition fix",
+      "message_protocol": "MEDIUM: NatHoleClient.sid as Option<String> diverges from Go's required string; wire compatible but semantically different",
+      "testing": "LOW: Go added 382-line discovery_test.go with comprehensive STUN integration tests — no Rust equivalent"
+    }
+  }
+}
