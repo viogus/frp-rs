@@ -204,9 +204,12 @@ async fn test_v2_tcp_proxy() {
                 r.error
             );
             let addr = r.remote_addr.as_ref().expect("remote_addr should be set");
-            addr.trim_start_matches(':')
-                .parse()
+            // remote_addr is "host:port" (e.g. "0.0.0.0:10000") — parse the port
+            addr.rsplit(':')
+                .next()
                 .expect("remote_addr should contain port")
+                .parse()
+                .expect("remote_addr should contain valid port")
         }
         other => panic!(
             "expected NewProxyResp, got v2 type_id: {:?}",
