@@ -500,8 +500,10 @@ pub(crate) async fn handle_nat_hole_visitor(
     let visitor_assisted = msg.assisted_addrs.unwrap_or_default();
 
     // --- Step 4: Classify both NAT features ---
-    let v_feature = classify::classify_nat_feature(&visitor_mapped, &[]).ok();
-    let c_feature = classify::classify_nat_feature(&client_mapped, &[]).ok();
+    let visitor_local_ips = classify::parse_ips(&visitor_assisted);
+    let client_local_ips = classify::parse_ips(&client_assisted);
+    let v_feature = classify::classify_nat_feature(&visitor_mapped, &visitor_local_ips).ok();
+    let c_feature = classify::classify_nat_feature(&client_mapped, &client_local_ips).ok();
 
     // Store features on session
     if let Some(ref vf) = v_feature {
@@ -704,8 +706,17 @@ pub(crate) async fn dispatch_v2_message(
     };
     match msg {
         FrpMessage::Login(login) => {
-            control::handle_control(io, *login, state, Some(addr), incoming, true, crypto_ctx)
-                .await;
+            control::handle_control(
+                io,
+                *login,
+                state,
+                Some(addr),
+                incoming,
+                true,
+                crypto_ctx,
+                false,
+            )
+            .await;
         }
         FrpMessage::NewWorkConn(nwc) => {
             handle_work_conn_inner(io, nwc, state).await;
@@ -734,7 +745,7 @@ pub(crate) async fn dispatch_v1_message(
 ) {
     match frp_core::protocol::read_msg_v1(&mut io).await {
         Ok(FrpMessage::Login(login)) => {
-            control::handle_control(io, *login, state, addr, incoming, false, None).await;
+            control::handle_control(io, *login, state, addr, incoming, false, None, false).await;
         }
         Ok(FrpMessage::NewWorkConn(nwc)) => {
             handle_work_conn_inner(io, nwc, state).await;

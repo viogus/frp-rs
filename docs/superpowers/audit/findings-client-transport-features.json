@@ -1,0 +1,96 @@
+{
+  "subsystem": "client-transport-features",
+  "go_commit": "d486018",
+  "findings": [
+    {
+      "severity": "MEDIUM",
+      "title": "Missing heartbeat timeout detection — Rust sends pings but does not track pong timeout",
+      "go_ref": "/tmp/frp-src/client/control.go lines 230-263 (heartbeatWorker), line 69 (lastPong), line 262 (heartbeat timeout check)",
+      "rust_file": "/home/claude/frp-rs/.claude/worktrees/fix+go-frp-dev-full-audit/frp-client/src/service.rs",
+      "rust_line": 968,
+      "description": "Go frp tracks `lastPong` time and checks it against `HeartbeatTimeout` (default 90s; set to -1 when TCPMux is enabled). If `time.Since(lastPong) > HeartbeatTimeout`, Go warns 'heartbeat timeout' and eventually reconnects. Rust's service.rs only sends pings at `heartbeat_interval` via a `tokio::time::interval` timer (line 968) and logs 'Ping sent' / 'Pong received' but never checks the elapsed time since the last Pong. A dead control connection with a responsive TCP stack (no RST) would go undetected until the next write fails.",
+      "fix_suggestion": "Add a `last_pong: Instant` field, update it on receiving Pong, and spawn a watchdog task/select branch that triggers reconnect if `last_pong.elapsed() > heartbeat_timeout`. Respect Go's convention of disabling heartbeat timeout when TCPMux is enabled (yamux provides its own keepalive)."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Missing proxy phase state machine for lifecycle tracking",
+      "go_ref": "/tmp/frp-src/client/proxy/proxy_wrapper.go lines 38-51 (ProxyPhase* constants), lines 138-164 (SetRunningStatus, Start, Stop), lines 194-239 (checkWorker)",
+      "rust_file": "/home/claude/frp-rs/.claude/worktrees/fix+go-frp-dev-full-audit/frp-client/src/proxy_runtime.rs",
+      "rust_line": 1,
+      "description": "Go frp maintains a detailed proxy phase state machine: New → WaitStart → StartErr/Running → CheckFailed → Closed. This controls when proxies are registered with the server, handles retries on start error, and integrates with health checks. Rust's ProxyRuntimeInfo stores only a generic `err: String` and `remote_addr: String` without any phase tracking. Proxies are registered once during login, and failures are stored as error strings with no retry cycle. This means a proxy that fails registration is never retried during the session.",
+      "fix_suggestion": "Add a ProxyPhase enum to ProxyRuntimeInfo (New, WaitStart, Running, CheckFailed, Closed) and a check_worker-style background task that retries failed proxy registrations. Match Go frp's behavior where `checkWorker` periodically transitions New/CheckFailed proxies back to WaitStart to retry registration."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "KCP XOR encryption comment in session.rs is misleading — Go frp does not use KCP-level encryption",
+      "go_ref": "/tmp/frp-src/pkg/util/net/kcp.go lines 31, 96 (kcp.ListenWithOptions with nil blockCrypt, NewConn3 with nil blockCrypt)",
+      "rust_file": "/home/claude/frp-rs/.claude/worktrees/fix+go-frp-dev-full-audit/frp-core/src/kcp/session.rs",
+      "rust_line": 10,
+      "description": "Rust session.rs line 10-11 reads: 'XOR encryption (`kcp_compat::XorBlock`) is NOT yet wired — KcpConfig lacks a crypt field'. This implies a gap in KCP interop, but Go frp's kcp.go passes `nil` for the blockCrypt parameter in both `kcp.ListenWithOptions()` and `kcp.NewConn3()`, meaning NO KCP-level encryption is used. The `kcp-go` library supports BlockCrypt (XOR, AES, Blowfish, etc.) but frp itself never enables it. The comment incorrectly flags a non-existent interop gap.",
+      "fix_suggestion": "Update the comment in session.rs and/or the CHANGELOG to clarify that Go frp does NOT use KCP block encryption. The `kcp_compat::XorBlock` code is unused dead code unless frp-rs decides to add a proprietary KCP encryption extension (which would break interop with Go frp)."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Group health check TODO describes a feature that does not exist in Go frp",
+      "go_ref": "/tmp/frp-src/pkg/config/v1/proxy.go lines 72-106 (HealthCheckConfig with Type: \"\" | \"tcp\" | \"http\"), /tmp/frp-src/pkg/config/v1/validation/proxy.go lines 49-54 (validation rejects anything other than \"\", \"tcp\", \"http\")",
+      "rust_file": "/home/claude/frp-rs/.claude/worktrees/fix+go-frp-dev-full-audit/frp-client/src/health.rs",
+      "rust_line": 10,
+      "description": "Rust health.rs lines 10-26 contain a TODO: 'group health check (Go frp compat gap) ... When health_check_type == \"group\"'. However, Go frp's validation logic (validation/proxy.go:49-54) only accepts health check types of \"\", \"tcp\", or \"http\". There is no \"group\" health check type in Go frp dev. Health checks are per-proxy only; the proxy Group field (proxy.go:53) is used solely for server-side load balancing, not health checking. The TODO describes a feature that would not interoperate with Go frp.",
+      "fix_suggestion": "Remove the group health check TODO comment or update it to reflect that Go frp does not support group-level health checks. If group-level health checking is desired as a frp-rs extension, document it as such (not as a Go compat gap)."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Missing config store / CRUD API for runtime proxy/visitor management",
+      "go_ref": "/tmp/frp-src/client/config_manager.go lines 153-464 (ListStoreProxies, CreateStoreProxy, UpdateStoreProxy, DeleteStoreProxy, etc. — full CRUD on StoreSource proxies and visitors)",
+      "rust_file": "/home/claude/frp-rs/.claude/worktrees/fix+go-frp-dev-full-audit/frp-client/src/reload.rs",
+      "rust_line": 85,
+      "description": "Go frp dev has a complete `config_manager.go` with `StoreSource` that supports CRUD operations on proxies and visitors (CreateStoreProxy, UpdateStoreProxy, DeleteStoreProxy, ListStoreProxies, etc.), config source aggregation, and hot-reload via the admin API. These are exposed through the admin HTTP API. Rust's reload.rs only implements `do_reload()` which diffs old vs new config from file. There is no store/CRUD mechanism, no config source aggregation, and no persistence layer. The admin API endpoints for proxy CRUD are therefore non-functional.",
+      "fix_suggestion": "Implement a StoreSource trait with in-memory HashMap storage (matching Go frp's source.StoreSource interface) and wire it through the admin API. The CRUD operations should trigger config reload (via the existing reload channel) after each mutation."
+    },
+    {
+      "severity": "LOW",
+      "title": "Yamux keepalive uses polling fallback instead of native yamux keepalive interval",
+      "go_ref": "/tmp/frp-src/client/connector.go line 151: fmuxCfg.KeepAliveInterval = time.Duration(c.cfg.Transport.TCPMuxKeepaliveInterval) * time.Second; default 30s",
+      "rust_file": "/home/claude/frp-rs/.claude/worktrees/fix+go-frp-dev-full-audit/frp-core/src/mux.rs",
+      "rust_line": 119,
+      "description": "Go frp sets `fmuxCfg.KeepAliveInterval` on the yamux config (hashicorp/yamux fork) to the configured value (default 30s). Rust mux.rs line 119-121 notes: 'NOTE: yamux 0.14.0 does not expose set_keepalive_interval on Config.' Rust implements keepalive via a `tokio::time::sleep(keepalive)` branch in the select! loop that drives the yamux connection (this triggers poll_next_inbound periodically). The behavior is functionally similar (both detect dead peers) but uses a different mechanism. Under sustained load, Rust's approach adds an extra timer wakeup per keepalive interval. Under idle, both approaches are equivalent.",
+      "fix_suggestion": "Monitor yamux-rs for API additions that expose keepalive_interval natively. Until then, the polling fallback is acceptable but should be documented more clearly as a behavioral divergence."
+    },
+    {
+      "severity": "LOW",
+      "title": "QUIC_GO_DISABLE_ECN and crypto.DefaultSalt env vars not configured in Rust",
+      "go_ref": "/tmp/frp-src/client/service.go lines 46-52: crypto.DefaultSalt = \"frp\", os.Setenv(\"QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING\", \"true\"), os.Setenv(\"QUIC_GO_DISABLE_ECN\", \"true\")",
+      "rust_file": "/home/claude/frp-rs/.claude/worktrees/fix+go-frp-dev-full-audit/frp-core/src/quic.rs",
+      "rust_line": 1,
+      "description": "Go frp's init() function sets `crypto.DefaultSalt = \"frp\"` (used by golib/crypto for AES-128-CFB control encryption key derivation) and disables QUIC ECN by default due to known issues on certain OSes. Rust uses `frp-core::encryption::derive_key()` for the AES key and `quinn` for QUIC (not quic-go). The quinn library may handle ECN differently, but there is no explicit equivalent to Go frp's ECN disabling. Additionally, Go frp disables quic-go's receive buffer warning.",
+      "fix_suggestion": "Ensure the encryption key derivation (`derive_key`) produces identical results to Go frp's `golib/crypto` with DefaultSalt=\"frp\". The QUIC ECN handling in quinn should be checked — if quinn enables ECN by default, consider disabling it for parity."
+    },
+    {
+      "severity": "LOW",
+      "title": "Go frp's ClientCommonConfig.Complete() defaults missing in Rust config",
+      "go_ref": "/tmp/frp-src/pkg/config/v1/client.go (Complete() method sets TCPMux defaults, poolCount, etc.) and server.go Complete() lines 182-197",
+      "rust_file": "/home/claude/frp-rs/.claude/worktrees/fix+go-frp-dev-full-audit/frp-core/src/config.rs",
+      "rust_line": 1,
+      "description": "Go frp has a `Complete()` method on config structs that fills in defaults (e.g., TCPMux default true, TCPMuxKeepaliveInterval default 30, TCPKeepAlive default 7200, HeartbeatTimeout default 90 or -1 depending on TCPMux). Rust's config.rs uses serde defaults. Some values match serde defaults (tcp_mux defaults to true in Rust), but the conditional logic (HeartbeatTimeout = -1 when TCPMux enabled) is not replicated. Config defaults may diverge subtly between the two implementations.",
+      "fix_suggestion": "Audit all numeric/boolean config defaults in frp-core/src/config.rs against Go frp v1 Complete() methods. Ensure the conditional logic (especially for HeartbeatTimeout and TCPMux interaction) is replicated in Rust's default path."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rust HTTP health check sends HTTP/1.0 requests; Go frp sends proper HTTP/1.1",
+      "go_ref": "/tmp/frp-src/client/health/health.go lines 167-184: http.NewRequestWithContext with http.DefaultClient.Do (proper HTTP client, HTTP/1.1 defaults)",
+      "rust_file": "/home/claude/frp-rs/.claude/worktrees/fix+go-frp-dev-full-audit/frp-client/src/health.rs",
+      "rust_line": 117,
+      "description": "Go frp's HTTP health check uses `http.NewRequestWithContext()` and `http.DefaultClient.Do()`, which sends proper HTTP/1.1 requests with full header support. Rust's `run_http_check` constructs a raw HTTP/1.0 GET request manually and only checks for '200' or ' 2' in the status line. The raw approach handles most cases but may not handle chunked responses, keep-alive connections, or redirects. The Host header is also derived from addr.split(':')[0] which may strip port info.",
+      "fix_suggestion": "Consider using an HTTP client crate (like `reqwest`) for HTTP health checks, or enhance the raw parser to handle HTTP/1.1 responses properly (chunked encoding, connection: close, etc.). At minimum, add port to the Host header."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rust WebSocket handler relies on raw manual framing for Go frp compat — diverges from Go frp's use of golang.org/x/net/websocket",
+      "go_ref": "/tmp/frp-src/pkg/util/net/websocket.go (WebsocketListener, BinaryFrame payload type), dial.go (DialHookWebsocket with cfg.PayloadType = websocket.BinaryFrame)",
+      "rust_file": "/home/claude/frp-rs/.claude/worktrees/fix+go-frp-dev-full-audit/frp-core/src/transport.rs",
+      "rust_line": 93,
+      "description": "Go frp uses `golang.org/x/net/websocket` library which sends encrypted frp data as TEXT frames (violating RFC 6455 §5.6 for non-UTF-8 payloads). Rust implements a custom WsByteStream with two modes: tungstenite (client side, sends Binary frames) and Raw (server/manual mode, handles both text and binary frames). The Raw mode is specifically designed to handle Go frp's non-UTF-8 text frames. Rust's client mode (tungstenite) sends Binary frames, which Go frp's server WsByteStream will accept. The interop should work but the Rust approach is much more complex and fragile.",
+      "fix_suggestion": "The existing Raw frame handling is correct for interop. However, the code (entire WsByteStream implementation plus accept_websocket/accept_websocket_from_peeked/connect_ws_raw) is nearly 800 lines of manual WebSocket frame parsing. Consider testing against Go frps with various payload patterns (binary, encrypted, compressed) to ensure edge cases are handled."
+    }
+  ]
+}

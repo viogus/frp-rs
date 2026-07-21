@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use frp_core::format_socket_addr;
 use frp_core::msg::{self, FrpMessage};
@@ -178,6 +178,56 @@ pub(crate) async fn handle_new_proxy(
     }
 
     let is_sudp = np.proxy_type == "sudp";
+    let is_tcp_group =
+        np.proxy_type == "tcp" && np.group.as_deref().filter(|g| !g.is_empty()).is_some();
+
+    // TCP group proxy: try to join an existing group first.
+    // Go frp dev compat: group members share a single port with round-robin dispatch.
+    let mut tcp_group_created = false;
+    if is_tcp_group {
+        let group_name = np.group.as_deref().unwrap_or("");
+        let group_key = np.group_key.as_deref().unwrap_or("");
+        if let Some(group_port) = state
+            .tcp_group_ctl
+            .get_group_port(group_name, group_key, remote_port, &state.proxy_bind_addr)
+            .await
+        {
+            info!(
+                proxy_name = %np.proxy_name,
+                group = %group_name,
+                port = %group_port,
+                "TCP proxy '{}' joining existing group '{}' on port {}",
+                np.proxy_name, group_name, group_port,
+            );
+            // Group exists — reuse its port and skip port allocation.
+            // The shared group listener handles connection dispatch.
+            // We still create ProxyInfo with the group's port so users
+            // connect to the correct port, but no new listener is spawned.
+            let mut ports = state.used_ports.write().await;
+            ports.insert(group_port);
+            let allocated_port = Some(group_port);
+            // Jump to proxy registration, skipping listener creation below.
+            handle_tcp_group_member_registration(
+                state,
+                run_id,
+                writer,
+                np,
+                remote_port,
+                internal_tx,
+                listener_handles,
+                udp_sockets,
+                udp_local_to_proxy,
+                v2,
+                allocated_port,
+                false,
+            )
+            .await;
+            return;
+        }
+        // No existing group — will create one with a new shared listener.
+        tcp_group_created = true;
+    }
+
     // When sudp_port is configured, force all SUDP proxies to use that port
     let remote_port = if is_sudp && state.sudp_port > 0 {
         if remote_port > 0 && remote_port != state.sudp_port {
@@ -536,6 +586,47 @@ pub(crate) async fn handle_new_proxy(
                 info!(is_sudp = %is_sudp, proxy_name = %np.proxy_name, port = %port, "{} proxy '{}' listening on port {}", if is_sudp { "SUDP" } else { "UDP" }, np.proxy_name, port);
             } else if is_nat_hole {
                 info!(proxy_type = %np.proxy_type, proxy_name = %np.proxy_name, "{} proxy '{}' registered (no listener, NAT hole punch)", np.proxy_type, np.proxy_name);
+            } else if tcp_group_created {
+                // TCP group first member: create a shared group listener
+                // that dispatches connections via round-robin (Go frp dev compat).
+                // NOT a per-proxy listener — groups share one port.
+                let group_name = np.group.clone().unwrap_or_default();
+                let group_key = np.group_key.clone().unwrap_or_default();
+                info!(
+                    proxy_name = %np.proxy_name,
+                    group = %group_name,
+                    port = %port,
+                    "TCP proxy '{}' creating shared group listener for '{}' on port {}",
+                    np.proxy_name, group_name, port,
+                );
+                let cancel_token = tokio_util::sync::CancellationToken::new();
+                let ct = cancel_token.clone();
+                let st = state.clone();
+                let gn = group_name.clone();
+                let ba = bind_addr.clone();
+                let handle = tokio::spawn(async move {
+                    tcp_group_listener(ba, port, gn, st, ct).await;
+                });
+                if let Err(e) = state
+                    .tcp_group_ctl
+                    .create_group(
+                        &group_name,
+                        &group_key,
+                        port,
+                        &bind_addr,
+                        handle,
+                        cancel_token,
+                    )
+                    .await
+                {
+                    warn!(
+                        proxy_name = %np.proxy_name,
+                        group = %group_name,
+                        error = %e,
+                        "Failed to register TCP group '{}': {}",
+                        group_name, e,
+                    );
+                }
             } else {
                 let handle = tokio::spawn(async move {
                     listen_and_proxy(bind_addr, port, pn, itx).await;
@@ -639,17 +730,41 @@ pub(crate) async fn unregister_control(
 ) {
     // When shutting down due to supersession (duplicate run_id), the new
     // handler has already inserted its ControlTx. Skip removal to avoid
-    // deleting the replacement's entry.
+    // deleting the replacement's entry. Also skip registry mark-offline
+    // because the new handler already registered with its own control_id.
     if !skip_ctl_unregister {
+        let control_id = {
+            let map = state.run_id_to_ctl_tx.read().await;
+            map.get(run_id).map(|c| c.control_id).unwrap_or(0)
+        };
         let mut map = state.run_id_to_ctl_tx.write().await;
         map.remove(run_id);
+        // Mark the client offline in the registry, generation-aware.
+        state
+            .client_registry
+            .mark_offline_by_run_id_and_control_id(run_id, control_id);
     }
     // Release allocated ports and clean up sk/vhost entries for this client
     let proxies = state.proxy_manager.list_client(run_id).await;
     let mut ports = state.used_ports.write().await;
     for p in &proxies {
         if let Some(port) = p.remote_port {
-            ports.remove(&port);
+            // For TCP group proxies, only release the port if this is the last
+            // member of the group. Otherwise the shared group listener still
+            // needs the port.
+            let is_tcp_group =
+                p.proxy_type == "tcp" && p.group.as_deref().filter(|g| !g.is_empty()).is_some();
+            if is_tcp_group {
+                // Check if the group still has other members
+                let group_name = p.group.as_deref().unwrap_or("");
+                if state.proxy_manager.group_len(group_name).await <= 1 {
+                    ports.remove(&port);
+                    // Stop the shared group listener
+                    state.tcp_group_ctl.remove_group(group_name).await;
+                }
+            } else {
+                ports.remove(&port);
+            }
         }
         // Clean up STCP sk_index (indexed by proxy_name — exact match, no
         // risk of removing another proxy's entry even when keys are shared)
@@ -676,4 +791,230 @@ pub(crate) async fn unregister_control(
     {
         state.oidc.subjects.write().await.remove(run_id);
     }
+}
+
+// ---- TCP group shared listener ----
+
+/// Shared TCP group listener: accepts connections on the group's shared port
+/// and dispatches them to group members via round-robin (`select_group_backend`).
+/// Stops when the group has no members or the cancel token is triggered.
+#[instrument(skip(state, cancel_token), fields(group = %group_name, port = %port))]
+async fn tcp_group_listener(
+    bind_addr: String,
+    port: u16,
+    group_name: String,
+    state: Arc<AppState>,
+    cancel_token: tokio_util::sync::CancellationToken,
+) {
+    let addr = format_socket_addr(&bind_addr, port);
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => {
+            info!(
+                addr = %addr,
+                group = %group_name,
+                "TCP group '{}' shared listener started on {}",
+                group_name, addr,
+            );
+            l
+        }
+        Err(e) => {
+            tracing::error!(
+                port = %port,
+                group = %group_name,
+                error = %e,
+                "Failed to bind TCP group port {} for '{}': {}",
+                port, group_name, e,
+            );
+            return;
+        }
+    };
+
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                info!(group = %group_name, "TCP group '{}' shared listener cancelled", group_name);
+                break;
+            }
+            result = listener.accept() => {
+                match result {
+                    Ok((conn, _addr)) => {
+                        frp_core::transport::set_nodelay(&conn);
+                        // Check if group still has members before dispatching
+                        if state.proxy_manager.group_len(&group_name).await == 0 {
+                            info!(group = %group_name, "TCP group '{}' has no members, stopping listener", group_name);
+                            break;
+                        }
+                        // Select a backend via round-robin (Go frp dev compat).
+                        // group_key is empty here — the shared listener uses simple
+                        // round-robin across ALL group members regardless of key.
+                        // The key-based affinity is maintained per-proxy via the
+                        // existing handle_proxy_user_conn group dispatch in pool.rs.
+                        if let Some(backend) = state
+                            .proxy_manager
+                            .select_group_backend(&group_name, "")
+                            .await
+                        {
+                            let backend_run_id = state
+                                .proxy_manager
+                                .get_run_id(&backend)
+                                .await
+                                .unwrap_or_default();
+                            let ctl_tx = {
+                                let map = state.run_id_to_ctl_tx.read().await;
+                                map.get(&backend_run_id).map(|c| c.tx.clone())
+                            };
+                            if let Some(tx) = ctl_tx {
+                                if let Err(e) = tx.try_send(InternalMsg::ProxyUserConn {
+                                    proxy_name: backend,
+                                    user_conn: frp_core::transport::IoStream::Tcp(conn),
+                                    pre_read: vec![],
+                                }) {
+                                    debug!(
+                                        group = %group_name,
+                                        error = %e,
+                                        "Failed to dispatch connection from group '{}': {}",
+                                        group_name, e,
+                                    );
+                                }
+                            } else {
+                                debug!(
+                                    group = %group_name,
+                                    backend = %backend,
+                                    "Group '{}' backend '{}' has no active control handler",
+                                    group_name, backend,
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            port = %port,
+                            group = %group_name,
+                            error = %e,
+                            "TCP group '{}' accept error on port {}: {}",
+                            group_name, port, e,
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Register a proxy as a member of an existing TCP group.
+/// This function is used when a TCP proxy joins a group that already
+/// has a shared listener. It registers the proxy with ProxyManager
+/// (so select_group_backend can route connections to it) but does NOT
+/// create a new listener — the shared group listener handles dispatch.
+///
+/// Returns early (via `return` from `handle_new_proxy`) after registration,
+/// skipping the normal listener creation path.
+#[allow(clippy::too_many_arguments)]
+async fn handle_tcp_group_member_registration(
+    state: &Arc<AppState>,
+    run_id: &str,
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    np: msg::NewProxy,
+    _remote_port: u16,
+    _internal_tx: &mpsc::Sender<InternalMsg>,
+    _listener_handles: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    _udp_sockets: &mut std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
+    _udp_local_to_proxy: &mut std::collections::HashMap<String, String>,
+    v2: bool,
+    allocated_port: Option<u16>,
+    _tcp_group_created: bool,
+) {
+    let port = match allocated_port {
+        Some(p) => p,
+        None => {
+            reject_new_proxy(
+                writer,
+                &np.proxy_name,
+                "no available port (TCP group)".into(),
+                v2,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let virtual_net = np.virtual_net.clone().filter(|v| !v.is_empty());
+    let info = ProxyInfo {
+        name: np.proxy_name.clone(),
+        proxy_type: np.proxy_type.clone(),
+        run_id: run_id.to_string(),
+        remote_port: Some(port),
+        sk: np.sk.clone(),
+        group: np.group.clone(),
+        group_key: np.group_key.clone(),
+        local_addr: np.local_str.clone(),
+        use_encryption: np.use_encryption.unwrap_or(false),
+        use_compression: np.use_compression.unwrap_or(false),
+        virtual_net: virtual_net.clone(),
+        allow_users: np.allow_users.clone().unwrap_or_default(),
+        proxy_protocol_version: np.proxy_protocol_version.clone().unwrap_or_default(),
+        response_headers: np.response_headers.clone().unwrap_or_default(),
+        custom_domains: np.custom_domains.clone().unwrap_or_default(),
+        route_by_http_user: np.route_by_http_user.clone().unwrap_or_default(),
+        multiplexer: np.multiplexer.clone().unwrap_or_default(),
+        bandwidth_limit: np.bandwidth_limit.clone().unwrap_or_default(),
+        bandwidth_limit_mode: np.bandwidth_limit_mode.clone().unwrap_or_default(),
+        user: state
+            .run_id_to_ctl_tx
+            .read()
+            .await
+            .get(run_id)
+            .map(|c| c.user.clone())
+            .unwrap_or_default(),
+    };
+
+    if let Err(e) = state
+        .proxy_manager
+        .register(run_id.to_string(), info.clone())
+        .await
+    {
+        state.used_ports.write().await.remove(&port);
+        reject_new_proxy(
+            writer,
+            &np.proxy_name,
+            err_msg(
+                state.detailed_errors_to_client,
+                e,
+                "proxy registration conflict (TCP group)",
+            ),
+            v2,
+        )
+        .await;
+        return;
+    }
+
+    // Emit dashboard event
+    #[cfg(feature = "dashboard")]
+    {
+        let _ = state.event_tx.send(crate::event::ServerEvent::ProxyUp {
+            proxy_name: np.proxy_name.clone(),
+            proxy_type: np.proxy_type.clone(),
+            run_id: run_id.to_string(),
+            remote_port: Some(port),
+        });
+    }
+
+    info!(
+        proxy_name = %np.proxy_name,
+        port = %port,
+        group = ?np.group,
+        "TCP proxy '{}' joined group '{}' on port {} (shared listener)",
+        np.proxy_name,
+        np.group.as_deref().unwrap_or(""),
+        port,
+    );
+
+    let remote_addr_str = format!(":{}", port);
+    let resp = FrpMessage::NewProxyResp(msg::NewProxyResp {
+        proxy_name: np.proxy_name.clone(),
+        remote_addr: Some(remote_addr_str),
+        error: None,
+    });
+    write_resp(writer, &resp, v2).await;
 }

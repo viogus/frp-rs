@@ -1,6 +1,6 @@
 //! Minimal STUN (RFC 5389) client for NAT traversal.
-//! Only implements Binding Request/Response and XOR-MAPPED-ADDRESS parsing.
-//! Go frp v0.69.1 compat: pkg/util/stun/stun.go
+//! Implements Binding Request/Response, XOR-MAPPED-ADDRESS, and OTHER-ADDRESS parsing.
+//! Go frp v0.70 dev compat: pkg/util/stun/stun.go, pkg/nathole/discovery.go
 
 use rand::Rng;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -13,6 +13,22 @@ const MAGIC_COOKIE: u32 = 0x2112A442;
 /// STUN attribute types.
 const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+/// OTHER-ADDRESS / CHANGED-ADDRESS (RFC 5780).
+/// Go frp uses this to get a second STUN server address for
+/// dual-server NAT probing (discovery.go:114).
+const ATTR_OTHER_ADDRESS: u16 = 0x802c;
+
+/// Result of a STUN Binding Response, including the mapped address
+/// and optionally an OTHER-ADDRESS for dual-server NAT probing.
+pub struct StunResult {
+    /// The primary mapped (external) address from XOR-MAPPED-ADDRESS
+    /// or MAPPED-ADDRESS attribute.
+    pub mapped_addr: String,
+    /// The OTHER-ADDRESS attribute (RFC 5780), if present.
+    /// Go frp uses this to send a second STUN request to a
+    /// different server IP for better NAT classification.
+    pub other_addr: Option<String>,
+}
 
 /// Resolve `addr_str` ("host:port" or "ip:port") to a `SocketAddr`, performing
 /// DNS lookup if needed.
@@ -149,6 +165,42 @@ pub async fn stun_binding_with_socket(stun_addr: &str) -> Result<(UdpSocket, Str
     Ok((socket, mapped))
 }
 
+/// Like `stun_binding_with_socket`, but also returns the OTHER-ADDRESS attribute
+/// if present (RFC 5780). Go frp uses this for dual-server NAT probing
+/// (discovery.go:114-116): the first STUN response's other-address is used
+/// as the target for a second STUN request.
+pub async fn stun_binding_with_details(stun_addr: &str) -> Result<(UdpSocket, StunResult), String> {
+    let addr_str = stun_addr.strip_prefix("stun:").unwrap_or(stun_addr);
+    let addr = resolve_stun_addr(addr_str).await?;
+    let socket = bind_matching_family(addr).await?;
+
+    let mut tx_id = [0u8; 12];
+    rand::thread_rng().fill(&mut tx_id);
+    let request = build_binding_request(&tx_id);
+
+    socket
+        .send_to(&request, addr)
+        .await
+        .map_err(|e| format!("STUN send: {e}"))?;
+    debug!(addr = %addr, "STUN Binding Request sent to {}", addr);
+
+    let mut buf = [0u8; 256];
+    let (n, _src) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        socket.recv_from(&mut buf),
+    )
+    .await
+    .map_err(|_| "STUN response timeout".to_string())?
+    .map_err(|e| format!("STUN recv: {e}"))?;
+
+    if n < 20 {
+        return Err("STUN response too short".into());
+    }
+
+    let result = parse_binding_response_full(&buf[..n], &tx_id)?;
+    Ok((socket, result))
+}
+
 fn build_binding_request(tx_id: &[u8; 12]) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(20);
     pkt.extend_from_slice(&0x0001u16.to_be_bytes());
@@ -207,6 +259,74 @@ pub fn parse_binding_response(data: &[u8], expected_tx_id: &[u8; 12]) -> Result<
     }
 
     mapped.ok_or_else(|| "STUN response missing MAPPED-ADDRESS".into())
+}
+
+/// Parse a STUN Binding Response and return both mapped and other addresses.
+/// This is used for dual-server NAT probing (Go frp discovery.go:114).
+pub fn parse_binding_response_full(
+    data: &[u8],
+    expected_tx_id: &[u8; 12],
+) -> Result<StunResult, String> {
+    let msg_type = u16::from_be_bytes([data[0], data[1]]);
+    if msg_type != 0x0101 {
+        return Err(format!("unexpected STUN message type: 0x{msg_type:04x}"));
+    }
+
+    let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+    if data.len() < 20 + msg_len {
+        return Err("STUN message truncated".into());
+    }
+
+    let cookie = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+    if cookie != MAGIC_COOKIE {
+        return Err(format!("bad magic cookie: 0x{cookie:08x}"));
+    }
+
+    if data[8..20] != *expected_tx_id {
+        return Err("STUN transaction ID mismatch".into());
+    }
+
+    let attrs = &data[20..20 + msg_len];
+    let mut mapped: Option<String> = None;
+    let mut other: Option<String> = None;
+    let mut i = 0;
+    while i + 4 <= attrs.len() {
+        let attr_type = u16::from_be_bytes([attrs[i], attrs[i + 1]]);
+        let attr_len = u16::from_be_bytes([attrs[i + 2], attrs[i + 3]]) as usize;
+        let padding = (4 - (attr_len % 4)) % 4;
+        let attr_end = i + 4 + attr_len;
+        if attr_end > attrs.len() {
+            break;
+        }
+        let value = &attrs[i + 4..attr_end];
+
+        match attr_type {
+            ATTR_XOR_MAPPED_ADDRESS => {
+                if let Some(addr) = parse_xor_mapped_address(value, MAGIC_COOKIE) {
+                    debug!(addr = %addr, "STUN XOR-MAPPED-ADDRESS: {}", addr);
+                    mapped = Some(addr);
+                }
+            }
+            ATTR_MAPPED_ADDRESS if mapped.is_none() => {
+                mapped = parse_mapped_address(value);
+            }
+            ATTR_OTHER_ADDRESS => {
+                // OTHER-ADDRESS uses XOR-MAPPED-ADDRESS encoding (RFC 5780).
+                if let Some(addr) = parse_xor_mapped_address(value, MAGIC_COOKIE) {
+                    debug!(addr = %addr, "STUN OTHER-ADDRESS: {}", addr);
+                    other = Some(addr);
+                }
+            }
+            _ => {}
+        }
+        i = attr_end + padding;
+    }
+
+    let mapped_addr = mapped.ok_or_else(|| String::from("STUN response missing MAPPED-ADDRESS"))?;
+    Ok(StunResult {
+        mapped_addr,
+        other_addr: other,
+    })
 }
 
 fn parse_mapped_address(data: &[u8]) -> Option<String> {
@@ -370,6 +490,72 @@ mod tests {
         attr.extend_from_slice(&xored_port.to_be_bytes());
         attr.extend_from_slice(&xored_ip.to_be_bytes());
         attr
+    }
+
+    fn build_other_addr_attr(ip: &[u8; 4], port: u16) -> Vec<u8> {
+        let cookie = MAGIC_COOKIE;
+        let cookie_hi = (cookie >> 16) as u16;
+        let xored_port = port ^ cookie_hi;
+        let ip_u32 = u32::from_be_bytes(*ip);
+        let xored_ip = ip_u32 ^ cookie;
+
+        let mut attr = Vec::new();
+        attr.extend_from_slice(&ATTR_OTHER_ADDRESS.to_be_bytes());
+        attr.extend_from_slice(&8u16.to_be_bytes());
+        attr.push(0x00);
+        attr.push(0x01);
+        attr.extend_from_slice(&xored_port.to_be_bytes());
+        attr.extend_from_slice(&xored_ip.to_be_bytes());
+        attr
+    }
+
+    #[test]
+    fn test_parse_binding_response_full_with_other_addr() {
+        let tx_id = [0xBB; 12];
+        let mapped_attr = build_xor_mapped_attr(&[10, 20, 30, 40], 12345);
+        let other_attr = build_other_addr_attr(&[192, 168, 1, 1], 3478);
+        let mut combined = mapped_attr;
+        combined.extend_from_slice(&other_attr);
+        let pkt = build_binding_response(&tx_id, &combined);
+
+        let result = parse_binding_response_full(&pkt, &tx_id).unwrap();
+        assert_eq!(result.mapped_addr, "10.20.30.40:12345");
+        assert_eq!(result.other_addr, Some("192.168.1.1:3478".to_string()));
+    }
+
+    #[test]
+    fn test_parse_binding_response_full_no_other_addr() {
+        let tx_id = [0xCC; 12];
+        let attr = build_xor_mapped_attr(&[10, 20, 30, 40], 12345);
+        let pkt = build_binding_response(&tx_id, &attr);
+
+        let result = parse_binding_response_full(&pkt, &tx_id).unwrap();
+        assert_eq!(result.mapped_addr, "10.20.30.40:12345");
+        assert_eq!(result.other_addr, None);
+    }
+
+    #[test]
+    fn test_parse_binding_response_full_other_addr_mapped_fallback() {
+        // OTHER-ADDRESS present, but no XOR-MAPPED-ADDRESS → fall back to MAPPED-ADDRESS
+        let tx_id = [0xDD; 12];
+        let mapped_attr = {
+            let mut attr = Vec::new();
+            attr.extend_from_slice(&ATTR_MAPPED_ADDRESS.to_be_bytes());
+            attr.extend_from_slice(&8u16.to_be_bytes());
+            attr.push(0x00);
+            attr.push(0x01);
+            attr.extend_from_slice(&8080u16.to_be_bytes());
+            attr.extend_from_slice(&[10, 0, 0, 1]);
+            attr
+        };
+        let other_attr = build_other_addr_attr(&[192, 168, 1, 1], 3478);
+        let mut combined = mapped_attr;
+        combined.extend_from_slice(&other_attr);
+        let pkt = build_binding_response(&tx_id, &combined);
+
+        let result = parse_binding_response_full(&pkt, &tx_id).unwrap();
+        assert_eq!(result.mapped_addr, "10.0.0.1:8080");
+        assert_eq!(result.other_addr, Some("192.168.1.1:3478".to_string()));
     }
 
     #[test]

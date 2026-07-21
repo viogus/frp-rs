@@ -1105,7 +1105,13 @@ impl SshListener {
                     timestamp: Some(now_ts),
                     privilege_key: Some(privilege_key),
                     metas: None,
-                    client_spec: None,
+                    // AlwaysAuthPass: internal SSH gateway connections bypass
+                    // token authentication (matching Go frp dev behavior where
+                    // sshTunnelGateway → HandleListener(internal=true)).
+                    client_spec: Some(frp_core::msg::ClientSpec {
+                        client_type: None,
+                        always_auth_pass: Some(true),
+                    }),
                     multiplexer: None,
                 };
 
@@ -1131,6 +1137,7 @@ impl SshListener {
                         None,  // no incoming streams (not mux)
                         false, // V1 protocol
                         None,  // no crypto context (V1)
+                        true,  // internal: SSH gateway connection
                     )
                     .await;
                 });

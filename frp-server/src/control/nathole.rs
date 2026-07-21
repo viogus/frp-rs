@@ -639,8 +639,10 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
         // Classify NAT features
         use crate::nathole::classify;
         use crate::nathole::controller as nathole_ctrl;
-        let v_feature = classify::classify_nat_feature(&visitor_mapped, &[]).ok();
-        let c_feature = classify::classify_nat_feature(&client_mapped, &[]).ok();
+        let visitor_local_ips = classify::parse_ips(&visitor_assisted);
+        let client_local_ips = classify::parse_ips(&client_assisted);
+        let v_feature = classify::classify_nat_feature(&visitor_mapped, &visitor_local_ips).ok();
+        let c_feature = classify::classify_nat_feature(&client_mapped, &client_local_ips).ok();
 
         // Run analysis and build responses
         let analysis_index;

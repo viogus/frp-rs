@@ -1,0 +1,114 @@
+{
+  "subsystem": "auth-encryption-config",
+  "go_commit": "d486018",
+  "findings": [
+    {
+      "severity": "CRITICAL",
+      "title": "Rust token auth enforces timestamp freshness by default (15s window); Go frp dev does not",
+      "go_ref": "/tmp/frp-src/pkg/auth/token.go — VerifyLogin only checks MD5(token+timestamp) equality with ConstantTimeEqString; NO timestamp freshness check exists anywhere in Go frp dev",
+      "rust_file": "frp-server/src/control/login.rs",
+      "rust_line": 139,
+      "description": "Rust login.rs validates timestamp freshness via token_auth_timeout + authentication_timeout (default: 15s) after token hash verification (lines 139-196). Go frp dev at d486018 has NO authentication_timeout field in any config struct — I searched the entire codebase with no matches. Go only does MD5(token+timestamp) comparison. Any Go frpc with clock skew >15s relative to the Rust frps will have its login rejected. This is a Rust-only extension that breaks interop with Go frpc by default.",
+      "fix_suggestion": "Set ServerConfig.auth.authentication_timeout = 0 and/or auth.token_auth_timeout = false to match Go behavior (no timestamp freshness check). Alternatively, document that Rust frps enforces a 15s clock skew tolerance by default and recommend NTP synchronization."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Rust heartbeat_interval defaults unconditionally to 30; Go conditionally sets to -1 when tcp_mux is enabled",
+      "go_ref": "/tmp/frp-src/pkg/config/v1/client.go ClientTransportConfig.Complete() line 156-159: when TCPMux=true, HeartbeatInterval defaults to -1 (disabled)",
+      "rust_file": "frp-core/src/config.rs",
+      "rust_line": 895,
+      "description": "Go ClientTransportConfig.Complete() conditionally sets HeartbeatInterval=-1 when TCPMux is enabled (relying on tcpmux keepalive instead), and HeartbeatInterval=30 only when TCPMux is disabled. Rust ClientConfig defaults heartbeat_interval unconditionally to 30 regardless of tcp_mux setting. This means Rust clients send application-layer heartbeats every 30s even when tcp_mux is active, while Go clients do not. The Rust server control loop also sends Pings every 10s unconditionally (login.rs line 442). This is a behavioral divergence — both sides work, but Rust generates unnecessary extra heartbeat traffic when tcp_mux is enabled.",
+      "fix_suggestion": "Apply the same conditional default logic as Go: if tcp_mux is true, set heartbeat_interval to -1 (disabled) as the default. This can be done in a ClientConfig::complete() method called after deserialization."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Rust nat_hole_stun_server defaults to empty string; Go defaults to 'stun.easyvoip.com:3478'",
+      "go_ref": "/tmp/frp-src/pkg/config/v1/client.go ClientCommonConfig.Complete() line 89: NatHoleSTUNServer defaults to 'stun.easyvoip.com:3478'",
+      "rust_file": "frp-core/src/config.rs",
+      "rust_line": 805,
+      "description": "Go frp dev defaults NatHoleSTUNServer to 'stun.easyvoip.com:3478'. Rust ClientConfig defaults nat_hole_stun_server to empty string (serde default for String). When empty, STUN-based NAT hole punching will not work unless the user explicitly configures a STUN server. This breaks NAT traversal for XTCP proxies requiring STUN-based address discovery.",
+      "fix_suggestion": "Change the default of nat_hole_stun_server to 'stun.easyvoip.com:3478' to match Go frp behavior, or apply the default in a post-deserialization Complete() step."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Rust tcp_mux default depends on compile-time feature flag; Go unconditionally defaults to true",
+      "go_ref": "/tmp/frp-src/pkg/config/v1/client.go ClientTransportConfig.Complete() line 153: TCPMux = util.EmptyOr(c.TCPMux, lo.ToPtr(true))",
+      "rust_file": "frp-core/src/config.rs",
+      "rust_line": 919,
+      "description": "Rust default_tcp_mux() returns cfg!(feature = 'tcp-mux') — true only when the tcp-mux crate feature is compiled in. Go unconditionally defaults TCPMux to true. If the Rust binary is compiled without the tcp-mux feature (unusual but possible), multiplexing is off by default, which would cause connection failures with Go clients expecting tcp_mux by default.",
+      "fix_suggestion": "Change default_tcp_mux() to unconditionally return true, matching Go behavior. The feature flag can still gate the implementation at compile time, but the default should be true regardless."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Rust proxy_bind_addr defaults to empty string; Go inherits from bind_addr",
+      "go_ref": "/tmp/frp-src/pkg/config/v1/server.go ServerConfig.Complete() lines 112-113: if ProxyBindAddr == '', set to BindAddr",
+      "rust_file": "frp-core/src/config.rs",
+      "rust_line": 15,
+      "description": "Go ServerConfig.Complete() sets ProxyBindAddr = BindAddr when ProxyBindAddr is empty. Rust's proxy_bind_addr defaults to '' with no fallback logic. If the application code doesn't handle this fallback, proxy listeners may bind to an incorrect address (potentially 0.0.0.0 instead of inheriting from bind_addr, or what Go would do).",
+      "fix_suggestion": "Add a ServerConfig::complete() method or application-level initialization that defaults proxy_bind_addr to bind_addr when empty, matching Go behavior."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rust authentication_timeout default (15) differs from comment claim (300) and Go has no such field",
+      "go_ref": "/tmp/frp-src/pkg/config/v1/server.go — AuthServerConfig has NO authentication_timeout field. Go frp dev has no AuthenticationTimeout anywhere in any config struct.",
+      "rust_file": "frp-core/src/config.rs",
+      "rust_line": 424,
+      "description": "Rust AuthServerConfig defaults authentication_timeout to 15 (line 428 via default_authentication_timeout()). AuthConfig::Default() uses 300 (auth.rs line 152). The auth.rs comment (line 97) claims 'Go frp v0.70.0 default: 900'. But Go frp dev at d486018 has NO authentication_timeout field at all — neither in AuthServerConfig nor AuthClientConfig nor any other config struct. The 900 reference appears to be from old Go legacy config which was removed. This creates confusion about the correct default. The effective default on the server path is 15 (from config), not 300 (from AuthConfig::Default).",
+      "fix_suggestion": "Remove authentication_timeout entirely from the config structs (matching Go dev which has no such field), or if kept for Rust-only extension, document clearly that Go frp dev does not have this field and set the default comment accurately."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rust server has allow_port_start (10000) / allow_port_end (50000) and max_ports_per_client (50) defaults not in Go",
+      "go_ref": "/tmp/frp-src/pkg/config/v1/server.go — ServerConfig has AllowPorts []PortsRange but no allow_port_start/allow_port_end or max_ports_per_client defaults",
+      "rust_file": "frp-core/src/config.rs",
+      "rust_line": 60,
+      "description": "Rust ServerConfig has allow_port_start (default 10000), allow_port_end (default 50000), and max_ports_per_client (default 50). Go frp dev has AllowPorts []PortsRange (a list of port range structs, not start/end integers) and MaxPortsPerClient int64 (default 0 = unlimited). These are Rust-specific extensions. The allow_port_start/end at defaults 10000-50000 mean Rust frps rejects proxy ports outside 10000-50000 by default, which would silently break user setups that worked with Go frps (no such restriction).",
+      "fix_suggestion": "Set allow_port_start/end defaults to match Go (0 or unset = no restriction), or document these as Rust extensions. Consider setting max_ports_per_client to 0 (unlimited) by default to match Go behavior."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rust LoginResp has server_additional_auth_scopes field not present in Go LoginResp",
+      "go_ref": "/tmp/frp-src/pkg/msg/msg.go — LoginResp struct has only Version, RunID, Error",
+      "rust_file": "frp-core/src/msg.rs",
+      "rust_line": 142,
+      "description": "Rust LoginResp has an extra field server_additional_auth_scopes (Option<Vec<String>>) that Go frp's LoginResp does not have. When serialized as JSON, this field will appear in the LoginResp payload sent to the client. While Go JSON decoders ignore unknown fields, this is a protocol deviation. Go LoginResp fields are plain strings (not Option), so they serialize as '' when empty, while Rust uses Option which omits the field entirely when None.",
+      "fix_suggestion": "Either remove the field to match Go, or tag it with skip_serializing_if = 'Option::is_none' (already done) and document it as a Rust extension. Ensure Go clients can safely ignore this extra field."
+    },
+    {
+      "severity": "COSMETIC",
+      "title": "Rust Login message has multiplexer field not in Go Login",
+      "go_ref": "/tmp/frp-src/pkg/msg/msg.go — Login struct has no multiplexer field",
+      "rust_file": "frp-core/src/msg.rs",
+      "rust_line": 128,
+      "description": "Rust msg::Login has multiplexer: Option<String> which is not present in Go frp's Login struct. This is a Rust extension for TCPMux proxy type detection. Go clients will never set this field, so it will always be None when talking to Go frpc. This does not break interop but is a protocol extension divergence.",
+      "fix_suggestion": "Document this as a Rust extension field. No code change needed."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rust tcp_mux feature flag inconsistency between client and server defaults",
+      "go_ref": "/tmp/frp-src/pkg/config/v1/server.go ServerTransportConfig.Complete() and client.go ClientTransportConfig.Complete() — both unconditionally default TCPMux to true",
+      "rust_file": "frp-core/src/config.rs",
+      "rust_line": 919,
+      "description": "Both Rust ClientConfig and ServerConfig/ServerTransportConfig use default_tcp_mux() = cfg!(feature = 'tcp-mux'). This means the tcp_mux default depends on compile-time feature selection, not the configuration. If server and client are compiled with different feature flags, they would have different defaults for tcp_mux — Go behavior is always true on both sides.",
+      "fix_suggestion": "Change to unconditional true default, or ensure the tcp-mux feature is always enabled in Cargo.toml and document this dependency."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rust V2 handshake preferred_aead_algorithms does not match Go conditional hardware detection",
+      "go_ref": "/tmp/frp-src/pkg/proto/wire/crypto.go PreferredAEADAlgorithms() — orders AES-256-GCM first only on x86_64/arm64/s390x with AES-NI; XChaCha20-Poly1305 first otherwise",
+      "rust_file": "frp-core/src/v2_handshake.rs",
+      "rust_line": 181,
+      "description": "Go frp dev's PreferredAEADAlgorithms() checks CPU capabilities (AES-NI, PCLMULQDQ, etc.) to determine whether to prefer AES-256-GCM or XChaCha20-Poly1305 first. Rust's preferred_aead_algorithms() unconditionally returns [AES-256-GCM, XChaCha20-Poly1305] (or just [AES-256-GCM] if chacha20 feature is disabled). This means Rust always advertises AES-256-GCM as preferred, even on hardware without AES acceleration, where Go would prefer XChaCha20-Poly1305 on the same hardware. The final algorithm selection is done by the server, so this only affects the client's offer order — the server picks, so in practice the server on similar hardware will select the same algorithm. But a Rust frps running on ARM without crypto extensions would still select AES-256-GCM, while Go would prefer XChaCha20-Poly1305.",
+      "fix_suggestion": "Update preferred_aead_algorithms() to check for AES-NI/PCLMULQDQ (x86), AES/PMULL (ARM64) and prefer XChaCha20-Poly1305 when hardware acceleration is unavailable, matching Go's behavior."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rust V2 HKDF AEAD key derivation uses token as IKM (raw bytes); Go does the same",
+      "go_ref": "/tmp/frp-src/pkg/util/net/conn.go deriveAEADControlKey — hkdf.New(sha256.New, key, transcriptHash, info)",
+      "rust_file": "frp-core/src/crypto.rs",
+      "rust_line": 730,
+      "description": "Both Go and Rust use the token bytes directly as IKM (input key material) for HKDF-SHA256, with transcript_hash as salt. This is correct and matches. However, Rust uses the token string's raw UTF-8 bytes (token.as_bytes()) while Go passes the []byte slice from the auth key. Both are effectively the same since the token is ASCII/UTF-8 in both implementations.",
+      "fix_suggestion": "No change needed — implementations are functionally identical."
+    }
+  ]
+}

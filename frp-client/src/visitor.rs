@@ -191,23 +191,35 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             }
 
                             // --- STUN Discovery (UDP socket for XTCP P2P) ---
-                            // Go frps v0.69.1 NAT classifier needs ≥2 mapped
+                            // Go frp v0.70 NAT classifier needs ≥2 mapped
                             // addresses. Reuse the same UDP socket for both
                             // STUN calls and subsequent KCP data plane.
-                            let (stun_socket, mapped_addrs) =
-                                match frp_core::stun::stun_binding_with_socket(&stun_server).await {
-                                    Ok((sock, addr1)) => {
+                            //
+                            // First STUN: get mapped address + optional OTHER-ADDRESS
+                            // (RFC 5780). If OTHER-ADDRESS is present, use it for the
+                            // second STUN request (Go frp discovery.go:137-138 dual-server
+                            // NAT probing). Otherwise fall back to the same stun_server.
+                            let (stun_socket, mapped_addrs, assisted_addrs) =
+                                match frp_core::stun::stun_binding_with_details(&stun_server).await
+                                {
+                                    Ok((sock, result1)) => {
+                                        let addr1 = result1.mapped_addr;
                                         debug!(visitor_name = %visitor_name, addr = %addr1, "Visitor '{}': STUN #1: {}", visitor_name, addr1);
                                         let mut addrs = vec![addr1];
+
+                                        // Use OTHER-ADDRESS as second STUN target if available
+                                        // (Go frp discovery.go:137 dual-server probing).
+                                        let second_target =
+                                            result1.other_addr.as_deref().unwrap_or(&stun_server);
                                         match frp_core::stun::stun_binding_on_socket(
                                             &sock,
-                                            &stun_server,
+                                            second_target,
                                         )
                                         .await
                                         {
                                             Ok(addr2) => {
-                                                debug!(visitor_name = %visitor_name, addr = %addr2, "Visitor '{}': STUN #2: {}", visitor_name, addr2);
-                                                // Go frps NAT classifier needs ≥2 addresses.
+                                                debug!(visitor_name = %visitor_name, addr = %addr2, "Visitor '{}': STUN #2 from '{}': {}", visitor_name, second_target, addr2);
+                                                // Go frp NAT classifier needs ≥2 addresses.
                                                 // Always push — Go frp doesn't dedup, and
                                                 // fewer than 2 causes "not enough addresses".
                                                 addrs.push(addr2);
@@ -216,11 +228,33 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                                 warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STUN #2 failed: {}", visitor_name, e);
                                             }
                                         }
-                                        (Some(sock), addrs)
+
+                                        // Build assisted addresses from local IPs + STUN socket port
+                                        // (Go frp nathole.go:143-150 ListLocalIPsForNatHole).
+                                        let assisted = if daa {
+                                            vec![]
+                                        } else {
+                                            let stun_port = sock
+                                                .local_addr()
+                                                .ok()
+                                                .map(|a| a.port())
+                                                .unwrap_or(0);
+                                            let local_ips = list_local_ips();
+                                            debug!(
+                                                visitor_name = %visitor_name, local_ips = ?local_ips, port = %stun_port,
+                                                "Visitor '{}': building assisted_addrs from {} local IPs port {}",
+                                                visitor_name, local_ips.len(), stun_port
+                                            );
+                                            local_ips
+                                                .into_iter()
+                                                .map(|ip| format!("{}:{}", ip, stun_port))
+                                                .collect()
+                                        };
+                                        (Some(sock), addrs, assisted)
                                     }
                                     Err(e) => {
                                         warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STUN failed: {}", visitor_name, e);
-                                        (None, vec![])
+                                        (None, vec![], vec![])
                                     }
                                 };
 
@@ -251,10 +285,10 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     } else {
                                         Some(mapped_addrs.clone())
                                     },
-                                    assisted_addrs: if daa || mapped_addrs.is_empty() {
+                                    assisted_addrs: if assisted_addrs.is_empty() {
                                         None
                                     } else {
-                                        Some(mapped_addrs)
+                                        Some(assisted_addrs)
                                     },
                                 },
                                 reply: reply_tx,
@@ -545,4 +579,80 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
             }
         }
     }
+}
+
+/// Discover local non-loopback IPv4 addresses for assisted NAT hole punching.
+/// Go frp equivalent: ListLocalIPsForNatHole(10) in pkg/nathole/utils.go:65-93.
+/// Filters out IPv6, loopback, link-local unicast, and link-local multicast addresses.
+///
+/// On Linux, reads /proc/net/fib_trie to enumerate local IPs without requiring
+/// external crate dependencies. Falls back to a simpler method if unavailable.
+fn list_local_ips() -> Vec<String> {
+    let mut ips = Vec::new();
+
+    // Linux-specific: parse /proc/net/fib_trie for local IPv4 addresses.
+    // On non-Linux platforms (macOS, Windows), this path is skipped and we
+    // fall through to the UDP connect fallback below, which only discovers
+    // the default-route IP. For full multi-homed NAT hole punching on macOS,
+    // a getifaddrs-based approach would be needed.
+    //
+    // Lines like "|-- 192.168.1.100" followed by "/32 host LOCAL" indicate
+    // local interface IPs assigned to this machine.
+    if let Ok(content) = std::fs::read_to_string("/proc/net/fib_trie") {
+        let lines: Vec<&str> = content.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            // Look for a line containing a dotted IPv4 address
+            if trimmed.starts_with("|--") || trimmed.starts_with("+--") {
+                if let Some(ip_str) = trimmed
+                    .split_whitespace()
+                    .find(|s| s.contains('.') && s.parse::<std::net::Ipv4Addr>().is_ok())
+                {
+                    // Check next non-empty line for /32 host LOCAL marker
+                    let is_local = lines
+                        .get(i + 1)
+                        .or(lines.get(i.wrapping_add(2)))
+                        .map(|n| {
+                            let n = n.trim();
+                            n.contains("/32 host LOCAL") || n.contains("LOCAL")
+                        })
+                        .unwrap_or(false);
+                    if is_local {
+                        if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+                            if !ip.is_loopback() && !ip.is_link_local() && !ip.is_multicast() {
+                                ips.push(ip.to_string());
+                                if ips.len() >= 10 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: try to get the default route interface IP.
+    if ips.is_empty() {
+        if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            // Connect to 8.8.8.8:53 — no data sent, just triggers the kernel
+            // to select the default route interface for us.
+            if socket.connect("8.8.8.8:53").is_ok() {
+                if let Ok(local_addr) = socket.local_addr() {
+                    let ip = local_addr.ip();
+                    if ip.is_ipv4() {
+                        let ipv4 = match ip {
+                            std::net::IpAddr::V4(v4) => v4,
+                            _ => unreachable!(),
+                        };
+                        if !ipv4.is_loopback() && !ipv4.is_link_local() && !ipv4.is_multicast() {
+                            ips.push(ipv4.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ips
 }

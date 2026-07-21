@@ -4,6 +4,42 @@ All notable changes to frp-rs.
 
 ## v0.7.0 (2026-07-21)
 
+### Go frp dev HEAD Full Audit (d486018)
+
+Full-source audit of Go frp dev branch against frp-rs, fixing 18 findings (7 CRITICAL, 11 MEDIUM).
+
+**Server control plane (3 critical):**
+- Two-phase login: Admit → Handoff Wait → Activate/LoginResp matching Go frp dev's ControlManager lifecycle
+- ClientRegistry with `control_id`-aware `register_with_control_id()` and `mark_offline_by_run_id_and_control_id()` — prevents stale handler mutations
+- Generation-aware control replacement: per-runID handoff barrier ensures old handler is fully shut down before new one activates
+
+**XTCP/NAT hole punch (3 critical):**
+- PublicNetwork detection: pass assisted_addrs as local_ips to classify_nat_feature (was always false with empty slice)
+- STUN OTHER-ADDRESS (0x802c) attribute parsing for dual-server NAT probing matching Go discovery.go
+- Visitor assisted_addrs: build local-IP-based addresses (ListLocalIPsForNatHole) instead of sending STUN mapped addresses
+
+**Auth/Config (1 critical, 4 medium):**
+- Token auth: no timestamp freshness check by default (matching Go's MD5-only VerifyLogin)
+- heartbeat_interval = -1 when tcp_mux enabled (yamux provides keepalive)
+- nat_hole_stun_server defaults to "stun.easyvoip.com:3478"
+- tcp_mux unconditionally defaults to true (not feature-gated)
+- proxy_bind_addr inherits from bind_addr when empty
+
+**Client (2 medium):**
+- Heartbeat timeout detection: track last_pong, trigger reconnect on timeout
+- Proxy phase state machine foundation: New → WaitStart → StartErr → Running → CheckFailed → Closed enum with phase field (currently transitions New/Running/StartErr; WaitStart/CheckFailed/Closed reserved for future retry worker)
+
+**Server misc (5 medium):**
+- TCP group shared listener per group with round-robin dispatch
+- HTTP group health-check-aware backend selection (skip unhealthy, 30s recovery)
+- Bandwidth limit mode: server-side limiters only for `mode == "server"` (matching Go)
+- AlwaysAuthPass for internal SSH gateway connections
+- ServerAdditionalAuthScopes defaults to empty (Go compat)
+
+**Docs:**
+- Clarify KCP XOR encryption is not needed for Go compat (Go passes nil blockCrypt)
+- Clarify group health checks are not a Go compat gap (Go only accepts "", "tcp", "http")
+
 ### Security
 
 - Constant-time comparison for HTTP Basic Auth and proxy credentials

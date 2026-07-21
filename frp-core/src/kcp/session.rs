@@ -7,8 +7,11 @@
 //! FEC is inter-packet: dataShards consecutive KCP output packets form one
 //! RS group; parity shards are generated from the equal-length RS blocks.
 //!
-//! XOR encryption (`kcp_compat::XorBlock`) is NOT yet wired — `KcpConfig`
-//! lacks a `crypt` field. When added, apply per-packet in `update()`/`input()`.
+//! XOR encryption (`kcp_compat::XorBlock`) is NOT needed for Go frp compat —
+//! Go frp (`pkg/util/net/kcp.go`) passes `nil` for the blockCrypt parameter in
+//! both `kcp.ListenWithOptions()` and `kcp.NewConn3()`, meaning NO KCP-level
+//! encryption is used. The `kcp_compat::XorBlock` code is unused unless frp-rs
+//! adds a proprietary KCP encryption extension.
 
 use std::collections::HashMap;
 use std::io::{self, Write};

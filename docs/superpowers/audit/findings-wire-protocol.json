@@ -1,0 +1,105 @@
+{
+  "subsystem": "wire-protocol",
+  "go_commit": "d486018",
+  "findings": [
+    {
+      "severity": "MEDIUM",
+      "title": "Rust-only V1 type bytes 0x37 ('7') and 0x38 ('8') not recognized by Go",
+      "go_ref": "pkg/msg/msg.go:22-41",
+      "rust_file": "frp-core/src/msg.rs",
+      "rust_line": 27,
+      "description": "Rust defines TYPE_CLOSE_PROXY_RESP (0x37 = '7') and TYPE_ERROR (0x38 = '8') as V1 type byte constants. Go frp dev only registers types through type byte '6'. If Rust ever sends either message to a Go peer over V1, Go will return 'unknown type byte' and close the connection. Currently these are not sent to Go peers (confirmed by code audit), but the type bytes occupy the ASCII '7' and '8' slots which Go could assign in the future, creating a conflict.",
+      "fix_suggestion": "Keep the internal-only guard (comments at protocol.rs line 12-14 are clear). Consider adding a runtime assertion in write_msg_v1 that panics if the target is a Go-compatible peer and the message is CloseProxyResp or Error. Add a crate-level compile-time check that these type bytes do not collide with any future Go dev additions."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Rust-only V2 type IDs 19 and 20 not recognized by Go",
+      "go_ref": "pkg/msg/wire_v2.go:28-46",
+      "rust_file": "frp-core/src/msg.rs",
+      "rust_line": 60,
+      "description": "Rust assigns V2_TYPE_CLOSE_PROXY_RESP = 19 and V2_TYPE_ERROR = 20 as V2 type IDs. Go frp dev only registers V2 type IDs 1-18. If Rust sends either message over V2 to a Go peer, Go will reject with 'unknown v2 message type'. These IDs are just below the V2 VNet range (42-44) so future Go assignments should be safe, but Rust needs to ensure these are never dispatched to Go peers.",
+      "fix_suggestion": "Same as V1 fix: add runtime guards in write_msg_v2. Document that IDs 19-20 are reserved for Rust extension and should not be used by Go."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rust Login message has extra field 'multiplexer' not present in Go Login",
+      "go_ref": "pkg/msg/msg.go:76-93",
+      "rust_file": "frp-core/src/msg.rs",
+      "rust_line": 128,
+      "description": "Rust Login struct contains a 'multiplexer: Option<String>' field that does not exist in Go's Login struct. Go's JSON decoder silently ignores unknown fields, so this does not cause deserialization errors. However, the field pollutes the wire with data Go does not use. 'multiplexer' IS a valid field in Go's NewProxy message (msg.go:133), so its presence in Login may indicate a copy-paste error or design intent mismatch.",
+      "fix_suggestion": "Verify that 'multiplexer' in Login is intentional. If not, remove it from the Rust Login struct. If it is intended as a forward-compatibility field, add a comment explaining why."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rust LoginResp has extra field 'serverAdditionalAuthScopes' not present in Go LoginResp",
+      "go_ref": "pkg/msg/msg.go:95-99",
+      "rust_file": "frp-core/src/msg.rs",
+      "rust_line": 142,
+      "description": "Rust LoginResp defines 'server_additional_auth_scopes: Option<Vec<String>>' with serde rename 'serverAdditionalAuthScopes'. This field does not exist in Go frp dev's LoginResp struct. Go silently ignores unknown JSON fields. The field appears to anticipate a future Go feature (scoped authentication for heartbeat and work connection messages) that does not yet exist in the Go codebase.",
+      "fix_suggestion": "Either gate this field behind a feature flag, or document that it is a forward-compatibility placeholder for a not-yet-implemented Go feature. Ensure Rust never sets a non-None value when talking to a Go peer."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rust NewProxy has extra fields not present in Go NewProxy",
+      "go_ref": "pkg/msg/msg.go:102-134",
+      "rust_file": "frp-core/src/msg.rs",
+      "rust_line": 164,
+      "description": "Rust NewProxy struct contains 7 fields not present in Go frp dev's NewProxy: 'local_str', 'virtual_net', 'proxy_protocol_version', 'advertise_subnet', 'vnet_ip', 'vnet_netmask', 'vnet_mtu'. 'proxy_protocol_version' exists as a transport config concept in Go but is not a wire field in the NewProxy message. 'virtual_net' is a Go plugin type but not a NewProxy wire field. The remaining VNet fields ('vnet_ip', 'vnet_netmask', 'vnet_mtu', 'advertise_subnet') have no Go equivalents at all. Go silently ignores unknown fields.",
+      "fix_suggestion": "Gate VNet-specific fields behind the 'vnet' feature flag like the VnetRouteAdvertise/VnetPacket/VnetRouteRemove message types. Remove 'local_str' if it is dead code. Consider whether 'proxy_protocol_version' should be removed or promoted to an actual Go-compatible field."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rust StartWorkConn has extra fields not present in Go StartWorkConn",
+      "go_ref": "pkg/msg/msg.go:154-161",
+      "rust_file": "frp-core/src/msg.rs",
+      "rust_line": 292,
+      "description": "Rust StartWorkConn has 5 fields not in Go's StartWorkConn: 'use_encryption: Option<bool>', 'use_compression: Option<bool>', 'nat_hole_sid: Option<String>', 'nat_hole_visitor_addr: Option<String>', 'sk: Option<String>'. Go's StartWorkConn only has: proxy_name, src_addr, dst_addr, src_port, dst_port, error. Go silently ignores extra JSON fields. These fields exist in Go's NewProxy and NewVisitorConn but not in StartWorkConn.",
+      "fix_suggestion": "Verify these extra fields are needed for Rust-internal communication purposes. If they are intended to be sent to Go peers, they will be silently ignored. Consider whether 'use_encryption' and 'use_compression' should be removed since Go conveys this information via the proxier metadata, not via StartWorkConn."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rust NatHoleClient has extra fields not present in Go NatHoleClient",
+      "go_ref": "pkg/msg/msg.go:203-209",
+      "rust_file": "frp-core/src/msg.rs",
+      "rust_line": 466,
+      "description": "Rust NatHoleClient has 2 fields not in Go frp dev's NatHoleClient: 'protocol: Option<String>' and 'visitor_addr: Option<String>'. Go's NatHoleClient only has: transaction_id, proxy_name, sid, mapped_addrs, assisted_addrs. Go silently ignores unknown JSON fields.",
+      "fix_suggestion": "Verify these fields are needed for Rust-internal NAT hole punching. If they are meant to be forwarded to Go peers, they will be silently ignored. Document why they exist."
+    },
+    {
+      "severity": "COSMETIC",
+      "title": "Rust UdpAddr does not serialize empty Zone field; Go always includes it",
+      "go_ref": "pkg/msg/msg.go:186-190",
+      "rust_file": "frp-core/src/msg.rs",
+      "rust_line": 372,
+      "description": "Rust UdpAddr uses 'skip_serializing_if = String::is_empty' on the Zone field, so empty zones are omitted from JSON. Go's net.UDPAddr always serializes Zone even when empty (producing '\"Zone\":\"\"'). Both sides can deserialize the other's format (Go tolerates missing Zone; Rust aliases missing Zone to empty string via #[serde(default)]). This is a cosmetic wire difference with no compatibility impact.",
+      "fix_suggestion": "No change needed. Both formats are interoperable. If wire-identical output is desired, remove the skip_serializing_if on Zone."
+    },
+    {
+      "severity": "COSMETIC",
+      "title": "Go NatHoleResp.DetectBehavior always serialized as non-null struct; Rust uses Option",
+      "go_ref": "pkg/msg/msg.go:227-235",
+      "rust_file": "frp-core/src/msg.rs",
+      "rust_line": 486,
+      "description": "Go's NatHoleResp.DetectBehavior is a value type (NatHoleDetectBehavior) with json:\"omitempty\" which does NOT omit struct values in Go's encoding/json. Go always sends '\"detect_behavior\":{}' even when the struct is zero-valued. Rust uses 'Option<NatHoleDetectBehavior>' with skip_serializing_if = Option::is_none, so it omits the field entirely when None. Both sides can deserialize both formats. This is purely cosmetic.",
+      "fix_suggestion": "No change needed. Both formats are interoperable. If Rust wants to always send the field for wire-identical output, it could use a value type instead of Option."
+    },
+    {
+      "severity": "LOW",
+      "title": "Go NatHoleDetectBehavior JSON key 'read_timeout' (not 'read_timeout_ms') is handled correctly by Rust alias",
+      "go_ref": "pkg/msg/msg.go:221",
+      "rust_file": "frp-core/src/msg.rs",
+      "rust_line": 453,
+      "description": "Go's NatHoleDetectBehavior uses JSON key 'read_timeout' (not 'read_timeout_ms') for the read timeout field. Rust handles this correctly with 'rename = \"read_timeout\", alias = \"read_timeout_ms\". This is correct, not a bug. Flagged because the field name and JSON tag differ from the Rust struct field name. Verified compatible.",
+      "fix_suggestion": "No change needed. The serde attributes correctly match Go's wire format."
+    },
+    {
+      "severity": "LOW",
+      "title": "Go StartWorkConn uses uint16 for ports; Rust uses i32 — compatible but type-mismatched",
+      "go_ref": "pkg/msg/msg.go:158-159",
+      "rust_file": "frp-core/src/msg.rs",
+      "rust_line": 297,
+      "description": "Go StartWorkConn declares SrcPort and DstPort as uint16 (0-65535). Rust declares src_port and dst_port as Option<i32>. JSON serialization uses the same numeric representation for values 0-65535. However, if Rust ever sets a port value outside the uint16 range (>65535 or negative), it would be a protocol mismatch. Currently this cannot happen because ports are always in the valid range.",
+      "fix_suggestion": "Consider changing Rust port fields to Option<u16> to match Go's type semantics and prevent accidental out-of-range values."
+    }
+  ]
+}

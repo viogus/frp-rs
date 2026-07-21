@@ -15,6 +15,7 @@ use frp_core::transport::IoStream;
 
 use crate::nathole::controller::Controller;
 use crate::proxy::ProxyManager;
+use crate::registry::ClientRegistry;
 use crate::tcpmux::TcpMuxManager;
 use crate::vhost::VhostManager;
 
@@ -44,7 +45,11 @@ pub enum InternalMsg {
     },
     /// Sent when a new control connection claims the same run_id.
     /// The old handler should stop listening and clean up.
-    Shutdown,
+    /// The `done` oneshot is signaled after cleanup completes,
+    /// allowing the new handler to wait for handoff.
+    Shutdown {
+        done: tokio::sync::oneshot::Sender<()>,
+    },
     // NatHoleClient variant removed — dead code. Go frp compat uses
     // NatHoleSidOnWorkConn path (server is pure relay, provider does STUN).
     /// Send NatHoleSid to provider on a work connection (Go frp v0.69.1 XTCP compat).
@@ -105,6 +110,9 @@ pub struct ControlTx {
     pub login_time_unix: i64,
     pub pool_stats: Arc<PoolStats>,
     pub user: String,
+    /// Monotonically increasing control generation ID.
+    /// Distinguished old vs new control connections with the same run_id.
+    pub control_id: u64,
 }
 
 /// Hot-reloadable server configuration subset, updated atomically on SIGUSR1.
@@ -124,6 +132,107 @@ pub struct PoolMetrics {
     pub drops: AtomicU64,
     /// Idle timeout for pooled work conns. `Duration::ZERO` = disabled.
     pub idle_timeout: Duration,
+}
+
+/// State for a TCP group's shared listener.
+pub(crate) struct TcpGroupEntry {
+    pub port: u16,
+    pub group_key: String,
+    pub bind_addr: String,
+    /// Shared listener task handle. None when stopped.
+    #[allow(dead_code)]
+    pub handle: Option<tokio::task::JoinHandle<()>>,
+    pub cancel_token: CancellationToken,
+}
+
+/// TCP group shared listener management (Go frp dev compat).
+/// Groups of TCP proxies share a single listener port with round-robin
+/// dispatch across group members. The first proxy to register in a group
+/// creates the shared listener; subsequent members reuse the port.
+pub(crate) struct TcpGroupCtl {
+    groups: RwLock<HashMap<String, TcpGroupEntry>>,
+}
+
+impl TcpGroupCtl {
+    pub fn new() -> Self {
+        Self {
+            groups: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Get the port for an existing group, validating that params match.
+    /// Returns None if the group doesn't exist.
+    pub async fn get_group_port(
+        &self,
+        group: &str,
+        group_key: &str,
+        port: u16,
+        bind_addr: &str,
+    ) -> Option<u16> {
+        let groups = self.groups.read().await;
+        let entry = groups.get(group)?;
+        // Validate that params match the existing group
+        if entry.group_key != group_key {
+            return None;
+        }
+        if entry.bind_addr != bind_addr {
+            return None;
+        }
+        // Port must match the group's actual bind port
+        if port != 0 && port != entry.port {
+            return None;
+        }
+        Some(entry.port)
+    }
+
+    /// Register a new TCP group. Returns Err if group already exists.
+    pub async fn create_group(
+        &self,
+        group: &str,
+        group_key: &str,
+        port: u16,
+        bind_addr: &str,
+        handle: tokio::task::JoinHandle<()>,
+        cancel_token: CancellationToken,
+    ) -> Result<(), String> {
+        let mut groups = self.groups.write().await;
+        if groups.contains_key(group) {
+            return Err(format!("TCP group '{}' already exists", group));
+        }
+        groups.insert(
+            group.to_string(),
+            TcpGroupEntry {
+                port,
+                group_key: group_key.to_string(),
+                bind_addr: bind_addr.to_string(),
+                handle: Some(handle),
+                cancel_token,
+            },
+        );
+        Ok(())
+    }
+
+    /// Remove a group and stop its shared listener.
+    /// Returns the port that was used by the group, if any.
+    pub async fn remove_group(&self, group: &str) {
+        let mut groups = self.groups.write().await;
+        if let Some(entry) = groups.remove(group) {
+            // Cancel the shared listener
+            entry.cancel_token.cancel();
+        }
+    }
+
+    /// Check if a group exists and has a running listener.
+    #[allow(dead_code)]
+    pub async fn group_exists(&self, group: &str) -> bool {
+        self.groups.read().await.contains_key(group)
+    }
+
+    /// Get the port for a group, if it exists.
+    #[allow(dead_code)]
+    pub async fn group_port(&self, group: &str) -> Option<u16> {
+        self.groups.read().await.get(group).map(|e| e.port)
+    }
 }
 
 /// OIDC verification state.
@@ -197,6 +306,14 @@ pub struct AppState {
     pub reloadable: Arc<std::sync::RwLock<ReloadableState>>,
     pub used_ports: Arc<RwLock<std::collections::HashSet<u16>>>,
     pub run_id_to_ctl_tx: Arc<RwLock<HashMap<String, ControlTx>>>,
+    /// Client registry tracking connected frpc instances with metadata.
+    pub client_registry: Arc<ClientRegistry>,
+    /// Monotonically increasing counter for control generation IDs.
+    pub control_id_counter: AtomicU64,
+    /// Per-runID mutex for serializing control lifecycle transitions
+    /// (Add/Activate/completeLogin/Remove). Inherited from old to new control
+    /// to prevent concurrent lifecycle operations for the same run_id.
+    pub run_mu_map: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     pub proxy_bind_addr: String,
     pub vhost_manager: Arc<VhostManager>,
     pub vhost_http_port: u16,
@@ -212,6 +329,9 @@ pub struct AppState {
     /// Shared UDP port for SUDP proxies. When > 0, all SUDP proxies
     /// use this port instead of their individual remote_port.
     pub sudp_port: u16,
+    /// TCP group shared listener management (Go frp dev compat).
+    /// Groups proxies that share the same remote port with round-robin dispatch.
+    pub(crate) tcp_group_ctl: TcpGroupCtl,
     pub vhost_http_timeout: u64,
     pub user_conn_timeout: u64,
     pub tcp_mux_passthrough: bool,
@@ -322,6 +442,9 @@ impl AppState {
             })),
             used_ports: Arc::new(RwLock::new(std::collections::HashSet::new())),
             run_id_to_ctl_tx: Arc::new(RwLock::new(HashMap::new())),
+            client_registry: Arc::new(ClientRegistry::new()),
+            control_id_counter: AtomicU64::new(1),
+            run_mu_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
             proxy_bind_addr,
             vhost_manager: Arc::new(VhostManager::new()),
             vhost_http_port: 0, // set by Service::run() before starting listeners
@@ -346,6 +469,7 @@ impl AppState {
             proxy_metrics: Arc::new(ProxyMetricsRegistry::new()),
             max_ports_per_client,
             sudp_port,
+            tcp_group_ctl: TcpGroupCtl::new(),
             vhost_http_timeout,
             user_conn_timeout,
             tcp_mux_passthrough,
@@ -422,5 +546,17 @@ impl AppState {
         }
         *count += 1; // Reserve this attempt atomically
         true
+    }
+
+    /// Get or create the per-run_id serialization mutex.
+    ///
+    /// This mutex ensures that only one lifecycle transition (admit/activate/
+    /// completeLogin/remove) happens at a time for a given run_id. It is
+    /// inherited by new control connections when they supersede old ones.
+    pub fn get_run_mu(&self, run_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.run_mu_map.lock().unwrap();
+        map.entry(run_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 }

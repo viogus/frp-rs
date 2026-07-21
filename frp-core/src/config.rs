@@ -203,7 +203,7 @@ fn default_graceful_timeout() -> u64 {
     30
 }
 fn default_authentication_timeout() -> i64 {
-    15
+    0
 }
 fn default_token_auth_timeout() -> bool {
     true
@@ -323,6 +323,17 @@ impl Default for ServerConfig {
             max_connections: None,
             max_accept_rate: None,
             graceful_shutdown_timeout: default_graceful_timeout(),
+        }
+    }
+}
+
+impl ServerConfig {
+    /// Apply conditional defaults matching Go frp dev (fatedier/frp@d486018)
+    /// `ServerConfig.Complete()`. Call after deserialization, before consuming.
+    pub fn complete(&mut self) {
+        // When proxy_bind_addr is empty, inherit from bind_addr (Go compat).
+        if self.proxy_bind_addr.is_empty() {
+            self.proxy_bind_addr = self.bind_addr.clone();
         }
     }
 }
@@ -454,7 +465,7 @@ impl Default for AuthServerConfig {
             oidc_skip_nbf: false,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
-            authentication_timeout: 15,
+            authentication_timeout: 0,
             token_auth_timeout: true,
             use_encryption: false,
         }
@@ -769,7 +780,7 @@ impl Default for AuthClientConfig {
             oidc_tls_insecure_skip_verify: false,
             oidc_proxy_url: String::new(),
             additional_auth_scopes: Vec::new(),
-            authentication_timeout: 15,
+            authentication_timeout: 0,
             token_auth_timeout: true,
         }
     }
@@ -801,8 +812,8 @@ pub struct ClientConfig {
     pub proxy_url: String,
     /// Custom STUN server address for NAT traversal.
     /// Format: "stun:host:port". Empty = use default.
-    /// Go frp compat: natHoleStunServer.
-    #[serde(default, alias = "natHoleStunServer")]
+    /// Go frp compat: natHoleStunServer. Default: "stun.easyvoip.com:3478".
+    #[serde(default = "default_nat_hole_stun_server", alias = "natHoleStunServer")]
     pub nat_hole_stun_server: String,
     /// Selective proxy start: if non-empty, only proxies with names in this
     /// list are started. Empty = start all proxies.
@@ -840,6 +851,11 @@ pub struct ClientConfig {
     /// interval. Default: 30. Go frp compat: transport.heartbeatInterval.
     #[serde(default = "default_heartbeat_interval", alias = "heartbeatInterval")]
     pub heartbeat_interval: i64,
+    /// Heartbeat timeout in seconds. Disconnect if no Pong received within
+    /// this interval. Default: 90. Go frp compat: transport.heartbeatTimeout.
+    /// Set to -1 when tcp_mux is enabled (yamux provides keepalive).
+    #[serde(default = "default_heartbeat_timeout", alias = "heartbeatTimeout")]
+    pub heartbeat_timeout: i64,
     #[serde(default)]
     pub dns_server: String,
     /// TCP keepalive interval in seconds for outbound connections to the
@@ -880,7 +896,7 @@ impl Default for ClientConfig {
             client_id: String::new(),
             metas: std::collections::HashMap::new(),
             proxy_url: String::new(),
-            nat_hole_stun_server: String::new(),
+            nat_hole_stun_server: default_nat_hole_stun_server(),
             start: Vec::new(),
             includes: Vec::new(),
             tls_enable: true,
@@ -893,6 +909,7 @@ impl Default for ClientConfig {
             login_fail_exit: true,
             pool_count: 1,
             heartbeat_interval: default_heartbeat_interval(),
+            heartbeat_timeout: default_heartbeat_timeout(),
             dns_server: String::new(),
             dial_server_keepalive: 7200,
             connect_server_local_ip: String::new(),
@@ -907,6 +924,32 @@ impl Default for ClientConfig {
     }
 }
 
+impl ClientConfig {
+    /// Apply conditional defaults matching Go frp dev (fatedier/frp@d486018)
+    /// `ClientCommonConfig.Complete()` + `ClientTransportConfig.Complete()`.
+    /// Call after deserialization, before consuming the config.
+    ///
+    /// NOTE: This compares against the serde default value (30) to decide
+    /// whether to disable heartbeats when tcp_mux is true. A user who
+    /// explicitly sets `heartbeat_interval = 30` will also have it overridden
+    /// to -1 because we cannot distinguish "serde default" from "user intent"
+    /// with the current integer type. Go frp uses `util.EmptyOr()` which
+    /// distinguishes "not set" from "explicitly set to 30" via pointer nils.
+    /// Future: switch to `Option<i64>` for these fields to match Go semantics.
+    pub fn complete(&mut self) {
+        if self.tcp_mux {
+            // When tcpMux is enabled, heartbeat of application layer is
+            // unnecessary — rely on yamux keepalive instead (Go compat).
+            if self.heartbeat_interval == default_heartbeat_interval() {
+                self.heartbeat_interval = -1;
+            }
+            if self.heartbeat_timeout == default_heartbeat_timeout() {
+                self.heartbeat_timeout = -1;
+            }
+        }
+    }
+}
+
 fn default_server_port() -> u16 {
     7000
 }
@@ -917,10 +960,13 @@ fn default_true() -> bool {
     true
 }
 fn default_tcp_mux() -> bool {
-    cfg!(feature = "tcp-mux")
+    true
 }
 fn default_heartbeat_interval() -> i64 {
     30
+}
+fn default_nat_hole_stun_server() -> String {
+    "stun.easyvoip.com:3478".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1102,9 +1148,11 @@ pub fn load_server_config_from_str(
         toml::from_str(content).map_err(|e| format!("TOML parse error: {e}"))?;
     normalize_server_config(&mut value);
     let json_value = toml_to_json(value);
-    let cfg: ServerConfig =
+    let mut cfg: ServerConfig =
         serde_json::from_value(json_value).map_err(|e| format!("config validation error: {e}"))?;
     validate_server_config(&cfg)?;
+    cfg.transport.complete();
+    cfg.complete();
     Ok(cfg)
 }
 
@@ -1114,9 +1162,10 @@ pub fn load_client_config_from_str(
     let mut value: toml::Value =
         toml::from_str(content).map_err(|e| format!("TOML parse error: {e}"))?;
     normalize_client_config(&mut value);
-    let cfg: ClientConfig = serde_json::from_value(toml_to_json(value))
+    let mut cfg: ClientConfig = serde_json::from_value(toml_to_json(value))
         .map_err(|e| format!("config validation error: {e}"))?;
     validate_client_config(&cfg)?;
+    cfg.complete();
     Ok(cfg)
 }
 
@@ -1466,6 +1515,7 @@ pub fn load_server_config(
         validate_server_config,
     )?;
     cfg.transport.complete();
+    cfg.complete();
     Ok(cfg)
 }
 
@@ -1475,13 +1525,15 @@ pub fn load_client_config(
     path: &str,
     strict_config: bool,
 ) -> Result<ClientConfig, Box<dyn std::error::Error>> {
-    load_config_from_file::<ClientConfig>(
+    let mut cfg = load_config_from_file::<ClientConfig>(
         path,
         strict_config,
         known_client_keys,
         normalize_client_config,
         validate_client_config,
-    )
+    )?;
+    cfg.complete();
+    Ok(cfg)
 }
 
 /// Process `includes` directives in a TOML config: for each glob pattern,

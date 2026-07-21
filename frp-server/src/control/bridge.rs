@@ -442,14 +442,16 @@ pub(crate) async fn assign_work_to_proxy(
         let use_enc = enc_key;
 
         // Create bandwidth limiters per direction.
-        // "client" mode throttles client egress → data from work to user (read_limiter).
-        // "server" mode throttles server egress → data from user to work (write_limiter).
-        let mut read_lim = if bw_rate > 0 && (bw_mode == "client" || bw_mode == "both") {
+        // Go frp dev compat: server-side bandwidth limiter only for "server" mode.
+        // Go wraps BOTH read and write directions with a single rate limiter when
+        // mode == "server" (proxy.go:479-481). "client" mode is the client's
+        // responsibility; "both" is not a recognized Go mode.
+        let mut read_lim = if bw_rate > 0 && bw_mode == "server" {
             Some(BandwidthLimiter::new(bw_rate))
         } else {
             None
         };
-        let mut write_lim = if bw_rate > 0 && (bw_mode == "server" || bw_mode == "both") {
+        let mut write_lim = if bw_rate > 0 && bw_mode == "server" {
             Some(BandwidthLimiter::new(bw_rate))
         } else {
             None

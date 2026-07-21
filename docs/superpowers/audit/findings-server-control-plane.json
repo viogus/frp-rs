@@ -1,0 +1,141 @@
+{
+  "subsystem": "server-control-plane",
+  "go_commit": "d486018",
+  "findings": [
+    {
+      "severity": "CRITICAL",
+      "title": "Control replacement lifecycle lacks generation-aware serialization",
+      "go_ref": "server/control.go:78-168 (ControlManager.Add, lockCurrentRun, runMu, handoffBarrier, controlID)",
+      "rust_file": "frp-server/src/control/login.rs",
+      "rust_line": 252,
+      "description": "Go frp dev has a complete ControlManager with generation-aware Add/Activate/completeLogin lifecycle. Each runID has a `runMu` serialization lock, monotonically increasing `controlID`, a `handoffBarrier` channel from the old control's doneCh, and registry registration with `RegisterWithControlID`. Rust replaces the old handler by sending `InternalMsg::Shutdown` with no lock-based serialization or barrier. Between the old handler receiving Shutdown and actually cleaning up, both old and new handlers coexist in the same runID map and may concurrently process messages. This can cause lost work connections, duplicate proxy registrations, and stale handler access.",
+      "fix_suggestion": "Implement a generation-aware ControlManager in Rust that: (a) assigns monotonically increasing control IDs, (b) uses a per-runID lock or oneshot channel to serialize lifecycle transitions, (c) waits for the old handler's done signal before activating the new one, and (d) validates control ID on registry/client operations to prevent stale generations from modifying state."
+    },
+    {
+      "severity": "CRITICAL",
+      "title": "ClientRegistry with control generation awareness missing in Rust",
+      "go_ref": "server/registry/registry.go:74-135 (RegisterWithControlID, MarkOfflineByRunIDAndControlID)",
+      "rust_file": "frp-server/src/state.rs",
+      "rust_line": 198,
+      "description": "Go frp dev's ClientRegistry stores `ControlID` per entry and provides `RegisterWithControlID(key, ..., controlID)` and `MarkOfflineByRunIDAndControlID(runID, controlID)` to prevent stale control generations from modifying registry state after replacement. Rust has no equivalent ClientRegistry — it only has a `run_id_to_ctl_tx` map and a `used_ports` set, with no client-identity-tracking registry. This means: (a) no client metadata (hostname, version, IP, wire protocol) is persisted, (b) the admin API cannot list clients with their metadata, (c) there is no enforcement of unique client_id across connections (Go frp dev returns 'already online' error).",
+      "fix_suggestion": "Implement a ClientRegistry in Rust matching Go frp dev's registry.go: maintain per-client info (user, clientID, runID, controlID, hostname, version, IP, wireProtocol, online status, timestamps), enforce unique clientID constraint when raw_clientID is non-empty, and accept controlID on register/mark-offline to prevent stale generation writes."
+    },
+    {
+      "severity": "CRITICAL",
+      "title": "Two-phase login (Add-Activate-completeLogin) not implemented in Rust",
+      "go_ref": "server/service.go:753-816 (RegisterControl), server/control.go:106-244 (ControlManager.Add/Activate/completeLogin)",
+      "rust_file": "frp-server/src/control/login.rs",
+      "rust_line": 248,
+      "description": "Go frp dev's login flow is: RegisterControl calls Add (admit + set handoff barrier) -> WaitForHandoff (blocks until old control finishes) -> Activate (register with client registry using controlID) -> completeLogin (write LoginResp within locked callback, then start worker). Rust's authenticate() sends LoginResp immediately upon auth success without any two-phase activation or handoff waiting. This means: (a) a new control can send LoginResp before the old control has finished cleanup, (b) two controls can simultaneously be 'active' for the same runID, (c) work connections arriving during the handoff window can be lost or misrouted.",
+      "fix_suggestion": "Restructure Rust login flow: (1) authenticate and admit the new control (pending state), (2) wait for any old handler's done channel, (3) activate by registering in shared state atomically, then (4) send LoginResp and start the worker loop. Use a oneshot/barrier channel between old and new handlers for handoff synchronization."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "TCP group load balancing allocates per-proxy ports instead of shared port",
+      "go_ref": "server/proxy/tcp.go:52-63 (TCPGroupCtl shared listener), server/group/tcp.go",
+      "rust_file": "frp-server/src/control/proxy_ops.rs",
+      "rust_line": 540,
+      "description": "Go frp dev's TCPGroupCtl creates a shared listener on one port for all proxies in the same load-balancer group, with round-robin dispatch. Rust's proxy_ops.rs `listen_and_proxy` spawns an independent TCP listener per proxy, even when proxies belong to a group. Each proxy gets its own port via `allocate_port_multi`. The group load balancing in pool.rs `handle_proxy_user_conn` selects a backend but the connection arrives on the selected proxy's own port, not a shared group port. This changes the port allocation behavior for TCP groups and may cause port exhaustion or conflict with expected frpc configuration.",
+      "fix_suggestion": "Implement a TCP group controller in Rust that creates a shared listener per group on a single port and dispatches incoming connections to group members via the InternalMsg::ProxyUserConn channel. Register proxies into the group controller during handle_new_proxy when group is non-empty, similar to Go frp dev's TCPGroupCtl."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "HTTP group health check awareness missing in Rust load balancer",
+      "go_ref": "server/group/http.go:175 ('no healthy endpoint'), server/proxy/http.go:89-95",
+      "rust_file": "frp-server/src/control/pool.rs",
+      "rust_line": 356,
+      "description": "Go frp dev's HTTPGroupController has health-check-aware endpoint selection: `chooseEndpoint`/`chooseCreateConn` delegates to `createConnByEndpoint` with round-robin over registered proxies, and the vhost router tracks 'healthy' status via back-end health check probes. Rust's group load balancing in `handle_proxy_user_conn` calls `select_group_backend` with no health check filtering — it picks the next backend in round-robin regardless of online/offline status. When a backend proxy is unhealthy, Rust may still route traffic to it, causing connection failures that Go frp would avoid.",
+      "fix_suggestion": "Add health status tracking to the proxy manager (e.g., a last-failure timestamp or explicit online/offline flag). Update select_group_backend to skip unhealthy backends. Add a periodic health check task that marks proxies as unhealthy after connection failures and recovers them after a cooldown period."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Server-side bandwidth limit mode semantics differ from Go frp",
+      "go_ref": "server/proxy/proxy.go:479-481 (only BandwidthLimitModeServer)",
+      "rust_file": "frp-server/src/control/bridge.rs",
+      "rust_line": 447,
+      "description": "Go frp dev applies server-side rate limiting only when `BandwidthLimitMode == BandwidthLimitModeServer` (the string 'server'). Rust checks for both 'client' and 'both' modes. When `BandwidthLimitMode` is set to 'both' or 'client' in the frpc config, Rust creates bandwidth limiters while Go frp dev does not (or creates them but with different semantics). This means client-side bandwidth limits configured in Rust may unexpectedly consume server CPU for rate limiting, or the server-side limiting may behave differently when the client sends 'both' mode.",
+      "fix_suggestion": "Match Go frp dev behavior: only create server-side bandwidth limiters when bandwidth_limit_mode is 'server'. For 'client' mode, trust the client to apply its own limits. For 'both' mode, Go frp dev does not handle it; decide whether to add Go-compatible 'both' semantics or reject unsupported modes."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "ClientSpec.AlwaysAuthPass for internal connections not supported",
+      "go_ref": "server/service.go:778-779 (internal + ClientSpec.AlwaysAuthPass -> AlwaysPassVerifier)",
+      "rust_file": "frp-server/src/control/login.rs",
+      "rust_line": 85,
+      "description": "Go frp dev allows internal connections (SSH tunnel gateway) with `ClientSpec.AlwaysAuthPass` to bypass authentication by substituting an AlwaysPassVerifier. Rust's login.rs authenticate() always validates the token (or returns an error) regardless of any internal connection flag. The SSH tunnel gateway in Rust does not pass an 'internal' flag to the control handler. This could cause SSH tunnel gateway connections to fail authentication if the token is not configured identically on both sides.",
+      "fix_suggestion": "Add an 'internal' flag to the control handler path that, when set, uses an AlwaysPassVerifier for auth. Thread this flag from the SSH gateway into handle_control (via the Login message or a separate parameter), similar to Go frp dev's AlwaysAuthPass in ClientSpec."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "ServerAdditionalAuthScopes in LoginResp differs from Go frp",
+      "go_ref": "server/service.go:497 (LoginResp has no ServerAdditionalAuthScopes field)",
+      "rust_file": "frp-server/src/control/login.rs",
+      "rust_line": 289,
+      "description": "Go frp dev's LoginResp struct does NOT have a ServerAdditionalAuthScopes field (checked in pkg/msg/msg.go: type LoginResp struct { Version, RunID, Error }). Rust's LoginResp includes `server_additional_auth_scopes` and authenticates() sends `Some([\"HeartBeats\", \"NewWorkConns\"])`. While Go clients ignore unknown JSON fields, this means Rust requires additional auth on HeartBeats and NewWorkConns messages by default, whereas Go frp dev does not. Rust frp clients handle this, but third-party clients or older Go frpc versions may not expect auth on HeartBeats and break.",
+      "fix_suggestion": "Either: (a) make server_additional_auth_scopes configurable with a Go-compatible default (empty/none), or (b) add a compatibility mode where additional_auth_scopes are empty for Go frpc interop. Document that Rust requires auth on those message types when this scopes list is non-empty."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Work connection pool lacks idle timeout configuration in Go frp dev",
+      "go_ref": "server/control.go:574-616 (GetWorkConn, no idle timeout)",
+      "rust_file": "frp-server/src/control/mod.rs",
+      "rust_line": 147,
+      "description": "Rust implements a configurable idle timeout for pooled work connections that Go frp dev does not have. Rust's `pool_idle_timeout` (from state.pool.idle_timeout) periodically evicts stale entries from the work pool. This is a strict superset of Go frp behavior, but if the idle timeout is misconfigured or too aggressive, it could cause unnecessary work connection churn that Go frp would not exhibit. The feature itself is beneficial; this finding flags the behavioral difference for interoperability testing.",
+      "fix_suggestion": "Ensure idle_timeout defaults to 0 (disabled) for Go frp compat. Document the configuration option if exposed to users so they understand it is a Rust-only feature."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Proxy NewProxyResp includes response_headers fields not handled in Rust inline bridge",
+      "go_ref": "server/proxy/http.go:63 (ResponseHeaders config in vhost route config)",
+      "rust_file": "frp-server/src/control/bridge.rs",
+      "rust_line": 462,
+      "description": "Go frp dev injects response headers at the vhost reverse proxy level (via vhost RouteConfig.ResponseHeaders). Rust's bridge.rs handles response_headers via ResponseHeaderInjector only when `req.proxy_type.starts_with('http')` and `use_enc` is true (line 462-481) or when bandwidth limiting is active (line 681-694). For the fast path (plain relay without encryption, bandwidth limit, or response_headers), Rust uses `relay_plain_fast` / `copy_bidirectional` which bypasses header injection entirely. This means HTTP response headers configured in NewProxy will not be injected for proxies without encryption or rate limiting.",
+      "fix_suggestion": "Move response_header injection earlier in the bridge pipeline so it always applies for HTTP proxy types, regardless of encryption/rate-limiting settings. Use the ResponseHeaderInjector wrapper unconditionally for HTTP proxy types."
+    },
+    {
+      "severity": "LOW",
+      "title": "Login throttle is Rust-only, not present in Go frp dev",
+      "go_ref": "server/service.go (no login throttle)",
+      "rust_file": "frp-server/src/control/login.rs",
+      "rust_line": 62,
+      "description": "Rust implements per-IP login throttling (5 failed attempts per 60s) with synthetic IP hashing for non-TCP transports. Go frp dev has no equivalent. This is an extra security feature in Rust but means Rust may reject legitimate rapid reconnections that Go frp would accept (e.g., during frpc crash loops). The throttle also reserves an attempt slot before authentication completes, so a single authentication failure consumes one of the 5 slots.",
+      "fix_suggestion": "Document the throttle behavior. Consider whether the throttle should only count authentication failures (not reservations) to match expected security posture. Make the throttle configurable or disabled by default for Go frp compat."
+    },
+    {
+      "severity": "LOW",
+      "title": "Timestamp-based replay protection is Rust-only",
+      "go_ref": "server/control.go (no timestamp dedup; relies on auth.VerifyLogin)",
+      "rust_file": "frp-server/src/control/login.rs",
+      "rust_line": 138,
+      "description": "Rust implements replay attack protection by tracking (timestamp, run_id) pairs in a BTreeMap with split_off cleanup. Go frp dev does not have this mechanism, relying solely on auth token validation and timestamp freshness in the auth verifier. This adds an extra layer of defense in Rust but introduces a dependency on client-provided run_id for effective dedup. When run_id is empty, Rust generates a UUID that is never reused, making the dedup ineffective. This finding flags a behavioral difference for interoperability testing.",
+      "fix_suggestion": "Document that the replay protection is best-effort when clients don't supply a stable run_id. Consider whether Go frpc sends run_id in Login messages consistently (it does for reconnections with the same run_id)."
+    },
+    {
+      "severity": "LOW",
+      "title": "ServerMetrics NewProxy signature includes user/clientID in Go frp dev",
+      "go_ref": "server/metrics/metrics.go:12 (NewProxy(name, type, user, clientID))",
+      "rust_file": "frp-server/src/state.rs",
+      "rust_line": 229,
+      "description": "Go frp dev's metrics server.NewProxy() receives `user` and `clientID` parameters. Rust's proxy_metrics tracking does not include user or clientID dimensions. This means admin API responses that require per-user or per-client proxy categorization may return incomplete data. The Go frp dev mem stats collector tracks proxy_type_counts and client_counts which depend on these parameters.",
+      "fix_suggestion": "Add user and clientID fields to the proxy metrics registry in Rust. Update NewProxy calls in proxy_ops.rs to pass the user (from ControlTx.user) and clientID (from run_id) when creating metrics entries."
+    },
+    {
+      "severity": "LOW",
+      "title": "healthz readiness probe differs from Go frp dev's simple healthz",
+      "go_ref": "server/api_router.go:73-75 (always returns 200)",
+      "rust_file": "frp-server/src/dashboard.rs",
+      "rust_line": 404,
+      "description": "Go frp dev's /healthz always returns HTTP 200 with no body. Rust's /healthz supports both 'liveness' (default, returns 200 OK) and 'readiness' (checks shutdown token, lock contention on used_ports, run_id_to_ctl_tx, and proxy_manager). The readiness check is a Rust-only enhancement but could cause load balancers to report the server as unhealthy when it would be considered healthy by Go frp standards, particularly under lock contention.",
+      "fix_suggestion": "Ensure the default /healthz (no probe param) always returns 200 for Go frp compat. Document that the readiness probe is a Rust-specific enhancement and may need adjusted thresholds in production."
+    },
+    {
+      "severity": "LOW",
+      "title": "Rust v2 dashboard API sends ServerAdditionalAuthScopes in error LoginResp",
+      "go_ref": "server/service.go:497-499 (no extra field in error LoginResp)",
+      "rust_file": "frp-server/src/control/login.rs",
+      "rust_line": 289,
+      "description": "Go frp dev's LoginResp error responses include only Version, RunID (empty), and Error. Rust's error LoginResp includes server_additional_auth_scopes even on error responses. This is harmless (Go clients ignore unknown fields) but differs from expected Go frp dev wire format. The extra field could confuse packet-capture analysis or protocol conformance tests.",
+      "fix_suggestion": "Only include server_additional_auth_scopes in successful LoginResp, matching Go frp dev behavior. Set it to None in error responses."
+    }
+  ]
+}
