@@ -606,7 +606,11 @@ pub(crate) async fn handle_nat_hole_visitor(
     // before sending NatHoleResp. This gives the sender time to complete
     // STUN and start sending detect messages before the receiver gets
     // the response and starts detecting.
-    if v_resp.detect_behavior.as_ref().is_some_and(|db| db.role.as_deref() == Some("sender")) {
+    if v_resp
+        .detect_behavior
+        .as_ref()
+        .is_some_and(|db| db.role.as_deref() == Some("sender"))
+    {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
@@ -623,7 +627,11 @@ pub(crate) async fn handle_nat_hole_visitor(
     // Go frp dev compat: if the provider has the "sender" role, wait 1s
     // before sending NatHoleResp (see comment above for rationale).
     if let Some(ref cr) = c_resp {
-        if cr.detect_behavior.as_ref().is_some_and(|db| db.role.as_deref() == Some("sender")) {
+        if cr
+            .detect_behavior
+            .as_ref()
+            .is_some_and(|db| db.role.as_deref() == Some("sender"))
+        {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
