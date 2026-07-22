@@ -2168,7 +2168,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
         #[cfg(feature = "kcp")]
         TransportProtocol::Kcp => {
             let addr = format!("{target_ip}:{}", opts.server_port);
-            let stream = crate::kcp::dial_kcp(&addr, crate::kcp::default_kcp_config())
+            let stream = crate::kcp::dial_kcp(&addr, crate::kcp::default_kcp_client_config())
                 .await
                 .map_err(|e| crate::Error::Transport(format!("KCP dial: {e}").into()))?;
             return Ok(IoStream::Kcp(stream));
@@ -3015,9 +3015,9 @@ pub fn build_root_store(
 }
 
 /// Create a TLS connector for client-side TLS.
-/// If ca_file is provided, use it as a custom root CA; otherwise use
-/// the OS platform verifier (macOS Security.framework, Windows Schannel,
-/// Linux system CA bundle).
+/// If ca_file is provided, use it as a custom root CA; otherwise skip
+/// certificate verification (InsecureSkipVerify=true), matching Go frp's
+/// `NewClientTLSConfig` behavior when no CA file is configured.
 /// If cert_file/key_file are provided, present client certificate to server (mTLS).
 #[cfg(feature = "tls")]
 pub fn build_tls_connector(
@@ -3027,13 +3027,11 @@ pub fn build_tls_connector(
 ) -> Result<TlsConnector, crate::Error> {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    use rustls_platform_verifier::BuilderVerifierExt;
-    use rustls_platform_verifier::ConfigVerifierExt;
 
     let root_store = build_root_store(ca_file)?;
 
     let config = if let Some(store) = root_store {
-        // Custom CA: use RootCertStore
+        // Custom CA: verify against the provided root store.
         if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
             if !cert_path.is_empty() && !key_path.is_empty() {
                 let cert_bytes = std::fs::read(cert_path).map_err(|e| {
@@ -3074,55 +3072,109 @@ pub fn build_tls_connector(
                 .with_root_certificates(Arc::new(store))
                 .with_no_client_auth()
         }
-    } else if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
-        // Platform verifier with client certificate (mTLS)
-        if !cert_path.is_empty() && !key_path.is_empty() {
-            let cert_bytes = std::fs::read(cert_path).map_err(|e| {
-                crate::Error::Transport(TransportError::Other(format!(
-                    "open client cert file: {e}"
-                )))
-            })?;
-            let client_certs = CertificateDer::pem_slice_iter(&cert_bytes)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| {
+    } else {
+        // No CA file: skip certificate verification (InsecureSkipVerify=true).
+        let verifier = Arc::new(InsecureSkipVerify);
+        if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
+            if !cert_path.is_empty() && !key_path.is_empty() {
+                let cert_bytes = std::fs::read(cert_path).map_err(|e| {
                     crate::Error::Transport(TransportError::Other(format!(
-                        "read client certs: {e}"
+                        "open client cert file: {e}"
                     )))
                 })?;
-            let key_bytes = std::fs::read(key_path).map_err(|e| {
-                crate::Error::Transport(TransportError::Other(format!("open client key file: {e}")))
-            })?;
-            let client_key = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| {
-                crate::Error::Transport(TransportError::Other(format!("read client key: {e}")))
-            })?;
-            rustls::ClientConfig::builder()
-                .with_platform_verifier()
-                .map_err(|e| {
+                let client_certs = CertificateDer::pem_slice_iter(&cert_bytes)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        crate::Error::Transport(TransportError::Other(format!(
+                            "read client certs: {e}"
+                        )))
+                    })?;
+                let key_bytes = std::fs::read(key_path).map_err(|e| {
                     crate::Error::Transport(TransportError::Other(format!(
-                        "platform verifier: {e}"
+                        "open client key file: {e}"
                     )))
-                })?
-                .with_client_auth_cert(client_certs, client_key)
-                .map_err(|e| {
-                    crate::Error::Transport(TransportError::Other(format!(
-                        "build mTLS client config: {e}"
-                    )))
-                })?
+                })?;
+                let client_key = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!("read client key: {e}")))
+                })?;
+                rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(verifier)
+                    .with_client_auth_cert(client_certs, client_key)
+                    .map_err(|e| {
+                        crate::Error::Transport(TransportError::Other(format!(
+                            "build mTLS client config with skip-verify: {e}"
+                        )))
+                    })?
+            } else {
+                rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(verifier)
+                    .with_no_client_auth()
+            }
         } else {
-            // Platform verifier, no client certificate
-            <rustls::ClientConfig as ConfigVerifierExt>::with_platform_verifier().map_err(|e| {
-                crate::Error::Transport(TransportError::Other(format!("platform verifier: {e}")))
-            })?
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth()
         }
-    } else {
-        // Platform verifier, no client certificate
-        <rustls::ClientConfig as ConfigVerifierExt>::with_platform_verifier().map_err(|e| {
-            crate::Error::Transport(TransportError::Other(format!("platform verifier: {e}")))
-        })?
     };
 
     Ok(TlsConnector::from(Arc::new(config)))
 }
+
+/// A certificate verifier that accepts all server certificates (InsecureSkipVerify=true).
+#[cfg(feature = "tls")]
+#[derive(Debug)]
+pub(crate) struct InsecureSkipVerify;
+
+#[cfg(feature = "tls")]
+impl rustls::client::danger::ServerCertVerifier for InsecureSkipVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
+
 
 /// A stream wrapper that yields pre-read bytes before the inner stream.
 /// Used when bytes have been consumed for protocol detection (e.g., SNI peek)

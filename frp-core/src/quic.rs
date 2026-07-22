@@ -263,16 +263,18 @@ pub async fn dial_quic_with_params(
             builder.with_no_client_auth()
         }
     } else {
-        // mTLS (client certificate) requires a CA store; with the platform
-        // verifier there is no builder chain to attach client certs to.
+        // No CA file: skip certificate verification (InsecureSkipVerify=true).
+        // Go frp auto-generates self-signed certs -- match Go behavior.
         if cert_file.is_some() || key_file.is_some() {
             return Err(io::Error::other(
                 "QUIC: client certificate (mTLS) requires a CA file (tls_trusted_ca_file)",
             ));
         }
-        use rustls_platform_verifier::ConfigVerifierExt;
-        <rustls::ClientConfig as ConfigVerifierExt>::with_platform_verifier()
-            .map_err(|e| io::Error::other(format!("QUIC platform verifier: {e}")))?
+        let verifier = std::sync::Arc::new(crate::transport::InsecureSkipVerify);
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth()
     };
 
     tls_config.alpn_protocols = vec![b"frp".to_vec()];

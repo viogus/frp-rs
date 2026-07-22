@@ -515,7 +515,8 @@ pub(crate) async fn handle_nat_hole_visitor(
 
     // --- Step 5: Run analysis and build responses ---
     let (v_resp, c_resp) = if let (Some(ref vf), Some(ref cf)) = (&v_feature, &c_feature) {
-        let key = nathole_ctrl::gen_analysis_key(cf, vf);
+        let key = nathole_ctrl::gen_analysis_key(cf, vf, &client_mapped, &visitor_mapped);
+        *session.analysis_key.lock().unwrap_or_else(|e| e.into_inner()) = Some(key.clone());
         let (mode, index, c_behavior, v_behavior) = state
             .xtcp
             .nat_hole
@@ -523,7 +524,12 @@ pub(crate) async fn handle_nat_hole_visitor(
             .get_recommend_behaviors(&key, cf, vf);
         *session.selected_index.lock().await = Some(index);
 
-        let timeout_ms = c_behavior.send_delay_ms.max(v_behavior.send_delay_ms) + 5000;
+        let extra_timeout = if c_behavior.listen_random_ports > 0 || v_behavior.listen_random_ports > 0 {
+            30000
+        } else {
+            0
+        };
+        let timeout_ms = c_behavior.send_delay_ms.max(v_behavior.send_delay_ms) + 5000 + extra_timeout;
         let v_read_timeout = timeout_ms - v_behavior.send_delay_ms;
         let c_read_timeout = timeout_ms - c_behavior.send_delay_ms;
         let c_ports_diff = cf.ports_difference;

@@ -38,6 +38,16 @@ pub fn default_kcp_config() -> KcpConfig {
     }
 }
 
+/// Build a KcpConfig for client-side KCP dialing.
+pub fn default_kcp_client_config() -> KcpConfig {
+    KcpConfig {
+        nodelay: KcpNoDelayConfig { nodelay: true, interval: 20, resend: 2, nc: true },
+        wnd_size: (1024, 1024), mtu: 1350,
+        data_shards: 0, parity_shards: 0,
+        stream: true, flush_write: true,
+    }
+}
+
 #[cfg(test)]
 mod integration_tests {
     use super::*;
