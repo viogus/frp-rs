@@ -293,7 +293,6 @@ impl Controller {
                             self.analyzer
                                 .report_success(&key, db.mode, index.unwrap_or(0));
                         }
-                        }
                     }
                 }
             }

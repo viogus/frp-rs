@@ -3,6 +3,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::msg::{self, FrpMessage};
 
 pub const V1_MAX_MSG_LENGTH: i64 = 64 * 1024;
+/// Go frp v0.70.0 default max message length is 10 KiB.
+/// Messages exceeding this threshold trigger a warning for Go compat debugging.
+pub const V1_WARN_MSG_LENGTH: usize = 10 * 1024;
 pub const V1_HEADER_LEN: usize = 9;
 
 pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
@@ -18,6 +21,13 @@ pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
 
     if payload.len() as u64 > V1_MAX_MSG_LENGTH as u64 {
         return Err(crate::Error::Protocol("V1 message too large".into()));
+    }
+    if payload.len() > V1_WARN_MSG_LENGTH {
+        tracing::warn!(
+            type_byte = %type_byte,
+            payload_len = payload.len(),
+            "V1 message exceeds Go frp 10 KiB limit"
+        );
     }
 
     let mut buf = Vec::with_capacity(V1_HEADER_LEN + payload.len());
@@ -75,6 +85,13 @@ pub async fn read_v1_frame<R: AsyncReadExt + Unpin>(
             .into(),
         ));
     }
+    if length > V1_WARN_MSG_LENGTH as u64 {
+        tracing::warn!(
+            type_byte = %type_byte,
+            length = %length,
+            "V1 frame exceeds Go frp 10 KiB limit"
+        );
+    }
 
     let length = length as usize;
     // Zero-initialize: passing &mut [u8] pointing to uninitialized memory
@@ -121,6 +138,13 @@ pub async fn read_msg_v1<R: AsyncReadExt + Unpin>(
             )
             .into(),
         ));
+    }
+    if length > V1_WARN_MSG_LENGTH as u64 {
+        tracing::warn!(
+            type_byte = %type_byte,
+            length = %length,
+            "V1 message exceeds Go frp 10 KiB limit"
+        );
     }
 
     let length = length as usize;

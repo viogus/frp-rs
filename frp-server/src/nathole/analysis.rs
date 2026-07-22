@@ -143,17 +143,6 @@ fn recv_ports(ttl: i32, delay: i32, prn: i32) -> RecommendBehavior {
     }
 }
 
-fn send_ports(ttl: i32, prn: i32) -> RecommendBehavior {
-    RecommendBehavior {
-        role: "sender".into(),
-        ttl,
-        send_delay_ms: 0,
-        ports_range_number: prn,
-        ports_random_number: 0,
-        listen_random_ports: 0,
-    }
-}
-
 fn sender_port(delay: i32, prnn: i32, lrp: i32) -> RecommendBehavior {
     RecommendBehavior {
         role: "sender".into(),
