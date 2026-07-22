@@ -8,6 +8,13 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use super::config::KcpConfig;
+
+/// UDP socket receive buffer size (4 MiB), matching Go frp's `SetReadBuffer(4194304)`.
+/// Without explicit sizing, the OS default (~212KB on Linux) can cause packet
+/// drops under bursty KCP traffic.
+const KCP_UDP_RCVBUF: usize = 4_194_304;
+/// UDP socket send buffer size (4 MiB), matching Go frp's `SetWriteBuffer(4194304)`.
+const KCP_UDP_SNDBUF: usize = 4_194_304;
 use super::session::KcpSession;
 use super::socket::{KcpSocket, KcpSocketHandle};
 use super::stream::KcpStream;
@@ -27,6 +34,18 @@ impl KcpListener {
     pub async fn bind(addr: &str, config: KcpConfig) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
+
+        // Set socket buffer sizes (4 MiB each) matching Go frp's
+        // listener.SetReadBuffer(4194304) / listener.SetWriteBuffer(4194304).
+        // Without explicit sizing, OS defaults (~212KB on Linux) can cause
+        // packet drops under bursty KCP traffic.
+        if let Err(e) = socket2::SockRef::from(&socket).set_recv_buffer_size(KCP_UDP_RCVBUF) {
+            tracing::debug!(error = %e, "KCP: failed to set SO_RCVBUF to {} (continuing with OS default)", KCP_UDP_RCVBUF);
+        }
+        if let Err(e) = socket2::SockRef::from(&socket).set_send_buffer_size(KCP_UDP_SNDBUF) {
+            tracing::debug!(error = %e, "KCP: failed to set SO_SNDBUF to {} (continuing with OS default)", KCP_UDP_SNDBUF);
+        }
+
         let socket = Arc::new(socket);
 
         let (kcp_socket, handle, accept_rx) = KcpSocket::new(socket, config);

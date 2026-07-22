@@ -128,8 +128,10 @@ fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     // far below the 1.5 GiB OOM risk zone.
     let stream_window = tcp_mux_cfg.max_stream_window_size as usize;
     cfg.set_max_connection_receive_window(Some(stream_window * 64));
-    cfg.set_max_num_streams(256);
     // NOTE: yamux 0.14.0 does not expose set_keepalive_interval on Config.
+    // max_num_streams not set — uses yamux-rs default (8192) vs Go's unlimited.
+    // 8192 accommodates high concurrent workloads (HTTP proxy, long-lived streams)
+    // without capping at 256 which would reject streams under load.
     // Keepalive is instead implemented via timeout-based poll loops in
     // server_mux and client_mux background tasks.
     let _ = tcp_mux_cfg.keepalive_interval;

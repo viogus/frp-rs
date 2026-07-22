@@ -86,6 +86,9 @@ pub async fn start_visitor_plugin(
                 result = listener.accept() => {
                     match result {
                         Ok((user_conn, peer)) => {
+                            // Disable Nagle for low-latency interactive data
+                            // (Go frp parity: user connections use NoDelay(true)).
+                            frp_core::transport::set_nodelay(&user_conn);
                             debug!(peer = %peer, "visitor plugin: new connection from {}", peer);
                             let sn = server_name.clone();
                             let sk = secret_key.clone();

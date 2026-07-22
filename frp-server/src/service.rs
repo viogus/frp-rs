@@ -326,6 +326,9 @@ impl Service {
                                 result = listener.accept() => {
                                     match result {
                                         Ok((stream, addr)) => {
+                                // Disable Nagle for low-latency small-message RTT
+                                // (Go frp parity: control path uses NoDelay(true)).
+                                frp_core::transport::set_nodelay(&stream);
                                 info!(addr = %addr, "New WebSocket connection from {}", addr);
                                 let state = ws_state.clone();
                                 let permit = state.conn_semaphore.as_ref()

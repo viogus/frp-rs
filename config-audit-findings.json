@@ -1,0 +1,169 @@
+[
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 979,
+    "description": "ProxyConfig is flat, missing nested transport/loadBalancer/healthCheck subtables. Go v1 TOML uses [[proxies]] sub-tables like [proxies.transport], [proxies.healthCheck.type], [proxies.loadBalancer.group]. In Rust, all proxy fields are flat, so sub-table keys are silently dropped — causing loss of encryption, compression, bandwidth, proxy protocol, health check, and load balancing config.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/proxy.go:28-47 (ProxyTransport), 49-57 (LoadBalancerConfig), 72-100 (HealthCheckConfig)",
+    "severity": "HIGH"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 979,
+    "description": "Proxy request headers mapping mismatch. Go uses requestHeaders.set.x-from-where-style nesting (HeaderOperations.Set map[string]string). Rust uses flat HashMap 'headers' with alias 'responseHeaders'. Go-format requestHeaders.set.* and responseHeaders.set.* configs silently dropped.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/common.go:133-136 (HeaderOperations), proxy.go:323-325 (HTTPProxyConfig.requestHeaders/responseHeaders)",
+    "severity": "HIGH"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 476,
+    "description": "LogConfig uses field 'file' (default empty string) but Go v1 uses 'to' (default 'console'). Go configs with log.to = '...' are silently ignored. The normalization maps log_file → log.file, not log.to. Logs go nowhere by default in Rust (empty file path) vs Go's 'console' default.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/common.go:108 (LogConfig.To), 120 (Complete sets to 'console')",
+    "severity": "MEDIUM"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 482,
+    "description": "LogConfig missing disable_print_color field. Go v1 has LogConfig.DisablePrintColor with default false. Rust LogConfig has only level/file/max_days.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/common.go:116 (LogConfig.DisablePrintColor)",
+    "severity": "LOW"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 538,
+    "description": "WebServerConfig addr defaults to '' (bind all interfaces). Go's WebServerConfig.Complete() defaults to '127.0.0.1' unconditionally, and ServerConfig.Complete() also overrides to '0.0.0.0' when port > 0 and addr is empty. Rust's default of '' means the dashboard/admin UI listens on all interfaces by default when port is set.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/common.go:71-73 (WebServerConfig.Complete sets addr to '127.0.0.1'), server.go:116-118 (ServerConfig.Complete overrides to '0.0.0.0' when port>0)",
+    "severity": "MEDIUM"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 448,
+    "description": "OIDC config nesting mismatch. Go v1 nests OIDC fields under auth.oidc.* (auth.oidc.issuer, auth.oidc.skipExpiryCheck). Rust uses flat fields at the auth level (auth.oidc_issuer, auth.oidc_skip_expiry). The normalize_server_config function only flattens top-level oidc_* into auth, not auth.oidc.* into auth.oidc_*. Go-format auth.oidc.* configs silently ignored.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/server.go:141-155 (AuthOIDCServerConfig with nested fields), /tmp/frp-source/conf/frps_full_example.toml:113-120 (auth.oidc.* TOML)",
+    "severity": "MEDIUM"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 567,
+    "description": "HTTP plugin config uses 'url' field, but Go v1 uses separate 'addr' + 'path'. Go's HTTPPluginOptions has Addr (host:port) and Path (path prefix) combined at runtime. Rust's HttpPluginConfig expects a single 'url'. Go config httpPlugins with addr/path are silently dropped.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/common.go:125-131 (HTTPPluginOptions with Addr, Path), /tmp/frp-source/conf/frps_full_example.toml:159-169 (httpPlugins TOML)", "severity": "MEDIUM"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 811,
+    "description": "proxy_url defaults to '' and does NOT read http_proxy environment variable. Go's ClientTransportConfig.Complete() defaults to os.Getenv('http_proxy') when proxyURL is not set.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/client.go:152 (util.EmptyOr(c.ProxyURL, os.Getenv('http_proxy')))",
+    "severity": "MEDIUM"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 560,
+    "description": "custom_404_page is under WebServerConfig in Rust, but Go v1 has Custom404Page as a top-level field of ServerConfig. The normalize_server_config does not map top-level custom404Page to web_server.custom_404_page. Go-format configs with custom404Page silently ignored.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/server.go:68 (Custom404Page top-level field), /tmp/frp-source/conf/frps_full_example.toml:141",
+    "severity": "MEDIUM"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 1382,
+    "description": "Server config normalization does not flatten legacy transport fields (heartbeat_timeout, max_pool_count, tcp_keepalive) into [transport] section. Only tcp_mux and tcp_mux_keepalive_interval are handled. Legacy flat-format configs writing heartbeat_timeout=90 at top level will have it silently dropped (not in [transport] where ServerTransportConfig expects it).",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/server.go:157-180 (ServerTransportConfig fields)",
+    "severity": "MEDIUM"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 1042,
+    "description": "Health check default values differ from Go v1. Rust uses serde defaults: interval_seconds=10, timeout_seconds=3, max_failed=1, url='/'. Go v1 HealthCheckConfig has no Complete() function, so defaults are Go zero values (0 for ints, '' for strings). Go v1 health check defaults are set at runtime, not in the config struct.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/proxy.go:72-100 (HealthCheckConfig struct, no Complete method)",
+    "severity": "MEDIUM"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 1077,
+    "description": "VisitorConfig has no 'protocol' field for XTCP. Go's XTCPVisitorConfig.Complete() defaults Protocol to 'quic' (validated to be 'kcp' or 'quic'). frp-rs XTCP P2P connections always use TCP (not configurable), which is not in Go's allowed protocol set.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/visitor.go:146-164 (XTCPVisitorConfig with Protocol field defaulting to 'quic'), /tmp/frp-source/pkg/config/v1/validation/visitor.go:57-61 (validates protocol must be kcp or quic)",
+    "severity": "MEDIUM"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 60,
+    "description": "Rust uses allow_port_start (default 10000) / allow_port_end (default 50000) integer fields plus allow_ports (comma-separated string). Go v1 allows configuring via allowPorts as an array of {start, end, single} objects. The formats are incompatible — Go allowPorts configs silently ignored.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/server.go:96 (AllowPorts []types.PortsRange), /tmp/frp-source/pkg/config/types/types.go:113-117 (PortsRange struct), /tmp/frp-source/conf/frps_full_example.toml:126-131",
+    "severity": "MEDIUM"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 592,
+    "description": "ServerTransportConfig missing TCPKeepAlive field. Go's ServerTransportConfig.Complete() defaults TCPKeepAlive to 7200 seconds. Rust has no equivalent field, so server-side TCP keepalive interval is not configurable and relies on OS defaults.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/server.go:167-168 (TCPKeepAlive int64, Complete sets to 7200 at line 185)",
+    "severity": "LOW"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 892,
+    "description": "ClientConfig missing DialServerTimeout field. Go's ClientTransportConfig.Complete() defaults DialServerTimeout to 10 seconds. Rust has no configurable dial timeout, relying on tokio/tcp default timeout behavior.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/client.go:111 (DialServerTimeout int64, Complete sets to 10 at line 150)",
+    "severity": "LOW"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 1077,
+    "description": "VisitorConfig missing separate use_encryption/use_compression from transport nesting. Go v1 nests these under Transport (VisitorTransport) in the visitor config. Rust has them as flat fields in VisitorConfig, which is correct functionally but structurally different from Go's format in the TOML.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/visitor.go:24-27 (VisitorTransport struct with UseEncryption, UseCompression)",
+    "severity": "LOW"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 730,
+    "description": "AuthClientConfig.additional_endpoint_params is a String in Rust but map[string]string in Go. Go stores OIDC additional endpoint params as a map for flexible parameter injection. Rust stores them as a flat string, losing the map structure.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/client.go:226 (AdditionalEndpointParams map[string]string)",
+    "severity": "LOW"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 124,
+    "description": "nat_hole_analysis_data_reserve_hours has no serde alias for 'natholeAnalysisDataReserveHours'. Go JSON tag is 'natholeAnalysisDataReserveHours'. Only snake_case form works in Rust config. However, the field is rarely used explicitly (default 168 hours = 7 days is sufficient for most).",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/server.go:94 (NatHoleAnalysisDataReserveHours, JSON tag 'natholeAnalysisDataReserveHours')",
+    "severity": "LOW"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 592,
+    "description": "ServerTransportConfig missing QUIC options sub-struct. Go's ServerTransportConfig has nested QUICOptions with KeepalivePeriod (10), MaxIdleTimeout (30), MaxIncomingStreams (100000). Rust's QUIC configuration does not expose these tuning parameters.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/common.go:38-48 (QUICOptions struct and Complete defaults)",
+    "severity": "LOW"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 892,
+    "description": "ClientConfig missing QUIC options and WireProtocol field. Go's ClientTransportConfig has QUICOptions and WireProtocol (default 'v1'). Rust handles wire protocol as a 'v2: bool' flag (derived via normalization from wireProtocol='v2'), losing the v1 string semantics.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/client.go:108-109 (WireProtocol defaults to v1), 134 (QUIC options)",
+    "severity": "LOW"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 1382,
+    "description": "Server config normalization does not map top-level 'heartbeat_timeout' (from legacy flat configs) into [transport] section. Only tcp_mux and tcp_mux_keepalive_interval are flattened into transport. heartbeat_timeout at top level is silently dropped by serde.",
+    "go_ref": "/tmp/frp-source/pkg/config/legacy/server.go:188 (HeartbeatTimeout as flat legacy field)",
+    "severity": "LOW"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 282,
+    "description": "ServerConfig.Default() sets heartbeat_timeout=90 regardless of tcp_mux. Go's ServerTransportConfig.Complete() conditionally sets heartbeat_timeout to -1 when tcp_mux=true, disabling application-layer heartbeats. The Rust ServerTransportConfig::complete() in the load path corrects this, but direct use of Default::default() gives wrong value.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/server.go:187-193 (conditional heartbeat timeout in Complete)",
+    "severity": "LOW"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 28,
+    "description": "sudp_port is a Rust extension not present in Go v1 ServerConfig. Go v1 has no shared SUDP port field at the server config level.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/server.go:24-99 (ServerConfig struct — no sudp_port)",
+    "severity": "LOW"
+  },
+  {
+    "file": "frp-core/src/config.rs",
+    "line": 36,
+    "description": "websocket_port is a Rust extension not present in Go v1 ServerConfig. Go upgrades WebSocket connections on the main bind port, not a separate port.",
+    "go_ref": "/tmp/frp-source/pkg/config/v1/server.go:24-99 (ServerConfig struct — no websocket_port)",
+    "severity": "LOW"
+  }
+]

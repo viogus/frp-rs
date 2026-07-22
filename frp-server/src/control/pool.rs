@@ -20,8 +20,19 @@ use super::{write_ctl_msg, ControlContext, ControlState};
 
 // ---- Constants ----
 
-/// Max age of a pending request before it is dropped (Go frp: 10s default).
-pub(super) const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default max age of a pending request when no user_conn_timeout configured.
+const DEFAULT_PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Return the pending request timeout from the configured user_conn_timeout (seconds),
+/// or the 10s default when the configured value is 0 (unset).
+#[inline]
+pub(super) fn pending_request_timeout(user_conn_timeout_secs: u64) -> Duration {
+    if user_conn_timeout_secs > 0 {
+        Duration::from_secs(user_conn_timeout_secs)
+    } else {
+        DEFAULT_PENDING_REQUEST_TIMEOUT
+    }
+}
 
 /// Max work connections to pool beyond what the client requested (Go frp: poolCount + 10).
 pub(crate) const WORK_POOL_EXTRA: usize = 10;
@@ -169,7 +180,7 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
     debug!(run_id = %ctx.run_id, "Got work conn for run_id {}", ctx.run_id);
     // Expire stale pending NatHoleSid entries first.
     while let Some((sid, _pn, ts)) = ctl.pending_nat_hole_sids.pop_front() {
-        if ts.elapsed() > PENDING_REQUEST_TIMEOUT {
+        if ts.elapsed() > pending_request_timeout(ctx.state.user_conn_timeout) {
             debug!(sid = %sid, "Pending NatHoleSid {} timed out", sid);
         } else {
             ctl.pending_nat_hole_sids.push_front((sid, _pn, ts));
@@ -205,7 +216,7 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
     } else {
         // Expire stale pending UDP requests first
         while let Some((pn, ts)) = ctl.pending_udp.pop_front() {
-            if ts.elapsed() > PENDING_REQUEST_TIMEOUT {
+            if ts.elapsed() > pending_request_timeout(ctx.state.user_conn_timeout) {
                 debug!(proxy_name = %pn, "Pending UDP work conn for '{}' timed out", pn);
             } else {
                 ctl.pending_udp.push_front((pn, ts));
@@ -234,7 +245,7 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
         } else {
             // Drain expired TCP requests
             while let Some(req) = ctl.pending_requests.front() {
-                if req.created_at.elapsed() > PENDING_REQUEST_TIMEOUT {
+                if req.created_at.elapsed() > pending_request_timeout(ctx.state.user_conn_timeout) {
                     ctl.pending_requests.pop_front();
                     ctx.pool_stats
                         .pending_requests

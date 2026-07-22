@@ -843,7 +843,7 @@ pub struct ClientConfig {
     pub disable_custom_tls_first_byte: bool,
     #[serde(default)]
     pub log: LogConfig,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub login_fail_exit: bool,
     #[serde(default)]
     pub pool_count: i32,
