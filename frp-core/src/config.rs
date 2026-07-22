@@ -1479,7 +1479,12 @@ fn normalize_server_config(value: &mut toml::Value) {
         // MEDIUM-9: Normalize legacy top-level transport fields into [transport]
         flatten_to_table(
             table,
-            &["heartbeat_timeout", "max_pool_count", "heartbeatTimeout", "maxPoolCount"],
+            &[
+                "heartbeat_timeout",
+                "max_pool_count",
+                "heartbeatTimeout",
+                "maxPoolCount",
+            ],
             "transport",
             &[],
         );
@@ -1505,8 +1510,12 @@ fn normalize_server_config(value: &mut toml::Value) {
         }
 
         // MEDIUM-8: Normalize top-level custom_404_page / custom404Page → web_server.custom_404_page
-        if let Some(v) = table.remove("custom_404_page").or_else(|| table.remove("custom404Page")) {
-            let ws_table = table.entry("web_server")
+        if let Some(v) = table
+            .remove("custom_404_page")
+            .or_else(|| table.remove("custom404Page"))
+        {
+            let ws_table = table
+                .entry("web_server")
                 .or_insert_with(|| toml::Value::Table(Default::default()));
             if let toml::Value::Table(ref mut ws) = ws_table {
                 ws.entry("custom_404_page".to_string()).or_insert(v);
@@ -1522,7 +1531,11 @@ fn normalize_server_config(value: &mut toml::Value) {
                         let path = pt.get("path").and_then(|v| v.as_str()).map(String::from);
                         if let Some(addr) = addr {
                             let url = if let Some(p) = path {
-                                let p = if p.starts_with('/') { p } else { format!("/{}", p) };
+                                let p = if p.starts_with('/') {
+                                    p
+                                } else {
+                                    format!("/{}", p)
+                                };
                                 format!("{}{}", addr.trim_end_matches('/'), p)
                             } else {
                                 addr
@@ -3170,7 +3183,9 @@ bindPort = 2200
         let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
         let p = &cfg.proxies[0];
         assert_eq!(
-            p.response_headers.get("X-Frame-Options").map(|s| s.as_str()),
+            p.response_headers
+                .get("X-Frame-Options")
+                .map(|s| s.as_str()),
             Some("DENY")
         );
     }
@@ -3206,7 +3221,10 @@ tokenEndpointURL = "https://auth.example.com/token"
         let cfg: super::ServerConfig = super::load_server_config_from_str(toml).unwrap();
         assert_eq!(cfg.auth.oidc_issuer, "https://auth.example.com");
         assert_eq!(cfg.auth.oidc_audience, "https://api.example.com");
-        assert_eq!(cfg.auth.oidc_token_endpoint, "https://auth.example.com/token");
+        assert_eq!(
+            cfg.auth.oidc_token_endpoint,
+            "https://auth.example.com/token"
+        );
     }
 
     // ── MEDIUM-6: HTTP plugins addr+path normalization ─────────────────

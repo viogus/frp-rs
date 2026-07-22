@@ -285,7 +285,9 @@ impl Controller {
                             // Use stored analysis key set during get_recommend_behaviors.
                             // Go frp compat: genAnalysisKey includes mapped IPs, so the
                             // key must match the one used when the recommendation was made.
-                            let key = session.analysis_key.lock()
+                            let key = session
+                                .analysis_key
+                                .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .clone()
                                 .unwrap_or_default();
@@ -428,9 +430,20 @@ impl Controller {
 /// incorporates first IP of each peer's mapped_addrs into the key).
 /// Uses a canonical string representation — stable across Rust versions and
 /// platforms, and human-readable for debugging.
-pub fn gen_analysis_key(c: &NatFeature, v: &NatFeature, c_mapped: &[String], v_mapped: &[String]) -> String {
-    let c_first_ip = c_mapped.first().and_then(|a| a.rsplit(':').nth(1)).unwrap_or("");
-    let v_first_ip = v_mapped.first().and_then(|a| a.rsplit(':').nth(1)).unwrap_or("");
+pub fn gen_analysis_key(
+    c: &NatFeature,
+    v: &NatFeature,
+    c_mapped: &[String],
+    v_mapped: &[String],
+) -> String {
+    let c_first_ip = c_mapped
+        .first()
+        .and_then(|a| a.rsplit(':').nth(1))
+        .unwrap_or("");
+    let v_first_ip = v_mapped
+        .first()
+        .and_then(|a| a.rsplit(':').nth(1))
+        .unwrap_or("");
     format!(
         "{}:{}:{}:{}|{}:{}:{}:{}",
         c.nat_type,

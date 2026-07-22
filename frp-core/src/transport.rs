@@ -3174,8 +3174,6 @@ impl rustls::client::danger::ServerCertVerifier for InsecureSkipVerify {
     }
 }
 
-
-
 /// A stream wrapper that yields pre-read bytes before the inner stream.
 /// Used when bytes have been consumed for protocol detection (e.g., SNI peek)
 /// but need to be replayed for the actual protocol handler (e.g., TLS handshake).

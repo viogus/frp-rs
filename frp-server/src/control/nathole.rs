@@ -658,12 +658,14 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
                 nat_hole.analyzer.get_recommend_behaviors(&key, cf, vf);
             analysis_index = Some(index);
 
-            let extra_timeout = if c_behavior.listen_random_ports > 0 || v_behavior.listen_random_ports > 0 {
-                30000
-            } else {
-                0
-            };
-            let timeout_ms = c_behavior.send_delay_ms.max(v_behavior.send_delay_ms) + 5000 + extra_timeout;
+            let extra_timeout =
+                if c_behavior.listen_random_ports > 0 || v_behavior.listen_random_ports > 0 {
+                    30000
+                } else {
+                    0
+                };
+            let timeout_ms =
+                c_behavior.send_delay_ms.max(v_behavior.send_delay_ms) + 5000 + extra_timeout;
             let v_read_timeout = timeout_ms - v_behavior.send_delay_ms;
             let c_read_timeout = timeout_ms - c_behavior.send_delay_ms;
 
