@@ -60,16 +60,19 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
 
     let mut failures: u32 = 0;
     let mut was_failed = false;
+    // Track whether the proxy has ever been healthy (Go frp: statusOK).
+    // Close is only fired after the proxy was healthy at least once.
+    let mut was_healthy = false;
 
     loop {
-        // Check cancellation before each sleep/check cycle.
+        // Check cancellation before each check cycle.
         if cancel.load(Ordering::Relaxed) {
             info!(proxy_name = %proxy_name, "Health check cancelled for '{}'", proxy_name);
             return;
         }
 
-        tokio::time::sleep(interval).await;
-
+        // Run check first, then sleep (Go frp compat: check happens immediately on start,
+        // then sleep for interval duration before the next check).
         let result = if check_type == "http" {
             run_http_check(&local_addr, &check_url, timeout, &hc_headers).await
         } else {
@@ -79,6 +82,7 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
         match result {
             Ok(()) => {
                 failures = 0;
+                was_healthy = true;
                 if was_failed {
                     // Service recovered. Notify control loop to re-register.
                     info!(proxy_name = %proxy_name, "Health check recovered for '{}', sending Recover event", proxy_name);
@@ -95,13 +99,17 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
             }
         }
 
-        if failures >= max_failed && !was_failed {
+        // Go frp compat: only fire Close after the proxy was ever healthy.
+        // (statusOK must be true before transitioning to false triggers the callback).
+        if was_healthy && failures >= max_failed && !was_failed {
             was_failed = true;
             warn!(proxy_name = %proxy_name, max_failed = %max_failed, "Health check: proxy '{}' exceeded max failures ({}), sending Close event",
                 proxy_name, max_failed);
             let _ = health_tx.send(HealthEvent::Close(proxy_name.clone())).await;
             // Keep running -- monitor for recovery (Go frp compat).
         }
+
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -127,13 +135,24 @@ pub(crate) async fn run_http_check(
         .map_err(|_| "connect timeout".to_string())?
         .map_err(|e| format!("TCP connect: {e}"))?;
 
-    // Extract host from addr (strip port for Host header)
-    let host = addr.split(':').next().unwrap_or(addr);
+    // Extract host from addr (strip port for Host header).
+    let default_host = addr.split(':').next().unwrap_or(addr);
+    // Support custom Host header override from user-configured headers (Go frp compat).
+    let host = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or(default_host);
+    // Use HTTP/1.1 (Go frp compat: http.NewRequestWithContext defaults to HTTP/1.1).
     let mut req = format!(
-        "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close",
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close",
         url, host
     );
     for (key, value) in headers {
+        // Skip Host header — already included above with the resolved host value.
+        if key.eq_ignore_ascii_case("host") {
+            continue;
+        }
         req.push_str(&format!("\r\n{}: {}", key, value));
     }
     req.push_str("\r\n\r\n");

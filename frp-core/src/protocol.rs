@@ -2,10 +2,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::msg::{self, FrpMessage};
 
-pub const V1_MAX_MSG_LENGTH: i64 = 64 * 1024;
-/// Go frp v0.70.0 default max message length is 10 KiB.
-/// Messages exceeding this threshold trigger a warning for Go compat debugging.
-pub const V1_WARN_MSG_LENGTH: usize = 10 * 1024;
+/// Go frp's defaultMaxMsgLength is 10KB (10240). Rust must not send
+/// messages larger than this to remain compatible with Go peers.
+pub const V1_MAX_MSG_LENGTH: i64 = 10_240;
 pub const V1_HEADER_LEN: usize = 9;
 
 pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
@@ -21,13 +20,6 @@ pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
 
     if payload.len() as u64 > V1_MAX_MSG_LENGTH as u64 {
         return Err(crate::Error::Protocol("V1 message too large".into()));
-    }
-    if payload.len() > V1_WARN_MSG_LENGTH {
-        tracing::warn!(
-            type_byte = %type_byte,
-            payload_len = payload.len(),
-            "V1 message exceeds Go frp 10 KiB limit"
-        );
     }
 
     let mut buf = Vec::with_capacity(V1_HEADER_LEN + payload.len());
@@ -79,18 +71,11 @@ pub async fn read_v1_frame<R: AsyncReadExt + Unpin>(
     if length > V1_MAX_MSG_LENGTH as u64 {
         return Err(crate::Error::Protocol(
             format!(
-                "invalid V1 msg length: {length}, raw header: {}",
+                "invalid V1 msg length: {length} (max: {V1_MAX_MSG_LENGTH}), raw header: {}",
                 crate::hex_encode(&header)
             )
             .into(),
         ));
-    }
-    if length > V1_WARN_MSG_LENGTH as u64 {
-        tracing::warn!(
-            type_byte = %type_byte,
-            length = %length,
-            "V1 frame exceeds Go frp 10 KiB limit"
-        );
     }
 
     let length = length as usize;
@@ -133,20 +118,12 @@ pub async fn read_msg_v1<R: AsyncReadExt + Unpin>(
     if length > V1_MAX_MSG_LENGTH as u64 {
         return Err(crate::Error::Protocol(
             format!(
-                "invalid V1 msg length: {length}, raw header: {}",
+                "invalid V1 msg length: {length} (max: {V1_MAX_MSG_LENGTH}), raw header: {}",
                 crate::hex_encode(&header)
             )
             .into(),
         ));
     }
-    if length > V1_WARN_MSG_LENGTH as u64 {
-        tracing::warn!(
-            type_byte = %type_byte,
-            length = %length,
-            "V1 message exceeds Go frp 10 KiB limit"
-        );
-    }
-
     let length = length as usize;
     // Use the global buffer pool for small payloads (<= BUFFER_SIZE, 32 KiB
     // by default).  Larger payloads fall back to a heap allocation.  The
@@ -553,16 +530,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_v1_frame_max_payload() {
-        // 65535-byte payload should be accepted
-        let payload = vec![b'x'; 65535];
-        let (mut client, mut server) = duplex(131072);
-        // Write manually a 65535-byte payload with type byte = Ping
+        // Go frp defaultMaxMsgLength is 10KB (10240); max payload is V1_MAX_MSG_LENGTH.
+        let payload = vec![b'x'; V1_MAX_MSG_LENGTH as usize];
+        let (mut client, mut server) = duplex(V1_MAX_MSG_LENGTH as usize * 2);
+        // Write manually a max-size payload with type byte = Ping
         let mut header = vec![msg::TYPE_PING];
-        header.extend_from_slice(&65535i64.to_be_bytes());
+        header.extend_from_slice(&V1_MAX_MSG_LENGTH.to_be_bytes());
         client.write_all(&header).await.expect("write header");
         client.write_all(&payload).await.expect("write payload");
         let (_ty, data) = read_v1_frame(&mut server).await.expect("read");
-        assert_eq!(data.len(), 65535);
+        assert_eq!(data.len(), V1_MAX_MSG_LENGTH as usize);
         assert_eq!(&data, &payload);
     }
 

@@ -209,28 +209,32 @@ fn default_token_auth_timeout() -> bool {
     true
 }
 
-/// Parse a bandwidth limit string like "1MB", "500KB", "100K".
+/// Parse a bandwidth limit string like "1MB", "500KB", "100KB".
 /// Returns bytes per second, or None if unparseable.
-/// Supports suffixes: K/KB, M/MB, G/GB (case-insensitive).
+/// Go frp compat: only supports "MB", "KB", "GB" suffixes (case-insensitive).
+/// Bare numbers and single-letter suffixes ("M", "K", "G") are rejected.
+/// Empty string returns Some(0) (no limit, Go compat).
+///
+/// Note: Empty string returns `Some(0)` (not `None`) so callers using `is_some()`
+/// will treat empty as a valid config value. This matches Go frp's behavior where
+/// an empty bandwidth limit field means "no limit" (effectively 0). Callers that
+/// need to distinguish "not set" from "set to 0" should check `is_empty()` before
+/// calling this function.
 pub fn parse_bandwidth_limit(s: &str) -> Option<u64> {
     if s.is_empty() {
-        return None;
+        return Some(0);
     }
     let s = s.trim().to_uppercase();
     let (num_str, mult) = if let Some(rest) = s.strip_suffix("GB") {
         (rest.trim(), 1_073_741_824u64)
-    } else if let Some(rest) = s.strip_suffix('G') {
-        (rest.trim(), 1_073_741_824u64)
     } else if let Some(rest) = s.strip_suffix("MB") {
         (rest.trim(), 1_048_576u64)
-    } else if let Some(rest) = s.strip_suffix('M') {
-        (rest.trim(), 1_048_576u64)
-    } else if let Some(rest) = s.strip_suffix("KB") {
-        (rest.trim(), 1024u64)
-    } else if let Some(rest) = s.strip_suffix('K') {
-        (rest.trim(), 1024u64)
     } else {
-        (&s[..], 1u64)
+        // Go requires a suffix; bare numbers and single-letter suffixes are invalid.
+        // `?` propagates None out of this Option-returning function when "KB" suffix
+        // is absent, rejecting bare numbers ("500") and single-letter ("500K").
+        let rest = s.strip_suffix("KB")?;
+        (rest.trim(), 1024u64)
     };
     let num: f64 = num_str.parse().ok()?;
     if num <= 0.0 {
@@ -984,9 +988,21 @@ impl ClientConfig {
             // unnecessary — rely on yamux keepalive instead (Go compat).
             if self.heartbeat_interval == default_heartbeat_interval() {
                 self.heartbeat_interval = -1;
+                tracing::warn!(
+                    "heartbeat_interval overridden to -1 because tcp_mux is enabled; \
+                     if heartbeat_interval was explicitly set to {} it is also overridden \
+                     (cannot distinguish default from explicit with i64 type)",
+                    default_heartbeat_interval(),
+                );
             }
             if self.heartbeat_timeout == default_heartbeat_timeout() {
                 self.heartbeat_timeout = -1;
+                tracing::warn!(
+                    "heartbeat_timeout overridden to -1 because tcp_mux is enabled; \
+                     if heartbeat_timeout was explicitly set to {} it is also overridden \
+                     (cannot distinguish default from explicit with i64 type)",
+                    default_heartbeat_timeout(),
+                );
             }
         }
     }
@@ -1285,9 +1301,25 @@ fn validate_proxy_configs(proxies: &[ProxyConfig]) -> Result<(), String> {
 
         // Validate bandwidth_limit: non-empty strings must parse
         if !p.bandwidth_limit.is_empty() && parse_bandwidth_limit(&p.bandwidth_limit).is_none() {
+            let hint = if p.bandwidth_limit == "0" || p.bandwidth_limit == "0KB" {
+                "value must be positive; use empty string for no limit"
+            } else {
+                "must be a positive number followed by KB, MB, or GB"
+            };
             return Err(format!(
-                "proxy '{}': invalid bandwidth_limit: {:?}",
-                p.name, p.bandwidth_limit
+                "proxy '{}': invalid bandwidth_limit: {:?} ({})",
+                p.name, p.bandwidth_limit, hint
+            ));
+        }
+
+        // Validate bandwidth_limit_mode: must be "client" or "server" (Go frp compat).
+        if !p.bandwidth_limit_mode.is_empty()
+            && p.bandwidth_limit_mode != "client"
+            && p.bandwidth_limit_mode != "server"
+        {
+            return Err(format!(
+                "proxy '{}': invalid bandwidth_limit_mode: {:?}, must be \"client\" or \"server\"",
+                p.name, p.bandwidth_limit_mode
             ));
         }
     }
@@ -1471,7 +1503,12 @@ fn normalize_server_config(value: &mut toml::Value) {
         );
         flatten_to_table(
             table,
-            &["tcp_mux", "tcp_mux_keepalive_interval"],
+            &[
+                "tcp_mux",
+                "tcp_mux_keepalive_interval",
+                "heartbeat_timeout",
+                "max_pool_count",
+            ],
             "transport",
             &[],
         );
@@ -2488,23 +2525,28 @@ remote_port = 7001
 
     #[test]
     fn test_parse_bandwidth_limit_edge_cases() {
-        // Empty/zero → None (no limit)
-        assert_eq!(parse_bandwidth_limit(""), None);
+        // Empty → Some(0) (no limit, Go compat)
+        assert_eq!(parse_bandwidth_limit(""), Some(0));
+        // Bare number without suffix → None (Go requires "KB"/"MB"/"GB")
         assert_eq!(parse_bandwidth_limit("0"), None);
 
-        // KB variants (binary: 1KB = 1024)
+        // KB variant (binary: 1KB = 1024)
         assert_eq!(parse_bandwidth_limit("1KB"), Some(1024));
-        assert_eq!(parse_bandwidth_limit("1K"), Some(1024));
 
-        // MB variants
+        // Single-letter suffix "K" → None (Go requires "KB")
+        assert_eq!(parse_bandwidth_limit("1K"), None);
+
+        // MB variant
         assert_eq!(parse_bandwidth_limit("1MB"), Some(1_048_576));
-        assert_eq!(parse_bandwidth_limit("1M"), Some(1_048_576));
+
+        // Single-letter suffix "M" → None (Go requires "MB")
+        assert_eq!(parse_bandwidth_limit("1M"), None);
 
         // GB variant
         assert_eq!(parse_bandwidth_limit("1GB"), Some(1_073_741_824));
 
-        // Plain bytes
-        assert_eq!(parse_bandwidth_limit("500"), Some(500));
+        // Bare number → None (Go requires a suffix)
+        assert_eq!(parse_bandwidth_limit("500"), None);
 
         // Case insensitive (input uppercased internally)
         assert_eq!(parse_bandwidth_limit("1mb"), Some(1_048_576));

@@ -30,6 +30,7 @@ reqwest = { workspace = true, optional = true }
 rand.workspace = true
 rand010 = { package = "rand", version = "0.10", optional = true }  # NOTE: rand 0.10 required by russh 0.61 for SSH feature. Workspace uses rand 0.8. Track russh upstream migration to unified rand version.
 ring.workspace = true
+md-5.workspace = true
 
 [features]
 default = ["ssh", "dashboard", "websocket", "quic", "kcp", "oidc", "tls", "http-proxy", "vnet", "compression", "chacha20", "tcp-mux"]

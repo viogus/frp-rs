@@ -424,36 +424,60 @@ impl Controller {
     }
 }
 
+/// Extract the IP portion from an "ip:port" address string.
+/// Handles IPv4 ("1.2.3.4:1234") and bracketed IPv6 ("[::1]:8080").
+fn extract_ip_from_addr(addr: &str) -> Option<String> {
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return None;
+    }
+    if addr.starts_with('[') {
+        // Bracketed IPv6: [::1]:8080
+        let close = addr.find(']')?;
+        Some(addr[1..close].to_string())
+    } else {
+        // IPv4 or hostname — split on last ':'
+        let colon = addr.rfind(':')?;
+        Some(addr[..colon].to_string())
+    }
+}
+
 /// Generate a stable analysis key from two NAT features for analyzer lookup.
-/// Includes the first mapped IP of each peer to distinguish different IP pairs
-/// with the same NAT characteristics (Go frp v0.69.1 compat: genAnalysisKey
-/// incorporates first IP of each peer's mapped_addrs into the key).
-/// Uses a canonical string representation — stable across Rust versions and
-/// platforms, and human-readable for debugging.
+/// Includes IP addresses from each peer's mapped addresses to prevent score
+/// contamination between different peer pairs with the same NAT profiles.
+/// Go frp v0.69.1 compat: controller.go GenAnalysisKey uses MD5(clientIP + visitorIP).
 pub fn gen_analysis_key(
     c: &NatFeature,
     v: &NatFeature,
-    c_mapped: &[String],
-    v_mapped: &[String],
+    client_mapped: &[String],
+    visitor_mapped: &[String],
 ) -> String {
-    let c_first_ip = c_mapped
+    // Extract first IP from each peer's mapped addresses for key isolation.
+    let c_ip = client_mapped
         .first()
-        .and_then(|a| a.rsplit(':').nth(1))
-        .unwrap_or("");
-    let v_first_ip = v_mapped
+        .and_then(|a| extract_ip_from_addr(a))
+        .unwrap_or_default();
+    let v_ip = visitor_mapped
         .first()
-        .and_then(|a| a.rsplit(':').nth(1))
-        .unwrap_or("");
+        .and_then(|a| extract_ip_from_addr(a))
+        .unwrap_or_default();
+
+    // MD5 hex digest of combined IPs (Go frp compat).
+    let ip_hash = {
+        use md5::{Digest, Md5};
+        let result = Md5::digest(format!("{c_ip}{v_ip}").as_bytes());
+        format!("{result:x}")
+    };
+
     format!(
-        "{}:{}:{}:{}|{}:{}:{}:{}",
+        "{}:{}:{}|{}:{}:{}|{}",
         c.nat_type,
         c.behavior,
         c.regular_ports_change as u8,
-        c_first_ip,
         v.nat_type,
         v.behavior,
         v.regular_ports_change as u8,
-        v_first_ip,
+        ip_hash,
     )
 }
 

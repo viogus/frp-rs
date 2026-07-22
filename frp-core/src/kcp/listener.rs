@@ -45,7 +45,6 @@ impl KcpListener {
         if let Err(e) = socket2::SockRef::from(&socket).set_send_buffer_size(KCP_UDP_SNDBUF) {
             tracing::debug!(error = %e, "KCP: failed to set SO_SNDBUF to {} (continuing with OS default)", KCP_UDP_SNDBUF);
         }
-
         let socket = Arc::new(socket);
 
         let (kcp_socket, handle, accept_rx) = KcpSocket::new(socket, config);

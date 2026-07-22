@@ -401,7 +401,7 @@ pub(crate) async fn handle_new_proxy(
                 let http_user = np.http_user.as_deref().unwrap_or("");
                 let http_pwd = np.http_pwd.as_deref().unwrap_or("");
                 let rubu = np.route_by_http_user.as_deref().unwrap_or("");
-                state
+                if let Err(conflict) = state
                     .vhost_manager
                     .register(
                         &np.proxy_name,
@@ -413,7 +413,30 @@ pub(crate) async fn handle_new_proxy(
                         http_pwd,
                         rubu,
                     )
+                    .await
+                {
+                    // Roll back previous registrations.
+                    state.used_ports.write().await.remove(&port);
+                    state
+                        .client_ports_used
+                        .write()
+                        .await
+                        .entry(run_id.to_string())
+                        .and_modify(|c| *c = c.saturating_sub(1));
+                    state.proxy_manager.remove(&np.proxy_name).await;
+                    reject_new_proxy(
+                        writer,
+                        &np.proxy_name,
+                        err_msg(
+                            state.detailed_errors_to_client,
+                            conflict.to_string(),
+                            "vhost route config conflict",
+                        ),
+                        v2,
+                    )
                     .await;
+                    return;
+                }
                 info!(proxy_name = %np.proxy_name, domains = ?domains, locations = ?locations, hhr = ?hhr, "VHost routes registered for '{}': domains={:?}, locations={:?}, rewrite={:?}",
                     np.proxy_name, domains, locations, hhr);
             }
@@ -445,7 +468,7 @@ pub(crate) async fn handle_new_proxy(
                 let http_user = np.http_user.as_deref().unwrap_or("");
                 let http_pwd = np.http_pwd.as_deref().unwrap_or("");
                 let rubu = np.route_by_http_user.as_deref().unwrap_or("");
-                state
+                if let Err(conflict) = state
                     .vhost_manager
                     .register(
                         &np.proxy_name,
@@ -457,7 +480,30 @@ pub(crate) async fn handle_new_proxy(
                         http_pwd,
                         rubu,
                     )
+                    .await
+                {
+                    // Roll back previous registrations.
+                    state.used_ports.write().await.remove(&port);
+                    state
+                        .client_ports_used
+                        .write()
+                        .await
+                        .entry(run_id.to_string())
+                        .and_modify(|c| *c = c.saturating_sub(1));
+                    state.proxy_manager.remove(&np.proxy_name).await;
+                    reject_new_proxy(
+                        writer,
+                        &np.proxy_name,
+                        err_msg(
+                            state.detailed_errors_to_client,
+                            conflict.to_string(),
+                            "vhost route config conflict",
+                        ),
+                        v2,
+                    )
                     .await;
+                    return;
+                }
                 info!(
                     proxy_name = %np.proxy_name, domains = ?domains, "VHost SNI routes registered for HTTPS proxy '{}': domains={:?}",
                     np.proxy_name, domains

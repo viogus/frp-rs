@@ -1211,6 +1211,7 @@ dependencies = [
  "frp-core",
  "frp-vnet",
  "jsonwebtoken",
+ "md-5",
  "prometheus",
  "rand 0.10.1",
  "rand 0.8.6",

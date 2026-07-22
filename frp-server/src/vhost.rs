@@ -26,19 +26,57 @@ pub struct VhostRoute {
     pub route_by_http_user: String,
 }
 
-/// Internal tables held under a single RwLock.
-struct VhostTables {
-    /// domain → route (host-based routing)
-    routes: HashMap<String, VhostRoute>,
-    /// path prefix → route (location-based routing)
-    location_routes: HashMap<String, VhostRoute>,
-    /// proxy_name → domains
-    by_proxy: HashMap<String, Vec<String>>,
-    /// proxy_name → location prefixes
-    by_proxy_locations: HashMap<String, Vec<String>>,
+/// Error returned when an exact (domain, route_by_http_user) route already exists.
+/// Corresponds to Go frp's `ErrRouterConfigConflict`.
+#[derive(Debug, Clone)]
+pub struct RouterConfigConflict {
+    pub domain: String,
+    pub route_by_http_user: String,
+    pub existing_proxy: String,
+    pub incoming_proxy: String,
 }
 
-/// Manages HTTP VHost routing table (domain + location → proxy).
+impl std::fmt::Display for RouterConfigConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "router config conflict for domain '{}' route_by_http_user '{}': proxy '{}' vs '{}'",
+            self.domain, self.route_by_http_user, self.existing_proxy, self.incoming_proxy
+        )
+    }
+}
+
+impl std::error::Error for RouterConfigConflict {}
+
+/// Try httpUser-specific route first, then fall back to empty-string httpUser
+/// (matching Go frp's `getExactOrAllUsersLocked`).
+fn route_for_user(
+    routes: &HashMap<String, HashMap<String, VhostRoute>>,
+    domain: &str,
+    http_user: &str,
+) -> Option<VhostRoute> {
+    let user_map = routes.get(domain)?;
+    user_map
+        .get(http_user)
+        .or_else(|| user_map.get(""))
+        .cloned()
+}
+
+/// Internal tables held under a single RwLock.
+struct VhostTables {
+    /// domain -> { route_by_http_user -> VhostRoute }
+    /// Supports multiple routes per domain differentiated by route_by_http_user
+    /// (matching Go frp's `map[string]routerByHTTPUser`).
+    routes: HashMap<String, HashMap<String, VhostRoute>>,
+    /// path prefix -> { route_by_http_user -> VhostRoute }
+    location_routes: HashMap<String, HashMap<String, VhostRoute>>,
+    /// proxy_name -> Vec<(domain, route_by_http_user)>
+    by_proxy: HashMap<String, Vec<(String, String)>>,
+    /// proxy_name -> Vec<(location, route_by_http_user)>
+    by_proxy_locations: HashMap<String, Vec<(String, String)>>,
+}
+
+/// Manages HTTP VHost routing table (domain + location -> proxy).
 pub struct VhostManager {
     inner: RwLock<VhostTables>,
 }
@@ -72,7 +110,7 @@ impl VhostManager {
         http_user: &str,
         http_pwd: &str,
         route_by_http_user: &str,
-    ) {
+    ) -> Result<(), RouterConfigConflict> {
         let route = VhostRoute {
             proxy_name: proxy_name.to_string(),
             run_id: run_id.to_string(),
@@ -85,102 +123,160 @@ impl VhostManager {
 
         let mut tables = self.inner.write().await;
 
-        let mut domains_for_proxy = Vec::new();
+        // Check for conflicts: for each domain, if the exact (domain, route_by_http_user)
+        // pair already exists, return Err (matching Go's ErrRouterConfigConflict).
         for domain in domains {
-            tables.routes.insert(domain.clone(), route.clone());
-            domains_for_proxy.push(domain.clone());
-        }
-        if !domains_for_proxy.is_empty() {
-            tables
-                .by_proxy
-                .insert(proxy_name.to_string(), domains_for_proxy);
+            if let Some(http_user_map) = tables.routes.get(domain) {
+                if let Some(existing) = http_user_map.get(route_by_http_user) {
+                    return Err(RouterConfigConflict {
+                        domain: domain.clone(),
+                        route_by_http_user: route_by_http_user.to_string(),
+                        existing_proxy: existing.proxy_name.clone(),
+                        incoming_proxy: proxy_name.to_string(),
+                    });
+                }
+            }
         }
 
-        let mut locs_for_proxy = Vec::new();
-        for loc in locations {
-            tables.location_routes.insert(loc.clone(), route.clone());
-            locs_for_proxy.push(loc.clone());
+        let mut domain_entries = Vec::new();
+        for domain in domains {
+            tables
+                .routes
+                .entry(domain.clone())
+                .or_default()
+                .insert(route_by_http_user.to_string(), route.clone());
+            domain_entries.push((domain.clone(), route_by_http_user.to_string()));
         }
-        if !locs_for_proxy.is_empty() {
+        if !domain_entries.is_empty() {
+            tables
+                .by_proxy
+                .insert(proxy_name.to_string(), domain_entries);
+        }
+
+        let mut loc_entries = Vec::new();
+        for loc in locations {
+            tables
+                .location_routes
+                .entry(loc.clone())
+                .or_default()
+                .insert(route_by_http_user.to_string(), route.clone());
+            loc_entries.push((loc.clone(), route_by_http_user.to_string()));
+        }
+        if !loc_entries.is_empty() {
             tables
                 .by_proxy_locations
-                .insert(proxy_name.to_string(), locs_for_proxy);
+                .insert(proxy_name.to_string(), loc_entries);
         }
+
+        Ok(())
     }
 
     pub async fn unregister(&self, proxy_name: &str) {
         let mut tables = self.inner.write().await;
 
-        if let Some(domains) = tables.by_proxy.remove(proxy_name) {
-            for domain in &domains {
-                tables.routes.remove(domain);
+        if let Some(entries) = tables.by_proxy.remove(proxy_name) {
+            for (domain, rubu) in &entries {
+                if let Some(http_user_map) = tables.routes.get_mut(domain) {
+                    http_user_map.remove(rubu);
+                    if http_user_map.is_empty() {
+                        tables.routes.remove(domain);
+                    }
+                }
             }
         }
-        if let Some(locs) = tables.by_proxy_locations.remove(proxy_name) {
-            for loc in &locs {
-                tables.location_routes.remove(loc);
+        if let Some(entries) = tables.by_proxy_locations.remove(proxy_name) {
+            for (loc, rubu) in &entries {
+                if let Some(http_user_map) = tables.location_routes.get_mut(loc) {
+                    http_user_map.remove(rubu);
+                    if http_user_map.is_empty() {
+                        tables.location_routes.remove(loc);
+                    }
+                }
             }
         }
     }
 
-    /// Look up by domain (exact match).
-    pub async fn lookup(&self, domain: &str) -> Option<VhostRoute> {
-        self.inner.read().await.routes.get(domain).cloned()
+    /// Look up by domain (exact match). Tries httpUser-specific route first,
+    /// then falls back to empty-string httpUser (match-all).
+    pub async fn lookup(&self, domain: &str, http_user: &str) -> Option<VhostRoute> {
+        let tables = self.inner.read().await;
+        route_for_user(&tables.routes, domain, http_user)
     }
 
     /// Look up by domain with wildcard support (Go frp dev compat).
     /// Tries exact match first, then progressively replaces the leftmost
-    /// label with "*" (e.g. "a.b.c" → "*.b.c" → "*.c"), then tries
-    /// the catch-all "*" wildcard.
-    pub async fn lookup_wildcard(&self, domain: &str) -> Option<VhostRoute> {
+    /// label with "*" (e.g. "a.b.c" → "*.b.c"), then tries the catch-all "*".
+    ///
+    /// For each candidate, tries httpUser-specific routes first, then falls
+    /// back to empty-string httpUser (matching Go's `getExactOrAllUsersLocked`).
+    ///
+    /// Only checks wildcards for domains with >=3 labels (matching Go frp's
+    /// `for len(hostSplit) >= 3` — prevents matching `*.com` for `example.com`).
+    pub async fn lookup_wildcard(&self, domain: &str, http_user: &str) -> Option<VhostRoute> {
         let routes = self.inner.read().await;
+
         // 1. Exact match
-        if let Some(route) = routes.routes.get(domain) {
-            return Some(route.clone());
+        if let Some(route) = route_for_user(&routes.routes, domain, http_user) {
+            return Some(route);
         }
-        // 2. Replace leftmost label with "*" progressively
+        // 2. Replace leftmost label with "*" progressively.
+        //    Only for domains with >=3 labels (matching Go's `for len(hostSplit) >= 3`).
         let mut parts: Vec<&str> = domain.split('.').collect();
-        while parts.len() > 1 {
+        while parts.len() > 2 {
             parts[0] = "*";
             let wildcard_host = parts.join(".");
-            if let Some(route) = routes.routes.get(&wildcard_host) {
-                return Some(route.clone());
+            if let Some(route) = route_for_user(&routes.routes, &wildcard_host, http_user) {
+                return Some(route);
             }
             parts = parts[1..].to_vec();
         }
         // 3. Catch-all "*"
-        routes.routes.get("*").cloned()
+        route_for_user(&routes.routes, "*", http_user)
     }
 
     /// Look up by URL path (longest prefix match among registered locations).
     /// Returns the VhostRoute whose location prefix best matches the given path.
-    pub async fn lookup_by_path(&self, path: &str) -> Option<VhostRoute> {
+    /// Tries httpUser-specific routes first, then falls back to empty-string httpUser.
+    pub async fn lookup_by_path(&self, path: &str, http_user: &str) -> Option<VhostRoute> {
         let tables = self.inner.read().await;
         // Find longest matching prefix
-        let mut best: Option<(&str, &VhostRoute)> = None;
-        for (prefix, route) in tables.location_routes.iter() {
+        let mut best: Option<(usize, VhostRoute)> = None;
+        for (prefix, user_map) in tables.location_routes.iter() {
             if path.starts_with(prefix.as_str()) {
-                match best {
-                    Some((best_prefix, _)) if prefix.len() > best_prefix.len() => {
-                        best = Some((prefix, route));
+                // Try httpUser-specific first, then empty-string fallback
+                let route = user_map
+                    .get(http_user)
+                    .or_else(|| user_map.get(""))
+                    .cloned();
+                if let Some(route) = route {
+                    match best {
+                        Some((best_len, _)) if prefix.len() > best_len => {
+                            best = Some((prefix.len(), route));
+                        }
+                        None => {
+                            best = Some((prefix.len(), route));
+                        }
+                        _ => {}
                     }
-                    None => {
-                        best = Some((prefix, route));
-                    }
-                    _ => {}
                 }
             }
         }
-        best.map(|(_, route)| route.clone())
+        best.map(|(_, route)| route)
     }
 
     /// Combined lookup: tries domain match first, then falls back to path-only match.
     /// If domain matches, returns that route (the route already carries its locations
     /// for the caller to verify path prefix).
     /// If no domain match, tries location-only routing.
-    pub async fn lookup_combined(&self, domain: &str, path: &str) -> Option<VhostRoute> {
+    /// `http_user` is the Basic Auth username from the request (empty if none).
+    pub async fn lookup_combined(
+        &self,
+        domain: &str,
+        path: &str,
+        http_user: &str,
+    ) -> Option<VhostRoute> {
         // Try host-based routing first (with wildcard support)
-        if let Some(route) = self.lookup_wildcard(domain).await {
+        if let Some(route) = self.lookup_wildcard(domain, http_user).await {
             // If the route has locations, verify path matches one of them
             if route.locations.is_empty() {
                 return Some(route);
@@ -190,13 +286,12 @@ impl VhostManager {
                     return Some(route);
                 }
             }
-            // Domain matched but no location matched — fall through to location-only
+            // Domain matched but no location matched -- fall through to location-only
         }
         // Try location-only routing (for proxies without custom_domains)
-        self.lookup_by_path(path).await
+        self.lookup_by_path(path, http_user).await
     }
 }
-
 /// Write an HTTP error response, optionally with a custom body.
 /// If custom_body is non-empty, it is used as the response body
 /// with Content-Type: text/html.
@@ -260,15 +355,28 @@ async fn serve_vhost_request<S>(
     };
     let path = extract_path(&request_text).unwrap_or("/");
 
-    debug!(host = %host, path = %path, peer = %peer, "{} VHost request for '{}' path '{}' from {}", scheme, host, path, peer);
+    // Parse Basic Auth once — reused for route matching, auth check,
+    // and per-user routing (Go frp compat: getByRoute(host, path, username)).
+    let http_auth = extract_basic_auth(&request_text);
+    let http_user = http_auth
+        .as_ref()
+        .map(|(u, _)| u.as_str())
+        .unwrap_or_default();
 
-    if let Some(route) = state.vhost_manager.lookup_combined(&host, path).await {
+    debug!(host = %host, path = %path, peer = %peer, http_user = %http_user, "{} VHost request for '{}' path '{}' from {}", scheme, host, path, peer);
+
+    if let Some(route) = state
+        .vhost_manager
+        .lookup_combined(&host, path, http_user)
+        .await
+    {
         // HTTP Basic Auth check (Go frp compat)
         if !route.http_user.is_empty() {
-            let auth_ok = extract_basic_auth(&request_text)
+            let auth_ok = http_auth
+                .as_ref()
                 .map(|(u, p)| {
-                    crate::constant_time_eq_str(&u, &route.http_user)
-                        && crate::constant_time_eq_str(&p, &route.http_pwd)
+                    crate::constant_time_eq_str(u, &route.http_user)
+                        && crate::constant_time_eq_str(p, &route.http_pwd)
                 })
                 .unwrap_or(false);
             if !auth_ok {
@@ -283,7 +391,7 @@ async fn serve_vhost_request<S>(
         // extract the Basic Auth username and look up proxy
         // `{route_by_http_user}.{username}` in the proxy manager.
         let (target_proxy_name, target_run_id) = if !route.route_by_http_user.is_empty() {
-            if let Some((username, _password)) = extract_basic_auth(&request_text) {
+            if let Some((username, _password)) = &http_auth {
                 let user_proxy = format!("{}.{}", route.route_by_http_user, username);
                 debug!(
                     host = %host, route_by_http_user = %route.route_by_http_user,
