@@ -1070,7 +1070,7 @@ impl Service {
                                 self.handle_nat_hole_resp(*resp, &mut pending_xtcp, &mut visitor_pending, &xtcp_sockets).await;
                             }
                             Ok(FrpMessage::NewProxyResp(resp)) => {
-                                let is_error = resp.error.as_ref().is_some_and(|e| !e.is_empty());
+                                let is_error = resp.error.as_ref().map_or(false, |e| !e.is_empty());
                                 if is_error {
                                     let err = resp.error.as_ref().unwrap();
                                     warn!(proxy_name = %resp.proxy_name, error = %err, "Proxy '{}' registration error: {}", resp.proxy_name, err);
