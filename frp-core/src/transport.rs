@@ -28,6 +28,11 @@ use tokio_rustls::TlsConnector;
 
 use crate::mux::YamuxStream;
 
+#[cfg(feature = "tls")]
+use rustls_platform_verifier::BuilderVerifierExt;
+#[cfg(feature = "tls")]
+use rustls_platform_verifier::ConfigVerifierExt;
+
 /// Go frp v0.69.1 FRPTLSHeadByte — sent before TLS handshake to allow
 /// mixed TLS/plaintext on the same port.
 pub const FRP_TLS_HEAD_BYTE: u8 = 0x17;
@@ -2230,7 +2235,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                             crate::Error::Transport(format!("write TLS head byte: {e}").into())
                         })?;
                     }
-                    let connector = build_tls_connector(
+                    let connector = build_tls_connector_skip_verify(
                         opts.tls_ca_file.as_deref(),
                         opts.tls_cert_file.as_deref(),
                         opts.tls_key_file.as_deref(),
@@ -2281,7 +2286,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                             crate::Error::Transport(format!("write TLS head byte: {e}").into())
                         })?;
                     }
-                    let connector = build_tls_connector(
+                    let connector = build_tls_connector_skip_verify(
                         opts.tls_ca_file.as_deref(),
                         opts.tls_cert_file.as_deref(),
                         opts.tls_key_file.as_deref(),
@@ -3014,10 +3019,12 @@ pub fn build_root_store(
     }
 }
 
-/// Create a TLS connector for client-side TLS.
-/// If ca_file is provided, use it as a custom root CA; otherwise skip
-/// certificate verification (InsecureSkipVerify=true), matching Go frp's
-/// `NewClientTLSConfig` behavior when no CA file is configured.
+/// Create a TLS connector with platform certificate verification.
+///
+/// Uses the OS platform trust store for certificate verification (safe default).
+/// Used by plugin backends connecting to user-specified HTTPS servers.
+///
+/// If ca_file is provided, verifies against that custom root store instead.
 /// If cert_file/key_file are provided, present client certificate to server (mTLS).
 #[cfg(feature = "tls")]
 pub fn build_tls_connector(
@@ -3073,7 +3080,131 @@ pub fn build_tls_connector(
                 .with_no_client_auth()
         }
     } else {
+        // No custom CA: use platform verifier for OS trust store (default safe behavior).
+        // Used by plugin backends connecting to user-specified HTTPS servers.
+        if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
+            if !cert_path.is_empty() && !key_path.is_empty() {
+                let cert_bytes = std::fs::read(cert_path).map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!(
+                        "open client cert file: {e}"
+                    )))
+                })?;
+                let client_certs = CertificateDer::pem_slice_iter(&cert_bytes)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        crate::Error::Transport(TransportError::Other(format!(
+                            "read client certs: {e}"
+                        )))
+                    })?;
+                let key_bytes = std::fs::read(key_path).map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!(
+                        "open client key file: {e}"
+                    )))
+                })?;
+                let client_key = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!("read client key: {e}")))
+                })?;
+                rustls::ClientConfig::builder()
+                    .with_platform_verifier()
+                    .map_err(|e| {
+                        crate::Error::Transport(TransportError::Other(format!(
+                            "platform verifier: {e}"
+                        )))
+                    })?
+                    .with_client_auth_cert(client_certs, client_key)
+                    .map_err(|e| {
+                        crate::Error::Transport(TransportError::Other(format!(
+                            "build mTLS client config: {e}"
+                        )))
+                    })?
+            } else {
+                rustls::ClientConfig::builder()
+                    .with_platform_verifier()
+                    .map_err(|e| {
+                        crate::Error::Transport(TransportError::Other(format!(
+                            "platform verifier: {e}"
+                        )))
+                    })?
+                    .with_no_client_auth()
+            }
+        } else {
+            <rustls::ClientConfig as ConfigVerifierExt>::with_platform_verifier().map_err(|e| {
+                crate::Error::Transport(TransportError::Other(format!("platform verifier: {e}")))
+            })?
+        }
+    };
+
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+/// Build a TLS connector that skips certificate verification.
+///
+/// Matches Go frp's `NewClientTLSConfig` behavior when no CA file is configured:
+/// sets `InsecureSkipVerify=true`, accepting any server certificate (including
+/// self-signed). Used for frp control connections to Go frp servers which
+/// auto-generate self-signed certificates.
+///
+/// If cert_file/key_file are provided, present client certificate to server (mTLS).
+#[cfg(feature = "tls")]
+pub fn build_tls_connector_skip_verify(
+    ca_file: Option<&str>,
+    cert_file: Option<&str>,
+    key_file: Option<&str>,
+) -> Result<TlsConnector, crate::Error> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let root_store = build_root_store(ca_file)?;
+
+    let config = if let Some(store) = root_store {
+        // Custom CA provided: verify against it normally.
+        if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
+            if !cert_path.is_empty() && !key_path.is_empty() {
+                let cert_bytes = std::fs::read(cert_path).map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!(
+                        "open client cert file: {e}"
+                    )))
+                })?;
+                let client_certs = CertificateDer::pem_slice_iter(&cert_bytes)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        crate::Error::Transport(TransportError::Other(format!(
+                            "read client certs: {e}"
+                        )))
+                    })?;
+                let key_bytes = std::fs::read(key_path).map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!(
+                        "open client key file: {e}"
+                    )))
+                })?;
+                let client_key = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!("read client key: {e}")))
+                })?;
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(Arc::new(store))
+                    .with_client_auth_cert(client_certs, client_key)
+                    .map_err(|e| {
+                        crate::Error::Transport(TransportError::Other(format!(
+                            "build mTLS client config: {e}"
+                        )))
+                    })?
+            } else {
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(Arc::new(store))
+                    .with_no_client_auth()
+            }
+        } else {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(Arc::new(store))
+                .with_no_client_auth()
+        }
+    } else {
         // No CA file: skip certificate verification (InsecureSkipVerify=true).
+        // Matches Go frp's default — auto-generated self-signed certs.
+        tracing::warn!(
+            "TLS certificate verification disabled (InsecureSkipVerify=true). \
+             Set tls.ca_file in config to enable verification."
+        );
         let verifier = Arc::new(InsecureSkipVerify);
         if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
             if !cert_path.is_empty() && !key_path.is_empty() {
@@ -3234,7 +3365,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "tls")]
-    fn test_build_tls_connector_with_default_roots() {
+    fn test_build_tls_connector_with_platform_verifier() {
         let result = build_tls_connector(None, None, None);
         assert!(
             result.is_ok(),
