@@ -3059,4 +3059,194 @@ bindPort = 2200
         "#;
         super::load_client_config_from_str(toml).unwrap();
     }
+
+    // ── HIGH-1 / HIGH-2: Proxy sub-table normalization ────────────────
+
+    #[test]
+    fn proxy_transport_subtable_normalized() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            [[proxies]]
+            name = "test"
+            type = "tcp"
+            local_ip = "127.0.0.1"
+            local_port = 80
+            remote_port = 7001
+            [proxies.transport]
+            useEncryption = true
+            bandwidthLimit = "1MB"
+            proxyProtocolVersion = "v2"
+        "#;
+        let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+        let p = &cfg.proxies[0];
+        assert!(p.use_encryption, "useEncryption should be true");
+        assert_eq!(p.bandwidth_limit, "1MB");
+        assert_eq!(p.proxy_protocol_version, "v2");
+    }
+
+    #[test]
+    fn proxy_healthcheck_subtable_normalized() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            [[proxies]]
+            name = "test"
+            type = "tcp"
+            local_ip = "127.0.0.1"
+            local_port = 80
+            remote_port = 7001
+            [proxies.healthCheck]
+            type = "tcp"
+            intervalSeconds = 5
+            timeoutSeconds = 2
+            maxFailed = 3
+        "#;
+        let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+        let p = &cfg.proxies[0];
+        assert_eq!(p.health_check_type, "tcp");
+        assert_eq!(p.health_check_interval_seconds, 5);
+        assert_eq!(p.health_check_timeout_seconds, 2);
+        assert_eq!(p.health_check_max_failed, 3);
+    }
+
+    #[test]
+    fn proxy_loadbalancer_subtable_normalized() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            [[proxies]]
+            name = "test"
+            type = "tcp"
+            local_ip = "127.0.0.1"
+            local_port = 80
+            remote_port = 7001
+            [proxies.loadBalancer]
+            group = "web"
+            groupKey = "secret"
+        "#;
+        let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+        let p = &cfg.proxies[0];
+        assert_eq!(p.group, "web");
+        assert_eq!(p.group_key, "secret");
+    }
+
+    #[test]
+    fn proxy_request_headers_set_normalized() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            [[proxies]]
+            name = "test"
+            type = "http"
+            local_ip = "127.0.0.1"
+            local_port = 80
+            custom_domains = ["example.com"]
+            [proxies.requestHeaders.set]
+            "x-from-where" = "value"
+        "#;
+        let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+        let p = &cfg.proxies[0];
+        assert_eq!(
+            p.headers.get("x-from-where").map(|s| s.as_str()),
+            Some("value")
+        );
+    }
+
+    #[test]
+    fn proxy_response_headers_set_normalized() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            [[proxies]]
+            name = "test"
+            type = "http"
+            local_ip = "127.0.0.1"
+            local_port = 80
+            custom_domains = ["example.com"]
+            [proxies.responseHeaders.set]
+            "X-Frame-Options" = "DENY"
+        "#;
+        let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+        let p = &cfg.proxies[0];
+        assert_eq!(
+            p.response_headers.get("X-Frame-Options").map(|s| s.as_str()),
+            Some("DENY")
+        );
+    }
+
+    // ── MEDIUM-3: LogConfig `to` alias ─────────────────────────────────
+
+    #[test]
+    fn log_to_alias_works() {
+        let toml = "level = \"debug\"\nto = \"/var/log/frps.log\"\nmax_days = 7\n";
+        let cfg: super::LogConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.file, "/var/log/frps.log");
+    }
+
+    // ── MEDIUM-4: WebServer addr default ────────────────────────────────
+
+    #[test]
+    fn web_server_addr_defaults_to_localhost() {
+        let cfg = super::WebServerConfig::default();
+        assert_eq!(cfg.addr, "127.0.0.1");
+    }
+
+    // ── MEDIUM-5: OIDC nesting normalization ───────────────────────────
+
+    #[test]
+    fn auth_oidc_subtable_normalized() {
+        let toml = r#"
+bind_port = 7000
+[auth.oidc]
+issuer = "https://auth.example.com"
+audience = "https://api.example.com"
+tokenEndpointURL = "https://auth.example.com/token"
+"#;
+        let cfg: super::ServerConfig = super::load_server_config_from_str(toml).unwrap();
+        assert_eq!(cfg.auth.oidc_issuer, "https://auth.example.com");
+        assert_eq!(cfg.auth.oidc_audience, "https://api.example.com");
+        assert_eq!(cfg.auth.oidc_token_endpoint, "https://auth.example.com/token");
+    }
+
+    // ── MEDIUM-6: HTTP plugins addr+path normalization ─────────────────
+
+    #[test]
+    fn http_plugin_addr_path_to_url() {
+        let toml = r#"
+bind_port = 7000
+[[http_plugins]]
+name = "test"
+addr = "http://127.0.0.1:4000"
+path = "/handler"
+"#;
+        let cfg: super::ServerConfig = super::load_server_config_from_str(toml).unwrap();
+        assert_eq!(cfg.http_plugins[0].url, "http://127.0.0.1:4000/handler");
+    }
+
+    // ── MEDIUM-8: custom_404_page normalization ────────────────────────
+
+    #[test]
+    fn custom_404_page_top_level_normalized() {
+        let toml = r#"
+bind_port = 7000
+custom404Page = "<html>Not Found</html>"
+"#;
+        let cfg: super::ServerConfig = super::load_server_config_from_str(toml).unwrap();
+        assert_eq!(cfg.web_server.custom_404_page, "<html>Not Found</html>");
+    }
+
+    // ── MEDIUM-9: transport legacy fields normalization ─────────────────
+
+    #[test]
+    fn transport_legacy_fields_normalized() {
+        let toml = r#"
+bind_port = 7000
+heartbeat_timeout = 120
+max_pool_count = 10
+"#;
+        let cfg: super::ServerConfig = super::load_server_config_from_str(toml).unwrap();
+        assert_eq!(cfg.transport.heartbeat_timeout, 120);
+        assert_eq!(cfg.transport.max_pool_count, 10);
+    }
 }
