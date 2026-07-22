@@ -53,6 +53,8 @@ pub struct Session {
     pub last_activity: std::sync::Mutex<Instant>,
     /// Selected behavior index from get_recommend_behaviors, stored for report_success feedback.
     pub selected_index: Mutex<Option<i32>>,
+    /// Analysis key for report_success lookup. Set during analysis, reused during reporting.
+    pub analysis_key: std::sync::Mutex<Option<String>>,
 }
 
 /// Central XTCP NAT hole punch controller.
@@ -138,6 +140,7 @@ impl Controller {
             created_at: Instant::now(),
             last_activity: std::sync::Mutex::new(Instant::now()),
             selected_index: Mutex::new(None),
+            analysis_key: std::sync::Mutex::new(None),
         });
         // Check-and-insert atomically under write lock (fixes TOCTOU).
         {
@@ -198,6 +201,7 @@ impl Controller {
             created_at: Instant::now(),
             last_activity: std::sync::Mutex::new(Instant::now()),
             selected_index: Mutex::new(None),
+            analysis_key: std::sync::Mutex::new(None),
         });
         // Check-and-insert atomically under write lock (fixes TOCTOU).
         {
@@ -278,14 +282,18 @@ impl Controller {
                     let v_resp = session.v_resp.lock().await;
                     if let Some(ref resp) = *v_resp {
                         if let Some(ref db) = resp.detect_behavior {
-                            let v_feat = session.v_nat_feature.lock().await;
-                            let c_feat = session.c_nat_feature.lock().await;
-                            if let (Some(ref vf), Some(ref cf)) = (&*v_feat, &*c_feat) {
-                                let key = gen_analysis_key(cf, vf);
-                                let index = *session.selected_index.lock().await;
-                                self.analyzer
-                                    .report_success(&key, db.mode, index.unwrap_or(0));
-                            }
+                            // Use stored analysis key set during get_recommend_behaviors.
+                            // Go frp compat: genAnalysisKey includes mapped IPs, so the
+                            // key must match the one used when the recommendation was made.
+                            let key = session
+                                .analysis_key
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone()
+                                .unwrap_or_default();
+                            let index = *session.selected_index.lock().await;
+                            self.analyzer
+                                .report_success(&key, db.mode, index.unwrap_or(0));
                         }
                     }
                 }
@@ -417,17 +425,35 @@ impl Controller {
 }
 
 /// Generate a stable analysis key from two NAT features for analyzer lookup.
+/// Includes the first mapped IP of each peer to distinguish different IP pairs
+/// with the same NAT characteristics (Go frp v0.69.1 compat: genAnalysisKey
+/// incorporates first IP of each peer's mapped_addrs into the key).
 /// Uses a canonical string representation — stable across Rust versions and
 /// platforms, and human-readable for debugging.
-pub fn gen_analysis_key(c: &NatFeature, v: &NatFeature) -> String {
+pub fn gen_analysis_key(
+    c: &NatFeature,
+    v: &NatFeature,
+    c_mapped: &[String],
+    v_mapped: &[String],
+) -> String {
+    let c_first_ip = c_mapped
+        .first()
+        .and_then(|a| a.rsplit(':').nth(1))
+        .unwrap_or("");
+    let v_first_ip = v_mapped
+        .first()
+        .and_then(|a| a.rsplit(':').nth(1))
+        .unwrap_or("");
     format!(
-        "{}:{}:{}|{}:{}:{}",
+        "{}:{}:{}:{}|{}:{}:{}:{}",
         c.nat_type,
         c.behavior,
         c.regular_ports_change as u8,
+        c_first_ip,
         v.nat_type,
         v.behavior,
         v.regular_ports_change as u8,
+        v_first_ip,
     )
 }
 

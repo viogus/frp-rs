@@ -133,11 +133,11 @@ pub async fn handle_control<S>(
     loop {
         // Expire stale pending requests
         while let Some(req) = ctl.pending_requests.pop_front() {
-            if req.created_at.elapsed() > pool::PENDING_REQUEST_TIMEOUT {
+            if req.created_at.elapsed() > pool::pending_request_timeout(state.user_conn_timeout) {
                 pool_stats
                     .pending_requests
                     .store(ctl.pending_requests.len() as i64, Ordering::Relaxed);
-                debug!(proxy_name = %req.proxy_name, timeout = ?pool::PENDING_REQUEST_TIMEOUT, "Pending request for proxy '{}' timed out after {:?}", req.proxy_name, pool::PENDING_REQUEST_TIMEOUT);
+                debug!(proxy_name = %req.proxy_name, timeout = ?pool::pending_request_timeout(state.user_conn_timeout), "Pending request for proxy '{}' timed out after {:?}", req.proxy_name, pool::pending_request_timeout(state.user_conn_timeout));
             } else {
                 ctl.pending_requests.push_front(req);
                 break;
@@ -146,8 +146,8 @@ pub async fn handle_control<S>(
 
         // Expire stale pending_udp entries
         while let Some((proxy_name, ts)) = ctl.pending_udp.pop_front() {
-            if ts.elapsed() > pool::PENDING_REQUEST_TIMEOUT {
-                debug!(%proxy_name, timeout = ?pool::PENDING_REQUEST_TIMEOUT, "Pending UDP request for proxy '{}' timed out after {:?}", proxy_name, pool::PENDING_REQUEST_TIMEOUT);
+            if ts.elapsed() > pool::pending_request_timeout(state.user_conn_timeout) {
+                debug!(%proxy_name, timeout = ?pool::pending_request_timeout(state.user_conn_timeout), "Pending UDP request for proxy '{}' timed out after {:?}", proxy_name, pool::pending_request_timeout(state.user_conn_timeout));
             } else {
                 ctl.pending_udp.push_front((proxy_name, ts));
                 break;
@@ -243,7 +243,7 @@ pub async fn handle_control<S>(
                     }
                     debug!(run_id = %run_id, "Yamux work conn for run_id {}", run_id);
                     while let Some(req) = ctl.pending_requests.front() {
-                        if req.created_at.elapsed() > pool::PENDING_REQUEST_TIMEOUT {
+                        if req.created_at.elapsed() > pool::pending_request_timeout(state.user_conn_timeout) {
                             ctl.pending_requests.pop_front();
                             pool_stats.pending_requests.store(ctl.pending_requests.len() as i64, Ordering::Relaxed);
                         } else {

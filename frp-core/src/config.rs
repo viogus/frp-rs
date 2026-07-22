@@ -476,7 +476,9 @@ impl Default for AuthServerConfig {
 pub struct LogConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
-    #[serde(default)]
+    /// File path for log output. Go frp uses `to` ("console" default).
+    /// Both `to` and `file` are accepted; `file` takes precedence.
+    #[serde(default, alias = "to")]
     pub file: String,
     #[serde(default = "default_max_days")]
     pub max_days: i32,
@@ -534,9 +536,11 @@ pub struct ObservabilityConfig {
     pub service_name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebServerConfig {
-    #[serde(default)]
+    /// Dashboard/admin listen address. Default: "127.0.0.1" (Go frp compat,
+    /// security: localhost-only by default). Empty string binds to all interfaces.
+    #[serde(default = "default_web_server_addr")]
     pub addr: String,
     #[serde(default)]
     pub port: u16,
@@ -558,6 +562,25 @@ pub struct WebServerConfig {
     /// Go frp compat: custom_404_page.
     #[serde(default)]
     pub custom_404_page: String,
+}
+
+impl Default for WebServerConfig {
+    fn default() -> Self {
+        Self {
+            addr: "127.0.0.1".into(),
+            port: 0,
+            user: String::new(),
+            password: String::new(),
+            enable_prometheus: false,
+            tls_cert_file: String::new(),
+            tls_key_file: String::new(),
+            custom_404_page: String::new(),
+        }
+    }
+}
+
+fn default_web_server_addr() -> String {
+    "127.0.0.1".into()
 }
 
 /// Server-side HTTP plugin configuration.
@@ -843,7 +866,7 @@ pub struct ClientConfig {
     pub disable_custom_tls_first_byte: bool,
     #[serde(default)]
     pub log: LogConfig,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub login_fail_exit: bool,
     #[serde(default)]
     pub pool_count: i32,
@@ -943,6 +966,19 @@ impl ClientConfig {
     /// distinguishes "not set" from "explicitly set to 30" via pointer nils.
     /// Future: switch to `Option<i64>` for these fields to match Go semantics.
     pub fn complete(&mut self) {
+        // MEDIUM-7: Fallback to http_proxy/HTTP_PROXY env var when proxy_url is empty
+        if self.proxy_url.is_empty() {
+            if let Ok(proxy) = std::env::var("http_proxy") {
+                if !proxy.is_empty() {
+                    self.proxy_url = proxy;
+                }
+            } else if let Ok(proxy) = std::env::var("HTTP_PROXY") {
+                if !proxy.is_empty() {
+                    self.proxy_url = proxy;
+                }
+            }
+        }
+
         if self.tcp_mux {
             // When tcpMux is enabled, heartbeat of application layer is
             // unnecessary — rely on yamux keepalive instead (Go compat).
@@ -1440,6 +1476,77 @@ fn normalize_server_config(value: &mut toml::Value) {
             &[],
         );
 
+        // MEDIUM-9: Normalize legacy top-level transport fields into [transport]
+        flatten_to_table(
+            table,
+            &[
+                "heartbeat_timeout",
+                "max_pool_count",
+                "heartbeatTimeout",
+                "maxPoolCount",
+            ],
+            "transport",
+            &[],
+        );
+
+        // MEDIUM-5: Normalize [auth.oidc] sub-table → auth.oidc_* flat fields
+        if let Some(toml::Value::Table(ref mut auth_table)) = table.get_mut("auth") {
+            if let Some(toml::Value::Table(oidc_table)) = auth_table.remove("oidc") {
+                for (k, v) in oidc_table {
+                    let flat_key = match k.as_str() {
+                        "issuer" => "oidc_issuer",
+                        "audience" => "oidc_audience",
+                        "tokenEndpointUrl" | "tokenEndpointURL" => "oidc_token_endpoint",
+                        "skipExpiry" => "oidc_skip_expiry",
+                        "skipIssuer" => "oidc_skip_issuer",
+                        "skipNbf" => "oidc_skip_nbf",
+                        "proxyURL" => "oidc_proxy_url",
+                        "additionalAuthScopes" => "additional_auth_scopes",
+                        other => other,
+                    };
+                    auth_table.entry(flat_key.to_string()).or_insert(v);
+                }
+            }
+        }
+
+        // MEDIUM-8: Normalize top-level custom_404_page / custom404Page → web_server.custom_404_page
+        if let Some(v) = table
+            .remove("custom_404_page")
+            .or_else(|| table.remove("custom404Page"))
+        {
+            let ws_table = table
+                .entry("web_server")
+                .or_insert_with(|| toml::Value::Table(Default::default()));
+            if let toml::Value::Table(ref mut ws) = ws_table {
+                ws.entry("custom_404_page".to_string()).or_insert(v);
+            }
+        }
+
+        // MEDIUM-6: Normalize http_plugins[*].addr + .path → .url
+        if let Some(toml::Value::Array(plugins)) = table.get_mut("http_plugins") {
+            for plugin_val in plugins.iter_mut() {
+                if let Some(ref mut pt) = plugin_val.as_table_mut() {
+                    if !pt.contains_key("url") {
+                        let addr = pt.get("addr").and_then(|v| v.as_str()).map(String::from);
+                        let path = pt.get("path").and_then(|v| v.as_str()).map(String::from);
+                        if let Some(addr) = addr {
+                            let url = if let Some(p) = path {
+                                let p = if p.starts_with('/') {
+                                    p
+                                } else {
+                                    format!("/{}", p)
+                                };
+                                format!("{}{}", addr.trim_end_matches('/'), p)
+                            } else {
+                                addr
+                            };
+                            pt.insert("url".to_string(), toml::Value::String(url));
+                        }
+                    }
+                }
+            }
+        }
+
         // Normalize camelCase section names to snake_case
         if let Some(ssh_section) = table.remove("sshTunnelGateway") {
             table.entry("ssh_tunnel_gateway").or_insert(ssh_section);
@@ -1504,6 +1611,101 @@ fn normalize_client_config(value: &mut toml::Value) {
             "log",
             &["log_"],
         );
+
+        // Normalize Go-format proxy sub-tables into flat fields
+        normalize_proxies(table);
+    }
+}
+
+/// Normalize Go-format proxy sub-tables into flat fields for each proxy entry.
+///
+/// Handles:
+/// - `[proxies.transport]` → flat fields (useEncryption, bandwidthLimit, ...)
+/// - `[proxies.healthCheck]` → flat fields (type, intervalSeconds, ...)
+/// - `[proxies.loadBalancer]` → flat fields (group, groupKey)
+/// - `[proxies.requestHeaders.set]` → `headers.*`
+/// - `[proxies.responseHeaders.set]` → `response_headers.*`
+fn normalize_proxies(table: &mut toml::Table) {
+    use toml::Value;
+
+    let proxies = match table.get_mut("proxies") {
+        Some(Value::Array(arr)) => arr,
+        _ => return,
+    };
+
+    for proxy_val in proxies.iter_mut() {
+        let proxy_table = match proxy_val.as_table_mut() {
+            Some(t) => t,
+            _ => continue,
+        };
+
+        // Flatten [proxies.transport] sub-table
+        if let Some(Value::Table(transport)) = proxy_table.remove("transport") {
+            for (k, v) in transport {
+                let flat_key = match k.as_str() {
+                    "useEncryption" => "use_encryption",
+                    "useCompression" => "use_compression",
+                    "bandwidthLimit" => "bandwidth_limit",
+                    "proxyProtocolVersion" => "proxy_protocol_version",
+                    other => other,
+                };
+                proxy_table.entry(flat_key.to_string()).or_insert(v);
+            }
+        }
+
+        // Flatten [proxies.healthCheck] sub-table
+        if let Some(Value::Table(hc)) = proxy_table.remove("healthCheck") {
+            for (k, v) in hc {
+                let flat_key = match k.as_str() {
+                    "type" => "health_check_type",
+                    "url" => "health_check_url",
+                    "httpHeaders" => "health_check_http_headers",
+                    "intervalSeconds" => "health_check_interval_seconds",
+                    "timeoutSeconds" => "health_check_timeout_seconds",
+                    "maxFailed" => "health_check_max_failed",
+                    other => other,
+                };
+                proxy_table.entry(flat_key.to_string()).or_insert(v);
+            }
+        }
+
+        // Flatten [proxies.loadBalancer] sub-table
+        if let Some(Value::Table(lb)) = proxy_table.remove("loadBalancer") {
+            for (k, v) in lb {
+                let flat_key = match k.as_str() {
+                    "group" => "group",
+                    "groupKey" => "group_key",
+                    other => other,
+                };
+                proxy_table.entry(flat_key.to_string()).or_insert(v);
+            }
+        }
+
+        // Normalize [proxies.requestHeaders.set] → flat headers map
+        if let Some(Value::Table(rh)) = proxy_table.remove("requestHeaders") {
+            if let Some(Value::Table(set)) = rh.get("set") {
+                if let Some(Value::Table(existing)) = proxy_table.get_mut("headers") {
+                    for (k, v) in set.clone() {
+                        existing.entry(k).or_insert(v);
+                    }
+                } else {
+                    proxy_table.insert("headers".to_string(), Value::Table(set.clone()));
+                }
+            }
+        }
+
+        // Normalize [proxies.responseHeaders.set] → flat response_headers map
+        if let Some(Value::Table(rh)) = proxy_table.remove("responseHeaders") {
+            if let Some(Value::Table(set)) = rh.get("set") {
+                if let Some(Value::Table(existing)) = proxy_table.get_mut("response_headers") {
+                    for (k, v) in set.clone() {
+                        existing.entry(k).or_insert(v);
+                    }
+                } else {
+                    proxy_table.insert("response_headers".to_string(), Value::Table(set.clone()));
+                }
+            }
+        }
     }
 }
 
@@ -2869,5 +3071,200 @@ bindPort = 2200
             bind_port = 9001
         "#;
         super::load_client_config_from_str(toml).unwrap();
+    }
+
+    // ── HIGH-1 / HIGH-2: Proxy sub-table normalization ────────────────
+
+    #[test]
+    fn proxy_transport_subtable_normalized() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            [[proxies]]
+            name = "test"
+            type = "tcp"
+            local_ip = "127.0.0.1"
+            local_port = 80
+            remote_port = 7001
+            [proxies.transport]
+            useEncryption = true
+            bandwidthLimit = "1MB"
+            proxyProtocolVersion = "v2"
+        "#;
+        let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+        let p = &cfg.proxies[0];
+        assert!(p.use_encryption, "useEncryption should be true");
+        assert_eq!(p.bandwidth_limit, "1MB");
+        assert_eq!(p.proxy_protocol_version, "v2");
+    }
+
+    #[test]
+    fn proxy_healthcheck_subtable_normalized() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            [[proxies]]
+            name = "test"
+            type = "tcp"
+            local_ip = "127.0.0.1"
+            local_port = 80
+            remote_port = 7001
+            [proxies.healthCheck]
+            type = "tcp"
+            intervalSeconds = 5
+            timeoutSeconds = 2
+            maxFailed = 3
+        "#;
+        let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+        let p = &cfg.proxies[0];
+        assert_eq!(p.health_check_type, "tcp");
+        assert_eq!(p.health_check_interval_seconds, 5);
+        assert_eq!(p.health_check_timeout_seconds, 2);
+        assert_eq!(p.health_check_max_failed, 3);
+    }
+
+    #[test]
+    fn proxy_loadbalancer_subtable_normalized() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            [[proxies]]
+            name = "test"
+            type = "tcp"
+            local_ip = "127.0.0.1"
+            local_port = 80
+            remote_port = 7001
+            [proxies.loadBalancer]
+            group = "web"
+            groupKey = "secret"
+        "#;
+        let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+        let p = &cfg.proxies[0];
+        assert_eq!(p.group, "web");
+        assert_eq!(p.group_key, "secret");
+    }
+
+    #[test]
+    fn proxy_request_headers_set_normalized() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            [[proxies]]
+            name = "test"
+            type = "http"
+            local_ip = "127.0.0.1"
+            local_port = 80
+            custom_domains = ["example.com"]
+            [proxies.requestHeaders.set]
+            "x-from-where" = "value"
+        "#;
+        let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+        let p = &cfg.proxies[0];
+        assert_eq!(
+            p.headers.get("x-from-where").map(|s| s.as_str()),
+            Some("value")
+        );
+    }
+
+    #[test]
+    fn proxy_response_headers_set_normalized() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            [[proxies]]
+            name = "test"
+            type = "http"
+            local_ip = "127.0.0.1"
+            local_port = 80
+            custom_domains = ["example.com"]
+            [proxies.responseHeaders.set]
+            "X-Frame-Options" = "DENY"
+        "#;
+        let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+        let p = &cfg.proxies[0];
+        assert_eq!(
+            p.response_headers
+                .get("X-Frame-Options")
+                .map(|s| s.as_str()),
+            Some("DENY")
+        );
+    }
+
+    // ── MEDIUM-3: LogConfig `to` alias ─────────────────────────────────
+
+    #[test]
+    fn log_to_alias_works() {
+        let toml = "level = \"debug\"\nto = \"/var/log/frps.log\"\nmax_days = 7\n";
+        let cfg: super::LogConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.file, "/var/log/frps.log");
+    }
+
+    // ── MEDIUM-4: WebServer addr default ────────────────────────────────
+
+    #[test]
+    fn web_server_addr_defaults_to_localhost() {
+        let cfg = super::WebServerConfig::default();
+        assert_eq!(cfg.addr, "127.0.0.1");
+    }
+
+    // ── MEDIUM-5: OIDC nesting normalization ───────────────────────────
+
+    #[test]
+    fn auth_oidc_subtable_normalized() {
+        let toml = r#"
+bind_port = 7000
+[auth.oidc]
+issuer = "https://auth.example.com"
+audience = "https://api.example.com"
+tokenEndpointURL = "https://auth.example.com/token"
+"#;
+        let cfg: super::ServerConfig = super::load_server_config_from_str(toml).unwrap();
+        assert_eq!(cfg.auth.oidc_issuer, "https://auth.example.com");
+        assert_eq!(cfg.auth.oidc_audience, "https://api.example.com");
+        assert_eq!(
+            cfg.auth.oidc_token_endpoint,
+            "https://auth.example.com/token"
+        );
+    }
+
+    // ── MEDIUM-6: HTTP plugins addr+path normalization ─────────────────
+
+    #[test]
+    fn http_plugin_addr_path_to_url() {
+        let toml = r#"
+bind_port = 7000
+[[http_plugins]]
+name = "test"
+addr = "http://127.0.0.1:4000"
+path = "/handler"
+"#;
+        let cfg: super::ServerConfig = super::load_server_config_from_str(toml).unwrap();
+        assert_eq!(cfg.http_plugins[0].url, "http://127.0.0.1:4000/handler");
+    }
+
+    // ── MEDIUM-8: custom_404_page normalization ────────────────────────
+
+    #[test]
+    fn custom_404_page_top_level_normalized() {
+        let toml = r#"
+bind_port = 7000
+custom404Page = "<html>Not Found</html>"
+"#;
+        let cfg: super::ServerConfig = super::load_server_config_from_str(toml).unwrap();
+        assert_eq!(cfg.web_server.custom_404_page, "<html>Not Found</html>");
+    }
+
+    // ── MEDIUM-9: transport legacy fields normalization ─────────────────
+
+    #[test]
+    fn transport_legacy_fields_normalized() {
+        let toml = r#"
+bind_port = 7000
+heartbeat_timeout = 120
+max_pool_count = 10
+"#;
+        let cfg: super::ServerConfig = super::load_server_config_from_str(toml).unwrap();
+        assert_eq!(cfg.transport.heartbeat_timeout, 120);
+        assert_eq!(cfg.transport.max_pool_count, 10);
     }
 }

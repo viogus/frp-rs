@@ -23,7 +23,7 @@ pub(crate) enum HealthEvent {
 }
 use rand::Rng;
 use std::time::Instant;
-use tokio::time::{interval, Duration};
+use tokio::time::Duration;
 use tracing::{debug, info, instrument, warn};
 
 use frp_core::auth::{AuthConfig, AuthMethod, OidcClient};
@@ -638,13 +638,27 @@ impl Service {
                 }
                 Err(e) => {
                     consecutive_err_count += 1;
-                    fast_retry_timestamps.push(Instant::now());
-                    let window_count = Self::prune_fast_retry_count(&mut fast_retry_timestamps);
                     warn!(attempt = %consecutive_err_count, error = %e, "Login failed (attempt {}): {}", consecutive_err_count, e);
                     if self.cfg.login_fail_exit && !did_login_once {
                         return Err(e.into());
                     }
-                    let delay = Self::fast_backoff_delay(consecutive_err_count, window_count);
+                    let delay = if did_login_once {
+                        // Session reconnect: full fast-backoff with Phase 1 (200ms) + Phase 2 (exponential).
+                        fast_retry_timestamps.push(Instant::now());
+                        let window_count = Self::prune_fast_retry_count(&mut fast_retry_timestamps);
+                        Self::fast_backoff_delay(consecutive_err_count, window_count)
+                    } else {
+                        // Initial login: pure exponential, no fast retry phase.
+                        // Matches Go frp's loopLoginUntilSuccess (FastBackoffOptions
+                        // without FastRetryCount).
+                        let mut delay_ms = 1000u64;
+                        for _ in 0..consecutive_err_count {
+                            delay_ms = delay_ms.saturating_mul(2).min(20_000);
+                        }
+                        let jitter_ms =
+                            (rand::thread_rng().gen::<f64>() * 0.1 * delay_ms as f64) as u64;
+                        Duration::from_millis(delay_ms.saturating_add(jitter_ms).min(20_000))
+                    };
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -995,9 +1009,19 @@ impl Service {
                 String,
                 oneshot::Sender<Result<msg::NatHoleResp, String>>,
             > = std::collections::HashMap::new();
-            let ping_secs = self.cfg.heartbeat_interval.max(1) as u64;
-            info!(interval = %ping_secs, "Heartbeat interval: {}s", ping_secs);
-            let mut ping_interval = interval(Duration::from_secs(ping_secs));
+            let mut ping_interval = if self.cfg.heartbeat_interval > 0 {
+                let secs = self.cfg.heartbeat_interval as u64;
+                info!(interval = %secs, "Heartbeat interval: {}s", secs);
+                Some(tokio::time::interval(Duration::from_secs(secs)))
+            } else {
+                info!("Heartbeat: disabled (heartbeat_interval <= 0, tcp_mux provides keepalive)");
+                None
+            };
+
+            // Proxy retry interval: every 30s, re-register proxies stuck in StartErr.
+            // Matches Go frp's proxy_wrapper.checkWorker (default startErrTimeout 30s).
+            let mut proxy_retry_interval = tokio::time::interval(Duration::from_secs(30));
+            proxy_retry_interval.tick().await; // Skip first immediate tick
 
             let mut last_pong = Instant::now();
             let hb_timeout = self.cfg.heartbeat_timeout;
@@ -1046,8 +1070,31 @@ impl Service {
                                 self.handle_nat_hole_resp(*resp, &mut pending_xtcp, &mut visitor_pending, &xtcp_sockets).await;
                             }
                             Ok(FrpMessage::NewProxyResp(resp)) => {
-                                if let Some(err) = resp.error {
-                                    warn!(error = %err, "Proxy registration error: {}", err);
+                                let is_error = resp.error.as_ref().is_some_and(|e| !e.is_empty());
+                                if is_error {
+                                    let err = resp.error.as_ref().unwrap();
+                                    warn!(proxy_name = %resp.proxy_name, error = %err, "Proxy '{}' registration error: {}", resp.proxy_name, err);
+                                    // Update phase if proxy was being retried (WaitStart -> StartErr).
+                                    let mut map = self.proxy_info_map.write().await;
+                                    if let Some(info) = map.get_mut(&resp.proxy_name) {
+                                        if info.phase == ProxyPhase::WaitStart {
+                                            info.err = err.clone();
+                                            info.phase = ProxyPhase::StartErr(err.clone());
+                                        }
+                                    }
+                                } else {
+                                    // Successful registration from retry path.
+                                    let mut map = self.proxy_info_map.write().await;
+                                    if let Some(info) = map.get_mut(&resp.proxy_name) {
+                                        if info.phase == ProxyPhase::WaitStart {
+                                            if let Some(ref remote) = resp.remote_addr {
+                                                info.remote_addr.clone_from(remote);
+                                            }
+                                            info.err.clear();
+                                            info.phase = ProxyPhase::Running;
+                                            info!(proxy_name = %resp.proxy_name, "Proxy '{}' re-registered", resp.proxy_name);
+                                        }
+                                    }
                                 }
                             }
                             #[cfg(feature = "vnet")]
@@ -1102,7 +1149,13 @@ impl Service {
                         }
                     }
 
-                    _ = ping_interval.tick() => {
+                    _ = async {
+                        if let Some(ref mut interval) = ping_interval {
+                            interval.tick().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
                         let mut ping_msg = msg::Ping {
                             privilege_key: None,
                             timestamp: None,
@@ -1135,6 +1188,30 @@ impl Service {
                             // Non-fatal: heartbeat timeout will detect actual dead connection.
                         } else {
                             debug!("Ping sent");
+                        }
+                    }
+
+                    _ = proxy_retry_interval.tick() => {
+                        let to_retry: Vec<(String, String)> = {
+                            let map = self.proxy_info_map.read().await;
+                            map.iter()
+                                .filter(|(_, info)| matches!(info.phase, ProxyPhase::StartErr(_)))
+                                .map(|(name, info)| (name.clone(), info.local_addr.clone()))
+                                .collect()
+                        };
+                        for (name, local_addr) in to_retry {
+                            if let Some(p) = proxies.iter().find(|p| p.name == name) {
+                                let new_proxy = crate::proxy::create_new_proxy_msg(p, &local_addr);
+                                if let Err(e) = write_msg(&mut *writer.lock().await, &new_proxy, v2).await {
+                                    warn!(proxy_name = %name, error = %e, "Proxy '{}' retry: write NewProxy failed: {}", name, e);
+                                } else {
+                                    info!(proxy_name = %name, "Proxy '{}' retry: sent NewProxy", name);
+                                    let mut map = self.proxy_info_map.write().await;
+                                    if let Some(info) = map.get_mut(&name) {
+                                        info.phase = ProxyPhase::WaitStart;
+                                    }
+                                }
+                            }
                         }
                     }
 

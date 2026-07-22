@@ -84,12 +84,13 @@ fn mode3_table() -> &'static [BehaviorPair] {
     static TABLE: OnceLock<Vec<BehaviorPair>> = OnceLock::new();
     TABLE.get_or_init(|| {
         vec![
-            (send_ports(0, 10), recv_ports(7, 0, 10)),
-            (send_ports(0, 10), recv_ports(4, 0, 10)),
-            (send_ports(0, 10), recv_ports(0, 0, 10)),
-            (recv_ports(7, 0, 10), send_ports(0, 10)),
-            (recv_ports(4, 0, 10), send_ports(0, 10)),
-            (recv_ports(0, 0, 10), send_ports(0, 10)),
+            // Go frp v0.69.1 compat: sender side has PortsRangeNumber=0 (default).
+            (sender(0, 0, 0, 0, 0), recv_ports(7, 0, 10)),
+            (sender(0, 0, 0, 0, 0), recv_ports(4, 0, 10)),
+            (sender(0, 0, 0, 0, 0), recv_ports(0, 0, 10)),
+            (recv_ports(7, 0, 10), sender(0, 0, 0, 0, 0)),
+            (recv_ports(4, 0, 10), sender(0, 0, 0, 0, 0)),
+            (recv_ports(0, 0, 10), sender(0, 0, 0, 0, 0)),
         ]
     })
 }
@@ -136,17 +137,6 @@ fn recv_ports(ttl: i32, delay: i32, prn: i32) -> RecommendBehavior {
         role: "receiver".into(),
         ttl,
         send_delay_ms: delay,
-        ports_range_number: prn,
-        ports_random_number: 0,
-        listen_random_ports: 0,
-    }
-}
-
-fn send_ports(ttl: i32, prn: i32) -> RecommendBehavior {
-    RecommendBehavior {
-        role: "sender".into(),
-        ttl,
-        send_delay_ms: 0,
         ports_range_number: prn,
         ports_random_number: 0,
         listen_random_ports: 0,
@@ -287,22 +277,10 @@ impl MakeHoleRecords {
             // Both hard, one regular: mode4 only.
             append_mode(&mut scores, 4, 1);
         } else {
-            // Fallback: single-entry modes 0, 1, 3 with score 1.
-            scores.push(BehaviorScore {
-                mode: 0,
-                index: 0,
-                score: 1,
-            });
-            scores.push(BehaviorScore {
-                mode: 1,
-                index: 0,
-                score: 1,
-            });
-            scores.push(BehaviorScore {
-                mode: 3,
-                index: 0,
-                score: 1,
-            });
+            // Fallback: all entries for modes 0, 1, 3 with score 1 (Go frp compat).
+            append_mode(&mut scores, 0, 1);
+            append_mode(&mut scores, 1, 1);
+            append_mode(&mut scores, 3, 1);
         }
 
         MakeHoleRecords {
@@ -325,6 +303,9 @@ impl MakeHoleRecords {
             }
         }
         self.scores[best_idx].score -= 1;
+        // Go frp v0.69.1 compat: update last_update_time on every recommendation
+        // to prevent premature cleanup of frequently-consulted records.
+        self.last_update_time = Instant::now();
         (self.scores[best_idx].mode, self.scores[best_idx].index)
     }
 
