@@ -819,6 +819,7 @@ write_frpc_config_udp() {
             printf 'server_addr = "127.0.0.1"\nserver_port = %s\n' "$server_port"
             printf 'token = "%s"\n' "$token"
             printf 'tcp_mux = %s\n' "$mux_val"
+            printf 'tls_enable = false\n'
             printf 'login_fail_exit = true\npool_count = 1\n'
             printf '\n[[proxies]]\nname = "%s"\ntype = "udp"\nlocal_ip = "127.0.0.1"\n' "$name"
             printf 'local_port = %s\nremote_port = %s\n' "$echo_port" "$proxy_port"
@@ -862,6 +863,7 @@ write_frpc_config_tcpmux() {
             printf 'server_addr = "127.0.0.1"\nserver_port = %s\n' "$server_port"
             printf 'token = "%s"\n' "$token"
             printf 'tcp_mux = %s\n' "$mux_val"
+            printf 'tls_enable = false\n'
             printf 'login_fail_exit = true\npool_count = 1\n'
             printf '\n[[proxies]]\nname = "%s"\ntype = "tcpmux"\nmultiplexer = "httpconnect"\n' "$name"
             printf 'local_ip = "127.0.0.1"\nlocal_port = %s\ncustom_domains = ["%s"]\n' "$echo_port" "$domain"
@@ -899,6 +901,7 @@ write_frpc_config_xtcp_provider() {
             printf 'server_addr = "%s"\nserver_port = %s\n' "$server_host" "$server_port"
             printf 'token = "%s"\n' "$token"
             printf 'tcp_mux = false\n'
+            printf 'tls_enable = false\n'
             printf 'login_fail_exit = true\npool_count = 1\n'
             printf 'nat_hole_stun_server = "stun.l.google.com:19302"\n'
             printf '\n[[proxies]]\nname = "%s"\ntype = "xtcp"\n' "$name"
@@ -945,6 +948,7 @@ write_frpc_config_xtcp_visitor() {
             printf 'server_addr = "%s"\nserver_port = %s\n' "$server_host" "$server_port"
             printf 'token = "%s"\n' "$token"
             printf 'tcp_mux = false\n'
+            printf 'tls_enable = false\n'
             printf 'login_fail_exit = true\npool_count = 1\n'
             printf 'nat_hole_stun_server = "stun.l.google.com:19302"\n'
             printf '\n[[visitors]]\nname = "%s-visitor"\ntype = "xtcp"\n' "$server_name"
@@ -1974,6 +1978,7 @@ server_addr = "127.0.0.1"
 server_port = $frps_port
 token = "$token"
 tcp_mux = false
+tls_enable = false
 login_fail_exit = true
 pool_count = 1
 
@@ -2446,6 +2451,7 @@ server_addr = "127.0.0.1"
 server_port = $frps_port
 token = "$token"
 tcp_mux = false
+tls_enable = false
 login_fail_exit = true
 pool_count = 1
 
@@ -2701,6 +2707,7 @@ server_addr = "127.0.0.1"
 server_port = $frps_port
 token = "$token"
 tcp_mux = false
+tls_enable = false
 login_fail_exit = true
 pool_count = 1
 
@@ -2921,6 +2928,7 @@ server_addr = "127.0.0.1"
 server_port = $frps_port
 token = "$token"
 tcp_mux = false
+tls_enable = false
 login_fail_exit = true
 pool_count = 1
 
@@ -2941,6 +2949,7 @@ server_addr = "127.0.0.1"
 server_port = $frps_port
 token = "$token"
 tcp_mux = false
+tls_enable = false
 login_fail_exit = true
 pool_count = 1
 
@@ -3098,6 +3107,7 @@ server_addr = "127.0.0.1"
 server_port = $frps_port
 token = "$token"
 tcp_mux = false
+tls_enable = false
 login_fail_exit = true
 pool_count = 1
 
@@ -3119,6 +3129,7 @@ server_addr = "127.0.0.1"
 server_port = $frps_port
 token = "$token"
 tcp_mux = false
+tls_enable = false
 login_fail_exit = true
 pool_count = 1
 
@@ -3932,6 +3943,7 @@ server_addr = "127.0.0.1"
 server_port = $frps_port
 token = "$token"
 tcp_mux = false
+tls_enable = false
 login_fail_exit = true
 pool_count = 1
 
@@ -4083,6 +4095,9 @@ test_auth_r2g_reject() {
     kill $bad_pid 2>/dev/null || true
     wait $bad_pid 2>/dev/null || true
     log "  $name: wrong token correctly rejected"
+
+    # Give Go frps time to clean up the failed auth session
+    sleep 2
 
     # Attempt 2: Rust frpc with CORRECT token — must succeed
     log "  $name: connecting with correct token..."
@@ -4312,6 +4327,7 @@ server_addr = "127.0.0.1"
 server_port = $frps_port
 token = "$token"
 tcp_mux = false
+tls_enable = false
 login_fail_exit = true
 pool_count = 1
 
@@ -4842,6 +4858,7 @@ server_addr = "127.0.0.1"
 server_port = $frps_port
 token = "$token"
 tcp_mux = false
+tls_enable = false
 login_fail_exit = true
 pool_count = 1
 

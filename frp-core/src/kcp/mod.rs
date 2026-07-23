@@ -39,6 +39,7 @@ pub fn default_kcp_config() -> KcpConfig {
 }
 
 /// Build a KcpConfig for client-side KCP dialing.
+/// Uses the same FEC params as the server (10,3) for wire compatibility.
 pub fn default_kcp_client_config() -> KcpConfig {
     KcpConfig {
         nodelay: KcpNoDelayConfig {
@@ -49,8 +50,10 @@ pub fn default_kcp_client_config() -> KcpConfig {
         },
         wnd_size: (1024, 1024),
         mtu: 1350,
-        data_shards: 0,
-        parity_shards: 0,
+        // Go frp v0.69.1 ListenKcp() uses FEC (10,3). Client must match
+        // server-side defaults or FEC-wrapped packets will be unparseable.
+        data_shards: 10,
+        parity_shards: 3,
         stream: true,
         flush_write: true,
     }

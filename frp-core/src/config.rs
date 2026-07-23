@@ -853,7 +853,7 @@ pub struct ClientConfig {
     /// Go frp compat: includes.
     #[serde(default)]
     pub includes: Vec<String>,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub tls_enable: bool,
     #[serde(default)]
     pub tls_cert_file: String,
