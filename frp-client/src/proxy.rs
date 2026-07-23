@@ -1,3 +1,4 @@
+use std::net::ToSocketAddrs;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -128,16 +129,26 @@ pub fn create_new_proxy_msg(p: &frp_core::config::ProxyConfig, local_addr: &str)
 /// occurs in V2 plain work_conn tasks. The hang manifests as TcpStream::connect
 /// never returning, even with tokio::time::timeout. Using spawn_blocking
 /// bypasses the tokio I/O driver entirely for the connect.
+///
+/// `addr` may be a hostname like `"localhost:8080"` or an IP literal.
+/// DNS resolution happens on the async runtime (before spawn_blocking).
 pub async fn connect_local(addr: &str) -> Result<TcpStream, frp_core::Error> {
-    let addr: std::net::SocketAddr = addr
-        .parse()
-        .map_err(|e| frp_core::Error::Transport(format!("parse addr: {}", e).into()))?;
+    // Resolve hostname on the async runtime before spawn_blocking.
+    // Only the first resolved address is used — matches the original
+    // tokio::TcpStream::connect behavior.
+    let resolved: std::net::SocketAddr = addr
+        .to_socket_addrs()
+        .map_err(|e| frp_core::Error::Transport(format!("resolve {}: {}", addr, e).into()))?
+        .next()
+        .ok_or_else(|| {
+            frp_core::Error::Transport(format!("no address found for {}", addr).into())
+        })?;
     let std_stream = tokio::task::spawn_blocking(move || {
-        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))
+        std::net::TcpStream::connect_timeout(&resolved, std::time::Duration::from_secs(5))
     })
     .await
     .map_err(|e| frp_core::Error::Transport(format!("spawn_blocking: {}", e).into()))?
-    .map_err(|e| frp_core::Error::Transport(format!("connect {}: {}", addr, e).into()))?;
+    .map_err(|e| frp_core::Error::Transport(format!("connect {}: {}", resolved, e).into()))?;
     // Convert to tokio TcpStream
     std_stream
         .set_nonblocking(true)

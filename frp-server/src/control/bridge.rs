@@ -264,11 +264,15 @@ async fn relay_plain_fast(
 
     // On Linux, prefer splice(2) zero-copy relay when both sides are raw TCP.
     // DISABLED (2026-07-23): splice causes V2 plain e2e tests to hang.
-    // The hang is a task-polling issue in tokio::join! where two splice_direction
-    // futures deadlock because the task is not polled when data arrives on the
-    // reverse direction. Re-enable after fixing frp_core::splice::bridge_splice.
-    // (To test: run `cargo test --test v2_e2e test_v2_e2e_tcp_proxy` and verify
-    // the echo completes within 2 seconds.)
+    // Root cause likely involves edge-triggered epoll (EPOLLET) in AsyncFd
+    // where both splice_direction futures register readiness on the same two
+    // fds in opposite order — creating a cross-dependency that starves one
+    // direction. Re-enable after fixing frp_core::splice::bridge_splice.
+    //
+    // Re-enablement checklist:
+    // 1. Restore the `#[cfg(target_os = "linux")]` block below
+    // 2. Run: cargo test --test v2_e2e (test_v2_e2e_tcp_proxy, test_v2_e2e_multiple_roundtrips)
+    // 3. Run: cargo test -p frp-server test_v2_ping_pong_raw_tcp (raw TCP, no tcp_mux)
 
     match tokio::io::copy_bidirectional(&mut user_conn, &mut work_conn).await {
         Ok((a, b)) => {
