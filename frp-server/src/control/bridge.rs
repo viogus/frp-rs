@@ -262,16 +262,29 @@ async fn relay_plain_fast(
 ) {
     use std::sync::atomic::Ordering;
 
-    // Zero-copy splice disabled for v0.7.0 — EAGAIN busy-loop on non-blocking
-    // fds can saturate CPU under backpressure (2 spawn_blocking tasks per conn).
-    // TODO: re-enable with AsyncFd/epoll-driven readiness waiting.
-    // Fall through to copy_bidirectional on all platforms.
-    // #[cfg(target_os = "linux")]
-    // if user_conn.try_tcp().is_some() && work_conn.try_tcp().is_some() {
-    //     ...
-    // }
+    // On Linux, use splice(2) zero-copy relay when both sides are raw TCP.
+    // AsyncFd provides epoll-driven readiness to avoid the old EAGAIN busy-loop.
+    #[cfg(target_os = "linux")]
+    match (user_conn, work_conn) {
+        (IoStream::Tcp(user), IoStream::Tcp(work)) => {
+            match frp_core::splice::bridge_splice(user, work).await {
+                Ok((a, b)) => {
+                    metrics.bytes_in.fetch_add(a, Ordering::Relaxed);
+                    metrics.bytes_out.fetch_add(b, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "splice bridge closed: {}", e);
+                }
+            }
+            return;
+        }
+        (u, w) => {
+            user_conn = u;
+            work_conn = w;
+            // Not both Tcp — fall through to copy_bidirectional.
+        }
+    }
 
-    // Fallback: standard copy_bidirectional.
     match tokio::io::copy_bidirectional(&mut user_conn, &mut work_conn).await {
         Ok((a, b)) => {
             metrics.bytes_in.fetch_add(a, Ordering::Relaxed);

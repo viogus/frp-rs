@@ -29,6 +29,8 @@ pub mod protocol;
 pub mod proxy_protocol;
 #[cfg(feature = "quic")]
 pub mod quic;
+#[cfg(target_os = "linux")]
+pub mod splice;
 pub mod stun;
 pub mod system;
 pub mod transport;

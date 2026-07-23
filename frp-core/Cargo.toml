@@ -64,6 +64,8 @@ profiling = ["dep:pprof"]
 debug-logs = []
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 tower = "0.5"
