@@ -810,6 +810,32 @@ mod tests {
         assert_ne!(c2s1, s2c1); // different directions should give different keys
     }
 
+    /// Reproduce Go frp `TestDeriveAEADControlKeysUsesDistinctDirections` test vector
+    /// from `pkg/util/net/conn_test.go` (commit 0e5383).
+    ///
+    /// Inputs: key = b"token", algorithm = xchacha20-poly1305, transcript_hash = 32×0x44.
+    /// Guards against accidental regressions in the ring HKDF-SHA256 path.
+    #[cfg(feature = "chacha20")]
+    #[test]
+    fn test_hkdf_go_frp_test_vector_xchacha20() {
+        let key = b"token";
+        let transcript = [0x44u8; 32];
+        let (c2s, s2c) =
+            derive_aead_control_keys(key, AeadAlgorithm::XChaCha20Poly1305, &transcript).unwrap();
+
+        // Expected values from Go frp conn_test.go TestDeriveAEADControlKeysUsesDistinctDirections
+        let expected_c2s: [u8; 32] = [
+            0xa0, 0x58, 0xcd, 0x02, 0x5d, 0x96, 0x98, 0x5f,
+            0xeb, 0xeb, 0xff, 0x79, 0xa1, 0x9f, 0x62, 0xb7,
+            0x15, 0xe0, 0x53, 0x91, 0x3d, 0xfc, 0x74, 0x77,
+            0x05, 0x91, 0x4c, 0x62, 0x4b, 0xf3, 0xd4, 0x95,
+        ];
+        assert_eq!(c2s, expected_c2s, "client-to-server key mismatch");
+
+        // server-to-client must differ (different direction → different info string)
+        assert_ne!(c2s, s2c.as_slice(), "c2s and s2c must differ");
+    }
+
     #[test]
     fn test_generate_random() {
         let r1 = generate_random(32).unwrap();
