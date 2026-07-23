@@ -73,9 +73,15 @@ async fn splice_direction(
                     flags,
                 )
             };
-            if ret >= 0 {
+            if ret > 0 {
                 guard.retain_ready();
                 break ret as usize;
+            }
+            if ret == 0 {
+                // Real EOF: splice returns 0 when the source has no more
+                // data (FIN received on socket). Return immediately —
+                // don't conflate with the EAGAIN sentinel.
+                return Ok(());
             }
             let err = io::Error::last_os_error();
             match err.raw_os_error() {
@@ -92,11 +98,6 @@ async fn splice_direction(
 
         // EAGAIN sentinel — re-await readable.
         if n_read == 0 {
-            // Check if this was a real EOF or a sentinel.
-            // We can't distinguish without trying again, so go back
-            // to the outer loop. If the fd is truly closed, readable()
-            // will wake immediately and splice will return 0 (real EOF),
-            // which the next iteration handles.
             continue;
         }
 
