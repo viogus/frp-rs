@@ -123,10 +123,27 @@ pub fn create_new_proxy_msg(p: &frp_core::config::ProxyConfig, local_addr: &str)
 }
 
 /// Connects to a local service and returns the TCP stream.
+///
+/// Uses spawn_blocking + std TcpStream to avoid a tokio I/O driver hang that
+/// occurs in V2 plain work_conn tasks. The hang manifests as TcpStream::connect
+/// never returning, even with tokio::time::timeout. Using spawn_blocking
+/// bypasses the tokio I/O driver entirely for the connect.
 pub async fn connect_local(addr: &str) -> Result<TcpStream, frp_core::Error> {
-    let stream = TcpStream::connect(addr).await.map_err(|e| {
-        frp_core::Error::Transport(format!("connect to local {}: {}", addr, e).into())
-    })?;
+    let addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| frp_core::Error::Transport(format!("parse addr: {}", e).into()))?;
+    let std_stream = tokio::task::spawn_blocking(move || {
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))
+    })
+    .await
+    .map_err(|e| frp_core::Error::Transport(format!("spawn_blocking: {}", e).into()))?
+    .map_err(|e| frp_core::Error::Transport(format!("connect {}: {}", addr, e).into()))?;
+    // Convert to tokio TcpStream
+    std_stream
+        .set_nonblocking(true)
+        .map_err(|e| frp_core::Error::Transport(format!("set_nonblocking: {}", e).into()))?;
+    let stream = TcpStream::from_std(std_stream)
+        .map_err(|e| frp_core::Error::Transport(format!("from_std: {}", e).into()))?;
     frp_core::transport::set_nodelay(&stream);
     Ok(stream)
 }

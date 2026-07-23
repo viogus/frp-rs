@@ -262,28 +262,13 @@ async fn relay_plain_fast(
 ) {
     use std::sync::atomic::Ordering;
 
-    // On Linux, use splice(2) zero-copy relay when both sides are raw TCP.
-    // AsyncFd provides epoll-driven readiness to avoid the old EAGAIN busy-loop.
-    #[cfg(target_os = "linux")]
-    match (user_conn, work_conn) {
-        (IoStream::Tcp(user), IoStream::Tcp(work)) => {
-            match frp_core::splice::bridge_splice(user, work).await {
-                Ok((a, b)) => {
-                    metrics.bytes_in.fetch_add(a, Ordering::Relaxed);
-                    metrics.bytes_out.fetch_add(b, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "splice bridge closed: {}", e);
-                }
-            }
-            return;
-        }
-        (u, w) => {
-            user_conn = u;
-            work_conn = w;
-            // Not both Tcp — fall through to copy_bidirectional.
-        }
-    }
+    // On Linux, prefer splice(2) zero-copy relay when both sides are raw TCP.
+    // DISABLED (2026-07-23): splice causes V2 plain e2e tests to hang.
+    // The hang is a task-polling issue in tokio::join! where two splice_direction
+    // futures deadlock because the task is not polled when data arrives on the
+    // reverse direction. Re-enable after fixing frp_core::splice::bridge_splice.
+    // (To test: run `cargo test --test v2_e2e test_v2_e2e_tcp_proxy` and verify
+    // the echo completes within 2 seconds.)
 
     match tokio::io::copy_bidirectional(&mut user_conn, &mut work_conn).await {
         Ok((a, b)) => {
