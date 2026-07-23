@@ -2802,6 +2802,258 @@ else:
 }
 
 # =============================================================================
+# Test: Go frpc -> Rust frps, HTTP proxy with route_by_http_user
+# =============================================================================
+test_g2r_route_by_http_user() {
+    local name="go-to-rust-route-by-http-user"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local vhost_port=$(random_port)
+    local echo1_port=$(random_port)
+    local echo2_port=$(random_port)
+    local echo3_port=$(random_port)
+    local token="test-token-g2r-rubu"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start 3 HTTP echo servers with different prefixes
+    start_http_echo_server "$echo1_port" "user1-ok:"
+    wait_for_port 127.0.0.1 "$echo1_port" 3 || { fail_test "$name" "echo1 did not start"; return; }
+    start_http_echo_server "$echo2_port" "user2-ok:"
+    wait_for_port 127.0.0.1 "$echo2_port" 3 || { fail_test "$name" "echo2 did not start"; return; }
+    start_http_echo_server "$echo3_port" "catchall-ok:"
+    wait_for_port 127.0.0.1 "$echo3_port" 3 || { fail_test "$name" "echo3 did not start"; return; }
+
+    # Start Rust frps with VHost HTTP port
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bind_addr = "127.0.0.1"
+bind_port = $frps_port
+vhost_http_port = $vhost_port
+subdomain_host = "test.local"
+
+[auth]
+method = "token"
+token = "$token"
+
+[transport]
+tcp_mux = false
+TOML
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || { fail_test "$name" "Rust frps did not start"; return; }
+    wait_for_port_safe 127.0.0.1 "$vhost_port" 5 || { fail_test "$name" "VHost HTTP port $vhost_port not reachable"; return; }
+
+    # Start Go frpc with 3 HTTP proxies on the same domain, differentiated by routeByHTTPUser
+    cat > "$TEST_DIR/$name/frpc.toml" <<TOML
+serverAddr = "127.0.0.1"
+serverPort = $frps_port
+auth.token = "$token"
+transport.tls.enable = false
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frpc-$name.log"
+log.level = "debug"
+
+[[proxies]]
+name = "rubu-user1"
+type = "http"
+localIP = "127.0.0.1"
+localPort = $echo1_port
+customDomains = ["rubu.local"]
+routeByHTTPUser = "user1"
+
+[[proxies]]
+name = "rubu-user2"
+type = "http"
+localIP = "127.0.0.1"
+localPort = $echo2_port
+customDomains = ["rubu.local"]
+routeByHTTPUser = "user2"
+
+[[proxies]]
+name = "rubu-catchall"
+type = "http"
+localIP = "127.0.0.1"
+localPort = $echo3_port
+customDomains = ["rubu.local"]
+TOML
+    run_go "$GO_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    sleep 3
+
+    # Helper: send HTTP request with optional Basic auth
+    send_auth_req() {
+        local label="$1" user="$2" pass="$3" expected_prefix="$4"
+        local result
+        result=$(python3 -c "
+import socket, base64
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect(('127.0.0.1', $vhost_port))
+req = b'GET / HTTP/1.1\r\nHost: rubu.local\r\n'
+if '$user':
+    creds = base64.b64encode(('$user:$pass').encode()).decode()
+    req += b'Authorization: Basic ' + creds.encode() + b'\r\n'
+req += b'Connection: close\r\n\r\n'
+s.sendall(req)
+resp = s.recv(4096)
+s.close()
+expected = b'${expected_prefix}'
+if expected in resp:
+    print('OK')
+else:
+    print('FAIL: ' + repr(resp[:200]))
+" 2>&1)
+        if [[ "$result" != "OK" ]]; then
+            fail_test "$name" "$label: $result"
+            return 1
+        fi
+        log "  $name: $label OK"
+        return 0
+    }
+
+    # Test 1: user1/auth → proxy rubu-user1 (echo1)
+    send_auth_req "user1" "user1" "pass1" "user1-ok:" || return
+
+    # Test 2: user2/auth → proxy rubu-user2 (echo2)
+    send_auth_req "user2" "user2" "pass2" "user2-ok:" || return
+
+    # Test 3: no auth → proxy rubu-catchall (echo3)
+    send_auth_req "no-auth" "" "" "catchall-ok:" || return
+
+    pass_test "$name"
+}
+
+# =============================================================================
+# Test: Rust frpc -> Go frps, HTTP proxy with route_by_http_user
+# =============================================================================
+test_r2g_route_by_http_user() {
+    local name="rust-to-go-route-by-http-user"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local vhost_port=$(random_port)
+    local echo1_port=$(random_port)
+    local echo2_port=$(random_port)
+    local echo3_port=$(random_port)
+    local token="test-token-r2g-rubu"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    # Start 3 HTTP echo servers with different prefixes
+    start_http_echo_server "$echo1_port" "user1-ok:"
+    wait_for_port 127.0.0.1 "$echo1_port" 3 || { fail_test "$name" "echo1 did not start"; return; }
+    start_http_echo_server "$echo2_port" "user2-ok:"
+    wait_for_port 127.0.0.1 "$echo2_port" 3 || { fail_test "$name" "echo2 did not start"; return; }
+    start_http_echo_server "$echo3_port" "catchall-ok:"
+    wait_for_port 127.0.0.1 "$echo3_port" 3 || { fail_test "$name" "echo3 did not start"; return; }
+
+    # Start Go frps with VHost HTTP port
+    cat > "$TEST_DIR/$name/frps.toml" <<TOML
+bindAddr = "127.0.0.1"
+bindPort = $frps_port
+vhostHTTPPort = $vhost_port
+subDomainHost = "test.local"
+auth.method = "token"
+auth.token = "$token"
+transport.tcpMux = false
+log.to = "$TEST_DIR/go-frps.log"
+log.level = "debug"
+TOML
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || { fail_test "$name" "Go frps did not start"; return; }
+    wait_for_port_safe 127.0.0.1 "$vhost_port" 5 || { fail_test "$name" "VHost HTTP port $vhost_port not reachable"; return; }
+
+    # Start Rust frpc with 3 HTTP proxies on the same domain, differentiated by route_by_http_user
+    cat > "$TEST_DIR/$name/frpc.toml" <<TOML
+server_addr = "127.0.0.1"
+server_port = $frps_port
+token = "$token"
+tcp_mux = false
+tls_enable = false
+login_fail_exit = true
+pool_count = 1
+
+[[proxies]]
+name = "rubu-user1"
+type = "http"
+local_ip = "127.0.0.1"
+local_port = $echo1_port
+custom_domains = ["rubu.local"]
+route_by_http_user = "user1"
+
+[[proxies]]
+name = "rubu-user2"
+type = "http"
+local_ip = "127.0.0.1"
+local_port = $echo2_port
+custom_domains = ["rubu.local"]
+route_by_http_user = "user2"
+
+[[proxies]]
+name = "rubu-catchall"
+type = "http"
+local_ip = "127.0.0.1"
+local_port = $echo3_port
+custom_domains = ["rubu.local"]
+TOML
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    sleep 3
+
+    # Same helper as g2r test
+    send_auth_req() {
+        local label="$1" user="$2" pass="$3" expected_prefix="$4"
+        local result
+        result=$(python3 -c "
+import socket, base64
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect(('127.0.0.1', $vhost_port))
+req = b'GET / HTTP/1.1\r\nHost: rubu.local\r\n'
+if '$user':
+    creds = base64.b64encode(('$user:$pass').encode()).decode()
+    req += b'Authorization: Basic ' + creds.encode() + b'\r\n'
+req += b'Connection: close\r\n\r\n'
+s.sendall(req)
+resp = s.recv(4096)
+s.close()
+expected = b'${expected_prefix}'
+if expected in resp:
+    print('OK')
+else:
+    print('FAIL: ' + repr(resp[:200]))
+" 2>&1)
+        if [[ "$result" != "OK" ]]; then
+            fail_test "$name" "$label: $result"
+            return 1
+        fi
+        log "  $name: $label OK"
+        return 0
+    }
+
+    # Test 1: user1/auth → proxy rubu-user1 (echo1)
+    send_auth_req "user1" "user1" "pass1" "user1-ok:" || return
+
+    # Test 2: user2/auth → proxy rubu-user2 (echo2)
+    send_auth_req "user2" "user2" "pass2" "user2-ok:" || return
+
+    # Test 3: no auth → proxy rubu-catchall (echo3)
+    send_auth_req "no-auth" "" "" "catchall-ok:" || return
+
+    pass_test "$name"
+}
+
+# =============================================================================
 # Test: Go frpc -> Rust frps, STCP relay
 # =============================================================================
 test_g2r_stcp() {
@@ -4167,6 +4419,8 @@ run_test test_g2r_http_response_headers
 run_test test_r2g_http_response_headers
 run_test test_g2r_http_locations
 run_test test_r2g_http_locations
+run_test test_g2r_route_by_http_user
+run_test test_r2g_route_by_http_user
 # Phase 4b: tcpmux HTTP CONNECT
 run_test test_g2r_tcpmux
 run_test test_r2g_tcpmux
