@@ -141,7 +141,7 @@ impl TestHarness {
             server_port,
             token: token.to_string(),
             login_fail_exit: false,
-            pool_count: 1,
+            pool_count: 2,
             tcp_mux: false,
             tls_enable: false,
             v2,
@@ -196,11 +196,11 @@ impl TestHarness {
             let _ = client_service.run().await;
         });
 
-        // 4. Wait for proxy port to become connectable
-        let proxy_addr: SocketAddr = format!("127.0.0.1:{}", proxy_port).parse().unwrap();
-        wait_for_port(proxy_addr, Duration::from_secs(10))
-            .await
-            .expect("proxy port did not become ready within 10s");
+        // 4. Wait for proxy to be ready.
+        // Use a sleep instead of wait_for_port to avoid consuming
+        // a pooled work connection (which causes on-demand hang in V2).
+        // The proxy listener starts synchronously after login+registration.
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
         TestHarness {
             server_port,
