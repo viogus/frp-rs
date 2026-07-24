@@ -53,6 +53,11 @@ the full suffix: `"500KB"`, `"10MB"`, `"1GB"`.
 Empty `bandwidth_limit` now means "no limit" (previously was treated
 as "not set"). This matches Go frp behavior.
 
+- **`bandwidth_limit_mode`**: changed from `""` (both directions) to
+  `"client"` (upload only). If you explicitly set `bandwidth_limit` and
+  want to throttle both upload and download, set
+  `bandwidth_limit_mode = ""`.
+
 ## v0.7.0 (2026-07-21)
 
 ### Go frp dev HEAD Full Audit (d486018)
