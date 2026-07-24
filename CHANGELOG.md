@@ -2,6 +2,57 @@
 
 All notable changes to frp-rs.
 
+## Upgrade Notes: v0.7.0 → v0.8.0 (Go frp v0.70.1 compat)
+
+This release changes several config defaults to match Go frp v0.70.1 behavior.
+Existing configs that relied on previous defaults may need updating.
+
+### Client defaults changed
+
+- **`tls_enable`**: changed from `false` to `true`. If your frps does not
+  have TLS configured, set `tls_enable = false` explicitly in frpc.toml.
+- **`disable_custom_tls_first_byte`**: changed from `false` to `true`.
+  Go frp v0.70.1 no longer sends the FRPTLSHeadByte before TLS handshake.
+  If connecting to older frps (< v0.70.1), set this to `false`.
+- **`tcp_mux`**: changed from feature-gated (`--features tcp-mux`) to
+  always-on (`true`). If you do not want yamux multiplexing, set
+  `tcp_mux = false` explicitly. When `tcp_mux` is enabled, heartbeats
+  are disabled automatically (yamux provides keepalive).
+- **`nat_hole_stun_server`**: changed from empty (`""`) to
+  `"stun.easyvoip.com:3478"`. If you need a different STUN server,
+  set it explicitly.
+- **`tcp_mux_keepalive_interval`**: new field, defaults to `30`
+  (seconds). Controls yamux keepalive ping interval.
+- **`heartbeat_timeout`**: new field, defaults to `90` (seconds).
+  Set to `-1` when `tcp_mux = true` (yamux provides keepalive).
+
+### Server defaults changed
+
+- **`max_ports_per_client`**: changed from `50` to `0` (unlimited).
+  To restore the old limit, set `max_ports_per_client = 50`.
+- **`auth.authentication_timeout`**: changed from `15` to `0`.
+- **`graceful_timeout`**: changed from `15` to `0`.
+- **`web_server.addr`**: changed from `""` (bind all interfaces) to
+  `"127.0.0.1"` (localhost only). This is a security hardening change.
+  If the dashboard/admin API must be reachable from remote hosts, set
+  `web_server.addr = "0.0.0.0"`.
+
+### Proxy defaults changed
+
+- **`local_ip`**: changed from `""` (empty) to `"127.0.0.1"`.
+  If your local service binds a different address, set `local_ip`
+  explicitly.
+
+### Bandwidth limit parsing tightened
+
+The `bandwidth_limit` field now requires a "KB", "MB", or "GB" suffix
+(case-insensitive). Bare numbers (e.g., `"500"`) and single-letter
+suffixes (e.g., `"500K"`) are rejected. Update your config to use
+the full suffix: `"500KB"`, `"10MB"`, `"1GB"`.
+
+Empty `bandwidth_limit` now means "no limit" (previously was treated
+as "not set"). This matches Go frp behavior.
+
 ## v0.7.0 (2026-07-21)
 
 ### Go frp dev HEAD Full Audit (d486018)
