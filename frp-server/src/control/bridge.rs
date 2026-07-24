@@ -256,24 +256,56 @@ pub(crate) async fn assign_udp_work_conn(
 /// Relay plain traffic between two IoStreams, preferring zero-copy splice
 /// on Linux when both sides are raw TCP.
 async fn relay_plain_fast(
+    user_conn: IoStream,
+    work_conn: IoStream,
+    metrics: &Arc<frp_core::metrics::ProxyMetrics>,
+) {
+    relay_plain_fast_inner(user_conn, work_conn, metrics).await
+}
+
+/// Linux: try splice(2) zero-copy relay when both sides are raw TCP.
+#[cfg(target_os = "linux")]
+async fn relay_plain_fast_inner(
+    user_conn: IoStream,
+    work_conn: IoStream,
+    metrics: &Arc<frp_core::metrics::ProxyMetrics>,
+) {
+    // Use a two-arm match so Rust knows the arms are exclusive —
+    // the Tcp arm consumes the streams, the other arm binds new mutable
+    // variables for the copy_bidirectional fallthrough.
+    match (user_conn, work_conn) {
+        (IoStream::Tcp(user), IoStream::Tcp(work)) => {
+            match frp_core::splice::bridge_splice(user, work).await {
+                Ok((a, b)) => {
+                    metrics.bytes_in.fetch_add(a, Ordering::Relaxed);
+                    metrics.bytes_out.fetch_add(b, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "splice bridge closed: {}", e);
+                }
+            }
+        }
+        (mut user_conn, mut work_conn) => {
+            match tokio::io::copy_bidirectional(&mut user_conn, &mut work_conn).await {
+                Ok((a, b)) => {
+                    metrics.bytes_in.fetch_add(a, Ordering::Relaxed);
+                    metrics.bytes_out.fetch_add(b, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "plain fast-path bridge closed: {}", e);
+                }
+            }
+        }
+    }
+}
+
+/// Non-Linux: just use copy_bidirectional.
+#[cfg(not(target_os = "linux"))]
+async fn relay_plain_fast_inner(
     mut user_conn: IoStream,
     mut work_conn: IoStream,
     metrics: &Arc<frp_core::metrics::ProxyMetrics>,
 ) {
-    use std::sync::atomic::Ordering;
-
-    // On Linux, prefer splice(2) zero-copy relay when both sides are raw TCP.
-    // DISABLED (2026-07-23): splice causes V2 plain e2e tests to hang.
-    // Root cause likely involves edge-triggered epoll (EPOLLET) in AsyncFd
-    // where both splice_direction futures register readiness on the same two
-    // fds in opposite order — creating a cross-dependency that starves one
-    // direction. Re-enable after fixing frp_core::splice::bridge_splice.
-    //
-    // Re-enablement checklist:
-    // 1. Restore the `#[cfg(target_os = "linux")]` block below
-    // 2. Run: cargo test --test v2_e2e (test_v2_e2e_tcp_proxy, test_v2_e2e_multiple_roundtrips)
-    // 3. Run: cargo test -p frp-server test_v2_ping_pong_raw_tcp (raw TCP, no tcp_mux)
-
     match tokio::io::copy_bidirectional(&mut user_conn, &mut work_conn).await {
         Ok((a, b)) => {
             metrics.bytes_in.fetch_add(a, Ordering::Relaxed);

@@ -43,6 +43,25 @@ fn create_pipe_pair() -> io::Result<(AsyncFd<OwnedFd>, AsyncFd<OwnedFd>)> {
 /// Phase B: `splice(pipe_rd → dst)` to drain the pipe to the destination.
 ///
 /// Returns when either side signals EOF (splice returns 0).
+///
+/// # Readiness model (tokio `AsyncFd`)
+///
+/// tokio's `AsyncFd` tracks readiness in an atomic bitmask inside
+/// `ScheduledIo`. When `readable().await` returns, the READABLE bit is
+/// **still set** — it is only cleared by an explicit `clear_ready()` call
+/// (see `AsyncFdReadyGuard::clear_ready`). `retain_ready()` is a no-op
+/// that merely satisfies the `#[must_use]` lint.
+///
+/// This means:
+/// - On **success** (splice returns >0): skip `clear_ready()` so the
+///   readiness bit stays for the next poll — this avoids an epoll
+///   round-trip when there is likely more data.
+/// - On **EAGAIN**: call `guard.clear_ready()` to clear the readiness
+///   bit. Without this, the next `readable().await` / `writable().await`
+///   returns immediately (the bit is still set), creating a tight loop
+///   that never yields to the runtime. The cleared bit forces
+///   re-registration with epoll, which parks the task until the fd
+///   truly becomes ready again.
 async fn splice_direction(
     src: &AsyncFd<OwnedFd>,
     pipe_rd: &AsyncFd<OwnedFd>,
@@ -74,22 +93,24 @@ async fn splice_direction(
                 )
             };
             if ret > 0 {
-                guard.retain_ready();
+                // Success: don't clear readiness — the bit stays set so the
+                // next readable().await returns immediately. Fast path for
+                // when more data is already buffered.
+                guard.retain_ready(); // no-op, satisfies #[must_use]
                 break ret as usize;
             }
             if ret == 0 {
                 // Real EOF: splice returns 0 when the source has no more
-                // data (FIN received on socket). Return immediately —
-                // don't conflate with the EAGAIN sentinel.
+                // data (FIN received on socket).
                 return Ok(());
             }
             let err = io::Error::last_os_error();
             match err.raw_os_error() {
                 Some(libc::EAGAIN) => {
-                    // Stale epoll notification (edge-triggered).
-                    // Drop the guard to clear the internal readiness flag
-                    // so the next readable().await properly registers with
-                    // epoll and yields to the runtime (avoids tight loop).
+                    // Clear the READABLE bit. Without this, readable().await
+                    // on the next loop iteration returns immediately (bit
+                    // was never cleared), creating a tight polling loop.
+                    guard.clear_ready();
                     break 'read_block 0;
                 }
                 Some(libc::EINTR) => continue,
@@ -117,7 +138,9 @@ async fn splice_direction(
                 )
             };
             if ret >= 0 {
-                guard.retain_ready();
+                // Success: don't clear readiness so next writable().await
+                // returns immediately if the kernel buffer still has room.
+                guard.retain_ready(); // no-op, satisfies #[must_use]
                 let n = ret as usize;
                 counter.fetch_add(n as u64, Ordering::Relaxed);
                 if n == 0 {
@@ -128,10 +151,10 @@ async fn splice_direction(
                 let err = io::Error::last_os_error();
                 match err.raw_os_error() {
                     Some(libc::EAGAIN) => {
-                        // Drop the guard to clear the internal readiness flag
-                        // and yield to the runtime. Continue the inner loop
+                        // Clear the WRITABLE bit. Continue the inner loop
                         // to finish draining the pipe before reading more
-                        // data from src in Phase A (avoids pipe overflow).
+                        // data from src (avoids pipe overflow).
+                        guard.clear_ready();
                         continue;
                     }
                     Some(libc::EINTR) => continue,
@@ -174,8 +197,7 @@ pub async fn bridge_splice(
     let u2w_count = AtomicU64::new(0);
     let w2u_count = AtomicU64::new(0);
 
-    // Step 5: Run both directions concurrently.
-    // tokio::join! runs both futures on the same task — no extra spawn.
+    // Step 5: Run both directions concurrently on the same task.
     let (res1, res2) = tokio::join!(
         splice_direction(&user_async, &u2w_r, &u2w_w, &work_async, &u2w_count),
         splice_direction(&work_async, &w2u_r, &w2u_w, &user_async, &w2u_count),
@@ -188,4 +210,127 @@ pub async fn bridge_splice(
     res2?;
 
     Ok((u2w_count.into_inner(), w2u_count.into_inner()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Helper: create two connected TCP socket pairs.
+    /// Returns ((bridge_user, test_user), (bridge_work, test_work)).
+    async fn socket_pairs() -> io::Result<(
+        (tokio::net::TcpStream, tokio::net::TcpStream),
+        (tokio::net::TcpStream, tokio::net::TcpStream),
+    )> {
+        let user_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let user_addr = user_listener.local_addr()?;
+        let work_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let work_addr = work_listener.local_addr()?;
+
+        let (test_user_res, accept_user_res) = tokio::join!(
+            tokio::net::TcpStream::connect(user_addr),
+            user_listener.accept(),
+        );
+        let test_user = test_user_res?;
+        let (bridge_user, _) = accept_user_res?;
+
+        let (test_work_res, accept_work_res) = tokio::join!(
+            tokio::net::TcpStream::connect(work_addr),
+            work_listener.accept(),
+        );
+        let test_work = test_work_res?;
+        let (bridge_work, _) = accept_work_res?;
+
+        Ok(((bridge_user, test_user), (bridge_work, test_work)))
+    }
+
+    /// One-direction: send data user→work, verify it arrives, then close both
+    /// ends so bridge_splice returns.
+    #[tokio::test]
+    async fn test_bridge_splice_one_direction() {
+        let ((bridge_user, mut test_user), (bridge_work, mut test_work)) =
+            socket_pairs().await.expect("socket pairs");
+
+        // Spawn bridge in background.
+        let handle = tokio::spawn(async move { bridge_splice(bridge_user, bridge_work).await });
+
+        // Send data user → work direction.
+        let msg = b"hello from user to work";
+        test_user.write_all(msg).await.expect("write to user");
+        test_user.shutdown().await.expect("shutdown user write");
+
+        // Read data on work side.
+        let mut buf = vec![0u8; msg.len()];
+        test_work
+            .read_exact(&mut buf)
+            .await
+            .expect("read from work");
+        assert_eq!(&buf, msg);
+
+        // Close work side so bridge can complete.
+        drop(test_work); // close work fd → Direction 2 sees EOF
+        drop(test_user); // close user fd → Direction 1 sees EOF
+
+        // Bridge should complete.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+            Ok(Ok(Ok((_u2w, _w2u)))) => {
+                // success
+            }
+            Ok(Ok(Err(e))) => {
+                panic!("bridge_splice error: {}", e);
+            }
+            Ok(Err(join_err)) => {
+                panic!("join error: {}", join_err);
+            }
+            Err(_timeout) => {
+                panic!("bridge_splice timed out after 5s — likely hung");
+            }
+        }
+    }
+
+    /// Bidirectional: send data both ways simultaneously.
+    #[tokio::test]
+    async fn test_bridge_splice_bidirectional() {
+        let ((bridge_user, mut test_user), (bridge_work, mut test_work)) =
+            socket_pairs().await.expect("socket pairs");
+
+        // Spawn bridge in background.
+        let handle = tokio::spawn(async move { bridge_splice(bridge_user, bridge_work).await });
+
+        // Send data in both directions concurrently.
+        let ((), ()) = tokio::join!(
+            async {
+                test_user.write_all(b"ping").await.expect("write ping");
+                let mut buf = [0u8; 4];
+                test_user.read_exact(&mut buf).await.expect("read pong");
+                assert_eq!(&buf, b"pong");
+                test_user.shutdown().await.expect("shutdown user");
+            },
+            async {
+                let mut buf = [0u8; 4];
+                test_work.read_exact(&mut buf).await.expect("read ping");
+                assert_eq!(&buf, b"ping");
+                test_work.write_all(b"pong").await.expect("write pong");
+                test_work.shutdown().await.expect("shutdown work");
+            },
+        );
+
+        // Bridge should complete.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+            Ok(Ok(Ok((u2w, w2u)))) => {
+                assert!(u2w > 0, "should have transferred data user→work");
+                assert!(w2u > 0, "should have transferred data work→user");
+            }
+            Ok(Ok(Err(e))) => {
+                panic!("bridge_splice error: {}", e);
+            }
+            Ok(Err(join_err)) => {
+                panic!("join error: {}", join_err);
+            }
+            Err(_timeout) => {
+                panic!("bridge_splice timed out after 5s — likely hung");
+            }
+        }
+    }
 }
