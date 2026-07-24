@@ -587,7 +587,18 @@ impl Service {
         let mut visitor_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         // Carry over run_id across reconnections (Go frp compat: previousRunID).
         let mut previous_run_id = String::new();
+        // Explicitly hold the previous session's yamux handle so we can drop it
+        // before creating a new connection (Go frp compat: svr.ctl.Close()).
+        // Dropping the Arc causes the background yamux task to notice the
+        // closed sender channel and exit, closing the TCP socket.
+        #[cfg(feature = "tcp-mux")]
+        let mut prev_yamux: Option<std::sync::Arc<frp_core::mux::YamuxSession>> = None;
         loop {
+            // Go frp compat (d486018): drop previous yamux session before
+            // creating a new control connection. This drops the sender channel,
+            // causing the background yamux task to exit and close the TCP socket.
+            #[cfg(feature = "tcp-mux")]
+            drop(prev_yamux.take());
             let mut ctl = ControlConnection::new(
                 self.cfg.server_addr.clone(),
                 self.cfg.server_port,
@@ -664,6 +675,11 @@ impl Service {
                 }
             };
             let yamux = yamux_session.map(std::sync::Arc::new);
+            // Store for explicit cleanup before next reconnect (Go frp compat d486018).
+            #[cfg(feature = "tcp-mux")]
+            {
+                prev_yamux = yamux.clone();
+            }
             #[cfg(feature = "quic")]
             let quic_conn = quic_conn.map(std::sync::Arc::new);
             previous_run_id = run_id.clone();
@@ -1373,6 +1389,20 @@ impl Service {
 
             // Signal session end to stop pool replenishment cascade
             session_alive.store(false, Ordering::Release);
+
+            // Go frp compat (d486018): explicitly drop the yamux session so
+            // the background task exits, closing the old TCP socket before
+            // we attempt to reconnect. This prevents dual-yamux-session leaks
+            // when reconnecting through a half-open TCP mux connection.
+            #[cfg(feature = "tcp-mux")]
+            drop(prev_yamux.take());
+
+            // Abort all visitor listener tasks so they don't hold yamux clones
+            // across reconnections (Go frp compat: visitor listeners are
+            // re-created on each session).
+            for h in visitor_handles.drain(..) {
+                h.abort();
+            }
 
             // Check if admin stop was requested
             if shutdown_flag.load(Ordering::SeqCst) {
