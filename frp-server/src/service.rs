@@ -50,6 +50,15 @@ fn is_v2_magic(buf: &[u8]) -> bool {
     buf.len() >= 7 && buf[..7] == frp_core::protocol::V2_MAGIC_BYTES
 }
 
+/// Check if a byte looks like a V1 protocol type byte.
+/// V1 type bytes are alphanumeric (e.g. 'o' for Login, 'p' for NewProxy)
+/// or in the range 0x40–0x42 (LoginResp, NewWorkConn, etc.).
+/// Used to distinguish raw V1 data from yamux headers (which start with 0x00).
+#[inline]
+fn is_v1_type_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, 0x40..=0x42)
+}
+
 /// Run V2 handshake then read the first message frame. Returns `None` on error
 /// (already logged). `addr` is `None` for listeners that don't capture peer addr.
 #[cfg(feature = "websocket")]
@@ -846,9 +855,6 @@ impl Service {
                                                     // Accumulate data across TLS records until we find
                                                     // a valid V1 header or reach 2 KiB without one.
                                                     let mut scan_data = tls_magic.to_vec();
-                                                    fn is_v1_type_byte(b: u8) -> bool {
-                                                        b.is_ascii_alphanumeric() || matches!(b, 0x40..=0x42)
-                                                    }
                                                     let find_v1 = |data: &[u8]| -> Option<usize> {
                                                         data.windows(9).position(|w| {
                                                             is_v1_type_byte(w[0])
@@ -931,9 +937,13 @@ impl Service {
                                                 warn!(peer = %peer, "TLS-only mode: rejected plain KCP from {}", peer);
                                                 return;
                                             }
-                                            if state.tcp_mux {
                                             // tcp_mux enabled: Go frpc wraps KCP conn in yamux
                                             // before sending Login (matching Go frps flow).
+                                            // But Rust frpc only proposes yamux for TCP
+                                            // (control.rs:123), not KCP. If the first byte is
+                                            // a V1 type byte (e.g. 0x6f Login), skip yamux
+                                            // and handle as raw V1.
+                                            if state.tcp_mux && !is_v1_type_byte(first_byte) {
                                             // Replay the 7 bytes consumed by magic check —
                                             // they are part of the yamux SYN header.
                                             let stream = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ctl));
