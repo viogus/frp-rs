@@ -86,9 +86,10 @@ async fn splice_direction(
             let err = io::Error::last_os_error();
             match err.raw_os_error() {
                 Some(libc::EAGAIN) => {
-                    // Stale epoll notification (edge-triggered). Re-arm
-                    // and re-await readable().
-                    guard.retain_ready();
+                    // Stale epoll notification (edge-triggered).
+                    // Drop the guard to clear the internal readiness flag
+                    // so the next readable().await properly registers with
+                    // epoll and yields to the runtime (avoids tight loop).
                     break 'read_block 0;
                 }
                 Some(libc::EINTR) => continue,
@@ -127,9 +128,11 @@ async fn splice_direction(
                 let err = io::Error::last_os_error();
                 match err.raw_os_error() {
                     Some(libc::EAGAIN) => {
-                        guard.retain_ready();
-                        // Break inner loop to re-await writable().
-                        break;
+                        // Drop the guard to clear the internal readiness flag
+                        // and yield to the runtime. Continue the inner loop
+                        // to finish draining the pipe before reading more
+                        // data from src in Phase A (avoids pipe overflow).
+                        continue;
                     }
                     Some(libc::EINTR) => continue,
                     _ => return Err(err),
@@ -150,10 +153,14 @@ pub async fn bridge_splice(
     work: tokio::net::TcpStream,
 ) -> io::Result<(u64, u64)> {
     // Step 1: Deregister from tokio's reactor and transfer fd ownership.
-    // `into_std()` returns a std TcpStream which implements `Into<OwnedFd>`,
-    // so the fd has exactly one owner — no double-close risk.
-    let user_owned: OwnedFd = user.into_std()?.into();
-    let work_owned: OwnedFd = work.into_std()?.into();
+    // `into_std()` may reset the fd to blocking mode; AsyncFd requires
+    // non-blocking fds for correct epoll edge-triggered behavior.
+    let user_std = user.into_std()?;
+    user_std.set_nonblocking(true)?;
+    let user_owned: OwnedFd = user_std.into();
+    let work_std = work.into_std()?;
+    work_std.set_nonblocking(true)?;
+    let work_owned: OwnedFd = work_std.into();
 
     // Step 2: Wrap in AsyncFd for epoll-driven readiness.
     let user_async = AsyncFd::new(user_owned)?;
