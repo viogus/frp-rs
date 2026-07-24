@@ -141,6 +141,11 @@ fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
 /// Receiver for incoming yamux streams (work connections) accepted by the server.
 pub struct IncomingStreams {
     rx: mpsc::Receiver<YamuxStream>,
+    /// When dropped, signals the background yamux task to exit.
+    /// Uses a oneshot: dropping the sender causes the receiver to return
+    /// `Err(oneshot::error::RecvError::Closed)`, breaking the background loop.
+    #[cfg(feature = "tcp-mux")]
+    _shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
 impl IncomingStreams {
@@ -208,6 +213,11 @@ where
     // Channel for forwarding accepted work connection streams.
     let (tx, rx) = mpsc::channel(256);
 
+    // Shutdown signal: dropping the sender (in IncomingStreams) cancels the
+    // background task. This ensures the old yamux Connection is terminated
+    // immediately when the control handler is replaced (Go frp compat d486018).
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
     // Spawn background task: accept yamux streams and drive connection I/O.
     //
     // Double-poll is required because yamux Active::poll processes
@@ -241,6 +251,15 @@ where
                     // Keepalive: idle connection. poll_next_inbound was
                     // called (driving I/O including next_ping()), but
                     // no new stream arrived within keepalive_interval.
+                    // Check if the control handler was replaced/dropped
+                    // (Go frp compat: interruptReadAndClose on old control).
+                    if matches!(
+                        shutdown_rx.try_recv(),
+                        Err(oneshot::error::TryRecvError::Closed)
+                    ) {
+                        debug!("yamux server: shutdown signal, stopping acceptor");
+                        break;
+                    }
                     continue;
                 }
             };
@@ -273,7 +292,13 @@ where
         }
     });
 
-    Ok((control_compat, IncomingStreams { rx }))
+    Ok((
+        control_compat,
+        IncomingStreams {
+            rx,
+            _shutdown_tx: Some(shutdown_tx),
+        },
+    ))
 }
 
 #[cfg(not(feature = "tcp-mux"))]

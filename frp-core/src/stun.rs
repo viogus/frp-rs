@@ -12,6 +12,8 @@ const MAGIC_COOKIE: u32 = 0x2112A442;
 
 /// STUN attribute types.
 const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
+const ATTR_CHANGED_ADDRESS: u16 = 0x0005;
+const ATTR_ERROR_CODE: u16 = 0x0009;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 /// OTHER-ADDRESS / CHANGED-ADDRESS (RFC 5780).
 /// Go frp uses this to get a second STUN server address for
@@ -20,6 +22,7 @@ const ATTR_OTHER_ADDRESS: u16 = 0x802c;
 
 /// Result of a STUN Binding Response, including the mapped address
 /// and optionally an OTHER-ADDRESS for dual-server NAT probing.
+#[derive(Debug)]
 pub struct StunResult {
     /// The primary mapped (external) address from XOR-MAPPED-ADDRESS
     /// or MAPPED-ADDRESS attribute.
@@ -212,8 +215,10 @@ fn build_binding_request(tx_id: &[u8; 12]) -> Vec<u8> {
 
 pub fn parse_binding_response(data: &[u8], expected_tx_id: &[u8; 12]) -> Result<String, String> {
     let msg_type = u16::from_be_bytes([data[0], data[1]]);
-    if msg_type != 0x0101 {
-        return Err(format!("unexpected STUN message type: 0x{msg_type:04x}"));
+    match msg_type {
+        0x0101 => {} // Binding Success Response — continue parsing
+        0x0111 => return Err(parse_error_response(data, expected_tx_id)),
+        _ => return Err(format!("unexpected STUN message type: 0x{msg_type:04x}")),
     }
 
     let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
@@ -245,7 +250,7 @@ pub fn parse_binding_response(data: &[u8], expected_tx_id: &[u8; 12]) -> Result<
 
         match attr_type {
             ATTR_XOR_MAPPED_ADDRESS => {
-                if let Some(addr) = parse_xor_mapped_address(value, MAGIC_COOKIE) {
+                if let Some(addr) = parse_xor_mapped_address(value, MAGIC_COOKIE, expected_tx_id) {
                     debug!(addr = %addr, "STUN XOR-MAPPED-ADDRESS: {}", addr);
                     return Ok(addr);
                 }
@@ -268,8 +273,10 @@ pub fn parse_binding_response_full(
     expected_tx_id: &[u8; 12],
 ) -> Result<StunResult, String> {
     let msg_type = u16::from_be_bytes([data[0], data[1]]);
-    if msg_type != 0x0101 {
-        return Err(format!("unexpected STUN message type: 0x{msg_type:04x}"));
+    match msg_type {
+        0x0101 => {} // Binding Success Response — continue parsing
+        0x0111 => return Err(parse_error_response(data, expected_tx_id)),
+        _ => return Err(format!("unexpected STUN message type: 0x{msg_type:04x}")),
     }
 
     let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
@@ -302,7 +309,7 @@ pub fn parse_binding_response_full(
 
         match attr_type {
             ATTR_XOR_MAPPED_ADDRESS => {
-                if let Some(addr) = parse_xor_mapped_address(value, MAGIC_COOKIE) {
+                if let Some(addr) = parse_xor_mapped_address(value, MAGIC_COOKIE, expected_tx_id) {
                     debug!(addr = %addr, "STUN XOR-MAPPED-ADDRESS: {}", addr);
                     mapped = Some(addr);
                 }
@@ -310,10 +317,11 @@ pub fn parse_binding_response_full(
             ATTR_MAPPED_ADDRESS if mapped.is_none() => {
                 mapped = parse_mapped_address(value);
             }
-            ATTR_OTHER_ADDRESS => {
-                // OTHER-ADDRESS uses XOR-MAPPED-ADDRESS encoding (RFC 5780).
-                if let Some(addr) = parse_xor_mapped_address(value, MAGIC_COOKIE) {
-                    debug!(addr = %addr, "STUN OTHER-ADDRESS: {}", addr);
+            ATTR_OTHER_ADDRESS | ATTR_CHANGED_ADDRESS => {
+                // OTHER-ADDRESS (RFC 5780) and CHANGED-ADDRESS (RFC 3489)
+                // both use XOR-MAPPED-ADDRESS encoding.
+                if let Some(addr) = parse_xor_mapped_address(value, MAGIC_COOKIE, expected_tx_id) {
+                    debug!(addr = %addr, "STUN OTHER/CHANGED-ADDRESS: {}", addr);
                     other = Some(addr);
                 }
             }
@@ -327,6 +335,58 @@ pub fn parse_binding_response_full(
         mapped_addr,
         other_addr: other,
     })
+}
+
+/// Parse a STUN Binding Error Response (type 0x0111).
+/// Returns a human-readable error string including the error code and reason phrase.
+fn parse_error_response(data: &[u8], expected_tx_id: &[u8; 12]) -> String {
+    let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+    if data.len() < 20 + msg_len {
+        return "STUN error message truncated".into();
+    }
+
+    let cookie = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+    if cookie != MAGIC_COOKIE {
+        return format!("STUN error response: bad magic cookie: 0x{cookie:08x}");
+    }
+
+    if data[8..20] != *expected_tx_id {
+        return "STUN error response: transaction ID mismatch".into();
+    }
+
+    let attrs = &data[20..20 + msg_len];
+    let mut i = 0;
+    while i + 4 <= attrs.len() {
+        let attr_type = u16::from_be_bytes([attrs[i], attrs[i + 1]]);
+        let attr_len = u16::from_be_bytes([attrs[i + 2], attrs[i + 3]]) as usize;
+        let padding = (4 - (attr_len % 4)) % 4;
+        let attr_end = i + 4 + attr_len;
+        if attr_end > attrs.len() {
+            break;
+        }
+        let value = &attrs[i + 4..attr_end];
+
+        if attr_type == ATTR_ERROR_CODE && attr_len >= 4 {
+            // ERROR-CODE: first 3 bits = 0 (reserved), next 5 bits = error class
+            // (hundreds digit), next byte = error number (units digit).
+            // Remaining bytes = UTF-8 reason phrase.
+            let class = (value[2] & 0x07) as u32;
+            let number = value[3] as u32;
+            let code = class * 100 + number;
+            let reason = if attr_len > 4 {
+                String::from_utf8_lossy(&value[4..attr_len]).into_owned()
+            } else {
+                String::new()
+            };
+            return format!(
+                "STUN error response: {code} {reason}",
+                reason = reason.trim()
+            );
+        }
+        i = attr_end + padding;
+    }
+
+    "STUN error response (no ERROR-CODE attribute)".into()
 }
 
 fn parse_mapped_address(data: &[u8]) -> Option<String> {
@@ -355,7 +415,7 @@ fn parse_mapped_address(data: &[u8]) -> Option<String> {
     }
 }
 
-fn parse_xor_mapped_address(data: &[u8], cookie: u32) -> Option<String> {
+fn parse_xor_mapped_address(data: &[u8], cookie: u32, tx_id: &[u8; 12]) -> Option<String> {
     if data.len() < 4 {
         return None;
     }
@@ -371,6 +431,23 @@ fn parse_xor_mapped_address(data: &[u8], cookie: u32) -> Option<String> {
             let xored = u32::from_be_bytes(addr_bytes) ^ cookie;
             let ip = Ipv4Addr::from(xored);
             Some(format!("{}:{}", ip, port))
+        }
+        0x02 => {
+            // IPv6 XOR-MAPPED-ADDRESS (RFC 5389 §15.2):
+            // XOR key = magic_cookie (4 bytes) || transaction_id (12 bytes)
+            if data.len() < 20 {
+                return None;
+            }
+            let mut ip_bytes = [0u8; 16];
+            ip_bytes.copy_from_slice(&data[4..20]);
+            let mut key = [0u8; 16];
+            key[..4].copy_from_slice(&cookie.to_be_bytes());
+            key[4..].copy_from_slice(tx_id);
+            for i in 0..16 {
+                ip_bytes[i] ^= key[i];
+            }
+            let ip = Ipv6Addr::from(ip_bytes);
+            Some(format!("[{}]:{}", ip, port))
         }
         _ => None,
     }
@@ -443,18 +520,18 @@ mod tests {
         data.extend_from_slice(&xored_port.to_be_bytes());
         data.extend_from_slice(&xored_ip.to_be_bytes());
 
-        let result = parse_xor_mapped_address(&data, cookie);
+        let result = parse_xor_mapped_address(&data, cookie, &[0u8; 12]);
         assert_eq!(result, Some("10.0.0.1:8080".to_string()));
     }
 
     #[test]
     fn test_parse_xor_mapped_address_too_short() {
         assert_eq!(
-            parse_xor_mapped_address(&[0x00, 0x01, 0x1F], MAGIC_COOKIE),
+            parse_xor_mapped_address(&[0x00, 0x01, 0x1F], MAGIC_COOKIE, &[0u8; 12]),
             None
         );
         assert_eq!(
-            parse_xor_mapped_address(&[0x00, 0x01, 0x1F, 0x90, 10, 0], MAGIC_COOKIE),
+            parse_xor_mapped_address(&[0x00, 0x01, 0x1F, 0x90, 10, 0], MAGIC_COOKIE, &[0u8; 12]),
             None
         );
     }
@@ -462,7 +539,10 @@ mod tests {
     #[test]
     fn test_parse_xor_mapped_address_unknown_family() {
         let data = [0x00, 0x03, 0x1F, 0x90, 0, 0, 0, 0];
-        assert_eq!(parse_xor_mapped_address(&data, MAGIC_COOKIE), None);
+        assert_eq!(
+            parse_xor_mapped_address(&data, MAGIC_COOKIE, &[0u8; 12]),
+            None
+        );
     }
 
     fn build_binding_response(tx_id: &[u8; 12], attrs: &[u8]) -> Vec<u8> {
@@ -639,6 +719,194 @@ mod tests {
         pkt.extend_from_slice(&[0u8; 12]);
         // No attributes — data is shorter than 20 + 10
         let result = parse_binding_response(&pkt, &[0u8; 12]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("truncated"));
+    }
+
+    // --- IPv6 XOR-MAPPED-ADDRESS tests ---
+
+    #[test]
+    fn test_parse_xor_mapped_address_ipv6() {
+        // XOR key = cookie (4 bytes) || tx_id (12 bytes) = 16 bytes
+        let cookie: u32 = 0x2112A442;
+        let tx_id: [u8; 12] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+        ];
+        let mut key = [0u8; 16];
+        key[..4].copy_from_slice(&cookie.to_be_bytes());
+        key[4..].copy_from_slice(&tx_id);
+
+        let real_ip: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
+        let cookie_hi = (cookie >> 16) as u16;
+        let real_port: u16 = 8080;
+        let xored_port = real_port ^ cookie_hi;
+        let mut xored_ip = [0u8; 16];
+        for i in 0..16 {
+            xored_ip[i] = real_ip[i] ^ key[i];
+        }
+
+        let mut data = vec![0x00, 0x02]; // family = IPv6
+        data.extend_from_slice(&xored_port.to_be_bytes());
+        data.extend_from_slice(&xored_ip);
+
+        let result = parse_xor_mapped_address(&data, cookie, &tx_id);
+        assert_eq!(result, Some("[2001:db8::1]:8080".to_string()));
+    }
+
+    #[test]
+    fn test_parse_xor_mapped_address_ipv6_too_short() {
+        let data = [0x00, 0x02, 0x1F, 0x90, 0, 0, 0, 0]; // only 8 bytes, need 20
+        assert_eq!(
+            parse_xor_mapped_address(&data, MAGIC_COOKIE, &[0u8; 12]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_binding_response_xor_ipv6() {
+        let tx_id = [0xEE; 12];
+        let cookie = MAGIC_COOKIE;
+        let mut key = [0u8; 16];
+        key[..4].copy_from_slice(&cookie.to_be_bytes());
+        key[4..].copy_from_slice(&tx_id);
+
+        let real_ip: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
+        let cookie_hi = (cookie >> 16) as u16;
+        let real_port: u16 = 443;
+        let xored_port = real_port ^ cookie_hi;
+        let mut xored_ip = [0u8; 16];
+        for i in 0..16 {
+            xored_ip[i] = real_ip[i] ^ key[i];
+        }
+
+        let mut attr = Vec::new();
+        attr.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        attr.extend_from_slice(&20u16.to_be_bytes()); // 4 + 16 bytes
+        attr.push(0x00);
+        attr.push(0x02); // IPv6
+        attr.extend_from_slice(&xored_port.to_be_bytes());
+        attr.extend_from_slice(&xored_ip);
+
+        let pkt = build_binding_response(&tx_id, &attr);
+        let result = parse_binding_response(&pkt, &tx_id).unwrap();
+        assert_eq!(result, "[2001:db8::1]:443");
+    }
+
+    // --- CHANGED-ADDRESS fallback test ---
+
+    #[test]
+    fn test_parse_binding_response_full_changed_address_fallback() {
+        let tx_id = [0xFF; 12];
+        let cookie = MAGIC_COOKIE;
+        let cookie_hi = (cookie >> 16) as u16;
+
+        // Build XOR-MAPPED-ADDRESS for the primary mapped address
+        let mapped_ip: [u8; 4] = [10, 20, 30, 40];
+        let mapped_port: u16 = 12345;
+        let xored_mapped_port = mapped_port ^ cookie_hi;
+        let mapped_ip_u32 = u32::from_be_bytes(mapped_ip);
+        let xored_mapped_ip = mapped_ip_u32 ^ cookie;
+        let mut mapped_attr = Vec::new();
+        mapped_attr.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        mapped_attr.extend_from_slice(&8u16.to_be_bytes());
+        mapped_attr.push(0x00);
+        mapped_attr.push(0x01);
+        mapped_attr.extend_from_slice(&xored_mapped_port.to_be_bytes());
+        mapped_attr.extend_from_slice(&xored_mapped_ip.to_be_bytes());
+
+        // Build CHANGED-ADDRESS (0x0005) as the second server address
+        let changed_ip: [u8; 4] = [192, 168, 1, 1];
+        let changed_port: u16 = 3478;
+        let xored_changed_port = changed_port ^ cookie_hi;
+        let changed_ip_u32 = u32::from_be_bytes(changed_ip);
+        let xored_changed_ip = changed_ip_u32 ^ cookie;
+        let mut changed_attr = Vec::new();
+        changed_attr.extend_from_slice(&ATTR_CHANGED_ADDRESS.to_be_bytes());
+        changed_attr.extend_from_slice(&8u16.to_be_bytes());
+        changed_attr.push(0x00);
+        changed_attr.push(0x01);
+        changed_attr.extend_from_slice(&xored_changed_port.to_be_bytes());
+        changed_attr.extend_from_slice(&xored_changed_ip.to_be_bytes());
+
+        let mut combined = mapped_attr;
+        combined.extend_from_slice(&changed_attr);
+        let pkt = build_binding_response(&tx_id, &combined);
+
+        let result = parse_binding_response_full(&pkt, &tx_id).unwrap();
+        assert_eq!(result.mapped_addr, "10.20.30.40:12345");
+        // CHANGED-ADDRESS should be picked up as the other_addr (RFC 3489 fallback)
+        assert_eq!(result.other_addr, Some("192.168.1.1:3478".to_string()));
+    }
+
+    // --- STUN Error Response tests ---
+
+    fn build_error_response(tx_id: &[u8; 12], code: u32, reason: &str) -> Vec<u8> {
+        let class = (code / 100) as u8;
+        let number = (code % 100) as u8;
+        let reason_bytes = reason.as_bytes();
+        // ERROR-CODE attribute: 4 + reason length (padded to 4-byte boundary)
+        let attr_value_len = 4 + reason_bytes.len();
+        let padding = (4 - (attr_value_len % 4)) % 4;
+        let attr_len = attr_value_len + padding;
+
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&0x0111u16.to_be_bytes()); // type = Binding Error Response
+        pkt.extend_from_slice(&((4 + attr_len) as u16).to_be_bytes()); // length
+        pkt.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        pkt.extend_from_slice(tx_id);
+        // ERROR-CODE attribute TLV
+        pkt.extend_from_slice(&ATTR_ERROR_CODE.to_be_bytes());
+        pkt.extend_from_slice(&(attr_value_len as u16).to_be_bytes());
+        pkt.push(0x00);
+        pkt.push(0x00);
+        pkt.push(class & 0x07);
+        pkt.push(number);
+        pkt.extend_from_slice(reason_bytes);
+        // padding
+        if padding > 0 {
+            pkt.extend(std::iter::repeat_n(0x00, padding));
+        }
+        pkt
+    }
+
+    #[test]
+    fn test_parse_error_response_unknown_attribute() {
+        let tx_id = [0xAB; 12];
+        let pkt = build_error_response(&tx_id, 420, "Unknown Attribute");
+        let result = parse_binding_response(&pkt, &tx_id);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("420"), "expected error code 420, got: {err}");
+        assert!(
+            err.contains("Unknown Attribute"),
+            "expected reason, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_error_response_server_error() {
+        let tx_id = [0xCD; 12];
+        let pkt = build_error_response(&tx_id, 500, "Server Error");
+        let result = parse_binding_response_full(&pkt, &tx_id);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("500"), "expected error code 500, got: {err}");
+    }
+
+    #[test]
+    fn test_parse_error_response_truncated() {
+        let tx_id = [0xEF; 12];
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&0x0111u16.to_be_bytes());
+        pkt.extend_from_slice(&100u16.to_be_bytes()); // claims 100 bytes
+        pkt.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        pkt.extend_from_slice(&tx_id);
+        // no actual attributes
+        let result = parse_binding_response(&pkt, &tx_id);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("truncated"));
     }
