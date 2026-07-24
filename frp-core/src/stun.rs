@@ -217,10 +217,7 @@ pub fn parse_binding_response(data: &[u8], expected_tx_id: &[u8; 12]) -> Result<
     let msg_type = u16::from_be_bytes([data[0], data[1]]);
     match msg_type {
         0x0101 => {} // Binding Success Response — continue parsing
-        0x0111 => match parse_error_response(data, expected_tx_id) {
-            Err(e) => return Err(e),
-            Ok(_) => unreachable!(),
-        },
+        0x0111 => return Err(parse_error_response(data, expected_tx_id)),
         _ => return Err(format!("unexpected STUN message type: 0x{msg_type:04x}")),
     }
 
@@ -278,10 +275,7 @@ pub fn parse_binding_response_full(
     let msg_type = u16::from_be_bytes([data[0], data[1]]);
     match msg_type {
         0x0101 => {} // Binding Success Response — continue parsing
-        0x0111 => match parse_error_response(data, expected_tx_id) {
-            Err(e) => return Err(e),
-            Ok(_) => unreachable!(),
-        },
+        0x0111 => return Err(parse_error_response(data, expected_tx_id)),
         _ => return Err(format!("unexpected STUN message type: 0x{msg_type:04x}")),
     }
 
@@ -343,23 +337,21 @@ pub fn parse_binding_response_full(
     })
 }
 
-/// Parse a STUN Binding Error Response (type 0x0111) and return a
-/// human-readable error string including the error code and reason phrase.
-fn parse_error_response(data: &[u8], expected_tx_id: &[u8; 12]) -> Result<String, String> {
+/// Parse a STUN Binding Error Response (type 0x0111).
+/// Returns a human-readable error string including the error code and reason phrase.
+fn parse_error_response(data: &[u8], expected_tx_id: &[u8; 12]) -> String {
     let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
     if data.len() < 20 + msg_len {
-        return Err("STUN error message truncated".into());
+        return "STUN error message truncated".into();
     }
 
     let cookie = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
     if cookie != MAGIC_COOKIE {
-        return Err(format!(
-            "STUN error response: bad magic cookie: 0x{cookie:08x}"
-        ));
+        return format!("STUN error response: bad magic cookie: 0x{cookie:08x}");
     }
 
     if data[8..20] != *expected_tx_id {
-        return Err("STUN error response: transaction ID mismatch".into());
+        return "STUN error response: transaction ID mismatch".into();
     }
 
     let attrs = &data[20..20 + msg_len];
@@ -386,15 +378,15 @@ fn parse_error_response(data: &[u8], expected_tx_id: &[u8; 12]) -> Result<String
             } else {
                 String::new()
             };
-            return Err(format!(
+            return format!(
                 "STUN error response: {code} {reason}",
                 reason = reason.trim()
-            ));
+            );
         }
         i = attr_end + padding;
     }
 
-    Err("STUN error response (no ERROR-CODE attribute)".into())
+    "STUN error response (no ERROR-CODE attribute)".into()
 }
 
 fn parse_mapped_address(data: &[u8]) -> Option<String> {
