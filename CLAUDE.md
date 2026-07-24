@@ -85,7 +85,7 @@ Every feature, fix, and test change follows three rules:
    bash scripts/download-go-frp.sh
    ```
 
-## Current Health (2026-07-19)
+## Current Health (2026-07-24)
 
 | Metric | Value |
 |--------|-------|
@@ -94,7 +94,7 @@ Every feature, fix, and test change follows three rules:
 | `cargo fmt --all -- --check` | zero diffs |
 | `cargo test --workspace --all-features` | 485 passed, 2 ignored (35 suites) |
 | `cargo build --release` | passes (frps ~4.8MB, frpc ~3.7MB) |
-| `compat-test.sh` (Go frp v0.70.0) | 60/60 passed (XTCP 16 skipped, V2 TCP guarded) |
+| `compat-test.sh` (Go frp v0.70.1) | 61/64 passed (3 flaky: KCP/QUIC timing, V2 skipped) |
 | `unsafe` blocks | 6 in frp-core, 3+ in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
 | `hex` crate | removed — inline `hex_encode` in frp-core |

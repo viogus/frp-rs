@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # frp-rs Cross-Compatibility Test Suite
-# Tests Go frp v0.70.0 <-> Rust frp-rs interoperability
+# Tests Go frp v0.70.1 <-> Rust frp-rs interoperability
 # =============================================================================
 set -euo pipefail
 
@@ -9,7 +9,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # Go version (overridable via env or --go-version flag)
-GO_FRP_VERSION="${GO_FRP_VERSION:-0.70.0}"
+GO_FRP_VERSION="${GO_FRP_VERSION:-0.70.1}"
 # Auto-detect Go frp binary path. Override with GO_FRP_DIR env var.
 GO_FRP_DIR_USER=""  # track if user provided explicit path
 if [[ -n "${GO_FRP_DIR:-}" ]]; then
@@ -3870,7 +3870,7 @@ test_r2g_tcpmux() {
 
 echo "============================================="
 echo " frp-rs Cross-Compatibility Test Suite"
-echo " Go frp v0.70.0 <-> Rust frp-rs"
+echo " Go frp v0.70.1 <-> Rust frp-rs"
 echo "============================================="
 echo ""
 
