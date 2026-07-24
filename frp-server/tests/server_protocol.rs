@@ -662,7 +662,7 @@ async fn test_login_via_tls() {
 
     // Verify we got a TLS stream
     match &io {
-        IoStream::Tls(_) => {} // expected
+        IoStream::Tls(..) => {} // expected
         other => panic!("expected IoStream::Tls, got: {:?}", other),
     }
 

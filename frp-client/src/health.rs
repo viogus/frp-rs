@@ -58,11 +58,19 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
     info!(check_type = %check_type, proxy_name = %proxy_name, local_addr = %local_addr, interval = ?interval, timeout = ?timeout, "Health check ({}) started for '{}' -> {} (interval: {:?}, timeout: {:?})",
         check_type, proxy_name, local_addr, interval, timeout);
 
-    let mut failures: u32 = 0;
+    // Go frp v0.70.1 compat: failedTimes is a monotonic uint64 that NEVER resets.
+    // State transitions are tracked by was_failed/statusOK, not by resetting the counter.
+    // See /tmp/frp-source/client/health/health.go:45,128-135.
+    let mut failures: u64 = 0;
     let mut was_failed = false;
     // Track whether the proxy has ever been healthy (Go frp: statusOK).
     // Close is only fired after the proxy was healthy at least once.
     let mut was_healthy = false;
+
+    // Go frp v0.70.1 compat: add 500ms startup delay before the first check.
+    // This prevents a thundering herd of health checks when many proxies
+    // register simultaneously at client startup.
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     loop {
         // Check cancellation before each check cycle.
@@ -81,7 +89,8 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
 
         match result {
             Ok(()) => {
-                failures = 0;
+                // Go frp compat: failedTimes is NEVER reset on success — monotonic.
+                // See /tmp/frp-source/client/health/health.go:121-127.
                 was_healthy = true;
                 if was_failed {
                     // Service recovered. Notify control loop to re-register.
@@ -101,7 +110,7 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
 
         // Go frp compat: only fire Close after the proxy was ever healthy.
         // (statusOK must be true before transitioning to false triggers the callback).
-        if was_healthy && failures >= max_failed && !was_failed {
+        if was_healthy && failures >= max_failed as u64 && !was_failed {
             was_failed = true;
             warn!(proxy_name = %proxy_name, max_failed = %max_failed, "Health check: proxy '{}' exceeded max failures ({}), sending Close event",
                 proxy_name, max_failed);

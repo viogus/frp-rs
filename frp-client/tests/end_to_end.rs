@@ -254,7 +254,7 @@ async fn test_e2e_tcp_proxy_over_tls() {
         allow_port_start: proxy_port.saturating_sub(50),
         allow_port_end: proxy_port + 50,
         transport: frp_core::config::ServerTransportConfig {
-            tcp_mux: false,
+            tcp_mux: Some(false),
             ..Default::default()
         },
         ..Default::default()
@@ -378,7 +378,7 @@ async fn test_e2e_tcp_proxy_over_yamux() {
             ..Default::default()
         },
         transport: frp_core::config::ServerTransportConfig {
-            tcp_mux: true,
+            tcp_mux: Some(true),
             tcp_mux_keepalive_interval: 30,
             ..Default::default()
         },

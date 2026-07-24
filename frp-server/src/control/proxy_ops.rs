@@ -241,22 +241,56 @@ pub(crate) async fn handle_new_proxy(
     } else {
         remote_port
     };
-    let allocated_port = if is_sudp && remote_port > 0 {
-        // SUDP proxies can share ports. If the requested port is already
-        // in use, reuse it without adding to used_ports.
-        // Check-and-allocate atomically under write lock (fixes TOCTOU).
-        let mut ports = state.used_ports.write().await;
-        if ports.contains(&remote_port) {
-            Some(remote_port)
+    // Separate port managers for TCP and UDP (Go frp compat).
+    // TCP port 8080 can coexist with UDP port 8080.
+    let is_udp_type = np.proxy_type == "udp" || np.proxy_type == "sudp";
+    let allocated_port = if is_udp_type {
+        // UDP/SuDP port allocation: no TCP bind probe (UdpSocket::bind handles
+        // OS-level validation later). Use dedicated used_udp_ports tracking
+        // separate from TCP used_ports (Go frp compat).
+        let mut ports = state.used_udp_ports.write().await;
+        if remote_port > 0 {
+            if ports.contains(&remote_port) {
+                // Port already used by another UDP proxy. SUDP allows sharing,
+                // pure UDP does not.
+                if is_sudp {
+                    Some(remote_port)
+                } else {
+                    None
+                }
+            } else {
+                ports.insert(remote_port);
+                Some(remote_port)
+            }
         } else {
-            allocate_port_multi(
-                &mut ports,
-                remote_port,
-                &state.reloadable.read_ok().allow_ports,
-                &state.proxy_bind_addr,
-            )
+            // Auto-assign: scan allow_ports ranges for first available UDP port
+            let allow_ports = state.reloadable.read_ok().allow_ports.clone();
+            drop(ports); // Release write lock before re-acquiring
+            let mut ports = state.used_udp_ports.write().await;
+            let mut found = None;
+            for &(start, end) in &allow_ports {
+                for p in start..=end {
+                    if !ports.contains(&p) {
+                        ports.insert(p);
+                        found = Some(p);
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            if found.is_none() {
+                tracing::warn!(
+                    ranges = ?allow_ports,
+                    "UDP port exhaustion: no available ports in configured allow_ports ranges",
+                );
+            }
+            found
         }
     } else {
+        // TCP-type proxy (tcp, http, https, tcpmux): use TCP port manager
+        // with OS-level bind probe.
         let mut ports = state.used_ports.write().await;
         allocate_port_multi(
             &mut ports,
@@ -328,6 +362,12 @@ pub(crate) async fn handle_new_proxy(
                     state.xtcp.sk_index.write().await.remove(&np.proxy_name);
                 }
                 state.used_ports.write().await.remove(&port);
+                // For UDP proxies, also clean up used_udp_ports. The port
+                // was allocated from the TCP set by the TCP group path
+                // (TCP group proxies are always TCP, not UDP).
+                if is_udp_type {
+                    state.used_udp_ports.write().await.remove(&port);
+                }
                 reject_new_proxy(
                     writer,
                     &np.proxy_name,
@@ -593,7 +633,7 @@ pub(crate) async fn handle_new_proxy(
                     }
                     Err(e) => {
                         tracing::error!(port = %port, error = %e, "Failed to bind UDP port {}: {}", port, e);
-                        state.used_ports.write().await.remove(&port);
+                        state.used_udp_ports.write().await.remove(&port);
                         state.proxy_manager.remove(&np.proxy_name).await;
                         reject_new_proxy(
                             writer,
@@ -811,6 +851,7 @@ pub(crate) async fn unregister_control(
     }
     // Release allocated ports and clean up sk/vhost entries for this client
     let proxies = state.proxy_manager.list_client(run_id).await;
+    // TCP port cleanup
     let mut ports = state.used_ports.write().await;
     for p in &proxies {
         if let Some(port) = p.remote_port {
@@ -827,7 +868,7 @@ pub(crate) async fn unregister_control(
                     // Stop the shared group listener
                     state.tcp_group_ctl.remove_group(group_name).await;
                 }
-            } else {
+            } else if p.proxy_type != "udp" && p.proxy_type != "sudp" {
                 ports.remove(&port);
             }
         }
@@ -838,6 +879,26 @@ pub(crate) async fn unregister_control(
         }
     }
     drop(ports);
+    // UDP port cleanup (Go frp compat: separate port manager for UDP)
+    let mut udp_ports = state.used_udp_ports.write().await;
+    for p in &proxies {
+        if let Some(port) = p.remote_port {
+            if p.proxy_type == "udp" || p.proxy_type == "sudp" {
+                // For SUDP, only release the port if no other SUDP proxy uses it
+                if p.proxy_type == "sudp" {
+                    let count = proxies.iter().filter(|op| {
+                        op.proxy_type == "sudp" && op.remote_port == Some(port) && op.name != p.name
+                    }).count();
+                    if count == 0 {
+                        udp_ports.remove(&port);
+                    }
+                } else {
+                    udp_ports.remove(&port);
+                }
+            }
+        }
+    }
+    drop(udp_ports);
     // Clear per-client port usage tracking (matching Go frp's portsUsedNum cleanup).
     state.client_ports_used.write().await.remove(run_id);
     // VHost unregister outside port lock to avoid holding it across awaits

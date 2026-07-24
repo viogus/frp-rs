@@ -182,10 +182,10 @@ impl ServerConfigSnapshot {
 }
 
 fn default_allow_port_start() -> u16 {
-    10000
+    0
 }
 fn default_allow_port_end() -> u16 {
-    50000
+    65535
 }
 fn default_vhost_http_timeout() -> u64 {
     60
@@ -338,6 +338,10 @@ impl ServerConfig {
         // When proxy_bind_addr is empty, inherit from bind_addr (Go compat).
         if self.proxy_bind_addr.is_empty() {
             self.proxy_bind_addr = self.bind_addr.clone();
+        }
+        // When web_server port is set but addr is empty, default to 0.0.0.0 (Go compat).
+        if self.web_server.port > 0 && self.web_server.addr.is_empty() {
+            self.web_server.addr = "0.0.0.0".into();
         }
     }
 }
@@ -501,8 +505,12 @@ impl Default for LogConfig {
 fn default_log_level() -> String {
     "info".into()
 }
+fn default_pool_count() -> i32 {
+    1
+}
+
 fn default_health_check_url() -> String {
-    "/".into()
+    "".into()
 }
 
 fn default_local_ip() -> String {
@@ -615,10 +623,45 @@ fn default_plugin_timeout() -> u64 {
     5
 }
 
+/// QUIC transport options.
+/// Go frp v0.70.1 compat: quic section in transport config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuicOptions {
+    /// Keepalive period in seconds. Default: 10.
+    #[serde(default = "default_quic_keepalive_period", alias = "keepalivePeriod")]
+    pub keepalive_period: i64,
+    /// Max idle timeout in seconds. Default: 30.
+    #[serde(default = "default_quic_max_idle_timeout", alias = "maxIdleTimeout")]
+    pub max_idle_timeout: i64,
+    /// Max incoming streams. Default: 100000.
+    #[serde(default = "default_quic_max_incoming_streams", alias = "maxIncomingStreams")]
+    pub max_incoming_streams: i64,
+}
+
+impl Default for QuicOptions {
+    fn default() -> Self {
+        Self {
+            keepalive_period: default_quic_keepalive_period(),
+            max_idle_timeout: default_quic_max_idle_timeout(),
+            max_incoming_streams: default_quic_max_incoming_streams(),
+        }
+    }
+}
+
+fn default_quic_keepalive_period() -> i64 {
+    10
+}
+fn default_quic_max_idle_timeout() -> i64 {
+    30
+}
+fn default_quic_max_incoming_streams() -> i64 {
+    100000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerTransportConfig {
-    #[serde(default = "default_tcp_mux")]
-    pub tcp_mux: bool,
+    #[serde(default = "default_tcp_mux_option")]
+    pub tcp_mux: Option<bool>,
     #[serde(default)]
     pub tcp_mux_keepalive_interval: i64,
     /// Heartbeat timeout in seconds. Server disconnects if no Ping
@@ -632,15 +675,24 @@ pub struct ServerTransportConfig {
     /// Go frp compat: transport.maxPoolCount.
     #[serde(default = "default_max_pool_count", alias = "maxPoolCount")]
     pub max_pool_count: i64,
+    /// TCP keepalive interval in seconds for server-side connections.
+    /// Go frp v0.70.1 compat: tcpKeepalive. Default: 7200.
+    #[serde(default = "default_tcp_keepalive", alias = "tcpKeepalive")]
+    pub tcp_keepalive: i64,
+    /// QUIC protocol options.
+    #[serde(default, rename = "quic")]
+    pub quic_options: Option<QuicOptions>,
 }
 
 impl Default for ServerTransportConfig {
     fn default() -> Self {
         Self {
-            tcp_mux: default_tcp_mux(),
+            tcp_mux: default_tcp_mux_option(),
             tcp_mux_keepalive_interval: 30,
             heartbeat_timeout: default_heartbeat_timeout(),
             max_pool_count: default_max_pool_count(),
+            tcp_keepalive: default_tcp_keepalive(),
+            quic_options: None,
         }
     }
 }
@@ -657,7 +709,7 @@ impl ServerTransportConfig {
     /// `ServerTransportConfig.Complete()`. Call after deserialization,
     /// before consuming the config.
     pub fn complete(&mut self) {
-        if self.tcp_mux {
+        if self.tcp_mux.unwrap_or(true) {
             // When tcpMux is enabled, heartbeat of application layer is
             // unnecessary — rely on yamux keepalive instead (Go compat).
             if self.heartbeat_timeout == default_heartbeat_timeout() || self.heartbeat_timeout == 0
@@ -826,7 +878,7 @@ pub struct ClientConfig {
     pub auth: Option<AuthClientConfig>,
     #[serde(default)]
     pub user: String,
-    #[serde(default)]
+    #[serde(default, alias = "clientID")]
     pub client_id: String,
     /// Client-level metadata sent in the Login message.
     /// Go frp compat: metadatas.
@@ -861,7 +913,7 @@ pub struct ClientConfig {
     pub tls_key_file: String,
     #[serde(default)]
     pub tls_ca_file: String,
-    #[serde(default)]
+    #[serde(default, alias = "tlsServerName")]
     pub tls_server_name: String,
     /// Disable the custom TLS head byte (0x17) written before the TLS handshake.
     /// When true, the client skips the Go frp protocol marker and starts TLS directly.
@@ -872,7 +924,7 @@ pub struct ClientConfig {
     pub log: LogConfig,
     #[serde(default = "default_true")]
     pub login_fail_exit: bool,
-    #[serde(default)]
+    #[serde(default = "default_pool_count")]
     pub pool_count: i32,
     /// Ping interval in seconds. Client sends a heartbeat Ping at this
     /// interval. Default: 30. Go frp compat: transport.heartbeatInterval.
@@ -889,6 +941,10 @@ pub struct ClientConfig {
     /// frp server. 0 disables. Go frp compat: dialServerKeepalive.
     #[serde(default, alias = "dialServerKeepalive")]
     pub dial_server_keepalive: i64,
+    /// Timeout in seconds for dialing the frp server.
+    /// Go frp v0.70.1 compat: dialServerTimeout. Default: 10.
+    #[serde(default = "default_dial_server_timeout", alias = "dialServerTimeout")]
+    pub dial_server_timeout: i64,
     /// Local IP address to bind when dialing the frp server.
     /// Empty means use system default. Go frp compat: connectServerLocalIP.
     #[serde(default, alias = "connectServerLocalIP")]
@@ -902,6 +958,9 @@ pub struct ClientConfig {
     pub tcp_mux_keepalive_interval: i64,
     #[serde(default)]
     pub v2: bool,
+    /// QUIC protocol options.
+    #[serde(default, rename = "quic")]
+    pub quic_options: Option<QuicOptions>,
     #[serde(default)]
     pub proxies: Vec<ProxyConfig>,
     #[serde(default)]
@@ -944,10 +1003,12 @@ impl Default for ClientConfig {
             heartbeat_timeout: default_heartbeat_timeout(),
             dns_server: String::new(),
             dial_server_keepalive: 7200,
+            dial_server_timeout: default_dial_server_timeout(),
             connect_server_local_ip: String::new(),
             tcp_mux: default_tcp_mux(),
             tcp_mux_keepalive_interval: 30,
             v2: false,
+            quic_options: None,
             proxies: vec![],
             visitors: vec![],
             web_server: WebServerConfig::default(),
@@ -1020,11 +1081,20 @@ fn default_true() -> bool {
 fn default_tcp_mux() -> bool {
     true
 }
+fn default_tcp_mux_option() -> Option<bool> {
+    Some(true)
+}
 fn default_heartbeat_interval() -> i64 {
     30
 }
 fn default_nat_hole_stun_server() -> String {
     "stun.easyvoip.com:3478".into()
+}
+fn default_tcp_keepalive() -> i64 {
+    7200
+}
+fn default_dial_server_timeout() -> i64 {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1125,7 +1195,7 @@ pub struct ProxyConfig {
 
 /// STCP/XTCP visitor configuration — used by frpc to expose a local port
 /// that tunnels traffic to a remote STCP/XTCP proxy through the frps server.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisitorConfig {
     /// Name for this visitor (used in logs).
     #[serde(default)]
@@ -1139,6 +1209,10 @@ pub struct VisitorConfig {
     /// Shared secret key — must match the STCP proxy's `sk`.
     #[serde(default, alias = "secretKey", alias = "sk")]
     pub secret_key: String,
+    /// Protocol for XTCP P2P connections: "kcp" or "quic". Default: "quic".
+    /// Go frp v0.70.1 compat.
+    #[serde(default = "default_xtcp_protocol", alias = "protocol")]
+    pub protocol: String,
     /// Optional server user for auth matching.
     #[serde(default, alias = "serverUser")]
     pub server_user: String,
@@ -1181,11 +1255,37 @@ pub struct VisitorConfig {
     pub min_retry_interval: i64,
 }
 
+impl Default for VisitorConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            visitor_type: String::new(),
+            server_name: String::new(),
+            secret_key: String::new(),
+            server_user: String::new(),
+            bind_addr: default_visitor_bind_addr(),
+            bind_port: 0,
+            fallback_timeout_ms: default_fallback_timeout_ms(),
+            fallback_to: String::new(),
+            disable_assisted_addrs: false,
+            use_encryption: false,
+            use_compression: false,
+            keep_tunnel_open: false,
+            max_retries_an_hour: default_max_retries_an_hour(),
+            min_retry_interval: default_min_retry_interval(),
+            protocol: default_xtcp_protocol(),
+        }
+    }
+}
+
 fn default_max_retries_an_hour() -> i32 {
     8
 }
 fn default_min_retry_interval() -> i64 {
     90
+}
+fn default_xtcp_protocol() -> String {
+    "quic".into()
 }
 fn default_vnet_netmask() -> String {
     "255.255.255.0".to_string()
@@ -1415,7 +1515,7 @@ fn flatten_to_table(table: &mut toml::Table, keys: &[&str], target: &str, strip_
             .or_insert_with(|| toml::Value::Table(Default::default()));
         if let toml::Value::Table(ref mut t) = target_table {
             for (k, v) in items {
-                t.entry(k).or_insert(v);
+                t.insert(k, v);
             }
         }
     }
@@ -1619,11 +1719,36 @@ fn normalize_client_config(value: &mut toml::Value) {
             table.entry("server_port").or_insert(v);
         }
 
-        // Extract token from [auth] table (Go frp uses auth.token, auth.method)
-        if let Some(Value::Table(auth_table)) = table.remove("auth") {
-            if let Some(token_val) = auth_table.get("token") {
-                table.entry("token").or_insert(token_val.clone());
-            }
+        // Flatten legacy top-level auth_*, oidc_* fields into [auth] table.
+        // Go frp uses auth.method, auth.token, auth.oidc_* in client config.
+        flatten_to_table(
+            table,
+            &[
+                "auth_method",
+                "auth_token",
+                "token",
+                "oidc_issuer",
+                "oidc_audience",
+                "oidc_token_endpoint",
+                "oidc_client_id",
+                "oidc_client_secret",
+                "oidc_scope",
+                "oidc_proxy_url",
+            ],
+            "auth",
+            &["auth_", "oidc_"],
+        );
+
+        // Also copy token from [auth] to top-level for backward compat
+        // (ClientConfig has both flat `token` and nested `auth.token`).
+        // Extract the token first to avoid mutable borrow conflict with table.
+        let auth_token = table
+            .get("auth")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("token"))
+            .cloned();
+        if let Some(token_val) = auth_token {
+            table.entry("token").or_insert(token_val);
         }
 
         // Flatten [transport] section → top-level (ClientConfig has tcp_mux at top level,
@@ -2253,6 +2378,22 @@ fn known_client_keys() -> std::collections::HashSet<&'static str> {
         "log_level",
         "log_max_days",
         "observability",
+        // Go frp v0.70.1 compat — new fields
+        "quic",
+        "dial_server_timeout",
+        "dialServerTimeout",
+        "clientID",
+        "tlsServerName",
+        // Client-side auth flat field normalization aliases
+        "auth_method",
+        "auth_token",
+        "oidc_client_id",
+        "oidc_client_secret",
+        "oidc_audience",
+        "oidc_token_endpoint",
+        "oidc_scope",
+        "oidc_issuer",
+        "oidc_proxy_url",
     ])
 }
 

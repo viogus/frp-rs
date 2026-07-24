@@ -152,21 +152,13 @@ pub fn classify_feature_count(features: &[NatFeature]) -> (i32, i32, i32) {
 }
 
 /// Extract IP addresses from "ip:port" strings (Go frp nathole.go parseIPs).
-/// Drops IPv6 bracketed addresses since the NAT classifier only considers
-/// IPv4 for local IP matching.
+/// Go frp v0.70.1 accepts all IP addresses including IPv6 (no IPv6 filtering).
 pub fn parse_ips(addrs: &[String]) -> Vec<String> {
     addrs
         .iter()
         .filter_map(|addr| {
-            // Use split_host_port which correctly handles IPv4, bracketed IPv6,
-            // and unbracketed IPv6 addresses.
             if let Ok((ip, _port)) = split_host_port(addr) {
-                if !ip.contains(':') {
-                    // Only collect IPv4 addresses (Go frp skips IPv6)
-                    Some(ip.to_string())
-                } else {
-                    None
-                }
+                Some(ip.to_string())
             } else {
                 None
             }
@@ -280,15 +272,17 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ips_skips_ipv6() {
+    fn test_parse_ips_includes_ipv6() {
         let addrs = vec![
             "192.168.1.1:3478".into(),
             "[::1]:8080".into(),
             "[2001:db8::1]:9000".into(),
         ];
         let ips = parse_ips(&addrs);
-        assert_eq!(ips.len(), 1);
-        assert_eq!(ips[0], "192.168.1.1");
+        assert_eq!(ips.len(), 3);
+        assert!(ips.contains(&"192.168.1.1".into()));
+        assert!(ips.contains(&"::1".into()));
+        assert!(ips.contains(&"2001:db8::1".into()));
     }
 
     #[test]

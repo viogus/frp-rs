@@ -221,8 +221,9 @@ impl Service {
             enc_key,
             allow_ports,
             sub_host,
-            cfg.transport.tcp_mux,
+            cfg.transport.tcp_mux.unwrap_or(true),
             cfg.transport.tcp_mux_keepalive_interval,
+            cfg.transport.tcp_keepalive,
             cfg.transport.heartbeat_timeout,
             cfg.udp_packet_size,
             cfg.tls_only,
@@ -338,6 +339,12 @@ impl Service {
                                 // Disable Nagle for low-latency small-message RTT
                                 // (Go frp parity: control path uses NoDelay(true)).
                                 frp_core::transport::set_nodelay(&stream);
+                                if ws_state.tcp_keepalive > 0 {
+                                    frp_core::transport::set_keepalive(
+                                        &stream,
+                                        ws_state.tcp_keepalive as u64,
+                                    );
+                                }
                                 info!(addr = %addr, "New WebSocket connection from {}", addr);
                                 let state = ws_state.clone();
                                 let permit = state.conn_semaphore.as_ref()
@@ -438,7 +445,7 @@ impl Service {
                                                             }
                                                         }
                                                     } else {
-                                                        let mut io = IoStream::Tls(Box::new(tls_stream));
+                                                        let mut io = IoStream::Tls(Box::new(tls_stream), addr);
 
                                                         let mut chicken = [0u8; 7];
                                                         let is_tls_v2 = match io.read_exact(&mut chicken).await {
@@ -733,7 +740,7 @@ impl Service {
                                                         return;
                                                     }
                                                 };
-                                                let tls_io = frp_core::transport::IoStream::Tls(Box::new(tls_stream));
+                                                let tls_io = frp_core::transport::IoStream::Tls(Box::new(tls_stream), peer);
 
                                                 // After TLS: if tcpMux, wrap in yamux before V2/V1
                                                 // (matching Go frps: TLS accept → yamux → V2/V1 on yamux stream).
@@ -1478,6 +1485,12 @@ impl Service {
                     match result {
                 Ok((stream, addr)) => {
                     frp_core::transport::set_nodelay(&stream);
+                    if self.state.tcp_keepalive > 0 {
+                        frp_core::transport::set_keepalive(
+                            &stream,
+                            self.state.tcp_keepalive as u64,
+                        );
+                    }
                     let state = self.state.clone();
                     #[cfg(feature = "tls")]
                     let acceptor = state.tls_acceptor.read_ok().clone();
@@ -1557,7 +1570,9 @@ impl Service {
                                     if let Some(sni_host) = crate::vhost::extract_sni_from_client_hello(&sni_data) {
                                         debug!(addr = %addr, sni_host = %sni_host, "SNI from {}: {}", addr, sni_host);
                                         // SNI routing: no HTTP auth, so http_user is empty string.
-                                        if let Some(route) = state.vhost_manager.lookup_wildcard(&sni_host, "").await {
+                                        // SNI routing: no HTTP path, so pass empty string.
+                                        // Routes with empty locations (HTTPS SNI) match any path.
+                                        if let Some(route) = state.vhost_manager.lookup_wildcard(&sni_host, "", "").await {
                                             let ctl_tx = {
                                                 let map = state.run_id_to_ctl_tx.read().await;
                                                 map.get(&route.run_id).cloned()
@@ -1585,6 +1600,14 @@ impl Service {
                                 let acceptor = match acceptor {
                                     Some(a) => a,
                                     None => {
+                                        // TLS.Force mode: if tls_only is set, reject connections
+                                        // that attempt TLS without a configured acceptor.
+                                        if state.tls_only {
+                                            warn!(addr = %addr,
+                                                "TLS-only mode: TLS byte (0x{:02x}) but TLS not configured, rejecting",
+                                                first_byte);
+                                            return;
+                                        }
                                         // Go frp compat: Go frpc sends 0x17 (FRP_TLS_HEAD_BYTE)
                                         // or 0x16 (FRP_TLS_DIRECT_BYTE) as the first byte when
                                         // TLS is enabled on the client but not on the server.
@@ -1633,7 +1656,7 @@ impl Service {
                                 info!(addr = %addr, "TLS connection from {}", addr);
 
                                 // Wrap TLS stream for unified V2/V1/WS handling.
-                                let mut io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls_stream)));
+                                let mut io = IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(tls_stream)), addr);
 
                                 // Peek for WebSocket upgrade inside TLS (Go frp 'ws'
                                 // transport sends TLS ClientHello first, then WebSocket
@@ -2054,7 +2077,7 @@ impl Service {
                                                         }
                                                     }
                                                 } else {
-                                                    let mut io = IoStream::Tls(Box::new(tls_stream));
+                                                    let mut io = IoStream::Tls(Box::new(tls_stream), addr);
 
                                                     // V2 chicken check on the decrypted TLS stream
                                                     let mut chicken = [0u8; 7];

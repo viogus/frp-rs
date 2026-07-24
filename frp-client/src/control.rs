@@ -5,7 +5,7 @@ use tracing::{debug, info, warn};
 
 use frp_core::auth::{AuthConfig, OidcClient};
 use frp_core::config::{ProxyConfig, VisitorConfig};
-use frp_core::msg::{self, FrpMessage};
+use frp_core::msg::{self, ClientSpec, FrpMessage};
 use frp_core::mux::{self, YamuxSession};
 use frp_core::protocol::write_msg_v1;
 #[cfg(feature = "quic")]
@@ -56,6 +56,8 @@ pub struct ControlConnection {
     pub server_auth_scopes: Vec<String>,
     metas: std::collections::HashMap<String, String>,
     proxy_url: String,
+    /// Client spec passed in Login message (Go frp compat).
+    client_spec: Option<ClientSpec>,
 }
 
 impl ControlConnection {
@@ -84,6 +86,7 @@ impl ControlConnection {
         metas: std::collections::HashMap<String, String>,
         proxy_url: String,
         previous_run_id: String,
+        client_spec: Option<ClientSpec>,
     ) -> Self {
         Self {
             server_addr,
@@ -110,6 +113,7 @@ impl ControlConnection {
             server_auth_scopes: Vec::new(),
             metas,
             proxy_url,
+            client_spec,
         }
     }
 
@@ -181,7 +185,7 @@ impl ControlConnection {
                             (IoStream::Yamux(control_stream), Some(session), None)
                         }
                         #[cfg(feature = "tls")]
-                        IoStream::Tls(tls_stream) => {
+                        IoStream::Tls(tls_stream, _) => {
                             let (control_stream, session) =
                                 mux::client_mux(tls_stream, &mux_cfg).await?;
                             info!("Yamux session established over TLS");
@@ -224,7 +228,7 @@ impl ControlConnection {
                         (IoStream::Yamux(control_stream), Some(session))
                     }
                     #[cfg(feature = "tls")]
-                    IoStream::Tls(tls_stream) => {
+                    IoStream::Tls(tls_stream, _) => {
                         let (control_stream, session) =
                             mux::client_mux(tls_stream, &mux_cfg).await?;
                         info!("Yamux session established over TLS");
@@ -246,16 +250,19 @@ impl ControlConnection {
         };
 
         // V2: ClientHello/ServerHello handshake on yamux-wrapped stream.
+        // Go frp compat (v0.70.1): Login is pipelined after ClientHello,
+        // BEFORE receiving ServerHello. This means the Login message goes
+        // over the wire before the server's ServerHello response is read.
+        // See /tmp/frp-source/client/control_session.go:140-203.
         let mut crypto_ctx = None;
+        let mut client_hello_json: Option<Vec<u8>> = None;
         if self.v2 {
             // Write V2 magic on the fully-established transport stream.
             // dial_server() no longer writes magic — control.rs is the single
             // call site for all transports, matching Go frp v0.70 where
             // WriteMagicIfV2 happens on the connector result after TLS/WS/mux
             // (client/control_session.go:140-141).
-            if self.v2 {
-                frp_core::protocol::write_v2_magic(&mut io_stream).await?;
-            }
+            frp_core::protocol::write_v2_magic(&mut io_stream).await?;
             let transport_name = match self.transport_protocol {
                 TransportProtocol::Tcp => "tcp",
                 #[cfg(feature = "kcp")]
@@ -269,7 +276,8 @@ impl ControlConnection {
                 #[allow(unreachable_patterns)]
                 _ => "tcp",
             };
-            crypto_ctx = frp_core::v2_handshake::v2_handshake_client(
+            // Step 1: Send ClientHello only (don't wait for ServerHello yet).
+            let ch_json = frp_core::v2_handshake::v2_handshake_client_send_hello(
                 &mut io_stream,
                 transport_name,
                 self.tls_enable,
@@ -277,6 +285,7 @@ impl ControlConnection {
                 true, // with_crypto
             )
             .await?;
+            client_hello_json = Some(ch_json);
         }
 
         let timestamp = std::time::SystemTime::now()
@@ -300,7 +309,7 @@ impl ControlConnection {
             timestamp: Some(timestamp),
             privilege_key: None,
             metas: opt_if_empty!(self.metas),
-            client_spec: None,
+            client_spec: self.client_spec.clone(),
             multiplexer: if propose_mux {
                 Some("yamux".into())
             } else {
@@ -319,6 +328,8 @@ impl ControlConnection {
 
         let login = FrpMessage::Login(Box::new(login));
 
+        // Step 2: Send Login frame immediately after ClientHello (Go frp compat:
+        // pipelined before ServerHello).
         if self.v2 {
             io_stream.write_v2_frame(&login).await?;
         } else {
@@ -326,6 +337,34 @@ impl ControlConnection {
         }
         info!("Login sent, waiting for response...");
 
+        // Step 3: Read ServerHello (Go frp compat: ServerHello arrives after Login).
+        if self.v2 {
+            if let Some(ch_json) = client_hello_json.take() {
+                crypto_ctx = frp_core::v2_handshake::v2_handshake_client_recv_hello(
+                    &mut io_stream,
+                    &ch_json,
+                    match self.transport_protocol {
+                        TransportProtocol::Tcp => "tcp",
+                        #[cfg(feature = "kcp")]
+                        TransportProtocol::Kcp => "kcp",
+                        #[cfg(feature = "quic")]
+                        TransportProtocol::Quic => "quic",
+                        #[cfg(feature = "websocket")]
+                        TransportProtocol::WebSocket => "websocket",
+                        #[cfg(feature = "websocket")]
+                        TransportProtocol::Wss => "wss",
+                        #[allow(unreachable_patterns)]
+                        _ => "tcp",
+                    },
+                    self.tls_enable,
+                    self.tcp_mux,
+                    true, // with_crypto
+                )
+                .await?;
+            }
+        }
+
+        // Step 4: Read LoginResp
         let resp_msg = if self.v2 {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(10),

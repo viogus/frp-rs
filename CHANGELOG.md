@@ -2,6 +2,24 @@
 
 All notable changes to frp-rs.
 
+## v0.7.1 — Go frp v0.70.1 compatibility
+
+### Config fixes (from Go frp v0.70.1 source audit)
+
+- **QUICOptions**: add `QuicOptions` struct with `keepalive_period` (10s), `max_idle_timeout` (30s), `max_incoming_streams` (100000). Added as `quic_options` field to `ServerTransportConfig` and `ClientConfig` (serde rename "quic").
+- **TCPKeepAlive**: add `tcp_keepalive` (default 7200) to `ServerTransportConfig` with alias `tcpKeepalive`.
+- **DialServerTimeout**: add `dial_server_timeout` (default 10) to `ClientConfig` with alias `dialServerTimeout`.
+- **WebServer.Addr override**: when `web_server.port > 0 && addr.is_empty()`, set addr to `"0.0.0.0"` in `ServerConfig::complete()`.
+- **XTCP visitor protocol**: add `protocol` field (default "quic") to `VisitorConfig` with alias "protocol".
+- **Client [auth] extraction**: flatten `auth_*` and `oidc_*` flat fields into `[auth]` table during client config normalization; keep the `[auth]` table intact for serde deserialization instead of discarding it.
+- **pool_count serde default**: changed from `0` to `1` via `default_pool_count()` function.
+- **health_check_url default**: changed from `"/"` to `""` (empty string, matching Go frp).
+- **tcp_mux (server)**: changed from `bool` to `Option<bool>` to distinguish "not set" from explicit `false`.
+- **flatten_to_table overwrite semantics**: change `or_insert` to `insert` so legacy flat fields overwrite v1 nested fields (Go compat).
+- **client_id alias**: add `alias = "clientID"`.
+- **tls_server_name alias**: add `alias = "tlsServerName"`.
+- **allow_port_start/end defaults**: changed from 10000-50000 to 0-65535 (all ports allowed, matching Go empty AllowPorts).
+
 ## Upgrade Notes: v0.7.0 → v0.8.0 (Go frp v0.70.1 compat)
 
 This release changes several config defaults to match Go frp v0.70.1 behavior.

@@ -334,12 +334,8 @@ pub(crate) async fn assign_work_to_proxy(
     }
     .map_or((String::new(), 0), |(ip, port)| (ip, port));
 
-    // Look up proxy info for dst address and proxy protocol version
+    // Look up proxy info for dst address
     let proxy_info = state.proxy_manager.get(&req.proxy_name).await;
-    let proxy_protocol_version = proxy_info
-        .as_ref()
-        .map(|p| p.proxy_protocol_version.clone())
-        .unwrap_or_default();
     let dst_addr = proxy_info
         .as_ref()
         .and_then(|p| p.local_addr.clone())
@@ -352,26 +348,10 @@ pub(crate) async fn assign_work_to_proxy(
 
     let swc = FrpMessage::StartWorkConn(Box::new(msg::StartWorkConn {
         proxy_name: req.proxy_name.clone(),
-        src_addr: if !proxy_protocol_version.is_empty() && !src_addr.is_empty() {
-            Some(src_addr)
-        } else {
-            None
-        },
-        src_port: if !proxy_protocol_version.is_empty() && src_port != 0 {
-            Some(src_port)
-        } else {
-            None
-        },
-        dst_addr: if !proxy_protocol_version.is_empty() && !dst_addr.is_empty() {
-            Some(dst_addr)
-        } else {
-            None
-        },
-        dst_port: if !proxy_protocol_version.is_empty() && dst_port != 0 {
-            Some(dst_port)
-        } else {
-            None
-        },
+        src_addr: if !src_addr.is_empty() { Some(src_addr) } else { None },
+        src_port: if src_port != 0 { Some(src_port) } else { None },
+        dst_addr: if !dst_addr.is_empty() { Some(dst_addr) } else { None },
+        dst_port: if dst_port != 0 { Some(dst_port) } else { None },
         error: None,
         // use_encryption/use_compression: propagate proxy config settings.
         // Go frpc v0.69.1 ignores these fields (not in its StartWorkConn struct)
@@ -534,7 +514,7 @@ pub(crate) async fn assign_work_to_proxy(
                     .await;
                 }
                 #[cfg(feature = "tls")]
-                IoStream::Tls(work) => {
+                IoStream::Tls(work, _) => {
                     let (u_r, u_w) = req.user_conn.into_split().unwrap();
                     let (w_r, w_w) = tokio::io::split(work);
                     frp_core::bridge::bridge_encrypted(

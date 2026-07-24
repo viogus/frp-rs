@@ -84,13 +84,14 @@ fn mode3_table() -> &'static [BehaviorPair] {
     static TABLE: OnceLock<Vec<BehaviorPair>> = OnceLock::new();
     TABLE.get_or_init(|| {
         vec![
-            // Go frp v0.69.1 compat: sender side has PortsRangeNumber=0 (default).
-            (sender(0, 0, 0, 0, 0), recv_ports(7, 0, 10)),
-            (sender(0, 0, 0, 0, 0), recv_ports(4, 0, 10)),
-            (sender(0, 0, 0, 0, 0), recv_ports(0, 0, 10)),
-            (recv_ports(7, 0, 10), sender(0, 0, 0, 0, 0)),
-            (recv_ports(4, 0, 10), sender(0, 0, 0, 0, 0)),
-            (recv_ports(0, 0, 10), sender(0, 0, 0, 0, 0)),
+            // Go frp v0.70.1 compat: both sender and receiver have PortsRangeNumber=10.
+            // sender(params: ttl, delay, prn, prnn, lrp) — so ports_range_number is 3rd param.
+            (sender(0, 0, 10, 0, 0), recv_ports(7, 0, 10)),
+            (sender(0, 0, 10, 0, 0), recv_ports(4, 0, 10)),
+            (sender(0, 0, 10, 0, 0), recv_ports(0, 0, 10)),
+            (recv_ports(7, 0, 10), sender(0, 0, 10, 0, 0)),
+            (recv_ports(4, 0, 10), sender(0, 0, 10, 0, 0)),
+            (recv_ports(0, 0, 10), sender(0, 0, 10, 0, 0)),
         ]
     })
 }
@@ -253,8 +254,9 @@ impl MakeHoleRecords {
             );
         } else if hard_count == 1 && ports_changed_regular_count == 1 {
             // One hard with regular port change: mode1, mode2, mode0.
-            append_mode(&mut scores, 1, 1);
-            append_mode(&mut scores, 2, 1);
+            // Go frp v0.70.1 uses score=0 for non-fallback entries.
+            append_mode(&mut scores, 1, 0);
+            append_mode(&mut scores, 2, 0);
             append_mode0(
                 &mut scores,
                 c_feature.public_network,
@@ -262,8 +264,9 @@ impl MakeHoleRecords {
             );
         } else if hard_count == 1 && ports_changed_regular_count == 0 {
             // One hard without regular port change: mode2, mode1, mode0.
-            append_mode(&mut scores, 2, 1);
-            append_mode(&mut scores, 1, 1);
+            // Go frp v0.70.1 uses score=0 for non-fallback entries.
+            append_mode(&mut scores, 2, 0);
+            append_mode(&mut scores, 1, 0);
             append_mode0(
                 &mut scores,
                 c_feature.public_network,
@@ -271,11 +274,13 @@ impl MakeHoleRecords {
             );
         } else if hard_count == 2 && ports_changed_regular_count == 2 {
             // Both hard, both regular: mode3, mode4.
-            append_mode(&mut scores, 3, 1);
-            append_mode(&mut scores, 4, 1);
+            // Go frp v0.70.1 uses score=0 for non-fallback entries.
+            append_mode(&mut scores, 3, 0);
+            append_mode(&mut scores, 4, 0);
         } else if hard_count == 2 && ports_changed_regular_count == 1 {
             // Both hard, one regular: mode4 only.
-            append_mode(&mut scores, 4, 1);
+            // Go frp v0.70.1 uses score=0 for non-fallback entries.
+            append_mode(&mut scores, 4, 0);
         } else {
             // Fallback: all entries for modes 0, 1, 3 with score 1 (Go frp compat).
             append_mode(&mut scores, 0, 1);
@@ -310,17 +315,14 @@ impl MakeHoleRecords {
     }
 
     /// Report success: boost the matching (mode, index) score, max +2 cap at 10.
+    /// Go frp v0.70.1 compat: update lastUpdateTime unconditionally BEFORE the loop.
     fn report_success(&mut self, mode: i32, index: i32) {
-        let mut found = false;
+        self.last_update_time = Instant::now();
         for s in &mut self.scores {
             if s.mode == mode && s.index == index {
                 s.score = (s.score + 2).min(10);
-                found = true;
                 break;
             }
-        }
-        if found {
-            self.last_update_time = Instant::now();
         }
     }
 }

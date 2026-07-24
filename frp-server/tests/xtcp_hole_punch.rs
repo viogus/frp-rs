@@ -298,7 +298,7 @@ async fn test_xtcp_nat_hole_message_routing() {
     // The session is complete — send report to clean up.
     let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
         sid: Some(txn_id.clone()),
-        success: None,
+        success: false,
     });
     write_msg_v1(&mut provider_ctl, &report)
         .await

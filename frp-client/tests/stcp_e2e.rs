@@ -101,6 +101,7 @@ async fn test_stcp_e2e_relay() {
             keep_tunnel_open: false,
             max_retries_an_hour: 0,
             min_retry_interval: 0,
+            protocol: "quic".into(),
         }],
         ..Default::default()
     };

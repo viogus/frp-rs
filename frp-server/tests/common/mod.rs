@@ -36,7 +36,7 @@ pub fn allocate_port() -> u16 {
 /// Note: tcp_mux is disabled by default for tests (raw V1 frames, no yamux).
 #[allow(dead_code)]
 pub async fn start_test_server(mut cfg: ServerConfig) -> (JoinHandle<()>, u16) {
-    cfg.transport.tcp_mux = false; // test clients use raw V1 frames
+    cfg.transport.tcp_mux = Some(false); // test clients use raw V1 frames
     let port = cfg.bind_port;
     let service = Service::new(cfg, None).await.expect("create service");
     let handle = tokio::spawn(async move {

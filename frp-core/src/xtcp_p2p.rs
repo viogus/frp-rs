@@ -27,6 +27,22 @@
 //! `response:false` probes (like Go's receiver role). This dual-role
 //! ensures compatibility with Go peers regardless of detect_behavior
 //! role assignment.
+//!
+//! ## TODO: MakeHole mode-based NAT traversal (Go's 5-mode state machine)
+//!
+//! Go frp v0.70.1 implements a full 5-mode state machine in
+//! `/tmp/frp-source/pkg/nathole/nathole.go:192-288` (`(mhr *makeHoleRecords) makeHole()`)
+//! that guides each peer through the specific hole-punch behavior selected by
+//! the analyzer (e.g., send_delay_ms, ttl, ports_range_number, listen_random_ports).
+//! Our Rust implementation currently ignores most of these parameters and uses
+//! a simplified "send detect message, wait for response" approach that works
+//! for EasyNAT but does not fully implement Go's mode-based traversal for
+//! HardNAT scenarios (mode 2/3/4 with random port ranges and listener ports).
+//! This means Rust↔Rust and Rust↔Go XTCP may fail in certain HardNAT
+//! configurations that Go handles correctly. Full implementation would require
+//! a per-peer MakeHole state machine with timer-driven behavior (send probes
+//! at send_delay_ms intervals, iterate through ports_range_number candidate
+//! ports, bind listen_random_ports on the receiver side).
 
 use std::future::Future;
 use std::io;

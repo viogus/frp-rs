@@ -33,7 +33,7 @@ use frp_core::unsafe_features::UnsafeFeatures;
 #[cfg(feature = "vnet")]
 type VnetTunMap = Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>;
 use frp_core::encryption;
-use frp_core::msg::{self, FrpMessage};
+use frp_core::msg::{self, ClientSpec, FrpMessage};
 use frp_core::protocol::{read_msg, write_msg};
 #[cfg(feature = "quic")]
 use frp_core::quic::QuicConnection;
@@ -335,7 +335,8 @@ impl Service {
         let (health_tx, health_rx) = mpsc::channel::<HealthEvent>(16);
 
         let nat_hole_stun_server = if cfg.nat_hole_stun_server.is_empty() {
-            "stun:stun.l.google.com:19302".to_string()
+            // Go frp v0.70.1 default STUN server (no "stun:" URI prefix needed).
+            "stun.easyvoip.com:3478".to_string()
         } else {
             cfg.nat_hole_stun_server.clone()
         };
@@ -413,6 +414,20 @@ impl Service {
     ///       FastRetryJitter: 0.5,
     ///       FastRetryWindow: time.Minute,
     ///   }
+    ///
+    /// # Architectural Note (Fix 10)
+    /// Go frp uses a **nested** backoff architecture: `loopLoginUntilSuccess` contains
+    /// its own `BackoffUntil` with a basic exponential (Duration=1s, Factor=2, MaxDuration=10s/20s),
+    /// while `keepControllerWorking` wraps it in an outer `BackoffUntil` with the full
+    /// two-phase FastBackoffManager. This means:
+    ///   - Initial login: inner loop retries forever with 10s cap.
+    ///   - Reconnection: outer loop adds fast-retry (200ms) and exponential (20s cap) BETWEEN
+    ///     inner-loop invocations, while each inner-loop invocation itself has exponential backoff.
+    ///
+    /// Rust's implementation uses a **combined** approach: a single reconnection loop with
+    /// the full two-phase backoff applied to each reconnect attempt. This is functionally
+    /// equivalent because Go's inner loop (loopLoginUntilSuccess) guarantees it returns
+    /// only on success, and the outer loop provides the error-aware backoff between retries.
     fn fast_backoff_delay(
         consecutive_err_count: u32,
         counts_in_fast_retry_window: u32,
@@ -623,6 +638,10 @@ impl Service {
                 self.cfg.metas.clone(),
                 self.cfg.proxy_url.clone(),
                 previous_run_id.clone(),
+                Some(ClientSpec {
+                    client_type: Some("frpc".into()),
+                    always_auth_pass: None,
+                }),
             );
 
             #[cfg(feature = "quic")]
@@ -661,14 +680,16 @@ impl Service {
                     } else {
                         // Initial login: pure exponential, no fast retry phase.
                         // Matches Go frp's loopLoginUntilSuccess (FastBackoffOptions
-                        // without FastRetryCount).
+                        // without FastRetryCount, MaxDuration=10s).
+                        // Go frp v0.70.1: initial login cap is 10s, reconnection cap is 20s.
+                        // See /tmp/frp-source/client/service.go:261,286.
                         let mut delay_ms = 1000u64;
                         for _ in 0..consecutive_err_count {
-                            delay_ms = delay_ms.saturating_mul(2).min(20_000);
+                            delay_ms = delay_ms.saturating_mul(2).min(10_000);
                         }
                         let jitter_ms =
                             (rand::thread_rng().gen::<f64>() * 0.1 * delay_ms as f64) as u64;
-                        Duration::from_millis(delay_ms.saturating_add(jitter_ms).min(20_000))
+                        Duration::from_millis(delay_ms.saturating_add(jitter_ms).min(10_000))
                     };
                     tokio::time::sleep(delay).await;
                     continue;
@@ -950,9 +971,19 @@ impl Service {
                 spawn_wc!(i);
             }
 
+            // Shared graceful shutdown signal for all visitor listener tasks.
+            // Set to true at session end so tasks exit cleanly (Fix 8).
+            let visitor_shutdown = Arc::new(AtomicBool::new(false));
+
             // Cancel old visitor listener tasks from a previous session.
+            // Signal gracefully and wait briefly for the previous session's
+            // visitors to exit, instead of aborting them (Go frp compat:
+            // visitor_manager.Close() closes each visitor cleanly).
             for h in visitor_handles.drain(..) {
-                h.abort();
+                // Previous session's visitor_shutdown was already set when
+                // the session ended; tasks should exit on their own.
+                // Give them a moment to notice and exit.
+                let _ = tokio::time::timeout(Duration::from_millis(500), h).await;
             }
 
             // Spawn STCP/XTCP visitor listeners
@@ -980,7 +1011,9 @@ impl Service {
                 let stun_server = nat_hole_stun_server.clone();
                 let fallback_to = v.fallback_to.clone();
                 let disable_assisted_addrs = v.disable_assisted_addrs;
+                let p2p_protocol = v.protocol.clone();
                 let vtx = self.visitor_tx.clone();
+                let shutdown = visitor_shutdown.clone();
                 let handle = tokio::spawn(async move {
                     crate::visitor::run_visitor_listener(crate::visitor::VisitorListenerConfig {
                         server_addr: sa,
@@ -1001,9 +1034,11 @@ impl Service {
                         max_retries_an_hour,
                         min_retry_interval,
                         stun_server,
+                        p2p_protocol,
                         visitor_tx: vtx,
                         fallback_to,
                         disable_assisted_addrs,
+                        shutdown,
                     })
                     .await;
                 });
@@ -1083,7 +1118,7 @@ impl Service {
                                 self.handle_nat_hole_client(*nhc, &writer, v2).await;
                             }
                             Ok(FrpMessage::NatHoleResp(resp)) => {
-                                self.handle_nat_hole_resp(*resp, &mut pending_xtcp, &mut visitor_pending, &xtcp_sockets).await;
+                                self.handle_nat_hole_resp(*resp, &mut pending_xtcp, &mut visitor_pending, &xtcp_sockets, &writer).await;
                             }
                             Ok(FrpMessage::NewProxyResp(resp)) => {
                                 let is_error = resp.error.as_ref().is_some_and(|e| !e.is_empty());
@@ -1176,27 +1211,23 @@ impl Service {
                             privilege_key: None,
                             timestamp: None,
                         };
-                        let client_scopes: Vec<String> = self.cfg.auth.as_ref()
-                            .map(|a| a.additional_auth_scopes.clone())
-                            .unwrap_or_default();
-                        let requires_auth = crate::work_conn::scope_requires_auth(
-                            &client_scopes, &self.server_auth_scopes.read().await, "HeartBeats"
-                        );
-                        if requires_auth {
-                            if let Some(ref oidc) = self.oidc_client {
-                                if let Err(e) = oidc.set_ping(&mut ping_msg).await {
-                                    warn!(error = %e, "OIDC ping token failed: {}. Reconnecting...", e);
-                                    break;
-                                }
-                            } else {
-                                let ts = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs() as i64;
-                                let ping_auth = AuthConfig::with_token(self.auth_cfg.token.clone());
-                                ping_msg.privilege_key = ping_auth.generate_login_key(ts);
-                                ping_msg.timestamp = Some(ts);
+                        // Go frp v0.70.1 compat: Ping always sends auth, regardless
+                        // of scope negotiation. Go's ctl.sessionCtx.Auth.Setter.SetPing()
+                        // is called unconditionally in heartbeatWorker.
+                        // See /tmp/frp-source/client/control.go:238-240.
+                        if let Some(ref oidc) = self.oidc_client {
+                            if let Err(e) = oidc.set_ping(&mut ping_msg).await {
+                                warn!(error = %e, "OIDC ping token failed: {}. Reconnecting...", e);
+                                break;
                             }
+                        } else {
+                            let ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64;
+                            let ping_auth = AuthConfig::with_token(self.auth_cfg.token.clone());
+                            ping_msg.privilege_key = ping_auth.generate_login_key(ts);
+                            ping_msg.timestamp = Some(ts);
                         }
                         let ping = FrpMessage::Ping(ping_msg);
                         if let Err(e) = write_msg(&mut *writer.lock().await, &ping, v2).await {
@@ -1333,8 +1364,10 @@ impl Service {
                             }
                         });
                         // 2. Send NatHoleClient on control (Go v0.70 compat: protocol "kcp").
+                        // Use a unique transaction_id per request (Go frp compat: UUID).
+                        let txn_id = uuid::Uuid::new_v4().to_string();
                         let client_msg = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
-                            transaction_id: sid.clone(),
+                            transaction_id: txn_id.clone(),
                             proxy_name: proxy_name.clone(),
                             sid: Some(sid.clone()),
                             protocol: Some("kcp".to_string()),
@@ -1387,21 +1420,26 @@ impl Service {
                 }
             }
 
-            // Signal session end to stop pool replenishment cascade
+            // Go frp GracefulClose ordering: close proxies first, then visitors,
+            // then the control connection. See /tmp/frp-source/client/control.go:203-210.
+            // Step 1: Signal work connection pool to stop replenishment cascade.
             session_alive.store(false, Ordering::Release);
 
-            // Go frp compat (d486018): explicitly drop the yamux session so
-            // the background task exits, closing the old TCP socket before
-            // we attempt to reconnect. This prevents dual-yamux-session leaks
-            // when reconnecting through a half-open TCP mux connection.
+            // Step 2: Signal visitor listeners to stop accepting new connections
+            // (Go frp compat: vm.Close() closes all visitors before session is torn down).
+            visitor_shutdown.store(true, Ordering::Release);
+
+            // Step 3: Drop the control connection (Go frp compat: closeSession()).
+            // Dropping prev_yamux closes the underlying TCP socket so the background
+            // yamux task exits before we attempt to reconnect. This prevents
+            // dual-yamux-session leaks through a half-open TCP mux connection.
             #[cfg(feature = "tcp-mux")]
             drop(prev_yamux.take());
 
-            // Abort all visitor listener tasks so they don't hold yamux clones
-            // across reconnections (Go frp compat: visitor listeners are
-            // re-created on each session).
+            // Wait briefly for visitor tasks to notice the shutdown signal and
+            // exit gracefully (timeout so we never block reconnection).
             for h in visitor_handles.drain(..) {
-                h.abort();
+                let _ = tokio::time::timeout(Duration::from_millis(500), h).await;
             }
 
             // Check if admin stop was requested
@@ -1570,23 +1608,14 @@ impl Service {
 
         if visitor_addr.is_empty() {
             warn!(proxy_name = %proxy_name, "NatHoleClient without visitor_addr for '{}'", proxy_name);
-            Self::send_nat_hole_report(writer, v2, sid.clone(), "no visitor_addr").await;
-            return;
-        }
-
-        // Send NatHoleSid FIRST — so visitor can start punching concurrently
-        let sid_msg = FrpMessage::NatHoleSid(msg::NatHoleSid {
-            sid: Some(sid.clone()),
-            ..Default::default()
-        });
-        if let Err(e) = write_msg(&mut *writer.lock().await, &sid_msg, v2).await {
-            warn!(error = %e, "Failed to send NatHoleSid: {}", e);
+            Self::send_nat_hole_report(writer, v2, sid.clone(), false, "no visitor_addr").await;
             return;
         }
 
         // Go v0.70 compat: UDP hole punch + KCP data plane.
-        // Bind socket matching the visitor's address family to avoid
-        // EINVAL on macOS when sending IPv4 from IPv6 socket.
+        // Bind socket FIRST (before sending NatHoleSid) so the UDP port
+        // is ready when the visitor starts sending probe packets.
+        // Go frp compat: bind UDP before sending NatHoleSid notification.
         let is_v4 = visitor_addr
             .parse::<std::net::SocketAddr>()
             .map(|a| a.is_ipv4())
@@ -1599,11 +1628,21 @@ impl Service {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(proxy_name = %proxy_name, error = %e, "XTCP: failed to bind UDP socket: {}", e);
-                    Self::send_nat_hole_report(writer, v2, sid, "bind failed").await;
+                    Self::send_nat_hole_report(writer, v2, sid, false, "bind failed").await;
                     return;
                 }
             },
         };
+
+        // Send NatHoleSid now that the UDP socket is bound and ready.
+        let sid_msg = FrpMessage::NatHoleSid(msg::NatHoleSid {
+            sid: Some(sid.clone()),
+            ..Default::default()
+        });
+        if let Err(e) = write_msg(&mut *writer.lock().await, &sid_msg, v2).await {
+            warn!(error = %e, "Failed to send NatHoleSid: {}", e);
+            return;
+        }
 
         let candidates = vec![visitor_addr];
         let conv = frp_core::xtcp_p2p::conv_from_sid(&sid);
@@ -1633,6 +1672,10 @@ impl Service {
         .await
         {
             Ok(mut p2p_stream) => {
+                // Send NatHoleReport with success=true after successful hole punch
+                // (Go frp compat: provider reports hole punch result to server)
+                Self::send_nat_hole_report(writer, v2, sid.clone(), true, "hole punch succeeded")
+                    .await;
                 if let Some(ref local) = local_addr {
                     match tokio::net::TcpStream::connect(local).await {
                         Ok(local_stream) => {
@@ -1676,18 +1719,18 @@ impl Service {
                         }
                         Err(e) => {
                             warn!(proxy_name = %proxy_name, error = %e, "XTCP provider '{}': connect local failed: {}", proxy_name, e);
-                            Self::send_nat_hole_report(writer, v2, sid, "connect local failed")
+                            Self::send_nat_hole_report(writer, v2, sid, false, "connect local failed")
                                 .await;
                         }
                     }
                 } else {
                     warn!(proxy_name = %proxy_name, "XTCP provider '{}': no local address", proxy_name);
-                    Self::send_nat_hole_report(writer, v2, sid, "no local addr").await;
+                    Self::send_nat_hole_report(writer, v2, sid, false, "no local addr").await;
                 }
             }
             Err(e) => {
                 warn!(proxy_name = %proxy_name, error = %e, "XTCP hole punch for '{}' failed: {}", proxy_name, e);
-                Self::send_nat_hole_report(writer, v2, sid, "hole punch failed").await;
+                Self::send_nat_hole_report(writer, v2, sid, false, "hole punch failed").await;
             }
         }
     }
@@ -1698,11 +1741,12 @@ impl Service {
         writer: &Arc<Mutex<WriteHalf>>,
         v2: bool,
         sid: String,
+        success: bool,
         reason: &str,
     ) {
         let report = FrpMessage::NatHoleReport(msg::NatHoleReport {
             sid: Some(sid),
-            success: None,
+            success,
         });
         if let Err(e) = write_msg(&mut *writer.lock().await, &report, v2).await {
             debug!(error = %e, "Failed to send NatHoleReport ({reason})");
@@ -1724,6 +1768,7 @@ impl Service {
                 std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
             >,
         >,
+        writer: &Arc<Mutex<WriteHalf>>,
     ) {
         // Route to waiting visitor first (Go frps compat path).
         let txn_id = resp.transaction_id.clone();
@@ -1780,6 +1825,8 @@ impl Service {
         let sid_clone = sid.clone();
         let xtcp_sockets_clone = xtcp_sockets.clone();
         let hp_timeout = hole_punch_timeout;
+        let resp_writer = writer.clone();
+        let resp_v2 = self.cfg.v2;
         tokio::spawn(async move {
             // Retrieve the STUN socket persisted by the control loop.
             let stun_socket = {
@@ -1857,6 +1904,15 @@ impl Service {
             .await
             {
                 Ok(mut p2p_stream) => {
+                    // Send NatHoleReport with success=true after successful hole punch
+                    // (Go frp compat: provider reports hole punch result to server).
+                    let ok_report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                        sid: Some(sid_clone.clone()),
+                        success: true,
+                    });
+                    let mut w = resp_writer.lock().await;
+                    let _ = frp_core::protocol::write_msg(&mut *w, &ok_report, resp_v2).await;
+                    drop(w);
                     info!(proxy_name = %proxy_name_clone, "XTCP provider '{}': P2P connected via KCP+yamux", proxy_name_clone);
                     if let Some(ref local) = local_addr {
                         match tokio::net::TcpStream::connect(local).await {
@@ -1896,14 +1952,35 @@ impl Service {
                             }
                             Err(e) => {
                                 warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': connect local failed", proxy_name_clone);
+                                let fail_report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                                    sid: Some(sid_clone.clone()),
+                                    success: false,
+                                });
+                                let mut w = resp_writer.lock().await;
+                                let _ = frp_core::protocol::write_msg(&mut *w, &fail_report, resp_v2).await;
+                                drop(w);
                             }
                         }
                     } else {
                         warn!(proxy_name = %proxy_name_clone, "XTCP provider '{}': no local address", proxy_name_clone);
+                        let fail_report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                            sid: Some(sid_clone.clone()),
+                            success: false,
+                        });
+                        let mut w = resp_writer.lock().await;
+                        let _ = frp_core::protocol::write_msg(&mut *w, &fail_report, resp_v2).await;
+                        drop(w);
                     }
                 }
                 Err(e) => {
                     warn!(proxy_name = %proxy_name_clone, error = %e, "XTCP provider '{}': UDP+KCP+yamux hole punch failed", proxy_name_clone);
+                    let fail_report = FrpMessage::NatHoleReport(msg::NatHoleReport {
+                        sid: Some(sid_clone.clone()),
+                        success: false,
+                    });
+                    let mut w = resp_writer.lock().await;
+                    let _ = frp_core::protocol::write_msg(&mut *w, &fail_report, resp_v2).await;
+                    drop(w);
                 }
             }
         });

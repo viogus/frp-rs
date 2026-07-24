@@ -126,7 +126,12 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
     }
     if let Some(info) = ctx.state.proxy_manager.get(&cp.proxy_name).await {
         if let Some(port) = info.remote_port {
-            ctx.state.used_ports.write().await.remove(&port);
+            // Clean up the appropriate port manager (TCP or UDP — Go frp compat).
+            if info.proxy_type == "udp" || info.proxy_type == "sudp" {
+                ctx.state.used_udp_ports.write().await.remove(&port);
+            } else {
+                ctx.state.used_ports.write().await.remove(&port);
+            }
             // Decrement per-client port count (matching Go frp's portsUsedNum).
             let mut port_counts = ctx.state.client_ports_used.write().await;
             if let Some(count) = port_counts.get_mut(&ctx.run_id) {

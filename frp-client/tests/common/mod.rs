@@ -58,7 +58,7 @@ pub async fn start_frps(port: u16, token: &str) -> JoinHandle<()> {
         allow_port_start: port.saturating_sub(50),
         allow_port_end: port + 50,
         transport: frp_core::config::ServerTransportConfig {
-            tcp_mux: false,
+            tcp_mux: Some(false),
             ..Default::default()
         },
         ..Default::default()

@@ -132,6 +132,13 @@ pub(crate) struct NatHoleWorkConnParams<'a> {
 /// Write StartWorkConn with embedded `nat_hole_sid` + a separate NatHoleSid
 /// frame for Go frpc compat. Go frp ignores unknown JSON fields, so the
 /// standalone frame is needed for XTCP notification recognition.
+///
+/// NOTE: Go frp v0.70.1 server only writes NatHoleSid on the work connection
+/// (no StartWorkConn). See /tmp/frp-source/server/proxy/xtcp.go:88-92.
+/// The Rust frpc currently expects StartWorkConn first (work_conn.rs:310),
+/// so Go frps → Rust frpc XTCP is NOT compatible for the provider side.
+/// Rust frps sends both StartWorkConn (Rust frpc compat) + NatHoleSid
+/// (Go frpc compat) to support both.
 pub(crate) async fn write_start_work_conn_with_nat_hole_sid<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     params: &NatHoleWorkConnParams<'_>,
