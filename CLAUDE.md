@@ -85,7 +85,7 @@ Every feature, fix, and test change follows three rules:
    bash scripts/download-go-frp.sh
    ```
 
-## Current Health (2026-07-24)
+## Current Health (2026-07-25)
 
 | Metric | Value |
 |--------|-------|
