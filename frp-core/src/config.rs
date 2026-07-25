@@ -634,7 +634,10 @@ pub struct QuicOptions {
     #[serde(default = "default_quic_max_idle_timeout", alias = "maxIdleTimeout")]
     pub max_idle_timeout: i64,
     /// Max incoming streams. Default: 100000.
-    #[serde(default = "default_quic_max_incoming_streams", alias = "maxIncomingStreams")]
+    #[serde(
+        default = "default_quic_max_incoming_streams",
+        alias = "maxIncomingStreams"
+    )]
     pub max_incoming_streams: i64,
 }
 

@@ -480,8 +480,15 @@ pub async fn v2_handshake_client(
 ) -> Result<Option<CryptoContext>, crate::Error> {
     let client_hello_json =
         v2_handshake_client_send_hello(stream, transport, tls, tcp_mux, with_crypto).await?;
-    v2_handshake_client_recv_hello(stream, &client_hello_json, transport, tls, tcp_mux, with_crypto)
-        .await
+    v2_handshake_client_recv_hello(
+        stream,
+        &client_hello_json,
+        transport,
+        tls,
+        tcp_mux,
+        with_crypto,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

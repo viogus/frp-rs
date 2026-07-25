@@ -348,9 +348,17 @@ pub(crate) async fn assign_work_to_proxy(
 
     let swc = FrpMessage::StartWorkConn(Box::new(msg::StartWorkConn {
         proxy_name: req.proxy_name.clone(),
-        src_addr: if !src_addr.is_empty() { Some(src_addr) } else { None },
+        src_addr: if !src_addr.is_empty() {
+            Some(src_addr)
+        } else {
+            None
+        },
         src_port: if src_port != 0 { Some(src_port) } else { None },
-        dst_addr: if !dst_addr.is_empty() { Some(dst_addr) } else { None },
+        dst_addr: if !dst_addr.is_empty() {
+            Some(dst_addr)
+        } else {
+            None
+        },
         dst_port: if dst_port != 0 { Some(dst_port) } else { None },
         error: None,
         // use_encryption/use_compression: propagate proxy config settings.

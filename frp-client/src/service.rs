@@ -1719,8 +1719,14 @@ impl Service {
                         }
                         Err(e) => {
                             warn!(proxy_name = %proxy_name, error = %e, "XTCP provider '{}': connect local failed: {}", proxy_name, e);
-                            Self::send_nat_hole_report(writer, v2, sid, false, "connect local failed")
-                                .await;
+                            Self::send_nat_hole_report(
+                                writer,
+                                v2,
+                                sid,
+                                false,
+                                "connect local failed",
+                            )
+                            .await;
                         }
                     }
                 } else {
@@ -1957,7 +1963,9 @@ impl Service {
                                     success: false,
                                 });
                                 let mut w = resp_writer.lock().await;
-                                let _ = frp_core::protocol::write_msg(&mut *w, &fail_report, resp_v2).await;
+                                let _ =
+                                    frp_core::protocol::write_msg(&mut *w, &fail_report, resp_v2)
+                                        .await;
                                 drop(w);
                             }
                         }

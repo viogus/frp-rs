@@ -167,7 +167,10 @@ impl VhostManager {
             if let Some(user_map) = tables.routes.get(domain) {
                 if let Some(vrs) = user_map.get(route_by_http_user) {
                     for loc in locations {
-                        if let Some(vr) = vrs.iter().find(|vr| vr.locations.iter().any(|vl| vl == loc)) {
+                        if let Some(vr) = vrs
+                            .iter()
+                            .find(|vr| vr.locations.iter().any(|vl| vl == loc))
+                        {
                             return Err(RouterConfigConflict {
                                 domain: domain.clone(),
                                 route_by_http_user: route_by_http_user.to_string(),
@@ -277,7 +280,12 @@ impl VhostManager {
     ///
     /// Only checks wildcards for domains with >=3 labels (matching Go frp's
     /// `for len(hostSplit) >= 3` — prevents matching `*.com` for `example.com`).
-    pub async fn lookup_wildcard(&self, domain: &str, path: &str, http_user: &str) -> Option<VhostRoute> {
+    pub async fn lookup_wildcard(
+        &self,
+        domain: &str,
+        path: &str,
+        http_user: &str,
+    ) -> Option<VhostRoute> {
         let tables = self.inner.read().await;
 
         // 1. Exact match

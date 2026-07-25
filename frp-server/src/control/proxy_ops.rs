@@ -886,9 +886,14 @@ pub(crate) async fn unregister_control(
             if p.proxy_type == "udp" || p.proxy_type == "sudp" {
                 // For SUDP, only release the port if no other SUDP proxy uses it
                 if p.proxy_type == "sudp" {
-                    let count = proxies.iter().filter(|op| {
-                        op.proxy_type == "sudp" && op.remote_port == Some(port) && op.name != p.name
-                    }).count();
+                    let count = proxies
+                        .iter()
+                        .filter(|op| {
+                            op.proxy_type == "sudp"
+                                && op.remote_port == Some(port)
+                                && op.name != p.name
+                        })
+                        .count();
                     if count == 0 {
                         udp_ports.remove(&port);
                     }

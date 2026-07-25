@@ -1,7 +1,6 @@
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-#[cfg(feature = "websocket")]
 use std::time::Duration;
 
 #[cfg(feature = "kcp")]
