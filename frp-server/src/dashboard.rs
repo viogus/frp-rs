@@ -324,7 +324,12 @@ async fn handle_proxy_traffic(
 async fn handle_proxies_by_type(
     State(state): State<Arc<AppState>>,
     Path(proxy_type): Path<String>,
-) -> Json<Vec<ProxyEntry>> {
+) -> Result<Json<Vec<ProxyEntry>>, StatusCode> {
+    // Validate proxy type — reject unknown types with 404
+    let valid_types = ["tcp", "udp", "http", "https", "stcp", "xtcp", "sudp"];
+    if !valid_types.contains(&proxy_type.as_str()) {
+        return Err(StatusCode::NOT_FOUND);
+    }
     let proxies = state.proxy_manager.list().await;
     let mut entries = Vec::new();
     let ctl_map = state.run_id_to_ctl_tx.read().await;
@@ -354,7 +359,7 @@ async fn handle_proxies_by_type(
             total_conns: traffic.total_conns,
         });
     }
-    Json(entries)
+    Ok(Json(entries))
 }
 
 /// GET /api/proxy/{type}/{name} — proxy detail with type verification.

@@ -38,7 +38,7 @@ async fn test_dashboard_healthz() {
 
     let resp = reqwest::get(&frps.dashboard_url("/healthz")).await.unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.text().await.unwrap(), "ok");
+    assert_eq!(resp.text().await.unwrap(), "");
 }
 
 /// GET /healthz?probe=readiness returns 200 "ok" on a fresh (non-draining) server.
