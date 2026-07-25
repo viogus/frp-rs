@@ -182,7 +182,7 @@ impl ServerConfigSnapshot {
 }
 
 fn default_allow_port_start() -> u16 {
-    0
+    1
 }
 fn default_allow_port_end() -> u16 {
     65535
