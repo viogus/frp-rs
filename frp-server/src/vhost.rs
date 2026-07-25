@@ -91,7 +91,7 @@ fn get_locked(
 
 /// Sort a Vec<VhostRoute> by longest location descending.
 /// Matches Go frp's sort order: longer location prefixes are tried first.
-fn sort_by_longest_location(vrs: &mut Vec<VhostRoute>) {
+fn sort_by_longest_location(vrs: &mut [VhostRoute]) {
     vrs.sort_by(|a, b| {
         let a_len = a.locations.iter().map(|l| l.len()).max().unwrap_or(0);
         let b_len = b.locations.iter().map(|l| l.len()).max().unwrap_or(0);

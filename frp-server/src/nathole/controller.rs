@@ -446,7 +446,7 @@ fn extract_ip_from_addr(addr: &str) -> Option<String> {
 /// Go frp v0.70.1 compat: controller.go genAnalysisKey() uses a single MD5
 /// over visitorIP + visitorNatType + visitorBehavior + visitorRegularPortsChange
 /// + clientIP + clientNatType + clientBehavior + clientRegularPortsChange,
-/// then hex-encodes the result.
+///   then hex-encodes the result.
 pub fn gen_analysis_key(
     c: &NatFeature,
     v: &NatFeature,
