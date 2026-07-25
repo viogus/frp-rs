@@ -278,7 +278,7 @@ impl Controller {
                 // Report success to analyzer — only when the provider
                 // reports the hole punch actually succeeded (Go frp compat:
                 // HandleReport only calls ReportSuccess when m.Success is true).
-                if msg.success.unwrap_or(false) {
+                if msg.success {
                     let v_resp = session.v_resp.lock().await;
                     if let Some(ref resp) = *v_resp {
                         if let Some(ref db) = resp.detect_behavior {
@@ -314,7 +314,7 @@ impl Controller {
             if let Some(tx) = session.report_tx.lock().await.take() {
                 let _ = tx.send(msg::NatHoleReport {
                     sid: Some(sid.to_string()),
-                    success: None,
+                    success: false,
                 });
             }
             return Some(session.proxy_name.clone());
@@ -443,42 +443,39 @@ fn extract_ip_from_addr(addr: &str) -> Option<String> {
 }
 
 /// Generate a stable analysis key from two NAT features for analyzer lookup.
-/// Includes IP addresses from each peer's mapped addresses to prevent score
-/// contamination between different peer pairs with the same NAT profiles.
-/// Go frp v0.69.1 compat: controller.go GenAnalysisKey uses MD5(clientIP + visitorIP).
+/// Go frp v0.70.1 compat: controller.go genAnalysisKey() uses a single MD5
+/// over visitorIP + visitorNatType + visitorBehavior + visitorRegularPortsChange
+/// + clientIP + clientNatType + clientBehavior + clientRegularPortsChange,
+///   then hex-encodes the result.
 pub fn gen_analysis_key(
     c: &NatFeature,
     v: &NatFeature,
     client_mapped: &[String],
     visitor_mapped: &[String],
 ) -> String {
-    // Extract first IP from each peer's mapped addresses for key isolation.
-    let c_ip = client_mapped
-        .first()
-        .and_then(|a| extract_ip_from_addr(a))
-        .unwrap_or_default();
+    use md5::{Digest, Md5};
+    let mut hash = Md5::new();
+
+    // Go frp genAnalysisKey order: visitor fields first, then client fields.
     let v_ip = visitor_mapped
         .first()
         .and_then(|a| extract_ip_from_addr(a))
         .unwrap_or_default();
+    hash.update(v_ip.as_bytes());
+    hash.update(v.nat_type.as_bytes());
+    hash.update(v.behavior.as_bytes());
+    hash.update(v.regular_ports_change.to_string().as_bytes());
 
-    // MD5 hex digest of combined IPs (Go frp compat).
-    let ip_hash = {
-        use md5::{Digest, Md5};
-        let result = Md5::digest(format!("{c_ip}{v_ip}").as_bytes());
-        format!("{result:x}")
-    };
+    let c_ip = client_mapped
+        .first()
+        .and_then(|a| extract_ip_from_addr(a))
+        .unwrap_or_default();
+    hash.update(c_ip.as_bytes());
+    hash.update(c.nat_type.as_bytes());
+    hash.update(c.behavior.as_bytes());
+    hash.update(c.regular_ports_change.to_string().as_bytes());
 
-    format!(
-        "{}:{}:{}|{}:{}:{}|{}",
-        c.nat_type,
-        c.behavior,
-        c.regular_ports_change as u8,
-        v.nat_type,
-        v.behavior,
-        v.regular_ports_change as u8,
-        ip_hash,
-    )
+    format!("{:x}", hash.finalize())
 }
 
 /// Parameters for building a NatHoleResp message.

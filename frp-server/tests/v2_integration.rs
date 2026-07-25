@@ -308,7 +308,7 @@ async fn test_v2_ping_pong_raw_tcp() {
         bind_addr: "127.0.0.1".into(),
         bind_port,
         transport: frp_core::config::ServerTransportConfig {
-            tcp_mux: false,
+            tcp_mux: Some(false),
             ..Default::default()
         },
         auth: test_auth_cfg(),

@@ -305,6 +305,9 @@ pub struct AppState {
     /// Writes only happen on SIGUSR1 reload (vanishingly rare).
     pub reloadable: Arc<std::sync::RwLock<ReloadableState>>,
     pub used_ports: Arc<RwLock<std::collections::HashSet<u16>>>,
+    /// Separate UDP port tracking (Go frp compat). TCP port 8080 can coexist
+    /// with UDP port 8080 — Go has separate TCPPortManager and UDPPortManager.
+    pub used_udp_ports: Arc<RwLock<std::collections::HashSet<u16>>>,
     pub run_id_to_ctl_tx: Arc<RwLock<HashMap<String, ControlTx>>>,
     /// Client registry tracking connected frpc instances with metadata.
     pub client_registry: Arc<ClientRegistry>,
@@ -323,6 +326,7 @@ pub struct AppState {
     pub sub_domain_host: String,
     pub tcp_mux: bool,
     pub tcp_mux_keepalive: i64,
+    pub tcp_keepalive: i64,
     pub heartbeat_timeout: i64,
     pub udp_packet_size: usize,
     pub tls_only: bool,
@@ -419,6 +423,7 @@ impl AppState {
         sub_domain_host: String,
         tcp_mux: bool,
         tcp_mux_keepalive: i64,
+        tcp_keepalive: i64,
         heartbeat_timeout: i64,
         udp_packet_size: usize,
         tls_only: bool,
@@ -445,6 +450,7 @@ impl AppState {
                 additional_auth_scopes: auth_cfg.additional_auth_scopes.clone(),
             })),
             used_ports: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            used_udp_ports: Arc::new(RwLock::new(std::collections::HashSet::new())),
             run_id_to_ctl_tx: Arc::new(RwLock::new(HashMap::new())),
             client_registry: Arc::new(ClientRegistry::new()),
             control_id_counter: AtomicU64::new(1),
@@ -462,6 +468,7 @@ impl AppState {
             sub_domain_host,
             tcp_mux,
             tcp_mux_keepalive,
+            tcp_keepalive,
             heartbeat_timeout,
             udp_packet_size,
             tls_only,

@@ -120,6 +120,13 @@ impl KcpSession {
             config.nodelay.nc,
         );
 
+        // Go frp (kcp-go) calls SetACKNoDelay(false) on its KCP sessions.
+        // The Rust kcp crate does not expose a set_ack_no_delay API, and
+        // its default behavior is equivalent to ACKNoDelay=false (ACKs are
+        // accumulated in acklist and flushed on the next tick rather than
+        // sent immediately). Verified: Rust kcp 0.6.0 always batches ACKs
+        // — no action needed.
+
         Self {
             conv,
             _peer_addr: peer_addr,

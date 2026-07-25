@@ -62,7 +62,7 @@ pub(crate) async fn handle_write_report<W: AsyncWriteExt + Unpin>(
     debug!(sid = %sid, "Writing NatHoleReport to visitor via control channel for {}", sid);
     let forward = FrpMessage::NatHoleReport(msg::NatHoleReport {
         sid: Some(sid),
-        success: None,
+        success: false,
     });
     if let Err(e) = write_ctl_msg(writer, &forward, ctx.v2).await {
         warn!(error = %e, "Failed to write NatHoleReport to visitor: {}", e);

@@ -320,7 +320,96 @@ async fn handle_proxy_traffic(
     Ok(Json(traffic))
 }
 
-/// GET /api/proxies/{name} — Go frp compat alias for /api/proxy/{name}.
+/// GET /api/proxy/{type} — list proxies filtered by type (path-param variant of ?type=).
+async fn handle_proxies_by_type(
+    State(state): State<Arc<AppState>>,
+    Path(proxy_type): Path<String>,
+) -> Result<Json<Vec<ProxyEntry>>, StatusCode> {
+    // Validate proxy type — reject unknown types with 404
+    let valid_types = ["tcp", "udp", "http", "https", "stcp", "xtcp", "sudp"];
+    if !valid_types.contains(&proxy_type.as_str()) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let proxies = state.proxy_manager.list().await;
+    let mut entries = Vec::new();
+    let ctl_map = state.run_id_to_ctl_tx.read().await;
+    for p in &proxies {
+        if p.proxy_type != proxy_type {
+            continue;
+        }
+        let online = ctl_map.contains_key(&p.run_id);
+        let traffic = state
+            .proxy_metrics
+            .get(&p.name)
+            .await
+            .map(|m| m.snapshot())
+            .unwrap_or_default();
+        entries.push(ProxyEntry {
+            name: p.name.clone(),
+            proxy_type: p.proxy_type.clone(),
+            status: if online {
+                "online".into()
+            } else {
+                "offline".into()
+            },
+            remote_port: p.remote_port,
+            local_addr: p.local_addr.clone(),
+            traffic_in: traffic.bytes_in,
+            traffic_out: traffic.bytes_out,
+            total_conns: traffic.total_conns,
+        });
+    }
+    Ok(Json(entries))
+}
+
+/// GET /api/proxy/{type}/{name} — proxy detail with type verification.
+async fn handle_proxy_by_type_name(
+    State(state): State<Arc<AppState>>,
+    Path((proxy_type, name)): Path<(String, String)>,
+) -> Result<Json<ProxyDetail>, (axum::http::StatusCode, Json<ErrorResponse>)> {
+    let proxy = state
+        .proxy_manager
+        .get(&name)
+        .await
+        .ok_or_else(|| not_found("proxy not found"))?;
+
+    if proxy.proxy_type != proxy_type {
+        return Err(not_found("proxy type mismatch"));
+    }
+
+    let online = state
+        .run_id_to_ctl_tx
+        .read()
+        .await
+        .contains_key(&proxy.run_id);
+    let traffic = state
+        .proxy_metrics
+        .get(&name)
+        .await
+        .map(|m| m.snapshot())
+        .unwrap_or_default();
+
+    Ok(Json(ProxyDetail {
+        name: proxy.name.clone(),
+        proxy_type: proxy.proxy_type.clone(),
+        status: if online {
+            "online".into()
+        } else {
+            "offline".into()
+        },
+        run_id: Some(proxy.run_id.clone()),
+        remote_port: proxy.remote_port,
+        local_addr: proxy.local_addr.clone(),
+        use_encryption: proxy.use_encryption,
+        use_compression: proxy.use_compression,
+        custom_domains: proxy.custom_domains.clone(),
+        multiplexer: proxy.multiplexer.clone(),
+        group: proxy.group.clone().unwrap_or_default(),
+        traffic,
+    }))
+}
+
+/// GET /api/proxies/{name} — Go frp compat alias for /api/proxy/{type}/{name}.
 async fn handle_proxy_by_name(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -414,17 +503,20 @@ async fn handle_healthz(
             }
             // Verify internal state structures are accessible (not deadlocked).
             let used_ok = state.used_ports.try_read().is_ok();
+            let used_udp_ok = state.used_udp_ports.try_read().is_ok();
             let ctl_ok = state.run_id_to_ctl_tx.try_read().is_ok();
             let proxy_ok = state.proxy_manager.is_responsive();
-            if used_ok && ctl_ok && proxy_ok {
+            if used_ok && used_udp_ok && ctl_ok && proxy_ok {
                 (StatusCode::OK, "ok")
             } else {
                 tracing::warn!(
                     used_ports = %used_ok,
+                    used_udp_ports = %used_udp_ok,
                     ctl_map = %ctl_ok,
                     proxy_manager = %proxy_ok,
-                    "Readiness check failed: used_ports={} ctl_map={} proxy_manager={}",
+                    "Readiness check failed: used_ports={} used_udp_ports={} ctl_map={} proxy_manager={}",
                     used_ok,
+                    used_udp_ok,
                     ctl_ok,
                     proxy_ok
                 );
@@ -432,8 +524,9 @@ async fn handle_healthz(
             }
         }
         _ => {
-            // Liveness: process is alive, always ok.
-            (StatusCode::OK, "ok")
+            // Liveness (no probe param, or probe=liveness): process is alive.
+            // Return empty body per Go frp compat.
+            (StatusCode::OK, "")
         }
     }
 }
@@ -555,9 +648,13 @@ async fn handle_store_proxy_delete(
 
     let run_id = proxy.run_id.clone();
 
-    // Clean up port
+    // Clean up port (TCP or UDP manager — Go frp compat)
     if let Some(port) = proxy.remote_port {
-        state.used_ports.write().await.remove(&port);
+        if proxy.proxy_type == "udp" || proxy.proxy_type == "sudp" {
+            state.used_udp_ports.write().await.remove(&port);
+        } else {
+            state.used_ports.write().await.remove(&port);
+        }
     }
     // Clean up sk_index (indexed by proxy_name)
     if let Some(key) = proxy.sk_index_key() {
@@ -601,7 +698,11 @@ async fn handle_proxies_delete(
     for name in &body.proxies {
         if let Some(proxy) = state.proxy_manager.get(name).await {
             if let Some(port) = proxy.remote_port {
-                state.used_ports.write().await.remove(&port);
+                if proxy.proxy_type == "udp" || proxy.proxy_type == "sudp" {
+                    state.used_udp_ports.write().await.remove(&port);
+                } else {
+                    state.used_ports.write().await.remove(&port);
+                }
             }
             if let Some(key) = proxy.sk_index_key() {
                 state.xtcp.sk_index.write().await.remove(key);
@@ -773,8 +874,10 @@ pub async fn run_dashboard(
             get(handle_proxies).delete(handle_proxies_delete),
         )
         .route("/api/proxies/{name}", get(handle_proxy_by_name))
-        .route("/api/proxy/{name}", get(handle_proxy_detail))
+        .route("/api/proxy/{type}", get(handle_proxies_by_type))
+        .route("/api/proxy/{type}/{name}", get(handle_proxy_by_type_name))
         .route("/api/proxy/{name}/traffic", get(handle_proxy_traffic))
+        .route("/api/traffic/{name}", get(handle_proxy_traffic))
         .route("/api/clients", get(handle_clients))
         .route("/api/clients/{run_id}", get(handle_client_detail))
         .route(

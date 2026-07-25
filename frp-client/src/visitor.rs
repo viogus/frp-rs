@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
@@ -25,9 +27,15 @@ pub(crate) struct VisitorListenerConfig {
     pub max_retries_an_hour: i32,
     pub min_retry_interval: i64,
     pub stun_server: String,
+    /// XTCP P2P data plane protocol: "kcp" or "quic" (Go frp v0.70.1 compat).
+    /// Default: "quic" matching Go frp.
+    pub p2p_protocol: String,
     pub visitor_tx: mpsc::Sender<crate::service::VisitorRequest>,
     pub fallback_to: String,
     pub disable_assisted_addrs: bool,
+    /// Graceful shutdown signal. When true, the listener stops accepting
+    /// new connections and exits. Checked between accept iterations.
+    pub shutdown: Arc<AtomicBool>,
 }
 /// Run an STCP/XTCP visitor listener.
 /// Binds a local port, accepts connections, and tunnels them
@@ -52,9 +60,11 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
         max_retries_an_hour,
         min_retry_interval,
         stun_server,
+        p2p_protocol,
         visitor_tx,
         fallback_to,
         disable_assisted_addrs,
+        shutdown,
     } = config;
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
@@ -66,6 +76,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
     info!(name = %name, bind_addr = %bind_addr, "Visitor '{}' listening on {}", name, bind_addr);
 
     loop {
+        // Check graceful shutdown signal before each accept (Go frp compat:
+        // visitor listeners exit cleanly instead of being aborted).
+        if shutdown.load(Ordering::Relaxed) {
+            info!(name = %name, "Visitor '{}' shutting down gracefully", name);
+            return;
+        }
+
         match listener.accept().await {
             Ok((user_conn, peer)) => {
                 frp_core::transport::set_nodelay(&user_conn);
@@ -84,6 +101,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                 let vtx = visitor_tx.clone();
                 let fb_to = fallback_to.clone();
                 let daa = disable_assisted_addrs;
+                let pp = p2p_protocol.clone();
 
                 tokio::spawn(async move {
                     // Dial options for STCP fallback (fresh connections only).
@@ -141,7 +159,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     transaction_id: uuid::Uuid::new_v4().to_string(),
                                     proxy_name: sn.clone(),
                                     pre_check: true,
-                                    protocol: Some("kcp".to_string()),
+                                    protocol: Some(pp.to_string()),
                                     sign_key,
                                     timestamp: Some(ts),
                                     mapped_addrs: None,
@@ -277,7 +295,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     transaction_id: txn_id.clone(),
                                     proxy_name: sn.clone(),
                                     pre_check: false,
-                                    protocol: Some("kcp".to_string()),
+                                    protocol: Some(pp.to_string()),
                                     sign_key,
                                     timestamp: Some(ts),
                                     mapped_addrs: if mapped_addrs.is_empty() {
@@ -353,12 +371,21 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                 } else {
                                     Some(sid.as_str())
                                 };
+                                // Use read_timeout_ms from server's detect_behavior as
+                                // the hole-punch timeout (Go frp v0.70.1 compat).
+                                // Keep fallback_timeout_ms as the outer STCP fallback
+                                // deadline (retry loop).
+                                let hp_timeout = resp
+                                    .detect_behavior
+                                    .as_ref()
+                                    .map(|db| db.read_timeout_ms.max(0) as u64)
+                                    .unwrap_or(fallback_timeout_ms);
                                 match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
                                     socket,
                                     &candidates,
                                     conv,
                                     kcp_cfg,
-                                    fallback_timeout_ms,
+                                    hp_timeout,
                                     true, // yamux_client = visitor
                                     p2p_sid,
                                     p2p_key.as_ref(),

@@ -1,6 +1,6 @@
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
-#[cfg(feature = "websocket")]
 use std::time::Duration;
 
 #[cfg(feature = "kcp")]
@@ -101,8 +101,8 @@ impl std::str::FromStr for TransportProtocol {
 ///
 /// Two modes:
 /// - Tungstenite: client side (binary frames, RFC 6455 compliant)
-/// - Raw: server side (manual framing, tolerates text frames with non-UTF-8
-///   payload — Go frp v0.69.1 sends these via golang.org/x/net/websocket)
+/// - Raw: server side (manual framing, tolerates text frames for
+///   backward compatibility with Go frp < v0.70.1)
 #[cfg(feature = "websocket")]
 pub struct WsByteStream {
     inner: WsInner,
@@ -891,8 +891,10 @@ pub enum IoStream {
     Tcp(TcpStream),
     /// Boxed TLS stream — type-erased to accept any TLS-wrapped transport
     /// (e.g. TlsStream<TcpStream> or TlsStream<PreReadStream<TcpStream>>).
+    /// Stores the peer `SocketAddr` alongside the stream so `peer_addr()`
+    /// can return it — unlike the boxed trait object which has no such method.
     #[cfg(feature = "tls")]
-    Tls(Box<dyn AsyncReadWrite>),
+    Tls(Box<dyn AsyncReadWrite>, SocketAddr),
     #[cfg(feature = "kcp")]
     Kcp(KcpStream),
     #[cfg(feature = "quic")]
@@ -1156,7 +1158,7 @@ impl std::fmt::Debug for IoStream {
         match self {
             IoStream::Tcp(_) => f.debug_struct("IoStream::Tcp").finish_non_exhaustive(),
             #[cfg(feature = "tls")]
-            IoStream::Tls(_) => f.debug_struct("IoStream::Tls").finish_non_exhaustive(),
+            IoStream::Tls(..) => f.debug_struct("IoStream::Tls").finish_non_exhaustive(),
             #[cfg(feature = "kcp")]
             IoStream::Kcp(_) => f.debug_struct("IoStream::Kcp").finish_non_exhaustive(),
             #[cfg(feature = "quic")]
@@ -1211,7 +1213,7 @@ impl tokio::io::AsyncRead for IoStream {
         match this {
             IoStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "tls")]
-            IoStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            IoStream::Tls(s, _) => Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "quic")]
@@ -1240,7 +1242,7 @@ macro_rules! io_stream_dispatch_poll {
         match $self.get_mut() {
             IoStream::Tcp(s) => Pin::new(s).$method($cx),
             #[cfg(feature = "tls")]
-            IoStream::Tls(s) => Pin::new(s).$method($cx),
+            IoStream::Tls(s, _) => Pin::new(s).$method($cx),
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => Pin::new(s).$method($cx),
             #[cfg(feature = "quic")]
@@ -1266,7 +1268,7 @@ impl tokio::io::AsyncWrite for IoStream {
         match self.get_mut() {
             IoStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "tls")]
-            IoStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            IoStream::Tls(s, _) => Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "quic")]
@@ -1300,7 +1302,7 @@ impl IoStream {
         match self {
             IoStream::Tcp(s) => crate::protocol::write_msg_v1(s, msg).await,
             #[cfg(feature = "tls")]
-            IoStream::Tls(s) => crate::protocol::write_msg_v1(s, msg).await,
+            IoStream::Tls(s, _) => crate::protocol::write_msg_v1(s, msg).await,
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::write_msg_v1(s, msg).await,
             #[cfg(feature = "quic")]
@@ -1323,7 +1325,7 @@ impl IoStream {
         match self {
             IoStream::Tcp(s) => crate::protocol::read_msg_v1(s).await,
             #[cfg(feature = "tls")]
-            IoStream::Tls(s) => crate::protocol::read_msg_v1(s).await,
+            IoStream::Tls(s, _) => crate::protocol::read_msg_v1(s).await,
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::read_msg_v1(s).await,
             #[cfg(feature = "quic")]
@@ -1353,7 +1355,7 @@ impl IoStream {
                     .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
             }
             #[cfg(feature = "tls")]
-            IoStream::Tls(s) => {
+            IoStream::Tls(s, _) => {
                 crate::protocol::write_msg_v2(s, msg).await?;
                 s.flush()
                     .await
@@ -1426,7 +1428,7 @@ impl IoStream {
         match self {
             IoStream::Tcp(s) => crate::protocol::read_msg_v2(s).await,
             #[cfg(feature = "tls")]
-            IoStream::Tls(s) => crate::protocol::read_msg_v2(s).await,
+            IoStream::Tls(s, _) => crate::protocol::read_msg_v2(s).await,
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::read_msg_v2(s).await,
             #[cfg(feature = "quic")]
@@ -1455,7 +1457,7 @@ impl IoStream {
                 crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
             }
             #[cfg(feature = "tls")]
-            IoStream::Tls(s) => {
+            IoStream::Tls(s, _) => {
                 crate::protocol::write_v2_frame_raw(s, frame_type, flags, payload).await
             }
             #[cfg(feature = "kcp")]
@@ -1497,7 +1499,7 @@ impl IoStream {
         match self {
             IoStream::Tcp(s) => crate::protocol::read_v2_frame_raw(s).await,
             #[cfg(feature = "tls")]
-            IoStream::Tls(s) => crate::protocol::read_v2_frame_raw(s).await,
+            IoStream::Tls(s, _) => crate::protocol::read_v2_frame_raw(s).await,
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => crate::protocol::read_v2_frame_raw(s).await,
             #[cfg(feature = "quic")]
@@ -1520,7 +1522,7 @@ impl IoStream {
             IoStream::PreRead(_, s) => s.peer_addr().ok(),
             IoStream::BufferedRead(_, _, inner) => inner.peer_addr(),
             #[cfg(feature = "tls")]
-            IoStream::Tls(_) => None,
+            IoStream::Tls(_, addr) => Some(*addr),
             IoStream::Yamux(_)
             | IoStream::Cipher(_)
             | IoStream::Aead(_)
@@ -1542,7 +1544,7 @@ impl IoStream {
                 Ok((ReadHalf::Tcp(r), WriteHalf::Tcp(w)))
             }
             #[cfg(feature = "tls")]
-            IoStream::Tls(s) => {
+            IoStream::Tls(s, _) => {
                 let (r, w) = tokio::io::split(s);
                 Ok((ReadHalf::Tls(r), WriteHalf::Tls(w)))
             }
@@ -1687,7 +1689,7 @@ impl Default for DialOptions {
             tls_key_file: None,
             dns_server: None,
             dial_timeout_secs: 10,
-            disable_custom_tls_first_byte: false,
+            disable_custom_tls_first_byte: true,
             keepalive_secs: 0,
             bind_addr: None,
             proxy_url: None,
@@ -1891,6 +1893,22 @@ async fn connect_direct(
 pub fn set_nodelay(stream: &tokio::net::TcpStream) {
     if let Err(e) = stream.set_nodelay(true) {
         tracing::debug!(error = %e, "set_nodelay failed (continuing with Nagle on)");
+    }
+}
+
+/// Set TCP keepalive interval on a stream, matching Go frp's server-side
+/// `muxer.SetKeepAlive(7200s)` behavior. Uses socket2 to configure the
+/// keepalive timeout. A failed socket option is logged at debug and ignored
+/// — consistent with `set_nodelay` error-handling policy.
+pub fn set_keepalive(stream: &tokio::net::TcpStream, secs: u64) {
+    if secs == 0 {
+        return;
+    }
+    let keepalive = socket2::SockRef::from(stream);
+    let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(secs));
+    if let Err(e) = keepalive.set_tcp_keepalive(&ka) {
+        tracing::debug!(error = %e, keepalive_secs = secs,
+            "set_keepalive failed (continuing without keepalive)");
     }
 }
 
@@ -2249,13 +2267,15 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                         .map_err(|e| {
                             crate::Error::Transport(format!("invalid server name: {e}").into())
                         })?;
+                    let peer_addr = peer;
                     let tls = connector
                         .connect(server_name, stream)
                         .await
                         .map_err(|e| crate::Error::Transport(format!("TLS connect: {e}").into()))?;
-                    Ok(IoStream::Tls(Box::new(tokio_rustls::TlsStream::Client(
-                        tls,
-                    ))))
+                    Ok(IoStream::Tls(
+                        Box::new(tokio_rustls::TlsStream::Client(tls)),
+                        peer_addr,
+                    ))
                 }
             } else {
                 Ok(IoStream::Tcp(stream))
@@ -2341,6 +2361,13 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
 ///
 /// If no match, wraps consumed bytes in `IoStream::PreRead` and classifies
 /// by the first byte. Downstream handlers receive the exact same byte stream.
+///
+/// ## Hardcoded timeout
+///
+/// The connection-read timeout is hardcoded to **5 seconds**. Go frp v0.70.1
+/// makes this configurable via `ServerConfig.Transport.connReadTimeout`.
+/// If a configurable timeout is needed, add a `conn_read_timeout: Duration`
+/// parameter to this function and thread it through from the server config.
 pub async fn detect_and_strip_magic(
     mut stream: tokio::net::TcpStream,
 ) -> Result<(ConnectionType, IoStream), crate::Error> {
@@ -2349,6 +2376,7 @@ pub async fn detect_and_strip_magic(
     let mut magic_buf = [0u8; 7];
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
+        // TODO: make this configurable via ServerConfig (Go frp v0.70.1 compat: connReadTimeout)
         stream.read_exact(&mut magic_buf),
     )
     .await
@@ -2414,10 +2442,9 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 /// Accept a WebSocket connection on a raw TcpStream.
 ///
-/// Does NOT use tungstenite — Go frp v0.69.1 (`golang.org/x/net/websocket`)
-/// sends frp V1 frames as TEXT frames. The V1 binary header contains bytes
-/// that aren't valid UTF-8 (e.g. the big-endian length field). Tungstenite
-/// rejects these text frames per RFC 6455 §5.6.
+/// Does NOT use tungstenite — Go frp v0.70.1 (`golang.org/x/net/websocket`)
+/// sends frp V1 frames as BINARY frames (BinaryFrame). The Raw path handles
+/// both binary and text frames for backward compatibility.
 ///
 /// This implementation handles the HTTP upgrade manually and returns a
 /// WsByteStream in Raw mode — all data frames are treated as opaque bytes.

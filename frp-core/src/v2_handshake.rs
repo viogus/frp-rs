@@ -326,25 +326,19 @@ fn write_transcript_part(ctx: &mut digest::Context, label: &str, payload: &[u8])
 // Client-side handshake (operates on IoStream)
 // ---------------------------------------------------------------------------
 
-/// Perform V2 client handshake after writing magic bytes.
+/// V2 client handshake step 1: write ClientHello and return the serialized
+/// payload byte vector for transcript hash computation.
 ///
-/// 1. Writes ClientHello frame (type=1) with crypto capabilities
-/// 2. Reads ServerHello frame (type=2)
-/// 3. Returns CryptoContext if AEAD crypto was negotiated, None otherwise
-///
-/// The stream must be positioned after the V2 magic bytes.
-/// After this returns, the stream is ready for V2 message frames (encrypted if
-/// CryptoContext is Some).
-///
-/// If `with_crypto` is false, crypto is not proposed and the handshake runs
-/// in plain V2 mode (used for Rust↔Rust V2 without AEAD interop).
-pub async fn v2_handshake_client(
+/// After this call, the caller may send the Login message on `stream`
+/// BEFORE reading ServerHello (matching Go frp's pipelined order:
+/// ClientHello → Login → ServerHello → LoginResp).
+pub async fn v2_handshake_client_send_hello(
     stream: &mut IoStream,
     transport: &str,
     tls: bool,
     tcp_mux: bool,
     with_crypto: bool,
-) -> Result<Option<CryptoContext>, crate::Error> {
+) -> Result<Vec<u8>, crate::Error> {
     let hello = if with_crypto {
         ClientHello::new(transport, tls, tcp_mux)
     } else {
@@ -355,6 +349,33 @@ pub async fn v2_handshake_client(
     stream
         .write_raw_v2_frame(V2_FRAME_TYPE_CLIENT_HELLO, 0, &client_hello_json)
         .await?;
+    Ok(client_hello_json)
+}
+
+/// V2 client handshake step 2: read and validate ServerHello, returning
+/// CryptoContext if AEAD crypto was negotiated.
+///
+/// Must be called AFTER `v2_handshake_client_send_hello`. The caller
+/// may send the Login message between the two calls.
+///
+/// `client_hello_json` must be the byte vector returned by
+/// `v2_handshake_client_send_hello` (needed for transcript hash).
+/// The remaining parameters are needed to re-derive the ClientHello
+/// for algorithm-offer validation.
+pub async fn v2_handshake_client_recv_hello(
+    stream: &mut IoStream,
+    client_hello_json: &[u8],
+    transport: &str,
+    tls: bool,
+    tcp_mux: bool,
+    with_crypto: bool,
+) -> Result<Option<CryptoContext>, crate::Error> {
+    // Re-derive hello for algorithm-offer validation.
+    let hello = if with_crypto {
+        ClientHello::new(transport, tls, tcp_mux)
+    } else {
+        ClientHello::new_without_crypto(transport, tls, tcp_mux)
+    };
 
     let (frame_type, _flags, server_hello_json) =
         tokio::time::timeout(V2_HANDSHAKE_TIMEOUT, stream.read_raw_v2_frame())
@@ -417,7 +438,7 @@ pub async fn v2_handshake_client(
                 }
 
                 let transcript_hash =
-                    compute_transcript_hash(&client_hello_json, &server_hello_json);
+                    compute_transcript_hash(client_hello_json, &server_hello_json);
                 Ok(Some(CryptoContext {
                     algorithm,
                     transcript_hash,
@@ -433,6 +454,41 @@ pub async fn v2_handshake_client(
             format!("unexpected V2 frame type during handshake: {other}").into(),
         )),
     }
+}
+
+/// Perform V2 client handshake after writing magic bytes.
+///
+/// Equivalent to calling `v2_handshake_client_send_hello` then
+/// `v2_handshake_client_recv_hello` sequentially (no pipelining).
+///
+/// 1. Writes ClientHello frame (type=1) with crypto capabilities
+/// 2. Reads ServerHello frame (type=2)
+/// 3. Returns CryptoContext if AEAD crypto was negotiated, None otherwise
+///
+/// The stream must be positioned after the V2 magic bytes.
+/// After this returns, the stream is ready for V2 message frames (encrypted if
+/// CryptoContext is Some).
+///
+/// If `with_crypto` is false, crypto is not proposed and the handshake runs
+/// in plain V2 mode (used for Rust↔Rust V2 without AEAD interop).
+pub async fn v2_handshake_client(
+    stream: &mut IoStream,
+    transport: &str,
+    tls: bool,
+    tcp_mux: bool,
+    with_crypto: bool,
+) -> Result<Option<CryptoContext>, crate::Error> {
+    let client_hello_json =
+        v2_handshake_client_send_hello(stream, transport, tls, tcp_mux, with_crypto).await?;
+    v2_handshake_client_recv_hello(
+        stream,
+        &client_hello_json,
+        transport,
+        tls,
+        tcp_mux,
+        with_crypto,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

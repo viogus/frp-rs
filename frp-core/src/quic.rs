@@ -3,6 +3,15 @@
 //! `QuicStream` maps a single QUIC bidirectional stream to `AsyncRead + AsyncWrite`.
 //! `QuicConnection` wraps a Quinn connection and supports opening/accepting
 //! multiple streams over a single QUIC connection (Go frp compat).
+//!
+//! ## Known gaps
+//!
+//! - **ECN disabled**: Go frp sets `QUIC_GO_DISABLE_ECN=true` to avoid
+//!   ECN (Explicit Congestion Notification) issues on some OS/kernel
+//!   configurations. Quinn may enable ECN by default on Linux, but does
+//!   not expose a public API to disable it. If ECN-related packet drops
+//!   are observed, this may be the cause. No action item at this time
+//!   — tracked as a potential future compatibility concern.
 
 use std::io;
 use std::net::SocketAddr;
