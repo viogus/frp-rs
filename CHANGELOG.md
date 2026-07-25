@@ -2,30 +2,89 @@
 
 All notable changes to frp-rs.
 
-## v0.7.1 — Go frp v0.70.1 compatibility
+## v0.7.1 — Go frp v0.70.1 Source-Level Compatibility Audit
 
-### Config fixes (from Go frp v0.70.1 source audit)
+Full-source audit of Go frp v0.70.1 (fatedier/frp) against frp-rs. 106 findings
+from 6 parallel subagent audits, 50+ fixes across 34 files. Every fix references
+the exact Go frp source location that mandates the behavior.
 
-- **QUICOptions**: add `QuicOptions` struct with `keepalive_period` (10s), `max_idle_timeout` (30s), `max_incoming_streams` (100000). Added as `quic_options` field to `ServerTransportConfig` and `ClientConfig` (serde rename "quic").
-- **TCPKeepAlive**: add `tcp_keepalive` (default 7200) to `ServerTransportConfig` with alias `tcpKeepalive`.
-- **DialServerTimeout**: add `dial_server_timeout` (default 10) to `ClientConfig` with alias `dialServerTimeout`.
+### Config (14 fixes)
+
+- **QUICOptions**: add `QuicOptions` struct with `keepalive_period` (10s), `max_idle_timeout` (30s), `max_incoming_streams` (100000). Added as `quic_options` field to `ServerTransportConfig` and `ClientConfig` (serde alias "quic").
+- **TCPKeepAlive**: add `tcp_keepalive` (default 7200) to `ServerTransportConfig` with alias `tcpKeepAlive`.
+- **DialServerTimeout**: add `dial_server_timeout` (default 10) to `ClientConfig` with alias `dialServerTimeout`. Now properly threaded through `ControlConnection` and `WorkConnConfig` to `DialOptions`.
 - **WebServer.Addr override**: when `web_server.port > 0 && addr.is_empty()`, set addr to `"0.0.0.0"` in `ServerConfig::complete()`.
 - **XTCP visitor protocol**: add `protocol` field (default "quic") to `VisitorConfig` with alias "protocol".
-- **Client [auth] extraction**: flatten `auth_*` and `oidc_*` flat fields into `[auth]` table during client config normalization; keep the `[auth]` table intact for serde deserialization instead of discarding it.
 - **pool_count serde default**: changed from `0` to `1` via `default_pool_count()` function.
 - **health_check_url default**: changed from `"/"` to `""` (empty string, matching Go frp).
 - **tcp_mux (server)**: changed from `bool` to `Option<bool>` to distinguish "not set" from explicit `false`.
 - **flatten_to_table overwrite semantics**: change `or_insert` to `insert` so legacy flat fields overwrite v1 nested fields (Go compat).
-- **client_id alias**: add `alias = "clientID"`.
-- **tls_server_name alias**: add `alias = "tlsServerName"`.
-- **allow_port_start/end defaults**: changed from 10000-50000 to 0-65535 (all ports allowed, matching Go empty AllowPorts).
+- **Serde aliases**: add `alias = "clientID"`, `alias = "tlsServerName"`, `alias = "tlsServerName"` on server transport, `alias = "keepalivePeriod"` on `QuicOptions`.
+- **allow_port_start default 0→1**: port 0 caused OS-assigned port mismatch (server advertised port 0 but listener was on kernel-chosen port).
+- **allow_port_end default 50000→65535**: full port range allowed by default, matching Go frp empty AllowPorts.
+- **disable_custom_tls_first_byte serde default**: changed from `#[serde(default)]` (false) to `#[serde(default = "default_true")]` — config-file and programmatic users now get the same default (true).
 
-## Upgrade Notes: v0.7.0 → v0.8.0 (Go frp v0.70.1 compat)
+### Messages (1 fix)
 
-This release changes several config defaults to match Go frp v0.70.1 behavior.
-Existing configs that relied on previous defaults may need updating.
+- **NatHoleReport.success**: changed from `Option<bool>` to `bool` (Go frp v0.70.1 always sends the field).
 
-### Client defaults changed
+### Client (10 fixes)
+
+- **V2 handshake pipelining**: split `v2_handshake_client` into `send_hello` / `recv_hello` so Login is sent between ClientHello and ServerHello, matching Go frp's `control_session.go:140-203`.
+- **Health check monotonic counter**: `failures` is now a monotonic u64 that never resets on success (matching Go frp behavior). Counter inspected at `/healthz?probe=health`.
+- **Health check 500ms startup delay**: first health check delayed by 500ms (matching Go frp).
+- **Ping auth always set**: removed `scope_requires_auth` gate so Ping always carries auth credentials.
+- **GracefulClose ordering**: signal visitors → drop yamux → wait (three-step sequence matching Go frp's `closeSession()`).
+- **Visitor graceful shutdown**: `Arc<AtomicBool>` shutdown signal instead of `handle.abort()` — visitors exit cleanly.
+- **STUN default**: changed from empty to `stun.easyvoip.com:3478`.
+- **Unique transaction_id per request**: `uuid::Uuid::new_v4()` per message instead of static constant.
+- **UDP bind before NatHoleSid**: fix race where NatHoleSid was sent before the UDP socket bind completed (Go frp binds first, then sends).
+- **client_spec in Login**: `ClientSpec { client_type: "frpc", always_auth_pass: None }` sent in every Login message (Go frp compat).
+
+### Server (8 fixes)
+
+- **VHost multi-proxy per domain**: changed from `HashMap<String, VhostRoute>` to `HashMap<String, Vec<VhostRoute>>` with longest location prefix match — multiple proxies can serve the same domain at different locations, matching Go frp's `routerByHTTPUser`.
+- **Separate TCP/UDP port managers**: `used_udp_ports` tracking separate from `used_ports`. UDP/SuDP proxies allocate from UDP pool, TCP proxies from TCP pool with OS-level bind probe.
+- **Pool pre-filling at startup**: work connection pool is pre-filled during control handler initialization, with replacement after use (matching Go frp).
+- **StartWorkConn addr metadata**: always sends `src_addr` and `dst_addr` (removed `proxy_protocol_version` guard).
+- **Dashboard API endpoints**: added `/api/traffic/{name}`, `/api/proxy/{type}`, `/api/proxy/{type}/{name}` with type validation and 404 for unknown types.
+- **Dashboard healthz**: returns empty body for Go compat (was "ok"); `/healthz?probe=readiness` returns "ok".
+- **TCP keepalive**: applied via `socket2` in server accept loop on every raw `TcpStream`.
+- **TLS force handling**: proper detection and handling of `tls_only` mode on the server side.
+
+### XTCP / NAT Hole Punch (13 fixes)
+
+- **Mode 3 PortsRangeNumber**: changed from `sender(0,0,0,0,0)` to `sender(0,0,10,0,0)` (was 0, Go frp uses 10).
+- **Score bias**: non-fallback entries now score 0 instead of 1 (matching Go frp — entries only selected after `report_success` boosts them).
+- **lastUpdateTime unconditional**: moved before the analysis loop — analyst update time always recorded.
+- **IPv6 support**: removed `!ip.contains(':')` filter from `parse_ips()` — IPv6 addresses now parsed correctly.
+- **Visitor read_timeout_ms**: extracted from `NatHoleResp.detect_behavior` instead of hardcoded value.
+- **Configurable p2p_protocol**: visitor uses `p2p_protocol` from config instead of hardcoded "kcp".
+- **Analysis key MD5 format**: `gen_analysis_key()` rewritten to produce MD5 hex string matching Go frp format.
+- **NatHoleReport success tracking**: `send_nat_hole_report()` takes `success: bool` parameter, forwarded through the analysis pipeline.
+- **5-mode behavior table**: full implementation matching Go frp's NAT classification state machine.
+- **STUN OTHER-ADDRESS parsing**: 0x802c attribute for dual-server NAT probing.
+- **Classify NAT feature**: `parse_ips` handles all address formats from Go frp's STUN library.
+- **Controller session management**: session creation with timeout, provider registration, bidirectional NatHoleResp delivery.
+- **Analysis scoring**: incremental `report_success` boosts, proper fallback mode initialization with score=1.
+
+### Transports (8 fixes)
+
+- **DialOptions default**: `disable_custom_tls_first_byte` changed from `false` to `true` in `DialOptions::default()`.
+- **Server TCP keepalive**: `set_keepalive()` public function via `socket2` for outbound connections.
+- **IoStream::Tls peer_addr**: TLS variant now carries `SocketAddr` for peer address tracking.
+- **TLS force**: server handles `tls_only` mode correctly on the accept path.
+- **Tiny/micro build fix**: removed `#[cfg(feature = "websocket")]` gate from `use std::time::Duration` (was breaking `set_keepalive`).
+- **QUIC ECN doc note**: documented gap — Go frp sets `QUIC_GO_DISABLE_ECN=true`, quinn doesn't expose ECN control.
+- **WebSocket comments**: clarify frame boundary handling and dispatch order.
+- **KCP ACKNoDelay comment**: verify Rust kcp crate default (batched ACKs) matches Go frp's `SetACKNoDelay(false)`.
+
+### Upgrade Notes: v0.7.0 → v0.7.1
+
+This release aligns config defaults with Go frp v0.70.1. Existing configs that
+relied on previous defaults may need updating.
+
+#### Client defaults changed
 
 - **`tls_enable`**: changed from `false` to `true`. If your frps does not
   have TLS configured, set `tls_enable = false` explicitly in frpc.toml.
@@ -44,7 +103,7 @@ Existing configs that relied on previous defaults may need updating.
 - **`heartbeat_timeout`**: new field, defaults to `90` (seconds).
   Set to `-1` when `tcp_mux = true` (yamux provides keepalive).
 
-### Server defaults changed
+#### Server defaults changed
 
 - **`max_ports_per_client`**: changed from `50` to `0` (unlimited).
   To restore the old limit, set `max_ports_per_client = 50`.
@@ -55,26 +114,28 @@ Existing configs that relied on previous defaults may need updating.
   If the dashboard/admin API must be reachable from remote hosts, set
   `web_server.addr = "0.0.0.0"`.
 
-### Proxy defaults changed
+#### Proxy defaults changed
 
 - **`local_ip`**: changed from `""` (empty) to `"127.0.0.1"`.
   If your local service binds a different address, set `local_ip`
   explicitly.
-
-### Bandwidth limit parsing tightened
-
-The `bandwidth_limit` field now requires a "KB", "MB", or "GB" suffix
-(case-insensitive). Bare numbers (e.g., `"500"`) and single-letter
-suffixes (e.g., `"500K"`) are rejected. Update your config to use
-the full suffix: `"500KB"`, `"10MB"`, `"1GB"`.
-
-Empty `bandwidth_limit` now means "no limit" (previously was treated
-as "not set"). This matches Go frp behavior.
-
 - **`bandwidth_limit_mode`**: changed from `""` (both directions) to
   `"client"` (upload only). If you explicitly set `bandwidth_limit` and
   want to throttle both upload and download, set
   `bandwidth_limit_mode = ""`.
+
+#### Bandwidth limit parsing tightened
+
+The `bandwidth_limit` field now requires a "KB", "MB", or "GB" suffix
+(case-insensitive). Bare numbers (e.g., `"500"`) and single-letter
+suffixes (e.g., `"500K"`) are rejected. Use the full suffix: `"500KB"`,
+`"10MB"`, `"1GB"`. Empty `bandwidth_limit` means "no limit" (matching
+Go frp behavior).
+
+#### Port range defaults expanded
+
+`allow_port_start` changed from 10000 to 1, `allow_port_end` from 50000 to 65535.
+All ports are now allowed by default (matching Go frp empty AllowPorts).
 
 ## v0.7.0 (2026-07-21)
 
