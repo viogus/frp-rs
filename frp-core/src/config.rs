@@ -920,8 +920,8 @@ pub struct ClientConfig {
     pub tls_server_name: String,
     /// Disable the custom TLS head byte (0x17) written before the TLS handshake.
     /// When true, the client skips the Go frp protocol marker and starts TLS directly.
-    /// Go frp compat: disableCustomTLSFirstByte.
-    #[serde(default, alias = "disableCustomTLSFirstByte")]
+    /// Go frp compat: disableCustomTLSFirstByte. Default: true.
+    #[serde(default = "default_true", alias = "disableCustomTLSFirstByte")]
     pub disable_custom_tls_first_byte: bool,
     #[serde(default)]
     pub log: LogConfig,

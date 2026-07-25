@@ -58,6 +58,9 @@ pub struct ControlConnection {
     proxy_url: String,
     /// Client spec passed in Login message (Go frp compat).
     client_spec: Option<ClientSpec>,
+    /// Timeout in seconds for dialing the frp server.
+    /// Go frp compat: dialServerTimeout. Default: 10.
+    dial_server_timeout: i64,
 }
 
 impl ControlConnection {
@@ -87,6 +90,7 @@ impl ControlConnection {
         proxy_url: String,
         previous_run_id: String,
         client_spec: Option<ClientSpec>,
+        dial_server_timeout: i64,
     ) -> Self {
         Self {
             server_addr,
@@ -114,6 +118,7 @@ impl ControlConnection {
             metas,
             proxy_url,
             client_spec,
+            dial_server_timeout,
         }
     }
 
@@ -141,7 +146,7 @@ impl ControlConnection {
             bind_addr: self.bind_addr.clone(),
             proxy_url: opt_if_empty!(self.proxy_url),
             v2: self.v2,
-            ..Default::default()
+            dial_timeout_secs: self.dial_server_timeout as u64,
         };
 
         // Establish transport connection.

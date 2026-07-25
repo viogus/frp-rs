@@ -73,6 +73,7 @@ pub(crate) struct WorkConnConfig {
     pub keepalive_secs: u64,
     pub bind_addr: Option<String>,
     pub proxy_url: String,
+    pub dial_timeout_secs: u64,
     pub xtcp_tx: mpsc::Sender<XtcpNotification>,
     pub session_alive: Arc<AtomicBool>,
     #[cfg(feature = "vnet")]
@@ -96,6 +97,7 @@ struct WorkConnDialConfig<'a> {
     keepalive_secs: u64,
     bind_addr: &'a Option<String>,
     proxy_url: &'a str,
+    dial_timeout_secs: u64,
 }
 
 /// Shared yamux-or-dial path for work connection transport acquisition.
@@ -129,6 +131,7 @@ async fn connect_yamux_or_dial(cfg: &WorkConnDialConfig<'_>) -> Option<IoStream>
             } else {
                 Some(cfg.proxy_url.to_string())
             },
+            dial_timeout_secs: cfg.dial_timeout_secs,
             ..Default::default()
         };
         match dial_server(&opts).await {
@@ -179,6 +182,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             keepalive_secs,
             bind_addr,
             proxy_url,
+            dial_timeout_secs,
             xtcp_tx,
             session_alive,
             #[cfg(feature = "vnet")]
@@ -223,6 +227,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                 keepalive_secs,
                 bind_addr: &bind_addr,
                 proxy_url: &proxy_url,
+                dial_timeout_secs,
             };
             match connect_yamux_or_dial(&dial_cfg).await {
                 Some(io) => io,
@@ -244,6 +249,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             keepalive_secs,
             bind_addr: &bind_addr,
             proxy_url: &proxy_url,
+            dial_timeout_secs,
         };
         #[cfg(not(feature = "quic"))]
         let mut work = match connect_yamux_or_dial(&dial_cfg).await {

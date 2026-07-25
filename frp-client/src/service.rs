@@ -642,6 +642,7 @@ impl Service {
                     client_type: Some("frpc".into()),
                     always_auth_pass: None,
                 }),
+                self.cfg.dial_server_timeout,
             );
 
             #[cfg(feature = "quic")]
@@ -957,6 +958,7 @@ impl Service {
                         keepalive_secs: self.cfg.dial_server_keepalive.max(0) as u64,
                         bind_addr: opt_if_empty!(self.cfg.connect_server_local_ip),
                         proxy_url: self.cfg.proxy_url.clone(),
+                        dial_timeout_secs: self.cfg.dial_server_timeout as u64,
                         xtcp_tx: xtcp_tx.clone(),
                         session_alive: session_alive.clone(),
                         #[cfg(feature = "vnet")]
