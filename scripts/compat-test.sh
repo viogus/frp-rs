@@ -189,14 +189,25 @@ cleanup() {
         rm -rf "$TEST_DIR"
     fi
 }
+
+# Kill all tracked PIDs without removing test dir.
+# Resets PIDS so subsequent tests start fresh.
+cleanup_pids() {
+    for pid in $PIDS; do
+        kill "$pid" 2>/dev/null || true
+    done
+    wait 2>/dev/null || true
+    PIDS=""
+}
 trap cleanup EXIT
 
 random_port() {
-    # Find an unused port in range
+    # Find an unused port in range (TCP + UDP)
     local port
     while true; do
         port=$(( (RANDOM % 10000) + 17000 ))
-        if ! lsof -iTCP:$port -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; then
+        if ! lsof -iTCP:$port -sTCP:LISTEN 2>/dev/null | grep -q LISTEN && \
+           ! lsof -iUDP:$port 2>/dev/null | grep -q .; then
             echo "$port"
             return
         fi
@@ -5981,6 +5992,11 @@ run_test test_g2r_wss_mux
 # Phase 7: Plugin
 run_test test_g2r_socks5
 run_test test_r2g_socks5
+
+# Kill all previous test processes before KCP/QUIC tests.
+# KCP and QUIC use UDP ports, and old processes from earlier phases
+# can hold UDP ports invisible to random_port()'s TCP-only lsof check.
+cleanup_pids
 
 # =============================================================================
 # Test: Rust frps -> Rust frpc, KCP transport (Rust↔Rust)

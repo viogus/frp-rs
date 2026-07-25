@@ -73,6 +73,7 @@ pub(crate) struct WorkConnConfig {
     pub keepalive_secs: u64,
     pub bind_addr: Option<String>,
     pub proxy_url: String,
+    pub user: String,
     pub dial_timeout_secs: u64,
     pub xtcp_tx: mpsc::Sender<XtcpNotification>,
     pub session_alive: Arc<AtomicBool>,
@@ -182,6 +183,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             keepalive_secs,
             bind_addr,
             proxy_url,
+            user,
             dial_timeout_secs,
             xtcp_tx,
             session_alive,
@@ -317,10 +319,26 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                 let proxy_name = &swc.proxy_name;
                 debug!(label = %label, proxy_name = %proxy_name, "Work conn {} assigned to proxy '{}'", label, proxy_name);
 
+                // Strip `{user}.` prefix from proxy_name if configured.
+                // Go frp server prefixes proxy names with `{user}.` when
+                // the client has a non-empty user (multi-tenant support).
+                // The local proxy_info_map uses the bare proxy name (no prefix).
+                let proxy_name = if !user.is_empty() {
+                    let prefix = format!("{}.", user);
+                    if let Some(rest) = proxy_name.strip_prefix(&prefix) {
+                        debug!(label = %label, original = %swc.proxy_name, stripped = %rest, "Work conn {}: stripped user prefix from '{}' -> '{}'", label, swc.proxy_name, rest);
+                        rest.to_string()
+                    } else {
+                        proxy_name.to_string()
+                    }
+                } else {
+                    proxy_name.to_string()
+                };
+
                 // Look up the proxy runtime info
                 let info = {
                     let map = proxy_info_map.read().await;
-                    map.get(proxy_name).cloned()
+                    map.get(&proxy_name).cloned()
                 };
                 let info = match info {
                     Some(info) => info,
@@ -518,7 +536,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     // UDP proxy: bridge work conn ↔ local UDP socket
                     let sock = {
                         let map = udp_sockets.lock().await;
-                        map.get(proxy_name).cloned()
+                        map.get(&proxy_name).cloned()
                     };
                     let sock = match sock {
                         Some(s) => s,
@@ -529,7 +547,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     };
                     let enc_cfg = {
                         let cfg = udp_enc_cfg.lock().await;
-                        cfg.get(proxy_name).copied().unwrap_or((false, false))
+                        cfg.get(&proxy_name).copied().unwrap_or((false, false))
                     };
                     let (use_enc, use_comp) = enc_cfg;
 
@@ -723,7 +741,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                             proxy::bridge_streams(proxy::BridgeStreamsParams {
                                 local,
                                 work,
-                                name: proxy_name,
+                                name: &proxy_name,
                                 use_encryption: use_enc,
                                 use_compression: use_comp,
                                 enc_key: enc,

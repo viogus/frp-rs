@@ -2,7 +2,7 @@
 //! Rendered from live AppState + ProxyMetricsRegistry data on each /metrics scrape.
 //! Same data source as the dashboard API (single metrics system).
 
-use prometheus::{Encoder, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
+use prometheus::{Encoder, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
 use std::sync::atomic::Ordering;
 use std::sync::LazyLock;
 
@@ -49,18 +49,18 @@ static CONNECTION_COUNTS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("metric definition must be valid")
 });
 
-/// frp_server_traffic_in — total inbound traffic bytes per proxy.
-static TRAFFIC_IN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    IntGaugeVec::new(
+/// frp_server_traffic_in — total inbound traffic bytes per proxy (counter).
+static TRAFFIC_IN: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
         Opts::new("frp_server_traffic_in", "total inbound traffic"),
         &["name", "type"],
     )
     .expect("metric definition must be valid")
 });
 
-/// frp_server_traffic_out — total outbound traffic bytes per proxy.
-static TRAFFIC_OUT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    IntGaugeVec::new(
+/// frp_server_traffic_out — total outbound traffic bytes per proxy (counter).
+static TRAFFIC_OUT: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
         Opts::new("frp_server_traffic_out", "total outbound traffic"),
         &["name", "type"],
     )
@@ -177,10 +177,10 @@ pub async fn sync_from_state(state: &AppState) {
             .set(snap.current_conns);
         TRAFFIC_IN
             .with_label_values(&[pn, pt])
-            .set(i64::try_from(snap.bytes_in).unwrap_or(i64::MAX));
+            .inc_by(snap.bytes_in);
         TRAFFIC_OUT
             .with_label_values(&[pn, pt])
-            .set(i64::try_from(snap.bytes_out).unwrap_or(i64::MAX));
+            .inc_by(snap.bytes_out);
     }
 
     for (pt, count) in &type_counts {
@@ -250,17 +250,17 @@ mod tests {
             .set(1);
         TRAFFIC_IN
             .with_label_values(&["__fmt_proxy", "__fmt_test"])
-            .set(0);
+            .inc_by(0);
         TRAFFIC_OUT
             .with_label_values(&["__fmt_proxy", "__fmt_test"])
-            .set(0);
+            .inc_by(0);
         CONNECTION_COUNTS
             .with_label_values(&["__fmt_proxy", "__fmt_test"])
             .set(0);
         let text = render_metrics_text();
         // HEADER line present for gauge (always renders)
         assert!(text.contains("TYPE frp_server_client_counts gauge"));
-        assert!(text.contains("TYPE frp_server_traffic_in gauge"));
+        assert!(text.contains("TYPE frp_server_traffic_in counter"));
         // Pool metrics should appear even without touching them (they're plain IntGauges)
         assert!(text.contains("frp_server_pool_hits_total"));
         assert!(text.contains("frp_server_pool_misses_total"));

@@ -404,10 +404,14 @@ async fn serve_vhost_request<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-    // Read the first 4096 bytes to extract Host header (with 10s timeout)
+    // Read the first 4096 bytes to extract Host header (with configured timeout)
+    let timeout_secs = state.vhost_http_timeout.max(1);
     let mut buf = [0u8; 4096];
-    let n = match tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buf))
-        .await
+    let n = match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        stream.read(&mut buf),
+    )
+    .await
     {
         Ok(Ok(n)) if n > 0 => n,
         _ => return,

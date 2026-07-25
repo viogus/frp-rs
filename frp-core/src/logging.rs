@@ -30,8 +30,8 @@ pub fn resolve_log_level(
 
 pub fn resolve_log_file(cli_file: Option<String>, cfg_file: &str) -> Option<String> {
     cli_file.or_else(|| {
-        if cfg_file.is_empty() {
-            None
+        if cfg_file.is_empty() || cfg_file == "console" {
+            None // "console" means stdout (Go frp compat)
         } else {
             Some(cfg_file.to_string())
         }

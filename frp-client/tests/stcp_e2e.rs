@@ -92,7 +92,7 @@ async fn test_stcp_e2e_relay() {
             secret_key: stcp_sk.into(),
             server_user: String::new(),
             bind_addr: "127.0.0.1".into(),
-            bind_port: visitor_port,
+            bind_port: visitor_port as i32,
             fallback_to: String::new(),
             fallback_timeout_ms: 5000,
             disable_assisted_addrs: false,

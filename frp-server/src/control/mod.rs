@@ -122,7 +122,7 @@ pub async fn handle_control<S>(
     // Convenience bindings for the main loop
     let state = ctx.state.clone();
     let run_id = ctx.run_id.clone();
-    let pool_cap = ctx.pool_cap;
+    let _pool_cap = ctx.pool_cap; // used by the non-yamux work-conn paths
     let pool_stats = ctx.pool_stats.clone();
     let v2 = ctx.v2;
     let reloadable = ctx.reloadable.clone();
@@ -241,29 +241,10 @@ pub async fn handle_control<S>(
                             continue;
                         }
                     }
-                    debug!(run_id = %run_id, "Yamux work conn for run_id {}", run_id);
-                    while let Some(req) = ctl.pending_requests.front() {
-                        if req.created_at.elapsed() > pool::pending_request_timeout(state.user_conn_timeout) {
-                            ctl.pending_requests.pop_front();
-                            pool_stats.pending_requests.store(ctl.pending_requests.len() as i64, Ordering::Relaxed);
-                        } else {
-                            break;
-                        }
-                    }
-                    if let Some(req) = ctl.pending_requests.pop_front() {
-                        state.pool.hits.fetch_add(1, Ordering::Relaxed);
-                        pool_stats.pending_requests.store(ctl.pending_requests.len() as i64, Ordering::Relaxed);
-                        pool_stats.pool_size.store(ctl.work_pool.len() as i64, Ordering::Relaxed);
-                        let enc_key = reloadable.encryption_key;
-                        bridge::assign_work_to_proxy(io, req, enc_key, state.clone(), v2).await;
-                    } else if ctl.work_pool.len() < pool_cap {
-                        ctl.work_pool.push_back(pool::PoolEntry { conn: io, pooled_at: Instant::now() });
-                        pool_stats.pool_size.store(ctl.work_pool.len() as i64, Ordering::Relaxed);
-                        debug!(run_id = %run_id, pool_size = %ctl.work_pool.len(), pool_cap = %pool_cap, "Yamux work conn pooled for {} (pool size: {}/{})", run_id, ctl.work_pool.len(), pool_cap);
-                    } else {
-                        state.pool.drops.fetch_add(1, Ordering::Relaxed);
-                        debug!(run_id = %run_id, pool_size = %ctl.work_pool.len(), pool_cap = %pool_cap, "Work pool full for {} ({}/{}), dropping yamux work conn", run_id, ctl.work_pool.len(), pool_cap);
-                    }
+                    // Route through pool::handle_new_work_conn for consistent
+                    // priority: NatHoleSid → UDP → pending requests → pool → drop.
+                    // The inline handler previously checked only pending_requests.
+                    let _ = pool::handle_new_work_conn(&mut ctx, &mut ctl, &mut writer, io).await;
                 }
             }
 

@@ -498,7 +498,7 @@ impl Service {
             Ok(p) => p,
             Err(_) => {
                 return Err(format!(
-                    "unknown transport protocol '{}'. Valid transports: tcp, kcp, quic, websocket",
+                    "unknown transport protocol '{}'. Valid transports: tcp, kcp, quic, websocket, wss",
                     self.cfg.transport_protocol
                 )
                 .into());
@@ -958,6 +958,7 @@ impl Service {
                         keepalive_secs: self.cfg.dial_server_keepalive.max(0) as u64,
                         bind_addr: opt_if_empty!(self.cfg.connect_server_local_ip),
                         proxy_url: self.cfg.proxy_url.clone(),
+                        user: self.cfg.user.clone(),
                         dial_timeout_secs: self.cfg.dial_server_timeout as u64,
                         xtcp_tx: xtcp_tx.clone(),
                         session_alive: session_alive.clone(),
@@ -997,6 +998,7 @@ impl Service {
                 let sp = self.cfg.server_port;
                 let pt = protocol.clone();
                 let server_name = v.server_name.clone();
+                let server_user = v.server_user.clone();
                 let secret_key = v.secret_key.clone();
                 let bind_addr = format!("{}:{}", v.bind_addr, v.bind_port);
                 let use_enc = v.use_encryption;
@@ -1022,6 +1024,7 @@ impl Service {
                         server_port: sp,
                         protocol: pt,
                         server_name,
+                        server_user,
                         secret_key,
                         bind_addr,
                         use_encryption: use_enc,

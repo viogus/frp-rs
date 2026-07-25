@@ -41,6 +41,9 @@ pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
         .write_all(&buf)
         .await
         .map_err(|e| crate::Error::Protocol(format!("write V1 frame: {e}").into()))?;
+    // Flush is NOT called here — callers that need it (KCP control channel
+    // after login) flush explicitly.  Adding a blanket flush breaks CipherStream
+    // layered writes because the intermediate flush can split encrypted blocks.
     Ok(())
 }
 
