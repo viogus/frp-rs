@@ -67,6 +67,49 @@ fn is_udp_port_bindable(bind_addr: &str, port: u16) -> bool {
     }
 }
 
+/// Pure validation of NewProxy fields. Returns Ok(()) or an error message.
+/// Checks port range, proxy_name length/control chars, custom_domains length,
+/// and subdomain length. Extracted from the async state machine to reduce
+/// the number of `.await` points in `handle_new_proxy`.
+#[inline(never)]
+fn validate_new_proxy(np: &msg::NewProxy) -> Result<(), String> {
+    let raw_port = np.remote_port.unwrap_or(0);
+    if raw_port < 0 || raw_port > u16::MAX as i32 {
+        return Err(format!(
+            "remote_port {} out of valid range (0-65535)",
+            raw_port
+        ));
+    }
+    if np.proxy_name.len() > 255 {
+        return Err("proxy_name exceeds 255 characters".into());
+    }
+    if np
+        .proxy_name
+        .contains(|c: char| c.is_control() && c != '\n' && c != '\r')
+    {
+        return Err("proxy_name contains invalid control characters".into());
+    }
+    if let Some(ref domains) = np.custom_domains {
+        for domain in domains {
+            if domain.len() > 253 {
+                return Err(format!(
+                    "custom_domain '{}' exceeds 253 characters (RFC 1035 FQDN limit)",
+                    domain
+                ));
+            }
+        }
+    }
+    if let Some(ref subdomain) = np.subdomain {
+        if subdomain.len() > 63 {
+            return Err(format!(
+                "subdomain '{}' exceeds 63 characters (RFC 1035 label limit)",
+                subdomain
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Register a new proxy and start listening on its assigned port.
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip(state, writer, internal_tx, listener_handles, udp_sockets, udp_local_to_proxy), fields(proxy_name = %np.proxy_name, proxy_type = %np.proxy_type, run_id = %run_id))]
@@ -81,76 +124,11 @@ pub(crate) async fn handle_new_proxy(
     udp_local_to_proxy: &mut std::collections::HashMap<String, String>,
     v2: bool,
 ) {
-    let raw_port = np.remote_port.unwrap_or(0);
-    if raw_port < 0 || raw_port > u16::MAX as i32 {
-        reject_new_proxy(
-            writer,
-            &np.proxy_name,
-            format!("remote_port {} out of valid range (0-65535)", raw_port),
-            v2,
-        )
-        .await;
+    if let Err(e) = validate_new_proxy(&np) {
+        reject_new_proxy(writer, &np.proxy_name, e, v2).await;
         return;
     }
-    let remote_port = raw_port as u16;
-
-    // Validate string lengths and reject control characters to prevent
-    // resource exhaustion and injection attacks.
-    if np.proxy_name.len() > 255 {
-        reject_new_proxy(
-            writer,
-            &np.proxy_name,
-            "proxy_name exceeds 255 characters".into(),
-            v2,
-        )
-        .await;
-        return;
-    }
-    if np
-        .proxy_name
-        .contains(|c: char| c.is_control() && c != '\n' && c != '\r')
-    {
-        reject_new_proxy(
-            writer,
-            &np.proxy_name,
-            "proxy_name contains invalid control characters".into(),
-            v2,
-        )
-        .await;
-        return;
-    }
-    if let Some(ref domains) = np.custom_domains {
-        for domain in domains {
-            if domain.len() > 253 {
-                reject_new_proxy(
-                    writer,
-                    &np.proxy_name,
-                    format!(
-                        "custom_domain '{}' exceeds 253 characters (RFC 1035 FQDN limit)",
-                        domain
-                    ),
-                    v2,
-                )
-                .await;
-                return;
-            }
-        }
-    }
-    if let Some(ref subdomain) = np.subdomain {
-        if subdomain.len() > 63 {
-            reject_new_proxy(
-                writer,
-                &np.proxy_name,
-                format!(
-                    "subdomain '{}' exceeds 63 characters (RFC 1035 label limit)",
-                    subdomain
-                ),
-                v2,
-            )
-            .await;
-            return;
-        }
-    }
+    let remote_port = np.remote_port.unwrap_or(0) as u16;
 
     // Server plugin: new_proxy hook (before port allocation).
     // Control-enabled plugins can reject the proxy registration.

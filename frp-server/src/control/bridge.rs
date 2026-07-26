@@ -15,6 +15,58 @@ use crate::service::AppState;
 
 use super::pool::PendingRequest;
 
+/// Build a StartWorkConn message from request and address info.
+/// Pure data construction — no `.await` calls. Extracted from the
+/// async state machine in `assign_work_to_proxy`.
+#[inline(never)]
+fn build_start_work_conn(
+    req: &PendingRequest,
+    src_addr: &str,
+    src_port: i32,
+    dst_addr: &str,
+    dst_port: i32,
+) -> FrpMessage {
+    FrpMessage::StartWorkConn(Box::new(msg::StartWorkConn {
+        proxy_name: req.proxy_name.clone(),
+        src_addr: if !src_addr.is_empty() {
+            Some(src_addr.to_string())
+        } else {
+            None
+        },
+        src_port: if src_port != 0 { Some(src_port) } else { None },
+        dst_addr: if !dst_addr.is_empty() {
+            Some(dst_addr.to_string())
+        } else {
+            None
+        },
+        dst_port: if dst_port != 0 { Some(dst_port) } else { None },
+        error: None,
+        // use_encryption/use_compression: propagate proxy config settings.
+        // Go frpc v0.69.1 ignores these fields (not in its StartWorkConn struct)
+        // and uses its own proxy config. The server must match whatever the
+        // provider does, so the bridge type (plain vs encrypted) is determined
+        // below based on req.use_encryption/compression, NOT forced to false.
+        // Rust frpc (work_conn.rs) respects swc.use_encryption over its own config.
+        // CipherWriter now eagerly flushes IV on first poll_flush, preventing the
+        // dual-CipherWriter deadlock that previously forced plain bridge for XTCP.
+        use_encryption: if req.use_encryption { Some(true) } else { None },
+        use_compression: if req.use_compression {
+            Some(true)
+        } else {
+            None
+        },
+        // For XTCP STCP fallback: set empty nat_hole_sid marker so Rust frpc
+        // knows this work conn is for STCP bridging, not XTCP notification.
+        nat_hole_sid: if req.proxy_type == "xtcp" {
+            Some(String::new())
+        } else {
+            None
+        },
+        nat_hole_visitor_addr: None,
+        sk: None,
+    }))
+}
+
 /// RAII guard that tracks an active bridge connection for graceful shutdown drain.
 struct ActiveGuard(std::sync::Arc<AppState>);
 impl ActiveGuard {
@@ -317,6 +369,27 @@ async fn relay_plain_fast_inner(
     }
 }
 
+/// Parse bandwidth limit and mode from proxy info fields.
+/// Pure config parsing — no `.await` calls. Extracted from the
+/// async state machine in `assign_work_to_proxy`.
+#[inline(never)]
+fn parse_bandwidth_config(
+    bandwidth_limit: Option<&str>,
+    bandwidth_limit_mode: Option<&str>,
+) -> (u64, String) {
+    let bw_rate = bandwidth_limit
+        .and_then(|bl| {
+            if bl.is_empty() {
+                None
+            } else {
+                frp_core::config::parse_bandwidth_limit(bl)
+            }
+        })
+        .unwrap_or(0);
+    let bw_mode = bandwidth_limit_mode.unwrap_or_default().to_string();
+    (bw_rate, bw_mode)
+}
+
 pub(crate) async fn assign_work_to_proxy(
     mut work_conn: IoStream,
     req: PendingRequest,
@@ -346,45 +419,7 @@ pub(crate) async fn assign_work_to_proxy(
         .map(|p| p as i32)
         .unwrap_or(0);
 
-    let swc = FrpMessage::StartWorkConn(Box::new(msg::StartWorkConn {
-        proxy_name: req.proxy_name.clone(),
-        src_addr: if !src_addr.is_empty() {
-            Some(src_addr)
-        } else {
-            None
-        },
-        src_port: if src_port != 0 { Some(src_port) } else { None },
-        dst_addr: if !dst_addr.is_empty() {
-            Some(dst_addr)
-        } else {
-            None
-        },
-        dst_port: if dst_port != 0 { Some(dst_port) } else { None },
-        error: None,
-        // use_encryption/use_compression: propagate proxy config settings.
-        // Go frpc v0.69.1 ignores these fields (not in its StartWorkConn struct)
-        // and uses its own proxy config. The server must match whatever the
-        // provider does, so the bridge type (plain vs encrypted) is determined
-        // below based on req.use_encryption/compression, NOT forced to false.
-        // Rust frpc (work_conn.rs) respects swc.use_encryption over its own config.
-        // CipherWriter now eagerly flushes IV on first poll_flush, preventing the
-        // dual-CipherWriter deadlock that previously forced plain bridge for XTCP.
-        use_encryption: if req.use_encryption { Some(true) } else { None },
-        use_compression: if req.use_compression {
-            Some(true)
-        } else {
-            None
-        },
-        // For XTCP STCP fallback: set empty nat_hole_sid marker so Rust frpc
-        // knows this work conn is for STCP bridging, not XTCP notification.
-        nat_hole_sid: if req.proxy_type == "xtcp" {
-            Some(String::new())
-        } else {
-            None
-        },
-        nat_hole_visitor_addr: None,
-        sk: None,
-    }));
+    let swc = build_start_work_conn(&req, &src_addr, src_port, &dst_addr, dst_port);
 
     let write_result = if v2 {
         work_conn.write_v2_frame(&swc).await
@@ -436,21 +471,16 @@ pub(crate) async fn assign_work_to_proxy(
     let comp_key = req.use_compression;
     let proxy_type = req.proxy_type.clone();
 
-    // Parse bandwidth limit from proxy info
-    let bw_rate = proxy_info
-        .as_ref()
-        .and_then(|p| {
+    let (bw_rate, bw_mode) = parse_bandwidth_config(
+        proxy_info.as_ref().and_then(|p| {
             if p.bandwidth_limit.is_empty() {
                 None
             } else {
-                frp_core::config::parse_bandwidth_limit(&p.bandwidth_limit)
+                Some(p.bandwidth_limit.as_str())
             }
-        })
-        .unwrap_or(0);
-    let bw_mode = proxy_info
-        .as_ref()
-        .map(|p| p.bandwidth_limit_mode.clone())
-        .unwrap_or_default();
+        }),
+        proxy_info.as_ref().map(|p| p.bandwidth_limit_mode.as_str()),
+    );
 
     tokio::spawn(async move {
         let _guard = guard;
