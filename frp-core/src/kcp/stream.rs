@@ -158,7 +158,16 @@ impl AsyncRead for KcpStream {
                     Poll::Ready(Ok(())) // EOF
                 }
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                if !self.session_alive.load(Ordering::Acquire) {
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "KCP session removed",
+                    )))
+                } else {
+                    Poll::Pending
+                }
+            }
         }
     }
 }

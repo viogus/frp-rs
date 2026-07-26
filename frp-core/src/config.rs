@@ -1424,7 +1424,7 @@ fn validate_proxy_configs(proxies: &[ProxyConfig]) -> Result<(), String> {
             let hint = if p.bandwidth_limit == "0" || p.bandwidth_limit == "0KB" {
                 "value must be positive; use empty string for no limit"
             } else {
-                "must be a positive number followed by KB, MB, or GB"
+                "must be a positive number followed by KB or MB"
             };
             return Err(format!(
                 "proxy '{}': invalid bandwidth_limit: {:?} ({})",
