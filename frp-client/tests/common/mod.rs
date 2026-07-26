@@ -55,8 +55,10 @@ pub async fn start_frps(port: u16, token: &str) -> JoinHandle<()> {
             token: token.to_string(),
             ..Default::default()
         },
-        allow_port_start: port.saturating_sub(50),
-        allow_port_end: port + 50,
+        // No port restriction in e2e tests — proxy ports can be anywhere.
+        // allow_port_start/end default to 0 (unrestricted), matching production.
+        allow_port_start: 0,
+        allow_port_end: 0,
         transport: frp_core::config::ServerTransportConfig {
             tcp_mux: Some(false),
             ..Default::default()

@@ -125,6 +125,10 @@ fn build_auth_config(
 fn resolve_allow_ports(cfg: &ServerConfig) -> Vec<(u16, u16)> {
     if !cfg.allow_ports.is_empty() {
         frp_core::config::parse_allow_ports(&cfg.allow_ports)
+    } else if cfg.allow_port_start == 0 && cfg.allow_port_end == 0 {
+        // Default: no restriction — allow all ports.
+        // Go frp compat: when both limits are unset, any port is allowed.
+        vec![(1, 65535)]
     } else {
         vec![(cfg.allow_port_start, cfg.allow_port_end)]
     }
