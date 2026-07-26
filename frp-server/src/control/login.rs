@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Duration, Instant, Interval};
+use tokio::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use frp_core::encryption;
@@ -50,7 +50,6 @@ pub(crate) async fn authenticate<S>(
         Box<dyn AsyncRead + Unpin + Send>,
         Box<dyn AsyncWrite + Unpin + Send>,
         Option<IncomingStreams>,
-        Interval,
     ),
     (),
 >
@@ -560,12 +559,6 @@ where
     let udp_local_to_proxy: HashMap<String, String> = HashMap::new();
     let shutting_down = false;
     let last_ping = Instant::now();
-    // Ping interval: max 10s to stay well within Go frpc's heartbeat timeout
-    let ping_interval = Duration::from_secs(10);
-    let mut ping_tick = tokio::time::interval(ping_interval);
-    // Defer first ping to ping_interval from now (Go frpc heartbeat timeout is 90s)
-    ping_tick.reset();
-    ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     Ok((
         ControlContext {
@@ -595,6 +588,5 @@ where
         reader,
         writer,
         incoming,
-        ping_tick,
     ))
 }

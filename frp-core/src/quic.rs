@@ -160,10 +160,27 @@ impl QuicListener {
         let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
             .map_err(|e| io::Error::other(format!("parse key: {e}")))?;
 
-        let mut tls_config = rustls::ServerConfig::builder()
+        let tls_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(cert_chain, key)
             .map_err(|e| io::Error::other(format!("TLS config: {e}")))?;
+
+        Self::new_with_tls_config(addr, tls_config, params)
+    }
+
+    /// Create a QUIC listener from an already-built [`rustls::ServerConfig`].
+    ///
+    /// Sets ALPN protocol `frp` on the config, wraps it in QUIC TLS, and binds
+    /// a UDP socket. Useful when the TLS config was built programmatically
+    /// (e.g., auto-generated self-signed certs).
+    ///
+    /// Matches Go frp's behavior of auto-generating self-signed TLS certs
+    /// when no cert/key files are configured.
+    pub fn new_with_tls_config(
+        addr: SocketAddr,
+        mut tls_config: rustls::ServerConfig,
+        params: QuicTransportParams,
+    ) -> io::Result<Self> {
         tls_config.alpn_protocols = vec![b"frp".to_vec()];
 
         let quic_tls = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)

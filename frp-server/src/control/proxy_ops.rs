@@ -556,6 +556,13 @@ pub(crate) async fn handle_new_proxy(
                 let domains: Vec<String> = np.custom_domains.clone().unwrap_or_default();
                 if domains.is_empty() {
                     // TCPMux requires at least one domain for routing
+                    state.used_ports.write().await.remove(&port);
+                    state
+                        .client_ports_used
+                        .write()
+                        .await
+                        .entry(run_id.to_string())
+                        .and_modify(|c| *c = c.saturating_sub(1));
                     reject_new_proxy(
                         writer,
                         &np.proxy_name,
@@ -615,6 +622,16 @@ pub(crate) async fn handle_new_proxy(
                             }
                             None => {
                                 tracing::error!(port = %port, error = %e, "SUDP port {} bind failed (no existing socket to share): {}", port, e);
+                                // Roll back port tracking: remove from used_udp_ports
+                                // (safe even if port was pre-existing — the bind failure
+                                // means it's unusable).
+                                state.used_udp_ports.write().await.remove(&port);
+                                state
+                                    .client_ports_used
+                                    .write()
+                                    .await
+                                    .entry(run_id.to_string())
+                                    .and_modify(|c| *c = c.saturating_sub(1));
                                 state.proxy_manager.remove(&np.proxy_name).await;
                                 reject_new_proxy(
                                     writer,
@@ -634,6 +651,12 @@ pub(crate) async fn handle_new_proxy(
                     Err(e) => {
                         tracing::error!(port = %port, error = %e, "Failed to bind UDP port {}: {}", port, e);
                         state.used_udp_ports.write().await.remove(&port);
+                        state
+                            .client_ports_used
+                            .write()
+                            .await
+                            .entry(run_id.to_string())
+                            .and_modify(|c| *c = c.saturating_sub(1));
                         state.proxy_manager.remove(&np.proxy_name).await;
                         reject_new_proxy(
                             writer,
