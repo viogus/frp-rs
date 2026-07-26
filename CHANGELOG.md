@@ -2,6 +2,47 @@
 
 All notable changes to frp-rs.
 
+## v0.7.2 — Binary Size Optimization
+
+Three-phase binary size reduction: frps -36% (8.18→5.20 MB), frpc -13% (6.24→5.42 MB)
+in the default build. Full-feature build (`--features "ssh,quic,dashboard"`) unchanged.
+
+### Feature Flags: Opt-In for Heavy Protocols
+
+- **SSH** (russh + rand010, ~407 KB) → opt-in. Enable with `--features ssh`.
+- **QUIC** (quinn, ~280 KB) → opt-in. Enable with `--features quic`.
+- **Dashboard** (prometheus + axum, ~181 KB) → opt-in. Enable with `--features dashboard`.
+- All three removed from default features. Transitive dependencies eliminated wholesale.
+- Feature forwarding added in frps/frpc Cargo.toml for all optional features.
+- `toml_edit` already removed in favor of `toml` 0.8 (zero-copy).
+
+### Code-Level Optimizations
+
+- **Type erasure for authenticate** (`frp-server/src/control/login.rs`): Changed from generic over `S: AsyncRead+AsyncWrite` to `Box<dyn AsyncReadWriteUnpin>` with `#[inline(never)]`. Eliminates dual monomorphization for `<IoStream>` (30.3 KB) and `<DuplexStream>` (30.0 KB). Saved ~37 KB.
+- **Box large async futures** (`frp-server/src/service.rs`): Added `spawn_boxed()` helper using unsizing coercion to erase concrete future types in `tokio::spawn` handlers. Boxed dispatch match block in main accept handler. Saved ~36 KB.
+- **Extract pure logic from async closures** (`frp-server/src/control/dispatch.rs`): Split `dispatch_frp_message` (43 KB) and `dispatch_internal` (25 KB) into non-async match functions returning `Pin<Box<dyn Future + Send>>` + tiny async wrappers. Eliminates N-variant async state machines. `dispatch_frp_message` reduced from 43 KB to 206 bytes.
+- **Validation extraction** (`frp-server/src/control/proxy_ops.rs`): Extracted `validate_new_proxy()` pure validation function, removing 5 `.await` points from `handle_new_proxy`.
+- **Message construction extraction** (`frp-server/src/control/bridge.rs`): Extracted `build_start_work_conn()` and `parse_bandwidth_config()` pure functions.
+- **anyhow backtrace disabled**: Changed to `default-features = false, features = ["std"]` in workspace. Added minimal panic hooks in frps/frpc. Eliminates runtime `Backtrace::capture()` overhead.
+- **Nightly infrastructure**: Added `nightly = []` feature placeholder for future nightly-only optimizations.
+
+### Binary Sizes
+
+| Build | frps | frpc |
+|-------|------|------|
+| Default | ~5.2 MB | ~5.4 MB |
+| Full (`--features "ssh,quic,dashboard"`) | ~7.8 MB | ~6.0 MB |
+| Tiny (`--no-default-features --features tiny`) | ~4.4 MB | ~3.8 MB |
+| Micro (`--no-default-features --features micro`) | ~2.6 MB | ~2.7 MB |
+
+### Upgrade Notes: v0.7.1 → v0.7.2
+
+- **SSH, QUIC, dashboard are now opt-in.** If you use SSH tunneling, QUIC transport,
+  or the dashboard/metrics API, add the corresponding feature flag:
+  `cargo build --release --features "ssh,quic,dashboard"`.
+- **Config files unchanged.** All config parsing and defaults are identical to v0.7.1.
+- **No wire protocol changes.** Compatible with Go frp v0.70.1 and frp-rs v0.7.1.
+
 ## v0.7.1 — Go frp v0.70.1 Source-Level Compatibility Audit
 
 Full-source audit of Go frp v0.70.1 (fatedier/frp) against frp-rs. 106 findings

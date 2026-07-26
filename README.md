@@ -79,15 +79,16 @@ matrix on VPS and V2 TCP source-built Go frp).
 
 **Smaller and lighter than Go frp.** Rust compiles to native code with no runtime, no GC, and aggressive size optimizations:
 
-| Metric | Go frp v0.69.1 | frp-rs (full) | frp-rs (`tiny`) | frp-rs (`micro`) |
-|--------|---------------|---------------|-----------------|-------------------|
-| frps binary | ~14 MB | ~4.8 MB | ~2.7 MB | ~1.6 MB |
-| frpc binary | ~12 MB | ~3.7 MB | ~2.3 MB | ~1.7 MB |
-| Memory (idle) | ~8-12 MB | ~2-4 MB | ~1.5-3 MB | ~1-2 MB |
+| Metric | Go frp v0.70.1 | frp-rs (default) | frp-rs (full) | frp-rs (`tiny`) | frp-rs (`micro`) |
+|--------|---------------|------------------|---------------|-----------------|-------------------|
+| frps binary | ~14 MB | ~5.2 MB | ~7.8 MB | ~4.4 MB | ~2.6 MB |
+| frpc binary | ~12 MB | ~5.4 MB | ~6.0 MB | ~3.8 MB | ~2.7 MB |
+| Memory (idle) | ~8-12 MB | ~2-4 MB | ~2-4 MB | ~1.5-3 MB | ~1-2 MB |
 
-**Three build sizes via feature flags.** Trim unused protocols and features to match your deployment:
+**Four build sizes via feature flags.** Trim unused protocols and features to match your deployment:
 
-- **full** (default): All transports (TCP, WS, TLS, KCP, QUIC), SSH gateway, OIDC auth, dashboard, compression, XChaCha20 V2 encryption, HTTP proxy, TCP mux.
+- **default**: Core transports (TCP, WS, TLS, KCP), OIDC auth, compression, XChaCha20 V2 encryption, HTTP proxy, TCP mux. SSH, QUIC, and dashboard are opt-in.
+- **full** (`--features "ssh,quic,dashboard"`): All transports + SSH gateway + dashboard/metrics.
 - **`tiny`**: Drops QUIC, KCP, WebSocket, SSH, OIDC, dashboard. Keeps TLS, compression, TCP mux. Ideal for edge devices.
 - **`micro`**: Core only — no TLS, no compression, no chacha20, no HTTP proxy, no TCP mux. Minimal attack surface and footprint.
 
@@ -109,15 +110,16 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 
 **兼容性。** 完全兼容 Go frp v0.70.1 协议。所有传输层（TCP、WebSocket、TLS、KCP、QUIC）、全部代理类型（TCP/UDP/HTTP/HTTPS/STCP/XTCP/SUDP）、全部 9 种客户端插件（http_proxy、socks5、static_file、unix_domain_socket、http2https、https2http、https2https、http2http、tls2raw）均已通过跨兼容测试。65 项兼容性测试在每次提交时自动运行，包括 XTCP NAT 穿透的 16 场景两两矩阵测试。可直接替换 Go frps 或 Go frpc，配置文件、加密方式、认证机制完全一致，零迁移成本。
 
-**体积。** 基于 Rust 原生编译，无运行时、无 GC。全功能版本（full）frps 仅 ~7.8 MB，frpc ~6.0 MB，约为 Go frp 的 1/3。内存占用同样大幅降低：空闲状态下全功能版本 ~2-4 MB，微核心版本（micro）仅 ~1-2 MB。无 GC 暂停保证负载下尾部延迟稳定。
+**体积。** 基于 Rust 原生编译，无运行时、无 GC。默认版本 frps 仅 ~5.2 MB，frpc ~5.4 MB，约为 Go frp 的 1/2.5。全功能版本（full）frps ~7.8 MB，frpc ~6.0 MB。内存占用同样大幅降低：空闲状态下 ~2-4 MB，微核心版本（micro）仅 ~1-2 MB。无 GC 暂停保证负载下尾部延迟稳定。
 
-**功能裁剪。** 三级构建体系，按需组合，适配从云端到嵌入式的全场景：
+**功能裁剪。** 四级构建体系，按需组合，适配从云端到嵌入式的全场景（SSH/QUIC/dashboard 需显式启用）：
 
 | 版本 | 体积 (frps/frpc) | 保留能力 | 适用场景 |
 |------|-----------------|---------|---------|
-| **full** | ~4.8MB / ~3.7MB | 全部传输层、OIDC、SSH、dashboard、压缩、XChaCha20、HTTP 代理、TCP mux | 通用部署 |
-| **tiny** | ~2.7MB / ~2.3MB | 去掉 QUIC/KCP/WebSocket/SSH/OIDC/dashboard，保留 TLS/压缩/TCP mux | 边缘设备、嵌入式 |
-| **micro** | ~1.6MB / ~1.7MB | 仅核心 TCP 代理，无 TLS/压缩/HTTP 代理/TCP mux | 极小镜像、安全敏感 |
+| **default** | ~5.2MB / ~5.4MB | TCP/WS/TLS/KCP、OIDC、压缩、XChaCha20、HTTP 代理、TCP mux | 通用部署 |
+| **full** | ~7.8MB / ~6.0MB | 全部传输层 + SSH + dashboard（需 `--features "ssh,quic,dashboard"`） | 全功能部署 |
+| **tiny** | ~4.4MB / ~3.8MB | 去掉 QUIC/KCP/WebSocket/SSH/OIDC/dashboard，保留 TLS/压缩/TCP mux | 边缘设备、嵌入式 |
+| **micro** | ~2.6MB / ~2.7MB | 仅核心 TCP 代理，无 TLS/压缩/HTTP 代理/TCP mux | 极小镜像、安全敏感 |
 
 每个 feature 均可独立开关，18 个编译期 feature flag 精细控制二进制内容。无需修改代码，Cargo feature 即按需裁剪。
 
@@ -173,29 +175,32 @@ The binaries land at `target/release/frps` and `target/release/frpc`.
 
 ### Binary Variants
 
-Three size tiers (see [Why frp-rs?](#why-frp-rs) for sizes):
+Four size tiers (see [Why frp-rs?](#why-frp-rs) for sizes). SSH, QUIC, and dashboard are opt-in:
 
 ```bash
-# Full — all features (~4.8 MB frps, ~3.7 MB frpc)
+# Default — core transports, no SSH/QUIC/dashboard (~5.2 MB frps, ~5.4 MB frpc)
 cargo build --release -p frps -p frpc
 
-# Tiny — no QUIC/KCP/WS/SSH/OIDC/dashboard, keeps TLS (~2.7 MB / ~2.3 MB)
+# Full — all features (~7.8 MB frps, ~6.0 MB frpc)
+cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
+
+# Tiny — no QUIC/KCP/WS/SSH/OIDC/dashboard, keeps TLS (~4.4 MB / ~3.8 MB)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
 
-# Micro — core only, no TLS/compression/chacha20/http-proxy/tcp-mux (~1.6 MB / ~1.7 MB)
+# Micro — core only, no TLS/compression/chacha20/http-proxy/tcp-mux (~2.6 MB / ~2.7 MB)
 cargo build --release -p frps -p frpc --no-default-features --features micro
 ```
 
-Individual feature flags (all default ON) let you cherry-pick:
+Individual feature flags let you cherry-pick (SSH, QUIC, dashboard are opt-in; all others default ON):
 
 | Feature | Removes |
 |---------|---------|
+| `ssh` | SSH gateway (russh) |
 | `quic` | QUIC transport (quinn, ~1 MB) |
+| `dashboard` | Metrics/status API (prometheus, axum) |
 | `kcp` | KCP transport |
 | `websocket` | WebSocket transport |
 | `oidc` | OIDC auth (jsonwebtoken, reqwest) |
-| `ssh` | SSH gateway (russh) |
-| `dashboard` | Metrics/status API (prometheus, axum) |
 | `tls` | TLS encryption (rustls) |
 | `compression` | Snappy bridge compression |
 | `chacha20` | XChaCha20-Poly1305 V2 cipher (AES-256-GCM stays) |
