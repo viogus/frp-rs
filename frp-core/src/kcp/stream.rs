@@ -4,7 +4,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -42,6 +42,9 @@ pub struct KcpStream {
     /// Uses OwnedNotified (not Notified<'_>) so the future holds its own
     /// Arc<Notify> reference — no transmute, no field ordering dependency.
     backpressure_fut: Option<Pin<Box<tokio::sync::futures::OwnedNotified>>>,
+    /// Shared with KcpSession. Set to false when the session is removed from
+    /// the driver, so poll_write/poll_read can fail fast.
+    session_alive: Arc<AtomicBool>,
 }
 
 impl KcpStream {
@@ -52,6 +55,7 @@ impl KcpStream {
         read_rx: mpsc::Receiver<Vec<u8>>,
         write_backlog: Arc<AtomicUsize>,
         write_notify: Arc<Notify>,
+        session_alive: Arc<AtomicBool>,
     ) -> Self {
         Self {
             conv,
@@ -67,6 +71,7 @@ impl KcpStream {
             write_backlog,
             write_notify,
             backpressure_fut: None,
+            session_alive,
         }
     }
 
@@ -141,7 +146,18 @@ impl AsyncRead for KcpStream {
                 }
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(None) => Poll::Ready(Ok(())), // EOF
+            Poll::Ready(None) => {
+                // If session is dead, return an error instead of EOF so the
+                // bridge fails fast rather than hanging.
+                if !self.session_alive.load(Ordering::Acquire) {
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "KCP session removed",
+                    )))
+                } else {
+                    Poll::Ready(Ok(())) // EOF
+                }
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -153,6 +169,16 @@ impl AsyncWrite for KcpStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        // Check if the underlying KCP session is still alive.
+        // Sessions removed by the driver (dead link, error, timeout) can no
+        // longer deliver data, and writes would be silently discarded.
+        if !self.session_alive.load(Ordering::Acquire) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "KCP session removed",
+            )));
+        }
+
         if self.shutdown {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::NotConnected,

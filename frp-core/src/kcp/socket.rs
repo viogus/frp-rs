@@ -172,6 +172,12 @@ impl KcpSocket {
                             to_remove.push(*key);
                         }
                     }
+                    // Mark dead before removal so KcpStream::poll_write fails fast.
+                    for key in &to_remove {
+                        if let Some(session) = self.sessions.get(key) {
+                            session.mark_dead();
+                        }
+                    }
                     for key in to_remove {
                         self.sessions.remove(&key);
                         self.conv_index.remove(&key.0);
@@ -191,6 +197,12 @@ impl KcpSocket {
                     for (key, created_at) in &self.session_created_at {
                         if now_ms.wrapping_sub(*created_at) > UNACCEPTED_SESSION_TIMEOUT_MS {
                             expired.push(*key);
+                        }
+                    }
+                    // Mark dead before removal.
+                    for key in &expired {
+                        if let Some(session) = self.sessions.get(key) {
+                            session.mark_dead();
                         }
                     }
                     for key in expired {
@@ -355,6 +367,7 @@ impl KcpSocket {
                                         read_rx,
                                         self.write_backlog.clone(),
                                         self.write_notify.clone(),
+                                        session.alive_handle(),
                                     );
                                     if let Err(mpsc::error::TrySendError::Full(_)) =
                                         self.accept_tx.try_send(stream)
