@@ -458,7 +458,10 @@ pub fn allocate_port_multi(
         // freePorts which is populated from allowPorts ranges). Without this
         // check, a client could bypass the port restriction by specifying a
         // port outside the configured ranges.
-        if !ranges.is_empty() && !ranges.iter().any(|(start, end)| port >= *start && port <= *end)
+        if !ranges.is_empty()
+            && !ranges
+                .iter()
+                .any(|(start, end)| port >= *start && port <= *end)
         {
             tracing::debug!(
                 port = %port,
@@ -567,7 +570,10 @@ mod tests {
         let mut used = std::collections::HashSet::new();
         let result = allocate_port_multi(&mut used, 51993, &[], "127.0.0.1");
         // Should succeed if port is bindable
-        assert!(result.is_some(), "port should be allocatable with empty ranges");
+        assert!(
+            result.is_some(),
+            "port should be allocatable with empty ranges"
+        );
         assert_eq!(result, Some(51993));
     }
 

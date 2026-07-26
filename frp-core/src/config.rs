@@ -97,7 +97,7 @@ pub struct ServerConfig {
     /// UDP packet buffer size in bytes. Controls the receive buffer for UDP
     /// proxy datagrams. Default: 1500 (Go frp compat).
     /// Go frp compat: udp_packet_size.
-    #[serde(default = "default_udp_packet_size")]
+    #[serde(default = "default_udp_packet_size", alias = "udpPacketSize")]
     pub udp_packet_size: usize,
     /// Server-side HTTP plugin configurations. Each plugin is an external
     /// HTTP service called on lifecycle events (login, new_proxy, close_proxy).
@@ -937,7 +937,7 @@ pub struct ClientConfig {
     pub disable_custom_tls_first_byte: bool,
     #[serde(default)]
     pub log: LogConfig,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "loginFailExit")]
     pub login_fail_exit: bool,
     #[serde(default = "default_pool_count")]
     pub pool_count: i32,
@@ -950,7 +950,7 @@ pub struct ClientConfig {
     /// Set to -1 when tcp_mux is enabled (yamux provides keepalive).
     #[serde(default = "default_heartbeat_timeout", alias = "heartbeatTimeout")]
     pub heartbeat_timeout: i64,
-    #[serde(default)]
+    #[serde(default, alias = "dnsServer")]
     pub dns_server: String,
     /// TCP keepalive interval in seconds for outbound connections to the
     /// frp server. 0 disables. Go frp compat: dialServerKeepalive.
@@ -1427,7 +1427,7 @@ fn validate_proxy_configs(proxies: &[ProxyConfig]) -> Result<(), String> {
             let hint = if p.bandwidth_limit == "0" || p.bandwidth_limit == "0KB" {
                 "value must be positive; use empty string for no limit"
             } else {
-                "must be a positive number followed by KB or MB"
+                "must be a positive number followed by KB, MB, or GB"
             };
             return Err(format!(
                 "proxy '{}': invalid bandwidth_limit: {:?} ({})",
@@ -1899,6 +1899,7 @@ fn normalize_proxies(table: &mut toml::Table) {
                 let flat_key = match k.as_str() {
                     "type" => "health_check_type",
                     "url" => "health_check_url",
+                    "path" => "health_check_url",
                     "httpHeaders" => "health_check_http_headers",
                     "intervalSeconds" => "health_check_interval_seconds",
                     "timeoutSeconds" => "health_check_timeout_seconds",

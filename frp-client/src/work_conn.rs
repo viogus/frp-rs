@@ -634,6 +634,11 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                         debug!(proxy_name = %pn_w, "UDP writer '{}' started", pn_w);
                         let mut buf = vec![0u8; 65535];
                         let mut payload = Vec::with_capacity(65535);
+                        // UDP work conn keepalive Ping every 30s (Go frp compat).
+                        // Go frp sends Ping{} on UDP work connections to prevent
+                        // the server's idle timeout from closing the connection.
+                        let mut keepalive = tokio::time::interval(Duration::from_secs(30));
+                        keepalive.tick().await; // skip first immediate tick
                         loop {
                             tokio::select! {
                                 result = sock.recv_from(&mut buf) => {
@@ -682,6 +687,22 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                 _ = tokio::time::sleep(Duration::from_secs(5)) => {
                                     if !session_alive_w.load(Ordering::Acquire) {
                                         debug!(proxy_name = %pn_w, "UDP writer '{}': session dead, stopping", pn_w);
+                                        break;
+                                    }
+                                }
+                                _ = keepalive.tick() => {
+                                    // Send Ping to keep UDP work connection alive (Go frp compat)
+                                    let ping = FrpMessage::Ping(msg::Ping {
+                                        privilege_key: None,
+                                        timestamp: None,
+                                    });
+                                    let result = if v2 {
+                                        write_msg_v2(&mut w_w, &ping).await
+                                    } else {
+                                        write_msg_v1(&mut w_w, &ping).await
+                                    };
+                                    if let Err(e) = result {
+                                        debug!(proxy_name = %pn_w, error = %e, "UDP work conn '{}' keepalive ping failed: {}", pn_w, e);
                                         break;
                                     }
                                 }

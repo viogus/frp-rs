@@ -842,11 +842,6 @@ pub(crate) async fn handle_work_conn_inner(
     let nwc_auth_result = if !has_key && !nwc_auth_scope {
         // No key sent and scope does not require it — skip auth.
         Ok(())
-    } else if has_key && msg.timestamp.is_none() && !nwc_auth_scope {
-        // Go frp compat: privilege_key present but no timestamp, and scope
-        // does not require NewWorkConn auth. Skip validation to avoid
-        // breaking work connections where Go frpc omits the timestamp field.
-        Ok(())
     } else if let Some(ref verifier) = state.oidc.verifier {
         let expected_sub = state
             .oidc

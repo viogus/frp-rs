@@ -62,7 +62,7 @@ Client plugins: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `ht
 ### Go frp Compatibility Notes
 
 frp-rs targets protocol compatibility with Go frp v0.70.1. **100% feature parity.**
-73/73 cross-compatibility tests pass on every commit (including XTCP 16-test pairwise
+65/67 cross-compatibility tests pass on every commit (including XTCP 16-test pairwise
 matrix on VPS and V2 TCP source-built Go frp).
 
 - **V1 wire protocol**: Fully compatible. All message types, authentication, encryption (AES-128-CFB),
@@ -107,9 +107,9 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 
 ### frp-rs 核心优势
 
-**兼容性。** 完全兼容 Go frp v0.70.1 协议。所有传输层（TCP、WebSocket、TLS、KCP、QUIC）、全部代理类型（TCP/UDP/HTTP/HTTPS/STCP/XTCP/SUDP）、全部 9 种客户端插件（http_proxy、socks5、static_file、unix_domain_socket、http2https、https2http、https2https、http2http、tls2raw）均已通过跨兼容测试。73 项兼容性测试在每次提交时自动运行，包括 XTCP NAT 穿透的 16 场景两两矩阵测试。可直接替换 Go frps 或 Go frpc，配置文件、加密方式、认证机制完全一致，零迁移成本。
+**兼容性。** 完全兼容 Go frp v0.70.1 协议。所有传输层（TCP、WebSocket、TLS、KCP、QUIC）、全部代理类型（TCP/UDP/HTTP/HTTPS/STCP/XTCP/SUDP）、全部 9 种客户端插件（http_proxy、socks5、static_file、unix_domain_socket、http2https、https2http、https2https、http2http、tls2raw）均已通过跨兼容测试。65 项兼容性测试在每次提交时自动运行，包括 XTCP NAT 穿透的 16 场景两两矩阵测试。可直接替换 Go frps 或 Go frpc，配置文件、加密方式、认证机制完全一致，零迁移成本。
 
-**体积。** 基于 Rust 原生编译，无运行时、无 GC。全功能版本（full）frps 仅 ~4.8 MB，frpc ~3.7 MB，约为 Go frp 的 1/3。内存占用同样大幅降低：空闲状态下全功能版本 ~2-4 MB，微核心版本（micro）仅 ~1-2 MB。无 GC 暂停保证负载下尾部延迟稳定。
+**体积。** 基于 Rust 原生编译，无运行时、无 GC。全功能版本（full）frps 仅 ~7.8 MB，frpc ~6.0 MB，约为 Go frp 的 1/3。内存占用同样大幅降低：空闲状态下全功能版本 ~2-4 MB，微核心版本（micro）仅 ~1-2 MB。无 GC 暂停保证负载下尾部延迟稳定。
 
 **功能裁剪。** 三级构建体系，按需组合，适配从云端到嵌入式的全场景：
 

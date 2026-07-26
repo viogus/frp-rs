@@ -1018,6 +1018,8 @@ impl Service {
                 let fallback_to = v.fallback_to.clone();
                 let disable_assisted_addrs = v.disable_assisted_addrs;
                 let p2p_protocol = v.protocol.clone();
+                let user = self.cfg.user.clone();
+                let rid = run_id.clone();
                 let vtx = self.visitor_tx.clone();
                 let shutdown = visitor_shutdown.clone();
                 let handle = tokio::spawn(async move {
@@ -1046,6 +1048,8 @@ impl Service {
                         fallback_to,
                         disable_assisted_addrs,
                         shutdown,
+                        user,
+                        run_id: rid,
                     })
                     .await;
                 });

@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       go_frp_version:
-        description: 'Go frp version (e.g. 0.70.1)'
+        description: 'Go frp version (e.g. 0.70.0)'
         required: false
-        default: '0.70.1'
+        default: '0.70.0'
 
 permissions:
   contents: read
@@ -26,7 +26,7 @@ jobs:
       fail-fast: false
 
     env:
-      GO_FRP_VERSION: ${{ github.event.inputs.go_frp_version || '0.70.1' }}
+      GO_FRP_VERSION: ${{ github.event.inputs.go_frp_version || '0.70.0' }}
 
     steps:
       - uses: actions/checkout@v4

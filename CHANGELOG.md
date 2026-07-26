@@ -5,10 +5,10 @@ All notable changes to frp-rs.
 ## v0.7.1 — Go frp v0.70.1 Source-Level Compatibility Audit
 
 Full-source audit of Go frp v0.70.1 (fatedier/frp) against frp-rs. 106 findings
-from 6 parallel subagent audits, 50+ fixes across 34 files. Every fix references
+from 6 parallel subagent audits, 60+ fixes across 37 files. Every fix references
 the exact Go frp source location that mandates the behavior.
 
-### Config (14 fixes)
+### Config (19 fixes)
 
 - **QUICOptions**: add `QuicOptions` struct with `keepalive_period` (10s), `max_idle_timeout` (30s), `max_incoming_streams` (100000). Added as `quic_options` field to `ServerTransportConfig` and `ClientConfig` (serde alias "quic").
 - **TCPKeepAlive**: add `tcp_keepalive` (default 7200) to `ServerTransportConfig` with alias `tcpKeepAlive`.
@@ -23,12 +23,17 @@ the exact Go frp source location that mandates the behavior.
 - **allow_port_start default 0→1**: port 0 caused OS-assigned port mismatch (server advertised port 0 but listener was on kernel-chosen port).
 - **allow_port_end default 50000→65535**: full port range allowed by default, matching Go frp empty AllowPorts.
 - **disable_custom_tls_first_byte serde default**: changed from `#[serde(default)]` (false) to `#[serde(default = "default_true")]` — config-file and programmatic users now get the same default (true).
+- **udp_packet_size serde alias**: add `alias = "udpPacketSize"` on `udp_packet_size` field for Go frp config compat.
+- **login_fail_exit serde alias**: add `alias = "loginFailExit"` on `login_fail_exit` field for Go frp config compat.
+- **dns_server serde alias**: add `alias = "dnsServer"` on `dns_server` field for Go frp config compat.
+- **Health check path → url mapping**: `normalize_proxies()` maps `health_check.path` to `health_check_url` (Go frp v0.70.1 aliases `path` as `url` in health check config).
+- **Bandwidth_limit GB hint**: validation error message now mentions GB suffix alongside KB/MB (was missing).
 
 ### Messages (1 fix)
 
 - **NatHoleReport.success**: changed from `Option<bool>` to `bool` (Go frp v0.70.1 always sends the field).
 
-### Client (10 fixes)
+### Client (13 fixes)
 
 - **V2 handshake pipelining**: split `v2_handshake_client` into `send_hello` / `recv_hello` so Login is sent between ClientHello and ServerHello, matching Go frp's `control_session.go:140-203`.
 - **Health check monotonic counter**: `failures` is now a monotonic u64 that never resets on success (matching Go frp behavior). Counter inspected at `/healthz?probe=health`.
@@ -40,8 +45,11 @@ the exact Go frp source location that mandates the behavior.
 - **Unique transaction_id per request**: `uuid::Uuid::new_v4()` per message instead of static constant.
 - **UDP bind before NatHoleSid**: fix race where NatHoleSid was sent before the UDP socket bind completed (Go frp binds first, then sends).
 - **client_spec in Login**: `ClientSpec { client_type: "frpc", always_auth_pass: None }` sent in every Login message (Go frp compat).
+- **NewVisitorConn proxy_name**: follows Go frp v0.70.1 `BuildTargetServerProxyName` — prefixes with `server_user` if non-empty, else with client `user` if non-empty, else bare `server_name`. Previously only supported `server_user` prefix.
+- **NewVisitorConn run_id**: passes client `run_id` in NewVisitorConn message for server-side session tracking (Go frp compat).
+- **UDP work conn keepalive**: sends `Ping` every 30s on UDP work connections to prevent server idle timeout from closing the connection (Go frp `udpWorkConnKeepalive`).
 
-### Server (8 fixes)
+### Server (9 fixes)
 
 - **VHost multi-proxy per domain**: changed from `HashMap<String, VhostRoute>` to `HashMap<String, Vec<VhostRoute>>` with longest location prefix match — multiple proxies can serve the same domain at different locations, matching Go frp's `routerByHTTPUser`.
 - **Separate TCP/UDP port managers**: `used_udp_ports` tracking separate from `used_ports`. UDP/SuDP proxies allocate from UDP pool, TCP proxies from TCP pool with OS-level bind probe.
@@ -51,6 +59,7 @@ the exact Go frp source location that mandates the behavior.
 - **Dashboard healthz**: returns empty body for Go compat (was "ok"); `/healthz?probe=readiness` returns "ok".
 - **TCP keepalive**: applied via `socket2` in server accept loop on every raw `TcpStream`.
 - **TLS force handling**: proper detection and handling of `tls_only` mode on the server side.
+- **NewWorkConn auth simplification**: removed Go frp compat workaround that skipped auth when `privilege_key` was present but timestamp missing — Go frp v0.70.1 always sends timestamp on NewWorkConn messages.
 
 ### XTCP / NAT Hole Punch (13 fixes)
 
