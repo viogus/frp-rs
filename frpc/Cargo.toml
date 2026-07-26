@@ -7,6 +7,17 @@ license = "MIT"
 [features]
 default = ["full"]
 full = ["frp-client/default"]
+# Feature forwarding: enable the corresponding frp-client feature.
+quic = ["frp-client/quic"]
+kcp = ["frp-client/kcp"]
+websocket = ["frp-client/websocket"]
+oidc = ["frp-client/oidc"]
+tls = ["frp-client/tls"]
+vnet = ["frp-client/vnet"]
+admin = ["frp-client/admin"]
+compression = ["frp-client/compression"]
+chacha20 = ["frp-client/chacha20"]
+tcp-mux = ["frp-client/tcp-mux"]
 # Tiny: removes heavy protocols (QUIC/KCP/WS/OIDC) but keeps TLS + tcp-mux
 tiny = ["frp-client/tls", "frp-client/tcp-mux"]
 # Micro: absolutely minimal — just TCP + V1/V2 core, no optional deps

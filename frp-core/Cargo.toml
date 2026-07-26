@@ -48,7 +48,7 @@ opentelemetry_sdk = { version = "0.27", optional = true, features = ["rt-tokio"]
 opentelemetry-otlp = { version = "0.27", optional = true, features = ["http-proto"] }
 tracing-opentelemetry = { version = "0.28", optional = true }
 [features]
-default = ["quic", "kcp", "websocket", "oidc", "tls", "compression", "chacha20", "vnet", "tcp-mux"]
+default = ["kcp", "websocket", "oidc", "tls", "compression", "chacha20", "vnet", "tcp-mux"]
 tcp-mux = ["dep:yamux"]
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-platform-verifier", "dep:rcgen"]
 admin-auth = ["dep:axum"]

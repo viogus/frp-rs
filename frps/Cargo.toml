@@ -7,6 +7,19 @@ license = "MIT"
 [features]
 default = ["full"]
 full = ["frp-server/default"]
+# Feature forwarding: enable the corresponding frp-server feature.
+ssh = ["frp-server/ssh"]
+dashboard = ["frp-server/dashboard"]
+websocket = ["frp-server/websocket"]
+quic = ["frp-server/quic"]
+kcp = ["frp-server/kcp"]
+oidc = ["frp-server/oidc"]
+tls = ["frp-server/tls"]
+http-proxy = ["frp-server/http-proxy"]
+vnet = ["frp-server/vnet"]
+compression = ["frp-server/compression"]
+chacha20 = ["frp-server/chacha20"]
+tcp-mux = ["frp-server/tcp-mux"]
 # Tiny: removes heavy protocols (QUIC/KCP/WS/SSH/OIDC/dashboard) but keeps TLS + http-proxy + tcp-mux
 tiny = ["frp-server/tls", "frp-server/http-proxy", "frp-server/tcp-mux"]
 # Micro: absolutely minimal — just TCP + V1/V2 core, no optional deps

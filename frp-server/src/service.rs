@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 
-#[cfg(any(feature = "dashboard", feature = "kcp", feature = "quic"))]
+#[cfg(feature = "quic")]
 use tokio_util::sync::CancellationToken;
 
 #[cfg(any(
