@@ -202,15 +202,22 @@ cleanup_pids() {
 trap cleanup EXIT
 
 random_port() {
-    # Find an unused port in range (TCP + UDP)
-    local port
+    # Find an unused port in range (TCP + UDP).
+    # Tries lsof first, then ss, then assumes port is free.
+    local port check_tcp check_udp
     while true; do
         port=$(( (RANDOM % 10000) + 17000 ))
-        if ! lsof -iTCP:$port -sTCP:LISTEN 2>/dev/null | grep -q LISTEN && \
-           ! lsof -iUDP:$port 2>/dev/null | grep -q .; then
-            echo "$port"
-            return
+        check_tcp=false
+        check_udp=false
+        if command -v lsof >/dev/null 2>&1; then
+            lsof -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | grep -q LISTEN && continue
+            lsof -iUDP:"$port" 2>/dev/null | grep -q . && continue
+        elif command -v ss >/dev/null 2>&1; then
+            ss -tln sport = :"$port" 2>/dev/null | grep -q ":$port " && continue
+            ss -uln sport = :"$port" 2>/dev/null | grep -q ":$port " && continue
         fi
+        echo "$port"
+        return
     done
 }
 
@@ -244,7 +251,17 @@ wait_for_port_safe() {
         done
     elif command -v ss >/dev/null 2>&1; then
         while true; do
-            if ss -tlnp "sport = :$port" 2>/dev/null | grep -q "LISTEN.*:$port"; then
+            if ss -tln sport = :"$port" 2>/dev/null | grep -q ":$port "; then
+                return 0
+            fi
+            if [[ $(date +%s) -gt $deadline ]]; then
+                return 1
+            fi
+            sleep 0.1
+        done
+    elif command -v nc >/dev/null 2>&1; then
+        while true; do
+            if nc -z "$host" "$port" 2>/dev/null; then
                 return 0
             fi
             if [[ $(date +%s) -gt $deadline ]]; then
@@ -253,7 +270,7 @@ wait_for_port_safe() {
             sleep 0.1
         done
     else
-        echo "WARNING: neither lsof nor ss available; sleeping ${timeout}s" >&2
+        echo "WARNING: neither lsof, ss, nor nc available; sleeping ${timeout}s" >&2
         sleep "$timeout"
         return 0
     fi
@@ -312,7 +329,9 @@ deadline = time.time() + timeout
 # takes ~20-25s with VPS latency. Use the full timeout on a single
 # connection. Retrying creates a second visitor handler task whose
 # XTCP cycle overlaps; first handler STCP data gets orphaned.
-per_attempt = timeout
+# For non-XTCP tests, cap per-attempt at 3s so retry logic can recover
+# from transient races (e.g. KCP work conn pool not yet ready).
+per_attempt = timeout if timeout >= 20 else min(timeout, 3.0)
 while True:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
