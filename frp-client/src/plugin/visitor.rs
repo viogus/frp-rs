@@ -153,7 +153,7 @@ async fn handle_visitor_conn(
         #[cfg(feature = "quic")]
         "quic" => TransportProtocol::Quic,
         #[cfg(feature = "websocket")]
-        "websocket" => TransportProtocol::WebSocket,
+        "websocket" | "wss" => TransportProtocol::WebSocket,
         _ => TransportProtocol::Tcp,
     };
     let opts = DialOptions {
@@ -233,6 +233,7 @@ async fn handle_visitor_conn(
         secret_key,
         use_encryption,
         use_compression,
+        None,
     );
     write_msg_v1(&mut server_stream, &nvc)
         .await

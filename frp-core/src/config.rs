@@ -196,6 +196,9 @@ fn default_user_conn_timeout() -> u64 {
 fn default_udp_packet_size() -> usize {
     1500
 }
+fn default_udp_packet_size_i64() -> i64 {
+    1500
+}
 fn default_nathole_analysis_data_reserve_hours() -> u64 {
     168
 }
@@ -343,6 +346,11 @@ impl ServerConfig {
         if self.web_server.port > 0 && self.web_server.addr.is_empty() {
             self.web_server.addr = "0.0.0.0".into();
         }
+        // Auto-force tls_only when tls_ca_file is set (Go frp compat).
+        // Go frp auto-sets TLS.Force = true when TrustedCaFile != "".
+        if !self.tls_ca_file.is_empty() && !self.tls_only {
+            self.tls_only = true;
+        }
     }
 }
 
@@ -486,7 +494,7 @@ pub struct LogConfig {
     pub level: String,
     /// File path for log output. Go frp uses `to` ("console" default).
     /// Both `to` and `file` are accepted; `file` takes precedence.
-    #[serde(default, alias = "to")]
+    #[serde(default = "default_log_file", alias = "to")]
     pub file: String,
     #[serde(default = "default_max_days")]
     pub max_days: i32,
@@ -496,7 +504,7 @@ impl Default for LogConfig {
     fn default() -> Self {
         Self {
             level: default_log_level(),
-            file: String::new(),
+            file: default_log_file(),
             max_days: default_max_days(),
         }
     }
@@ -504,6 +512,9 @@ impl Default for LogConfig {
 
 fn default_log_level() -> String {
     "info".into()
+}
+fn default_log_file() -> String {
+    "console".into()
 }
 fn default_pool_count() -> i32 {
     1
@@ -973,6 +984,11 @@ pub struct ClientConfig {
     /// Experimental feature gates. Go frp compat: [feature] section.
     #[serde(default)]
     pub feature: FeatureConfig,
+    /// UDP packet buffer size in bytes. Controls the receive buffer for UDP
+    /// proxy datagrams. Default: 1500 (Go frp compat).
+    /// Go frp compat: udpPacketSize / UDPPacketSize.
+    #[serde(default = "default_udp_packet_size_i64", alias = "udpPacketSize")]
+    pub udp_packet_size: i64,
     /// OpenTelemetry / observability settings.
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -1016,6 +1032,7 @@ impl Default for ClientConfig {
             visitors: vec![],
             web_server: WebServerConfig::default(),
             feature: FeatureConfig::default(),
+            udp_packet_size: default_udp_packet_size_i64(),
             observability: ObservabilityConfig::default(),
         }
     }
@@ -1115,7 +1132,7 @@ pub struct ProxyConfig {
     pub use_encryption: bool,
     #[serde(default)]
     pub use_compression: bool,
-    #[serde(default)]
+    #[serde(default, alias = "secretKey")]
     pub sk: String,
     #[serde(default)]
     pub plugin: Option<PluginConfig>,
@@ -1222,9 +1239,11 @@ pub struct VisitorConfig {
     /// Local address to bind for accepting connections.
     #[serde(default = "default_visitor_bind_addr")]
     pub bind_addr: String,
-    /// Local port for the visitor listener (0 = disabled).
+    /// Local port for the visitor listener. 0 = disabled, -1 = no-bind (do not
+    /// listen locally), positive values start a local listener. Go frp uses `int`
+    /// and negative values mean "don't bind".
     #[serde(default, alias = "bindPort")]
-    pub bind_port: u16,
+    pub bind_port: i32,
     /// Fallback timeout in milliseconds before switching from XTCP to STCP.
     /// Go frp compat: fallbackTimeoutMs. Default: 1000 (1 second, Go frp compat)
     #[serde(default = "default_fallback_timeout_ms")]
@@ -1691,6 +1710,25 @@ fn normalize_server_config(value: &mut toml::Value) {
         if let Some(ssh_section) = table.remove("sshTunnelGateway") {
             table.entry("ssh_tunnel_gateway").or_insert(ssh_section);
         }
+
+        // Extract meta_* prefixed keys into metas map (Go frp legacy compat).
+        let meta_keys: Vec<String> = table
+            .keys()
+            .filter(|k| k.starts_with("meta_"))
+            .cloned()
+            .collect();
+        if !meta_keys.is_empty() {
+            let mut meta_map = toml::Table::new();
+            for key in &meta_keys {
+                if let Some(v) = table.remove(key) {
+                    let sub_key = key.strip_prefix("meta_").unwrap().to_string();
+                    meta_map.insert(sub_key, v);
+                }
+            }
+            table
+                .entry("metas".to_string())
+                .or_insert(toml::Value::Table(meta_map));
+        }
     }
 }
 
@@ -1769,6 +1807,23 @@ fn normalize_client_config(value: &mut toml::Value) {
             }
         }
 
+        // Flatten [transport.tls] sub-table → top-level tls_* fields
+        // Go frp compat: transport.tls.enable → tls_enable, etc.
+        if let Some(Value::Table(tls_table)) = table.remove("tls") {
+            for (k, v) in tls_table {
+                let flat_key = match k.as_str() {
+                    "enable" => "tls_enable",
+                    "certFile" => "tls_cert_file",
+                    "keyFile" => "tls_key_file",
+                    "trustedCaFile" => "tls_ca_file",
+                    "serverName" => "tls_server_name",
+                    "disableCustomTLSFirstByte" => "disable_custom_tls_first_byte",
+                    other => other,
+                };
+                table.entry(flat_key.to_string()).or_insert(v);
+            }
+        }
+
         // Flatten log_* fields into log table (client side)
         flatten_to_table(
             table,
@@ -1779,6 +1834,25 @@ fn normalize_client_config(value: &mut toml::Value) {
 
         // Normalize Go-format proxy sub-tables into flat fields
         normalize_proxies(table);
+
+        // Extract meta_* prefixed keys into metas map (Go frp legacy compat).
+        let meta_keys: Vec<String> = table
+            .keys()
+            .filter(|k| k.starts_with("meta_"))
+            .cloned()
+            .collect();
+        if !meta_keys.is_empty() {
+            let mut meta_map = toml::Table::new();
+            for key in &meta_keys {
+                if let Some(v) = table.remove(key) {
+                    let sub_key = key.strip_prefix("meta_").unwrap().to_string();
+                    meta_map.insert(sub_key, v);
+                }
+            }
+            table
+                .entry("metas".to_string())
+                .or_insert(toml::Value::Table(meta_map));
+        }
     }
 }
 

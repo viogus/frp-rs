@@ -232,7 +232,34 @@ impl Service {
             cfg.vhost_http_timeout,
             cfg.user_conn_timeout,
             cfg.tcp_mux_passthrough,
-            cfg.web_server.custom_404_page.clone(),
+            {
+                // Go frp compat: custom_404_page is a file path, not inline HTML.
+                // Try to read the file; if it doesn't exist, log a warning and
+                // treat the value as inline HTML (backward-compatible fallback).
+                let page_path = cfg.web_server.custom_404_page.clone();
+                if page_path.is_empty() {
+                    String::new()
+                } else {
+                    match std::fs::read_to_string(&page_path) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::NotFound {
+                                tracing::warn!(
+                                    path = %page_path,
+                                    "custom_404_page file not found, using value as inline HTML"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    path = %page_path,
+                                    error = %e,
+                                    "failed to read custom_404_page file, using value as inline HTML"
+                                );
+                            }
+                            page_path
+                        }
+                    }
+                }
+            },
             Arc::new(crate::plugin::HttpPluginManager::new(
                 cfg.http_plugins.clone(),
             )),
@@ -1513,11 +1540,28 @@ impl Service {
                         continue;
                     }
                     tokio::spawn(async move {
+                        // Connection read deadline: wrap the initial message
+                        // detection (detect_and_strip_magic) with a timeout.
+                        // Matches Go frp's SetReadDeadline(10s) before reading
+                        // any data from a new connection (server/service.go:557).
+                        let read_timeout = Duration::from_secs(10);
                         let _permit = permit;
-                        let (ct, stream_io) = match detect_and_strip_magic(stream).await {
-                            Ok((c, s)) => (c, s),
-                            Err(e) => {
+                        let (ct, stream_io) = match tokio::time::timeout(
+                            read_timeout,
+                            detect_and_strip_magic(stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok((c, s))) => (c, s),
+                            Ok(Err(e)) => {
                                 warn!(addr = %addr, error = %e, "Failed to detect connection type from {}: {}", addr, e);
+                                return;
+                            }
+                            Err(_elapsed) => {
+                                warn!(addr = %addr, read_timeout_secs = 10,
+                                    "Initial read timeout (10s) before message detection from {}, dropping connection",
+                                    addr
+                                );
                                 return;
                             }
                         };

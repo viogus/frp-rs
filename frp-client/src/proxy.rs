@@ -20,6 +20,7 @@ pub fn create_visitor_conn_msg(
     secret_key: &str,
     use_encryption: bool,
     use_compression: bool,
+    server_user: Option<&str>,
 ) -> FrpMessage {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -44,7 +45,15 @@ pub fn create_visitor_conn_msg(
         Some(hash)
     };
     FrpMessage::NewVisitorConn(msg::NewVisitorConn {
-        proxy_name: server_name.to_string(),
+        proxy_name: if let Some(su) = server_user {
+            if !su.is_empty() {
+                format!("{}.{}", su, server_name)
+            } else {
+                server_name.to_string()
+            }
+        } else {
+            server_name.to_string()
+        },
         sign_key,
         timestamp: Some(timestamp),
         run_id: None,
@@ -292,7 +301,7 @@ mod tests {
     #[test]
     fn test_create_visitor_conn_sign_key_with_sk() {
         let sk = "test_secret";
-        let msg = create_visitor_conn_msg("stcp-proxy", sk, false, false);
+        let msg = create_visitor_conn_msg("stcp-proxy", sk, false, false, None);
 
         match msg {
             FrpMessage::NewVisitorConn(ref nvc) => {
@@ -309,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_create_visitor_conn_sign_key_empty_sk() {
-        let msg = create_visitor_conn_msg("stcp-proxy", "", false, false);
+        let msg = create_visitor_conn_msg("stcp-proxy", "", false, false, None);
 
         match msg {
             FrpMessage::NewVisitorConn(ref nvc) => {
@@ -325,7 +334,7 @@ mod tests {
     #[test]
     fn test_create_visitor_conn_sign_key_format() {
         // sign_key should be a 32-char hex string (MD5 digest)
-        let msg = create_visitor_conn_msg("stcp-proxy", "another_key", true, true);
+        let msg = create_visitor_conn_msg("stcp-proxy", "another_key", true, true, None);
 
         match msg {
             FrpMessage::NewVisitorConn(ref nvc) => {

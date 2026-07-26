@@ -189,14 +189,25 @@ cleanup() {
         rm -rf "$TEST_DIR"
     fi
 }
+
+# Kill all tracked PIDs without removing test dir.
+# Resets PIDS so subsequent tests start fresh.
+cleanup_pids() {
+    for pid in $PIDS; do
+        kill "$pid" 2>/dev/null || true
+    done
+    wait 2>/dev/null || true
+    PIDS=""
+}
 trap cleanup EXIT
 
 random_port() {
-    # Find an unused port in range
+    # Find an unused port in range (TCP + UDP)
     local port
     while true; do
         port=$(( (RANDOM % 10000) + 17000 ))
-        if ! lsof -iTCP:$port -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; then
+        if ! lsof -iTCP:$port -sTCP:LISTEN 2>/dev/null | grep -q LISTEN && \
+           ! lsof -iUDP:$port 2>/dev/null | grep -q .; then
             echo "$port"
             return
         fi
@@ -3950,6 +3961,56 @@ test_kcp_rust_to_rust() {
 }
 
 # =============================================================================
+# Test: Rust frps -> Rust frpc, KCP transport + encrypted bridge
+# =============================================================================
+test_kcp_rust_encrypted() {
+    local name="kcp-rust-encrypted"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local kcp_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="test-token-kcp-r2r-enc"
+
+    mkdir -p "$TEST_DIR/$name"
+
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    write_frps_config rust "$frps_port" "$token" "$TEST_DIR/$name/frps.toml" "kcp=$kcp_port"
+    RUST_LOG=info "$RUST_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 10 || {
+        fail_test "$name" "Rust frps did not start"
+        return
+    }
+
+    write_frpc_config rust "$kcp_port" "$token" "$echo_port" "$proxy_port" "kcp-enc" "$TEST_DIR/$name/frpc.toml" "kcp enc"
+    RUST_LOG=info "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    if ! wait_for_port_safe 127.0.0.1 "$proxy_port" 15; then
+        fail_test "$name" "proxy port $proxy_port not reachable"
+        return
+    fi
+
+    local result
+    result=$(send_and_expect "$proxy_port" "kcp-enc-test" "kcp-enc-test" 10)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
+# =============================================================================
 # Test: Rust frps -> Rust frpc, QUIC transport (Rust↔Rust)
 # =============================================================================
 test_quic_rust_to_rust() {
@@ -5974,6 +6035,9 @@ run_test test_g2r_wss_mux
 # Go frps sends fatal UnrecognisedName alert (112). Rust frpc rustls aborts.
 # Go frps vhostHTTPSPort TLS config does not set ServerName for reverse WSS
 # connections. Monitor Go frp upstream for fix.
+# r2g WSS tests disabled: Go frps HTTPS port rejects self-signed certs without proper SAN.
+# Go frps WSS requires certs with vhost domain SAN entries; our test certs only have
+# localhost. g2r WSS tests work because Rust frps accepts our self-signed certs.
 # run_test test_r2g_wss_plain
 # run_test test_r2g_wss_encrypted
 # run_test test_r2g_wss_mux
@@ -5981,6 +6045,11 @@ run_test test_g2r_wss_mux
 # Phase 7: Plugin
 run_test test_g2r_socks5
 run_test test_r2g_socks5
+
+# Kill all previous test processes before KCP/QUIC tests.
+# KCP and QUIC use UDP ports, and old processes from earlier phases
+# can hold UDP ports invisible to random_port()'s TCP-only lsof check.
+cleanup_pids
 
 # =============================================================================
 # Test: Rust frps -> Rust frpc, KCP transport (Rust↔Rust)
@@ -5992,9 +6061,10 @@ run_test test_kcp_rust_to_rust
 # all working. echo server 100ms delay workaround for kcp-go Close() race.
 run_test test_g2r_kcp
 run_test test_r2g_kcp
+# KCP+encrypted bridge (Rust-Rust only): KCP transport with AES-128-CFB encryption.
+run_test test_kcp_rust_encrypted
 # KCP+TLS and KCP+tcpMux: Rust-Rust only tests (Go frp doesn't support KCP+TLS
-# combined), not blocked by Go compat. Test functions defined in PR #123, not yet
-# in this branch. TODO: enable for Rust-Rust KCP+TLS coverage when merged.
+# combined), not blocked by Go compat. TODO: implement test functions.
 # run_test test_g2r_kcp_tls
 # run_test test_r2g_kcp_tls
 # run_test test_g2r_kcp_mux

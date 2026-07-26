@@ -528,6 +528,7 @@ impl ControlConnection {
             &v.secret_key,
             v.use_encryption,
             v.use_compression,
+            Some(v.server_user.as_str()).filter(|s| !s.is_empty()),
         );
         debug!(server_name = %v.server_name, json = %serde_json::to_string(&nvc).unwrap_or_default(), "NewVisitorConn for '{}': {}", v.server_name,
             serde_json::to_string(&nvc).unwrap_or_default());

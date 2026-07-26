@@ -2,7 +2,8 @@
 //! Rendered from live AppState + ProxyMetricsRegistry data on each /metrics scrape.
 //! Same data source as the dashboard API (single metrics system).
 
-use prometheus::{Encoder, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
+use prometheus::{Encoder, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::LazyLock;
 
@@ -49,23 +50,38 @@ static CONNECTION_COUNTS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("metric definition must be valid")
 });
 
-/// frp_server_traffic_in — total inbound traffic bytes per proxy.
-static TRAFFIC_IN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    IntGaugeVec::new(
+/// frp_server_traffic_in — total inbound traffic bytes per proxy (counter).
+static TRAFFIC_IN: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
         Opts::new("frp_server_traffic_in", "total inbound traffic"),
         &["name", "type"],
     )
     .expect("metric definition must be valid")
 });
 
-/// frp_server_traffic_out — total outbound traffic bytes per proxy.
-static TRAFFIC_OUT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    IntGaugeVec::new(
+/// frp_server_traffic_out — total outbound traffic bytes per proxy (counter).
+static TRAFFIC_OUT: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
         Opts::new("frp_server_traffic_out", "total outbound traffic"),
         &["name", "type"],
     )
     .expect("metric definition must be valid")
 });
+
+/// Traffic delta key: (proxy_name, proxy_type).
+type TrafficKey = (String, String);
+/// (bytes_in, bytes_out) cumulative pair.
+type TrafficPair = (u64, u64);
+
+/// Last-reported cumulative traffic per `(proxy_name, proxy_type)`.
+/// Used to compute per-scrape deltas so Prometheus counters accumulate
+/// monotonically (rate() in PromQL requires counters to never decrease).
+///
+/// Uses `tokio::sync::Mutex` because the guard must be held across `.await`
+/// points inside `sync_from_state` — `std::sync::MutexGuard` is `!Send`
+/// and would make the async future non-`Send`, breaking the axum handler.
+static LAST_TRAFFIC: LazyLock<tokio::sync::Mutex<HashMap<TrafficKey, TrafficPair>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
 // --- Pool metrics (new in frp-rs, no Go frp equivalent) ---
 
@@ -143,15 +159,16 @@ pub async fn sync_from_state(state: &AppState) {
     let client_count = state.run_id_to_ctl_tx.read().await.len() as i64;
     CLIENT_COUNTS.set(client_count);
 
-    // Reset all label-based metrics before rebuilding
+    // Reset gauge-based label metrics before rebuilding.
+    // Traffic counters are NOT reset — we compute per-scrape deltas to
+    // preserve Prometheus counter monotonicity (rate() requires it).
     PROXY_COUNTS.reset();
     PROXY_COUNTS_DETAILED.reset();
     CONNECTION_COUNTS.reset();
-    TRAFFIC_IN.reset();
-    TRAFFIC_OUT.reset();
 
     let proxies = state.proxy_manager.list().await;
     let mut type_counts: HashMap<String, i64> = HashMap::new();
+    let mut last_traffic = LAST_TRAFFIC.lock().await;
 
     for p in &proxies {
         *type_counts.entry(p.proxy_type.clone()).or_default() += 1;
@@ -175,13 +192,28 @@ pub async fn sync_from_state(state: &AppState) {
         CONNECTION_COUNTS
             .with_label_values(&[pn, pt])
             .set(snap.current_conns);
-        TRAFFIC_IN
-            .with_label_values(&[pn, pt])
-            .set(i64::try_from(snap.bytes_in).unwrap_or(i64::MAX));
-        TRAFFIC_OUT
-            .with_label_values(&[pn, pt])
-            .set(i64::try_from(snap.bytes_out).unwrap_or(i64::MAX));
+
+        // Delta-tracking: compute bytes since last scrape and inc_by(delta).
+        // The original reset+inc_by(cumulative) gave correct point-in-time
+        // values but broke Prometheus counter monotonicity — counters would
+        // drop to 0 between scrapes, making rate() return garbage.
+        let key = (pn.clone(), pt.clone());
+        let (prev_in, prev_out) = last_traffic.remove(&key).unwrap_or((0, 0));
+        let delta_in = snap.bytes_in.saturating_sub(prev_in);
+        let delta_out = snap.bytes_out.saturating_sub(prev_out);
+        if delta_in > 0 {
+            TRAFFIC_IN.with_label_values(&[pn, pt]).inc_by(delta_in);
+        }
+        if delta_out > 0 {
+            TRAFFIC_OUT.with_label_values(&[pn, pt]).inc_by(delta_out);
+        }
+        // Store cumulative values for the next scrape's delta calculation.
+        if snap.bytes_in > 0 || snap.bytes_out > 0 {
+            last_traffic.insert(key, (snap.bytes_in, snap.bytes_out));
+        }
     }
+    // Stale proxy entries are left in last_traffic to be cleaned up on next
+    // scrape — their counters naturally stop incrementing.
 
     for (pt, count) in &type_counts {
         PROXY_COUNTS.with_label_values(&[pt]).set(*count);
@@ -250,17 +282,17 @@ mod tests {
             .set(1);
         TRAFFIC_IN
             .with_label_values(&["__fmt_proxy", "__fmt_test"])
-            .set(0);
+            .inc_by(0);
         TRAFFIC_OUT
             .with_label_values(&["__fmt_proxy", "__fmt_test"])
-            .set(0);
+            .inc_by(0);
         CONNECTION_COUNTS
             .with_label_values(&["__fmt_proxy", "__fmt_test"])
             .set(0);
         let text = render_metrics_text();
         // HEADER line present for gauge (always renders)
         assert!(text.contains("TYPE frp_server_client_counts gauge"));
-        assert!(text.contains("TYPE frp_server_traffic_in gauge"));
+        assert!(text.contains("TYPE frp_server_traffic_in counter"));
         // Pool metrics should appear even without touching them (they're plain IntGauges)
         assert!(text.contains("frp_server_pool_hits_total"));
         assert!(text.contains("frp_server_pool_misses_total"));
@@ -273,5 +305,40 @@ mod tests {
         TRAFFIC_IN.reset();
         TRAFFIC_OUT.reset();
         CONNECTION_COUNTS.reset();
+    }
+
+    #[tokio::test]
+    async fn test_delta_tracking_no_reset() {
+        register_all();
+
+        // Simulate two sequential scrapes:
+        // Scrape 1: cumulative in=100, out=50 → delta in=100, out=50
+        // Scrape 2: cumulative in=250, out=120 → delta in=150, out=70
+        // After both scrapes, counter should be 100+150=250 in, 50+70=120 out
+        {
+            let mut lt = LAST_TRAFFIC.lock().await;
+            // Scrape 1: first visit → no previous record, delta = cumulative
+            let key = ("delta_test".to_string(), "tcp".to_string());
+            let (prev_in, prev_out) = lt.remove(&key).unwrap_or((0, 0));
+            assert_eq!((prev_in, prev_out), (0, 0));
+            let delta_in = 100u64.saturating_sub(prev_in);
+            let delta_out = 50u64.saturating_sub(prev_out);
+            assert_eq!((delta_in, delta_out), (100, 50));
+            lt.insert(key.clone(), (100, 50));
+        }
+        // Scrape 2: cumulative increased
+        {
+            let mut lt = LAST_TRAFFIC.lock().await;
+            let key = ("delta_test".to_string(), "tcp".to_string());
+            let (prev_in, prev_out) = lt.remove(&key).unwrap_or((0, 0));
+            assert_eq!((prev_in, prev_out), (100, 50));
+            let delta_in = 250u64.saturating_sub(prev_in);
+            let delta_out = 120u64.saturating_sub(prev_out);
+            assert_eq!((delta_in, delta_out), (150, 70));
+            lt.insert(key, (250, 120));
+        }
+
+        // Cleanup
+        LAST_TRAFFIC.lock().await.clear();
     }
 }

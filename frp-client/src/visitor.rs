@@ -13,6 +13,7 @@ pub(crate) struct VisitorListenerConfig {
     pub server_port: u16,
     pub protocol: TransportProtocol,
     pub server_name: String,
+    pub server_user: String,
     pub secret_key: String,
     pub bind_addr: String,
     pub use_encryption: bool,
@@ -46,6 +47,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
         server_port,
         protocol,
         server_name,
+        server_user,
         secret_key,
         bind_addr,
         use_encryption,
@@ -92,6 +94,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                 let sp = server_port;
                 let pt = protocol.clone();
                 let sn = server_name.clone();
+                let su = server_user.clone();
                 let sk = secret_key.clone();
                 let visitor_name = name.clone();
                 let tls_sn = tls_server_name.clone();
@@ -481,6 +484,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             &sk,
                             use_encryption,
                             use_compression,
+                            Some(su.as_str()).filter(|s| !s.is_empty()),
                         );
                         debug!(visitor_name = %visitor_name, json = %serde_json::to_string(&nvc).unwrap_or_default(), "Visitor '{}': NewVisitorConn JSON: {}", visitor_name, serde_json::to_string(&nvc).unwrap_or_default());
                         if let Err(e) = server_conn.write_v1_frame(&nvc).await {
@@ -542,7 +546,24 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             debug!(visitor_name = %visitor_name, "Visitor '{}' STCP fallback relay closed", visitor_name);
                         }
                     } else {
-                        // --- STCP relay path (existing) ---
+                        // SUDP visitor warning: SUDP is not yet implemented as a
+                        // dedicated UDP-based visitor (Go frp has one). Falls through
+                        // to the STCP TCP-based path which will not work correctly
+                        // for UDP traffic.
+                        if vt == "sudp" {
+                            warn!(
+                                visitor_name = %visitor_name,
+                                visitor_type = %vt,
+                                "Visitor '{}': SUDP visitor type not yet implemented \
+                                 (using TCP STCP fallback which will likely fail). \
+                                 Tracked: SUDP visitor needs dedicated UDP transport.",
+                                visitor_name
+                            );
+                        }
+
+                        // --- STCP relay path (TCP-based visitors) ---
+                        // Handles: stcp, and sudp (TCP fallback until dedicated
+                        // SUDP visitor is implemented).
                         let mut server_conn = match dial_server(&opts).await {
                             Ok(io) => io,
                             Err(e) => {
@@ -556,6 +577,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             &sk,
                             use_encryption,
                             use_compression,
+                            Some(su.as_str()).filter(|s| !s.is_empty()),
                         );
                         debug!(visitor_name = %visitor_name, json = %serde_json::to_string(&nvc).unwrap_or_default(), "Visitor '{}': NewVisitorConn JSON: {}", visitor_name, serde_json::to_string(&nvc).unwrap_or_default());
                         if let Err(e) = server_conn.write_v1_frame(&nvc).await {
