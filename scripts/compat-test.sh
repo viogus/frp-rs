@@ -117,67 +117,24 @@ run_go() {
         "$@"
 }
 
-# --- Source-built Go frp for V2 tests ---
-# Pre-built Go frp binary lacks V2 support. When Go is available,
-# auto-build from source and cache keyed by version.
-GO_FRP_SOURCE_DIR="${GO_FRP_SOURCE_DIR:-/tmp/frp-source-build-${GO_FRP_VERSION}}"
-GO_FRPS_V2="$GO_FRP_SOURCE_DIR/frps"
-GO_FRPC_V2="$GO_FRP_SOURCE_DIR/frpc"
-GO_FRP_CLONE_DIR="/tmp/frp-clone-${GO_FRP_VERSION}"
+# --- V2 test support ---
+# Go frp v0.70.1+ pre-built binaries include V2 protocol support.
+# V2 tests use the same pre-built binaries as V1 tests.
+GO_FRPS_V2="$GO_FRP_DIR/frps"
+GO_FRPC_V2="$GO_FRP_DIR/frpc"
 
-build_go_frp_v2() {
-    # Verify cached binaries match the expected version
-    if [[ -x "$GO_FRPS_V2" ]] && [[ -x "$GO_FRPC_V2" ]]; then
-        local cached_ver
-        cached_ver=$("$GO_FRPS_V2" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || true
-        if [[ "$cached_ver" == "$GO_FRP_VERSION" ]]; then
-            return 0
-        fi
-        log "Cached V2 Go frp version mismatch (cached=${cached_ver:-unknown}, expected=$GO_FRP_VERSION); rebuilding."
-    fi
-
-    if ! command -v go &>/dev/null; then
-        log "SKIP V2: Go compiler not found. Install Go 1.22+ for V2 compat tests."
+ensure_go_frp_v2() {
+    if [[ ! -x "$GO_FRPS_V2" ]] || [[ ! -x "$GO_FRPC_V2" ]]; then
+        log "SKIP V2: Go frp pre-built binary not found"
         return 1
     fi
-
-    log "Building Go frp from source (v${GO_FRP_VERSION}, V2 support)..."
-
-    # Clone/update repo, verify the tag
-    if [[ -d "$GO_FRP_CLONE_DIR" ]]; then
-        (cd "$GO_FRP_CLONE_DIR" && git fetch -q --depth 1 origin tag "v${GO_FRP_VERSION}" 2>&1) || true
-    else
-        git clone -q --depth 1 --branch "v${GO_FRP_VERSION}" \
-            https://github.com/fatedier/frp.git "$GO_FRP_CLONE_DIR" 2>&1 || {
-            log "SKIP V2: failed to clone Go frp source (tag v${GO_FRP_VERSION})"
-            return 1
-        }
-    fi
-
-    # Verify the checkout is on the expected tag
-    local actual_tag
-    actual_tag=$(cd "$GO_FRP_CLONE_DIR" && git describe --tags --exact-match 2>/dev/null) || true
-    if [[ "$actual_tag" != "v${GO_FRP_VERSION}" ]]; then
-        log "SKIP V2: clone not at expected tag (got=${actual_tag:-none}, expected=v${GO_FRP_VERSION}); re-cloning."
-        rm -rf "$GO_FRP_CLONE_DIR"
-        git clone -q --depth 1 --branch "v${GO_FRP_VERSION}" \
-            https://github.com/fatedier/frp.git "$GO_FRP_CLONE_DIR" 2>&1 || {
-            log "SKIP V2: failed to re-clone Go frp source (tag v${GO_FRP_VERSION})"
-            return 1
-        }
-    fi
-
-    rm -rf "$GO_FRP_SOURCE_DIR"
-    mkdir -p "$GO_FRP_SOURCE_DIR"
-    (cd "$GO_FRP_CLONE_DIR" && go build -tags "frps,noweb" -o "$GO_FRPS_V2" ./cmd/frps) 2>&1 || {
-        log "SKIP V2: failed to build Go frps from source"
+    local ver
+    ver=$("$GO_FRPS_V2" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || true
+    if [[ -z "$ver" ]]; then
+        log "SKIP V2: cannot determine Go frp version"
         return 1
-    }
-    (cd "$GO_FRP_CLONE_DIR" && go build -tags "frpc,noweb" -o "$GO_FRPC_V2" ./cmd/frpc) 2>&1 || {
-        log "SKIP V2: failed to build Go frpc from source"
-        return 1
-    }
-    log "Go frp source build complete (v${GO_FRP_VERSION}): frps=$GO_FRPS_V2 frpc=$GO_FRPC_V2"
+    fi
+    # V2 is included in pre-built binaries since v0.70.1.
     return 0
 }
 
@@ -5727,11 +5684,11 @@ test_r2g_quic_encrypted() {
 # Test: Go frpc (V2 wire protocol) -> Rust frps
 # =============================================================================
 test_g2r_v2_tcp() {
-    local name="go-to-rust-v2-tcp"
+    local name="test_g2r_v2_tcp"
     should_run_test "$name" || return 0
 
-    # V2 needs Go frp source build (pre-built v0.70.0 binary lacks V2).
-    build_go_frp_v2 || return 0
+    # Go frp v0.70.1+ pre-built binary includes V2 support.
+    ensure_go_frp_v2 || return 0
 
     log "=== $name ==="
     local frps_port=$(random_port)
@@ -5758,7 +5715,7 @@ test_g2r_v2_tcp() {
         return
     }
 
-    # Start Go frpc (source-built, V2 + tcp_mux).
+    # Start Go frpc (V2 + tcp_mux, pre-built binary).
     write_frpc_config go "$frps_port" "$token" "$echo_port" "$proxy_port" \
         "v2-tcp" "$TEST_DIR/$name/frpc.toml" "mux"
     # Insert V2 wire protocol BEFORE transport.tls.enable. Inserting before
@@ -5790,7 +5747,7 @@ transport.wireProtocol = "v2"
 # Test: Rust frpc (V2 wire protocol) -> Go frps
 # =============================================================================
 test_r2g_v2_tcp() {
-    local name="rust-to-go-v2-tcp"
+    local name="test_r2g_v2_tcp"
     should_run_test "$name" || return 0
 
     # Go frps auto-detects V2 from connection magic bytes — no server-side
@@ -6093,7 +6050,7 @@ run_test test_kcp_rust_encrypted
 run_test test_quic_rust_to_rust
 # QUIC Go↔Rust: multi-stream-per-connection enabled.
 # Go frp v0.70.0 uses quic-go (multi-stream), Rust accepts additional streams.
-# Both pre-built and source-built Go frp binaries work with release Rust build.
+# Go frp v0.70.1+ pre-built binaries work with release Rust build.
 run_test test_g2r_quic
 run_test test_r2g_quic
 run_test test_g2r_quic_multi_proxy
@@ -6101,16 +6058,13 @@ run_test test_g2r_quic_encrypted
 run_test test_r2g_quic_encrypted
 
 # Phase 9: V2 wire protocol
-# g2r: Go frpc needs source build for transport.wireProtocol config support.
-#      Auto-builds via build_go_frp_v2() when Go is available.
-# r2g: Go frps auto-detects V2 from connection magic bytes — pre-built binary works.
-# V2 data bridge fixed (PR #32): magic bytes consumed before read_ctl_msg on
-# new yamux streams. Tests run when Go is available (needed for source build).
-if build_go_frp_v2; then
+# Go frp v0.70.1+ pre-built binaries include V2 protocol support.
+# Both g2r and r2g V2 tests use the pre-built binary.
+if ensure_go_frp_v2; then
     run_test test_g2r_v2_tcp
     run_test test_r2g_v2_tcp
 else
-    log "SKIP V2 tests: Go compiler not available (needed for source build of Go frpc)"
+    log "SKIP V2 tests: Go frp pre-built binary does not support V2"
 fi
 
 # Phase 10: SSH Gateway compat

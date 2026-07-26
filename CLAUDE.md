@@ -94,7 +94,7 @@ Every feature, fix, and test change follows three rules:
 | `cargo fmt --all -- --check` | zero diffs |
 | `cargo test --workspace --all-features` | 522 passed, 2 ignored (35 suites) |
 | `cargo build --release` | passes (frps ~7.8MB, frpc ~6.0MB) |
-| `compat-test.sh` (Go frp v0.70.1) | 65/67 passed (2 guarded: V2, XTCP VPS-only) |
+| `compat-test.sh` (Go frp v0.70.1) | 67/67 passed (XTCP VPS-only) |
 | `unsafe` blocks | 6 in frp-core, 3+ in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
 | `hex` crate | removed — inline `hex_encode` in frp-core |
