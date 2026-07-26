@@ -531,6 +531,47 @@ mod tests {
     }
 
     #[test]
+    fn test_allocate_port_multi_explicit_not_in_ranges() {
+        // An explicit port outside the configured allow_ports ranges must be rejected
+        // (Go frp compat: Manager.Acquire checks freePorts which is populated from allowPorts).
+        let mut used = std::collections::HashSet::new();
+        let ranges = [(10000, 20000)];
+        assert_eq!(
+            allocate_port_multi(&mut used, 8080, &ranges, "127.0.0.1"),
+            None,
+            "explicit port outside allow_ports ranges must return None"
+        );
+    }
+
+    #[test]
+    fn test_allocate_port_multi_explicit_in_ranges() {
+        // An explicit port within a configured allow_ports range must be accepted
+        let mut used = std::collections::HashSet::new();
+        let ranges = [(10000, 20000), (30000, 40000)];
+        let result = allocate_port_multi(&mut used, 35000, &ranges, "127.0.0.1");
+        assert_eq!(
+            result,
+            Some(35000),
+            "explicit port within allow_ports range must be accepted"
+        );
+        // Verify it's now in used_ports
+        assert!(
+            used.contains(&35000),
+            "allocated port must be in used_ports"
+        );
+    }
+
+    #[test]
+    fn test_allocate_port_multi_explicit_empty_ranges_always_allowed() {
+        // When ranges is empty (no allow_ports configured), all ports are allowed
+        let mut used = std::collections::HashSet::new();
+        let result = allocate_port_multi(&mut used, 51993, &[], "127.0.0.1");
+        // Should succeed if port is bindable
+        assert!(result.is_some(), "port should be allocatable with empty ranges");
+        assert_eq!(result, Some(51993));
+    }
+
+    #[test]
     fn test_allocate_port_multi_explicit_available() {
         // Allocate a port that's not in used_ports and verify it succeeds.
         // "0.0.0.0" with port 0 is invalid, so use a specific port that's
