@@ -101,23 +101,15 @@ pub async fn handle_control<S>(
 {
     info!(peer = ?peer, "New control connection from {:?}", peer);
     // 1. Authenticate and set up per-client state (login.rs)
-    let (
-        mut ctx,
-        mut ctl,
-        _internal_tx,
-        mut internal_rx,
-        mut reader,
-        mut writer,
-        mut incoming,
-        mut ping_tick,
-    ) = match login::authenticate(
-        stream, &login, state, peer, incoming, v2, crypto_ctx, internal,
-    )
-    .await
-    {
-        Ok(tuple) => tuple,
-        Err(()) => return,
-    };
+    let (mut ctx, mut ctl, _internal_tx, mut internal_rx, mut reader, mut writer, mut incoming) =
+        match login::authenticate(
+            stream, &login, state, peer, incoming, v2, crypto_ctx, internal,
+        )
+        .await
+        {
+            Ok(tuple) => tuple,
+            Err(()) => return,
+        };
 
     // Convenience bindings for the main loop
     let state = ctx.state.clone();
@@ -125,7 +117,6 @@ pub async fn handle_control<S>(
     let _pool_cap = ctx.pool_cap; // used by the non-yamux work-conn paths
     let pool_stats = ctx.pool_stats.clone();
     let v2 = ctx.v2;
-    let reloadable = ctx.reloadable.clone();
     let peer = ctx.peer;
     let login_user = login.user.clone().unwrap_or_default();
 
@@ -260,33 +251,6 @@ pub async fn handle_control<S>(
                         break;
                     }
                 }
-            }
-            _ = ping_tick.tick() => {
-                // Send periodic Ping to keep the control connection alive.
-                // Go frpc expects server Pings; without them it times out and reconnects.
-                // Only include privilege_key when HeartBeats is in additional_auth_scopes
-                // (matching Go frp behavior: skip auth on heartbeat messages unless
-                // the client requires it via additionalAuthScopes).
-                let privilege_key = if reloadable.additional_auth_scopes.iter().any(|s| s == "HeartBeats") {
-                    Some(reloadable.auth_cfg.token.clone())
-                } else {
-                    None
-                };
-                let ping = FrpMessage::Ping(msg::Ping {
-                    timestamp: Some(std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64),
-                    privilege_key,
-                });
-                if let Err(e) = write_ctl_msg(&mut writer, &ping, v2).await {
-                    warn!(peer = ?peer, error = %e, "Failed to send Ping: {}", e);
-                    break;
-                }
-                debug!(peer = ?peer, "Sent Ping to {:?}", peer);
-                // Do NOT update last_ping here — only update when Pong is
-                // received from client. Updating on server-initiated Pings
-                // would prevent the heartbeat timeout from ever triggering.
             }
             _ = state.shutdown_token.cancelled() => {
                 info!(run_id = %run_id, "Graceful shutdown: draining control handler for {}", run_id);

@@ -99,6 +99,7 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
     let (kcp_socket, handle, _accept_rx) = KcpSocket::new(socket, config.clone());
     let (read_tx, read_rx) = mpsc::channel(256);
     let session = KcpSession::new(conv, remote, config.clone(), read_tx);
+    let alive_handle = session.alive_handle();
 
     // Register session BEFORE spawning driver so the driver can route
     // incoming FEC packets to the correct session from the start.
@@ -118,5 +119,6 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
         read_rx,
         handle.write_backlog.clone(),
         handle.write_notify.clone(),
+        alive_handle,
     ))
 }

@@ -214,8 +214,8 @@ fn default_token_auth_timeout() -> bool {
 
 /// Parse a bandwidth limit string like "1MB", "500KB", "100KB".
 /// Returns bytes per second, or None if unparseable.
-/// Go frp compat: only supports "MB", "KB", "GB" suffixes (case-insensitive).
-/// Bare numbers and single-letter suffixes ("M", "K", "G") are rejected.
+/// Go frp compat: only supports "MB" and "KB" suffixes (case-insensitive).
+/// Bare numbers, single-letter suffixes ("M", "K"), and "GB" are rejected.
 /// Empty string returns Some(0) (no limit, Go compat).
 ///
 /// Note: Empty string returns `Some(0)` (not `None`) so callers using `is_some()`
@@ -228,9 +228,7 @@ pub fn parse_bandwidth_limit(s: &str) -> Option<u64> {
         return Some(0);
     }
     let s = s.trim().to_uppercase();
-    let (num_str, mult) = if let Some(rest) = s.strip_suffix("GB") {
-        (rest.trim(), 1_073_741_824u64)
-    } else if let Some(rest) = s.strip_suffix("MB") {
+    let (num_str, mult) = if let Some(rest) = s.strip_suffix("MB") {
         (rest.trim(), 1_048_576u64)
     } else {
         // Go requires a suffix; bare numbers and single-letter suffixes are invalid.
@@ -1426,7 +1424,7 @@ fn validate_proxy_configs(proxies: &[ProxyConfig]) -> Result<(), String> {
             let hint = if p.bandwidth_limit == "0" || p.bandwidth_limit == "0KB" {
                 "value must be positive; use empty string for no limit"
             } else {
-                "must be a positive number followed by KB, MB, or GB"
+                "must be a positive number followed by KB or MB"
             };
             return Err(format!(
                 "proxy '{}': invalid bandwidth_limit: {:?} ({})",
@@ -2760,8 +2758,8 @@ remote_port = 7001
         // Single-letter suffix "M" → None (Go requires "MB")
         assert_eq!(parse_bandwidth_limit("1M"), None);
 
-        // GB variant
-        assert_eq!(parse_bandwidth_limit("1GB"), Some(1_073_741_824));
+        // GB variant — Go frp rejects "GB"; must use "MB" or "KB"
+        assert_eq!(parse_bandwidth_limit("1GB"), None);
 
         // Bare number → None (Go requires a suffix)
         assert_eq!(parse_bandwidth_limit("500"), None);

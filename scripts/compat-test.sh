@@ -242,9 +242,9 @@ wait_for_port_safe() {
             fi
             sleep 0.1
         done
-    elif command -v nc >/dev/null 2>&1; then
+    elif command -v ss >/dev/null 2>&1; then
         while true; do
-            if nc -z "$host" "$port" 2>/dev/null; then
+            if ss -tlnp "sport = :$port" 2>/dev/null | grep -q "LISTEN.*:$port"; then
                 return 0
             fi
             if [[ $(date +%s) -gt $deadline ]]; then
@@ -253,7 +253,7 @@ wait_for_port_safe() {
             sleep 0.1
         done
     else
-        echo "WARNING: neither lsof nor nc available; sleeping ${timeout}s" >&2
+        echo "WARNING: neither lsof nor ss available; sleeping ${timeout}s" >&2
         sleep "$timeout"
         return 0
     fi

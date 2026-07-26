@@ -817,15 +817,35 @@ pub(crate) async fn handle_work_conn_inner(
         }
     };
 
-    // Verify work connection auth (Go frp v0.69.1 compat).
-    // Only validate when "NewWorkConns" is in additional_auth_scopes.
-    let requires_nwc_auth = state
+    // Go frp v0.69.1 compat: always attempt work connection auth
+    // verification. Go's RegisterWorkConn unconditionally calls
+    // AuthVerifier.VerifyNewWorkConn(newMsg) — the verifier decides
+    // whether to enforce based on additional_auth_scopes.
+    //
+    // When "NewWorkConns" is NOT in the scope, we skip verification
+    // only if no privilege_key was sent (backward compat). If a key
+    // IS present, it must be valid — this catches invalid credentials
+    // even when the scope is not configured. When the scope IS set,
+    // a privilege_key is always required.
+    let nwc_auth_scope = state
         .reloadable
         .read_ok()
         .additional_auth_scopes
         .iter()
         .any(|s| s == "NewWorkConns");
-    let nwc_auth_result = if !requires_nwc_auth {
+    let has_key = msg
+        .privilege_key
+        .as_deref()
+        .map(|k| !k.is_empty())
+        .unwrap_or(false);
+
+    let nwc_auth_result = if !has_key && !nwc_auth_scope {
+        // No key sent and scope does not require it — skip auth.
+        Ok(())
+    } else if has_key && msg.timestamp.is_none() && !nwc_auth_scope {
+        // Go frp compat: privilege_key present but no timestamp, and scope
+        // does not require NewWorkConn auth. Skip validation to avoid
+        // breaking work connections where Go frpc omits the timestamp field.
         Ok(())
     } else if let Some(ref verifier) = state.oidc.verifier {
         let expected_sub = state

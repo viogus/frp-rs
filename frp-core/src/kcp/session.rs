@@ -15,6 +15,8 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
@@ -90,6 +92,10 @@ pub struct KcpSession {
     pending_shards: Vec<Vec<u8>>,
     /// Max RS payload length in current pending group.
     pending_max_size: usize,
+    /// Set to false when the session is removed from the KcpSocket driver.
+    /// KcpStream checks this on poll_write/poll_read to fail fast instead of
+    /// silently dropping data.
+    alive: Arc<AtomicBool>,
 }
 
 impl KcpSession {
@@ -127,6 +133,8 @@ impl KcpSession {
         // sent immediately). Verified: Rust kcp 0.6.0 always batches ACKs
         // — no action needed.
 
+        let alive = Arc::new(AtomicBool::new(true));
+
         Self {
             conv,
             _peer_addr: peer_addr,
@@ -141,6 +149,7 @@ impl KcpSession {
             pending_read: None,
             pending_shards: Vec::new(),
             pending_max_size: 0,
+            alive,
         }
     }
 
@@ -519,6 +528,17 @@ impl KcpSession {
     /// Check if the KCP connection is dead (too many retransmissions).
     pub fn is_dead_link(&self) -> bool {
         self.kcp.is_dead_link()
+    }
+
+    /// Returns a handle that becomes false when the session is removed from
+    /// the driver. KcpStream uses this to detect a dead session.
+    pub fn alive_handle(&self) -> Arc<AtomicBool> {
+        self.alive.clone()
+    }
+
+    /// Mark the session as dead -- called by KcpSocket when removing.
+    pub fn mark_dead(&self) {
+        self.alive.store(false, Ordering::Release);
     }
 
     /// Mark session for shutdown. Driver will remove it on next tick.

@@ -1103,9 +1103,9 @@ impl Service {
             }
         }
 
-        // Start QUIC listener if configured (requires TLS cert/key)
+        // Start QUIC listener if configured (auto-generates self-signed TLS cert if needed)
         #[cfg(feature = "quic")]
-        if self.cfg.quic_bind_port > 0 && self.cfg.tls_enable {
+        if self.cfg.quic_bind_port > 0 {
             let quic_state = self.state.clone();
             let quic_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.quic_bind_port);
             let quic_addr2 = quic_addr.clone();
@@ -1113,38 +1113,99 @@ impl Service {
             let cert_path = self.cfg.tls_cert_file.clone();
             let key_path = self.cfg.tls_key_file.clone();
             tokio::spawn(async move {
-                let cert_pem = match std::fs::read_to_string(&cert_path) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!(cert_path = %cert_path, error = %e, "QUIC: failed to read cert file {}: {}", cert_path, e);
-                        return;
-                    }
-                };
-                let key_pem = match std::fs::read_to_string(&key_path) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!(key_path = %key_path, error = %e, "QUIC: failed to read key file {}: {}", key_path, e);
-                        return;
-                    }
-                };
                 let sockaddr: std::net::SocketAddr = match quic_addr.parse() {
                     Ok(a) => a,
                     Err(e) => {
-                        tracing::error!(addr = %quic_addr, error = %e, "QUIC: invalid bind address {}: {}", quic_addr, e);
+                        tracing::error!(addr = %quic_addr, error = %e, "QUIC: invalid bind address");
                         return;
                     }
                 };
-                let listener =
-                    match frp_core::quic::QuicListener::new(sockaddr, &cert_pem, &key_pem) {
-                        Ok(l) => {
-                            let _ = quic_bind_tx.send(());
-                            l
+
+                // Try configured TLS cert/key files; fall back to auto-generated
+                // self-signed certs (Go frp compat: QUIC always starts when
+                // quicBindPort > 0, with or without TLS config).
+                let listener = if !cert_path.is_empty() && !key_path.is_empty() {
+                    match (
+                        std::fs::read_to_string(&cert_path),
+                        std::fs::read_to_string(&key_path),
+                    ) {
+                        (Ok(cert_pem), Ok(key_pem)) => {
+                            match frp_core::quic::QuicListener::new(sockaddr, &cert_pem, &key_pem) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        "QUIC: listen failed with configured TLS certs"
+                                    );
+                                    return;
+                                }
+                            }
                         }
+                        _ => {
+                            tracing::warn!(
+                                "QUIC: failed to read TLS cert/key files \
+                                 (cert={cert_path}, key={key_path}), \
+                                 falling back to auto-generated self-signed certificate"
+                            );
+                            let tls_config =
+                                match frp_core::transport::generate_self_signed_tls_config() {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = %e,
+                                            "QUIC: failed to generate TLS cert"
+                                        );
+                                        return;
+                                    }
+                                };
+                            match frp_core::quic::QuicListener::new_with_tls_config(
+                                sockaddr,
+                                tls_config,
+                                frp_core::quic::QuicTransportParams::default(),
+                            ) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        "QUIC: listen failed with auto-generated certs"
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    tracing::info!(
+                        "QUIC: no TLS cert/key configured, \
+                         auto-generating self-signed certificate"
+                    );
+                    let tls_config = match frp_core::transport::generate_self_signed_tls_config() {
+                        Ok(c) => c,
                         Err(e) => {
-                            tracing::error!(error = %e, "QUIC listener bind failed: {}", e);
+                            tracing::error!(
+                                error = %e,
+                                "QUIC: failed to generate TLS cert"
+                            );
                             return;
                         }
                     };
+                    match frp_core::quic::QuicListener::new_with_tls_config(
+                        sockaddr,
+                        tls_config,
+                        frp_core::quic::QuicTransportParams::default(),
+                    ) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "QUIC: listen failed with auto-generated certs"
+                            );
+                            return;
+                        }
+                    }
+                };
+                let _ = quic_bind_tx.send(());
+
                 tracing::info!(addr = %quic_addr, "QUIC listener started on {}", quic_addr);
                 'quic_accept: loop {
                     tokio::select! {
