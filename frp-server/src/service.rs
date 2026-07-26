@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -145,6 +147,15 @@ fn note_restart_change<T: PartialEq + std::fmt::Display>(
     if *old != *new {
         changes.push(format!("{name}: {old} -> {new} (restart required)"));
     }
+}
+
+/// Spawn a boxed future with type erasure. Reduces binary size by
+/// preventing monomorphization of `tokio::spawn` for every concrete
+/// future type — the unsizing coercion from `Pin<Box<ConcreteFut>>`
+/// to `Pin<Box<dyn Future<...> + Send>>` ensures `tokio::spawn` is
+/// specialized for the single pointer-sized `dyn` type.
+fn spawn_boxed(fut: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
+    tokio::spawn(fut);
 }
 
 // ---------------------------------------------------------------
@@ -357,7 +368,7 @@ impl Service {
             let ws_addr2 = ws_addr.clone();
             let ws_state = self.state.clone();
             let (ws_bind_tx, ws_bind_rx) = tokio::sync::oneshot::channel::<()>();
-            tokio::spawn(async move {
+            spawn_boxed(Box::pin(async move {
                 match TcpListener::bind(&ws_addr2).await {
                     Ok(listener) => {
                         let _ = ws_bind_tx.send(());
@@ -393,7 +404,7 @@ impl Service {
                                     tokio::time::sleep(wait).await;
                                     continue;
                                 }
-                                tokio::spawn(async move {
+                                spawn_boxed(Box::pin(async move {
                                     let _permit = permit;
                                     match frp_core::transport::accept_websocket(IoStream::Tcp(stream)).await {
                                         Ok(mut ws) => {
@@ -511,7 +522,7 @@ impl Service {
                                             warn!(addr = %addr, error = %e, "WebSocket upgrade failed for {}: {}", addr, e);
                                         }
                                     }
-                                });
+                                }));
                                         }
                                         Err(e) => {
                                             tracing::warn!(error = %e, "WS accept error, retrying...");
@@ -528,7 +539,7 @@ impl Service {
                         tracing::error!(addr = %ws_addr2, error = %e, "WebSocket listener bind failed: {}", e);
                     }
                 }
-            });
+            }));
             match ws_bind_rx.await {
                 Ok(_) => info!(addr = %ws_addr, "WebSocket listener started on {}", ws_addr),
                 Err(_) => tracing::error!(addr = %ws_addr, "WebSocket listener failed to start"),
@@ -622,7 +633,7 @@ impl Service {
             let kcp_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.kcp_bind_port);
             let kcp_addr2 = kcp_addr.clone();
             let (kcp_bind_tx, kcp_bind_rx) = tokio::sync::oneshot::channel::<()>();
-            tokio::spawn(async move {
+            spawn_boxed(Box::pin(async move {
                 let mut listener = match frp_core::kcp::KcpListener::bind(
                     &kcp_addr2,
                     frp_core::kcp::default_kcp_config(),
@@ -662,7 +673,7 @@ impl Service {
                                             tokio::time::sleep(wait).await;
                                             continue;
                                         }
-                                        tokio::spawn(async move {
+                                        spawn_boxed(Box::pin(async move {
                                             let _permit = permit;
                                             let peer = stream.peer_addr;
                                     let conv = stream.conv();
@@ -1088,7 +1099,7 @@ impl Service {
                                         }
                                     }
                                     }
-                                });
+                                }));
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "KCP accept error, retrying...");
@@ -1100,7 +1111,7 @@ impl Service {
                         _ = kcp_state.shutdown_token.cancelled() => break 'kcp_accept,
                     }
                 }
-            });
+            }));
             match kcp_bind_rx.await {
                 Ok(_) => tracing::info!(addr = %kcp_addr, "KCP listener started on {}", kcp_addr),
                 Err(_) => tracing::error!(addr = %kcp_addr, "KCP listener failed to start"),
@@ -1116,7 +1127,7 @@ impl Service {
             let (quic_bind_tx, quic_bind_rx) = tokio::sync::oneshot::channel::<()>();
             let cert_path = self.cfg.tls_cert_file.clone();
             let key_path = self.cfg.tls_key_file.clone();
-            tokio::spawn(async move {
+            spawn_boxed(Box::pin(async move {
                 let sockaddr: std::net::SocketAddr = match quic_addr.parse() {
                     Ok(a) => a,
                     Err(e) => {
@@ -1233,7 +1244,7 @@ impl Service {
                                             tokio::time::sleep(wait).await;
                                             continue;
                                         }
-                                        tokio::spawn(async move {
+                                        spawn_boxed(Box::pin(async move {
                                             let _permit = permit;
                                             // Accept first bidirectional stream (control channel).
                                             // This is inside the handler, not in the accept loop —
@@ -1247,7 +1258,7 @@ impl Service {
                                                 }
                                             };
                                             handle_quic_stream(stream, conn, state).await;
-                                        });
+                                        }));
                                     }
                             Err(e) => {
                                 tracing::warn!(error = %e, "QUIC accept error, retrying...");
@@ -1263,7 +1274,7 @@ impl Service {
                     }
                 }
                 tracing::info!("QUIC accept loop shut down gracefully");
-            });
+            }));
             match quic_bind_rx.await {
                 Ok(_) => {
                     tracing::info!(addr = %quic_addr2, "QUIC listener started on {}", quic_addr2)
@@ -1604,7 +1615,7 @@ impl Service {
                         tokio::time::sleep(wait).await;
                         continue;
                     }
-                    tokio::spawn(async move {
+                    spawn_boxed(Box::pin(async move {
                         // Connection read deadline: wrap the initial message
                         // detection (detect_and_strip_magic) with a timeout.
                         // Matches Go frp's SetReadDeadline(10s) before reading
@@ -1631,6 +1642,7 @@ impl Service {
                             }
                         };
 
+                        Box::pin(async move {
                         match ct {
                             #[cfg(feature = "tls")]
                         ConnectionType::Tls(first_byte) => {
@@ -2428,7 +2440,8 @@ impl Service {
                                 }
                             }
                         }
-                    });
+                        }).await;
+                    }));
                 }
                 Err(e) => {
                     error!(error = %e, "Failed to accept connection: {}", e);
