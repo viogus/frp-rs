@@ -32,8 +32,9 @@ use super::{write_ctl_msg, ControlContext, ControlState};
 /// When `internal` is true and the login's ClientSpec.AlwaysAuthPass is set,
 /// authentication is bypassed (Go frp SSH gateway compat).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn authenticate<S>(
-    mut stream: S,
+#[inline(never)]
+pub(crate) async fn authenticate(
+    mut stream: Box<dyn frp_core::cipher_stream::AsyncReadWriteUnpin>,
     login: &msg::Login,
     state: Arc<AppState>,
     peer: Option<SocketAddr>,
@@ -52,10 +53,7 @@ pub(crate) async fn authenticate<S>(
         Option<IncomingStreams>,
     ),
     (),
->
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+> {
     // --- Login throttle: max 5 failed attempts per 60s per IP ---
     // For transports with a peer address (TCP), use the real IP.
     // For transports without SocketAddr (TLS/WS/KCP/QUIC), hash the
@@ -469,7 +467,7 @@ where
                 // Server reads from client → client_to_server (= read_key).
                 // Server writes to client → server_to_client (= write_key).
                 match frp_core::crypto::AeadStream::new(
-                    Box::new(stream),
+                    stream,
                     ctx.algorithm,
                     &read_key,
                     &write_key,
@@ -500,7 +498,7 @@ where
         // encryption, not control plane encryption.
         info!(peer = ?peer, run_id = %run_id, "Wrapping control stream in CipherStream (AES-128-CFB)");
         let enc_key = encryption::derive_key(&reloadable.auth_cfg.token);
-        let cipher = frp_core::cipher_stream::CipherStream::new(Box::new(stream), enc_key);
+        let cipher = frp_core::cipher_stream::CipherStream::new(stream, enc_key);
         // ReqWorkConn pre-warming is done AFTER the if/else block below,
         // so BOTH V1 and V2+AEAD paths benefit from pre-warmed work conns.
         let (r, w) = tokio::io::split(cipher);
