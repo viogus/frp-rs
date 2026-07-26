@@ -28,21 +28,34 @@
 //! ensures compatibility with Go peers regardless of detect_behavior
 //! role assignment.
 //!
-//! ## TODO: MakeHole mode-based NAT traversal (Go's 5-mode state machine)
+//! ## Known limitation: Simplified hole-punch (not Go's 5-mode MakeHole state machine)
 //!
-//! Go frp v0.70.1 implements a full 5-mode state machine in
-//! `/tmp/frp-source/pkg/nathole/nathole.go:192-288` (`(mhr *makeHoleRecords) makeHole()`)
-//! that guides each peer through the specific hole-punch behavior selected by
-//! the analyzer (e.g., send_delay_ms, ttl, ports_range_number, listen_random_ports).
-//! Our Rust implementation currently ignores most of these parameters and uses
-//! a simplified "send detect message, wait for response" approach that works
-//! for EasyNAT but does not fully implement Go's mode-based traversal for
-//! HardNAT scenarios (mode 2/3/4 with random port ranges and listener ports).
-//! This means Rust↔Rust and Rust↔Go XTCP may fail in certain HardNAT
-//! configurations that Go handles correctly. Full implementation would require
-//! a per-peer MakeHole state machine with timer-driven behavior (send probes
-//! at send_delay_ms intervals, iterate through ports_range_number candidate
-//! ports, bind listen_random_ports on the receiver side).
+//! Go frp v0.70.1 implements a full 5-mode state machine (`MakeHole`) in
+//! `/tmp/frp-source/pkg/nathole/nathole.go:192-288` that guides each peer
+//! through the specific hole-punch behavior selected by the analyzer:
+//!
+//! | Mode | Condition | Works? | Notes |
+//! |------|-----------|--------|-------|
+//! | 0 | Both EasyNAT | Yes | Simple "send + wait" suffices for this case |
+//! | 1 | One EasyNAT, one HardNAT | Partial | Simplified approach may work in some configurations |
+//! | 2 | Both HardNAT (port-restricted) | No | Requires port-range scanning (ports_range_number) + random ports |
+//! | 3 | Both HardNAT with listen randomization | No | Requires listen_random_ports on receiver side |
+//! | 4 | Both HardNAT symmetric mapping | No | Requires TTL-limited probes + port difference scanning |
+//!
+//! **What works:** Mode 0 (both peers are EasyNAT). The simplified "send detect
+//! message, wait for response" approach handles this case well.
+//!
+//! **What doesn't work:** Modes 2-4 (HardNAT scenarios where at least one peer
+//! has port-restricted or symmetric NAT). Go frp's MakeHole state machine uses
+//! `send_delay_ms` interval probing, `ports_range_number` candidate scanning,
+//! `listen_random_ports` on the receiver, and TTL-limited probes. Our
+//! implementation ignores most of these parameters.
+//!
+//! **Status for v0.7.1:** This is a known limitation. The simplified approach
+//! works for EasyNAT↔EasyNAT (common when both peers are on standard home/cloud
+//! networks without symmetric NAT). HardNAT scenarios may fail — Go frp handles
+//! these correctly. Future releases should implement the full MakeHole state
+//! machine for complete compatibility.
 
 use std::future::Future;
 use std::io;

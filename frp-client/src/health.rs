@@ -182,9 +182,19 @@ pub(crate) async fn run_http_check(
     }
     let response = String::from_utf8_lossy(&buf[..n]);
     let status_line = response.lines().next().unwrap_or("");
-    if status_line.contains("200") || status_line.contains(" 2") {
-        Ok(())
-    } else {
-        Err(format!("non-2xx status: {}", status_line))
+    // Proper HTTP status parsing: check "HTTP/1." prefix, extract the 3-digit
+    // numeric status code, and verify 200 <= code < 300. Substring matching
+    // ("200" or " 2") could misparse multi-line responses or body content.
+    // Matches Go frp's resp.StatusCode / 100 == 2 check.
+    if status_line.starts_with("HTTP/1.") {
+        let parts: Vec<&str> = status_line.splitn(3, ' ').collect();
+        if parts.len() >= 2 {
+            if let Ok(code) = parts[1].parse::<u16>() {
+                if (200..300).contains(&code) {
+                    return Ok(());
+                }
+            }
+        }
     }
+    Err(format!("non-2xx status: {}", status_line))
 }

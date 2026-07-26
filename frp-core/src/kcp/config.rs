@@ -44,8 +44,6 @@ pub struct KcpConfig {
     pub parity_shards: usize,
     /// Stream mode: each KCP output produces a single contiguous datagram.
     pub stream: bool,
-    /// Flush after every write.
-    pub flush_write: bool,
 }
 
 impl Default for KcpConfig {
@@ -58,7 +56,6 @@ impl Default for KcpConfig {
             data_shards: 0,
             parity_shards: 0,
             stream: true,
-            flush_write: true,
         }
     }
 }

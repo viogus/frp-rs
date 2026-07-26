@@ -1689,7 +1689,7 @@ impl Default for DialOptions {
             tls_key_file: None,
             dns_server: None,
             dial_timeout_secs: 10,
-            disable_custom_tls_first_byte: true,
+            disable_custom_tls_first_byte: false,
             keepalive_secs: 0,
             bind_addr: None,
             proxy_url: None,
