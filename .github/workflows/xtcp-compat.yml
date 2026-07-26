@@ -63,7 +63,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/release/
-            /tmp/frp_0.70.0_linux_amd64/
+            /tmp/frp_0.70.1_linux_amd64/
           key: ${{ runner.os }}-xtcp-${{ hashFiles('**/Cargo.toml') }}-v3
           restore-keys: |
             ${{ runner.os }}-xtcp-${{ hashFiles('**/Cargo.toml') }}-
@@ -80,13 +80,13 @@ jobs:
 
       - name: Download Go frp
         if: steps.check.outputs.configured == 'true'
-        run: bash scripts/download-go-frp.sh 0.70.0
+        run: bash scripts/download-go-frp.sh 0.70.1
 
       - name: Run XTCP compat tests
         if: steps.check.outputs.configured == 'true'
         run: |
           bash scripts/compat-test.sh \
-            --go-version 0.70.0 \
+            --go-version 0.70.1 \
             --frps-remote "$XTCP_VPS_HOST" \
             --xtcp-only \
             --shard ${{ matrix.shard }}/4 \
