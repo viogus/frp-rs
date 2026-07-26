@@ -970,9 +970,11 @@ impl Service {
                 }};
             }
 
-            for i in 0..pool_count {
-                spawn_wc!(i);
-            }
+            // Go frp compat: work connections are created ONLY in response to
+            // ReqWorkConn messages from the server (handled in the message loop
+            // below, which calls spawn_wc!(-1)). Do NOT eagerly spawn pool_count
+            // connections here; pool_count is sent to the server via Login so it
+            // knows how many ReqWorkConn messages to issue.
 
             // Shared graceful shutdown signal for all visitor listener tasks.
             // Set to true at session end so tasks exit cleanly (Fix 8).
@@ -1216,23 +1218,29 @@ impl Service {
                             privilege_key: None,
                             timestamp: None,
                         };
-                        // Go frp v0.70.1 compat: Ping always sends auth, regardless
-                        // of scope negotiation. Go's ctl.sessionCtx.Auth.Setter.SetPing()
-                        // is called unconditionally in heartbeatWorker.
-                        // See /tmp/frp-source/client/control.go:238-240.
-                        if let Some(ref oidc) = self.oidc_client {
-                            if let Err(e) = oidc.set_ping(&mut ping_msg).await {
-                                warn!(error = %e, "OIDC ping token failed: {}. Reconnecting...", e);
-                                break;
+                        // Go frp v0.70.1 compat: Ping sends auth ONLY when the
+                        // server's additionalAuthScopes includes "HeartBeats".
+                        // Go's heartbeatWorker checks
+                        // ctl.GetController().GetAuthCfg().AdditionalAuthScopes
+                        // for "HeartBeats". Default scope is empty, so Ping has
+                        // no auth fields unless the scope was negotiated.
+                        // See /tmp/frp-source/client/control.go:heartbeatWorker.
+                        let send_auth = server_scopes.iter().any(|s| s == "HeartBeats");
+                        if send_auth {
+                            if let Some(ref oidc) = self.oidc_client {
+                                if let Err(e) = oidc.set_ping(&mut ping_msg).await {
+                                    warn!(error = %e, "OIDC ping token failed: {}. Reconnecting...", e);
+                                    break;
+                                }
+                            } else {
+                                let ts = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs() as i64;
+                                let ping_auth = AuthConfig::with_token(self.auth_cfg.token.clone());
+                                ping_msg.privilege_key = ping_auth.generate_login_key(ts);
+                                ping_msg.timestamp = Some(ts);
                             }
-                        } else {
-                            let ts = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs() as i64;
-                            let ping_auth = AuthConfig::with_token(self.auth_cfg.token.clone());
-                            ping_msg.privilege_key = ping_auth.generate_login_key(ts);
-                            ping_msg.timestamp = Some(ts);
                         }
                         let ping = FrpMessage::Ping(ping_msg);
                         if let Err(e) = write_msg(&mut *writer.lock().await, &ping, v2).await {
@@ -1271,6 +1279,14 @@ impl Service {
                         match event {
                             HealthEvent::Close(proxy_name) => {
                                 info!(proxy_name = %proxy_name, "Health check sending CloseProxy for unhealthy proxy: {}", proxy_name);
+                                // Set phase to CheckFailed before sending CloseProxy
+                                // (Go frp compat: PhaseCheckFailed is an explicit state in proxy lifecycle).
+                                {
+                                    let mut map = self.proxy_info_map.write().await;
+                                    if let Some(info) = map.get_mut(&proxy_name) {
+                                        info.phase = ProxyPhase::CheckFailed;
+                                    }
+                                }
                                 let close = FrpMessage::CloseProxy(msg::CloseProxy {
                                     proxy_name: proxy_name.clone(),
                                 });
@@ -1291,6 +1307,15 @@ impl Service {
                                         .get(&proxy_name)
                                         .map(|info| info.local_addr.clone())
                                         .unwrap_or_else(|| format!("{}:{}", cfg.local_ip, cfg.local_port));
+                                    // Set phase to WaitStart so NewProxyResp handler
+                                    // transitions it to Running on success (Go frp compat:
+                                    // CheckFailed -> re-register -> Running).
+                                    {
+                                        let mut map = self.proxy_info_map.write().await;
+                                        if let Some(info) = map.get_mut(&proxy_name) {
+                                            info.phase = ProxyPhase::WaitStart;
+                                        }
+                                    }
                                     let new_proxy = crate::proxy::create_new_proxy_msg(&cfg, &local_addr);
                                     if let Err(e) = write_msg(&mut *writer.lock().await, &new_proxy, v2).await {
                                         warn!(proxy_name = %proxy_name, error = %e, "Failed to re-register proxy on health recovery: {}", e);
@@ -1318,14 +1343,21 @@ impl Service {
                         // 1. Do STUN discovery on a persistent UDP socket.
                         //    Go frps needs ≥2 mapped addresses for NAT classification.
                         let mut mapped_addrs = Vec::new();
-                        let stun_socket = match frp_core::stun::stun_binding_with_socket(&nat_hole_stun_server).await {
-                            Ok((sock, addr1)) => {
+                        let stun_socket = match frp_core::stun::stun_binding_with_details(&nat_hole_stun_server).await {
+                            Ok((sock, result1)) => {
+                                let addr1 = result1.mapped_addr;
                                 debug!(addr = %addr1, "XTCP STUN #1: {}", addr1);
                                 mapped_addrs.push(addr1);
-                                // Second STUN on same socket for NAT classification.
-                                match frp_core::stun::stun_binding_on_socket(&sock, &nat_hole_stun_server).await {
+                                // Use OTHER-ADDRESS as second STUN target if available
+                                // (Go frp v0.70 discovery.go:137 dual-server probing).
+                                // This gives the server a second mapped address for NAT
+                                // classification (RFC 5780, detects endpoint-independent
+                                // vs address-dependent mapping).
+                                let second_target =
+                                    result1.other_addr.as_deref().unwrap_or(&nat_hole_stun_server);
+                                match frp_core::stun::stun_binding_on_socket(&sock, second_target).await {
                                     Ok(addr2) => {
-                                        debug!(addr = %addr2, "XTCP STUN #2: {}", addr2);
+                                        debug!(addr = %addr2, "XTCP STUN #2 from '{}': {}", second_target, addr2);
                                         // Go frps NAT classifier needs ≥2 addresses.
                                         // Always push — Go frp doesn't dedup.
                                         mapped_addrs.push(addr2);

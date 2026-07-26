@@ -34,7 +34,6 @@ pub fn default_kcp_config() -> KcpConfig {
         data_shards: 10,
         parity_shards: 3,
         stream: true,
-        flush_write: true,
     }
 }
 
@@ -55,7 +54,6 @@ pub fn default_kcp_client_config() -> KcpConfig {
         data_shards: 10,
         parity_shards: 3,
         stream: true,
-        flush_write: true,
     }
 }
 

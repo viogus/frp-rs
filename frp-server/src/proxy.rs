@@ -453,6 +453,20 @@ pub fn allocate_port_multi(
         if used_ports.contains(&port) {
             return None;
         }
+        // When allow_ports ranges are configured, an explicit port must fall
+        // within at least one range (Go frp compat: Manager.Acquire checks
+        // freePorts which is populated from allowPorts ranges). Without this
+        // check, a client could bypass the port restriction by specifying a
+        // port outside the configured ranges.
+        if !ranges.is_empty() && !ranges.iter().any(|(start, end)| port >= *start && port <= *end)
+        {
+            tracing::debug!(
+                port = %port,
+                ranges = ?ranges,
+                "Explicit port {port} is not within any configured allow_ports range",
+            );
+            return None;
+        }
         if is_port_bindable(bind_addr, port) {
             used_ports.insert(port);
             return Some(port);

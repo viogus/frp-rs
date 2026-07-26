@@ -69,7 +69,7 @@ pub struct ServerConfig {
     /// Maximum number of proxies a single client can register.
     /// Max ports a single client can occupy. Default 50 to prevent port pool
     /// exhaustion; set to 0 for unlimited. Go frp compat: maxPortsPerClient.
-    #[serde(default)]
+    #[serde(default, alias = "maxPortsPerClient")]
     pub max_ports_per_client: u64,
     /// Timeout in seconds for backend HTTP response in VHost handler.
     /// Go frp compat: VhostHTTPTimeout. Default: 60.
@@ -77,7 +77,7 @@ pub struct ServerConfig {
     pub vhost_http_timeout: u64,
     /// Idle timeout in seconds on user-facing proxy connections.
     /// Go frp compat: UserConnTimeout. Default: 10.
-    #[serde(default = "default_user_conn_timeout")]
+    #[serde(default = "default_user_conn_timeout", alias = "userConnTimeout")]
     pub user_conn_timeout: u64,
     /// When true (default), internal error details are included in client-facing
     /// error responses. When false, generic messages replace full details.
@@ -120,7 +120,10 @@ pub struct ServerConfig {
     /// NAT hole analysis data retention in hours.
     /// Controls how long historical NAT behavior records are kept.
     /// Go frp compat: natholeAnalysisDataReserveHours. Default: 168 (7 days, Go frp compat).
-    #[serde(default = "default_nathole_analysis_data_reserve_hours")]
+    #[serde(
+        default = "default_nathole_analysis_data_reserve_hours",
+        alias = "natholeAnalysisDataReserveHours"
+    )]
     pub nat_hole_analysis_data_reserve_hours: u64,
     /// OpenTelemetry / observability settings.
     #[serde(default)]
@@ -1012,7 +1015,7 @@ impl Default for ClientConfig {
             tls_key_file: String::new(),
             tls_ca_file: String::new(),
             tls_server_name: String::new(),
-            disable_custom_tls_first_byte: true,
+            disable_custom_tls_first_byte: false,
             log: LogConfig::default(),
             login_fail_exit: true,
             pool_count: 1,
@@ -2397,6 +2400,9 @@ fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "tcpmuxHTTPConnectPort",
         "proxyBindAddr",
         "websocketPort",
+        "maxPortsPerClient",
+        "userConnTimeout",
+        "natholeAnalysisDataReserveHours",
     ])
 }
 

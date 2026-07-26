@@ -45,6 +45,28 @@ async fn reject_new_proxy(
     write_resp(writer, &resp, v2).await;
 }
 
+/// Check whether a UDP port is available at the OS level by attempting a bind.
+/// Immediately drops the socket if successful (just a probe).
+/// Matches Go frp's `Manager.isPortAvailable` for UDP netType.
+fn is_udp_port_bindable(bind_addr: &str, port: u16) -> bool {
+    let addr = frp_core::format_socket_addr(bind_addr, port);
+    match std::net::UdpSocket::bind(&addr) {
+        Ok(socket) => {
+            drop(socket);
+            true
+        }
+        Err(e) => {
+            tracing::debug!(
+                port = %port,
+                bind_addr = %bind_addr,
+                error = %e,
+                "UDP port {port} on '{bind_addr}' is not available at OS level: {e}",
+            );
+            false
+        }
+    }
+}
+
 /// Register a new proxy and start listening on its assigned port.
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip(state, writer, internal_tx, listener_handles, udp_sockets, udp_local_to_proxy), fields(proxy_name = %np.proxy_name, proxy_type = %np.proxy_type, run_id = %run_id))]
@@ -259,18 +281,25 @@ pub(crate) async fn handle_new_proxy(
                     None
                 }
             } else {
-                ports.insert(remote_port);
-                Some(remote_port)
+                // OS-level UDP bind probe before marking as used (Go frp compat:
+                // Manager.isPortAvailable does net.ListenUDP for UDP netType).
+                if !is_udp_port_bindable(&state.proxy_bind_addr, remote_port) {
+                    None
+                } else {
+                    ports.insert(remote_port);
+                    Some(remote_port)
+                }
             }
         } else {
             // Auto-assign: scan allow_ports ranges for first available UDP port
+            // with OS-level bind probe (Go frp compat).
             let allow_ports = state.reloadable.read_ok().allow_ports.clone();
             drop(ports); // Release write lock before re-acquiring
             let mut ports = state.used_udp_ports.write().await;
             let mut found = None;
             for &(start, end) in &allow_ports {
                 for p in start..=end {
-                    if !ports.contains(&p) {
+                    if !ports.contains(&p) && is_udp_port_bindable(&state.proxy_bind_addr, p) {
                         ports.insert(p);
                         found = Some(p);
                         break;

@@ -569,7 +569,6 @@ mod tests {
             mtu: 1400,
             wnd_size: (128, 128),
             stream: true,
-            flush_write: true,
             data_shards: 0,
             parity_shards: 0,
             nodelay: KcpNoDelayConfig {
@@ -666,7 +665,6 @@ mod tests {
             wnd_size: (128, 128),
             // Non-stream mode: each send() = one KCP output packet = one FEC data shard.
             stream: false,
-            flush_write: true,
             data_shards: 3,
             parity_shards: 2,
             nodelay: KcpNoDelayConfig {
