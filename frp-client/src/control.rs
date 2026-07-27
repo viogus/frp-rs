@@ -360,6 +360,8 @@ impl ControlConnection {
                     TransportProtocol::Kcp => "KCP",
                     #[cfg(feature = "websocket")]
                     TransportProtocol::WebSocket => "WebSocket",
+                    #[cfg(feature = "websocket")]
+                    TransportProtocol::Wss => "WSS",
                     #[allow(unreachable_patterns)]
                     _ => "unknown",
                 }

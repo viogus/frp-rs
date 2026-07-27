@@ -144,6 +144,14 @@ pub(crate) async fn handle_visitor_conn_inner(
     // down, the control handler may no longer be accepting messages and the
     // visitor connection would be silently dropped. Return an error immediately
     // so the visitor can retry against a healthy server.
+    //
+    // NOTE: This check may produce false-positive rejections during the drain
+    // phase. The CancellationToken fires before individual control handlers
+    // finish draining, so a visitor arriving during drain can be rejected even
+    // though the control handler is still processing VisitorConn messages.
+    // This is acceptable defense-in-depth: the visitor receives a clean error
+    // response ("server shutting down") and retries, which is better than
+    // silently dropping the connection with no response.
     if state.shutdown_token.is_cancelled() {
         warn!(
             proxy_name = %proxy_name, run_id = %run_id,
