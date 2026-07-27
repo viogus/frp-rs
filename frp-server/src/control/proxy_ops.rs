@@ -275,7 +275,7 @@ pub(crate) async fn handle_new_proxy(
             drop(ports); // Release write lock before re-acquiring
             let mut ports = state.used_udp_ports.write().await;
             let mut found = None;
-            for &(start, end) in &allow_ports {
+            for &(start, end) in allow_ports.iter() {
                 for p in start..=end {
                     if !ports.contains(&p) && is_udp_port_bindable(&state.proxy_bind_addr, p) {
                         ports.insert(p);
@@ -1012,16 +1012,11 @@ async fn tcp_group_listener(
                         // round-robin across ALL group members regardless of key.
                         // The key-based affinity is maintained per-proxy via the
                         // existing handle_proxy_user_conn group dispatch in pool.rs.
-                        if let Some(backend) = state
+                        if let Some((backend, backend_run_id)) = state
                             .proxy_manager
-                            .select_group_backend(&group_name, "")
+                            .select_group_backend_with_run_id(&group_name, "")
                             .await
                         {
-                            let backend_run_id = state
-                                .proxy_manager
-                                .get_run_id(&backend)
-                                .await
-                                .unwrap_or_default();
                             let ctl_tx = {
                                 let map = state.run_id_to_ctl_tx.read().await;
                                 map.get(&backend_run_id).map(|c| c.tx.clone())

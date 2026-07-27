@@ -382,18 +382,12 @@ pub(crate) async fn handle_proxy_user_conn<W: AsyncWriteExt + Unpin>(
             .and_then(|p| p.group_key.clone())
             .unwrap_or_default();
         if let Some(ref group_name) = group {
-            if let Some(backend) = ctx
+            if let Some((backend, backend_run_id)) = ctx
                 .state
                 .proxy_manager
-                .select_group_backend(group_name, &group_key)
+                .select_group_backend_with_run_id(group_name, &group_key)
                 .await
             {
-                let backend_run_id = ctx
-                    .state
-                    .proxy_manager
-                    .get_run_id(&backend)
-                    .await
-                    .unwrap_or_default();
                 info!(proxy_name = %proxy_name, backend = %backend, backend_run_id = %backend_run_id, "Group LB: {} -> backend {} (run_id {})", proxy_name, backend, backend_run_id);
                 (backend, backend_run_id)
             } else {

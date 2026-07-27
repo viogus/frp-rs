@@ -222,23 +222,10 @@ pub(crate) async fn handle_nat_hole_resp(
     // Go frp XTCP compat: visitor needs provider's candidate addresses
     // for TCP simultaneous open.
     let tid = &resp_msg.transaction_id;
-    // Try control-channel path first.
-    if ctx
-        .state
-        .xtcp
-        .nat_hole
-        .forward_nat_hole_resp_via_ctl(
-            tid,
-            resp_msg.error.clone(),
-            resp_msg.sid.clone(),
-            resp_msg.protocol.clone(),
-            resp_msg.candidate_addrs.clone(),
-            resp_msg.assisted_addrs.clone(),
-        )
-        .await
-    {
-        debug!(tid = %tid, "Forwarded NatHoleResp via control channel for {}", tid);
-    } else if let Some(mut accept_writer) = ctx.state.xtcp.nat_hole.take_writer(tid).await {
+    // Try accept-writer path first (cheap: take_writer takes &str, no clones needed).
+    // A session has either a writer OR a ctl_tx (never both), so the order
+    // doesn't change behavior — exactly one path will succeed.
+    if let Some(mut accept_writer) = ctx.state.xtcp.nat_hole.take_writer(tid).await {
         let forward = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
             transaction_id: tid.clone(),
             error: resp_msg.error.clone(),
@@ -254,6 +241,21 @@ pub(crate) async fn handle_nat_hole_resp(
             .nat_hole
             .return_writer(tid, accept_writer)
             .await;
+    } else if ctx
+        .state
+        .xtcp
+        .nat_hole
+        .forward_nat_hole_resp_via_ctl(
+            tid,
+            resp_msg.error.clone(),
+            resp_msg.sid.clone(),
+            resp_msg.protocol.clone(),
+            resp_msg.candidate_addrs.clone(),
+            resp_msg.assisted_addrs.clone(),
+        )
+        .await
+    {
+        debug!(tid = %tid, "Forwarded NatHoleResp via control channel for {}", tid);
     } else {
         warn!(tid = %tid, "NatHoleResp for unknown session {}", tid);
     }

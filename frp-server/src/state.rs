@@ -120,7 +120,7 @@ pub struct ControlTx {
 pub struct ReloadableState {
     pub auth_cfg: Arc<AuthConfig>,
     pub encryption_key: [u8; 16],
-    pub allow_ports: Vec<(u16, u16)>,
+    pub allow_ports: Arc<Vec<(u16, u16)>>,
     pub additional_auth_scopes: Vec<String>,
 }
 
@@ -446,7 +446,7 @@ impl AppState {
             reloadable: Arc::new(std::sync::RwLock::new(ReloadableState {
                 auth_cfg: Arc::new(auth_cfg.clone()),
                 encryption_key,
-                allow_ports,
+                allow_ports: Arc::new(allow_ports),
                 additional_auth_scopes: auth_cfg.additional_auth_scopes.clone(),
             })),
             used_ports: Arc::new(RwLock::new(std::collections::HashSet::new())),
