@@ -194,8 +194,15 @@ impl VhostManager {
                 .entry(route_by_http_user.to_string())
                 .or_default();
             vrs.push(route.clone());
-            sort_by_longest_location(vrs);
             domain_entries.push((domain.clone(), route_by_http_user.to_string()));
+        }
+        // Sort once after all domain insertions (was O(N) per registration).
+        for domain in domains {
+            if let Some(user_map) = tables.routes.get_mut(domain) {
+                if let Some(vrs) = user_map.get_mut(route_by_http_user) {
+                    sort_by_longest_location(vrs);
+                }
+            }
         }
         if !domain_entries.is_empty() {
             tables
@@ -213,8 +220,15 @@ impl VhostManager {
                 .entry(route_by_http_user.to_string())
                 .or_default();
             vrs.push(route.clone());
-            sort_by_longest_location(vrs);
             loc_entries.push((loc.clone(), route_by_http_user.to_string()));
+        }
+        // Sort once after all location insertions.
+        for loc in locations {
+            if let Some(user_map) = tables.location_routes.get_mut(loc) {
+                if let Some(vrs) = user_map.get_mut(route_by_http_user) {
+                    sort_by_longest_location(vrs);
+                }
+            }
         }
         if !loc_entries.is_empty() {
             tables
