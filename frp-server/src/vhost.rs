@@ -304,7 +304,12 @@ impl VhostManager {
     /// Look up by domain (exact match) with path prefix matching.
     /// Tries httpUser-specific routes first, then falls back to empty-string httpUser
     /// (matching Go frp's `getLocked` → `getExactOrAllUsersLocked`).
-    pub async fn lookup(&self, domain: &str, path: &str, http_user: &str) -> Option<VhostRouteMatch> {
+    pub async fn lookup(
+        &self,
+        domain: &str,
+        path: &str,
+        http_user: &str,
+    ) -> Option<VhostRouteMatch> {
         let tables = self.inner.read().await;
         get_locked(&tables.routes, domain, path, http_user)
     }

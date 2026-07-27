@@ -189,8 +189,7 @@ impl ProxyManager {
                 let mut health = self.group_health.write().await;
                 health.remove(name);
                 if health.is_empty() {
-                    self.health_tracking_active
-                        .store(false, Ordering::Release);
+                    self.health_tracking_active.store(false, Ordering::Release);
                 }
             }
             drop(proxies);
@@ -283,8 +282,7 @@ impl ProxyManager {
     /// (3), the backend is marked `Unhealthy`. It recovers after `HEALTH_COOLDOWN`
     /// (30s) or on the next successful connection via `report_backend_success`.
     pub async fn report_backend_failure(&self, name: &str) {
-        self.health_tracking_active
-            .store(true, Ordering::Release);
+        self.health_tracking_active.store(true, Ordering::Release);
         let mut health = self.group_health.write().await;
         let entry = health
             .entry(name.to_string())
@@ -308,8 +306,7 @@ impl ProxyManager {
         let mut health = self.group_health.write().await;
         health.remove(name);
         if health.is_empty() {
-            self.health_tracking_active
-                .store(false, Ordering::Release);
+            self.health_tracking_active.store(false, Ordering::Release);
         }
     }
 
