@@ -1349,71 +1349,70 @@ impl IoStream {
         use tokio::io::AsyncWriteExt;
         match self {
             IoStream::Tcp(s) => {
-                crate::protocol::write_msg_v2(s, msg).await?;
-                s.flush()
-                    .await
-                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
+                // TCP_NODELAY is set on every TcpStream in the data path;
+                // the kernel sends immediately after write. Flush is a no-op.
+                crate::protocol::write_msg_v2_inner(s, msg).await?;
             }
             #[cfg(feature = "tls")]
             IoStream::Tls(s, _) => {
-                crate::protocol::write_msg_v2(s, msg).await?;
+                crate::protocol::write_msg_v2_inner(s, msg).await?;
                 s.flush()
                     .await
                     .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
             }
             #[cfg(feature = "kcp")]
             IoStream::Kcp(s) => {
-                crate::protocol::write_msg_v2(s, msg).await?;
+                crate::protocol::write_msg_v2_inner(s, msg).await?;
                 s.flush()
                     .await
                     .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
             }
             #[cfg(feature = "quic")]
             IoStream::Quic(s) => {
-                crate::protocol::write_msg_v2(s, msg).await?;
+                crate::protocol::write_msg_v2_inner(s, msg).await?;
                 s.flush()
                     .await
                     .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
             }
             #[cfg(feature = "websocket")]
             IoStream::WebSocket(s) => {
-                crate::protocol::write_msg_v2(s, msg).await?;
+                crate::protocol::write_msg_v2_inner(s, msg).await?;
                 s.flush()
                     .await
                     .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
             }
             IoStream::Yamux(s) => {
-                crate::protocol::write_msg_v2(s, msg).await?;
+                crate::protocol::write_msg_v2_inner(s, msg).await?;
                 s.flush()
                     .await
                     .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
             }
             IoStream::Cipher(s) => {
-                crate::protocol::write_msg_v2(s, msg).await?;
+                crate::protocol::write_msg_v2_inner(s, msg).await?;
                 s.flush()
                     .await
                     .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
             }
             IoStream::Aead(s) => {
-                crate::protocol::write_msg_v2(s, msg).await?;
+                crate::protocol::write_msg_v2_inner(s, msg).await?;
                 s.flush()
                     .await
                     .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
             }
             IoStream::SshChannel(s) => {
-                crate::protocol::write_msg_v2(s, msg).await?;
+                crate::protocol::write_msg_v2_inner(s, msg).await?;
                 s.flush()
                     .await
                     .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
             }
             IoStream::PreRead(_, s) => {
-                crate::protocol::write_msg_v2(s, msg).await?;
+                crate::protocol::write_msg_v2_inner(s, msg).await?;
                 s.flush()
                     .await
                     .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
             }
             IoStream::BufferedRead(_, _, inner) => {
-                crate::protocol::write_msg_v2(inner.as_mut(), msg).await?;
+                crate::protocol::write_msg_v2_inner(inner.as_mut(), msg).await?;
                 inner
                     .flush()
                     .await
