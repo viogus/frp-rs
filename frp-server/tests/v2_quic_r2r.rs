@@ -1,3 +1,4 @@
+#![cfg(feature = "quic")]
 //! Rust↔Rust V2+QUIC compatibility test.
 //!
 //! Verifies: V2 handshake (ClientHello/ServerHello) + AEAD crypto +
