@@ -315,7 +315,7 @@ impl VhostManager {
             if let Some(route) = get_locked(&tables.routes, &wildcard_host, path, http_user) {
                 return Some(route);
             }
-            parts = parts[1..].to_vec();
+            parts.remove(0);
         }
         // 3. Catch-all "*"
         get_locked(&tables.routes, "*", path, http_user)
