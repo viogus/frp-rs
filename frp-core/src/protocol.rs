@@ -253,11 +253,6 @@ pub fn deserialize_v1(type_byte: u8, payload: &[u8]) -> Result<FrpMessage, crate
         msg::TYPE_NEW_VISITOR_CONN_RESP => deser_msg!(payload, NewVisitorConnResp, ""),
         msg::TYPE_UDP_PACKET => deser_msg!(payload, UDPPacket, ""),
         msg::TYPE_NAT_HOLE_VISITOR => {
-            tracing::debug!(
-                payload_text = %String::from_utf8_lossy(payload),
-                "NatHoleVisitor raw payload: {}",
-                String::from_utf8_lossy(payload)
-            );
             let v: msg::NatHoleVisitor = serde_json::from_slice(payload).map_err(|e| {
                 crate::Error::Protocol(format!("deserialize NatHoleVisitor: {e}").into())
             })?;
