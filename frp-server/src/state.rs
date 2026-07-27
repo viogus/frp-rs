@@ -580,7 +580,7 @@ impl AppState {
     /// completeLogin/remove) happens at a time for a given run_id. It is
     /// inherited by new control connections when they supersede old ones.
     pub fn get_run_mu(&self, run_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.run_mu_map.lock().unwrap();
+        let mut map = self.run_mu_map.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(run_id.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
