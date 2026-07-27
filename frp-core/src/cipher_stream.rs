@@ -145,7 +145,7 @@ pub struct CipherReader<R: AsyncRead + Unpin> {
     inner: R,
     key: [u8; 16],
     cfb: Option<CfbState>,
-    iv_buf: Vec<u8>,
+    iv_buf: [u8; 16],
     iv_read: usize,
 }
 
@@ -155,7 +155,7 @@ impl<R: AsyncRead + Unpin> CipherReader<R> {
             inner,
             key,
             cfb: None,
-            iv_buf: vec![0u8; 16],
+            iv_buf: [0u8; 16],
             iv_read: 0,
         }
     }
@@ -551,7 +551,7 @@ pub struct CipherStream<S: AsyncRead + AsyncWrite + Unpin> {
     read_cfb: Option<CfbState>,
     write_cfb: Option<CfbState>,
     iv_read: usize,
-    iv_buf: Vec<u8>,
+    iv_buf: [u8; 16],
     iv_sent: bool,
     write_iv: [u8; 16],
     /// Buffered first write for partial-write retry safety.
@@ -582,7 +582,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> CipherStream<S> {
             read_cfb: None,
             write_cfb: None,
             iv_read: 0,
-            iv_buf: vec![0u8; 16],
+            iv_buf: [0u8; 16],
             iv_sent: false,
             write_iv,
             first_write_buf: None,
