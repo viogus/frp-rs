@@ -116,7 +116,7 @@ fn build_auth_config(
         oidc_proxy_url: auth.oidc_proxy_url.clone(),
         additional_auth_scopes: auth.additional_auth_scopes.clone(),
         authentication_timeout: auth.authentication_timeout,
-        token_auth_timeout: true,
+        token_auth_timeout: auth.token_auth_timeout,
         use_encryption: auth.use_encryption,
     }
 }

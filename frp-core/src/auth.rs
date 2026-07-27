@@ -93,9 +93,9 @@ pub struct AuthConfig {
     /// are rejected. Set to 0 to disable timestamp verification (accepts
     /// any timestamp, weakening replay protection).
     ///
-    /// Go frp v0.70.0 default: 900 (15 minutes). This implementation defaults
-    /// to 300 seconds (5 minutes) — token auth path does not check freshness
-    /// (matching Go behavior); OIDC path uses this timeout for JWT validation.
+    /// Go frp has no `authentication_timeout` equivalent (timestamp freshness
+    /// is not checked in the token auth path). The config default is 0
+    /// (disabled). When set, OIDC uses this for JWT expiry validation.
     /// Go frp compat: authentication_timeout.
     pub authentication_timeout: i64,
     /// When true (default), token auth validates timestamp freshness and
