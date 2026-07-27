@@ -452,15 +452,16 @@ mod oidc_impl {
             let alg = header.alg;
             let kid = header.kid.clone();
 
-            // Restrict to known asymmetric algorithms only. Symmetric algorithms
-            // (HS256, HS384, HS512) are excluded because they use a shared secret
-            // rather than a public/private key pair. When verifying against JWKS
-            // public keys (used by OIDC), allowing HMAC-based algorithms creates
-            // an algorithm confusion attack surface: an attacker who knows the
-            // public key could forge tokens using the public key as the HMAC secret.
-            // This allowlist is defense-in-depth on top of jsonwebtoken's own
-            // algorithm-vs-key-type verification.
+            // Allowlist of known JWT algorithms. Includes symmetric HMAC algorithms
+            // (HS256, HS384, HS512) for oct-key use cases (shared secret JWKs).
+            // Algorithm confusion (e.g. HS256 with RSA public key) is prevented by
+            // jsonwebtoken's algorithm-vs-key-type verification: an RSA key cannot
+            // verify an HMAC signature and vice versa. This allowlist provides
+            // defense-in-depth on top of that library-level check.
             const ALLOWED_ALGS: &[jsonwebtoken::Algorithm] = &[
+                jsonwebtoken::Algorithm::HS256,
+                jsonwebtoken::Algorithm::HS384,
+                jsonwebtoken::Algorithm::HS512,
                 jsonwebtoken::Algorithm::RS256,
                 jsonwebtoken::Algorithm::RS384,
                 jsonwebtoken::Algorithm::RS512,
