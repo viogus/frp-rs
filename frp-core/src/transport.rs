@@ -1349,9 +1349,10 @@ impl IoStream {
         use tokio::io::AsyncWriteExt;
         match self {
             IoStream::Tcp(s) => {
-                // TCP_NODELAY is set on every TcpStream in the data path;
-                // the kernel sends immediately after write. Flush is a no-op.
                 crate::protocol::write_msg_v2_inner(s, msg).await?;
+                s.flush()
+                    .await
+                    .map_err(|e| crate::Error::Transport(format!("flush: {e}").into()))?;
             }
             #[cfg(feature = "tls")]
             IoStream::Tls(s, _) => {
