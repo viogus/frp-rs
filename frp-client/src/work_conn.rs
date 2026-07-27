@@ -589,6 +589,8 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                         if let Ok(ip) = ra.ip.parse::<std::net::IpAddr>() {
                                             *last_remote_r.lock().unwrap() =
                                                 Some(std::net::SocketAddr::new(ip, ra.port));
+                                        } else {
+                                            tracing::warn!(ip = %ra.ip, port = ra.port, "UDP packet: unparseable remote IP, keeping previous last_remote");
                                         }
                                     }
                                     let n = up.content.len();

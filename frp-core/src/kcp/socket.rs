@@ -403,9 +403,14 @@ impl KcpSocket {
                                             "KCP: accept channel full, dropping new session"
                                         );
                                         // Clean up the partially-created session.
+                                        // peer_addr_index is NOT removed here: the
+                                        // session was never inserted (insertion happens
+                                        // only after successful try_send below). Removing
+                                        // it would clobber the reverse-index entry of a
+                                        // sibling session sharing the same SocketAddr,
+                                        // silently dropping their FEC parity shards.
                                         self.sessions.remove(&key);
                                         self.conv_index.remove(&key.0);
-                                        self.peer_addr_index.remove(&key.1);
                                         let ip = key.1.ip();
                                         if let Some(count) = self.peer_session_counts.get_mut(&ip) {
                                             *count = count.saturating_sub(1);
