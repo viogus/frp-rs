@@ -124,10 +124,11 @@ fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     // configured max_stream_window_size without allowing all 256
     // streams to simultaneously consume their full window (which
     // would risk OOM at 1.5 GiB), set the connection receive window
-    // to max_stream_window_size * 64 = 384 MiB — still generous but
-    // far below the 1.5 GiB OOM risk zone.
+    // to max_stream_window_size * 32 = 192 MiB — moderate increase
+    	    // from old 128 MiB, still accommodates the larger per-stream window
+	    // window without memory exhaustion risk.
     let stream_window = tcp_mux_cfg.max_stream_window_size as usize;
-    cfg.set_max_connection_receive_window(Some(stream_window * 64));
+    cfg.set_max_connection_receive_window(Some(stream_window * 32));
     // NOTE: yamux 0.14.0 does not expose set_keepalive_interval on Config.
     // max_num_streams not set — uses yamux-rs default (8192) vs Go's unlimited.
     // 8192 accommodates high concurrent workloads (HTTP proxy, long-lived streams)
