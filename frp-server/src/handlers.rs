@@ -801,6 +801,77 @@ pub(crate) async fn dispatch_v1_message(
 // Work connection handler
 // ---------------------------------------------------------------
 
+/// Validate NewWorkConn credentials (privilege_key + timestamp) for both
+/// standalone TCP work connections and yamux-stream work connections.
+///
+/// Go frp v0.69.1 compat: always attempt work connection auth verification.
+/// Go's RegisterWorkConn unconditionally calls AuthVerifier.VerifyNewWorkConn
+/// — the verifier decides whether to enforce based on additional_auth_scopes.
+///
+/// When "NewWorkConns" is NOT in the scope, we skip verification only if no
+/// privilege_key was sent (backward compat). If a key IS present, it must be
+/// valid — this catches invalid credentials even when the scope is not
+/// configured. When the scope IS set, a privilege_key is always required.
+#[instrument(skip(state), fields(run_id = %run_id))]
+pub(crate) async fn validate_new_work_conn_auth(
+    msg: &msg::NewWorkConn,
+    run_id: &str,
+    state: &AppState,
+) -> Result<(), String> {
+    let nwc_auth_scope = state
+        .reloadable
+        .read_ok()
+        .additional_auth_scopes
+        .iter()
+        .any(|s| s == "NewWorkConns");
+    let has_key = msg
+        .privilege_key
+        .as_deref()
+        .map(|k| !k.is_empty())
+        .unwrap_or(false);
+
+    if !has_key && !nwc_auth_scope {
+        // No key sent and scope does not require it — skip auth.
+        return Ok(());
+    }
+    if let Some(ref verifier) = state.oidc.verifier {
+        let expected_sub = state
+            .oidc
+            .subjects
+            .read()
+            .await
+            .get(run_id)
+            .cloned()
+            .unwrap_or_default();
+        verifier
+            .verify_new_work_conn(msg.privilege_key.as_deref().unwrap_or(""), &expected_sub)
+            .await
+    } else {
+        state
+            .reloadable
+            .read_ok()
+            .auth_cfg
+            .validate_login(msg.privilege_key.as_deref(), msg.timestamp)
+            .map(|_| ())
+    }
+}
+
+/// Run the NewWorkConn plugin hook. Returns `Err(reason)` if a plugin
+/// rejects the connection.
+#[instrument(skip(state), fields(run_id = %run_id))]
+pub(crate) async fn run_new_work_conn_plugin(
+    run_id: &str,
+    state: &AppState,
+) -> Result<(), String> {
+    let nwc_content = serde_json::json!({
+        "run_id": run_id,
+    });
+    state
+        .plugin_manager
+        .notify("new_work_conn", nwc_content)
+        .await
+}
+
 /// Handle an incoming work connection. Verifies auth, then routes the
 /// IoStream to the appropriate control handler via InternalMsg.
 #[instrument(skip(stream, state), fields(run_id = %msg.run_id.clone().unwrap_or_default()))]
@@ -817,65 +888,13 @@ pub(crate) async fn handle_work_conn_inner(
         }
     };
 
-    // Go frp v0.69.1 compat: always attempt work connection auth
-    // verification. Go's RegisterWorkConn unconditionally calls
-    // AuthVerifier.VerifyNewWorkConn(newMsg) — the verifier decides
-    // whether to enforce based on additional_auth_scopes.
-    //
-    // When "NewWorkConns" is NOT in the scope, we skip verification
-    // only if no privilege_key was sent (backward compat). If a key
-    // IS present, it must be valid — this catches invalid credentials
-    // even when the scope is not configured. When the scope IS set,
-    // a privilege_key is always required.
-    let nwc_auth_scope = state
-        .reloadable
-        .read_ok()
-        .additional_auth_scopes
-        .iter()
-        .any(|s| s == "NewWorkConns");
-    let has_key = msg
-        .privilege_key
-        .as_deref()
-        .map(|k| !k.is_empty())
-        .unwrap_or(false);
-
-    let nwc_auth_result = if !has_key && !nwc_auth_scope {
-        // No key sent and scope does not require it — skip auth.
-        Ok(())
-    } else if let Some(ref verifier) = state.oidc.verifier {
-        let expected_sub = state
-            .oidc
-            .subjects
-            .read()
-            .await
-            .get(&run_id)
-            .cloned()
-            .unwrap_or_default();
-        verifier
-            .verify_new_work_conn(msg.privilege_key.as_deref().unwrap_or(""), &expected_sub)
-            .await
-    } else {
-        state
-            .reloadable
-            .read_ok()
-            .auth_cfg
-            .validate_login(msg.privilege_key.as_deref(), msg.timestamp)
-            .map(|_| ())
-    };
-    if let Err(e) = nwc_auth_result {
+    if let Err(e) = validate_new_work_conn_auth(&msg, &run_id, &state).await {
         warn!(run_id = %run_id, error = %e, "Work conn auth failed for run_id {}: {}", run_id, e);
         return;
     }
 
     // NewWorkConn plugin hook — control-enabled plugins can reject
-    let nwc_content = serde_json::json!({
-        "run_id": run_id,
-    });
-    if let Err(reason) = state
-        .plugin_manager
-        .notify("new_work_conn", nwc_content)
-        .await
-    {
+    if let Err(reason) = run_new_work_conn_plugin(&run_id, &state).await {
         warn!(run_id = %run_id, reason = %reason, "NewWorkConn plugin hook rejected: {}", reason);
         return;
     }
