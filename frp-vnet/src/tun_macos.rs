@@ -22,8 +22,13 @@ pub struct MacOSTun {
     mtu: AtomicU16,
 }
 
-// SAFETY: AsyncFd<OwnedFd> is Send + Sync on Unix; AtomicU16 is Sync.
-unsafe impl Send for MacOSTun {}
+// SAFETY: Rust auto-derives Send — all fields are Send (AsyncFd<OwnedFd> is
+// Send+Sync on Unix; AtomicU16 is Sync). This static assertion catches any
+// future non-Send field addition at compile time.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<MacOSTun>();
+};
 
 impl MacOSTun {
     pub async fn open(requested_name: &str) -> anyhow::Result<Box<dyn TunDevice>> {

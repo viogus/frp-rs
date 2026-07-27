@@ -394,6 +394,20 @@ pub struct AppState {
     pub shutdown_token: CancellationToken,
     /// Active bridge connection counter. Incremented when a bridge task starts,
     /// decremented when it completes. The drain phase polls this counter.
+    ///
+    /// This counter is shared between two independent subsystems:
+    /// 1. Bridge tasks (control/bridge.rs ActiveGuard RAII) — increment on start,
+    ///    decrement on drop.
+    /// 2. Pool idle expiry (control/pool.rs) — when the work-conn pool expires
+    ///    idle connections, the associated bridge tasks drop their ActiveGuards,
+    ///    which decrements this counter.
+    ///
+    /// During the drain phase, pool idle expiry may run concurrently with bridge
+    /// task completion, causing the counter to fluctuate. The drain loop handles
+    /// this by polling repeatedly (with the graceful_shutdown_timeout as a hard
+    /// deadline) until the counter reaches zero or the timeout expires. Brief
+    /// counter increases from new connections started just before the accept
+    /// loop shut down are expected and handled.
     pub active_connections: AtomicU64,
     /// Aggregate work-conn pool metrics (hits/misses/drops/idle_timeout).
     /// Updated atomically from control handlers, read by Prometheus /admin API.

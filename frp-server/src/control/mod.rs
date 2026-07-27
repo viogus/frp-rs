@@ -224,6 +224,27 @@ pub async fn handle_control<S>(
                                 debug!(expected_run_id = %run_id, got_run_id = %stream_run_id, "Yamux work conn run_id mismatch: expected {run_id}, got {stream_run_id}");
                                 continue;
                             }
+                            // Validate NewWorkConn credentials (privilege_key + timestamp).
+                            // Standalone TCP work connections go through handle_work_conn_inner
+                            // which validates auth. Yamux work connections must apply the
+                            // same validation — without it, tcp_mux (default on) creates an
+                            // auth bypass: yamux streams skip NewWorkConn verification that
+                            // standalone TCP work connections require.
+                            if let Err(e) = crate::handlers::validate_new_work_conn_auth(
+                                &nwc, &run_id, &state,
+                            )
+                            .await
+                            {
+                                warn!(run_id = %run_id, error = %e, "Yamux work conn auth failed for {run_id}: {e}");
+                                continue;
+                            }
+                            // NewWorkConn plugin hook — control-enabled plugins can reject
+                            if let Err(reason) =
+                                crate::handlers::run_new_work_conn_plugin(&run_id, &state).await
+                            {
+                                warn!(run_id = %run_id, reason = %reason, "Yamux work conn plugin hook rejected: {reason}");
+                                continue;
+                            }
                         }
                         Ok(other) => {
                             debug!(run_id = %run_id, msg_type = ?other.v1_type_byte(), "Unexpected yamux stream message for {run_id}: {:?}", other.v1_type_byte());
@@ -258,6 +279,19 @@ pub async fn handle_control<S>(
                 info!(run_id = %run_id, "Graceful shutdown: draining control handler for {}", run_id);
                 break;
             }
+        }
+    }
+
+    // Drain buffered internal messages after supersession Shutdown.
+    // When the old control handler breaks on Shutdown (replaced by a new
+    // control connection for the same run_id), messages already queued in
+    // internal_rx (up to 1024 — VisitorConn, ProxyUserConn, NewWorkConn)
+    // are processed before cleanup. Without this drain, those connections
+    // receive TCP RST instead of clean error responses.
+    if ctl.shutting_down {
+        while let Ok(msg) = internal_rx.try_recv() {
+            debug!(run_id = %run_id, "Draining buffered internal message after supersession Shutdown");
+            let _ = dispatch::dispatch_internal(&mut ctx, &mut ctl, &mut writer, msg).await;
         }
     }
 

@@ -140,6 +140,32 @@ pub(crate) async fn handle_visitor_conn_inner(
         }
     }
 
+    // Check for graceful shutdown before proceeding — if the server is shutting
+    // down, the control handler may no longer be accepting messages and the
+    // visitor connection would be silently dropped. Return an error immediately
+    // so the visitor can retry against a healthy server.
+    //
+    // NOTE: This check may produce false-positive rejections during the drain
+    // phase. The CancellationToken fires before individual control handlers
+    // finish draining, so a visitor arriving during drain can be rejected even
+    // though the control handler is still processing VisitorConn messages.
+    // This is acceptable defense-in-depth: the visitor receives a clean error
+    // response ("server shutting down") and retries, which is better than
+    // silently dropping the connection with no response.
+    if state.shutdown_token.is_cancelled() {
+        warn!(
+            proxy_name = %proxy_name, run_id = %run_id,
+            "STCP visitor for proxy '{}' rejected: server is shutting down",
+            proxy_name
+        );
+        let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
+            proxy_name: proxy_name.clone(),
+            error: Some("server shutting down".into()),
+        });
+        let _ = write_msg(&mut stream, &resp, v2).await;
+        return;
+    }
+
     let ctl_tx = {
         let map = state.run_id_to_ctl_tx.read().await;
         map.get(&run_id).cloned()
@@ -426,17 +452,37 @@ pub(crate) async fn handle_nat_hole_visitor(
     // The provider reads NatHoleSid from the work connection, does its own STUN,
     // and sends NatHoleClient back on its control connection with its mapped addresses.
     // handle_client() signals notify_ch when the provider's response arrives.
-    if ctl_tx
-        .tx
-        .try_send(InternalMsg::NatHoleSidOnWorkConn {
+    //
+    // Use send().await with a 5s timeout instead of try_send(). try_send() conflates
+    // two distinct failure modes:
+    //   - Channel full (temporary backpressure): the provider is alive but busy.
+    //     try_send() returns TrySendError::Full, but is_err() discards the variant.
+    //   - Provider disconnected (permanent): the channel is closed. try_send()
+    //     returns TrySendError::Closed.
+    // With send().await + timeout we wait briefly for capacity, and can distinguish
+    // timeout from SendError in the log message.
+    let send_result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ctl_tx.tx.send(InternalMsg::NatHoleSidOnWorkConn {
             sid: sid.clone(),
             proxy_name: proxy_name.clone(),
-        })
-        .is_err()
-    {
-        warn!(run_id = %run_id, "Provider for run_id {} has gone away", run_id);
-        state.xtcp.nat_hole.remove(&transaction_id).await;
-        return;
+        }),
+    )
+    .await;
+    match send_result {
+        Ok(Ok(())) => {
+            // Message delivered successfully.
+        }
+        Ok(Err(_send_err)) => {
+            warn!(run_id = %run_id, "Provider for run_id {} has disconnected (channel closed)", run_id);
+            state.xtcp.nat_hole.remove(&transaction_id).await;
+            return;
+        }
+        Err(_elapsed) => {
+            warn!(run_id = %run_id, "Provider for run_id {} is overloaded (channel full for 5s)", run_id);
+            state.xtcp.nat_hole.remove(&transaction_id).await;
+            return;
+        }
     }
 
     info!(
@@ -801,32 +847,23 @@ pub(crate) async fn dispatch_v1_message(
 // Work connection handler
 // ---------------------------------------------------------------
 
-/// Handle an incoming work connection. Verifies auth, then routes the
-/// IoStream to the appropriate control handler via InternalMsg.
-#[instrument(skip(stream, state), fields(run_id = %msg.run_id.clone().unwrap_or_default()))]
-pub(crate) async fn handle_work_conn_inner(
-    stream: IoStream,
-    msg: msg::NewWorkConn,
-    state: Arc<AppState>,
-) {
-    let run_id = match msg.run_id {
-        Some(id) => id,
-        None => {
-            warn!("NewWorkConn without run_id, ignoring");
-            return;
-        }
-    };
-
-    // Go frp v0.69.1 compat: always attempt work connection auth
-    // verification. Go's RegisterWorkConn unconditionally calls
-    // AuthVerifier.VerifyNewWorkConn(newMsg) — the verifier decides
-    // whether to enforce based on additional_auth_scopes.
-    //
-    // When "NewWorkConns" is NOT in the scope, we skip verification
-    // only if no privilege_key was sent (backward compat). If a key
-    // IS present, it must be valid — this catches invalid credentials
-    // even when the scope is not configured. When the scope IS set,
-    // a privilege_key is always required.
+/// Validate NewWorkConn credentials (privilege_key + timestamp) for both
+/// standalone TCP work connections and yamux-stream work connections.
+///
+/// Go frp v0.69.1 compat: always attempt work connection auth verification.
+/// Go's RegisterWorkConn unconditionally calls AuthVerifier.VerifyNewWorkConn
+/// — the verifier decides whether to enforce based on additional_auth_scopes.
+///
+/// When "NewWorkConns" is NOT in the scope, we skip verification only if no
+/// privilege_key was sent (backward compat). If a key IS present, it must be
+/// valid — this catches invalid credentials even when the scope is not
+/// configured. When the scope IS set, a privilege_key is always required.
+#[instrument(skip(state), fields(run_id = %run_id))]
+pub(crate) async fn validate_new_work_conn_auth(
+    msg: &msg::NewWorkConn,
+    run_id: &str,
+    state: &AppState,
+) -> Result<(), String> {
     let nwc_auth_scope = state
         .reloadable
         .read_ok()
@@ -839,16 +876,17 @@ pub(crate) async fn handle_work_conn_inner(
         .map(|k| !k.is_empty())
         .unwrap_or(false);
 
-    let nwc_auth_result = if !has_key && !nwc_auth_scope {
+    if !has_key && !nwc_auth_scope {
         // No key sent and scope does not require it — skip auth.
-        Ok(())
-    } else if let Some(ref verifier) = state.oidc.verifier {
+        return Ok(());
+    }
+    if let Some(ref verifier) = state.oidc.verifier {
         let expected_sub = state
             .oidc
             .subjects
             .read()
             .await
-            .get(&run_id)
+            .get(run_id)
             .cloned()
             .unwrap_or_default();
         verifier
@@ -861,21 +899,45 @@ pub(crate) async fn handle_work_conn_inner(
             .auth_cfg
             .validate_login(msg.privilege_key.as_deref(), msg.timestamp)
             .map(|_| ())
+    }
+}
+
+/// Run the NewWorkConn plugin hook. Returns `Err(reason)` if a plugin
+/// rejects the connection.
+#[instrument(skip(state), fields(run_id = %run_id))]
+pub(crate) async fn run_new_work_conn_plugin(run_id: &str, state: &AppState) -> Result<(), String> {
+    let nwc_content = serde_json::json!({
+        "run_id": run_id,
+    });
+    state
+        .plugin_manager
+        .notify("new_work_conn", nwc_content)
+        .await
+}
+
+/// Handle an incoming work connection. Verifies auth, then routes the
+/// IoStream to the appropriate control handler via InternalMsg.
+#[instrument(skip(stream, state), fields(run_id = %msg.run_id.clone().unwrap_or_default()))]
+pub(crate) async fn handle_work_conn_inner(
+    stream: IoStream,
+    msg: msg::NewWorkConn,
+    state: Arc<AppState>,
+) {
+    let run_id = match &msg.run_id {
+        Some(id) => id.clone(),
+        None => {
+            warn!("NewWorkConn without run_id, ignoring");
+            return;
+        }
     };
-    if let Err(e) = nwc_auth_result {
+
+    if let Err(e) = validate_new_work_conn_auth(&msg, &run_id, &state).await {
         warn!(run_id = %run_id, error = %e, "Work conn auth failed for run_id {}: {}", run_id, e);
         return;
     }
 
     // NewWorkConn plugin hook — control-enabled plugins can reject
-    let nwc_content = serde_json::json!({
-        "run_id": run_id,
-    });
-    if let Err(reason) = state
-        .plugin_manager
-        .notify("new_work_conn", nwc_content)
-        .await
-    {
+    if let Err(reason) = run_new_work_conn_plugin(&run_id, &state).await {
         warn!(run_id = %run_id, reason = %reason, "NewWorkConn plugin hook rejected: {}", reason);
         return;
     }

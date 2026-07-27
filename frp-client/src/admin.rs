@@ -337,20 +337,41 @@ pub async fn run_admin_server(
     let app = apply_admin_auth(app, &auth_user, &auth_password);
     let app = app.with_state(state);
 
-    // Security: when no admin auth is configured, force binding to localhost
-    // to prevent unauthenticated access to the admin API (which exposes
-    // config with tokens, reload, and stop).
-    let bind_addr = if auth_user.is_empty() || auth_password.is_empty() {
-        let localhost_addr = format!("127.0.0.1:{}", addr.rsplit(':').next().unwrap_or("7400"));
-        tracing::warn!(
-            original = %addr,
-            bind = %localhost_addr,
-            "frpc admin: no admin auth configured — binding to {} (localhost only) to prevent unauthenticated public access. Set admin_user and admin_password.",
-            localhost_addr
-        );
-        localhost_addr
-    } else {
+    // Security: always bind to localhost by default, even when auth is configured.
+    // The admin API exposes config with tokens, reload, and stop — binding to
+    // 0.0.0.0/:: by accident is a serious exposure. Only bind to non-loopback
+    // addresses when the user explicitly configured admin_addr to one.
+    let default_port = addr.rsplit(':').next().unwrap_or("7400");
+    let localhost_addr = format!("127.0.0.1:{}", default_port);
+
+    let bind_addr = if addr.starts_with("127.0.0.1:")
+        || addr.starts_with("::1")
+        || addr.starts_with("localhost:")
+    {
+        // Loopback explicitly configured — use as-is.
         addr.clone()
+    } else if !addr.starts_with("0.0.0.0:") && !addr.starts_with("[::]:") && !addr.starts_with("::")
+    {
+        // Non-loopback, non-wildcard address explicitly configured — use as-is.
+        addr.clone()
+    } else {
+        // Wildcard (0.0.0.0 or [::]) or unspecified — force localhost.
+        if auth_user.is_empty() || auth_password.is_empty() {
+            tracing::warn!(
+                original = %addr,
+                bind = %localhost_addr,
+                "frpc admin: no admin auth configured — binding to {} (localhost only) to prevent unauthenticated public access. Set admin_user and admin_password.",
+                localhost_addr
+            );
+        } else {
+            tracing::warn!(
+                original = %addr,
+                bind = %localhost_addr,
+                "frpc admin: binding to {} (localhost only). Set admin_addr to an explicit non-loopback address to bind externally.",
+                localhost_addr
+            );
+        }
+        localhost_addr
     };
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;

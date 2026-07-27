@@ -11,8 +11,16 @@ use std::collections::VecDeque;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 
-/// Pooled buffer size in bytes. Defaults to 32KB (matches Go frp io.Copy); override
-/// for experiments via FRP_BRIDGE_BUF_KB (e.g. 256). Read once at process start.
+/// Pooled buffer size in bytes.
+///
+/// Default: 32 KiB (32768), matching Go frp's `io.Copy` buffer size.
+/// Override via env `FRP_BRIDGE_BUF_KB` (valid range: 4–1024 KB,
+/// i.e. 4 KiB – 1 MiB). Read once at process start via `LazyLock`.
+///
+/// This buffer size is used by the encrypted/compressed bridge data
+/// path (`bridge.rs`) and the V2 frame read path (`protocol.rs`).
+/// The plain (unencrypted) bridge path uses `tokio::io::copy_bidirectional`
+/// which has its own internal buffers and is not affected by this constant.
 pub static BUFFER_SIZE: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("FRP_BRIDGE_BUF_KB")
         .ok()
