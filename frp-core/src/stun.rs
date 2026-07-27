@@ -39,7 +39,7 @@ async fn resolve_stun_addr(addr_str: &str) -> Result<SocketAddr, String> {
     if let Ok(sa) = addr_str.parse::<SocketAddr>() {
         return Ok(sa);
     }
-    let addrs = tokio::net::lookup_host(addr_str.to_string())
+    let addrs = tokio::net::lookup_host(addr_str)
         .await
         .map_err(|e| format!("STUN DNS lookup failed for '{}': {}", addr_str, e))?;
     addrs
