@@ -386,18 +386,20 @@ pub(crate) async fn authenticate(
         },
     });
     // Hex-dump the raw LoginResp V1 frame for Go compat debugging
-    let type_byte = resp.v1_type_byte();
-    let payload = serde_json::to_vec(&resp).unwrap_or_default();
-    let frame_len = 9 + payload.len();
-    info!(
-        peer = ?peer, run_id = %run_id,
-        type_byte = format_args!("{:#04x}", type_byte),
-        payload_len = payload.len(),
-        payload_text = %String::from_utf8_lossy(&payload),
-        "LoginResp V1 frame: type={:#04x} len={} frame_total={} json={}",
-        type_byte, payload.len(), frame_len,
-        String::from_utf8_lossy(&payload),
-    );
+    if tracing::enabled!(tracing::Level::INFO) {
+        let type_byte = resp.v1_type_byte();
+        let payload = serde_json::to_vec(&resp).unwrap_or_default();
+        let frame_len = 9 + payload.len();
+        info!(
+            peer = ?peer, run_id = %run_id,
+            type_byte = format_args!("{:#04x}", type_byte),
+            payload_len = payload.len(),
+            payload_text = %String::from_utf8_lossy(&payload),
+            "LoginResp V1 frame: type={:#04x} len={} frame_total={} json={}",
+            type_byte, payload.len(), frame_len,
+            String::from_utf8_lossy(&payload),
+        );
+    }
     // Go frp compat: write LoginResp with 5-second deadline
     let resp_send = tokio::time::timeout(
         Duration::from_secs(5),

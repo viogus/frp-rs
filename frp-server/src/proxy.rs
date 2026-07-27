@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::RwLock;
@@ -97,6 +98,10 @@ pub struct ProxyManager {
     /// Per-proxy health state for group load balancing.
     /// Keyed by proxy name (same as `proxies` keys).
     group_health: RwLock<HashMap<String, GroupMemberHealth>>,
+    /// Fast-path guard: true when `group_health` has ≥1 entries.
+    /// Avoids acquiring the `group_health` RwLock on every
+    /// `select_group_backend` call when no health tracking is active.
+    health_tracking_active: AtomicBool,
 }
 
 impl Default for ProxyManager {
@@ -113,6 +118,7 @@ impl ProxyManager {
             groups: RwLock::new(HashMap::new()),
             group_counters: Mutex::new(HashMap::new()),
             group_health: RwLock::new(HashMap::new()),
+            health_tracking_active: AtomicBool::new(false),
         }
     }
 
@@ -179,7 +185,13 @@ impl ProxyManager {
                 }
             }
             // Clean up health tracking for this proxy
-            self.group_health.write().await.remove(name);
+            {
+                let mut health = self.group_health.write().await;
+                health.remove(name);
+                if health.is_empty() {
+                    self.health_tracking_active.store(false, Ordering::Release);
+                }
+            }
             drop(proxies);
             let mut by_client = self.by_client.write().await;
             if let Some(client_proxies) = by_client.get_mut(&info.run_id) {
@@ -270,6 +282,7 @@ impl ProxyManager {
     /// (3), the backend is marked `Unhealthy`. It recovers after `HEALTH_COOLDOWN`
     /// (30s) or on the next successful connection via `report_backend_success`.
     pub async fn report_backend_failure(&self, name: &str) {
+        self.health_tracking_active.store(true, Ordering::Release);
         let mut health = self.group_health.write().await;
         let entry = health
             .entry(name.to_string())
@@ -290,7 +303,11 @@ impl ProxyManager {
 
     /// Remove health tracking for a proxy (called on proxy removal).
     pub async fn remove_backend_health(&self, name: &str) {
-        self.group_health.write().await.remove(name);
+        let mut health = self.group_health.write().await;
+        health.remove(name);
+        if health.is_empty() {
+            self.health_tracking_active.store(false, Ordering::Release);
+        }
     }
 
     /// Select a backend from a group for load balancing.
@@ -303,6 +320,25 @@ impl ProxyManager {
         let members = groups.get(group)?;
         if members.is_empty() {
             return None;
+        }
+
+        // Fast path: no health tracking entries → skip RwLock and Vec alloc.
+        if !self.health_tracking_active.load(Ordering::Acquire) {
+            return if !group_key.is_empty() {
+                let hash = group_key
+                    .bytes()
+                    .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
+                Some(members[hash as usize % members.len()].clone())
+            } else {
+                let mut counters = self
+                    .group_counters
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let counter = counters.entry(group.to_string()).or_insert(0);
+                let idx = (*counter as usize) % members.len();
+                *counter += 1;
+                Some(members[idx].clone())
+            };
         }
 
         // Filter out unhealthy members, but only if at least one is healthy.

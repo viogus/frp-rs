@@ -26,6 +26,32 @@ pub struct VhostRoute {
     pub route_by_http_user: String,
 }
 
+/// Borrowed match result — avoids cloning VhostRoute (especially the locations Vec)
+/// on every HTTP request. Fields are owned Strings because the caller holds them
+/// across await points after the RwLock read guard is dropped.
+#[derive(Debug, Clone)]
+pub struct VhostRouteMatch {
+    pub proxy_name: String,
+    pub run_id: String,
+    pub host_header_rewrite: String,
+    pub http_user: String,
+    pub http_pwd: String,
+    pub route_by_http_user: String,
+}
+
+impl VhostRouteMatch {
+    fn from_route(route: &VhostRoute) -> Self {
+        Self {
+            proxy_name: route.proxy_name.clone(),
+            run_id: route.run_id.clone(),
+            host_header_rewrite: route.host_header_rewrite.clone(),
+            http_user: route.http_user.clone(),
+            http_pwd: route.http_pwd.clone(),
+            route_by_http_user: route.route_by_http_user.clone(),
+        }
+    }
+}
+
 /// Error returned when an exact (domain, route_by_http_user) route already exists.
 /// Corresponds to Go frp's `ErrRouterConfigConflict`.
 #[derive(Debug, Clone)]
@@ -50,14 +76,14 @@ impl std::error::Error for RouterConfigConflict {}
 
 /// Find the first route in a sorted Vec whose location prefix-matches the path.
 /// If the route has no locations (e.g. HTTPS SNI routes), it matches any path.
-fn find_matching_route(vrs: &[VhostRoute], path: &str) -> Option<VhostRoute> {
+fn find_matching_route(vrs: &[VhostRoute], path: &str) -> Option<VhostRouteMatch> {
     for route in vrs {
         if route.locations.is_empty() {
-            return Some(route.clone());
+            return Some(VhostRouteMatch::from_route(route));
         }
         for loc in &route.locations {
             if path.starts_with(loc.as_str()) {
-                return Some(route.clone());
+                return Some(VhostRouteMatch::from_route(route));
             }
         }
     }
@@ -72,7 +98,7 @@ fn get_locked(
     host: &str,
     path: &str,
     http_user: &str,
-) -> Option<VhostRoute> {
+) -> Option<VhostRouteMatch> {
     let user_map = routes.get(host)?;
     // Try httpUser-specific first
     if let Some(vrs) = user_map.get(http_user) {
@@ -183,8 +209,7 @@ impl VhostManager {
             }
         }
 
-        // Register domain routes: append to Vec, then sort by location descending
-        // (matching Go frp's Add() which appends then slices.SortFunc).
+        // Register domain routes: append to Vec; sort once after all inserts.
         let mut domain_entries = Vec::new();
         for domain in domains {
             let vrs = tables
@@ -194,8 +219,15 @@ impl VhostManager {
                 .entry(route_by_http_user.to_string())
                 .or_default();
             vrs.push(route.clone());
-            sort_by_longest_location(vrs);
             domain_entries.push((domain.clone(), route_by_http_user.to_string()));
+        }
+        // Sort once after all domain insertions (was O(N) per registration).
+        for domain in domains {
+            if let Some(user_map) = tables.routes.get_mut(domain) {
+                if let Some(vrs) = user_map.get_mut(route_by_http_user) {
+                    sort_by_longest_location(vrs);
+                }
+            }
         }
         if !domain_entries.is_empty() {
             tables
@@ -213,8 +245,15 @@ impl VhostManager {
                 .entry(route_by_http_user.to_string())
                 .or_default();
             vrs.push(route.clone());
-            sort_by_longest_location(vrs);
             loc_entries.push((loc.clone(), route_by_http_user.to_string()));
+        }
+        // Sort once after all location insertions.
+        for loc in locations {
+            if let Some(user_map) = tables.location_routes.get_mut(loc) {
+                if let Some(vrs) = user_map.get_mut(route_by_http_user) {
+                    sort_by_longest_location(vrs);
+                }
+            }
         }
         if !loc_entries.is_empty() {
             tables
@@ -265,7 +304,12 @@ impl VhostManager {
     /// Look up by domain (exact match) with path prefix matching.
     /// Tries httpUser-specific routes first, then falls back to empty-string httpUser
     /// (matching Go frp's `getLocked` → `getExactOrAllUsersLocked`).
-    pub async fn lookup(&self, domain: &str, path: &str, http_user: &str) -> Option<VhostRoute> {
+    pub async fn lookup(
+        &self,
+        domain: &str,
+        path: &str,
+        http_user: &str,
+    ) -> Option<VhostRouteMatch> {
         let tables = self.inner.read().await;
         get_locked(&tables.routes, domain, path, http_user)
     }
@@ -285,7 +329,7 @@ impl VhostManager {
         domain: &str,
         path: &str,
         http_user: &str,
-    ) -> Option<VhostRoute> {
+    ) -> Option<VhostRouteMatch> {
         let tables = self.inner.read().await;
 
         // 1. Exact match
@@ -301,7 +345,7 @@ impl VhostManager {
             if let Some(route) = get_locked(&tables.routes, &wildcard_host, path, http_user) {
                 return Some(route);
             }
-            parts = parts[1..].to_vec();
+            parts.remove(0);
         }
         // 3. Catch-all "*"
         get_locked(&tables.routes, "*", path, http_user)
@@ -312,10 +356,10 @@ impl VhostManager {
     /// Tries httpUser-specific routes first, then falls back to empty-string httpUser.
     /// For each matching prefix, finds the first route whose location prefix-matches
     /// the path by iterating the sorted Vec (matching Go's getLocked pattern).
-    pub async fn lookup_by_path(&self, path: &str, http_user: &str) -> Option<VhostRoute> {
+    pub async fn lookup_by_path(&self, path: &str, http_user: &str) -> Option<VhostRouteMatch> {
         let tables = self.inner.read().await;
         // Find longest matching prefix
-        let mut best: Option<(usize, VhostRoute)> = None;
+        let mut best: Option<(usize, VhostRouteMatch)> = None;
         for (prefix, user_map) in tables.location_routes.iter() {
             if path.starts_with(prefix.as_str()) {
                 // Try httpUser-specific first, then empty-string fallback,
@@ -350,7 +394,7 @@ impl VhostManager {
         domain: &str,
         path: &str,
         http_user: &str,
-    ) -> Option<VhostRoute> {
+    ) -> Option<VhostRouteMatch> {
         // Try host-based routing first (with wildcard support and path matching)
         // lookup_wildcard internally calls get_locked which finds the first
         // route whose location prefix-matches the path.

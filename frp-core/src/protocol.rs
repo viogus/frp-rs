@@ -434,13 +434,13 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
     Ok((frame_type, flags, payload))
 }
 
-/// Write a FrpMessage using Go-compatible V2 framing.
-/// Frame: type=16(Message) flags=0, payload = type_id(2 BE) + JSON.
+/// Write V2 frame payload without flushing the writer.
 ///
-/// NOTE: V2 type IDs 19 (CloseProxyResp) and 20 (Error) are Rust-only
-/// extensions. Go frp v0.70.0 treats unknown type IDs as errors.
-/// These MUST NOT be sent to Go peers. See msg.rs lines 59-62.
-pub async fn write_msg_v2<W: AsyncWriteExt + Unpin>(
+/// Builds the V2 frame (header + type_id + JSON) and calls `write_all`.
+/// Does NOT flush — callers that wrap a buffered transport (TLS, KCP,
+/// WebSocket, yamux) must flush to push data to the underlying socket.
+/// Callers that write to a raw TcpStream (with TCP_NODELAY) can skip flush.
+pub(crate) async fn write_msg_v2_inner<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg: &FrpMessage,
 ) -> Result<(), crate::Error> {
@@ -472,6 +472,25 @@ pub async fn write_msg_v2<W: AsyncWriteExt + Unpin>(
         .write_all(&buf)
         .await
         .map_err(|e| crate::Error::Protocol(format!("write V2 msg: {e}").into()))?;
+    Ok(())
+}
+
+/// Write a FrpMessage using Go-compatible V2 framing.
+/// Frame: type=16(Message) flags=0, payload = type_id(2 BE) + JSON.
+///
+/// NOTE: V2 type IDs 19 (CloseProxyResp) and 20 (Error) are Rust-only
+/// extensions. Go frp v0.70.0 treats unknown type IDs as errors.
+/// These MUST NOT be sent to Go peers. See msg.rs lines 59-62.
+///
+/// Flush is called after write to support buffered transports (TLS, KCP,
+/// WebSocket, yamux). For callers that manage flush themselves (e.g.
+/// `IoStream::write_v2_frame`), use `write_msg_v2_inner` to avoid a
+/// redundant flush on raw TcpStream where TCP_NODELAY already sends immediately.
+pub async fn write_msg_v2<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    msg: &FrpMessage,
+) -> Result<(), crate::Error> {
+    write_msg_v2_inner(writer, msg).await?;
     writer
         .flush()
         .await
