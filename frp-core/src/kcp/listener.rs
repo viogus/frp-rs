@@ -9,12 +9,11 @@ use tokio::sync::mpsc;
 
 use super::config::KcpConfig;
 
-/// UDP socket receive buffer size (4 MiB), matching Go frp's `SetReadBuffer(4194304)`.
-/// Without explicit sizing, the OS default (~212KB on Linux) can cause packet
-/// drops under bursty KCP traffic.
-const KCP_UDP_RCVBUF: usize = 4_194_304;
-/// UDP socket send buffer size (4 MiB), matching Go frp's `SetWriteBuffer(4194304)`.
-const KCP_UDP_SNDBUF: usize = 4_194_304;
+/// UDP socket receive buffer size (1 MiB). ~5x the OS default (~212KB on Linux),
+/// enough to absorb KCP bursts without 200-client memory blowout.
+const KCP_UDP_RCVBUF: usize = 1_048_576;
+/// UDP socket send buffer size (1 MiB), matching RCVBUF.
+const KCP_UDP_SNDBUF: usize = 1_048_576;
 use super::session::KcpSession;
 use super::socket::{KcpSocket, KcpSocketHandle};
 use super::stream::KcpStream;
@@ -35,10 +34,8 @@ impl KcpListener {
         let socket = UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
 
-        // Set socket buffer sizes (4 MiB each) matching Go frp's
-        // listener.SetReadBuffer(4194304) / listener.SetWriteBuffer(4194304).
-        // Without explicit sizing, OS defaults (~212KB on Linux) can cause
-        // packet drops under bursty KCP traffic.
+        // Set socket buffer sizes (1 MiB each). ~5x OS default (~212KB on Linux)
+        // — enough for KCP bursts without 200-client kernel-memory blowout.
         if let Err(e) = socket2::SockRef::from(&socket).set_recv_buffer_size(KCP_UDP_RCVBUF) {
             tracing::debug!(error = %e, "KCP: failed to set SO_RCVBUF to {} (continuing with OS default)", KCP_UDP_RCVBUF);
         }

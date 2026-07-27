@@ -224,10 +224,7 @@ impl KcpSession {
                     self.pending_max_size = 0;
                 }
             }
-            Ok(std::mem::replace(
-                &mut self.packets,
-                Vec::with_capacity(PACKET_POOL_CAPACITY),
-            ))
+            Ok(std::mem::take(&mut self.packets))
         } else {
             // Non-FEC path: return output directly without going through self.packets.
             Ok(output)
