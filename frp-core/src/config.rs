@@ -2619,12 +2619,15 @@ auth.token = "test"
 "#;
         let cfg: ServerConfig = load_server_config_from_str(toml_str).unwrap();
         assert_eq!(cfg.bind_port, 7000, "bindPort");
+        #[cfg(feature = "kcp")]
         assert_eq!(cfg.kcp_bind_port, 7100, "kcpBindPort");
         assert_eq!(cfg.vhost_http_port, 10080, "vhostHTTPPort");
         assert_eq!(cfg.vhost_https_port, 10443, "vhostHTTPSPort");
+        #[cfg(feature = "quic")]
         assert_eq!(cfg.quic_bind_port, 7200, "quicBindPort");
         assert_eq!(cfg.sudp_port, 7300, "sudpPort");
         assert_eq!(cfg.tcpmux_httpconnect_port, 7400, "tcpmuxHTTPConnectPort");
+        #[cfg(feature = "websocket")]
         assert_eq!(cfg.websocket_port, 7500, "websocketPort");
         assert_eq!(cfg.proxy_bind_addr, "10.0.0.1", "proxyBindAddr");
     }
