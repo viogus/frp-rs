@@ -84,6 +84,9 @@ pub(crate) async fn authenticate(
 
     // --- Authenticate ---
     // Internal connections (SSH gateway) with AlwaysAuthPass bypass all auth.
+    // always_auth_pass is Option<Option<bool>>: outer Option is ClientSpec presence
+    // (Go clients never send ClientSpec; only internal/Rust connections do).
+    // Inner Option<bool> defaults to false. Only Some(Some(true)) triggers bypass.
     let is_auth_bypass = internal
         && login
             .client_spec
