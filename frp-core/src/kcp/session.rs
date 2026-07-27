@@ -373,7 +373,11 @@ impl KcpSession {
                 }
 
                 // Track which data shards were already received (to avoid double-feed).
-                // Fixed-size array avoids heap allocation (data_shards <= 64 by debug_assert).
+                // Fixed-size array avoids heap allocation.
+                debug_assert!(
+                    self.config.data_shards <= 64,
+                    "data_shards > 64 not supported in decode path"
+                );
                 let mut had_data = [false; 64];
                 for (i, s) in group
                     .shards
