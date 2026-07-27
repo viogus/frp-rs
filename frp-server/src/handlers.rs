@@ -140,6 +140,24 @@ pub(crate) async fn handle_visitor_conn_inner(
         }
     }
 
+    // Check for graceful shutdown before proceeding — if the server is shutting
+    // down, the control handler may no longer be accepting messages and the
+    // visitor connection would be silently dropped. Return an error immediately
+    // so the visitor can retry against a healthy server.
+    if state.shutdown_token.is_cancelled() {
+        warn!(
+            proxy_name = %proxy_name, run_id = %run_id,
+            "STCP visitor for proxy '{}' rejected: server is shutting down",
+            proxy_name
+        );
+        let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
+            proxy_name: proxy_name.clone(),
+            error: Some("server shutting down".into()),
+        });
+        let _ = write_msg(&mut stream, &resp, v2).await;
+        return;
+    }
+
     let ctl_tx = {
         let map = state.run_id_to_ctl_tx.read().await;
         map.get(&run_id).cloned()
@@ -426,17 +444,37 @@ pub(crate) async fn handle_nat_hole_visitor(
     // The provider reads NatHoleSid from the work connection, does its own STUN,
     // and sends NatHoleClient back on its control connection with its mapped addresses.
     // handle_client() signals notify_ch when the provider's response arrives.
-    if ctl_tx
-        .tx
-        .try_send(InternalMsg::NatHoleSidOnWorkConn {
+    //
+    // Use send().await with a 5s timeout instead of try_send(). try_send() conflates
+    // two distinct failure modes:
+    //   - Channel full (temporary backpressure): the provider is alive but busy.
+    //     try_send() returns TrySendError::Full, but is_err() discards the variant.
+    //   - Provider disconnected (permanent): the channel is closed. try_send()
+    //     returns TrySendError::Closed.
+    // With send().await + timeout we wait briefly for capacity, and can distinguish
+    // timeout from SendError in the log message.
+    let send_result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ctl_tx.tx.send(InternalMsg::NatHoleSidOnWorkConn {
             sid: sid.clone(),
             proxy_name: proxy_name.clone(),
-        })
-        .is_err()
-    {
-        warn!(run_id = %run_id, "Provider for run_id {} has gone away", run_id);
-        state.xtcp.nat_hole.remove(&transaction_id).await;
-        return;
+        }),
+    )
+    .await;
+    match send_result {
+        Ok(Ok(())) => {
+            // Message delivered successfully.
+        }
+        Ok(Err(_send_err)) => {
+            warn!(run_id = %run_id, "Provider for run_id {} has disconnected (channel closed)", run_id);
+            state.xtcp.nat_hole.remove(&transaction_id).await;
+            return;
+        }
+        Err(_elapsed) => {
+            warn!(run_id = %run_id, "Provider for run_id {} is overloaded (channel full for 5s)", run_id);
+            state.xtcp.nat_hole.remove(&transaction_id).await;
+            return;
+        }
     }
 
     info!(
@@ -859,10 +897,7 @@ pub(crate) async fn validate_new_work_conn_auth(
 /// Run the NewWorkConn plugin hook. Returns `Err(reason)` if a plugin
 /// rejects the connection.
 #[instrument(skip(state), fields(run_id = %run_id))]
-pub(crate) async fn run_new_work_conn_plugin(
-    run_id: &str,
-    state: &AppState,
-) -> Result<(), String> {
+pub(crate) async fn run_new_work_conn_plugin(run_id: &str, state: &AppState) -> Result<(), String> {
     let nwc_content = serde_json::json!({
         "run_id": run_id,
     });
@@ -880,8 +915,8 @@ pub(crate) async fn handle_work_conn_inner(
     msg: msg::NewWorkConn,
     state: Arc<AppState>,
 ) {
-    let run_id = match msg.run_id {
-        Some(id) => id,
+    let run_id = match &msg.run_id {
+        Some(id) => id.clone(),
         None => {
             warn!("NewWorkConn without run_id, ignoring");
             return;
