@@ -226,6 +226,32 @@ impl AuthConfig {
         if self.method == AuthMethod::Token && self.token.is_empty() {
             return Err("CRITICAL: [auth].token is empty with token auth method — server would accept ALL connections. Set a strong token in the config file.".into());
         }
+        // OIDC configuration validation.
+        #[cfg(feature = "oidc")]
+        if self.method == AuthMethod::Oidc {
+            if self.oidc_issuer.is_empty() {
+                return Err(
+                    "CRITICAL: [auth].oidc_issuer is empty with OIDC auth method. \
+                     Set oidc_issuer to your OIDC provider URL."
+                        .into(),
+                );
+            }
+            if self.oidc_audience.is_empty() {
+                return Err(
+                    "CRITICAL: [auth].oidc_audience is empty with OIDC auth method. \
+                     Set oidc_audience to the expected audience claim."
+                        .into(),
+                );
+            }
+            if self.oidc_skip_expiry && self.oidc_skip_issuer {
+                tracing::warn!(
+                    "SECURITY WARNING: both oidc_skip_expiry and oidc_skip_issuer are true. \
+                     JWT expiry AND issuer validation are disabled — any validly-signed JWT \
+                     from any issuer will be accepted indefinitely. This should only be used \
+                     in development environments."
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -408,6 +434,17 @@ mod oidc_impl {
         }
 
         /// Verify a login JWT. Returns LoginOidcToken with subject and expiry.
+        ///
+        /// # Security: jti replay prevention
+        ///
+        /// TODO: Add jti (JWT ID) replay prevention. The current implementation
+        /// validates signature, expiry (unless skip_expiry is set), issuer,
+        /// and audience, but does NOT track previously-seen `jti` claims.
+        /// A stolen token can be replayed until it expires — the only defense
+        /// is the `exp` claim. For production deployments, add a time-bounded
+        /// cache (e.g. TTL = max clock_skew + token lifetime) keyed by jti
+        /// to detect and reject replayed JWTs. This is a defense-in-depth
+        /// measure; the primary protection is TLS transport + short-lived tokens.
         pub async fn verify_login(&self, token: &str) -> Result<LoginOidcToken, String> {
             let header = jsonwebtoken::decode_header(token)
                 .map_err(|e| format!("OIDC: failed to decode JWT header: {e}"))?;
@@ -415,9 +452,14 @@ mod oidc_impl {
             let alg = header.alg;
             let kid = header.kid.clone();
 
-            // Restrict to known algorithms. The JWT header `alg` is verified
-            // against the JWK key type by jsonwebtoken (algorithm confusion
-            // protection). This allowlist is defense-in-depth.
+            // Restrict to known asymmetric algorithms only. Symmetric algorithms
+            // (HS256, HS384, HS512) are excluded because they use a shared secret
+            // rather than a public/private key pair. When verifying against JWKS
+            // public keys (used by OIDC), allowing HMAC-based algorithms creates
+            // an algorithm confusion attack surface: an attacker who knows the
+            // public key could forge tokens using the public key as the HMAC secret.
+            // This allowlist is defense-in-depth on top of jsonwebtoken's own
+            // algorithm-vs-key-type verification.
             const ALLOWED_ALGS: &[jsonwebtoken::Algorithm] = &[
                 jsonwebtoken::Algorithm::RS256,
                 jsonwebtoken::Algorithm::RS384,
@@ -427,9 +469,7 @@ mod oidc_impl {
                 jsonwebtoken::Algorithm::PS256,
                 jsonwebtoken::Algorithm::PS384,
                 jsonwebtoken::Algorithm::PS512,
-                jsonwebtoken::Algorithm::HS256,
-                jsonwebtoken::Algorithm::HS384,
-                jsonwebtoken::Algorithm::HS512,
+                jsonwebtoken::Algorithm::EdDSA,
             ];
             if !ALLOWED_ALGS.contains(&alg) {
                 return Err(format!("OIDC: algorithm {alg:?} not allowed"));
@@ -456,6 +496,10 @@ mod oidc_impl {
                 validation.set_issuer(&[&self.issuer]);
             }
             validation.set_audience(&[&self.audience]);
+            // Require the "sub" (subject) claim in OIDC tokens. Without this,
+            // a JWT that omits "sub" would be accepted with an empty subject,
+            // potentially bypassing subject-based proxy routing.
+            validation.required_spec_claims.insert("sub".to_string());
 
             // First attempt with cached JWKS
             let first_result = self
@@ -465,7 +509,13 @@ mod oidc_impl {
             match first_result {
                 Ok(tok) => Ok(tok),
                 Err(first_err) => {
-                    // Refresh JWKS and retry once
+                    // Refresh JWKS and retry once.
+                    // NOTE: this triggers on ALL verification failures,
+                    // not just signature/key-mismatch errors. A future
+                    // improvement would be to only refresh on signature-
+                    // related errors (e.g. InvalidSignature, InvalidRsaKey)
+                    // and skip the refresh for semantic errors like expired
+                    // tokens or missing claims.
                     self.refresh_jwks().await?;
                     self.try_verify_token(token, &validation, kid.as_deref())
                         .await
@@ -510,6 +560,13 @@ mod oidc_impl {
                 match jsonwebtoken::decode::<serde_json::Value>(token, &decoding_key, validation) {
                     Ok(data) => {
                         let sub = data.claims["sub"].as_str().unwrap_or("").to_string();
+                        // Reject tokens with an empty subject — "sub" is
+                        // required_spec_claims so it will exist, but it
+                        // could still be the empty string.
+                        if sub.is_empty() {
+                            last_err = "OIDC: JWT subject (sub) is empty".to_string();
+                            continue;
+                        }
                         let exp = data.claims["exp"].as_i64().unwrap_or(0);
                         return Ok(LoginOidcToken {
                             subject: sub,

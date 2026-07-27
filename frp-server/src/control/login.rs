@@ -498,6 +498,16 @@ pub(crate) async fn authenticate(
         // NewCryptoReadWriter unconditionally — no config flag gates it).
         // The use_encryption config flag controls proxy bridge (data plane)
         // encryption, not control plane encryption.
+        //
+        // Security note: when V2 is negotiated without AEAD (plain V2 path)
+        // and tls_enable is false, this CFB wrapping serves as an encryption
+        // safety net for the control connection. Without it, a plain V2
+        // control channel over raw TCP would transmit all control messages
+        // (including auth tokens in Login) in cleartext. The CFB cipher
+        // derives its key from the auth token, so an attacker must already
+        // know the token to decrypt. For production, prefer AEAD-negotiated
+        // V2 or TLS to avoid potential CFB weaknesses (malleability, lack of
+        // integrity protection).
         info!(peer = ?peer, run_id = %run_id, "Wrapping control stream in CipherStream (AES-128-CFB)");
         let enc_key = encryption::derive_key(&reloadable.auth_cfg.token);
         let cipher = frp_core::cipher_stream::CipherStream::new(stream, enc_key);

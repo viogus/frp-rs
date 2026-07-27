@@ -19,7 +19,7 @@ pub struct LinuxTun {
 // Send+Sync on Unix; AtomicU16 is Sync). This static assertion catches any
 // future non-Send field addition at compile time.
 const _: () = {
-    fn assert_send<T: Send>() {}
+    const fn assert_send<T: Send>() {}
     assert_send::<LinuxTun>();
 };
 

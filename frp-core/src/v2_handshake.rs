@@ -304,6 +304,23 @@ impl ServerHello {
 /// Matches Go frp `HashCryptoTranscript`:
 ///   SHA256("frp wire v2 crypto transcript" || part("client hello", ch) || part("server hello", sh))
 /// where part(label, payload) = "\x00" || label || "\x00" || BE64(len(payload)) || payload
+///
+/// # Security note: transcript provides key confirmation, not handshake integrity
+///
+/// The transcript hash is included in the AEAD key derivation (via HKDF) so both
+/// sides derive the same session keys only if they saw the same handshake messages.
+/// This provides **key confirmation** — a mismatch produces different keys and the
+/// first encrypted message will fail to decrypt.
+///
+/// However, the transcript itself is NOT MAC'd or signed. An active MITM could
+/// modify ClientHello/ServerHello in transit without detection; the connection
+/// would simply fail to decrypt (denial of service) rather than produce a
+/// cryptographic alert. Handshake **integrity** (protection against modification)
+/// depends on the outer TLS layer. When TLS is disabled, an active attacker can
+/// disrupt the handshake but cannot impersonate either side without the pre-shared
+/// key (used as the HKDF salt).
+///
+/// See also: `compute_session_key` which uses this transcript hash as HKDF info.
 pub fn compute_transcript_hash(
     client_hello_payload: &[u8],
     server_hello_payload: &[u8],
@@ -372,6 +389,13 @@ pub async fn v2_handshake_client_recv_hello(
     with_crypto: bool,
 ) -> Result<Option<CryptoContext>, crate::Error> {
     // Re-derive hello for algorithm-offer validation.
+    // NOTE: this re-creates ClientHello with fresh OsRng. Currently safe
+    // because `preferred_aead_algorithms()` is deterministic. If algorithm
+    // preferences ever become non-deterministic (e.g. runtime feature
+    // detection), this validation will use a different algorithm list than
+    // what was actually sent in the handshake — producing a transcript hash
+    // mismatch. In that case, the client must cache the original
+    // ClientHello struct or the algorithm list used during send.
     let hello = if with_crypto {
         ClientHello::new(transport, tls, tcp_mux)
     } else {

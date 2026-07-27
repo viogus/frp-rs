@@ -335,6 +335,36 @@ impl ControlConnection {
 
         // Step 2: Send Login frame immediately after ClientHello (Go frp compat:
         // pipelined before ServerHello).
+        //
+        // SECURITY: V2 Login (containing privilege_key) is sent as a plaintext
+        // V2 frame before AEAD keys are derived from the handshake. Without
+        // transport encryption (TLS or QUIC's built-in TLS 1.3), a passive
+        // network observer can capture the privilege_key credential.
+        // This matches Go frp's protocol design: ClientHello/ServerHello +
+        // Login/LoginResp are always plaintext at the V2 frame level; AEAD
+        // encryption is established only after login completes.
+        // Enable tls_enable or use QUIC transport to protect credentials.
+        #[cfg(feature = "quic")]
+        let transport_encrypted =
+            self.tls_enable || matches!(self.transport_protocol, TransportProtocol::Quic);
+        #[cfg(not(feature = "quic"))]
+        let transport_encrypted = self.tls_enable;
+        if self.v2 && !transport_encrypted {
+            warn!(
+                "V2 Login credential sent in plaintext: tls_enable=false and \
+                 transport={} is not encrypted. Enable tls_enable or use QUIC \
+                 to protect the privilege_key from passive network observers.",
+                match self.transport_protocol {
+                    TransportProtocol::Tcp => "TCP",
+                    #[cfg(feature = "kcp")]
+                    TransportProtocol::Kcp => "KCP",
+                    #[cfg(feature = "websocket")]
+                    TransportProtocol::WebSocket => "WebSocket",
+                    #[allow(unreachable_patterns)]
+                    _ => "unknown",
+                }
+            );
+        }
         if self.v2 {
             io_stream.write_v2_frame(&login).await?;
         } else {

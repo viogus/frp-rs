@@ -372,6 +372,16 @@ pub async fn write_v2_frame_raw<W: AsyncWriteExt + Unpin>(
 
 /// Read a raw V2 frame. Returns (frame_type, flags, payload).
 /// This is the Go wire.Conn.ReadFrame format.
+///
+/// Frame type bytes: V2 uses wire-level constants from Go frp's
+/// `pkg/proto/wire/wire.go`:
+///   - `1` — ClientHello
+///   - `2` — ServerHello
+///   - `16` — Message (data-carrying frame)
+///
+/// Go-compatible peers recognize only these three types. Unknown types
+/// are rejected. (V1 type bytes 7 (CloseProxyResp) and 8 (Error) are
+/// Rust-only extensions and do NOT apply to the V2 frame path.)
 pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> Result<(u16, u16, Vec<u8>), crate::Error> {

@@ -482,7 +482,7 @@ impl AeadStream {
         // read has `scratch.len() == len`. If this trips, some exit path failed to
         // reset state and the resize guard below would treat stale bytes as freshly
         // read (silent frame corruption).
-        debug_assert!(
+        assert!(
             self.read.scratch_filled == 0 || self.read.scratch.len() == len,
             "read_exact state leak: filled={} scratch_len={} len={}",
             self.read.scratch_filled,

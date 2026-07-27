@@ -5,6 +5,10 @@ use std::path::Path;
 // Server Configuration
 // ---------------------------------------------------------------
 
+// NOTE: Clone is a deep copy used at config reload boundaries
+// (reload.rs snapshots the full ServerConfig). If config size grows
+// significantly, consider Arc-wrapping the large sub-structs instead
+// of cloning them wholesale on every reload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_bind_addr", alias = "bindAddr")]
