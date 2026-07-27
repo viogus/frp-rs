@@ -261,6 +261,19 @@ pub async fn handle_control<S>(
         }
     }
 
+    // Drain buffered internal messages after supersession Shutdown.
+    // When the old control handler breaks on Shutdown (replaced by a new
+    // control connection for the same run_id), messages already queued in
+    // internal_rx (up to 1024 — VisitorConn, ProxyUserConn, NewWorkConn)
+    // are processed before cleanup. Without this drain, those connections
+    // receive TCP RST instead of clean error responses.
+    if ctl.shutting_down {
+        while let Ok(msg) = internal_rx.try_recv() {
+            debug!(run_id = %run_id, "Draining buffered internal message after supersession Shutdown");
+            let _ = dispatch::dispatch_internal(&mut ctx, &mut ctl, &mut writer, msg).await;
+        }
+    }
+
     // Cleanup
     proxy::cleanup(&mut ctx, &mut ctl, &mut writer).await;
 
