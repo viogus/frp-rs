@@ -81,6 +81,7 @@ async fn dispatch_plugin_start(
 /// The main frpc service.
 pub struct Service {
     cfg: ClientConfig,
+    proxies: Arc<Vec<frp_core::config::ProxyConfig>>,
     auth_cfg: Arc<AuthConfig>,
     encryption_key: [u8; 16],
     /// Map proxy_name -> runtime info for looking up where to connect
@@ -112,9 +113,9 @@ pub struct Service {
     visitor_rx: std::sync::Mutex<Option<mpsc::Receiver<VisitorRequest>>>,
     /// Per-proxy health check cancel flags. Keyed by proxy name.
     /// Set to true on CloseProxy/CloseProxyResp; entry removed in try_reload.
-    health_cancels: Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    health_cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// Proxy configs for health-checked proxies, used to re-register on health recovery.
-    health_proxy_configs: Arc<std::sync::Mutex<HashMap<String, frp_core::config::ProxyConfig>>>,
+    health_proxy_configs: Arc<Mutex<HashMap<String, frp_core::config::ProxyConfig>>>,
     /// Channel sender for health check events (Close/Recover). Cloned by try_reload()
     /// to spawn health checks for new/changed proxies after reload.
     health_tx: mpsc::Sender<HealthEvent>,
@@ -350,7 +351,7 @@ impl Service {
         #[cfg(feature = "vnet")]
         let vnet_tun_names = Arc::new(Mutex::new(HashMap::new()));
 
-        let health_proxy_configs = Arc::new(std::sync::Mutex::new(
+        let health_proxy_configs = Arc::new(Mutex::new(
             cfg.proxies
                 .iter()
                 .filter(|p| !p.health_check_type.is_empty())
@@ -358,8 +359,11 @@ impl Service {
                 .collect(),
         ));
 
+        let proxies = Arc::new(cfg.proxies.clone());
+
         Ok(Self {
             cfg,
+            proxies,
             auth_cfg: Arc::new(auth_cfg),
             encryption_key: enc_key,
             proxy_info_map,
@@ -375,7 +379,7 @@ impl Service {
             xtcp_rx: std::sync::Mutex::new(Some(xtcp_rx)),
             visitor_tx,
             visitor_rx: std::sync::Mutex::new(Some(visitor_rx)),
-            health_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            health_cancels: Arc::new(Mutex::new(HashMap::new())),
             health_proxy_configs,
             health_tx,
             health_rx: std::sync::Mutex::new(Some(health_rx)),
@@ -505,24 +509,25 @@ impl Service {
             }
         };
         let pool_count = self.cfg.pool_count.max(0);
-        let proxies = self.cfg.proxies.clone();
+        let proxies = Arc::clone(&self.proxies);
 
         // Selective proxy start: if `start` is non-empty, only start proxies
         // whose names are in the start list. Go frp compat.
         let proxies: Vec<frp_core::config::ProxyConfig> = if self.cfg.start.is_empty() {
-            proxies
+            (*proxies).clone()
         } else {
             let start_set: std::collections::HashSet<&str> =
                 self.cfg.start.iter().map(|s| s.as_str()).collect();
             let filtered: Vec<_> = proxies
-                .into_iter()
+                .iter()
                 .filter(|p| start_set.contains(p.name.as_str()))
+                .cloned()
                 .collect();
             info!(
-                active = %filtered.len(), total = %self.cfg.proxies.len(), start = ?self.cfg.start,
+                active = %filtered.len(), total = %proxies.len(), start = ?self.cfg.start,
                 "Selective proxy start: {} of {} proxies active (start={:?})",
                 filtered.len(),
-                self.cfg.proxies.len(),
+                proxies.len(),
                 self.cfg.start,
             );
             filtered
@@ -531,9 +536,8 @@ impl Service {
         // Filter out disabled proxies. Go frp compat: proxy.enabled.
         let proxies: Vec<frp_core::config::ProxyConfig> =
             proxies.into_iter().filter(|p| p.enabled).collect();
-        if proxies.len() < self.cfg.proxies.len() {
+        if proxies.len() < self.proxies.len() {
             let disabled: Vec<&str> = self
-                .cfg
                 .proxies
                 .iter()
                 .filter(|p| !p.enabled)
@@ -1110,7 +1114,7 @@ impl Service {
                             Ok(FrpMessage::CloseProxy(cp)) => {
                                 info!(proxy_name = %cp.proxy_name, "Server closed proxy: {}", cp.proxy_name);
                                 // Cancel health check task and remove map entry.
-                                let mut cancels = health_cancels.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut cancels = health_cancels.lock().await;
                                 if let Some(cancel) = cancels.get(&cp.proxy_name) {
                                     cancel.store(true, Ordering::Relaxed);
                                 }
@@ -1303,7 +1307,7 @@ impl Service {
                                 info!(proxy_name = %proxy_name, "Health check recovered for '{}', re-registering", proxy_name);
                                 // Look up proxy config and send NewProxy to re-register.
                                 let need_send = {
-                                    let configs = self.health_proxy_configs.lock().unwrap_or_else(|e| e.into_inner());
+                                    let configs = self.health_proxy_configs.lock().await;
                                     configs.get(&proxy_name).cloned()
                                 };
                                 if let Some(cfg) = need_send {
@@ -1507,7 +1511,7 @@ impl Service {
         &self,
         proxies: &[frp_core::config::ProxyConfig],
         health_tx: &mpsc::Sender<HealthEvent>,
-        health_cancels: &Arc<std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
+        health_cancels: &Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     ) {
         for p in proxies {
             let hc_type = p.health_check_type.clone();
@@ -1551,7 +1555,7 @@ impl Service {
             let hc_headers = p.health_check_http_headers.clone();
             let cancel = Arc::new(AtomicBool::new(false));
             {
-                let mut cancels = health_cancels.lock().unwrap_or_else(|e| e.into_inner());
+                let mut cancels = health_cancels.lock().await;
                 cancels.insert(pn.clone(), cancel.clone());
             }
             tokio::spawn(async move {
@@ -1685,101 +1689,106 @@ impl Service {
             return;
         }
 
-        let candidates = vec![visitor_addr];
-        let conv = frp_core::xtcp_p2p::conv_from_sid(&sid);
-        #[allow(clippy::default_constructed_unit_structs)]
-        let kcp_cfg = frp_core::kcp::default_kcp_config();
-        let p2p_key = if !xtcp_sk.is_empty() {
-            Some(frp_core::xtcp_p2p::derive_detect_key(&xtcp_sk))
-        } else {
-            None
-        };
-        let p2p_sid = if sid.is_empty() {
-            None
-        } else {
-            Some(sid.as_str())
-        };
+        // Spawn the blocking P2P connection + bridging into a detached task
+        // so it doesn't starve the control loop's ping/health/reload handling.
+        let w = writer.clone();
+        tokio::spawn(async move {
+            let candidates = vec![visitor_addr];
+            let conv = frp_core::xtcp_p2p::conv_from_sid(&sid);
+            #[allow(clippy::default_constructed_unit_structs)]
+            let kcp_cfg = frp_core::kcp::default_kcp_config();
+            let p2p_key = if !xtcp_sk.is_empty() {
+                Some(frp_core::xtcp_p2p::derive_detect_key(&xtcp_sk))
+            } else {
+                None
+            };
+            let p2p_sid2 = if sid.is_empty() {
+                None
+            } else {
+                Some(sid.as_str())
+            };
 
-        match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
-            socket,
-            &candidates,
-            conv,
-            kcp_cfg,
-            5000,
-            false, // yamux_client = false (provider/server)
-            p2p_sid,
-            p2p_key.as_ref(),
-        )
-        .await
-        {
-            Ok(mut p2p_stream) => {
-                // Send NatHoleReport with success=true after successful hole punch
-                // (Go frp compat: provider reports hole punch result to server)
-                Self::send_nat_hole_report(writer, v2, sid.clone(), true, "hole punch succeeded")
-                    .await;
-                if let Some(ref local) = local_addr {
-                    match tokio::net::TcpStream::connect(local).await {
-                        Ok(local_stream) => {
-                            frp_core::transport::set_nodelay(&local_stream);
-                            let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
-                            let use_comp = xtcp_use_comp;
-                            let sk = xtcp_sk.clone();
-                            let pn = proxy_name.clone();
-                            tokio::spawn(async move {
-                                let (local_r, local_w) = local_stream.into_split();
-                                let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
-                                if use_enc {
-                                    let key = frp_core::encryption::derive_key(&sk);
-                                    frp_core::bridge::bridge_encrypted(
-                                        local_r,
-                                        local_w,
-                                        p2p_r,
-                                        p2p_w,
-                                        &key,
-                                        use_comp,
-                                        vec![],
-                                        None,
-                                        None,
-                                        None,
-                                    )
-                                    .await;
-                                } else {
-                                    frp_core::bridge::bridge_plain(
-                                        local_r,
-                                        local_w,
-                                        p2p_r,
-                                        p2p_w,
-                                        use_comp,
-                                        vec![],
-                                        None,
-                                    )
-                                    .await;
-                                }
-                                debug!(proxy_name = %pn, "XTCP provider '{}' encrypted P2P closed", pn);
-                            });
+            match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
+                socket,
+                &candidates,
+                conv,
+                kcp_cfg,
+                5000,
+                false, // yamux_client = false (provider/server)
+                p2p_sid2,
+                p2p_key.as_ref(),
+            )
+            .await
+            {
+                Ok(mut p2p_stream) => {
+                    // Send NatHoleReport with success=true after successful hole punch
+                    // (Go frp compat: provider reports hole punch result to server)
+                    Self::send_nat_hole_report(&w, v2, sid.clone(), true, "hole punch succeeded")
+                        .await;
+                    if let Some(ref local) = local_addr {
+                        match tokio::net::TcpStream::connect(local).await {
+                            Ok(local_stream) => {
+                                frp_core::transport::set_nodelay(&local_stream);
+                                let use_enc = xtcp_use_enc && !xtcp_sk.is_empty();
+                                let use_comp = xtcp_use_comp;
+                                let sk = xtcp_sk.clone();
+                                let pn = proxy_name.clone();
+                                tokio::spawn(async move {
+                                    let (local_r, local_w) = local_stream.into_split();
+                                    let (p2p_r, p2p_w) = tokio::io::split(&mut p2p_stream);
+                                    if use_enc {
+                                        let key = frp_core::encryption::derive_key(&sk);
+                                        frp_core::bridge::bridge_encrypted(
+                                            local_r,
+                                            local_w,
+                                            p2p_r,
+                                            p2p_w,
+                                            &key,
+                                            use_comp,
+                                            vec![],
+                                            None,
+                                            None,
+                                            None,
+                                        )
+                                        .await;
+                                    } else {
+                                        frp_core::bridge::bridge_plain(
+                                            local_r,
+                                            local_w,
+                                            p2p_r,
+                                            p2p_w,
+                                            use_comp,
+                                            vec![],
+                                            None,
+                                        )
+                                        .await;
+                                    }
+                                    debug!(proxy_name = %pn, "XTCP provider '{}' encrypted P2P closed", pn);
+                                });
+                            }
+                            Err(e) => {
+                                warn!(proxy_name = %proxy_name, error = %e, "XTCP provider '{}': connect local failed: {}", proxy_name, e);
+                                Self::send_nat_hole_report(
+                                    &w,
+                                    v2,
+                                    sid,
+                                    false,
+                                    "connect local failed",
+                                )
+                                .await;
+                            }
                         }
-                        Err(e) => {
-                            warn!(proxy_name = %proxy_name, error = %e, "XTCP provider '{}': connect local failed: {}", proxy_name, e);
-                            Self::send_nat_hole_report(
-                                writer,
-                                v2,
-                                sid,
-                                false,
-                                "connect local failed",
-                            )
-                            .await;
-                        }
+                    } else {
+                        warn!(proxy_name = %proxy_name, "XTCP provider '{}': no local address", proxy_name);
+                        Self::send_nat_hole_report(&w, v2, sid, false, "no local addr").await;
                     }
-                } else {
-                    warn!(proxy_name = %proxy_name, "XTCP provider '{}': no local address", proxy_name);
-                    Self::send_nat_hole_report(writer, v2, sid, false, "no local addr").await;
+                }
+                Err(e) => {
+                    warn!(proxy_name = %proxy_name, error = %e, "XTCP hole punch for '{}' failed: {}", proxy_name, e);
+                    Self::send_nat_hole_report(&w, v2, sid, false, "hole punch failed").await;
                 }
             }
-            Err(e) => {
-                warn!(proxy_name = %proxy_name, error = %e, "XTCP hole punch for '{}' failed: {}", proxy_name, e);
-                Self::send_nat_hole_report(writer, v2, sid, false, "hole punch failed").await;
-            }
-        }
+        });
     }
 
     /// Build and send a NatHoleReport for `sid`; log at debug on failure.
@@ -2109,10 +2118,7 @@ impl Service {
         // flags — setting them to true stops the health check loop. PluginHandle::Drop
         // sends a oneshot shutdown signal to the plugin task.
         {
-            let mut cancels = self
-                .health_cancels
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut cancels = self.health_cancels.lock().await;
             for name in delta.removed.iter().chain(delta.changed.iter()) {
                 if let Some(cancel) = cancels.get(name) {
                     cancel.store(true, Ordering::Relaxed);
@@ -2303,10 +2309,7 @@ impl Service {
         // This ensures that on HealthEvent::Recover, the correct config is
         // used to re-register the proxy after reload.
         {
-            let mut configs = self
-                .health_proxy_configs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut configs = self.health_proxy_configs.lock().await;
             for name in &delta.removed {
                 configs.remove(name);
             }
