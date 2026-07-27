@@ -121,24 +121,38 @@ impl AeadCipher {
         }
     }
 
-    fn encrypt(&self, nonce: &[u8], mut in_out: Vec<u8>, aad: &[u8]) -> Result<Vec<u8>, String> {
+    /// Encrypts the last `plaintext_len` bytes of `buf` in place and appends the
+    /// AEAD authentication tag.  `buf` must have been pre-extended with the
+    /// plaintext bytes; after this call those bytes become ciphertext and 16
+    /// bytes of tag are appended.  This avoids a separate `plaintext.to_vec()`
+    /// allocation per encrypted frame.
+    fn encrypt_suffix(
+        &self,
+        nonce: &[u8],
+        plaintext_len: usize,
+        buf: &mut Vec<u8>,
+        aad: &[u8],
+    ) -> Result<(), String> {
+        let plaintext_start = buf.len() - plaintext_len;
         match self {
             Self::Aes256Gcm(key) => {
                 let nonce = Nonce::try_assume_unique_for_key(nonce)
                     .map_err(|e| format!("aes-gcm nonce: {e}"))?;
                 let aad = Aad::from(aad);
-                key.seal_in_place_append_tag(nonce, aad, &mut in_out)
+                let tag = key
+                    .seal_in_place_separate_tag(nonce, aad, &mut buf[plaintext_start..])
                     .map_err(|e| format!("aes-gcm encrypt: {e}"))?;
-                Ok(in_out)
+                buf.extend_from_slice(tag.as_ref());
+                Ok(())
             }
             #[cfg(feature = "chacha20")]
             Self::XChaCha20Poly1305(c) => {
                 let nonce = chacha20poly1305::XNonce::from_slice(nonce);
                 let tag = c
-                    .encrypt_in_place_detached(nonce, aad, &mut in_out)
+                    .encrypt_in_place_detached(nonce, aad, &mut buf[plaintext_start..])
                     .map_err(|e| format!("xchacha20 encrypt: {e}"))?;
-                in_out.extend_from_slice(&tag);
-                Ok(in_out)
+                buf.extend_from_slice(tag.as_ref());
+                Ok(())
             }
         }
     }
@@ -562,7 +576,6 @@ impl AsyncWrite for AeadStream {
             #[cfg(not(debug_assertions))]
             tracing::debug!("[AEAD-WRITE] first write");
             // Queue the nonce write
-            let mut pending = this.write.stream_nonce.clone();
             let overhead = this.algorithm.overhead();
             let ciphertext_len = (plaintext.len() + overhead) as u32;
             let mut header = [0u8; AEAD_FRAME_HEADER_SIZE];
@@ -574,21 +587,26 @@ impl AsyncWrite for AeadStream {
                 .extend_from_slice(&this.write.stream_nonce);
             this.write.aad_buf.extend_from_slice(&header);
 
-            let sealed = match this.write.cipher.encrypt(
+            // Build pending directly: stream_nonce || frame_header || plaintext,
+            // then encrypt_suffix encrypts the plaintext portion in place and
+            // appends the tag — no intermediate plaintext.to_vec() allocation.
+            let total_len =
+                this.write.stream_nonce.len() + AEAD_FRAME_HEADER_SIZE + plaintext.len() + overhead;
+            let mut pending = Vec::with_capacity(total_len);
+            pending.extend_from_slice(&this.write.stream_nonce);
+            pending.extend_from_slice(&header);
+            pending.extend_from_slice(plaintext);
+
+            if let Err(e) = this.write.cipher.encrypt_suffix(
                 &this.write.nonce,
-                plaintext.to_vec(),
+                plaintext.len(),
+                &mut pending,
                 &this.write.aad_buf,
             ) {
-                Ok(s) => s,
-                Err(e) => {
-                    let io_err = io::Error::other(e);
-                    this.write.err = Some(io_err);
-                    return Poll::Ready(Err(io::Error::other("encrypt failed")));
-                }
-            };
-
-            pending.extend_from_slice(&header);
-            pending.extend_from_slice(&sealed);
+                let io_err = io::Error::other(e);
+                this.write.err = Some(io_err);
+                return Poll::Ready(Err(io::Error::other("encrypt failed")));
+            }
 
             if !increment_nonce(&mut this.write.nonce) {
                 return Poll::Ready(Err(io::Error::other("AEAD write nonce exhausted")));
@@ -611,27 +629,30 @@ impl AsyncWrite for AeadStream {
                 .extend_from_slice(&this.write.stream_nonce);
             this.write.aad_buf.extend_from_slice(&header);
 
-            let sealed = match this.write.cipher.encrypt(
+            // Build pending directly: frame_header || plaintext,
+            // then encrypt_suffix encrypts the plaintext portion in place and
+            // appends the tag — no intermediate plaintext.to_vec() allocation.
+            let mut pending =
+                Vec::with_capacity(AEAD_FRAME_HEADER_SIZE + plaintext.len() + overhead);
+            pending.extend_from_slice(&header);
+            pending.extend_from_slice(plaintext);
+
+            if let Err(e) = this.write.cipher.encrypt_suffix(
                 &this.write.nonce,
-                plaintext.to_vec(),
+                plaintext.len(),
+                &mut pending,
                 &this.write.aad_buf,
             ) {
-                Ok(s) => s,
-                Err(e) => {
-                    let io_err = io::Error::other(e);
-                    this.write.err = Some(io_err);
-                    return Poll::Ready(Err(io::Error::other("encrypt failed")));
-                }
-            };
+                let io_err = io::Error::other(e);
+                this.write.err = Some(io_err);
+                return Poll::Ready(Err(io::Error::other("encrypt failed")));
+            }
 
             if !increment_nonce(&mut this.write.nonce) {
                 return Poll::Ready(Err(io::Error::other("AEAD write nonce exhausted")));
             }
             this.write.frame_count += 1;
 
-            let mut pending = Vec::with_capacity(AEAD_FRAME_HEADER_SIZE + sealed.len());
-            pending.extend_from_slice(&header);
-            pending.extend_from_slice(&sealed);
             this.write.pending = pending;
             this.write.pending_pos = 0;
         }
