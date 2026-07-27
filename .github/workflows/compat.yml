@@ -52,7 +52,7 @@ jobs:
         run: |
           mkdir -p .cargo
           printf '[profile.release]\nlto = false\nopt-level = 2\n' >> .cargo/config.toml
-          cargo build --release --bin frps --bin frpc
+          cargo build --release --bin frps --bin frpc --features "ssh,quic,dashboard"
 
       - name: Run Rust unit tests
         run: cargo test --workspace --release --lib
