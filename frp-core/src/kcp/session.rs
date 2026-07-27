@@ -162,26 +162,10 @@ impl KcpSession {
         self.conv
     }
 
-    /// Called by driver on each tick. Updates KCP clock, returns output packets.
-    /// `now_ms` is a monotonic millisecond timestamp.
-    pub fn update(&mut self, now_ms: u32) -> io::Result<Vec<Vec<u8>>> {
-        if self.shutdown {
-            return Ok(Vec::new());
-        }
-        self.kcp.update(now_ms).map_err(io::Error::other)?;
-
-        let output = self.kcp.output_mut().drain();
-        if output.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        tracing::trace!(
-            conv = self.conv,
-            output_count = output.len(),
-            fec_avail = self.fec.is_some(),
-            "KCP SESSION: update produced {} output packets",
-            output.len()
-        );
+    /// Common FEC encode logic for both update() and force_flush().
+    /// Processes output packets through FEC encoding (if enabled), or returns
+    /// them directly if FEC is disabled.
+    fn fec_encode_output(&mut self, output: Vec<Vec<u8>>) -> io::Result<Vec<Vec<u8>>> {
         self.packets.clear();
         if let Some(ref fec) = self.fec {
             for raw in &output {
@@ -240,14 +224,37 @@ impl KcpSession {
                     self.pending_max_size = 0;
                 }
             }
+            Ok(std::mem::replace(
+                &mut self.packets,
+                Vec::with_capacity(PACKET_POOL_CAPACITY),
+            ))
         } else {
             // Non-FEC path: return output directly without going through self.packets.
-            return Ok(output);
+            Ok(output)
         }
-        Ok(std::mem::replace(
-            &mut self.packets,
-            Vec::with_capacity(PACKET_POOL_CAPACITY),
-        ))
+    }
+
+    /// Called by driver on each tick. Updates KCP clock, returns output packets.
+    /// `now_ms` is a monotonic millisecond timestamp.
+    pub fn update(&mut self, now_ms: u32) -> io::Result<Vec<Vec<u8>>> {
+        if self.shutdown {
+            return Ok(Vec::new());
+        }
+        self.kcp.update(now_ms).map_err(io::Error::other)?;
+
+        let output = self.kcp.output_mut().drain();
+        if output.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        tracing::trace!(
+            conv = self.conv,
+            output_count = output.len(),
+            fec_avail = self.fec.is_some(),
+            "KCP SESSION: update produced {} output packets",
+            output.len()
+        );
+        self.fec_encode_output(output)
     }
 
     /// Enqueue data to send via KCP.
@@ -276,58 +283,7 @@ impl KcpSession {
             "KCP SESSION: force_flush produced {} packets",
             output.len()
         );
-        self.packets.clear();
-        if let Some(ref fec) = self.fec {
-            for raw in &output {
-                let size = (2u16 + raw.len() as u16).to_le_bytes();
-                let mut rs_data = Vec::with_capacity(2 + raw.len());
-                rs_data.extend_from_slice(&size);
-                rs_data.extend_from_slice(raw);
-                let mut packet = Vec::with_capacity(FEC_HEADER_SIZE + rs_data.len());
-                packet.extend_from_slice(&self.fec_seqid.to_le_bytes());
-                packet.extend_from_slice(&TYPE_DATA.to_le_bytes());
-                packet.extend_from_slice(&rs_data);
-                self.packets.push(packet);
-                self.fec_seqid = self.fec_seqid.wrapping_add(1);
-                let rs_len = rs_data.len();
-                self.pending_shards.push(rs_data);
-                self.pending_max_size = self.pending_max_size.max(rs_len);
-                if self.pending_shards.len() == self.config.data_shards {
-                    let max_size = self.pending_max_size;
-                    for shard in &mut self.pending_shards {
-                        shard.resize(max_size, 0);
-                    }
-                    // Stack-allocated array avoids heap allocation for shard_refs Vec.
-                    debug_assert!(
-                        self.config.data_shards <= 64,
-                        "data_shards > 64 not supported"
-                    );
-                    let n = self.pending_shards.len();
-                    let mut shard_refs: [&[u8]; 64] = [&[]; 64];
-                    for (i, s) in self.pending_shards.iter().enumerate() {
-                        shard_refs[i] = s.as_slice();
-                    }
-                    let all_shards = fec.encode(&shard_refs[..n]);
-                    for parity in &all_shards[self.config.data_shards..] {
-                        let mut packet = Vec::with_capacity(FEC_HEADER_SIZE + parity.len());
-                        packet.extend_from_slice(&self.fec_seqid.to_le_bytes());
-                        packet.extend_from_slice(&TYPE_PARITY.to_le_bytes());
-                        packet.extend_from_slice(parity);
-                        self.packets.push(packet);
-                        self.fec_seqid = self.fec_seqid.wrapping_add(1);
-                    }
-                    self.pending_shards.clear();
-                    self.pending_max_size = 0;
-                }
-            }
-        } else {
-            // Non-FEC path: return output directly without going through self.packets.
-            return Ok(output);
-        }
-        Ok(std::mem::replace(
-            &mut self.packets,
-            Vec::with_capacity(PACKET_POOL_CAPACITY),
-        ))
+        self.fec_encode_output(output)
     }
 
     /// Feed received UDP data into KCP. Handles FEC decode if enabled.
@@ -406,8 +362,19 @@ impl KcpSession {
 
             // Attempt FEC recovery when we have enough shards.
             if group.received_count >= self.config.data_shards {
+                // Fast path: all data shards present, no recovery needed.
+                // Avoid allocating a Vec for had_data by using a slice check first.
+                if group.shards[..self.config.data_shards]
+                    .iter()
+                    .all(|s| s.is_some())
+                {
+                    self.shard_groups.remove(&shard_begin);
+                    return Ok(());
+                }
+
                 // Track which data shards were already received (to avoid double-feed).
-                let mut had_data = vec![false; self.config.data_shards];
+                // Fixed-size array avoids heap allocation (data_shards <= 64 by debug_assert).
+                let mut had_data = [false; 64];
                 for (i, s) in group
                     .shards
                     .iter()
@@ -415,14 +382,6 @@ impl KcpSession {
                     .take(self.config.data_shards)
                 {
                     had_data[i] = s.is_some();
-                }
-
-                // Fast path: all data shards present, no recovery needed.
-                // Skip the expensive pad+decode+feed_recovered steps.
-                let all_present = had_data.iter().all(|&b| b);
-                if all_present {
-                    self.shard_groups.remove(&shard_begin);
-                    return Ok(());
                 }
 
                 // Normalize shard lengths to max (Go: zero-extend shorter shards).
@@ -434,17 +393,13 @@ impl KcpSession {
                     .max()
                     .unwrap_or(0);
 
-                let mut decode_shards: Vec<Option<Vec<u8>>> = group
-                    .shards
-                    .iter()
-                    .map(|s| {
-                        s.as_ref().map(|d| {
-                            let mut v = d.clone();
-                            v.resize(max_len, 0);
-                            v
-                        })
-                    })
-                    .collect();
+                // Take ownership of shards to avoid cloning+resizing each one.
+                // The shard_groups entry will be removed after decode, so we
+                // don't need to preserve the original shards.
+                let mut decode_shards = std::mem::take(&mut group.shards);
+                for ref mut v in decode_shards.iter_mut().flatten() {
+                    v.resize(max_len, 0);
+                }
 
                 if fec.decode(&mut decode_shards) {
                     // Feed recovered (previously missing) data shards to KCP.

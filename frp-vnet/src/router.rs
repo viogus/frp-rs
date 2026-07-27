@@ -15,6 +15,7 @@ pub struct RouteTable {
 struct Ipv4Net {
     addr: u32,
     prefix_len: u8,
+    mask: u32,
 }
 
 impl std::fmt::Display for Ipv4Net {
@@ -40,17 +41,13 @@ impl Ipv4Net {
         Some(Ipv4Net {
             addr: u32::from(addr) & mask,
             prefix_len,
+            mask,
         })
     }
 
     fn contains(&self, ip: &Ipv4Addr) -> bool {
         let ip_u32 = u32::from(*ip);
-        let mask = if self.prefix_len == 0 {
-            0
-        } else {
-            !0u32 << (32 - self.prefix_len)
-        };
-        (ip_u32 & mask) == self.addr
+        (ip_u32 & self.mask) == self.addr
     }
 }
 
@@ -97,10 +94,15 @@ impl RouteTable {
         self.remove(name);
 
         self.by_name.insert(name.to_string(), net.clone());
-        self.routes.push((net, name.to_string()));
-        // Sort by prefix length descending for longest-prefix match
-        self.routes
-            .sort_by_key(|item| std::cmp::Reverse(item.0.prefix_len));
+        // Maintain sorted-by-prefix-length-descending order via binary search + insert.
+        // O(n) per insertion (shift) vs O(n log n) for full sort.
+        let pos = self
+            .routes
+            .binary_search_by_key(&std::cmp::Reverse(net.prefix_len), |item| {
+                std::cmp::Reverse(item.0.prefix_len)
+            })
+            .unwrap_or_else(|e| e);
+        self.routes.insert(pos, (net, name.to_string()));
 
         Ok(())
     }
