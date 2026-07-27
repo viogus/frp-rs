@@ -183,8 +183,7 @@ impl VhostManager {
             }
         }
 
-        // Register domain routes: append to Vec, then sort by location descending
-        // (matching Go frp's Add() which appends then slices.SortFunc).
+        // Register domain routes: append to Vec; sort once after all inserts.
         let mut domain_entries = Vec::new();
         for domain in domains {
             let vrs = tables
@@ -194,8 +193,15 @@ impl VhostManager {
                 .entry(route_by_http_user.to_string())
                 .or_default();
             vrs.push(route.clone());
-            sort_by_longest_location(vrs);
             domain_entries.push((domain.clone(), route_by_http_user.to_string()));
+        }
+        // Sort each affected (domain, rubu) bucket once (was O(N) sorts per registration).
+        for domain in domains {
+            if let Some(user_map) = tables.routes.get_mut(domain) {
+                if let Some(vrs) = user_map.get_mut(route_by_http_user) {
+                    sort_by_longest_location(vrs);
+                }
+            }
         }
         if !domain_entries.is_empty() {
             tables
@@ -213,8 +219,15 @@ impl VhostManager {
                 .entry(route_by_http_user.to_string())
                 .or_default();
             vrs.push(route.clone());
-            sort_by_longest_location(vrs);
             loc_entries.push((loc.clone(), route_by_http_user.to_string()));
+        }
+        // Sort each affected (loc, rubu) bucket once.
+        for loc in locations {
+            if let Some(user_map) = tables.location_routes.get_mut(loc) {
+                if let Some(vrs) = user_map.get_mut(route_by_http_user) {
+                    sort_by_longest_location(vrs);
+                }
+            }
         }
         if !loc_entries.is_empty() {
             tables
@@ -260,106 +273,6 @@ impl VhostManager {
                 }
             }
         }
-    }
-
-    /// Look up by domain (exact match) with path prefix matching.
-    /// Tries httpUser-specific routes first, then falls back to empty-string httpUser
-    /// (matching Go frp's `getLocked` → `getExactOrAllUsersLocked`).
-    pub async fn lookup(&self, domain: &str, path: &str, http_user: &str) -> Option<VhostRoute> {
-        let tables = self.inner.read().await;
-        get_locked(&tables.routes, domain, path, http_user)
-    }
-
-    /// Look up by domain with wildcard and path prefix support (Go frp dev compat).
-    /// Tries exact match first, then progressively replaces the leftmost
-    /// label with "*" (e.g. "a.b.c" → "*.b.c"), then tries the catch-all "*".
-    ///
-    /// For each candidate, calls get_locked which tries httpUser-specific routes
-    /// first, then falls back to empty-string httpUser, and finds the first route
-    /// whose location prefix-matches the given path (Go frp's getLocked pattern).
-    ///
-    /// Only checks wildcards for domains with >=3 labels (matching Go frp's
-    /// `for len(hostSplit) >= 3` — prevents matching `*.com` for `example.com`).
-    pub async fn lookup_wildcard(
-        &self,
-        domain: &str,
-        path: &str,
-        http_user: &str,
-    ) -> Option<VhostRoute> {
-        let tables = self.inner.read().await;
-
-        // 1. Exact match
-        if let Some(route) = get_locked(&tables.routes, domain, path, http_user) {
-            return Some(route);
-        }
-        // 2. Replace leftmost label with "*" progressively.
-        //    Only for domains with >=3 labels (matching Go's `for len(hostSplit) >= 3`).
-        let mut parts: Vec<&str> = domain.split('.').collect();
-        while parts.len() > 2 {
-            parts[0] = "*";
-            let wildcard_host = parts.join(".");
-            if let Some(route) = get_locked(&tables.routes, &wildcard_host, path, http_user) {
-                return Some(route);
-            }
-            parts = parts[1..].to_vec();
-        }
-        // 3. Catch-all "*"
-        get_locked(&tables.routes, "*", path, http_user)
-    }
-
-    /// Look up by URL path (longest prefix match among registered locations).
-    /// Returns the VhostRoute whose location prefix best matches the given path.
-    /// Tries httpUser-specific routes first, then falls back to empty-string httpUser.
-    /// For each matching prefix, finds the first route whose location prefix-matches
-    /// the path by iterating the sorted Vec (matching Go's getLocked pattern).
-    pub async fn lookup_by_path(&self, path: &str, http_user: &str) -> Option<VhostRoute> {
-        let tables = self.inner.read().await;
-        // Find longest matching prefix
-        let mut best: Option<(usize, VhostRoute)> = None;
-        for (prefix, user_map) in tables.location_routes.iter() {
-            if path.starts_with(prefix.as_str()) {
-                // Try httpUser-specific first, then empty-string fallback,
-                // then find first matching route in the Vec.
-                let route = user_map
-                    .get(http_user)
-                    .or_else(|| user_map.get(""))
-                    .and_then(|vrs| find_matching_route(vrs, path));
-                if let Some(route) = route {
-                    match best {
-                        Some((best_len, _)) if prefix.len() > best_len => {
-                            best = Some((prefix.len(), route));
-                        }
-                        None => {
-                            best = Some((prefix.len(), route));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        best.map(|(_, route)| route)
-    }
-
-    /// Combined lookup: tries domain match first, then falls back to path-only match.
-    /// Calls `lookup_wildcard` which handles both domain wildcard expansion and
-    /// location prefix matching (Go frp's getLocked/getByRoute pattern).
-    /// If no domain match, tries location-only routing (for proxies without custom_domains).
-    /// `http_user` is the Basic Auth username from the request (empty if none).
-    pub async fn lookup_combined(
-        &self,
-        domain: &str,
-        path: &str,
-        http_user: &str,
-    ) -> Option<VhostRoute> {
-        // Try host-based routing first (with wildcard support and path matching)
-        // lookup_wildcard internally calls get_locked which finds the first
-        // route whose location prefix-matches the path.
-        if let Some(route) = self.lookup_wildcard(domain, path, http_user).await {
-            return Some(route);
-        }
-        // Try location-only routing (for proxies without custom_domains)
-        self.lookup_by_path(path, http_user).await
-    }
 }
 /// Write an HTTP error response, optionally with a custom body.
 /// If custom_body is non-empty, it is used as the response body
