@@ -31,12 +31,12 @@ FRPS_BIN=/path/to/frps FRPC_BIN=/path/to/frpc cargo test --workspace --all-featu
 
 ### Binary Variants
 
-Four size tiers via feature flags. SSH, QUIC, and dashboard are opt-in (not in defaults):
+Four size tiers via feature flags. QUIC and dashboard are opt-in (not in defaults); SSH is default:
 
 ```bash
 # Default (no SSH, QUIC, dashboard; keeps TLS, KCP, WS, compression)
 cargo build --release -p frps -p frpc
-# → frps (~5.2MB), frpc (~5.4MB)
+# → frps (~5.6MB), frpc (~5.4MB)
 
 # Full (all features; add opt-in flags)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
@@ -97,7 +97,7 @@ Every feature, fix, and test change follows three rules:
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
 | `cargo test --workspace --all-features` | 522 passed, 2 ignored (35 suites) |
-| `cargo build --release` | passes (frps ~5.2MB, frpc ~5.4MB default; ~7.8MB/6.0MB all-features) |
+| `cargo build --release` | passes (frps ~5.6MB, frpc ~5.4MB default; ~7.8MB/6.0MB all-features) |
 | `compat-test.sh` (Go frp v0.70.1) | 67/67 passed (XTCP VPS-only) |
 | `unsafe` blocks | 6 in frp-core, 3+ in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |

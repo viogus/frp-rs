@@ -173,7 +173,7 @@ in the default build. Full-feature build (`--features "ssh,quic,dashboard"`) unc
 
 | Build | frps | frpc |
 |-------|------|------|
-| Default | ~5.2 MB | ~5.4 MB |
+| Default | ~5.6 MB | ~5.4 MB |
 | Full (`--features "ssh,quic,dashboard"`) | ~7.8 MB | ~6.0 MB |
 | Tiny (`--no-default-features --features tiny`) | ~4.4 MB | ~3.8 MB |
 | Micro (`--no-default-features --features micro`) | ~2.6 MB | ~2.7 MB |
@@ -445,3 +445,9 @@ Full-source audit of Go frp dev branch against frp-rs, fixing 18 findings (7 CRI
 ### Changed
 - ~98-99% feature parity with Go frp v0.69.1 (was ~90%)
 - Compat test suite: 31 tests (was 18)
+
+### SSH Added to Default Features
+
+SSH gateway (russh + rand010) added to default features. Default frps now
+includes SSH support (~4.1 MB). Tiny and micro profiles unchanged.
+
