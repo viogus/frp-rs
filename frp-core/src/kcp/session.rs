@@ -96,6 +96,9 @@ pub struct KcpSession {
     /// KcpStream checks this on poll_write/poll_read to fail fast instead of
     /// silently dropping data.
     alive: Arc<AtomicBool>,
+    /// Reusable output packet Vec. Pre-allocated with PACKET_POOL_CAPACITY,
+    /// cleared and filled each update/force_flush call to avoid per-call allocation.
+    packets: Vec<Vec<u8>>,
 }
 
 impl KcpSession {
@@ -150,6 +153,7 @@ impl KcpSession {
             pending_shards: Vec::new(),
             pending_max_size: 0,
             alive,
+            packets: Vec::with_capacity(PACKET_POOL_CAPACITY),
         }
     }
 
@@ -178,7 +182,7 @@ impl KcpSession {
             "KCP SESSION: update produced {} output packets",
             output.len()
         );
-        let mut packets = Vec::new();
+        self.packets.clear();
         if let Some(ref fec) = self.fec {
             for raw in &output {
                 // Build RS payload: SIZE(2B LE) + raw KCP data.
@@ -193,7 +197,7 @@ impl KcpSession {
                 packet.extend_from_slice(&self.fec_seqid.to_le_bytes());
                 packet.extend_from_slice(&TYPE_DATA.to_le_bytes());
                 packet.extend_from_slice(&rs_data);
-                packets.push(packet);
+                self.packets.push(packet);
                 self.fec_seqid = self.fec_seqid.wrapping_add(1);
 
                 // Buffer for parity generation.
@@ -210,9 +214,17 @@ impl KcpSession {
                         shard.resize(max_size, 0);
                     }
 
-                    let shard_refs: Vec<&[u8]> =
-                        self.pending_shards.iter().map(|s| s.as_slice()).collect();
-                    let all_shards = fec.encode(&shard_refs);
+                    // Stack-allocated array avoids heap allocation for shard_refs Vec.
+                    debug_assert!(
+                        self.config.data_shards <= 64,
+                        "data_shards > 64 not supported"
+                    );
+                    let n = self.pending_shards.len();
+                    let mut shard_refs: [&[u8]; 64] = [&[]; 64];
+                    for (i, s) in self.pending_shards.iter().enumerate() {
+                        shard_refs[i] = s.as_slice();
+                    }
+                    let all_shards = fec.encode(&shard_refs[..n]);
 
                     // Output parity shards (skip data shards, already sent).
                     for parity in &all_shards[self.config.data_shards..] {
@@ -220,7 +232,7 @@ impl KcpSession {
                         packet.extend_from_slice(&self.fec_seqid.to_le_bytes());
                         packet.extend_from_slice(&TYPE_PARITY.to_le_bytes());
                         packet.extend_from_slice(parity);
-                        packets.push(packet);
+                        self.packets.push(packet);
                         self.fec_seqid = self.fec_seqid.wrapping_add(1);
                     }
 
@@ -229,9 +241,13 @@ impl KcpSession {
                 }
             }
         } else {
-            packets = output;
+            // Non-FEC path: return output directly without going through self.packets.
+            return Ok(output);
         }
-        Ok(packets)
+        Ok(std::mem::replace(
+            &mut self.packets,
+            Vec::with_capacity(PACKET_POOL_CAPACITY),
+        ))
     }
 
     /// Enqueue data to send via KCP.
@@ -260,7 +276,7 @@ impl KcpSession {
             "KCP SESSION: force_flush produced {} packets",
             output.len()
         );
-        let mut packets = Vec::new();
+        self.packets.clear();
         if let Some(ref fec) = self.fec {
             for raw in &output {
                 let size = (2u16 + raw.len() as u16).to_le_bytes();
@@ -271,7 +287,7 @@ impl KcpSession {
                 packet.extend_from_slice(&self.fec_seqid.to_le_bytes());
                 packet.extend_from_slice(&TYPE_DATA.to_le_bytes());
                 packet.extend_from_slice(&rs_data);
-                packets.push(packet);
+                self.packets.push(packet);
                 self.fec_seqid = self.fec_seqid.wrapping_add(1);
                 let rs_len = rs_data.len();
                 self.pending_shards.push(rs_data);
@@ -281,15 +297,23 @@ impl KcpSession {
                     for shard in &mut self.pending_shards {
                         shard.resize(max_size, 0);
                     }
-                    let shard_refs: Vec<&[u8]> =
-                        self.pending_shards.iter().map(|s| s.as_slice()).collect();
-                    let all_shards = fec.encode(&shard_refs);
+                    // Stack-allocated array avoids heap allocation for shard_refs Vec.
+                    debug_assert!(
+                        self.config.data_shards <= 64,
+                        "data_shards > 64 not supported"
+                    );
+                    let n = self.pending_shards.len();
+                    let mut shard_refs: [&[u8]; 64] = [&[]; 64];
+                    for (i, s) in self.pending_shards.iter().enumerate() {
+                        shard_refs[i] = s.as_slice();
+                    }
+                    let all_shards = fec.encode(&shard_refs[..n]);
                     for parity in &all_shards[self.config.data_shards..] {
                         let mut packet = Vec::with_capacity(FEC_HEADER_SIZE + parity.len());
                         packet.extend_from_slice(&self.fec_seqid.to_le_bytes());
                         packet.extend_from_slice(&TYPE_PARITY.to_le_bytes());
                         packet.extend_from_slice(parity);
-                        packets.push(packet);
+                        self.packets.push(packet);
                         self.fec_seqid = self.fec_seqid.wrapping_add(1);
                     }
                     self.pending_shards.clear();
@@ -297,9 +321,13 @@ impl KcpSession {
                 }
             }
         } else {
-            packets = output;
+            // Non-FEC path: return output directly without going through self.packets.
+            return Ok(output);
         }
-        Ok(packets)
+        Ok(std::mem::replace(
+            &mut self.packets,
+            Vec::with_capacity(PACKET_POOL_CAPACITY),
+        ))
     }
 
     /// Feed received UDP data into KCP. Handles FEC decode if enabled.

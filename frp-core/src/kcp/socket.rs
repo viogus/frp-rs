@@ -84,6 +84,13 @@ pub(crate) struct KcpSocket {
     write_backlog: Arc<AtomicUsize>,
     write_notify: Arc<Notify>,
     start: Instant,
+    /// Pre-allocated Vec for session removal during tick (avoids per-tick allocation).
+    to_remove: Vec<(u32, SocketAddr)>,
+    /// Pre-allocated Vec for expired unaccepted sessions cleanup during tick.
+    expired: Vec<(u32, SocketAddr)>,
+    /// Reverse index from SocketAddr -> conv for O(1) FEC fallback lookup.
+    /// Avoids O(n) iter().find(|(_, a)| *a == src) on every FEC non-matching packet.
+    peer_addr_index: HashMap<SocketAddr, u32>,
 }
 
 impl KcpSocket {
@@ -116,6 +123,9 @@ impl KcpSocket {
             write_backlog: write_backlog.clone(),
             write_notify: write_notify.clone(),
             start: Instant::now(),
+            to_remove: Vec::with_capacity(16),
+            expired: Vec::with_capacity(16),
+            peer_addr_index: HashMap::new(),
         };
         let handle = KcpSocketHandle {
             write_tx,
@@ -134,6 +144,7 @@ impl KcpSocket {
         // causing FEC fallback to create a duplicate session with wrong conv.
         while let Ok((conv, addr, session)) = self.register_rx.try_recv() {
             self.conv_index.insert(conv, addr);
+            self.peer_addr_index.insert(addr, conv);
             self.sessions.insert((conv, addr), session);
         }
 
@@ -144,7 +155,7 @@ impl KcpSocket {
             tokio::select! {
                 _ = tick.tick() => {
                     let now_ms = self.start.elapsed().as_millis() as u32;
-                    let mut to_remove = Vec::new();
+                    self.to_remove.clear();
                     for (key, session) in &mut self.sessions {
                         match session.update(now_ms) {
                             Ok(packets) => {
@@ -156,31 +167,40 @@ impl KcpSocket {
                             }
                             Err(e) => {
                                 tracing::debug!(conv = key.0, peer = %key.1, error = %e, "KCP session error");
-                                to_remove.push(*key);
+                                self.to_remove.push(*key);
                                 continue;
                             }
                         }
                         if let Err(e) = session.recv_and_push() {
                             tracing::debug!(conv = key.0, peer = %key.1, error = %e, "KCP recv error");
-                            to_remove.push(*key);
+                            self.to_remove.push(*key);
                             continue;
                         }
                         // Remove dead sessions (retransmission exhaustion).
                         // is_dead_link() was previously defined but never called.
                         if session.is_dead_link() {
                             tracing::warn!(conv = key.0, peer = %key.1, "KCP session dead link (retransmission limit)");
-                            to_remove.push(*key);
+                            self.to_remove.push(*key);
                         }
                     }
                     // Mark dead before removal so KcpStream::poll_write fails fast.
-                    for key in &to_remove {
+                    for key in &self.to_remove {
                         if let Some(session) = self.sessions.get(key) {
                             session.mark_dead();
                         }
                     }
-                    for key in to_remove {
+                    for key in self.to_remove.drain(..) {
                         self.sessions.remove(&key);
                         self.conv_index.remove(&key.0);
+                        // Remove from reverse addr index only if this was the last session for this addr.
+                        if let Some(&conv) = self.peer_addr_index.get(&key.1) {
+                            if conv == key.0 {
+                                let has_other = self.sessions.iter().any(|((_, a), _)| *a == key.1);
+                                if !has_other {
+                                    self.peer_addr_index.remove(&key.1);
+                                }
+                            }
+                        }
                         self.session_created_at.remove(&key);
                         let ip = key.1.ip();
                         if let Some(count) = self.peer_session_counts.get_mut(&ip) {
@@ -193,22 +213,31 @@ impl KcpSocket {
                     // Clean up sessions that were never accepted by the listener.
                     // These are created from garbage packets that happen to pass
                     // the first input() check but are never picked up.
-                    let mut expired = Vec::new();
+                    self.expired.clear();
                     for (key, created_at) in &self.session_created_at {
                         if now_ms.wrapping_sub(*created_at) > UNACCEPTED_SESSION_TIMEOUT_MS {
-                            expired.push(*key);
+                            self.expired.push(*key);
                         }
                     }
                     // Mark dead before removal.
-                    for key in &expired {
+                    for key in &self.expired {
                         if let Some(session) = self.sessions.get(key) {
                             session.mark_dead();
                         }
                     }
-                    for key in expired {
+                    for key in self.expired.drain(..) {
                         tracing::debug!(conv = key.0, peer = %key.1, "KCP: removing unaccepted session");
                         self.sessions.remove(&key);
                         self.conv_index.remove(&key.0);
+                        // Remove from reverse addr index only if this was the last session for this addr.
+                        if let Some(&conv) = self.peer_addr_index.get(&key.1) {
+                            if conv == key.0 {
+                                let has_other = self.sessions.iter().any(|((_, a), _)| *a == key.1);
+                                if !has_other {
+                                    self.peer_addr_index.remove(&key.1);
+                                }
+                            }
+                        }
                         self.session_created_at.remove(&key);
                         let ip = key.1.ip();
                         if let Some(count) = self.peer_session_counts.get_mut(&ip) {
@@ -308,12 +337,8 @@ impl KcpSocket {
                                     && (u16::from_le_bytes([data[4], data[5]]) == 0xf1
                                         || u16::from_le_bytes([data[4], data[5]]) == 0xf2);
                                 let fec_key = if is_fec {
-                                    // Find the session matching this peer addr.
-                                    // .copied() converts Option<&(u32, SocketAddr)>
-                                    // to Option<(u32, SocketAddr)>.
-                                    self.sessions.keys()
-                                        .find(|(_, a)| *a == src)
-                                        .copied()
+                                    // O(1) reverse index lookup instead of O(n) sessions scan.
+                                    self.peer_addr_index.get(&src).map(|conv| (*conv, src))
                                 } else {
                                     None
                                 };
@@ -380,6 +405,7 @@ impl KcpSocket {
                                         // Clean up the partially-created session.
                                         self.sessions.remove(&key);
                                         self.conv_index.remove(&key.0);
+                                        self.peer_addr_index.remove(&key.1);
                                         let ip = key.1.ip();
                                         if let Some(count) = self.peer_session_counts.get_mut(&ip) {
                                             *count = count.saturating_sub(1);
@@ -390,6 +416,7 @@ impl KcpSocket {
                                         continue;
                                     }
                                     self.conv_index.insert(key.0, key.1);
+                                    self.peer_addr_index.insert(key.1, key.0);
                                     self.sessions.insert(key, session);
                                     *self.peer_session_counts.entry(src.ip()).or_default() += 1;
                                     let now_ms = self.start.elapsed().as_millis() as u32;
@@ -415,6 +442,7 @@ impl KcpSocket {
                 Some((conv, addr, session)) = self.register_rx.recv() => {
                     let key = (conv, addr);
                     self.conv_index.insert(conv, addr);
+                    self.peer_addr_index.insert(addr, conv);
                     self.sessions.insert(key, session);
                 }
             }
