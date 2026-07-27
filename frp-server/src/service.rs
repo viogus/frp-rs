@@ -410,6 +410,15 @@ impl Service {
                                         Ok(mut ws) => {
                                             info!(addr = %addr, "WebSocket upgrade completed for {}", addr);
 
+                                            // Reject plain WebSocket when tls_only is set.
+                                            // The main TCP accept loop enforces this for all
+                                            // connection types, but the dedicated WS listener
+                                            // on proxy_bind_addr bypasses that check.
+                                            if state.tls_only {
+                                                warn!(addr = %addr, "TLS-only mode: rejected WebSocket on dedicated WS port from {}", addr);
+                                                return;
+                                            }
+
                                             // Try V2 magic detection
                                             let mut magic = [0u8; 7];
                                             let is_v2 = match ws.read_exact(&mut magic).await {
