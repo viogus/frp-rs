@@ -228,11 +228,14 @@ async fn handle_visitor_conn(
     }
 
     // 3. Send NewVisitorConn
+    // Note: plugin visitors have no user/run_id context; pass None.
     let nvc = crate::proxy::create_visitor_conn_msg(
         server_name,
         secret_key,
         use_encryption,
         use_compression,
+        None,
+        None,
         None,
     );
     write_msg_v1(&mut server_stream, &nvc)

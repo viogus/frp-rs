@@ -3,6 +3,8 @@
 //! These functions contain NO business logic. They match on message type
 //! and delegate to the appropriate handler in `pool`, `nathole`, or `proxy`.
 
+use std::future::Future;
+use std::pin::Pin;
 use tokio::io::AsyncWriteExt;
 
 use frp_core::msg::{self, FrpMessage};
@@ -13,36 +15,45 @@ use super::{ControlContext, ControlState};
 
 // ── InternalMsg dispatch ─────────────────────────────────────────────
 
-pub(crate) async fn dispatch_internal<W: AsyncWriteExt + Unpin>(
-    ctx: &mut ControlContext,
-    ctl: &mut ControlState,
-    writer: &mut W,
+/// Non-async match that returns a boxed future for the matched handler.
+#[inline(never)]
+fn match_internal_dispatch<'a, W: AsyncWriteExt + Unpin + Send + 'a>(
+    ctx: &'a mut ControlContext,
+    ctl: &'a mut ControlState,
+    writer: &'a mut W,
     msg: InternalMsg,
-) -> Result<(), ()> {
+) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + 'a>> {
     match msg {
-        InternalMsg::NewWorkConn(s) => super::pool::handle_new_work_conn(ctx, ctl, writer, s).await,
+        InternalMsg::NewWorkConn(s) => {
+            Box::pin(super::pool::handle_new_work_conn(ctx, ctl, writer, s))
+        }
         InternalMsg::VisitorConn {
             proxy_name,
             visitor_conn,
-        } => super::pool::handle_visitor_conn(ctx, ctl, writer, proxy_name, visitor_conn).await,
+        } => Box::pin(super::pool::handle_visitor_conn(
+            ctx,
+            ctl,
+            writer,
+            proxy_name,
+            visitor_conn,
+        )),
         InternalMsg::ProxyUserConn {
             proxy_name,
             user_conn,
             pre_read,
-        } => {
-            super::pool::handle_proxy_user_conn(ctx, ctl, writer, proxy_name, user_conn, pre_read)
-                .await
-        }
-        InternalMsg::UdpNeedsWorkConn { proxy_name } => {
-            super::pool::handle_udp_work_conn(ctx, ctl, writer, proxy_name).await
-        }
-        InternalMsg::NatHoleSidOnWorkConn { sid, proxy_name } => {
-            super::nathole::handle_sid_on_work_conn(ctx, ctl, writer, sid, proxy_name).await
-        }
-        InternalMsg::WriteNatHoleSid { sid } => {
+        } => Box::pin(super::pool::handle_proxy_user_conn(
+            ctx, ctl, writer, proxy_name, user_conn, pre_read,
+        )),
+        InternalMsg::UdpNeedsWorkConn { proxy_name } => Box::pin(
+            super::pool::handle_udp_work_conn(ctx, ctl, writer, proxy_name),
+        ),
+        InternalMsg::NatHoleSidOnWorkConn { sid, proxy_name } => Box::pin(
+            super::nathole::handle_sid_on_work_conn(ctx, ctl, writer, sid, proxy_name),
+        ),
+        InternalMsg::WriteNatHoleSid { sid } => Box::pin(async move {
             super::nathole::handle_write_sid(ctx, ctl, writer, sid).await;
             Ok(())
-        }
+        }),
         InternalMsg::WriteNatHoleResp {
             transaction_id,
             error,
@@ -50,7 +61,7 @@ pub(crate) async fn dispatch_internal<W: AsyncWriteExt + Unpin>(
             protocol,
             candidate_addrs,
             assisted_addrs,
-        } => {
+        } => Box::pin(async move {
             super::nathole::handle_write_resp(
                 ctx,
                 ctl,
@@ -67,21 +78,21 @@ pub(crate) async fn dispatch_internal<W: AsyncWriteExt + Unpin>(
             )
             .await;
             Ok(())
-        }
-        InternalMsg::WriteNatHoleReport { sid } => {
+        }),
+        InternalMsg::WriteNatHoleReport { sid } => Box::pin(async move {
             super::nathole::handle_write_report(ctx, ctl, writer, sid).await;
             Ok(())
-        }
+        }),
         #[cfg(feature = "vnet")]
-        InternalMsg::VnetPacketForward { proxy_name, data } => {
+        InternalMsg::VnetPacketForward { proxy_name, data } => Box::pin(async move {
             super::nathole::handle_vnet_packet_forward(ctx, ctl, writer, proxy_name, data).await;
             Ok(())
-        }
-        InternalMsg::WriteCloseProxy { proxy_name } => {
+        }),
+        InternalMsg::WriteCloseProxy { proxy_name } => Box::pin(async move {
             super::proxy::handle_write_close_proxy(ctx, ctl, writer, proxy_name).await;
             Ok(())
-        }
-        InternalMsg::Shutdown { done } => {
+        }),
+        InternalMsg::Shutdown { done } => Box::pin(async move {
             tracing::warn!(
                 run_id = %ctx.run_id,
                 "Shutdown received for run_id {} (replaced by new control connection)",
@@ -89,68 +100,95 @@ pub(crate) async fn dispatch_internal<W: AsyncWriteExt + Unpin>(
             );
             ctl.shutting_down = true;
             ctl.shutdown_done = Some(done);
-            // Return Err to trigger loop break via is_err() in mod.rs,
-            // so that cleanup runs after the select! loop exits.
             Err(())
-        }
+        }),
     }
+}
+
+/// Async wrapper around `match_internal_dispatch`.
+pub(crate) async fn dispatch_internal<W: AsyncWriteExt + Unpin + Send>(
+    ctx: &mut ControlContext,
+    ctl: &mut ControlState,
+    writer: &mut W,
+    msg: InternalMsg,
+) -> Result<(), ()> {
+    match_internal_dispatch(ctx, ctl, writer, msg).await
 }
 
 // ── FrpMessage dispatch ─────────────────────────────────────────────
 
-pub(crate) async fn dispatch_frp_message<W: AsyncWriteExt + Unpin>(
+/// Non-async match that returns a boxed future for the matched handler.
+/// This avoids having the 16-arm dispatch inside the async state machine
+/// of `dispatch_frp_message`, reducing its closure size.
+#[inline(never)]
+fn match_dispatch<'a, W: AsyncWriteExt + Unpin + Send + 'a>(
+    ctx: &'a mut ControlContext,
+    ctl: &'a mut ControlState,
+    writer: &'a mut W,
+    msg: FrpMessage,
+    login_user: &'a str,
+) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + 'a>> {
+    match msg {
+        FrpMessage::NewProxy(m) => Box::pin(super::proxy::handle_new_proxy(ctx, ctl, writer, *m)),
+        FrpMessage::CloseProxy(m) => {
+            Box::pin(super::proxy::handle_close_proxy(ctx, ctl, writer, m))
+        }
+        FrpMessage::Ping(m) => Box::pin(super::proxy::handle_ping(ctx, ctl, writer, m)),
+        FrpMessage::UDPPacket(m) => Box::pin(super::proxy::handle_udp_packet(ctx, ctl, writer, m)),
+        FrpMessage::NatHoleClient(m) => Box::pin(async move {
+            super::nathole::handle_nat_hole_client(ctx, ctl, writer, *m).await;
+            Ok(())
+        }),
+        FrpMessage::NatHoleSid(m) => Box::pin(async move {
+            super::nathole::handle_nat_hole_sid(ctx, ctl, writer, m).await;
+            Ok(())
+        }),
+        FrpMessage::NatHoleResp(m) => Box::pin(async move {
+            super::nathole::handle_nat_hole_resp(ctx, ctl, writer, *m).await;
+            Ok(())
+        }),
+        FrpMessage::NatHoleReport(m) => Box::pin(async move {
+            super::nathole::handle_nat_hole_report(ctx, ctl, writer, m).await;
+            Ok(())
+        }),
+        FrpMessage::NatHoleVisitor(m) => Box::pin(super::nathole::handle_nat_hole_visitor_on_ctl(
+            ctx, ctl, writer, m, login_user,
+        )),
+        FrpMessage::NewVisitorConn(m) => Box::pin(async move {
+            super::nathole::handle_new_visitor_conn(ctx, ctl, writer, m, login_user).await;
+            Ok(())
+        }),
+        #[cfg(feature = "vnet")]
+        FrpMessage::VnetRouteAdvertise(m) => Box::pin(async move {
+            super::nathole::handle_vnet_route_advertise(ctx, ctl, writer, m).await;
+            Ok(())
+        }),
+        #[cfg(feature = "vnet")]
+        FrpMessage::VnetPacket(m) => Box::pin(async move {
+            super::nathole::handle_vnet_packet(ctx, ctl, writer, m).await;
+            Ok(())
+        }),
+        #[cfg(feature = "vnet")]
+        FrpMessage::VnetRouteRemove(m) => Box::pin(async move {
+            super::nathole::handle_vnet_route_remove(ctx, ctl, writer, m).await;
+            Ok(())
+        }),
+        other => Box::pin(async move {
+            tracing::debug!("unhandled control msg: {:?}", other.v1_type_byte());
+            Ok(())
+        }),
+    }
+}
+
+/// Async wrapper around `match_dispatch`. The state machine has only
+/// two variants (start + await boxed future), shrinking from the
+/// original 16-arm inline match.
+pub(crate) async fn dispatch_frp_message<W: AsyncWriteExt + Unpin + Send>(
     ctx: &mut ControlContext,
     ctl: &mut ControlState,
     writer: &mut W,
     msg: FrpMessage,
     login_user: &str,
 ) -> Result<(), ()> {
-    match msg {
-        FrpMessage::NewProxy(m) => super::proxy::handle_new_proxy(ctx, ctl, writer, *m).await,
-        FrpMessage::CloseProxy(m) => super::proxy::handle_close_proxy(ctx, ctl, writer, m).await,
-        FrpMessage::Ping(m) => super::proxy::handle_ping(ctx, ctl, writer, m).await,
-        FrpMessage::UDPPacket(m) => super::proxy::handle_udp_packet(ctx, ctl, writer, m).await,
-        FrpMessage::NatHoleClient(m) => {
-            super::nathole::handle_nat_hole_client(ctx, ctl, writer, *m).await;
-            Ok(())
-        }
-        FrpMessage::NatHoleSid(m) => {
-            super::nathole::handle_nat_hole_sid(ctx, ctl, writer, m).await;
-            Ok(())
-        }
-        FrpMessage::NatHoleResp(m) => {
-            super::nathole::handle_nat_hole_resp(ctx, ctl, writer, *m).await;
-            Ok(())
-        }
-        FrpMessage::NatHoleReport(m) => {
-            super::nathole::handle_nat_hole_report(ctx, ctl, writer, m).await;
-            Ok(())
-        }
-        FrpMessage::NatHoleVisitor(m) => {
-            super::nathole::handle_nat_hole_visitor_on_ctl(ctx, ctl, writer, m, login_user).await
-        }
-        FrpMessage::NewVisitorConn(m) => {
-            super::nathole::handle_new_visitor_conn(ctx, ctl, writer, m, login_user).await;
-            Ok(())
-        }
-        #[cfg(feature = "vnet")]
-        FrpMessage::VnetRouteAdvertise(m) => {
-            super::nathole::handle_vnet_route_advertise(ctx, ctl, writer, m).await;
-            Ok(())
-        }
-        #[cfg(feature = "vnet")]
-        FrpMessage::VnetPacket(m) => {
-            super::nathole::handle_vnet_packet(ctx, ctl, writer, m).await;
-            Ok(())
-        }
-        #[cfg(feature = "vnet")]
-        FrpMessage::VnetRouteRemove(m) => {
-            super::nathole::handle_vnet_route_remove(ctx, ctl, writer, m).await;
-            Ok(())
-        }
-        other => {
-            tracing::debug!("unhandled control msg: {:?}", other.v1_type_byte());
-            Ok(())
-        }
-    }
+    match_dispatch(ctx, ctl, writer, msg, login_user).await
 }

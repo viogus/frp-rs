@@ -1,3 +1,4 @@
+#![cfg(feature = "ssh")]
 mod common;
 
 use common::{allocate_port, start_test_server, test_auth_cfg};

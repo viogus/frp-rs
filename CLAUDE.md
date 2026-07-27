@@ -31,20 +31,24 @@ FRPS_BIN=/path/to/frps FRPC_BIN=/path/to/frpc cargo test --workspace --all-featu
 
 ### Binary Variants
 
-Three size tiers via feature flags:
+Four size tiers via feature flags. SSH, QUIC, and dashboard are opt-in (not in defaults):
 
 ```bash
-# Full (all features)
+# Default (no SSH, QUIC, dashboard; keeps TLS, KCP, WS, compression)
 cargo build --release -p frps -p frpc
-# → frps (~4.8MB), frpc (~3.7MB)
+# → frps (~5.2MB), frpc (~5.4MB)
+
+# Full (all features; add opt-in flags)
+cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
+# → frps (~7.8MB), frpc (~6.0MB)
 
 # Tiny (no heavy protocols: QUIC/KCP/WS/SSH/OIDC/dashboard; keeps TLS)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
-# → frps-tiny (~2.7MB), frpc-tiny (~2.3MB)
+# → frps-tiny (~4.4MB), frpc-tiny (~3.8MB)
 
 # Micro (core only: no TLS, compression, chacha20, HTTP proxy, tcp-mux)
 cargo build --release -p frps -p frpc --no-default-features --features micro
-# → frps-micro (~1.6MB), frpc-micro (~1.7MB)
+# → frps-micro (~2.6MB), frpc-micro (~2.7MB)
 ```
 
 Feature flags across crates:
@@ -85,16 +89,16 @@ Every feature, fix, and test change follows three rules:
    bash scripts/download-go-frp.sh
    ```
 
-## Current Health (2026-07-25)
+## Current Health (2026-07-27)
 
 | Metric | Value |
 |--------|-------|
 | `cargo clippy` (default) | zero warnings |
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
-| `cargo test --workspace --all-features` | 485 passed, 2 ignored (35 suites) |
-| `cargo build --release` | passes (frps ~4.8MB, frpc ~3.7MB) |
-| `compat-test.sh` (Go frp v0.70.1) | 61/64 passed (3 flaky: KCP/QUIC timing, V2 skipped) |
+| `cargo test --workspace --all-features` | 522 passed, 2 ignored (35 suites) |
+| `cargo build --release` | passes (frps ~5.2MB, frpc ~5.4MB default; ~7.8MB/6.0MB all-features) |
+| `compat-test.sh` (Go frp v0.70.1) | 67/67 passed (XTCP VPS-only) |
 | `unsafe` blocks | 6 in frp-core, 3+ in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
 | `hex` crate | removed — inline `hex_encode` in frp-core |

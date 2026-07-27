@@ -100,6 +100,9 @@ pub async fn handle_control<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     info!(peer = ?peer, "New control connection from {:?}", peer);
+    // Box stream to erase type — authenticate is type-erased to avoid
+    // monomorphization (saves ~30KB per copy in release binary).
+    let stream: Box<dyn frp_core::cipher_stream::AsyncReadWriteUnpin> = Box::new(stream);
     // 1. Authenticate and set up per-client state (login.rs)
     let (mut ctx, mut ctl, _internal_tx, mut internal_rx, mut reader, mut writer, mut incoming) =
         match login::authenticate(

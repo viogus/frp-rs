@@ -5,10 +5,10 @@ All notable changes to frp-rs.
 ## v0.7.1 — Go frp v0.70.1 Source-Level Compatibility Audit
 
 Full-source audit of Go frp v0.70.1 (fatedier/frp) against frp-rs. 106 findings
-from 6 parallel subagent audits, 50+ fixes across 34 files. Every fix references
+from 6 parallel subagent audits, 60+ fixes across 37 files. Every fix references
 the exact Go frp source location that mandates the behavior.
 
-### Config (14 fixes)
+### Config (19 fixes)
 
 - **QUICOptions**: add `QuicOptions` struct with `keepalive_period` (10s), `max_idle_timeout` (30s), `max_incoming_streams` (100000). Added as `quic_options` field to `ServerTransportConfig` and `ClientConfig` (serde alias "quic").
 - **TCPKeepAlive**: add `tcp_keepalive` (default 7200) to `ServerTransportConfig` with alias `tcpKeepAlive`.
@@ -23,12 +23,17 @@ the exact Go frp source location that mandates the behavior.
 - **allow_port_start default 0→1**: port 0 caused OS-assigned port mismatch (server advertised port 0 but listener was on kernel-chosen port).
 - **allow_port_end default 50000→65535**: full port range allowed by default, matching Go frp empty AllowPorts.
 - **disable_custom_tls_first_byte serde default**: changed from `#[serde(default)]` (false) to `#[serde(default = "default_true")]` — config-file and programmatic users now get the same default (true).
+- **udp_packet_size serde alias**: add `alias = "udpPacketSize"` on `udp_packet_size` field for Go frp config compat.
+- **login_fail_exit serde alias**: add `alias = "loginFailExit"` on `login_fail_exit` field for Go frp config compat.
+- **dns_server serde alias**: add `alias = "dnsServer"` on `dns_server` field for Go frp config compat.
+- **Health check path → url mapping**: `normalize_proxies()` maps `health_check.path` to `health_check_url` (Go frp v0.70.1 aliases `path` as `url` in health check config).
+- **Bandwidth_limit GB hint**: validation error message now mentions GB suffix alongside KB/MB (was missing).
 
 ### Messages (1 fix)
 
 - **NatHoleReport.success**: changed from `Option<bool>` to `bool` (Go frp v0.70.1 always sends the field).
 
-### Client (10 fixes)
+### Client (13 fixes)
 
 - **V2 handshake pipelining**: split `v2_handshake_client` into `send_hello` / `recv_hello` so Login is sent between ClientHello and ServerHello, matching Go frp's `control_session.go:140-203`.
 - **Health check monotonic counter**: `failures` is now a monotonic u64 that never resets on success (matching Go frp behavior). Counter inspected at `/healthz?probe=health`.
@@ -40,8 +45,11 @@ the exact Go frp source location that mandates the behavior.
 - **Unique transaction_id per request**: `uuid::Uuid::new_v4()` per message instead of static constant.
 - **UDP bind before NatHoleSid**: fix race where NatHoleSid was sent before the UDP socket bind completed (Go frp binds first, then sends).
 - **client_spec in Login**: `ClientSpec { client_type: "frpc", always_auth_pass: None }` sent in every Login message (Go frp compat).
+- **NewVisitorConn proxy_name**: follows Go frp v0.70.1 `BuildTargetServerProxyName` — prefixes with `server_user` if non-empty, else with client `user` if non-empty, else bare `server_name`. Previously only supported `server_user` prefix.
+- **NewVisitorConn run_id**: passes client `run_id` in NewVisitorConn message for server-side session tracking (Go frp compat).
+- **UDP work conn keepalive**: sends `Ping` every 30s on UDP work connections to prevent server idle timeout from closing the connection (Go frp `udpWorkConnKeepalive`).
 
-### Server (8 fixes)
+### Server (9 fixes)
 
 - **VHost multi-proxy per domain**: changed from `HashMap<String, VhostRoute>` to `HashMap<String, Vec<VhostRoute>>` with longest location prefix match — multiple proxies can serve the same domain at different locations, matching Go frp's `routerByHTTPUser`.
 - **Separate TCP/UDP port managers**: `used_udp_ports` tracking separate from `used_ports`. UDP/SuDP proxies allocate from UDP pool, TCP proxies from TCP pool with OS-level bind probe.
@@ -51,6 +59,7 @@ the exact Go frp source location that mandates the behavior.
 - **Dashboard healthz**: returns empty body for Go compat (was "ok"); `/healthz?probe=readiness` returns "ok".
 - **TCP keepalive**: applied via `socket2` in server accept loop on every raw `TcpStream`.
 - **TLS force handling**: proper detection and handling of `tls_only` mode on the server side.
+- **NewWorkConn auth simplification**: removed Go frp compat workaround that skipped auth when `privilege_key` was present but timestamp missing — Go frp v0.70.1 always sends timestamp on NewWorkConn messages.
 
 ### XTCP / NAT Hole Punch (13 fixes)
 
@@ -136,6 +145,45 @@ Go frp behavior).
 
 `allow_port_start` changed from 10000 to 1, `allow_port_end` from 50000 to 65535.
 All ports are now allowed by default (matching Go frp empty AllowPorts).
+
+### Binary Size Optimization
+
+Three-phase binary size reduction: frps -36% (8.18→5.20 MB), frpc -13% (6.24→5.42 MB)
+in the default build. Full-feature build (`--features "ssh,quic,dashboard"`) unchanged.
+
+#### Feature Flags: Opt-In for Heavy Protocols
+
+- **SSH** (russh + rand010, ~407 KB) → opt-in. Enable with `--features ssh`.
+- **QUIC** (quinn, ~280 KB) → opt-in. Enable with `--features quic`.
+- **Dashboard** (prometheus + axum, ~181 KB) → opt-in. Enable with `--features dashboard`.
+- All three removed from default features. Transitive dependencies eliminated wholesale.
+- Feature forwarding added in frps/frpc Cargo.toml for all optional features.
+- `toml_edit` already removed in favor of `toml` 0.8.
+
+#### Code-Level Optimizations
+
+- **Type erasure for authenticate**: Changed from generic to `Box<dyn AsyncReadWriteUnpin>` with `#[inline(never)]`. Eliminates dual monomorphization. Saved ~37 KB.
+- **Box large async futures**: Added `spawn_boxed()` helper using unsizing coercion to erase concrete future types. Boxed dispatch match block in main accept handler. Saved ~36 KB.
+- **Dispatch split**: Non-async match functions returning `Pin<Box<dyn Future + Send>>` replace N-variant async state machines. `dispatch_frp_message` reduced from 43 KB to 206 bytes.
+- **Validation extraction**: `validate_new_proxy()` pure function removes 5 `.await` points from `handle_new_proxy`.
+- **anyhow backtrace disabled**: Changed to `default-features = false, features = ["std"]`. Added minimal panic hooks.
+- **Nightly infrastructure**: Added `nightly = []` feature placeholder.
+
+#### Binary Sizes
+
+| Build | frps | frpc |
+|-------|------|------|
+| Default | ~5.2 MB | ~5.4 MB |
+| Full (`--features "ssh,quic,dashboard"`) | ~7.8 MB | ~6.0 MB |
+| Tiny (`--no-default-features --features tiny`) | ~4.4 MB | ~3.8 MB |
+| Micro (`--no-default-features --features micro`) | ~2.6 MB | ~2.7 MB |
+
+#### Upgrade Notes
+
+- **SSH, QUIC, dashboard are now opt-in.** If you use SSH tunneling, QUIC transport,
+  or the dashboard/metrics API, add `--features "ssh,quic,dashboard"` to your build.
+- **Config files unchanged.** All config parsing and defaults are identical.
+- **No wire protocol changes.** Compatible with Go frp v0.70.1.
 
 ## v0.7.0 (2026-07-21)
 

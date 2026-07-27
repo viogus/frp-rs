@@ -1,6 +1,6 @@
 [package]
 name = "frp-client"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 license = "MIT"
 
@@ -27,7 +27,7 @@ rand.workspace = true
 data-encoding.workspace = true
 
 [features]
-default = ["tls", "quic", "kcp", "websocket", "oidc", "vnet", "admin", "compression", "chacha20", "tcp-mux"]
+default = ["tls", "kcp", "websocket", "oidc", "vnet", "admin", "compression", "chacha20", "tcp-mux"]
 admin = ["dep:axum", "frp-core/admin-auth"]
 tls = ["frp-core/tls", "dep:rustls", "dep:tokio-rustls"]
 quic = ["frp-core/quic"]

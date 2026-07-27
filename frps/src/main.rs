@@ -17,6 +17,9 @@ static GLOBAL: frp_core::mem_profile::CountingAlloc = frp_core::mem_profile::Cou
 
 #[tokio::main]
 async fn main() {
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("fatal: {info}");
+    }));
     let cli = parse_frps_args();
     #[cfg(feature = "mem-profile")]
     frp_core::mem_profile::spawn_emitter();

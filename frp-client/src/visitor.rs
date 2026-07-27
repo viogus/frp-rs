@@ -37,6 +37,10 @@ pub(crate) struct VisitorListenerConfig {
     /// Graceful shutdown signal. When true, the listener stops accepting
     /// new connections and exits. Checked between accept iterations.
     pub shutdown: Arc<AtomicBool>,
+    /// Client's user name for proxy_name prefix (Go frp BuildTargetServerProxyName compat).
+    pub user: String,
+    /// Current session run_id for NewVisitorConn (Go frp compat).
+    pub run_id: String,
 }
 /// Run an STCP/XTCP visitor listener.
 /// Binds a local port, accepts connections, and tunnels them
@@ -67,6 +71,8 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
         fallback_to,
         disable_assisted_addrs,
         shutdown,
+        user,
+        run_id,
     } = config;
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
@@ -105,6 +111,8 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                 let fb_to = fallback_to.clone();
                 let daa = disable_assisted_addrs;
                 let pp = p2p_protocol.clone();
+                let u = user.clone();
+                let rid = run_id.clone();
 
                 tokio::spawn(async move {
                     // Dial options for STCP fallback (fresh connections only).
@@ -485,6 +493,8 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             use_encryption,
                             use_compression,
                             Some(su.as_str()).filter(|s| !s.is_empty()),
+                            Some(u.as_str()).filter(|s| !s.is_empty()),
+                            Some(rid.as_str()).filter(|s| !s.is_empty()),
                         );
                         debug!(visitor_name = %visitor_name, json = %serde_json::to_string(&nvc).unwrap_or_default(), "Visitor '{}': NewVisitorConn JSON: {}", visitor_name, serde_json::to_string(&nvc).unwrap_or_default());
                         if let Err(e) = server_conn.write_v1_frame(&nvc).await {
@@ -578,6 +588,8 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             use_encryption,
                             use_compression,
                             Some(su.as_str()).filter(|s| !s.is_empty()),
+                            Some(u.as_str()).filter(|s| !s.is_empty()),
+                            Some(rid.as_str()).filter(|s| !s.is_empty()),
                         );
                         debug!(visitor_name = %visitor_name, json = %serde_json::to_string(&nvc).unwrap_or_default(), "Visitor '{}': NewVisitorConn JSON: {}", visitor_name, serde_json::to_string(&nvc).unwrap_or_default());
                         if let Err(e) = server_conn.write_v1_frame(&nvc).await {

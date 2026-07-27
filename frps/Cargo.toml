@@ -1,12 +1,25 @@
 [package]
 name = "frps"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 license = "MIT"
 
 [features]
 default = ["full"]
 full = ["frp-server/default"]
+# Feature forwarding: enable the corresponding frp-server feature.
+ssh = ["frp-server/ssh"]
+dashboard = ["frp-server/dashboard"]
+websocket = ["frp-server/websocket"]
+quic = ["frp-server/quic"]
+kcp = ["frp-server/kcp"]
+oidc = ["frp-server/oidc"]
+tls = ["frp-server/tls"]
+http-proxy = ["frp-server/http-proxy"]
+vnet = ["frp-server/vnet"]
+compression = ["frp-server/compression"]
+chacha20 = ["frp-server/chacha20"]
+tcp-mux = ["frp-server/tcp-mux"]
 # Tiny: removes heavy protocols (QUIC/KCP/WS/SSH/OIDC/dashboard) but keeps TLS + http-proxy + tcp-mux
 tiny = ["frp-server/tls", "frp-server/http-proxy", "frp-server/tcp-mux"]
 # Micro: absolutely minimal — just TCP + V1/V2 core, no optional deps
@@ -28,6 +41,9 @@ profiling = ["frp-server/profiling"]
 # Use mimalloc global allocator (~10-20% throughput gain for network workloads).
 # Mutually exclusive with mem-profile (only one #[global_allocator] allowed).
 mimalloc = ["dep:mimalloc"]
+# Nightly-only optimizations (requires +nightly toolchain).
+# Enables panic_immediate_abort to skip drop glue on panic path (~30-50KB savings).
+nightly = []
 
 [dependencies]
 frp-core = { path = "../frp-core", default-features = false }
