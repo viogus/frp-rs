@@ -124,6 +124,8 @@ pub async fn handle_control<S>(
     let login_user = login.user.clone().unwrap_or_default();
 
     // --- Main select loop ---
+    // Cache heartbeat timeout duration (never changes during the loop).
+    let hb_timeout = Duration::from_secs(state.heartbeat_timeout as u64);
     loop {
         // Expire stale pending requests
         while let Some(req) = ctl.pending_requests.pop_front() {
@@ -167,12 +169,9 @@ pub async fn handle_control<S>(
         // Heartbeat check: if no ping in heartbeat_timeout, disconnect.
         // When heartbeat_timeout <= 0, heartbeat checking is disabled
         // (matching Go frp v0.70.0 behaviour when tcpMux is enabled).
-        if state.heartbeat_timeout > 0 {
-            let hb_timeout = Duration::from_secs(state.heartbeat_timeout as u64);
-            if ctl.last_ping.elapsed() > hb_timeout {
-                warn!(peer = ?peer, hb_timeout = ?hb_timeout, "Heartbeat timeout for {:?} (no ping in {:?}), disconnecting", peer, hb_timeout);
-                break;
-            }
+        if state.heartbeat_timeout > 0 && ctl.last_ping.elapsed() > hb_timeout {
+            warn!(peer = ?peer, hb_timeout = ?hb_timeout, "Heartbeat timeout for {:?} (no ping in {:?}), disconnecting", peer, hb_timeout);
+            break;
         }
 
         tokio::select! {

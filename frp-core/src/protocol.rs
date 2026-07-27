@@ -15,26 +15,29 @@ pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
     // extensions. Go frp v0.70.0 treats unknown type bytes as errors.
     // These MUST NOT be sent to Go peers. See msg.rs lines 26-29.
     let type_byte = msg.v1_type_byte();
-    let payload = serde_json::to_vec(msg)
+    let mut buf = serde_json::to_vec(msg)
         .map_err(|e| crate::Error::Protocol(format!("serialize V1 msg: {e}").into()))?;
 
-    if payload.len() as u64 > V1_MAX_MSG_LENGTH as u64 {
+    if buf.len() as u64 > V1_MAX_MSG_LENGTH as u64 {
         return Err(crate::Error::Protocol("V1 message too large".into()));
     }
 
-    let mut buf = Vec::with_capacity(V1_HEADER_LEN + payload.len());
-    buf.push(type_byte);
-    buf.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-    buf.extend_from_slice(&payload);
+    // Prepend 9-byte header (1 type byte + 8 length bytes) in-place,
+    // avoiding a second Vec allocation (previous code used Vec::with_capacity + copy).
+    let payload_len = buf.len();
+    buf.resize(payload_len + V1_HEADER_LEN, 0);
+    buf.copy_within(0..payload_len, V1_HEADER_LEN);
+    buf[0] = type_byte;
+    buf[1..V1_HEADER_LEN].copy_from_slice(&(payload_len as u64).to_be_bytes());
 
     tracing::trace!(
         type_byte = %type_byte,
-        payload_len = payload.len(),
-        payload_text = %String::from_utf8_lossy(&payload),
+        payload_len = payload_len,
+        payload_text = %String::from_utf8_lossy(&buf[V1_HEADER_LEN..]),
         "V1 frame: type=0x{:02x} len={} payload={}",
         type_byte,
-        payload.len(),
-        String::from_utf8_lossy(&payload)
+        payload_len,
+        String::from_utf8_lossy(&buf[V1_HEADER_LEN..])
     );
 
     writer
@@ -408,13 +411,25 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
         ));
     }
 
-    // Zero-initialize: passing &mut [u8] pointing to uninitialized
-    // memory to read_exact is UB per Rust reference validity rules.
-    let mut payload = vec![0u8; payload_len];
-    reader
-        .read_exact(&mut payload)
-        .await
-        .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
+    // Use global buffer pool for small payloads (<= BUFFER_SIZE, 32 KiB
+    // by default), matching the V1 read path in read_msg_v1.  Larger
+    // payloads fall back to a direct heap allocation.
+    let pool_size = *crate::buffer_pool::BUFFER_SIZE;
+    let payload = if payload_len <= pool_size {
+        let mut guard = crate::buffer_pool::PoolGuard::acquire();
+        reader
+            .read_exact(&mut guard.as_mut_slice()[..payload_len])
+            .await
+            .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
+        guard.raw_buf()[..payload_len].to_vec()
+    } else {
+        let mut payload = vec![0u8; payload_len];
+        reader
+            .read_exact(&mut payload)
+            .await
+            .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
+        payload
+    };
 
     Ok((frame_type, flags, payload))
 }
@@ -430,14 +445,33 @@ pub async fn write_msg_v2<W: AsyncWriteExt + Unpin>(
     msg: &FrpMessage,
 ) -> Result<(), crate::Error> {
     let type_id = msg.v2_type_id();
-    let json_bytes = serde_json::to_vec(msg)
+
+    // Build complete frame in a single Vec: header(8) + type_id(2) + JSON.
+    // Previously this used serde_json::to_vec + payload Vec + write_v2_frame_raw
+    // inner Vec (3 allocs).  Now serde_json::to_writer writes directly into the
+    // frame buffer (1 alloc, plus growth if estimate is low).
+    let mut buf = Vec::with_capacity(V2_FRAME_HEADER_LEN + 2 + 512);
+    buf.resize(V2_FRAME_HEADER_LEN, 0);
+    buf.extend_from_slice(&type_id.to_be_bytes());
+    serde_json::to_writer(&mut buf, msg)
         .map_err(|e| crate::Error::Protocol(format!("V2 JSON serialize: {e}").into()))?;
 
-    let mut payload = Vec::with_capacity(2 + json_bytes.len());
-    payload.extend_from_slice(&type_id.to_be_bytes());
-    payload.extend_from_slice(&json_bytes);
+    let payload_len = buf.len() - V2_FRAME_HEADER_LEN;
+    if payload_len > V2_MAX_FRAME_PAYLOAD as usize {
+        return Err(crate::Error::Protocol(
+            format!("V2 payload too large: {payload_len} > {V2_MAX_FRAME_PAYLOAD}").into(),
+        ));
+    }
 
-    write_v2_frame_raw(writer, V2_FRAME_TYPE_MESSAGE, 0, &payload).await?;
+    // Fill in frame header now that payload length is known
+    buf[0..2].copy_from_slice(&V2_FRAME_TYPE_MESSAGE.to_be_bytes());
+    buf[2..4].copy_from_slice(&0u16.to_be_bytes());
+    buf[4..8].copy_from_slice(&(payload_len as u32).to_be_bytes());
+
+    writer
+        .write_all(&buf)
+        .await
+        .map_err(|e| crate::Error::Protocol(format!("write V2 msg: {e}").into()))?;
     writer
         .flush()
         .await

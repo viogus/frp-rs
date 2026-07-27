@@ -230,15 +230,19 @@ pub fn parse_bandwidth_limit(s: &str) -> Option<u64> {
     if s.is_empty() {
         return Some(0);
     }
-    let s = s.trim().to_uppercase();
-    let (num_str, mult) = if let Some(rest) = s.strip_suffix("MB") {
-        (rest.trim(), 1_048_576u64)
-    } else {
-        // Go requires a suffix; bare numbers and single-letter suffixes are invalid.
-        // `?` propagates None out of this Option-returning function when "KB" suffix
-        // is absent, rejecting bare numbers ("500") and single-letter ("500K").
-        let rest = s.strip_suffix("KB")?;
-        (rest.trim(), 1024u64)
+    let s = s.trim();
+    let (num_str, mult) = {
+        let end = s.len();
+        if end > 2 && s[(end - 2)..].eq_ignore_ascii_case("MB") {
+            (s[..(end - 2)].trim(), 1_048_576u64)
+        } else if end > 2 && s[(end - 2)..].eq_ignore_ascii_case("KB") {
+            // Go requires a suffix; bare numbers and single-letter suffixes are invalid.
+            // Returns None when "KB" suffix is absent, rejecting bare numbers ("500")
+            // and single-letter ("500K").
+            (s[..(end - 2)].trim(), 1024u64)
+        } else {
+            return None;
+        }
     };
     let num: f64 = num_str.parse().ok()?;
     if num <= 0.0 {

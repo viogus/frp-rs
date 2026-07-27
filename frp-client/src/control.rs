@@ -467,7 +467,10 @@ impl ControlConnection {
         stream: &mut IoStream,
     ) -> Result<msg::NewProxyResp, frp_core::Error> {
         let np = proxy::create_new_proxy_msg(p, local_addr);
-        debug!(json = %serde_json::to_string(&np).unwrap_or_default(), "NewProxy JSON: {}", serde_json::to_string(&np).unwrap_or_default());
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let json = serde_json::to_string(&np).unwrap_or_default();
+            debug!(json = %json, "NewProxy JSON: {}", json);
+        }
         info!(name = %p.name, proxy_type = %p.proxy_type, remote_port = %p.remote_port, local_addr = %local_addr,
             "Registering proxy '{}' type={} remote_port={} local={}",
             p.name, p.proxy_type, p.remote_port, local_addr);
@@ -532,8 +535,10 @@ impl ControlConnection {
             Some(self.user.as_str()).filter(|s| !s.is_empty()),
             Some(self.run_id.as_str()).filter(|s| !s.is_empty()),
         );
-        debug!(server_name = %v.server_name, json = %serde_json::to_string(&nvc).unwrap_or_default(), "NewVisitorConn for '{}': {}", v.server_name,
-            serde_json::to_string(&nvc).unwrap_or_default());
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let json = serde_json::to_string(&nvc).unwrap_or_default();
+            debug!(server_name = %v.server_name, json = %json, "NewVisitorConn for '{}': {}", v.server_name, json);
+        }
         info!(visitor_name = %v.name, proxy_name = %v.server_name, "Registering visitor '{}' for proxy '{}'", v.name, v.server_name);
         if self.v2 {
             stream.write_v2_frame(&nvc).await?;

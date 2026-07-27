@@ -416,6 +416,18 @@ impl ProxyManager {
             .map(|p| p.run_id.clone())
     }
 
+    /// Select a backend from a group and return both the backend name and its run_id.
+    /// Returns `None` if the group has no suitable backends.
+    pub async fn select_group_backend_with_run_id(
+        &self,
+        group: &str,
+        group_key: &str,
+    ) -> Option<(String, String)> {
+        let backend = self.select_group_backend(group, group_key).await?;
+        let run_id = self.get_run_id(&backend).await.unwrap_or_default();
+        Some((backend, run_id))
+    }
+
     pub async fn list(&self) -> Vec<Arc<ProxyInfo>> {
         self.proxies.read().await.values().cloned().collect()
     }

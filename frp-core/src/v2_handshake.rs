@@ -9,6 +9,7 @@
 //! 4. Both sides derive directional AEAD keys via HKDF-SHA256
 //! 5. All subsequent V2 frames are encrypted with the selected AEAD algorithm
 
+use std::borrow::Cow;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -78,7 +79,7 @@ fn base64_deserialize_non_null<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BootstrapInfo {
     #[serde(default)]
-    pub transport: String,
+    pub transport: Cow<'static, str>,
     #[serde(default)]
     pub tls: bool,
     #[serde(default, rename = "tcpMux")]
@@ -88,13 +89,13 @@ pub struct BootstrapInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MessageCapabilities {
     #[serde(default)]
-    pub codecs: Vec<String>,
+    pub codecs: Vec<Cow<'static, str>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CryptoCapabilities {
     #[serde(default)]
-    pub algorithms: Vec<String>,
+    pub algorithms: Vec<Cow<'static, str>>,
     /// 32 random bytes, base64-encoded in JSON (matching Go []byte).
     #[serde(
         default,
@@ -124,7 +125,7 @@ pub struct ClientHello {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MessageSelection {
     #[serde(default)]
-    pub codec: String,
+    pub codec: Cow<'static, str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -178,22 +179,22 @@ pub struct CryptoContext {
 /// Return preferred AEAD algorithms in order. AES-256-GCM first on x86 with
 /// AES-NI, otherwise XChaCha20-Poly1305 first. We always prefer AES-256-GCM
 /// on modern hardware.
-pub fn preferred_aead_algorithms() -> Vec<String> {
+pub fn preferred_aead_algorithms() -> Vec<Cow<'static, str>> {
     #[cfg(feature = "chacha20")]
     {
         vec![
-            AeadAlgorithm::Aes256Gcm.as_str().to_string(),
-            AeadAlgorithm::XChaCha20Poly1305.as_str().to_string(),
+            AeadAlgorithm::Aes256Gcm.as_str().into(),
+            AeadAlgorithm::XChaCha20Poly1305.as_str().into(),
         ]
     }
     #[cfg(not(feature = "chacha20"))]
     {
-        vec![AeadAlgorithm::Aes256Gcm.as_str().to_string()]
+        vec![AeadAlgorithm::Aes256Gcm.as_str().into()]
     }
 }
 
 /// Select first algorithm from client list that we support.
-pub fn select_aead_algorithm(client_algorithms: &[String]) -> Option<AeadAlgorithm> {
+pub fn select_aead_algorithm(client_algorithms: &[Cow<'static, str>]) -> Option<AeadAlgorithm> {
     for alg in client_algorithms {
         if let Ok(a) = AeadAlgorithm::from_str(alg) {
             return Some(a);
@@ -209,19 +210,19 @@ pub fn select_aead_algorithm(client_algorithms: &[String]) -> Option<AeadAlgorit
 impl ClientHello {
     /// Build a ClientHello with crypto capabilities.
     /// Generates 32 random bytes for client_random.
-    pub fn new(transport: &str, tls: bool, tcp_mux: bool) -> Self {
+    pub fn new(transport: &'static str, tls: bool, tcp_mux: bool) -> Self {
         let mut client_random = vec![0u8; CRYPTO_RANDOM_SIZE];
         rand::rngs::OsRng.fill_bytes(&mut client_random);
 
         Self {
             bootstrap: BootstrapInfo {
-                transport: transport.to_string(),
+                transport: transport.into(),
                 tls,
                 tcp_mux,
             },
             capabilities: ClientCapabilities {
                 message: MessageCapabilities {
-                    codecs: vec!["json".to_string()],
+                    codecs: vec!["json".into()],
                 },
                 crypto: CryptoCapabilities {
                     algorithms: preferred_aead_algorithms(),
@@ -232,16 +233,16 @@ impl ClientHello {
     }
 
     /// Build a ClientHello without crypto (for Rust↔Rust V2 without AEAD).
-    pub fn new_without_crypto(transport: &str, tls: bool, tcp_mux: bool) -> Self {
+    pub fn new_without_crypto(transport: &'static str, tls: bool, tcp_mux: bool) -> Self {
         Self {
             bootstrap: BootstrapInfo {
-                transport: transport.to_string(),
+                transport: transport.into(),
                 tls,
                 tcp_mux,
             },
             capabilities: ClientCapabilities {
                 message: MessageCapabilities {
-                    codecs: vec!["json".to_string()],
+                    codecs: vec!["json".into()],
                 },
                 crypto: CryptoCapabilities {
                     algorithms: vec![],
@@ -257,7 +258,7 @@ impl ServerHello {
         Self {
             selected: ServerSelection {
                 message: MessageSelection {
-                    codec: "json".to_string(),
+                    codec: Cow::Borrowed("json"),
                 },
                 crypto: None,
             },
@@ -270,7 +271,7 @@ impl ServerHello {
         Self {
             selected: ServerSelection {
                 message: MessageSelection {
-                    codec: "json".to_string(),
+                    codec: Cow::Borrowed("json"),
                 },
                 crypto: Some(CryptoSelection {
                     algorithm: algorithm.as_str().to_string(),
@@ -285,7 +286,7 @@ impl ServerHello {
         Self {
             selected: ServerSelection {
                 message: MessageSelection {
-                    codec: "json".to_string(),
+                    codec: Cow::Borrowed("json"),
                 },
                 crypto: None,
             },
@@ -334,7 +335,7 @@ fn write_transcript_part(ctx: &mut digest::Context, label: &str, payload: &[u8])
 /// ClientHello → Login → ServerHello → LoginResp).
 pub async fn v2_handshake_client_send_hello(
     stream: &mut IoStream,
-    transport: &str,
+    transport: &'static str,
     tls: bool,
     tcp_mux: bool,
     with_crypto: bool,
@@ -365,7 +366,7 @@ pub async fn v2_handshake_client_send_hello(
 pub async fn v2_handshake_client_recv_hello(
     stream: &mut IoStream,
     client_hello_json: &[u8],
-    transport: &str,
+    transport: &'static str,
     tls: bool,
     tcp_mux: bool,
     with_crypto: bool,
@@ -473,7 +474,7 @@ pub async fn v2_handshake_client_recv_hello(
 /// in plain V2 mode (used for Rust↔Rust V2 without AEAD interop).
 pub async fn v2_handshake_client(
     stream: &mut IoStream,
-    transport: &str,
+    transport: &'static str,
     tls: bool,
     tcp_mux: bool,
     with_crypto: bool,

@@ -560,7 +560,8 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     // Shared last_remote_addr: the server tells us the remote user's address
                     // in each UDPPacket. We must echo it back so the server can route
                     // the response to the correct remote user (not the local echo service).
-                    let last_remote: Arc<Mutex<Option<msg::UdpAddr>>> = Arc::new(Mutex::new(None));
+                    let last_remote: Arc<std::sync::Mutex<Option<std::net::SocketAddr>>> =
+                        Arc::new(std::sync::Mutex::new(None));
 
                     // Reader: work conn → local UDP socket
                     // Decrypt/decompress before forwarding to local service
@@ -583,8 +584,14 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                     match result {
                                 Ok(FrpMessage::UDPPacket(up)) => {
                                     // Save the original remote address for the response
+                                    // Convert from wire format to SocketAddr (Copy) for lock-free storage
                                     if let Some(ref ra) = up.remote_addr {
-                                        *last_remote_r.lock().await = Some(ra.clone());
+                                        if let Ok(ip) = ra.ip.parse::<std::net::IpAddr>() {
+                                            *last_remote_r.lock().unwrap() =
+                                                Some(std::net::SocketAddr::new(ip, ra.port));
+                                        } else {
+                                            tracing::warn!(ip = %ra.ip, port = ra.port, "UDP packet: unparseable remote IP, keeping previous last_remote");
+                                        }
                                     }
                                     let n = up.content.len();
                                     let mut payload = up.content;
@@ -658,14 +665,19 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                                         }
                                     }
                                     // Use saved remote_addr from server (the true remote user)
-                                    let remote = last_remote_w.lock().await.clone();
+                                    // Extract from lock-free storage; convert back to UdpAddr for wire format
+                                    let remote_addr_opt = last_remote_w.lock().unwrap().map(|sa| msg::UdpAddr {
+                                        ip: sa.ip().to_string(),
+                                        port: sa.port(),
+                                        zone: String::new(),
+                                    });
                                     // Take ownership of payload, leaving an empty Vec
                                     // (capacity preserved) for the next iteration.
                                     let taken = std::mem::take(&mut payload);
                                     let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
                                         content: taken,
                                         local_addr: msg::UdpAddr::from_string(&local_addr_str),
-                                        remote_addr: remote,
+                                        remote_addr: remote_addr_opt,
                                     });
                                     let write_result = if v2 {
                                         write_msg_v2(&mut w_w, &pkt).await

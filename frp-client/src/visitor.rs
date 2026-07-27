@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
@@ -668,6 +669,19 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
 /// On Linux, reads /proc/net/fib_trie to enumerate local IPs without requiring
 /// external crate dependencies. Falls back to a simpler method if unavailable.
 fn list_local_ips() -> Vec<String> {
+    // Cache result with 30-second TTL to avoid per-connection
+    // filesystem reads (/proc/net/fib_trie) and UDP socket creation.
+    static CACHE: std::sync::Mutex<Option<(Vec<String>, Instant)>> = std::sync::Mutex::new(None);
+    {
+        if let Ok(cache) = CACHE.lock() {
+            if let Some((ref ips, ref time)) = *cache {
+                if time.elapsed() < std::time::Duration::from_secs(30) {
+                    return ips.clone();
+                }
+            }
+        }
+    }
+
     let mut ips = Vec::new();
 
     // Linux-specific: parse /proc/net/fib_trie for local IPv4 addresses.
@@ -732,6 +746,11 @@ fn list_local_ips() -> Vec<String> {
                 }
             }
         }
+    }
+
+    // Update cache
+    if let Ok(mut cache) = CACHE.lock() {
+        *cache = Some((ips.clone(), Instant::now()));
     }
 
     ips

@@ -2513,12 +2513,12 @@ impl Service {
         // Apply under write lock
         {
             let mut r = self.state.reloadable.write_ok();
-            if r.allow_ports != new_allow_ports {
+            if *r.allow_ports != new_allow_ports {
                 changes.push(format!(
                     "allow_ports: {:?} -> {:?}",
                     r.allow_ports, new_allow_ports
                 ));
-                r.allow_ports = new_allow_ports;
+                r.allow_ports = Arc::new(new_allow_ports);
             }
             if r.auth_cfg.token != new_auth_cfg.token {
                 changes.push("auth token updated".into());
