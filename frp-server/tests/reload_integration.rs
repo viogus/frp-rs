@@ -34,7 +34,7 @@ mod unix_tests {
         }
         // 3. ../<name> in workspace root (downloaded release)
         let local = PathBuf::from(format!("../{}", name));
-        if local.exists() {
+        if local.is_file() {
             return local;
         }
         // 4. Fallback: construct path relative to the workspace root.

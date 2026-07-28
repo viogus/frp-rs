@@ -210,7 +210,7 @@ impl FrpsHandle {
             .or_else(|_| std::env::var("CARGO_BIN_EXE_frps"))
             .or_else(|_| {
                 let local = "../frps";
-                if std::path::Path::new(local).exists() {
+                if std::path::Path::new(local).is_file() {
                     Ok(local.to_string())
                 } else {
                     Err(std::env::VarError::NotPresent)
