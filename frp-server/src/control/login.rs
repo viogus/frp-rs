@@ -79,6 +79,17 @@ pub(crate) async fn authenticate(
     };
     if !state.check_login_throttle(throttle_key).await {
         warn!(peer = ?peer, "Login throttle: too many failed attempts from {:?}", peer);
+        // Send LoginResp with error so the client gets a meaningful error
+        // instead of a silent TCP RST / early eof. Reservation in
+        // check_login_throttle is consumed (logged as failed attempt).
+        let (_, mut writer) = tokio::io::split(stream);
+        let resp = FrpMessage::LoginResp(msg::LoginResp {
+            version: Some(frp_core::VERSION.into()),
+            run_id: None,
+            error: Some("too many failed login attempts, please try again in 60 seconds".into()),
+            server_additional_auth_scopes: None,
+        });
+        let _ = write_ctl_msg(&mut writer, &resp, v2).await;
         return Err(());
     }
 
