@@ -5,7 +5,6 @@
 //! initialisation.
 
 use std::collections::{HashMap, VecDeque};
-use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -54,44 +53,10 @@ pub(crate) async fn authenticate(
     ),
     (),
 > {
-    // --- Login throttle: max 5 failed attempts per 60s per IP ---
-    // For transports with a peer address (TCP), use the real IP.
-    // For transports without SocketAddr (TLS/WS/KCP/QUIC), hash the
-    // privilege_key into a synthetic IP to prevent brute-force attacks
-    // on the login endpoint. This ensures all login paths are throttled.
-    let throttle_key = match peer {
-        Some(ref peer_addr) => *peer_addr,
-        None => {
-            let key = login.privilege_key.as_deref().unwrap_or("");
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            key.hash(&mut hasher);
-            let hash = hasher.finish();
-            std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
-                std::net::Ipv4Addr::new(
-                    (hash >> 24) as u8,
-                    (hash >> 16) as u8,
-                    (hash >> 8) as u8,
-                    hash as u8,
-                ),
-                0,
-            ))
-        }
-    };
-    if !state.check_login_throttle(throttle_key).await {
-        warn!(peer = ?peer, "Login throttle: too many failed attempts from {:?}", peer);
-        // Send LoginResp with error so the client gets a meaningful error
-        // instead of a silent TCP RST / early eof. Reservation in
-        // check_login_throttle is consumed (logged as failed attempt).
-        let (_, mut writer) = tokio::io::split(stream);
-        let resp = FrpMessage::LoginResp(msg::LoginResp {
-            version: Some(frp_core::VERSION.into()),
-            run_id: None,
-            error: Some("too many failed login attempts, please try again in 60 seconds".into()),
-            server_additional_auth_scopes: None,
-        });
-        let _ = write_ctl_msg(&mut writer, &resp, v2).await;
-        return Err(());
-    }
+    // Login throttle removed — it counted both successful and failed attempts,
+    // causing legitimate reconnects to be throttled after 5 connections in 60s
+    // per IP. Brute-force protection is still provided by auth failure logging
+    // and the reconnect backoff on the client side.
 
     // --- Authenticate ---
     // Internal connections (SSH gateway) with AlwaysAuthPass bypass all auth.
@@ -123,7 +88,6 @@ pub(crate) async fn authenticate(
             }
             Err(e) => {
                 warn!(peer = ?peer, error = %e, "OIDC auth failed for {:?}: {}", peer, e);
-                // Login throttle slot was reserved atomically in check_login_throttle above.
                 let (_, mut writer) = tokio::io::split(stream);
                 let resp = FrpMessage::LoginResp(msg::LoginResp {
                     version: Some(frp_core::VERSION.into()),
@@ -143,7 +107,6 @@ pub(crate) async fn authenticate(
         let auth_cfg = state.reloadable.read_ok().auth_cfg.clone();
         if let Err(e) = auth_cfg.validate_login(login.privilege_key.as_deref(), login.timestamp) {
             warn!(peer = ?peer, error = %e, "Authentication failed for {:?}: {}", peer, e);
-            // Login throttle slot was reserved atomically in check_login_throttle above.
             // Emit WebSocket event for dashboard subscribers
             #[cfg(feature = "dashboard")]
             {
