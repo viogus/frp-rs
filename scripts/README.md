@@ -36,7 +36,7 @@ cargo test -p frp-server --test xtcp_edge
 ```bash
 # Build Rust binaries first
 cargo build --release --bin frps --bin frpc
-bash scripts/download-go-frp.sh 0.69.1
+bash scripts/download-go-frp.sh 0.70.1
 
 # Run only XTCP tests
 RUN_XTCP=1 bash scripts/compat-test.sh --xtcp-only --verbose
@@ -73,7 +73,7 @@ Env vars used when `--frps-remote` is set:
 |----------|----------|---------|-------------|
 | `XTCP_VPS_SSH_KEY` | Yes | — | Path to SSH private key for `frp-test` user |
 | `XTCP_VPS_USER` | No | `frp-test` | SSH username on VPS |
-| `GO_FRP_VERSION` | No | `0.69.1` | Go frp version for test |
+| `GO_FRP_VERSION` | No | `0.70.1` | Go frp version for test |
 
 ### `remote-frps.sh` — VPS frps Lifecycle
 
@@ -215,7 +215,7 @@ XTCP_VPS_USER=frp-test bash scripts/remote-frps.sh status <VPS_IP> ~/.ssh/xtcp-c
 
 # Test full flow
 cargo build --release --bin frps --bin frpc
-bash scripts/download-go-frp.sh 0.69.1
+bash scripts/download-go-frp.sh 0.70.1
 XTCP_VPS_SSH_KEY=~/.ssh/xtcp-ci bash scripts/compat-test.sh \
     --frps-remote <VPS_IP> --xtcp-only --verbose
 ```

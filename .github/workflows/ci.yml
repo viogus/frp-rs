@@ -32,6 +32,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Run all-features lib tests (QUIC admission and feature combos)
+        run: cargo test --workspace --all-features --lib
       - name: Build binaries (needed for integration tests)
         run: cargo build --bin frps --bin frpc
       - name: Run tests

@@ -81,7 +81,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --frps-remote HOST  Remote VPS address for XTCP tests"
             echo "  --xtcp-only       Run only XTCP tests (skip all other phases)"
             echo "  --shard INDEX/TOTAL  Shard XTCP tests across N jobs (e.g. 0/4)"
-            echo "  --go-version VER  Go frp version (default: 0.70.0)"
+            echo "  --go-version VER  Go frp version (default: 0.70.1)"
             exit 0
             ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
@@ -100,6 +100,10 @@ if [[ -z "$GO_FRP_DIR_USER" ]]; then
     GO_FRPS="$GO_FRP_DIR/frps"
     GO_FRPC="$GO_FRP_DIR/frpc"
 fi
+
+# Pass the resolved Go frp version/path to remote-frps.sh for VPS XTCP runs.
+export GO_FRP_VERSION
+export GO_FRP_DIR
 
 # =============================================================================
 # Helpers
@@ -6092,7 +6096,7 @@ run_test test_r2g_ws_encrypted
 run_test test_g2r_wss_plain
 run_test test_g2r_wss_encrypted
 run_test test_g2r_wss_mux
-# r2g: Rust frpc → Go frps — blocked by Go frp v0.70.0 vhostHTTPSPort TLS SNI bug.
+# r2g: Rust frpc → Go frps — blocked by Go frp v0.70.1 vhostHTTPSPort TLS SNI bug.
 # Go frps sends fatal UnrecognisedName alert (112). Rust frpc rustls aborts.
 # Go frps vhostHTTPSPort TLS config does not set ServerName for reverse WSS
 # connections. Monitor Go frp upstream for fix.
@@ -6134,7 +6138,7 @@ run_test test_kcp_rust_encrypted
 # QUIC Rust↔Rust: both sides use quinn crate, wire-compatible.
 run_test test_quic_rust_to_rust
 # QUIC Go↔Rust: multi-stream-per-connection enabled.
-# Go frp v0.70.0 uses quic-go (multi-stream), Rust accepts additional streams.
+# Go frp v0.70.1 uses quic-go (multi-stream), Rust accepts additional streams.
 # Go frp v0.70.1+ pre-built binaries work with release Rust build.
 run_test test_g2r_quic
 run_test test_r2g_quic

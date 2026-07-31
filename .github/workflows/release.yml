@@ -85,7 +85,7 @@ jobs:
             | tar xJ -C /tmp
           echo "/tmp/zig-linux-x86_64-0.14.0" >> "$GITHUB_PATH"
 
-      - name: Build (full)
+      - name: Build (default)
         run: |
           if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
             cargo build --target ${{ matrix.target }} --release

@@ -1,7 +1,7 @@
 # Configuration Reference
 
 Complete field reference for frp-rs `frps.toml` and `frpc.toml`. Every field maps
-1:1 to a Go frp v0.69.1 equivalent.
+1:1 to a Go frp v0.70.1 equivalent.
 
 ---
 
@@ -22,20 +22,20 @@ Complete field reference for frp-rs `frps.toml` and `frpc.toml`. Every field map
 | `websocket_port` | `u16` | `0` | `websocketPort` | WebSocket transport listener port. 0 = disabled. Requires `websocket` feature. |
 | `sudp_port` | `u16` | `0` | `sudpPort` | Shared UDP port for all SUDP proxies. When > 0, SUDP proxies share this port instead of allocating individual ports. |
 | `sub_domain_host` | `string` | `""` | `subDomainHost` | Base domain for sub-domain proxy routing (e.g. `"example.com"`). A proxy with `subdomain = "web"` will be reachable at `web.example.com`. |
-| `tls_enable` | `bool` | `false` | `tlsEnable` | Enable TLS on the main listener. Requires `tls_cert_file` and `tls_key_file`. |
+| `tls_enable` | `bool` | `true` | `tlsEnable` | Enable TLS on the main listener. Requires `tls_cert_file` and `tls_key_file`. |
 | `tls_only` | `bool` | `false` | `tlsOnly` | When true, the main `bind_port` only accepts TLS connections. Plain TCP and WebSocket upgrades are rejected. Clients must also have `tls_enable = true`. |
 | `tls_cert_file` | `string` | `""` | `tlsCertFile` | Path to TLS certificate PEM file. |
 | `tls_key_file` | `string` | `""` | `tlsKeyFile` | Path to TLS private key PEM file. |
 | `tls_ca_file` | `string` | `""` | `tlsCaFile` | Path to CA certificate PEM file for mutual TLS client verification. Empty = no mTLS. |
-| `allow_port_start` | `u16` | `10000` | `allowPorts` (start) | Start of auto-assigned port range. Used when `allow_ports` is empty. |
-| `allow_port_end` | `u16` | `50000` | `allowPorts` (end) | End of auto-assigned port range (inclusive). Used when `allow_ports` is empty. |
+| `allow_port_start` | `u16` | `1` | `allowPorts` (start) | Start of auto-assigned port range. Used when `allow_ports` is empty. |
+| `allow_port_end` | `u16` | `65535` | `allowPorts` (end) | End of auto-assigned port range (inclusive). Used when `allow_ports` is empty. |
 | `allow_ports` | `string` | `""` | `allowPorts` | Comma-separated port ranges, e.g. `"10000-20000,30000-40000"`. Each range is inclusive on both ends. When non-empty, takes precedence over `allow_port_start`/`allow_port_end`. |
 | `max_ports_per_client` | `u64` | `0` | `maxPortsPerClient` | Maximum number of proxies a single client can register. 0 = unlimited. |
 | `vhost_http_timeout` | `u64` | `60` | `vhostHTTPTimeout` | Timeout in seconds for backend HTTP response in VHost handler. |
 | `user_conn_timeout` | `u64` | `10` | `userConnTimeout` | Idle timeout in seconds on user-facing proxy connections. |
 | `detailed_errors_to_client` | `bool` | `false` | `detailedErrorsToClient` | When true, full Rust error details are included in client-facing error responses. When false (default), internal errors are replaced with generic messages. |
 | `tcp_mux_passthrough` | `bool` | `false` | `tcpMuxPassthrough` | When `tcp_mux` is enabled and yamux init fails, forward raw bytes to the VHost handler instead of closing the connection. |
-| `udp_packet_size` | `usize` | `65535` | `udpPacketSize` | UDP packet buffer size in bytes. Controls the receive buffer for UDP proxy datagrams. |
+| `udp_packet_size` | `usize` | `1500` | `udpPacketSize` | UDP packet buffer size in bytes. Controls the receive buffer for UDP proxy datagrams. |
 | `nat_hole_analysis_data_reserve_hours` | `u64` | `1` | `natholeAnalysisDataReserveHours` | How long historical NAT behavior records are kept (in hours). Used by XTCP NAT analysis. |
 | `includes` | `string[]` | `[]` | `includes` | Glob patterns for additional TOML/INI config files to merge. Relative to the main config file directory. |
 
@@ -158,19 +158,19 @@ quic_bind_port = 0
 websocket_port = 0
 sudp_port = 0
 sub_domain_host = "example.com"
-tls_enable = false
+tls_enable = true
 tls_only = false
 tls_cert_file = ""
 tls_key_file = ""
 tls_ca_file = ""
-allow_port_start = 10000
-allow_port_end = 50000
+allow_port_start = 1
+allow_port_end = 65535
 max_ports_per_client = 0
 vhost_http_timeout = 60
 user_conn_timeout = 10
 detailed_errors_to_client = false
 tcp_mux_passthrough = false
-udp_packet_size = 65535
+udp_packet_size = 1500
 nat_hole_analysis_data_reserve_hours = 1
 includes = ["conf.d/*.toml"]
 

@@ -62,13 +62,13 @@ Client plugins: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `ht
 ### Go frp Compatibility Notes
 
 frp-rs targets protocol compatibility with Go frp v0.70.1. **100% feature parity.**
-65/67 cross-compatibility tests pass on every commit (including XTCP 16-test pairwise
-matrix on VPS and V2 TCP source-built Go frp).
+The full Go frp v0.70.1 cross-compatibility suite runs in CI (including the
+XTCP pairwise matrix on VPS and V2 over the v0.70.1 pre-built binaries).
 
 - **V1 wire protocol**: Fully compatible. All message types, authentication, encryption (AES-128-CFB),
-  compression (Snappy) — wire-compatible with Go frp v0.69.1.
-- **V2 wire protocol**: Full AEAD encryption + capability negotiation. Requires source-built Go frp
-  with V2 patches (pre-built v0.69.1 binary does not include V2).
+  compression (Snappy) — wire-compatible with Go frp v0.70.1.
+- **V2 wire protocol**: Full AEAD encryption + capability negotiation, verified against the
+  Go frp v0.70.1 pre-built binary (V2 is included since v0.70.1).
 - **All transports**: TCP, WebSocket, TLS, KCP, QUIC — full interop verified.
 - **All 9 client plugins**: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `http2https`,
   `https2http`, `https2https`, `http2http`, `tls2raw`.
@@ -87,9 +87,9 @@ matrix on VPS and V2 TCP source-built Go frp).
 
 **Four build sizes via feature flags.** Trim unused protocols and features to match your deployment:
 
-- **default**: Core transports (TCP, WS, TLS, KCP), OIDC auth, compression, XChaCha20 V2 encryption, HTTP proxy, TCP mux. SSH, QUIC, and dashboard are opt-in.
+- **default**: Core transports (TCP, WS, TLS, KCP), OIDC auth, compression, XChaCha20 V2 encryption, HTTP proxy, TCP mux, and the SSH gateway. QUIC and dashboard are opt-in.
 - **full** (`--features "ssh,quic,dashboard"`): All transports + SSH gateway + dashboard/metrics.
-- **`tiny`**: Drops QUIC, KCP, WebSocket, SSH, OIDC, dashboard. Keeps TLS, compression, TCP mux. Ideal for edge devices.
+- **`tiny`**: Drops QUIC, KCP, WebSocket, SSH, OIDC, dashboard, and compression. Keeps TLS, HTTP proxy, TCP mux. Ideal for edge devices.
 - **`micro`**: Core only — no TLS, no compression, no chacha20, no HTTP proxy, no TCP mux. Minimal attack surface and footprint.
 
 ```bash
@@ -108,7 +108,7 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 
 ### frp-rs 核心优势
 
-**兼容性。** 完全兼容 Go frp v0.70.1 协议。所有传输层（TCP、WebSocket、TLS、KCP、QUIC）、全部代理类型（TCP/UDP/HTTP/HTTPS/STCP/XTCP/SUDP）、全部 9 种客户端插件（http_proxy、socks5、static_file、unix_domain_socket、http2https、https2http、https2https、http2http、tls2raw）均已通过跨兼容测试。65 项兼容性测试在每次提交时自动运行，包括 XTCP NAT 穿透的 16 场景两两矩阵测试。可直接替换 Go frps 或 Go frpc，配置文件、加密方式、认证机制完全一致，零迁移成本。
+**兼容性。** 完全兼容 Go frp v0.70.1 协议。所有传输层（TCP、WebSocket、TLS、KCP、QUIC）、全部代理类型（TCP/UDP/HTTP/HTTPS/STCP/XTCP/SUDP）、全部 9 种客户端插件（http_proxy、socks5、static_file、unix_domain_socket、http2https、https2http、https2https、http2http、tls2raw）均已通过跨兼容测试。CI 自动运行 68 项常规兼容性测试加 16 项 XTCP 两两矩阵测试。可直接替换 Go frps 或 Go frpc，配置文件、加密方式、认证机制完全一致，零迁移成本。
 
 **体积。** 基于 Rust 原生编译，无运行时、无 GC。默认版本 frps 仅 ~5.2 MB，frpc ~5.4 MB，约为 Go frp 的 1/2.5。全功能版本（full）frps ~7.8 MB，frpc ~6.0 MB。内存占用同样大幅降低：空闲状态下 ~2-4 MB，微核心版本（micro）仅 ~1-2 MB。无 GC 暂停保证负载下尾部延迟稳定。
 
@@ -175,26 +175,28 @@ The binaries land at `target/release/frps` and `target/release/frpc`.
 
 ### Binary Variants
 
-Four size tiers (see [Why frp-rs?](#why-frp-rs) for sizes). SSH, QUIC, and dashboard are opt-in:
+Four size tiers (see [Why frp-rs?](#why-frp-rs) for sizes). SSH is enabled by
+default; QUIC and dashboard are opt-in:
 
 ```bash
-# Default — core transports, no SSH/QUIC/dashboard (~5.2 MB frps, ~5.4 MB frpc)
+# Default — core transports + SSH, no QUIC/dashboard (~5.6 MB frps, ~5.4 MB frpc)
 cargo build --release -p frps -p frpc
 
 # Full — all features (~7.8 MB frps, ~6.0 MB frpc)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
 
-# Tiny — no QUIC/KCP/WS/SSH/OIDC/dashboard, keeps TLS (~4.4 MB / ~3.8 MB)
+# Tiny — no QUIC/KCP/WS/SSH/OIDC/dashboard/compression, keeps TLS+HTTP proxy+TCP mux (~4.4 MB / ~3.8 MB)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
 
 # Micro — core only, no TLS/compression/chacha20/http-proxy/tcp-mux (~2.6 MB / ~2.7 MB)
 cargo build --release -p frps -p frpc --no-default-features --features micro
 ```
 
-Individual feature flags let you cherry-pick (SSH, QUIC, dashboard are opt-in; all others default ON):
+Individual feature flags let you cherry-pick (QUIC and dashboard are opt-in;
+SSH and the rest are default ON):
 
-| Feature | Removes |
-|---------|---------|
+| Feature | Adds |
+|---------|------|
 | `ssh` | SSH gateway (russh) |
 | `quic` | QUIC transport (quinn, ~1 MB) |
 | `dashboard` | Metrics/status API (prometheus, axum) |
@@ -279,7 +281,7 @@ tcp_mux_keepalive_interval = 30
 | `websocket_port` | `0` | WebSocket listener port (0 = disabled) |
 | `sub_domain_host` | `""` | Host for sub-domain proxy support |
 | `sudp_port` | `0` | Shared port for all SUDP proxies (0 = per-proxy ports) |
-| `tls_enable` | `false` | Enable TLS on the listener |
+| `tls_enable` | `true` | Enable TLS on the listener |
 | `tls_only` | `false` | Reject non-TLS connections |
 | `tls_cert_file` | `""` | Path to TLS certificate |
 | `tls_key_file` | `""` | Path to TLS private key |
@@ -297,10 +299,10 @@ tcp_mux_keepalive_interval = 30
 | `web_server.tls_key_file` | `""` | Dashboard TLS private key path |
 | `transport.tcp_mux` | `true` | Enable TCP multiplexing |
 | `transport.tcp_mux_keepalive_interval` | `30` | Keepalive interval (seconds) for mux |
-| `transport.heartbeat_timeout` | `90` | Heartbeat timeout in seconds (server disconnects if no ping) |
-| `allow_port_start` | `10000` | Start of auto-assigned port range |
-| `allow_port_end` | `50000` | End of auto-assigned port range |
-| `udp_packet_size` | `65535` | UDP packet buffer size in bytes |
+| `transport.heartbeat_timeout` | `-1` | Heartbeat timeout in seconds; `-1` disables it under tcp_mux (Go v0.70.1 default) |
+| `allow_port_start` | `1` | Start of auto-assigned port range |
+| `allow_port_end` | `65535` | End of auto-assigned port range |
+| `udp_packet_size` | `1500` | UDP packet buffer size in bytes |
 
 ### Logging
 
@@ -377,36 +379,36 @@ use_compression = false
 | `token` | `""` | Authentication token (must match server) |
 | `user` | `""` | User identity for multi-tenant setups |
 | `client_id` | `""` | Unique client identifier (auto-generated if empty) |
-| `tls_enable` | `false` | Enable TLS |
+| `tls_enable` | `true` | Enable TLS |
 | `tls_cert_file` | `""` | Client TLS certificate |
 | `tls_key_file` | `""` | Client TLS private key |
 | `tls_ca_file` | `""` | CA certificate for server verification |
 | `tls_server_name` | `""` | Server name for TLS SNI |
 | `log.level` | `"info"` | Log level |
 | `login_fail_exit` | `true` | Exit on login failure; false to keep retrying |
-| `pool_count` | `0` | Number of pre-established work connections (pooled on the server) |
+| `pool_count` | `1` | Number of pre-established work connections (pooled on the server) |
 | `tcp_mux` | `true` | Enable TCP multiplexing |
 | `web_server.addr` | `"127.0.0.1"` | Admin API bind address |
 | `web_server.port` | `0` | Admin API port (0 = disabled) |
 | `web_server.user` | `""` | Admin API Basic Auth username |
 | `web_server.password` | `""` | Admin API Basic Auth password |
-| `heartbeat_interval` | `30` | Ping interval in seconds |
+| `heartbeat_interval` | `-1` | Ping interval in seconds; `-1` disables it under tcp_mux (Go v0.70.1 default) |
 | `proxy_url` | `""` | Upstream HTTP/SOCKS5 proxy for control connection |
 | `start` | `[]` | Selective proxy start: only start proxies named in this list |
 | `includes` | `[]` | Glob patterns for additional config files to merge |
 | `metas` | `{}` | Client-level metadata sent in Login message |
-| `dial_server_keepalive` | `0` | TCP keepalive interval (seconds) for server connection |
+| `dial_server_keepalive` | `7200` | TCP keepalive interval (seconds) for server connection |
 | `connect_server_local_ip` | `""` | Local IP to bind when connecting to server |
-| `disable_custom_tls_first_byte` | `false` | Skip Go frp TLS head byte (0x17) |
-| `nat_hole_stun_server` | `""` | Custom STUN server for NAT traversal |
+| `disable_custom_tls_first_byte` | `true` | Skip Go frp TLS head byte (0x17) |
+| `nat_hole_stun_server` | `"stun.easyvoip.com:3478"` | STUN server for NAT traversal |
 | `dns_server` | `""` | Custom DNS server for resolving server address |
 
 #### Latency tuning (`pool_count`)
 
 `pool_count` pre-warms work connections on the server so they are ready
-before a user connects. With `pool_count = 0` (the default, matching Go frp),
-each new user connection first pays a `ReqWorkConn` → `StartWorkConn` control
-round-trip before the first byte can flow. A small positive `pool_count`
+before a user connects. With `pool_count = 1` (the default, matching Go frp),
+the first user connection pays a `ReqWorkConn` → `StartWorkConn` control
+round-trip before the first byte can flow. A larger `pool_count`
 absorbs that round-trip up front.
 
 Measured connection-setup latency (64 B probe, 2000 samples, loopback):
@@ -416,10 +418,8 @@ Measured connection-setup latency (64 B probe, 2000 samples, loopback):
 | `0` (cold)   | 251 µs    | 633 µs    |
 | `4` (warm)   | 191 µs    | 372 µs    |
 
-Warming the pool cut setup p50 by ~24% and p99 by ~41% on loopback. The
-default stays at `0` for Go frp parity and to avoid holding idle connections;
-latency-sensitive deployments should set `pool_count` to a small positive
-value.
+Warming the pool cut setup p50 by ~24% and p99 by ~41% on loopback.
+Latency-sensitive deployments can raise `pool_count` further.
 
 `TCP_NODELAY` is enabled on every data-path TCP connection automatically
 (matching Go frp), so small request/response and interactive traffic is not
@@ -435,7 +435,7 @@ buffer defaults to 32 KiB (matching Go frp) and can be tuned via the
 |-------|---------|-------------|
 | `name` | — | Unique proxy name |
 | `type` | — | Proxy type: tcp, udp, http, https, stcp, xtcp, tcpmux |
-| `local_ip` | `""` | Local service IP |
+| `local_ip` | `"127.0.0.1"` | Local service IP |
 | `local_port` | `0` | Local service port |
 | `remote_port` | `0` | Remote port to expose (0 = auto-assign) |
 | `use_encryption` | `false` | Encrypt proxy traffic |
@@ -595,7 +595,7 @@ The server uses an `InternalMsg` channel for cross-task communication:
 
 ### Authentication
 
-Authentication uses **MD5(token + timestamp)** → hex string, matching Go frp v0.69.1:
+Authentication uses **MD5(token + timestamp)** → hex string, matching Go frp v0.70.1:
 
 ```
 privilege_key = hex(MD5(token + timestamp))
@@ -607,7 +607,7 @@ the Login message, then compares directly.
 ### Encryption
 
 When `use_encryption = true` on a proxy, data between frps and frpc is encrypted
-with **AES-128-CFB**, matching Go frp v0.69.1. The encryption key (16 bytes) is
+with **AES-128-CFB**, matching Go frp v0.70.1. The encryption key (16 bytes) is
 derived from the auth token via PBKDF2-SHA1:
 
 ```
@@ -617,7 +617,7 @@ encryption_key = PBKDF2(token, "frp", iterations=64, key_len=16, hash=SHA1)
 ### Compression
 
 When `use_compression = true`, data is compressed with **Snappy** (matching Go frp
-v0.69.1) before encryption. Compression is applied first, then encryption:
+v0.70.1) before encryption. Compression is applied first, then encryption:
 
 ```
 plaintext → Snappy compress → AES-128-CFB encrypt → [4-byte BE len][encrypted frame]
@@ -631,7 +631,7 @@ Each encrypted frame contains a random 16-byte IV followed by the CFB-encrypted
 ```
 
 - Supported for TCP proxies (both client and server bridge paths) and control connections.
-- Note: Go frp v0.69.1 golib source says salt `"crypto"` but the pre-built binary uses `"frp"`. This codebase uses `"frp"` for binary compatibility.
+- Note: Go frp v0.70.1 golib source says salt `"crypto"` but the pre-built binary uses `"frp"`. This codebase uses `"frp"` for binary compatibility.
 
 ## Documentation
 
@@ -665,7 +665,7 @@ frp-rs/
       protocol.rs         V1/V2 frame read/write
       quic.rs             QUIC transport wrapper
       transport.rs        TCP/TLS/WebSocket dial + accept + IoStream abstraction
-      v1_compat.rs        Go frp v0.69.1 compatibility helpers
+      v1_compat.rs        Go frp v0.70.1 compatibility helpers
   frp-server/             Server library
     Cargo.toml
     src/
@@ -711,7 +711,7 @@ frp-rs/
     entrypoint.c           Minimal static entrypoint (FRP_MODE, conf path)
     README.md              Docker build documentation
   scripts/
-    compat-test.sh         Go↔Rust cross-compatibility test suite (39 tests, 5 guarded)
+    compat-test.sh         Go↔Rust cross-compatibility test suite (68 + 16 XTCP scenarios)
   frps.toml               Example server config
   frpc.toml               Example client config
   CLAUDE.md               Claude Code project instructions

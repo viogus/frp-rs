@@ -149,14 +149,8 @@ where
     R: FnOnce(String) -> F,
     F: Future<Output = std::io::Result<Vec<SocketAddr>>>,
 {
-    connect_local_with_resolver_and_connector(
-        addr,
-        timeout,
-        resolver,
-        TcpStream::connect,
-        timeout,
-    )
-    .await
+    connect_local_with_resolver_and_connector(addr, timeout, resolver, TcpStream::connect, timeout)
+        .await
 }
 
 async fn connect_local_with_resolver_and_connector<R, F, C, G>(

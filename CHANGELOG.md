@@ -8,6 +8,37 @@ Full-source audit of Go frp v0.70.1 (fatedier/frp) against frp-rs. 106 findings
 from 6 parallel subagent audits, 60+ fixes across 37 files. Every fix references
 the exact Go frp source location that mandates the behavior.
 
+### Post-Release Review Fixes (2026-08-01)
+
+Second parallel audit pass focused on the staged 0.7.1 review-fix wave:
+
+- **yamux liveness**: dead-peer retention is bounded by transport I/O while
+  healthy idle sessions stay open; zero keepalive intervals are normalized.
+- **Work-conn admission**: removed the client-side 64-inflight/128-queue cap
+  that diverged from Go frp and could tear down the control session; each
+  `ReqWorkConn` is spawned directly, matching Go v0.70.1.
+- **Heartbeat defaults**: application heartbeats are disabled under `tcp_mux`
+  by default (Go parity) while explicit values are preserved; `dialServerTimeout`
+  zero means default, and explicit server heartbeat timeouts are kept.
+- **QUIC**: zero option values normalize to Go defaults; pre-auth timeout/error
+  paths close the connection; first-frame deadline starts after stream accept;
+  preauth stream admission is bounded after acceptance.
+- **OIDC**: authorization keeps the claimed `login.user` (Go parity); subject
+  generation-scoped cleanup prevents supersession clobbering.
+- **STCP/XTCP visitors**: legacy visitors without `run_id` and fresh-TCP NAT
+  visitors use Go owner/allow-list admission instead of failing closed.
+- **SSH gateway**: raw exec commands are no longer logged; reverse forwarding
+  (`-R`) is disabled until a safe listener implementation lands.
+- **mTLS**: `trustedCaFile` always requires and verifies client certificates;
+  partial cert/key configs fail startup.
+- **Log sanitization**: client/server control logs no longer emit full JSON
+  payloads, STCP secrets, or V1 payload text.
+- **Config**: Go `[transport.tls]`, server `[transport] tcpMux`, and related
+  camelCase keys are normalized; WebSocket raw frames allow V2 payloads.
+- **Concurrency**: per-run_id lifecycle mutexes are reclaimed; ClientRegistry
+  lock order is canonical; post-login AEAD failure cleanup is generation-safe.
+- **KCP**: login throttling uses the real peer address instead of a shared key.
+
 ### Config (19 fixes)
 
 - **QUICOptions**: add `QuicOptions` struct with `keepalive_period` (10s), `max_idle_timeout` (30s), `max_incoming_streams` (100000). Added as `quic_options` field to `ServerTransportConfig` and `ClientConfig` (serde alias "quic").
@@ -151,12 +182,12 @@ All ports are now allowed by default (matching Go frp empty AllowPorts).
 Three-phase binary size reduction: frps -36% (8.18→5.20 MB), frpc -13% (6.24→5.42 MB)
 in the default build. Full-feature build (`--features "ssh,quic,dashboard"`) unchanged.
 
-#### Feature Flags: Opt-In for Heavy Protocols
+#### Feature Flags: QUIC/Dashboard Opt-In, SSH Default
 
-- **SSH** (russh + rand010, ~407 KB) → opt-in. Enable with `--features ssh`.
+- **SSH** (russh + rand010, ~407 KB) → enabled by default.
 - **QUIC** (quinn, ~280 KB) → opt-in. Enable with `--features quic`.
 - **Dashboard** (prometheus + axum, ~181 KB) → opt-in. Enable with `--features dashboard`.
-- All three removed from default features. Transitive dependencies eliminated wholesale.
+- QUIC/dashboard removed from default features; SSH remains default. Transitive dependencies for QUIC/dashboard eliminated wholesale.
 - Feature forwarding added in frps/frpc Cargo.toml for all optional features.
 - `toml_edit` already removed in favor of `toml` 0.8.
 
@@ -180,8 +211,9 @@ in the default build. Full-feature build (`--features "ssh,quic,dashboard"`) unc
 
 #### Upgrade Notes
 
-- **SSH, QUIC, dashboard are now opt-in.** If you use SSH tunneling, QUIC transport,
-  or the dashboard/metrics API, add `--features "ssh,quic,dashboard"` to your build.
+- **QUIC and dashboard are now opt-in.** If you use QUIC transport or the
+  dashboard/metrics API, add `--features "quic,dashboard"` to your build.
+  SSH is enabled by default.
 - **Config files unchanged.** All config parsing and defaults are identical.
 - **No wire protocol changes.** Compatible with Go frp v0.70.1.
 
@@ -450,4 +482,3 @@ Full-source audit of Go frp dev branch against frp-rs, fixing 18 findings (7 CRI
 
 SSH gateway (russh + rand010) added to default features. Default frps now
 includes SSH support (~4.1 MB). Tiny and micro profiles unchanged.
-
