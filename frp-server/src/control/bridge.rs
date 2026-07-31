@@ -749,6 +749,10 @@ pub(crate) async fn assign_work_to_proxy(
                     )
                     .await;
                 }
+                _ => {
+                    warn!("unsupported IoStream variant in encrypted server bridge");
+                    return;
+                }
             }
         } else {
             // Pass VHost pre-read bytes through bridge_plain so the bridge

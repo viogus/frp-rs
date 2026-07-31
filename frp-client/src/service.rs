@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
 /// Internal request from a visitor task to the control loop.
 /// Visitor sends NatHoleVisitor on the control connection (Go frps compat:
@@ -49,36 +49,6 @@ use crate::proxy_runtime::{ProxyPhase, ProxyRuntimeInfo, ReloadRequest};
 use crate::util::opt_if_empty;
 use crate::work_conn::XtcpNotification;
 
-/// Maximum number of work connections concurrently dialing or waiting for
-/// StartWorkConn within one control session. This is intentionally independent
-/// of pool_count: the pool is a warm-idle target, not a normal concurrency cap.
-const MAX_INFLIGHT_WORK_CONNS: usize = 64;
-const MAX_QUEUED_WORK_CONN_REQUESTS: usize = 128;
-const STABLE_SESSION_BACKOFF_RESET: Duration = Duration::from_secs(60);
-
-fn new_work_conn_admission_limiter() -> Arc<Semaphore> {
-    Arc::new(Semaphore::new(MAX_INFLIGHT_WORK_CONNS))
-}
-
-fn spawn_work_conn_dispatcher<T, F>(
-    mut requests: mpsc::Receiver<T>,
-    limiter: Arc<Semaphore>,
-    mut spawn: F,
-) -> tokio::task::JoinHandle<()>
-where
-    T: Send + 'static,
-    F: FnMut(T, OwnedSemaphorePermit) + Send + 'static,
-{
-    tokio::spawn(async move {
-        while let Some(request) = requests.recv().await {
-            let Ok(permit) = limiter.clone().acquire_owned().await else {
-                break;
-            };
-            spawn(request, permit);
-        }
-    })
-}
-
 fn heartbeat_requires_auth(client_scopes: &[String], server_scopes: &[String]) -> bool {
     crate::work_conn::scope_requires_auth(client_scopes, server_scopes, "HeartBeats")
 }
@@ -86,12 +56,7 @@ fn heartbeat_requires_auth(client_scopes: &[String], server_scopes: &[String]) -
 fn reconnect_delay_after_session(
     consecutive_err_count: &mut u32,
     fast_retry_timestamps: &mut Vec<Instant>,
-    session_lifetime: Duration,
 ) -> Duration {
-    if session_lifetime >= STABLE_SESSION_BACKOFF_RESET {
-        *consecutive_err_count = 0;
-        fast_retry_timestamps.clear();
-    }
     *consecutive_err_count += 1;
     fast_retry_timestamps.push(Instant::now());
     let window_count = Service::prune_fast_retry_count(fast_retry_timestamps);
@@ -757,11 +722,9 @@ impl Service {
             let quic_conn = quic_conn.map(std::sync::Arc::new);
             previous_run_id = run_id.clone();
             let v2 = self.cfg.v2;
-            let session_started = Instant::now();
             info!(run_id = %run_id, "Logged in. run_id: {}", run_id);
 
             let session_alive = Arc::new(AtomicBool::new(true));
-            let work_conn_admission = new_work_conn_admission_limiter();
 
             // Register proxies using IoStream directly (supports TCP and TLS).
             // NOTE: each proxy is registered sequentially via a NewProxy
@@ -1015,7 +978,7 @@ impl Service {
                         dial_timeout_secs: self.cfg.dial_server_timeout.max(1) as u64,
                         xtcp_tx: xtcp_tx.clone(),
                         session_alive: session_alive.clone(),
-                        inflight_permit: None,
+                        spawned_counter: None,
                         #[cfg(feature = "vnet")]
                         vnet_tuns: self.vnet_tuns.clone(),
                         #[cfg(feature = "vnet")]
@@ -1023,17 +986,6 @@ impl Service {
                     }
                 }};
             }
-
-            let (work_conn_request_tx, work_conn_request_rx) =
-                mpsc::channel(MAX_QUEUED_WORK_CONN_REQUESTS);
-            let work_conn_dispatcher = spawn_work_conn_dispatcher(
-                work_conn_request_rx,
-                work_conn_admission.clone(),
-                |mut cfg: crate::work_conn::WorkConnConfig, permit| {
-                    cfg.inflight_permit = Some(permit);
-                    crate::work_conn::spawn_work_conn(cfg);
-                },
-            );
 
             // Go frp compat: work connections are created ONLY in response to
             // ReqWorkConn messages from the server (handled in the message loop
@@ -1159,18 +1111,15 @@ impl Service {
                     msg = read_msg(&mut reader, v2) => {
                         match msg {
                             Ok(FrpMessage::ReqWorkConn(_)) => {
-                                match work_conn_request_tx.try_send(work_conn_config!(-1)) {
-                                    Ok(()) => debug!("Received ReqWorkConn, queued work connection"),
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        warn!(queue_limit = MAX_QUEUED_WORK_CONN_REQUESTS,
-                                            "Work connection request queue full; reconnecting control session");
-                                        break;
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        warn!("Work connection dispatcher closed; reconnecting control session");
-                                        break;
-                                    }
-                                }
+                                // Go frp v0.70.1 spawns each ReqWorkConn handler
+                                // asynchronously with no client-side in-flight cap
+                                // (client/control.go:handleReqWorkConn). Spawn
+                                // directly so a burst of requests cannot overflow a
+                                // queue or tear down the control session; each work
+                                // conn's dial/StartWorkConn read is still bounded by
+                                // its own timeout in work_conn.rs.
+                                debug!("Received ReqWorkConn, spawning work connection");
+                                crate::work_conn::spawn_work_conn(work_conn_config!(-1));
                             }
                             Ok(FrpMessage::Pong(pong)) => {
                                 if let Some(ref err) = pong.error {
@@ -1297,10 +1246,13 @@ impl Service {
                             privilege_key: None,
                             timestamp: None,
                         };
-                        // Go frp v0.70.1 compat: client and server auth scopes
-                        // are unioned. Either side requiring "HeartBeats" makes
-                        // Ping carry authentication, matching NewWorkConn.
-                        // See /tmp/frp-source/client/control.go:heartbeatWorker.
+                        // Auth scopes: unioning the client's own scopes with the
+                        // server-advertised scopes is a Rust-to-Rust extension.
+                        // Go v0.70.1's TokenAuthSetterVerifier.SetPing checks only
+                        // the client's own additionalAuthScopes
+                        // (pkg/auth/token.go:44-51); Go has no
+                        // serverAdditionalAuthScopes field in LoginResp, so the
+                        // server side of this union is ignored by Go peers.
                         let send_auth = heartbeat_requires_auth(&client_scopes, &server_scopes);
                         if send_auth {
                             if let Some(ref oidc) = self.oidc_client {
@@ -1538,7 +1490,6 @@ impl Service {
             // then the control connection. See /tmp/frp-source/client/control.go:203-210.
             // Step 1: Signal work connection pool to stop replenishment cascade.
             session_alive.store(false, Ordering::Release);
-            work_conn_dispatcher.abort();
 
             // Step 2: Signal visitor listeners to stop accepting new connections
             // (Go frp compat: vm.Close() closes all visitors before session is torn down).
@@ -1568,7 +1519,6 @@ impl Service {
             let delay = reconnect_delay_after_session(
                 &mut consecutive_err_count,
                 &mut fast_retry_timestamps,
-                session_started.elapsed(),
             );
             warn!(delay_ms = %delay.as_millis(), attempt = %consecutive_err_count, "Session ended, reconnecting in {}ms (attempt {})...",
                 delay.as_millis(), consecutive_err_count);
@@ -2565,101 +2515,15 @@ mod tests {
         assert!(!heartbeat_requires_auth(&[], &unrelated));
     }
 
-    #[tokio::test]
-    async fn work_conn_dispatcher_starts_65th_after_permit_release() {
-        use std::sync::Mutex as StdMutex;
-
-        let limiter = new_work_conn_admission_limiter();
-        let held_permits = Arc::new(StdMutex::new(Vec::new()));
-        let captured = held_permits.clone();
-        let (tx, rx) = mpsc::channel(MAX_QUEUED_WORK_CONN_REQUESTS);
-        let dispatcher = spawn_work_conn_dispatcher(rx, limiter, move |id, permit| {
-            captured.lock().unwrap().push((id, permit));
-        });
-
-        for id in 0..=MAX_INFLIGHT_WORK_CONNS {
-            tx.send(id).await.unwrap();
-        }
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if held_permits.lock().unwrap().len() == MAX_INFLIGHT_WORK_CONNS {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("first 64 requests should start");
-        assert_eq!(held_permits.lock().unwrap().len(), 64);
-        assert_eq!(
-            held_permits
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(id, _)| *id)
-                .collect::<Vec<_>>(),
-            (0..MAX_INFLIGHT_WORK_CONNS).collect::<Vec<_>>()
-        );
-
-        drop(held_permits.lock().unwrap().pop());
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if held_permits.lock().unwrap().len() == MAX_INFLIGHT_WORK_CONNS {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("65th request should start after one permit is released");
-        assert_eq!(held_permits.lock().unwrap().len(), 64);
-        assert_eq!(held_permits.lock().unwrap().last().unwrap().0, 64);
-
-        dispatcher.abort();
-    }
-
-    #[tokio::test]
-    async fn work_conn_queue_full_and_closed_are_explicit() {
-        let (tx, rx) = mpsc::channel(1);
-        tx.try_send(1).unwrap();
-        assert!(matches!(
-            tx.try_send(2),
-            Err(mpsc::error::TrySendError::Full(2))
-        ));
-        drop(rx);
-        assert!(matches!(
-            tx.try_send(3),
-            Err(mpsc::error::TrySendError::Closed(3))
-        ));
-    }
-
-    #[tokio::test]
-    async fn aborting_dispatcher_drops_queued_request() {
-        struct DropProbe(Arc<std::sync::atomic::AtomicUsize>);
-        impl Drop for DropProbe {
-            fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let limiter = Arc::new(Semaphore::new(0));
-        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (tx, rx) = mpsc::channel(1);
-        let dispatcher = spawn_work_conn_dispatcher(rx, limiter, |_, _| {});
-        tx.send(DropProbe(drops.clone())).await.unwrap();
-        tokio::task::yield_now().await;
-        dispatcher.abort();
-        dispatcher.await.unwrap_err();
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
     #[test]
-    fn repeated_short_sessions_escalate_backoff_without_login_reset() {
+    fn stable_sessions_do_not_reset_backoff_escalation() {
+        // Go frp v0.70.1's fastBackoffImpl resets only when the retry callback
+        // reports success; keepControllerWorking always reports an error after a
+        // session closes, so escalation continues regardless of session length.
         let mut errors = 0;
         let mut retries = Vec::new();
         let delays = (0..5)
-            .map(|_| reconnect_delay_after_session(&mut errors, &mut retries, Duration::ZERO))
+            .map(|_| reconnect_delay_after_session(&mut errors, &mut retries))
             .collect::<Vec<_>>();
 
         assert!(delays[..3]

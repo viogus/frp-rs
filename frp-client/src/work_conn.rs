@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use frp_core::auth::{AuthConfig, OidcClient};
@@ -77,7 +77,9 @@ pub(crate) struct WorkConnConfig {
     pub dial_timeout_secs: u64,
     pub xtcp_tx: mpsc::Sender<XtcpNotification>,
     pub session_alive: Arc<AtomicBool>,
-    pub inflight_permit: Option<OwnedSemaphorePermit>,
+    /// Test-only probe: each spawned work-conn task increments this counter when
+    /// it starts. Always `None` in production configs.
+    pub spawned_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(feature = "vnet")]
     pub vnet_tuns: VnetTunMap,
     #[cfg(feature = "vnet")]
@@ -154,8 +156,10 @@ async fn read_start_work_conn_with_timeout(
     work: &mut IoStream,
     v2: bool,
     timeout: Duration,
-    _permit: OwnedSemaphorePermit,
 ) -> std::io::Result<FrpMessage> {
+    // Rust-only transport safety: Go frp v0.70.1 has no client-side timeout for
+    // StartWorkConn. This bounds only the dial/handshake phase and is dropped as
+    // soon as StartWorkConn arrives, so it never limits a long-lived bridge.
     tokio::time::timeout(timeout, async {
         if v2 {
             work.read_v2_frame().await
@@ -368,6 +372,10 @@ async fn run_udp_work_conn(
 /// `pool_id` is for logging only (< 0 means on-demand).
 pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
     tokio::spawn(async move {
+        if let Some(counter) = &cfg.spawned_counter {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+
         let WorkConnConfig {
             server_addr,
             server_port,
@@ -397,7 +405,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             dial_timeout_secs,
             xtcp_tx,
             session_alive,
-            inflight_permit,
+            spawned_counter: _spawned_counter,
             #[cfg(feature = "vnet")]
                 vnet_tuns: _vnet_tuns,
             #[cfg(feature = "vnet")]
@@ -520,15 +528,10 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
         }
 
         // Read StartWorkConn
-        let Some(inflight_permit) = inflight_permit else {
-            warn!(label = %label, "Work conn dispatched without admission permit");
-            return;
-        };
         let swc_result = read_start_work_conn_with_timeout(
             &mut work,
             v2,
             start_work_conn_timeout(dial_timeout_secs),
-            inflight_permit,
         )
         .await;
         match swc_result {
@@ -882,6 +885,54 @@ mod tests {
         (client.unwrap(), accepted.unwrap().0)
     }
 
+    fn test_work_conn_config(
+        pool_id: i32,
+        xtcp_tx: mpsc::Sender<XtcpNotification>,
+        session_alive: Arc<AtomicBool>,
+        spawned_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> WorkConnConfig {
+        #[cfg(feature = "quic")]
+        let quic_conn = None;
+        #[cfg(not(feature = "quic"))]
+        let quic_conn = ();
+
+        WorkConnConfig {
+            server_addr: "127.0.0.1".to_string(),
+            server_port: 1,
+            protocol: frp_core::transport::TransportProtocol::Tcp,
+            run_id: "burst-test-run-id".to_string(),
+            proxy_info_map: Arc::new(RwLock::new(HashMap::new())),
+            enc_key: [0; 16],
+            pool_id,
+            auth_token: String::new(),
+            tls_enable: false,
+            tls_server_name: String::new(),
+            tls_ca_file: None,
+            yamux: None,
+            quic_conn,
+            v2: false,
+            oidc_client: None,
+            udp_sockets: Arc::new(Mutex::new(HashMap::new())),
+            udp_enc_cfg: Arc::new(Mutex::new(HashMap::new())),
+            proxy_metrics: Arc::new(frp_core::metrics::ProxyMetricsRegistry::new()),
+            client_auth_scopes: Vec::new(),
+            server_auth_scopes: Vec::new(),
+            disable_custom_tls_first_byte: true,
+            keepalive_secs: 0,
+            bind_addr: None,
+            proxy_url: String::new(),
+            user: String::new(),
+            dial_timeout_secs: 1,
+            xtcp_tx,
+            session_alive,
+            spawned_counter,
+            #[cfg(feature = "vnet")]
+            vnet_tuns: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "vnet")]
+            vnet_routes: Arc::new(RwLock::new(frp_vnet::router::RouteTable::new())),
+        }
+    }
+
     #[test]
     fn start_work_conn_timeout_has_one_second_floor() {
         assert_eq!(
@@ -893,22 +944,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn silent_start_work_conn_handshake_times_out_and_releases_permit() {
+    async fn silent_start_work_conn_handshake_times_out() {
         let (client, _silent_server) = tcp_pair().await;
         let mut work = IoStream::Tcp(client);
-        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = limiter.clone().try_acquire_owned().unwrap();
 
-        let err =
-            read_start_work_conn_with_timeout(&mut work, false, Duration::from_millis(20), permit)
-                .await
-                .unwrap_err();
+        let err = read_start_work_conn_with_timeout(&mut work, false, Duration::from_millis(20))
+            .await
+            .unwrap_err();
 
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
-        assert!(
-            limiter.try_acquire_owned().is_ok(),
-            "timeout must release the in-flight permit"
-        );
+    }
+
+    #[tokio::test]
+    async fn burst_of_req_work_conn_spawns_immediately_without_cap() {
+        // Go frp v0.70.1 runs each ReqWorkConn handler asynchronously with no
+        // client-side in-flight cap. The control loop spawns directly, so a
+        // burst larger than the removed 64-inflight limit must all start. The
+        // tasks dial 127.0.0.1:1, which fails immediately; the counter proves
+        // every task began concurrently rather than waiting on a limiter.
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (xtcp_tx, _xtcp_rx) = mpsc::channel(64);
+        let session_alive = Arc::new(AtomicBool::new(true));
+        let expected = 200;
+
+        for pool_id in 0..expected {
+            let cfg = test_work_conn_config(
+                pool_id as i32,
+                xtcp_tx.clone(),
+                session_alive.clone(),
+                Some(started.clone()),
+            );
+            spawn_work_conn(cfg);
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while started.load(Ordering::SeqCst) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all spawned work conn tasks should start immediately");
     }
 
     #[tokio::test]

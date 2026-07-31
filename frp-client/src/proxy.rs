@@ -149,8 +149,34 @@ where
     R: FnOnce(String) -> F,
     F: Future<Output = std::io::Result<Vec<SocketAddr>>>,
 {
-    // Resolved addresses are attempted sequentially under one deadline shared
-    // by DNS and all connects. This is deliberately not a Happy Eyeballs race.
+    connect_local_with_resolver_and_connector(
+        addr,
+        timeout,
+        resolver,
+        TcpStream::connect,
+        timeout,
+    )
+    .await
+}
+
+async fn connect_local_with_resolver_and_connector<R, F, C, G>(
+    addr: &str,
+    timeout: std::time::Duration,
+    resolver: R,
+    connector: C,
+    per_attempt_timeout: std::time::Duration,
+) -> Result<TcpStream, frp_core::Error>
+where
+    R: FnOnce(String) -> F,
+    F: Future<Output = std::io::Result<Vec<SocketAddr>>>,
+    C: Fn(SocketAddr) -> G,
+    G: Future<Output = std::io::Result<TcpStream>>,
+{
+    // Resolved addresses are attempted sequentially under one wall deadline
+    // shared by DNS and all connects. Each attempt gets its own bounded timeout
+    // so a blackholed address cannot consume the whole window: on per-address
+    // timeout we continue with the next address until the wall deadline expires.
+    // This is deliberately not a Happy Eyeballs race.
     let deadline = tokio::time::Instant::now() + timeout;
     let addresses = tokio::time::timeout_at(deadline, resolver(addr.to_owned()))
         .await
@@ -165,27 +191,24 @@ where
 
     let mut last_error = None;
     for socket_addr in addresses {
-        match tokio::time::timeout_at(deadline, TcpStream::connect(socket_addr)).await {
+        let now = tokio::time::Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        let attempt_deadline = now + std::cmp::min(per_attempt_timeout, remaining);
+        match tokio::time::timeout_at(attempt_deadline, connector(socket_addr)).await {
             Ok(Ok(stream)) => {
                 frp_core::transport::set_nodelay(&stream);
                 return Ok(stream);
             }
             Ok(Err(error)) => last_error = Some(error.to_string()),
             Err(_) => {
-                return Err(frp_core::Error::Transport(
-                    format!("connect {}: timed out", addr).into(),
-                ));
+                last_error = Some("timed out".to_string());
             }
         }
     }
 
+    let detail = last_error.unwrap_or_else(|| "no address succeeded".to_string());
     Err(frp_core::Error::Transport(
-        format!(
-            "connect {}: {}",
-            addr,
-            last_error.unwrap_or_else(|| "no address succeeded".to_string())
-        )
-        .into(),
+        format!("connect {}: {}", addr, detail).into(),
     ))
 }
 
@@ -380,6 +403,36 @@ mod tests {
         .unwrap();
 
         assert!(stream.peer_addr().unwrap().is_ipv6());
+    }
+
+    #[tokio::test]
+    async fn connect_continues_after_first_address_stalls_until_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let success = listener.local_addr().unwrap();
+        let stalled: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let stream = connect_local_with_resolver_and_connector(
+            "local.test:80",
+            std::time::Duration::from_secs(2),
+            move |_| async move { Ok(vec![stalled, success]) },
+            move |addr| {
+                async move {
+                    if addr.port() == 1 {
+                        // Simulate a blackholed first address: wait for the shared
+                        // deadline instead of returning an immediate error.
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        Err(std::io::Error::other("stalled address"))
+                    } else {
+                        tokio::net::TcpStream::connect(addr).await
+                    }
+                }
+            },
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stream.peer_addr().unwrap(), success);
     }
 
     #[derive(Clone)]
