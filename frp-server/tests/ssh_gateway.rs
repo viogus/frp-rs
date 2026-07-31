@@ -3,8 +3,23 @@ mod common;
 
 use common::{allocate_port, start_test_server, test_auth_cfg};
 use frp_core::config::ServerConfig;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::time::{timeout, Duration};
+
+struct TestSshClient;
+
+impl russh::client::Handler for TestSshClient {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &russh::keys::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+}
 
 fn ssh_test_config(ssh_port: u16, bind_port: u16) -> ServerConfig {
     let mut cfg = ServerConfig {
@@ -236,4 +251,51 @@ async fn test_ssh_gateway_starts_with_port_limit_config() {
     assert!(banner.contains("frp-rs"));
 
     drop(ssh_stream);
+}
+
+/// Reverse forwarding (`-R` / `tcpip_forward`) is disabled for this release:
+/// the SSH server must reject the global request instead of allocating a port
+/// it never binds.
+#[tokio::test]
+async fn test_ssh_gateway_rejects_reverse_forwarding() {
+    let ssh_port = allocate_port();
+    let bind_port = allocate_port();
+
+    let cfg = ssh_test_config(ssh_port, bind_port);
+    let (_handle, _port) = start_test_server(cfg).await;
+
+    let addr: SocketAddr = format!("127.0.0.1:{}", ssh_port).parse().unwrap();
+    let mut client = None;
+    for _ in 0..20 {
+        if let Ok(c) = russh::client::connect(
+            Arc::new(russh::client::Config::default()),
+            addr,
+            TestSshClient,
+        )
+        .await
+        {
+            client = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut client = client.expect("SSH client should connect");
+
+    let auth = client
+        .authenticate_password("v0", common::TEST_TOKEN)
+        .await
+        .expect("password auth should succeed");
+    assert!(auth.success(), "SSH password auth failed");
+
+    let result = client.tcpip_forward("127.0.0.1", 0).await;
+    assert!(
+        matches!(result, Err(russh::Error::RequestDenied)),
+        "reverse forwarding must be denied, got {:?}",
+        result
+    );
+
+    client
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+        .await
+        .ok();
 }

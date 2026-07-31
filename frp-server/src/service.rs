@@ -626,14 +626,7 @@ impl Service {
                                                 Err(_) => false,
                                             };
 
-                                            if is_v2 {
-                                                // V2 path: ClientHello/ServerHello handshake
-                                                let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut ws, Some(addr), "WS V2").await {
-                                                    Some(v) => v,
-                                                    None => return,
-                                                };
-                                                crate::handlers::dispatch_v2_message(ws, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
-                                            } else if magic[0] == 0x16 {
+                                            if magic[0] == 0x16 {
                                                 #[cfg(feature = "tls")]
                                                 {
                                                     let tls_acceptor = match state.tls_acceptor.read_ok().clone() {
@@ -721,6 +714,54 @@ impl Service {
                                                 {
                                                     tracing::warn!(addr = %addr, "TLS ClientHello in WebSocket frame but TLS feature not enabled, dropping connection from {}", addr);
                                                 }
+                                            } else if state.tcp_mux {
+                                                // Plain WebSocket + tcp_mux: Go frp v0.70.1 wraps the
+                                                // upgraded stream in yamux before any FRP bytes, so
+                                                // wrap here and run V2/V1 detection on the yamux stream.
+                                                let stream = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
+                                                let mux_cfg = mux::TcpMuxConfig {
+                                                    keepalive_interval: std::time::Duration::from_secs(
+                                                        state.tcp_mux_keepalive.max(1) as u64
+                                                    ),
+
+                                                ..Default::default()
+                                                };
+                                                match mux::server_mux(stream, &mux_cfg).await {
+                                                    Ok((control_stream, incoming)) => {
+                                                        let mut io = IoStream::Yamux(control_stream);
+                                                        tracing::info!(addr = ?addr, "Yamux over WebSocket session established for {:?}", addr);
+
+                                                        // V2 detection on yamux stream
+                                                        let mut mux_magic = [0u8; 7];
+                                                        let is_v2 = match io.read_exact(&mut mux_magic).await {
+                                                            Ok(_) => is_v2_magic(&mux_magic),
+                                                            Err(_) => false,
+                                                        };
+                                                        if is_v2 {
+                                                            let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut io, Some(addr), "WS+yamux V2").await {
+                                                                Some(v) => v,
+                                                                None => return,
+                                                            };
+                                                            crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, Some(incoming), None, crypto_ctx).await;
+                                                        } else {
+                                                            // V1 over plain WS+yamux
+                                                            let io = IoStream::BufferedRead(
+                                                                mux_magic.to_vec(), 0, Box::new(io),
+                                                            );
+                                                            crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None).await;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(addr = ?addr, error = %e, "Failed to start yamux over WebSocket for {:?}: {}", addr, e);
+                                                    }
+                                                }
+                                            } else if is_v2 {
+                                                // V2 path: ClientHello/ServerHello handshake
+                                                let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut ws, Some(addr), "WS V2").await {
+                                                    Some(v) => v,
+                                                    None => return,
+                                                };
+                                                crate::handlers::dispatch_v2_message(ws, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
                                             } else {
                                                 // V1 fallback: replay consumed 7 bytes
                                                 let ws = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
@@ -1190,12 +1231,11 @@ impl Service {
                                                 warn!(peer = %peer, "TLS-only mode: rejected plain KCP from {}", peer);
                                                 return;
                                             }
-                                            // tcp_mux enabled: Go frpc wraps KCP conn in yamux
-                                            // before sending Login (matching Go frps flow).
-                                            // But Rust frpc only proposes yamux for TCP
-                                            // (control.rs:123), not KCP. If the first byte is
-                                            // a V1 type byte (e.g. 0x6f Login), skip yamux
-                                            // and handle as raw V1.
+                                            // tcp_mux enabled: Go frpc and frp-rs wrap KCP conns in
+                                            // yamux before sending Login (matching Go frps flow).
+                                            // If the first byte is a V1 type byte (e.g. 0x6f Login),
+                                            // this is a legacy Rust frpc or custom client sending raw
+                                            // V1; keep handling it directly so those clients work.
                                             if state.tcp_mux && !is_v1_type_byte(first_byte) {
                                             // Replay the 7 bytes consumed by magic check —
                                             // they are part of the yamux SYN header.
@@ -2448,30 +2488,7 @@ impl Service {
                                             Err(_) => false,
                                         };
 
-                                        if is_v2 {
-                                            // V2 path: ClientHello/ServerHello handshake
-                                            let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ws).await {
-                                                Ok((Some(p), crypto)) => (p, crypto),
-                                                Ok((None, crypto)) => {
-                                                    match ws.read_raw_v2_frame().await {
-                                                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                        Ok((ft, _, _)) => {
-                                                            warn!(frame_type = ?ft, addr = %addr, "WS V2 (main): unexpected frame type {} after handshake from {}", ft, addr);
-                                                            return;
-                                                        }
-                                                        Err(e) => {
-                                                            warn!(addr = %addr, error = %e, "WS V2 (main): failed to read message after handshake from {}: {}", addr, e);
-                                                            return;
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    warn!(addr = %addr, error = %e, "WS V2 (main) handshake error from {}: {}", addr, e);
-                                                    return;
-                                                }
-                                            };
-                                            crate::handlers::dispatch_v2_message(ws, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
-                                        } else if magic[0] == 0x16 {
+                                        if magic[0] == 0x16 {
                                             // TLS-over-WebSocket: Go frpc (Docker default) sends
                                             // TLS ClientHello as first WebSocket frame payload.
                                             // Replay consumed bytes and wrap in TLS, matching
@@ -2603,6 +2620,86 @@ impl Service {
                                             {
                                                 warn!(addr = %addr, "TLS ClientHello in WebSocket frame but TLS feature not enabled, dropping connection from {}", addr);
                                             }
+                                        } else if state.tcp_mux {
+                                            // Plain WebSocket + tcp_mux: Go frp v0.70.1 wraps the
+                                            // upgraded stream in yamux before any FRP bytes, so
+                                            // wrap here and run V2/V1 detection on the yamux stream.
+                                            let stream = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
+                                            let mux_cfg = mux::TcpMuxConfig {
+                                                keepalive_interval: std::time::Duration::from_secs(
+                                                    state.tcp_mux_keepalive.max(1) as u64
+                                                ),
+
+                                            ..Default::default()
+                                            };
+                                            match mux::server_mux(stream, &mux_cfg).await {
+                                                Ok((control_stream, incoming)) => {
+                                                    let mut io = IoStream::Yamux(control_stream);
+                                                    info!(addr = ?addr, "Yamux over WebSocket session established for {:?}", addr);
+
+                                                    // V2 detection on yamux stream
+                                                    let mut mux_magic = [0u8; 7];
+                                                    let is_v2 = match io.read_exact(&mut mux_magic).await {
+                                                        Ok(_) => is_v2_magic(&mux_magic),
+                                                        Err(_) => false,
+                                                    };
+                                                    if is_v2 {
+                                                        let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                            Ok((Some(p), crypto)) => (p, crypto),
+                                                            Ok((None, crypto)) => {
+                                                                match io.read_raw_v2_frame().await {
+                                                                    Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                    Ok((ft, _, _)) => {
+                                                                        warn!(frame_type = ?ft, addr = %addr, "WS+yamux V2: unexpected frame type {} from {}", ft, addr);
+                                                                        return;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        warn!(addr = %addr, error = %e, "WS+yamux V2: failed to read message from {}: {}", addr, e);
+                                                                        return;
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                warn!(addr = %addr, error = %e, "WS+yamux V2 handshake error from {}: {}", addr, e);
+                                                                return;
+                                                            }
+                                                        };
+                                                        crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, Some(incoming), None, crypto_ctx).await;
+                                                    } else {
+                                                        // V1 over plain WS+yamux
+                                                        let io = IoStream::BufferedRead(
+                                                            mux_magic.to_vec(), 0, Box::new(io),
+                                                        );
+                                                        crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None).await;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(addr = ?addr, error = %e, "Failed to start yamux over WebSocket for {:?}: {}", addr, e);
+                                                }
+                                            }
+                                        } else if is_v2 {
+                                            // V2 path: ClientHello/ServerHello handshake
+                                            let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ws).await {
+                                                Ok((Some(p), crypto)) => (p, crypto),
+                                                Ok((None, crypto)) => {
+                                                    match ws.read_raw_v2_frame().await {
+                                                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                        Ok((ft, _, _)) => {
+                                                            warn!(frame_type = ?ft, addr = %addr, "WS V2 (main): unexpected frame type {} after handshake from {}", ft, addr);
+                                                            return;
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(addr = %addr, error = %e, "WS V2 (main): failed to read message after handshake from {}: {}", addr, e);
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(addr = %addr, error = %e, "WS V2 (main) handshake error from {}: {}", addr, e);
+                                                    return;
+                                                }
+                                            };
+                                            crate::handlers::dispatch_v2_message(ws, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
                                         } else {
                                             // V1 fallback: replay consumed 7 bytes
                                             let ws = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));

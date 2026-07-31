@@ -28,6 +28,70 @@ type LoginRet = (IoStream, String, Option<YamuxSession>);
 
 use crate::proxy;
 
+/// Whether the control connection should wrap its transport stream in yamux
+/// when `tcp_mux` is enabled. Go frp v0.70.1 applies yamux over TCP, KCP,
+/// WebSocket, and WSS; QUIC remains unmuxed.
+fn propose_mux_for_transport(tcp_mux: bool, protocol: &TransportProtocol) -> bool {
+    if !tcp_mux {
+        return false;
+    }
+    match protocol {
+        TransportProtocol::Tcp => true,
+        #[cfg(feature = "kcp")]
+        TransportProtocol::Kcp => true,
+        #[cfg(feature = "websocket")]
+        TransportProtocol::WebSocket => true,
+        #[cfg(feature = "websocket")]
+        TransportProtocol::Wss => true,
+        _ => false,
+    }
+}
+
+/// Wrap an established client transport stream in yamux (matching Go frp
+/// v0.70.1, which wraps the connector result for every non-QUIC transport).
+async fn wrap_client_mux(
+    raw_stream: IoStream,
+    keepalive_interval: i64,
+) -> Result<(IoStream, Option<YamuxSession>), frp_core::Error> {
+    let mux_cfg = mux::TcpMuxConfig {
+        keepalive_interval: Duration::from_secs(keepalive_interval.max(1) as u64),
+        max_stream_window_size: 6 * 1024 * 1024,
+    };
+    match raw_stream {
+        IoStream::Tcp(tcp_stream) => {
+            let (control_stream, session) = mux::client_mux(tcp_stream, &mux_cfg).await?;
+            info!("Yamux session established");
+            Ok((IoStream::Yamux(control_stream), Some(session)))
+        }
+        #[cfg(feature = "kcp")]
+        IoStream::Kcp(kcp_stream) => {
+            let (control_stream, session) = mux::client_mux(kcp_stream, &mux_cfg).await?;
+            info!("Yamux session established over KCP");
+            Ok((IoStream::Yamux(control_stream), Some(session)))
+        }
+        #[cfg(feature = "tls")]
+        IoStream::Tls(tls_stream, _) => {
+            let (control_stream, session) = mux::client_mux(tls_stream, &mux_cfg).await?;
+            info!("Yamux session established over TLS");
+            Ok((IoStream::Yamux(control_stream), Some(session)))
+        }
+        #[cfg(feature = "websocket")]
+        IoStream::WebSocket(ws_stream) => {
+            let (control_stream, session) = mux::client_mux(ws_stream, &mux_cfg).await?;
+            info!("Yamux session established over WebSocket");
+            Ok((IoStream::Yamux(control_stream), Some(session)))
+        }
+        other => {
+            warn!(
+                transport = ?std::mem::discriminant(&other),
+                "Unexpected transport {:?} for mux proposal — yamux not applied",
+                std::mem::discriminant(&other)
+            );
+            Ok((other, None))
+        }
+    }
+}
+
 /// Control connection state for the client.
 pub struct ControlConnection {
     server_addr: String,
@@ -126,10 +190,11 @@ impl ControlConnection {
     /// Returns the control stream, run_id, optional yamux session, and optional
     /// QUIC connection (for opening additional streams for work connections).
     pub async fn login(&mut self) -> Result<LoginRet, frp_core::Error> {
-        // Go frp servers with tcpMux=true wrap every incoming TCP connection
-        // in yamux immediately, so the client MUST wrap BEFORE sending Login.
-        // Works over both plain TCP and TLS (yamux sits on top of TLS).
-        let propose_mux = self.tcp_mux && matches!(self.transport_protocol, TransportProtocol::Tcp);
+        // Go frp servers with tcpMux=true wrap every incoming non-QUIC
+        // connection in yamux immediately, so the client MUST wrap BEFORE
+        // sending Login. This applies to TCP, TLS, KCP, WebSocket, and WSS
+        // (yamux sits on top of the transport stream).
+        let propose_mux = propose_mux_for_transport(self.tcp_mux, &self.transport_protocol);
 
         let opts = DialOptions {
             server_addr: self.server_addr.clone(),
@@ -176,35 +241,9 @@ impl ControlConnection {
                 // The server wraps its side on accept, so the client must wrap
                 // before sending ClientHello.
                 if propose_mux {
-                    let mux_cfg = mux::TcpMuxConfig {
-                        keepalive_interval: Duration::from_secs(
-                            self.tcp_mux_keepalive_interval.max(1) as u64,
-                        ),
-                        max_stream_window_size: 6 * 1024 * 1024,
-                    };
-                    match raw_stream {
-                        IoStream::Tcp(tcp_stream) => {
-                            let (control_stream, session) =
-                                mux::client_mux(tcp_stream, &mux_cfg).await?;
-                            info!("Yamux session established");
-                            (IoStream::Yamux(control_stream), Some(session), None)
-                        }
-                        #[cfg(feature = "tls")]
-                        IoStream::Tls(tls_stream, _) => {
-                            let (control_stream, session) =
-                                mux::client_mux(tls_stream, &mux_cfg).await?;
-                            info!("Yamux session established over TLS");
-                            (IoStream::Yamux(control_stream), Some(session), None)
-                        }
-                        other => {
-                            warn!(
-                                transport = ?std::mem::discriminant(&other),
-                                "Unexpected transport {:?} for mux proposal — yamux not applied",
-                                std::mem::discriminant(&other)
-                            );
-                            (other, None, None)
-                        }
-                    }
+                    let (io_stream, session) =
+                        wrap_client_mux(raw_stream, self.tcp_mux_keepalive_interval).await?;
+                    (io_stream, session, None)
                 } else {
                     // No yamux: raw stream directly (V2 handshake happens below).
                     (raw_stream, None, None)
@@ -219,35 +258,9 @@ impl ControlConnection {
             // The server wraps its side on accept, so the client must wrap
             // before sending ClientHello.
             if propose_mux {
-                let mux_cfg = mux::TcpMuxConfig {
-                    keepalive_interval: Duration::from_secs(
-                        self.tcp_mux_keepalive_interval.max(1) as u64
-                    ),
-                    max_stream_window_size: 6 * 1024 * 1024,
-                };
-                match raw_stream {
-                    IoStream::Tcp(tcp_stream) => {
-                        let (control_stream, session) =
-                            mux::client_mux(tcp_stream, &mux_cfg).await?;
-                        info!("Yamux session established");
-                        (IoStream::Yamux(control_stream), Some(session))
-                    }
-                    #[cfg(feature = "tls")]
-                    IoStream::Tls(tls_stream, _) => {
-                        let (control_stream, session) =
-                            mux::client_mux(tls_stream, &mux_cfg).await?;
-                        info!("Yamux session established over TLS");
-                        (IoStream::Yamux(control_stream), Some(session))
-                    }
-                    other => {
-                        warn!(
-                            transport = ?std::mem::discriminant(&other),
-                            "Unexpected transport {:?} for mux proposal — yamux not applied",
-                            std::mem::discriminant(&other)
-                        );
-                        (other, None)
-                    }
-                }
+                let (io_stream, session) =
+                    wrap_client_mux(raw_stream, self.tcp_mux_keepalive_interval).await?;
+                (io_stream, session)
             } else {
                 // No yamux: raw stream directly (V2 handshake happens below).
                 (raw_stream, None)
@@ -669,4 +682,29 @@ async fn hostname() -> String {
         .await
         .unwrap_or_else(|_| "unknown".to_string());
     HOSTNAME.get_or_init(|| h).clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn propose_mux_covers_non_tcp_transports_and_skips_quic() {
+        assert!(propose_mux_for_transport(true, &TransportProtocol::Tcp));
+        #[cfg(feature = "kcp")]
+        assert!(propose_mux_for_transport(true, &TransportProtocol::Kcp));
+        #[cfg(feature = "websocket")]
+        assert!(propose_mux_for_transport(
+            true,
+            &TransportProtocol::WebSocket
+        ));
+        #[cfg(feature = "websocket")]
+        assert!(propose_mux_for_transport(true, &TransportProtocol::Wss));
+        #[cfg(feature = "quic")]
+        assert!(!propose_mux_for_transport(true, &TransportProtocol::Quic));
+
+        assert!(!propose_mux_for_transport(false, &TransportProtocol::Tcp));
+        #[cfg(feature = "kcp")]
+        assert!(!propose_mux_for_transport(false, &TransportProtocol::Kcp));
+    }
 }

@@ -1,9 +1,13 @@
-//! SSH Tunnel Gateway — `ssh -R` reverse tunnel → frp proxy.
+//! SSH Tunnel Gateway — SSH client registration → frp proxy.
 //!
 //! Users connect with a standard SSH client:
 //!   ssh -R :80:127.0.0.1:8080 v0@server -p 2200 tcp --proxy_name "web" --remote_port 9090
 //!
 //! The remote command string is parsed into a ProxyConfig.
+//!
+//! SSH reverse forwarding (`tcpip_forward` / `-R`) is disabled in this
+//! release: the port allocation/work-connection bridge was unsafe and
+//! non-functional, so `-R` requests are rejected explicitly.
 //!
 //! NOTE: russh 0.61 transitively depends on rsa 0.10.0-rc.18 which has a known
 //! timing sidechannel (RUSTSEC-2023-0071, Marvin Attack). Only affects the SSH
@@ -365,24 +369,20 @@ impl VirtualControl {
 /// Lifecycle:
 /// 1. `auth_succeeded` → store handle, spawn work-connection background task
 /// 2. `exec_request` → parse proxy args from SSH remote command
-/// 3. `tcpip_forward` → register an FRP proxy via VirtualControl, store listen port
+/// 3. `tcpip_forward` → rejected; SSH reverse forwarding is disabled
 /// 4. When a work connection is needed, the control handler sends
 ///    ReqWorkConn → VirtualControl intercepts → WorkConnRequest →
-///    background task opens TCP to SSH listen port → sends NewWorkConn.
+///    background task drops the request (no reverse tunnel is available).
 pub struct SshSession {
     /// Unique run_id for this SSH client (used as FRP run_id).
     pub run_id: String,
     /// Proxy names registered by this session (for cleanup).
     pub registered_proxies: Vec<String>,
-    /// Stored after auth_succeeded; used to open reverse-forward
-    /// channels and request work connections from the SSH client.
+    /// Stored after auth_succeeded; retained for session lifecycle handling.
+    /// Reverse-forward channels are not opened in this release.
     pub ssh_handle: Option<russh::server::Handle>,
     /// V1 frame sender into the VirtualControl channel (→ control handler).
     frame_tx: Option<mpsc::Sender<Vec<u8>>>,
-    /// SSH listen ports allocated by `tcpip_forward`, consumed by the
-    /// work-connection background task to open TCP connections that
-    /// traverse the SSH reverse tunnel.
-    listen_ports: std::sync::Arc<tokio::sync::Mutex<std::collections::VecDeque<u16>>>,
     /// Server auth token for password authentication.
     server_token: String,
     /// Allowed public keys (loaded from authorized_keys file).
@@ -391,13 +391,6 @@ pub struct SshSession {
     state: std::sync::Arc<AppState>,
     /// Set to true by auth_succeeded.
     authenticated: bool,
-    /// The raw exec command string from the SSH client.
-    pending_command: Option<String>,
-    /// Parsed proxy args from the exec command.
-    pending_proxy: Option<ParsedProxyArgs>,
-    /// Bind info from tcpip_forward (-R), consumed by exec_request.
-    /// (bind_address, allocated_ssh_port)
-    pending_bind: Option<(String, u16)>,
     peer_addr: std::net::SocketAddr,
     auth_complete_tx: tokio::sync::watch::Sender<bool>,
     authenticated_run_id: Arc<std::sync::Mutex<Option<String>>>,
@@ -425,16 +418,10 @@ impl SshSession {
             registered_proxies: Vec::new(),
             ssh_handle: None,
             frame_tx: None,
-            listen_ports: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::collections::VecDeque::new(),
-            )),
             server_token,
             authorized_keys,
             state,
             authenticated: false,
-            pending_command: None,
-            pending_proxy: None,
-            pending_bind: None,
             peer_addr,
             auth_complete_tx,
             authenticated_run_id,
@@ -520,6 +507,35 @@ fn none_if_empty(s: &str) -> Option<String> {
     } else {
         Some(s.to_string())
     }
+}
+
+/// Build the sanitized exec_request log line. Secret values (`--sk`,
+/// `--group_key`, `--http_pwd`) are never formatted here or passed to the
+/// logging macro; only proxy type/name, remote port, and boolean flags.
+fn exec_request_log_summary(args: &ParsedProxyArgs) -> String {
+    format!(
+        "exec_request type={} name={} remote_port={} encryption={} compression={}",
+        args.proxy_type,
+        args.proxy_name,
+        args.remote_port,
+        args.use_encryption,
+        args.use_compression
+    )
+}
+
+/// Log an SSH exec_request using sanitized fields only.
+fn log_exec_request(run_id: &str, args: &ParsedProxyArgs) {
+    tracing::info!(
+        run_id = %run_id,
+        proxy_type = %args.proxy_type,
+        proxy_name = %args.proxy_name,
+        remote_port = %args.remote_port,
+        use_encryption = %args.use_encryption,
+        use_compression = %args.use_compression,
+        "SSH session {}: {}",
+        run_id,
+        exec_request_log_summary(args)
+    );
 }
 
 /// Return None if the vec is empty, Some(v) otherwise.
@@ -623,19 +639,14 @@ impl Handler for SshSession {
         *self.authenticated_run_id.lock().unwrap() = Some(self.run_id.clone());
         tracing::info!(run_id = %self.run_id, "SSH session {} authenticated", self.run_id);
 
-        // Spawn a background task that handles work connection requests.
-        // When the control handler needs a work connection, it writes
-        // ReqWorkConn → VirtualControl intercepts → WorkConnRequest.
-        // This task receives WorkConnRequest, opens a TCP connection to
-        // the SSH listen port (which traverses the SSH reverse tunnel
-        // back to the client's local service), and sends the resulting
-        // stream as InternalMsg::NewWorkConn to the control handler.
-        let listen_ports = self.listen_ports.clone();
-        let state = self.state.clone();
+        // Spawn a background task that drains work-connection requests.
+        // Reverse forwarding is disabled, so there is no SSH reverse tunnel
+        // to bridge; the receiver is drained so the control handler never
+        // blocks on the bounded channel.
         let run_id = self.run_id.clone();
 
         tokio::spawn(async move {
-            handle_work_conn_requests(work_conn_rx, listen_ports, state, run_id).await;
+            handle_work_conn_requests(work_conn_rx, run_id).await;
         });
 
         Ok(())
@@ -660,10 +671,6 @@ impl Handler for SshSession {
             ));
         }
 
-        self.pending_command = Some(cmd.clone());
-
-        tracing::info!(run_id = %self.run_id, cmd = %cmd, "SSH session {}: exec_request '{}'", self.run_id, cmd);
-
         let args = match parse_ssh_args(&cmd) {
             Ok(args) => args,
             Err(e) => {
@@ -671,20 +678,7 @@ impl Handler for SshSession {
                 return Err(anyhow!("{}", e));
             }
         };
-
-        // If -R bind hasn't arrived yet (unusual but possible), store args for later
-        let (_bind_addr, ssh_listen_port) = match self.pending_bind.take() {
-            Some(bind) => bind,
-            None => {
-                tracing::debug!(
-                    run_id = %self.run_id,
-                    "SSH session {}: exec before -R, storing pending proxy",
-                    self.run_id
-                );
-                self.pending_proxy = Some(args);
-                return Ok(());
-            }
-        };
+        log_exec_request(&self.run_id, &args);
 
         // Check per-client port limit (matching Go frp's GetUsedPortsNum logic).
         if self.state.max_ports_per_client > 0 {
@@ -725,24 +719,15 @@ impl Handler for SshSession {
         let proxy_name = args.proxy_name.clone();
         self.registered_proxies.push(proxy_name.clone());
 
-        // Store the SSH listen port so the work-connection background task
-        // can open a TCP connection through the tunnel.
-        {
-            let mut ports = self.listen_ports.lock().await;
-            ports.push_back(ssh_listen_port);
-        }
-
         tracing::info!(
             proxy_name = %proxy_name,
             proxy_type = %args.proxy_type,
             remote_port = %allocated,
-            ssh_listen_port = %ssh_listen_port,
             run_id = %self.run_id,
-            "SSH gateway: registered proxy '{}' type={} remote_port={} ssh_listen_port={} (run_id={})",
+            "SSH gateway: registered proxy '{}' type={} remote_port={} (run_id={})",
             proxy_name,
             args.proxy_type,
             allocated,
-            ssh_listen_port,
             self.run_id
         );
 
@@ -753,31 +738,17 @@ impl Handler for SshSession {
 
     async fn tcpip_forward(
         &mut self,
-        _address: &str,
-        port: &mut u32,
+        address: &str,
+        _port: &mut u32,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        // SSH sends tcpip_forward (-R) BEFORE exec_request (remote command).
-        // Allocate a port for the SSH tunnel now; proxy registration happens
-        // in exec_request when we have both the bind info and the parsed args.
-        let state = self.state.clone();
-        let allocated = {
-            let mut used = state.used_ports.write().await;
-            let ranges = state.reloadable.read_ok().allow_ports.clone();
-            allocate_port_multi(&mut used, 0, &ranges, &state.proxy_bind_addr)
-                .ok_or_else(|| anyhow!("no port available in configured ranges"))?
-        };
-
-        self.pending_bind = Some((_address.to_string(), allocated));
-        *port = allocated as u32;
-
-        tracing::debug!(
-            address = %_address,
-            allocated_port = %allocated,
-            "SSH -R bind: {}:{} (SSH listen port {})",
-            _address, allocated, allocated
+        tracing::warn!(
+            run_id = %self.run_id,
+            address = %address,
+            "SSH -R reverse forwarding is disabled in this release; rejecting tcpip_forward for {}",
+            address
         );
-        Ok(true)
+        Ok(false)
     }
 
     // ── Environment / PTY ────────────────────────────────────
@@ -813,8 +784,14 @@ impl Handler for SshSession {
         _origin_port: u32,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        // Accept: work connections bridge through forwarded channels
-        Ok(true)
+        // Reverse forwarding is disabled; reject any forwarded-tcpip channels
+        // a client may still attempt to open.
+        tracing::debug!(
+            run_id = %self.run_id,
+            "SSH gateway {}: rejecting forwarded-tcpip channel (reverse forwarding disabled)",
+            self.run_id
+        );
+        Ok(false)
     }
 
     async fn channel_open_direct_tcpip(
@@ -845,86 +822,18 @@ impl Handler for SshSession {
 }
 
 /// Background task: receives WorkConnRequest signals from VirtualControl
-/// (which intercepted ReqWorkConn from the control handler), opens a TCP
-/// connection to the SSH listen port so it traverses the reverse tunnel
-/// back to the client's local service, and sends the stream as
-/// InternalMsg::NewWorkConn to the control handler for bridging.
-async fn handle_work_conn_requests(
-    mut work_rx: mpsc::Receiver<WorkConnRequest>,
-    listen_ports: std::sync::Arc<tokio::sync::Mutex<std::collections::VecDeque<u16>>>,
-    state: std::sync::Arc<AppState>,
-    run_id: String,
-) {
+/// (which intercepted ReqWorkConn from the control handler).
+///
+/// Reverse forwarding is disabled in this release, so there is no SSH
+/// reverse tunnel to bridge work connections through. The receiver is still
+/// drained so the control handler never blocks on the bounded channel.
+async fn handle_work_conn_requests(mut work_rx: mpsc::Receiver<WorkConnRequest>, run_id: String) {
     while let Some(_req) = work_rx.recv().await {
-        // Pop the next listen port allocated by tcpip_forward
-        let port = {
-            let mut ports = listen_ports.lock().await;
-            ports.pop_front()
-        };
-
-        let port = match port {
-            Some(p) => p,
-            None => {
-                tracing::warn!(
-                    run_id = %run_id,
-                    "SSH session {}: WorkConnRequest but no listen ports available",
-                    run_id
-                );
-                continue;
-            }
-        };
-
-        // Open a TCP connection to the SSH listen port. This connection
-        // traverses the SSH reverse tunnel: frps TCP → SSH forwarded-tcpip
-        // channel → SSH client → local service.
-        let stream = match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(
-                    run_id = %run_id,
-                    listen_port = %port,
-                    error = %e,
-                    "SSH session {}: failed to connect to SSH listen port {}: {}",
-                    run_id, port, e
-                );
-                continue;
-            }
-        };
-
-        // Interactive SSH-forwarded traffic — disable Nagle to cut latency.
-        frp_core::transport::set_nodelay(&stream);
-
-        // Look up the control handler's internal_tx from the global map
-        let ctl_tx = {
-            let map = state.run_id_to_ctl_tx.read().await;
-            map.get(&run_id).cloned()
-        };
-
-        match ctl_tx {
-            Some(tx) => {
-                use crate::service::InternalMsg;
-                let io_stream = frp_core::transport::IoStream::Tcp(stream);
-                if tx
-                    .tx
-                    .send(InternalMsg::NewWorkConn(io_stream))
-                    .await
-                    .is_err()
-                {
-                    tracing::error!(
-                        run_id = %run_id,
-                        "SSH session {}: control handler channel closed",
-                        run_id
-                    );
-                }
-            }
-            None => {
-                tracing::error!(
-                    run_id = %run_id,
-                    "SSH session {}: no control handler found for work connection",
-                    run_id
-                );
-            }
-        }
+        tracing::warn!(
+            run_id = %run_id,
+            "SSH gateway {}: dropping WorkConnRequest because SSH reverse forwarding is disabled",
+            run_id
+        );
     }
 
     tracing::debug!(run_id = %run_id, "SSH session {} work-connection handler exiting", run_id);
@@ -1348,6 +1257,47 @@ mod tests {
         // This is acceptable — proxy names are never empty in practice.
         let tokens = shell_split(r#"tcp --proxy_name """#);
         assert_eq!(tokens, vec!["tcp", "--proxy_name"]);
+    }
+
+    #[test]
+    fn test_exec_request_log_summary_redacts_secrets() {
+        const SK: &str = "S3KR-sk-value";
+        const GROUP_KEY: &str = "S3KR-group-key-value";
+        const HTTP_PWD: &str = "S3KR-http-pwd-value";
+        let args = ParsedProxyArgs {
+            proxy_type: "tcp".into(),
+            proxy_name: "web".into(),
+            remote_port: 9090,
+            local_ip: "127.0.0.1".into(),
+            local_port: 8080,
+            custom_domains: Vec::new(),
+            subdomain: String::new(),
+            sk: SK.into(),
+            multiplexer: String::new(),
+            use_encryption: true,
+            use_compression: true,
+            group: String::new(),
+            group_key: GROUP_KEY.into(),
+            http_user: String::new(),
+            http_pwd: HTTP_PWD.into(),
+            host_header_rewrite: String::new(),
+            locations: Vec::new(),
+            bandwidth_limit: String::new(),
+            bandwidth_limit_mode: String::new(),
+        };
+
+        let summary = exec_request_log_summary(&args);
+        assert!(summary.contains("type=tcp"));
+        assert!(summary.contains("name=web"));
+        assert!(summary.contains("remote_port=9090"));
+        assert!(summary.contains("encryption=true"));
+        assert!(summary.contains("compression=true"));
+        for secret in [SK, GROUP_KEY, HTTP_PWD] {
+            assert!(
+                !summary.contains(secret),
+                "secret leaked into exec_request log summary: {summary}"
+            );
+        }
     }
 }
 
