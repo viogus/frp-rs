@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicI64, AtomicU64};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 #[cfg(feature = "dashboard")]
@@ -261,6 +261,42 @@ pub struct RateLimiter {
     last_refill: Instant,
 }
 
+/// Per-run_id lifecycle mutex plus the number of live lifecycle participants.
+///
+/// A control login or an active control handler holds one reference while it
+/// participates in the run_id lifecycle. The map entry is removed once the
+/// last reference drops, so reconnect churn cannot grow `run_mu_map`
+/// without bound while in-flight logins still inherit the same mutex.
+pub struct RunMuEntry {
+    mu: Arc<tokio::sync::Mutex<()>>,
+    refs: AtomicUsize,
+}
+
+/// RAII reference to a per-run_id lifecycle mutex.
+///
+/// Dropping the last guard removes the entry from `run_mu_map` (and thus the
+/// stored `Arc<Mutex<()>>`), but any in-flight login or active control that
+/// already acquired the entry keeps using the same mutex for the remainder of
+/// its lifecycle transition.
+pub struct RunMuGuard {
+    map: Arc<std::sync::Mutex<HashMap<String, Arc<RunMuEntry>>>>,
+    run_id: String,
+    entry: Arc<RunMuEntry>,
+}
+
+impl Drop for RunMuGuard {
+    fn drop(&mut self) {
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = map.get(&self.run_id) {
+            if Arc::ptr_eq(entry, &self.entry)
+                && entry.refs.fetch_sub(1, AtomicOrdering::SeqCst) == 1
+            {
+                map.remove(&self.run_id);
+            }
+        }
+    }
+}
+
 impl RateLimiter {
     /// `max_per_sec`: 0 = unlimited. Burst = min(max_per_sec, 1024).
     pub fn new(max_per_sec: u32) -> Self {
@@ -317,7 +353,7 @@ pub struct AppState {
     /// Per-runID mutex for serializing control lifecycle transitions
     /// (Add/Activate/completeLogin/Remove). Inherited from old to new control
     /// to prevent concurrent lifecycle operations for the same run_id.
-    pub run_mu_map: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    pub run_mu_map: Arc<std::sync::Mutex<HashMap<String, Arc<RunMuEntry>>>>,
     pub proxy_bind_addr: String,
     pub vhost_manager: Arc<VhostManager>,
     pub vhost_http_port: u16,
@@ -580,10 +616,81 @@ impl AppState {
     /// This mutex ensures that only one lifecycle transition (admit/activate/
     /// completeLogin/remove) happens at a time for a given run_id. It is
     /// inherited by new control connections when they supersede old ones.
-    pub fn get_run_mu(&self, run_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    pub fn get_run_mu(&self, run_id: &str) -> (Arc<tokio::sync::Mutex<()>>, RunMuGuard) {
         let mut map = self.run_mu_map.lock().unwrap_or_else(|e| e.into_inner());
-        map.entry(run_id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        let entry = map
+            .entry(run_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(RunMuEntry {
+                    mu: Arc::new(tokio::sync::Mutex::new(())),
+                    refs: AtomicUsize::new(0),
+                })
+            })
+            .clone();
+        entry.refs.fetch_add(1, AtomicOrdering::SeqCst);
+        let guard = RunMuGuard {
+            map: self.run_mu_map.clone(),
+            run_id: run_id.to_string(),
+            entry: entry.clone(),
+        };
+        (entry.mu.clone(), guard)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> Arc<AppState> {
+        let cfg = frp_core::config::ServerConfig::default();
+        Arc::new(AppState::new(
+            frp_core::auth::AuthConfig::with_token("test-token"),
+            "127.0.0.1".into(),
+            frp_core::encryption::derive_key("test-token"),
+            vec![(1, u16::MAX)],
+            String::new(),
+            true,
+            30,
+            7200,
+            90,
+            1500,
+            false,
+            None,
+            0,
+            60,
+            10,
+            false,
+            String::new(),
+            Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
+            168,
+            true,
+            0,
+            0,
+            frp_core::config::ServerConfigSnapshot::from_config(&cfg),
+        ))
+    }
+
+    #[tokio::test]
+    async fn run_mu_entries_are_reclaimed_when_last_guard_drops() {
+        let state = test_state();
+
+        let (mu_a, guard_a) = state.get_run_mu("run-a");
+        let (_mu_b, guard_b) = state.get_run_mu("run-b");
+        assert_eq!(state.run_mu_map.lock().unwrap().len(), 2);
+
+        // A second lifecycle participant inherits the same mutex.
+        let (mu_a2, guard_a2) = state.get_run_mu("run-a");
+        assert!(Arc::ptr_eq(&mu_a, &mu_a2));
+
+        drop(guard_a);
+        // run-a still has one live participant, so its entry must persist.
+        assert_eq!(state.run_mu_map.lock().unwrap().len(), 2);
+        drop(guard_a2);
+        // run-b still holds its entry; run-a is fully reclaimed.
+        assert_eq!(state.run_mu_map.lock().unwrap().len(), 1);
+
+        drop(guard_b);
+        assert!(state.run_mu_map.lock().unwrap().is_empty());
     }
 }

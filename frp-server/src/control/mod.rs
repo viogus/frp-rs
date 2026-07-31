@@ -75,12 +75,18 @@ pub(crate) struct ControlContext {
     pub reloadable: crate::state::ReloadableState,
     pub v2: bool,
     pub run_id: String,
+    /// Monotonically increasing control generation ID for this connection.
+    pub control_id: u64,
     pub pool_cap: usize,
     pub internal_tx: tokio::sync::mpsc::Sender<crate::state::InternalMsg>,
     pub peer: Option<std::net::SocketAddr>,
-    /// Verified authorization identity. This differs from the claimed/login
-    /// user under OIDC, while token auth intentionally keeps Go semantics.
+    /// Authorization identity used for proxy ownership and visitor access.
+    /// Go frp keeps the client-claimed `login.user` here even with OIDC; the
+    /// verified OIDC subject is used only for NewWorkConn/Ping verification.
     pub authenticated_user: String,
+    /// Keeps the per-run_id lifecycle mutex entry alive for this control
+    /// session and reclaims it after cleanup.
+    pub(crate) _run_mu_guard: crate::state::RunMuGuard,
 }
 
 /// Handle a control connection from a frpc client.

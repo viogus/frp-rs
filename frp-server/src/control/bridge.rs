@@ -749,6 +749,9 @@ pub(crate) async fn assign_work_to_proxy(
                     )
                     .await;
                 }
+                // Reachable when frp-core's quic feature is enabled through a
+                // dev-dependency while frp-server's own quic feature is off.
+                #[allow(unreachable_patterns)]
                 _ => {
                     warn!("unsupported IoStream variant in encrypted server bridge");
                     return;

@@ -14,6 +14,22 @@ use crate::nathole::controller as nathole_ctrl;
 use crate::nathole::{classify, NAT_HOLE_TIMEOUT};
 use crate::state::{AppState, InternalMsg};
 
+/// Go frp visitor authorization: empty `allow_users` is owner-only, `*` is a
+/// wildcard, otherwise the list is a specific allow-list.
+pub(crate) fn visitor_user_allowed(
+    authenticated_user: &str,
+    owner: &str,
+    allow_users: &[String],
+) -> bool {
+    if allow_users.is_empty() {
+        authenticated_user == owner
+    } else {
+        allow_users
+            .iter()
+            .any(|user| user == "*" || user == authenticated_user)
+    }
+}
+
 // ---------------------------------------------------------------
 // STCP visitor connection handler
 // ---------------------------------------------------------------
@@ -125,29 +141,20 @@ pub(crate) async fn handle_visitor_conn_inner(
     };
 
     // Bind fresh visitor authorization to an existing authenticated control.
+    // Go v0.70.1 fallback: visitors without a run_id are admitted with the
+    // empty identity and the normal owner/allow-users check.
     if let Some(proxy_info) = state.proxy_manager.get(&proxy_name).await {
-        let visitor_identity = if let Some(visitor_run_id) = msg.run_id.as_deref() {
-            state
+        let visitor_identity = match msg.run_id.as_deref() {
+            Some(visitor_run_id) if !visitor_run_id.is_empty() => state
                 .run_id_to_ctl_tx
                 .read()
                 .await
                 .get(visitor_run_id)
                 .map(|control| control.user.clone())
-        } else {
-            None
+                .unwrap_or_default(),
+            _ => String::new(),
         };
-        let allowed = if proxy_info.allow_users.iter().any(|user| user == "*") {
-            true
-        } else {
-            visitor_identity.as_deref().is_some_and(|identity| {
-                if proxy_info.allow_users.is_empty() {
-                    identity == proxy_info.user
-                } else {
-                    proxy_info.allow_users.iter().any(|user| user == identity)
-                }
-            })
-        };
-        if !allowed {
+        if !visitor_user_allowed(&visitor_identity, &proxy_info.user, &proxy_info.allow_users) {
             warn!(visitor_run_id = ?msg.run_id, proxy_name = %proxy_name, "STCP visitor has no trusted identity allowed for proxy '{}'", proxy_name);
             let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
                 proxy_name: proxy_name.clone(),
@@ -316,14 +323,15 @@ pub(crate) async fn handle_nat_hole_visitor(
     // Go frp controller.go: checks proxy exists + user in allow_users
     // (fresh-TCP path uses visitorUser="", so only "*" wildcard passes).
     if msg.pre_check {
-        // Validate allow_users: on fresh TCP, visitorUser is not known.
-        // Only allow if allow_users is unrestricted (empty or "*" wildcard).
-        let allowed = proxy_info.allow_users.iter().any(|u| u == "*");
+        // Validate allow_users: on fresh TCP the visitor identity is "".
+        // Empty allow_users is owner-only, so an owner-less proxy admits;
+        // otherwise the normal Go v0.70.1 owner/allow-list check applies.
+        let allowed = visitor_user_allowed("", &proxy_info.user, &proxy_info.allow_users);
         if !allowed {
             debug!(
                 proxy_name = %proxy_name,
                 allow_users = ?proxy_info.allow_users,
-                "NatHoleVisitor pre_check for proxy '{}': denied (allow_users restricts access, use '*' wildcard for fresh-TCP pre_check)",
+                "NatHoleVisitor pre_check for proxy '{}': denied (fresh-TCP identity '' does not match owner/allow_users)",
                 proxy_name
             );
             let (_, mut writer) = stream.into_split().unwrap();
@@ -420,12 +428,12 @@ pub(crate) async fn handle_nat_hole_visitor(
         debug!(proxy_name = %proxy_name, "NatHoleVisitor auth OK (constant-time) for proxy '{}'", proxy_name);
 
         // --- allow_users check on fresh connections ---
-        // Fresh TCP connections carry no user identity — only sign_key.
-        // If the proxy restricts visitors via allow_users, reject fresh
-        // connections outright; authorized visitors must use the control
+        // Fresh TCP connections carry no user identity, so the Go v0.70.1
+        // admission identity is "". Empty allow_users is owner-only, so an
+        // owner-less proxy admits; restricted proxies require the control
         // channel path (control/mod.rs NatHoleVisitor handler).
-        if !proxy_info.allow_users.iter().any(|user| user == "*") {
-            warn!(proxy_name = %proxy_name, "NatHoleVisitor: fresh connection lacks authenticated visitor identity — rejecting restricted proxy");
+        if !visitor_user_allowed("", &proxy_info.user, &proxy_info.allow_users) {
+            warn!(proxy_name = %proxy_name, "NatHoleVisitor: fresh connection identity '' denied for proxy '{}'", proxy_name);
             let mut writer = stream.into_split().unwrap().1;
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
@@ -1040,5 +1048,20 @@ pub(crate) async fn handle_work_conn_inner(
         None => {
             warn!(run_id = %run_id, "No control handler found for run_id {}", run_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod visitor_admission_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_visitor_without_run_id_uses_empty_identity_admission() {
+        // Go v0.70.1: empty run_id falls back to identity "" and the normal
+        // owner/allow-users check, so an owner-less unrestricted proxy admits.
+        assert!(visitor_user_allowed("", "", &[]));
+        assert!(visitor_user_allowed("", "", &["*".to_string()]));
+        assert!(!visitor_user_allowed("", "", &["alice".to_string()]));
+        assert!(!visitor_user_allowed("", "owner", &[]));
     }
 }

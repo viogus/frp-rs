@@ -19,16 +19,6 @@ use crate::service::InternalMsg;
 use super::pool;
 use super::{write_ctl_msg, ControlContext, ControlState};
 
-fn visitor_user_allowed(authenticated_user: &str, owner: &str, allow_users: &[String]) -> bool {
-    if allow_users.is_empty() {
-        authenticated_user == owner
-    } else {
-        allow_users
-            .iter()
-            .any(|user| user == "*" || user == authenticated_user)
-    }
-}
-
 // ── InternalMsg handlers ────────────────────────────────────────────
 
 /// Write NatHoleSid to the visitor via the control channel.
@@ -347,7 +337,11 @@ pub(crate) async fn handle_new_visitor_conn<W: AsyncWriteExt + Unpin>(
         // (accept loop) semantics. Empty = owner-only (Go frp compat);
         // if both owner and visitor have no user (empty string),
         // they are the same identity and access is allowed.
-        let user_ok = visitor_user_allowed(login_user, &proxy_info.user, &proxy_info.allow_users);
+        let user_ok = crate::handlers::visitor_user_allowed(
+            login_user,
+            &proxy_info.user,
+            &proxy_info.allow_users,
+        );
         if !user_ok {
             warn!(proxy_name = %nvc.proxy_name, "NewVisitorConn on ctl: user denied for proxy '{}'", nvc.proxy_name);
             false
@@ -425,7 +419,8 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
     // Auth is enforced BEFORE pre_check response so Go frp's
     // pre_check permission model is preserved.
 
-    if !visitor_user_allowed(login_user, &proxy_info.user, &proxy_info.allow_users) {
+    if !crate::handlers::visitor_user_allowed(login_user, &proxy_info.user, &proxy_info.allow_users)
+    {
         let error = if proxy_info.allow_users.is_empty() {
             let owner = &proxy_info.user;
             warn!(proxy_name = %proxy_name, user = %login_user, owner = %owner, "NatHoleVisitor: user '{}' not proxy owner '{}' for proxy '{}'", login_user, owner, proxy_name);
@@ -896,28 +891,49 @@ pub(crate) async fn handle_vnet_route_remove(
 
 #[cfg(test)]
 mod identity_binding_tests {
-    use super::*;
-
     #[test]
-    fn oidc_subject_b_cannot_claim_user_a_for_a_only_proxy() {
+    fn oidc_keeps_claimed_user_a_even_when_subject_is_b() {
         let identity = super::super::login::authenticated_user(Some("A"), Some("B"));
-        assert_eq!(identity, "B");
-        assert!(!visitor_user_allowed(&identity, "A", &["A".to_string()]));
-        assert!(!visitor_user_allowed(&identity, "A", &[]));
+        assert_eq!(identity, "A");
+        assert!(crate::handlers::visitor_user_allowed(
+            &identity,
+            "A",
+            &["A".to_string()]
+        ));
+        assert!(crate::handlers::visitor_user_allowed(&identity, "A", &[]));
     }
 
     #[test]
-    fn oidc_subject_a_is_allowed_even_when_claimed_user_differs() {
+    fn oidc_does_not_substitute_subject_a_for_claimed_user_b() {
         let identity = super::super::login::authenticated_user(Some("B"), Some("A"));
+        assert_eq!(identity, "B");
+        assert!(!crate::handlers::visitor_user_allowed(
+            &identity,
+            "owner",
+            &["A".to_string()]
+        ));
+    }
+
+    #[test]
+    fn oidc_without_claimed_user_falls_back_to_subject() {
+        let identity = super::super::login::authenticated_user(None, Some("A"));
         assert_eq!(identity, "A");
-        assert!(visitor_user_allowed(&identity, "owner", &["A".to_string()]));
+        assert!(crate::handlers::visitor_user_allowed(
+            &identity,
+            "owner",
+            &["A".to_string()]
+        ));
     }
 
     #[test]
     fn token_auth_preserves_claimed_user_compatibility() {
         let identity = super::super::login::authenticated_user(Some("A"), None);
         assert_eq!(identity, "A");
-        assert!(visitor_user_allowed(&identity, "A", &[]));
-        assert!(visitor_user_allowed(&identity, "owner", &["A".to_string()]));
+        assert!(crate::handlers::visitor_user_allowed(&identity, "A", &[]));
+        assert!(crate::handlers::visitor_user_allowed(
+            &identity,
+            "owner",
+            &["A".to_string()]
+        ));
     }
 }

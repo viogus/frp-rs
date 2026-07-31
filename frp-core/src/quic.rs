@@ -53,6 +53,35 @@ impl QuicTransportParams {
     }
 }
 
+/// Normalize zero-valued options to Go frp defaults.
+///
+/// Go frp's `QUICOptions.Complete()` treats `0` as "use default":
+/// keepalive 10s, idle timeout 30s, and 100_000 incoming streams.
+pub fn quic_params_from_option_values(
+    keepalive_period_secs: i64,
+    max_idle_timeout_secs: i64,
+    max_incoming_streams: i64,
+) -> QuicTransportParams {
+    let defaults = QuicTransportParams::default();
+    QuicTransportParams {
+        keepalive_period_secs: if keepalive_period_secs > 0 {
+            keepalive_period_secs as u32
+        } else {
+            defaults.keepalive_period_secs
+        },
+        max_idle_timeout_secs: if max_idle_timeout_secs > 0 {
+            max_idle_timeout_secs as u32
+        } else {
+            defaults.max_idle_timeout_secs
+        },
+        max_incoming_streams: if max_incoming_streams > 0 {
+            max_incoming_streams as u32
+        } else {
+            defaults.max_incoming_streams
+        },
+    }
+}
+
 /// A QUIC bidirectional stream wrapped as a unified read/write type.
 ///
 /// QUIC streams have separate send and receive halves; this struct
@@ -443,5 +472,29 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(params.effective_max_incoming_streams(), 1);
+    }
+
+    #[test]
+    fn zero_option_values_normalize_to_go_defaults() {
+        let params = quic_params_from_option_values(0, 0, 0);
+        assert_eq!(params.keepalive_period_secs, 10);
+        assert_eq!(params.max_idle_timeout_secs, 30);
+        assert_eq!(params.max_incoming_streams, 100_000);
+    }
+
+    #[test]
+    fn negative_option_values_also_normalize_to_go_defaults() {
+        let params = quic_params_from_option_values(-1, -5, -100);
+        assert_eq!(params.keepalive_period_secs, 10);
+        assert_eq!(params.max_idle_timeout_secs, 30);
+        assert_eq!(params.max_incoming_streams, 100_000);
+    }
+
+    #[test]
+    fn positive_option_values_are_preserved() {
+        let params = quic_params_from_option_values(20, 60, 2_048);
+        assert_eq!(params.keepalive_period_secs, 20);
+        assert_eq!(params.max_idle_timeout_secs, 60);
+        assert_eq!(params.max_incoming_streams, 2_048);
     }
 }

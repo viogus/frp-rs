@@ -26,11 +26,14 @@ use super::pool::{PendingRequest, PoolEntry, WORK_POOL_EXTRA};
 use super::proxy_ops::{err_msg, unregister_control};
 use super::{write_ctl_msg, ControlContext, ControlState};
 
-/// Identity used for authorization decisions. OIDC binds authorization to the
-/// verified JWT subject; token auth retains Go-compatible `login.user` semantics.
+/// Identity used for authorization decisions.
+///
+/// Go frp never rewrites `LoginMsg.User` when OIDC is enabled: the claimed
+/// user drives proxy ownership and visitor `allow_users` checks, while the
+/// verified JWT subject is used only for NewWorkConn/Ping verification.
 pub(crate) fn authenticated_user(claimed_user: Option<&str>, oidc_subject: Option<&str>) -> String {
-    oidc_subject
-        .or(claimed_user)
+    claimed_user
+        .or(oidc_subject)
         .unwrap_or_default()
         .to_string()
 }
@@ -60,6 +63,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod auth_signal_tests {
     use std::io;
     use std::pin::Pin;
@@ -461,7 +465,7 @@ pub(crate) async fn authenticate(
 
     // Acquire per-runID mutex to serialize lifecycle transitions.
     // This prevents two concurrent logins for the same run_id from racing.
-    let run_mu = state.get_run_mu(&run_id);
+    let (run_mu, run_mu_guard) = state.get_run_mu(&run_id);
     let run_guard = run_mu.lock().await;
 
     // Check for existing control and set up handoff barrier.
@@ -557,7 +561,7 @@ pub(crate) async fn authenticate(
             server_additional_auth_scopes: None,
         });
         let _ = write_ctl_msg(&mut stream, &resp, v2).await;
-        unregister_control(&state, &run_id, false).await;
+        unregister_control(&state, &run_id, control_id, false).await;
         // Clean up OIDC subject
         if oidc_subject.is_some() {
             remove_oidc_subject_generation(&state, &run_id, control_id).await;
@@ -609,7 +613,7 @@ pub(crate) async fn authenticate(
         }
     } {
         warn!(peer = ?peer, error = %e, "Failed to send login response to {:?}: {}", peer, e);
-        unregister_control(&state, &run_id, false).await;
+        unregister_control(&state, &run_id, control_id, false).await;
         // Clean up registry entry
         state
             .client_registry
@@ -623,7 +627,7 @@ pub(crate) async fn authenticate(
     // Flush TLS stream to ensure LoginResp reaches KCP before we wrap in CipherStream
     if let Err(e) = flush_login_response_and_signal(&mut *stream, auth_success).await {
         warn!(peer = ?peer, error = %e, "Failed to flush after LoginResp: {}", e);
-        unregister_control(&state, &run_id, false).await;
+        unregister_control(&state, &run_id, control_id, false).await;
         state
             .client_registry
             .mark_offline_by_run_id_and_control_id(&run_id, control_id);
@@ -681,14 +685,14 @@ pub(crate) async fn authenticate(
                     }
                     Err(e) => {
                         warn!(peer = ?peer, error = %e, "Failed to create AEAD stream for {:?}: {}", peer, e);
-                        unregister_control(&state, &run_id, false).await;
+                        unregister_control(&state, &run_id, control_id, false).await;
                         return Err(());
                     }
                 }
             }
             Err(e) => {
                 warn!(peer = ?peer, error = %e, "Failed to derive AEAD keys for {:?}: {}", peer, e);
-                unregister_control(&state, &run_id, false).await;
+                unregister_control(&state, &run_id, control_id, false).await;
                 return Err(());
             }
         }
@@ -778,10 +782,12 @@ pub(crate) async fn authenticate(
             reloadable,
             v2,
             run_id,
+            control_id,
             pool_cap,
             internal_tx: internal_tx.clone(),
             peer,
             authenticated_user,
+            _run_mu_guard: run_mu_guard,
         },
         ControlState {
             shutting_down,

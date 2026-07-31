@@ -96,6 +96,35 @@ mod quic_admission_tests {
     }
 
     #[tokio::test]
+    async fn drain_preauth_limiter_bounds_concurrent_first_frame_waits() {
+        // Mirrors the drain loop: the stream is already accepted, then the
+        // preauth permit is acquired before the first-frame read. The
+        // limiter must cap concurrent waits at QUIC_PREAUTH_STREAM_LIMIT.
+        let limiter = new_quic_preauth_stream_limiter();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for _ in 0..(QUIC_PREAUTH_STREAM_LIMIT * 4) {
+            let limiter = limiter.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            tasks.spawn(async move {
+                let _permit = limiter.acquire_owned().await.unwrap();
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+
+        assert_eq!(max_active.load(Ordering::SeqCst), QUIC_PREAUTH_STREAM_LIMIT);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(limiter.available_permits(), QUIC_PREAUTH_STREAM_LIMIT);
+    }
+
+    #[tokio::test]
     async fn preauth_stream_admission_uses_small_safety_cap() {
         let limiter = new_quic_preauth_stream_limiter();
         let mut permits = Vec::new();
@@ -908,10 +937,7 @@ impl Service {
                                                 return;
                                             }
                                         };
-                                        // KCP listener doesn't capture peer addr (matching V1 behavior).
-                                        // Use unspecified addr for dispatch_v2_message logging.
-                                        let peer_addr = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
-                                        crate::handlers::dispatch_v2_message(ctl, msg_payload, state, peer_addr, None, None, crypto_ctx).await;
+                                        crate::handlers::dispatch_v2_message(ctl, msg_payload, state, peer, None, None, crypto_ctx).await;
                                     } else {
                                         let first_byte = magic[0];
 
@@ -1005,8 +1031,7 @@ impl Service {
                                                                         return;
                                                                     }
                                                                 };
-                                                                let peer_addr = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
-                                                                crate::handlers::dispatch_v2_message(io, msg_payload, state, peer_addr, Some(incoming), None, crypto_ctx).await;
+                                                                crate::handlers::dispatch_v2_message(io, msg_payload, state, peer, Some(incoming), None, crypto_ctx).await;
                                                             } else {
                                                                 let mut io = frp_core::transport::IoStream::BufferedRead(yamux_magic.to_vec(), 0, Box::new(io));
                                                                 match frp_core::protocol::read_msg_v1(&mut io).await {
@@ -1072,8 +1097,7 @@ impl Service {
                                                             return;
                                                         }
                                                     };
-                                                    let peer_addr = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
-                                                    crate::handlers::dispatch_v2_message(ctl, msg_payload, state, peer_addr, None, None, crypto_ctx).await;
+                                                    crate::handlers::dispatch_v2_message(ctl, msg_payload, state, peer, None, None, crypto_ctx).await;
                                                 } else {
                                                     // After KCP TLS handshake, Go frpc's decrypted stream
                                                     // starts with non-FRP bytes (TLS Finished verify_data
@@ -1128,7 +1152,7 @@ impl Service {
                                                             match frp_core::protocol::read_msg_v1(&mut ctl).await {
                                                                 Ok(frp_core::msg::FrpMessage::Login(login)) => {
                                                                     tracing::info!(peer = %peer, "KCP TLS Login from {}", peer);
-                                                                    control::handle_control(ctl, *login, state, None, None, false, None, false).await;
+                                                                    control::handle_control(ctl, *login, state, Some(peer), None, false, None, false).await;
                                                                 }
                                                                 Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                                                     tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP TLS NewWorkConn from {}", peer);
@@ -1254,8 +1278,8 @@ impl Service {
                                             let mut ctl = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ctl));
                                             match frp_core::protocol::read_msg_v1(&mut ctl).await {
                                                 Ok(frp_core::msg::FrpMessage::Login(login)) => {
-                                                    tracing::info!(peer = %peer, "KCP Login from {}", peer);
-                                                    control::handle_control(ctl, *login, state, None, None, false, None, false).await;
+                                                                    tracing::info!(peer = %peer, "KCP Login from {}", peer);
+                                                                    control::handle_control(ctl, *login, state, Some(peer), None, false, None, false).await;
                                                 }
                                                 Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                                     tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP NewWorkConn from {}", peer);
@@ -1303,12 +1327,11 @@ impl Service {
         if self.cfg.quic_bind_port > 0 {
             let quic_state = self.state.clone();
             let quic_options = self.cfg.transport.quic_options.clone().unwrap_or_default();
-            let quic_params = frp_core::quic::QuicTransportParams {
-                keepalive_period_secs: quic_options.keepalive_period.max(0) as u32,
-                max_idle_timeout_secs: quic_options.max_idle_timeout.max(1) as u32,
-                max_incoming_streams: quic_options.max_incoming_streams.clamp(1, u32::MAX as i64)
-                    as u32,
-            };
+            let quic_params = frp_core::quic::quic_params_from_option_values(
+                quic_options.keepalive_period,
+                quic_options.max_idle_timeout,
+                quic_options.max_incoming_streams,
+            );
             let authenticated_stream_limit = quic_params.max_incoming_streams as usize;
             let mut listener_quic_params = quic_params.clone();
             listener_quic_params.max_incoming_streams = quic_params
@@ -1448,11 +1471,10 @@ impl Service {
                                             // This is inside the handler, not in the accept loop —
                                             // matching Go frp's HandleQUICListener pattern where
                                             // the accept loop never blocks on a stream.
-                                            let deadline = tokio::time::Instant::now()
-                                                + QUIC_FIRST_FRAME_TIMEOUT;
                                             let stream = match await_quic_preauth(
                                                 conn.accept_bi(),
-                                                deadline,
+                                                tokio::time::Instant::now()
+                                                    + QUIC_FIRST_FRAME_TIMEOUT,
                                                 &state.shutdown_token,
                                             )
                                             .await
@@ -1472,6 +1494,11 @@ impl Service {
                                                     return;
                                                 }
                                             };
+                                            // The first-frame budget starts after the stream is
+                                            // accepted, not while we are waiting for the peer to
+                                            // open it (Go frp applies the read deadline post-accept).
+                                            let deadline = tokio::time::Instant::now()
+                                                + QUIC_FIRST_FRAME_TIMEOUT;
                                             handle_quic_stream(
                                                 stream,
                                                 conn,
@@ -1530,6 +1557,7 @@ impl Service {
                     Ok(Err(_)) => false,
                     Err(_) => {
                         tracing::warn!("QUIC control stream timed out before protocol magic");
+                        conn.close(b"control stream timeout");
                         return;
                     }
                 };
@@ -1558,9 +1586,13 @@ impl Service {
                 }).await;
                 let (msg_payload, crypto_ctx) = match first_message {
                     Ok(Some(message)) => message,
-                    Ok(None) => return,
+                    Ok(None) => {
+                        conn.close(b"control stream error");
+                        return;
+                    }
                     Err(_) => {
                         tracing::warn!("QUIC V2 control stream timed out before first message");
+                        conn.close(b"control stream timeout");
                         return;
                     }
                 };
@@ -1611,6 +1643,7 @@ impl Service {
                 {
                     Err(_) => {
                         tracing::warn!("QUIC V1 control stream timed out before Login");
+                        conn.close(b"control stream timeout");
                     }
                     Ok(result) => match result {
                         Ok(frp_core::msg::FrpMessage::Login(login)) => {
@@ -1656,6 +1689,7 @@ impl Service {
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "QUIC read error: {}", e);
+                            conn.close(b"control stream error");
                         }
                     },
                 }
@@ -1680,6 +1714,8 @@ impl Service {
                 let authenticated_limiter =
                     new_quic_authenticated_stream_limiter(authenticated_stream_limit);
                 let mut stream_tasks = tokio::task::JoinSet::new();
+                let accept_next = drain_conn.accept_bi();
+                tokio::pin!(accept_next);
                 loop {
                     tokio::select! {
                         biased;
@@ -1692,20 +1728,26 @@ impl Service {
                                 tracing::debug!(error = %e, tag, "QUIC stream task ended with error");
                             }
                         }
-                        permit = preauth_limiter.clone().acquire_owned() => {
-                            let Ok(preauth_permit) = permit else { break; };
-                            let result = tokio::select! {
-                                biased;
-                                _ = drain_cancel.cancelled() => break,
-                                result = drain_conn.accept_bi() => result,
+                        result = &mut accept_next => {
+                            let result = if drain_cancel.is_cancelled() {
+                                break;
+                            } else {
+                                result
                             };
                             match result {
                                 Ok(work_stream) => {
                                     tracing::debug!(tag, "QUIC drain ({tag}): accepted new stream");
                                     let s = Arc::clone(&state);
                                     let authenticated_limiter = authenticated_limiter.clone();
+                                    let preauth_limiter = preauth_limiter.clone();
                                     stream_tasks.spawn(async move {
-                                        let preauth_permit = preauth_permit;
+                                        // Bound concurrent unauthenticated first-frame waits:
+                                        // acquire only after the stream was accepted so the
+                                        // limiter caps actual reads, not the accept backlog.
+                                        let preauth_permit = match preauth_limiter.acquire_owned().await {
+                                            Ok(permit) => permit,
+                                            Err(_) => return,
+                                        };
                                         let mut wc = frp_core::transport::IoStream::Quic(work_stream);
                                         let request = tokio::time::timeout(QUIC_FIRST_FRAME_TIMEOUT, async {
                                             let mut wmagic = [0u8; 7];
@@ -1742,6 +1784,7 @@ impl Service {
                                             Err(_) => tracing::warn!(timeout_secs = QUIC_FIRST_FRAME_TIMEOUT.as_secs(), "QUIC work stream first-frame timeout"),
                                         }
                                     });
+                                    accept_next.set(drain_conn.accept_bi());
                                 }
                                 Err(e) => {
                                     tracing::debug!(error = %e, tag, "QUIC drain ({tag}) done: {e}");
