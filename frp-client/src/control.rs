@@ -43,6 +43,8 @@ fn propose_mux_for_transport(tcp_mux: bool, protocol: &TransportProtocol) -> boo
         TransportProtocol::WebSocket => true,
         #[cfg(feature = "websocket")]
         TransportProtocol::Wss => true,
+        // Reachable when the relevant transport feature is disabled.
+        #[allow(unreachable_patterns)]
         _ => false,
     }
 }

@@ -18,6 +18,13 @@ ignore = [
     # only for signature *verification* of client public keys. Feature kept so
     # RSA-key clients can still authenticate. No fixed rsa version exists.
     "RUSTSEC-2023-0071",
+    # quick-xml 0.26.x (pulled by pprof -> inferno for on-demand CPU flamegraph
+    # profiling). RUSTSEC-2026-0194/0195 affect XML parsing in the profiling
+    # tool path, which is opt-in, developer-only, never exposed to network
+    # input, and absent from all shipped default/tiny/micro builds. pprof
+    # upstream still pins inferno 0.11; track for a fixed release.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 [licenses]

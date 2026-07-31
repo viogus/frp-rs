@@ -96,7 +96,7 @@ Every feature, fix, and test change follows three rules:
 | `cargo clippy` (default) | zero warnings |
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
-| `cargo test --workspace --all-features` | 522 passed, 2 ignored (35 suites) |
+| `cargo test --workspace --all-features` | 620 passed, 2 ignored (36 suites) |
 | `cargo build --release` | passes (frps ~5.6MB, frpc ~5.4MB default; ~7.8MB/6.0MB all-features) |
 | `compat-test.sh` (Go frp v0.70.1) | 68 non-XTCP + 16 XTCP scenarios |
 | `unsafe` blocks | 6 in frp-core, 3+ in frp-vnet (all with `// SAFETY:` comment) |

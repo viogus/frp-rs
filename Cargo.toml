@@ -52,7 +52,7 @@ socket2 = "0.5"
 libc = "0.2"
 chacha20poly1305 = "0.10"
 criterion = "0.5"
-pprof = { version = "0.14", features = ["flamegraph"] }
+pprof = { version = "0.15", features = ["flamegraph"] }
 mimalloc = "0.1.52"
 
 # Release profile: slim, LTO, single codegen unit, stripped symbols, abort on panic.
