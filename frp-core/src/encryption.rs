@@ -131,6 +131,16 @@ pub fn decompress(_data: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(feature = "compression")]
 pub struct SnappyDecompressor {
     buf: Vec<u8>,
+    offset: usize,
+}
+
+/// State returned by [`SnappyDecompressor::feed_into_progress`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnappyFeedStatus {
+    /// Another complete frame can be processed without supplying more input.
+    pub has_more_complete: bool,
+    /// Buffered bytes remain, but they do not yet form a complete frame.
+    pub has_pending_partial: bool,
 }
 
 #[cfg(feature = "compression")]
@@ -143,14 +153,17 @@ impl Default for SnappyDecompressor {
 #[cfg(feature = "compression")]
 impl SnappyDecompressor {
     pub fn new() -> Self {
-        Self { buf: Vec::new() }
+        Self {
+            buf: Vec::new(),
+            offset: 0,
+        }
     }
 
     /// Feed compressed bytes into the decompressor.
     ///
-    /// Returns all decompressed plaintext that can be produced from complete
-    /// frames currently in the buffer.  Bytes that belong to an incomplete
-    /// frame are retained and will be processed on the next `feed()` call.
+    /// Returns at most one decompressed data chunk. Complete later frames and
+    /// an incomplete tail are retained; call `feed(&[])` to drain them before
+    /// reading more compressed input. This supplies bounded backpressure.
     ///
     /// Returns an error only for truly corrupt input (bad magic, bad CRC);
     /// partial frames are silently buffered, not treated as errors.
@@ -160,77 +173,144 @@ impl SnappyDecompressor {
         Ok(out)
     }
 
-    /// Like [`feed`], but writes decompressed output into an existing buffer,
-    /// reusing its allocation.
+    /// Like [`feed`], but writes at most one chunk into an existing buffer,
+    /// reusing its allocation. This compatibility API skips metadata internally
+    /// until it produces data or needs more input. Use [`feed_into_progress`]
+    /// when each call must have a fixed metadata-work budget.
     pub fn feed_into(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
-        const MAX_SNAPPY_BUFFER: usize = 16 * 1024 * 1024; // 16 MB
-        const MAX_OUTPUT_PER_FEED: usize = 64 * 1024 * 1024; // 64 MB
-        if self.buf.len() + data.len() > MAX_SNAPPY_BUFFER {
-            return Err("snappy decompression buffer exhausted".into());
+        let mut status = self.feed_into_progress(data, out)?;
+        let mut metadata_batches = 1usize;
+        while out.is_empty() && status.has_more_complete {
+            if metadata_batches >= 16 {
+                return Err(
+                    "snappy: legacy metadata work limit exceeded; use feed_into_progress".into(),
+                );
+            }
+            status = self.feed_into_progress(&[], out)?;
+            metadata_batches += 1;
         }
-        self.buf.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// Process at most 1024 metadata frames and at most one data frame.
+    ///
+    /// The returned status explicitly tells callers whether to drain again or
+    /// wait for more input, so an empty output is never ambiguous.
+    pub fn feed_into_progress(
+        &mut self,
+        data: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<SnappyFeedStatus, String> {
+        self.feed_into_step(data, out)?;
+        let has_more_complete = self.has_complete_frame();
+        Ok(SnappyFeedStatus {
+            has_more_complete,
+            has_pending_partial: self.has_pending() && !has_more_complete,
+        })
+    }
+
+    fn feed_into_step(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
+        const MAX_SNAPPY_CHUNK: usize = 128 * 1024;
+        const MAX_SNAPPY_PENDING: usize = 16 * 1024 * 1024;
+        const MAX_FRAMES_PER_CALL: usize = 1024;
 
         out.clear();
-        let mut pos = 0;
+        if self.offset > 0 && !data.is_empty() {
+            self.buf.drain(..self.offset);
+            self.offset = 0;
+        }
+        let mut remaining = data;
         let stream_body = b"sNaPpY";
 
-        while pos + 4 <= self.buf.len() {
-            let chunk_type = self.buf[pos];
-            let chunk_len =
-                u32::from_le_bytes([self.buf[pos + 1], self.buf[pos + 2], self.buf[pos + 3], 0])
-                    as usize;
+        // Complete and validate the first pending header before copying a
+        // co-delivered payload. Remaining bytes share one contiguous buffer.
+        if self.buf.len() < 4 {
+            let take = (4 - self.buf.len()).min(remaining.len());
+            self.buf.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+        }
+        if self.buf.len() >= 4 {
+            let chunk_len = u32::from_le_bytes([self.buf[1], self.buf[2], self.buf[3], 0]) as usize;
+            if chunk_len > MAX_SNAPPY_CHUNK {
+                return Err(format!(
+                    "snappy: chunk length {chunk_len} exceeds {MAX_SNAPPY_CHUNK} byte limit"
+                ));
+            }
+        }
+        let new_len = self
+            .buf
+            .len()
+            .checked_add(remaining.len())
+            .ok_or_else(|| "snappy pending buffer length overflow".to_string())?;
+        if new_len > MAX_SNAPPY_PENDING {
+            return Err("snappy decompression buffer exhausted".into());
+        }
+        self.buf.extend_from_slice(remaining);
 
+        // Drain bounded metadata work and at most one plaintext-producing frame.
+        for _ in 0..MAX_FRAMES_PER_CALL {
+            if self.offset + 4 > self.buf.len() {
+                break;
+            }
+            let start = self.offset;
+            let chunk_type = self.buf[start];
+            let chunk_len = u32::from_le_bytes([
+                self.buf[start + 1],
+                self.buf[start + 2],
+                self.buf[start + 3],
+                0,
+            ]) as usize;
+            if chunk_len > MAX_SNAPPY_CHUNK {
+                return Err(format!(
+                    "snappy: chunk length {chunk_len} exceeds {MAX_SNAPPY_CHUNK} byte limit"
+                ));
+            }
+            let total = 4 + chunk_len;
+            if start + total > self.buf.len() {
+                break;
+            }
             match chunk_type {
                 0x00 => {
                     // Compressed data: length field includes 4-byte CRC.
                     if chunk_len < 4 {
                         return Err("snappy: compressed chunk length too small".into());
                     }
-                    let total = 4 + chunk_len;
-                    if pos + total > self.buf.len() {
-                        break; // incomplete chunk
-                    }
                     // Skip 4-byte header (already read) + 4-byte CRC
-                    let data_start = pos + 8;
-                    let compressed = &self.buf[data_start..pos + total];
-                    let mut decoder = snap::raw::Decoder::new();
-                    let decompressed = decoder
-                        .decompress_vec(compressed)
+                    let compressed = &self.buf[start + 8..start + total];
+                    let decompressed_len = snap::raw::decompress_len(compressed)
                         .map_err(|e| format!("snappy decompress: {e}"))?;
-                    out.extend_from_slice(&decompressed);
-                    if out.len() > MAX_OUTPUT_PER_FEED {
-                        return Err("snappy: decompressed output exceeds 64 MB limit".into());
+                    if decompressed_len > MAX_SNAPPY_CHUNK {
+                        return Err(format!(
+                            "snappy: decompressed output {decompressed_len} exceeds per-chunk {MAX_SNAPPY_CHUNK} byte limit"
+                        ));
                     }
-                    pos += total;
+                    out.resize(decompressed_len, 0);
+                    let mut decoder = snap::raw::Decoder::new();
+                    let written = decoder
+                        .decompress(compressed, out)
+                        .map_err(|e| format!("snappy decompress: {e}"))?;
+                    if written != decompressed_len {
+                        return Err("snappy: decompressed output length changed".into());
+                    }
+                    self.offset += total;
+                    return Ok(());
                 }
                 0x01 => {
                     // Uncompressed data: length field includes 4-byte CRC.
                     if chunk_len < 4 {
                         return Err("snappy: uncompressed chunk length too small".into());
                     }
-                    let total = 4 + chunk_len;
-                    if pos + total > self.buf.len() {
-                        break; // incomplete chunk
-                    }
-                    let data_start = pos + 8; // skip header + CRC
-                    let data = &self.buf[data_start..pos + total];
-                    out.extend_from_slice(data);
-                    if out.len() > MAX_OUTPUT_PER_FEED {
-                        return Err("snappy: decompressed output exceeds 64 MB limit".into());
-                    }
-                    pos += total;
+                    let chunk_data = &self.buf[start + 8..start + total];
+                    out.extend_from_slice(chunk_data);
+                    self.offset += total;
+                    return Ok(());
                 }
                 0xFF => {
                     // Stream identifier: 4-byte header + body, NO CRC.
-                    let total = 4 + chunk_len;
-                    if pos + total > self.buf.len() {
-                        break; // incomplete
-                    }
-                    let body = &self.buf[pos + 4..pos + total];
+                    let body = &self.buf[start + 4..start + total];
                     if body != stream_body {
                         return Err(format!("snappy: bad stream identifier: {:?}", body));
                     }
-                    pos += total;
                 }
                 t if (0x02..=0x7F).contains(&t) => {
                     // Reserved unskippable chunk — spec says return error.
@@ -239,27 +319,79 @@ impl SnappyDecompressor {
                 _ => {
                     // Padding (0xFE) and reserved skippable (0x80-0xFD).
                     // No CRC for these types.
-                    let total = 4 + chunk_len;
-                    if pos + total > self.buf.len() {
-                        break; // incomplete chunk
-                    }
-                    pos += total;
                 }
             }
+            self.offset += total;
         }
 
-        self.buf.drain(..pos);
+        if self.offset == self.buf.len() {
+            self.buf.clear();
+            self.offset = 0;
+        }
+
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn buffered_capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
+    #[cfg(test)]
+    fn buffered_segments(&self) -> usize {
+        usize::from(!self.buf.is_empty())
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        self.offset < self.buf.len()
+    }
+
+    pub(crate) fn has_complete_frame(&self) -> bool {
+        if self.offset + 4 > self.buf.len() {
+            return false;
+        }
+        let chunk_len = u32::from_le_bytes([
+            self.buf[self.offset + 1],
+            self.buf[self.offset + 2],
+            self.buf[self.offset + 3],
+            0,
+        ]) as usize;
+        self.offset + 4 + chunk_len <= self.buf.len()
+    }
+
+    /// Validate that EOF did not leave a partial frame. Complete frames must be
+    /// drained through [`feed_into_progress`] before calling this method.
+    pub fn validate_partial_eof(&mut self) -> Result<(), String> {
+        if self.has_complete_frame() {
+            return Err("snappy: complete frame remains at EOF; drain progress first".into());
+        }
+        if self.has_pending() {
+            self.buf.clear();
+            self.offset = 0;
+            Err("snappy: incomplete frame at end of stream".into())
+        } else {
+            Ok(())
+        }
     }
 
     /// Flush any remaining buffered data, returning decompressed output.
     /// Call this when the compressed stream has ended (work_r EOF).
     pub fn flush(&mut self) -> Result<Vec<u8>, String> {
-        if self.buf.is_empty() {
-            return Ok(Vec::new());
+        let offset_before = self.offset;
+        let output = self.feed(&[])?;
+        if !output.is_empty() {
+            return Ok(output);
         }
-        let remaining = std::mem::take(&mut self.buf);
-        decompress(&remaining)
+        if !self.has_pending() {
+            Ok(Vec::new())
+        } else if self.offset > offset_before {
+            // Bounded metadata work was consumed; the caller should drain again.
+            Ok(Vec::new())
+        } else {
+            self.buf.clear();
+            self.offset = 0;
+            Err("snappy: incomplete frame at end of stream".into())
+        }
     }
 }
 
@@ -284,6 +416,22 @@ impl SnappyDecompressor {
     }
     pub fn feed_into(&mut self, _data: &[u8], _out: &mut Vec<u8>) -> Result<(), String> {
         Err("compression not compiled".into())
+    }
+    pub fn feed_into_progress(
+        &mut self,
+        _data: &[u8],
+        _out: &mut Vec<u8>,
+    ) -> Result<SnappyFeedStatus, String> {
+        Err("compression not compiled".into())
+    }
+    pub(crate) fn has_pending(&self) -> bool {
+        false
+    }
+    pub(crate) fn has_complete_frame(&self) -> bool {
+        false
+    }
+    pub fn validate_partial_eof(&mut self) -> Result<(), String> {
+        Ok(())
     }
     pub fn flush(&mut self) -> Result<Vec<u8>, String> {
         Ok(Vec::new())
@@ -369,6 +517,198 @@ mod tests {
     fn test_snappy_decompressor_empty() {
         let mut dec = SnappyDecompressor::new();
         assert!(dec.feed(b"").unwrap().is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn snappy_rejects_oversized_declared_chunk_before_payload_allocation() {
+        let mut dec = SnappyDecompressor::new();
+        let declared = 256 * 1024_u32;
+        let header = [
+            0x00,
+            declared as u8,
+            (declared >> 8) as u8,
+            (declared >> 16) as u8,
+        ];
+
+        let error = dec.feed(&header).unwrap_err();
+        assert!(error.contains("chunk length"), "unexpected error: {error}");
+        assert!(dec.buffered_capacity() <= 256 * 1024);
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn snappy_rejects_expansion_bomb_before_output_allocation() {
+        // A complete, small framed chunk whose raw Snappy header declares
+        // 128 KiB + 1 of output. The limit must fire before decompression or
+        // any output reservation; the payload itself may remain invalid.
+        let frame = [0x00, 0x07, 0x00, 0x00, 0, 0, 0, 0, 0x81, 0x80, 0x08];
+        let mut dec = SnappyDecompressor::new();
+        let mut output = Vec::new();
+
+        let error = dec.feed_into(&frame, &mut output).unwrap_err();
+        assert!(
+            error.contains("decompressed output"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(output.capacity(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn snappy_fragmented_valid_frame_stays_bounded_and_roundtrips() {
+        let plaintext = vec![0x5a; 64 * 1024];
+        let compressed = compress(&plaintext).unwrap();
+        let mut dec = SnappyDecompressor::new();
+        let mut output = Vec::new();
+
+        for fragment in compressed.chunks(7) {
+            output.extend_from_slice(&dec.feed(fragment).unwrap());
+            assert!(dec.buffered_capacity() <= 256 * 1024);
+        }
+        loop {
+            let chunk = dec.feed(&[]).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            output.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(output, plaintext);
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn snappy_accepts_one_megabyte_multi_chunk_feed() {
+        let plaintext = vec![0x42; 1024 * 1024];
+        let compressed = compress(&plaintext).unwrap();
+        let mut dec = SnappyDecompressor::new();
+
+        let mut output = dec.feed(&compressed).unwrap();
+        loop {
+            let chunk = dec.feed(&[]).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            output.extend_from_slice(&chunk);
+        }
+        assert_eq!(output, plaintext);
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn snappy_drains_highly_compressed_three_megabytes_one_bounded_chunk_at_a_time() {
+        let plaintext = vec![0x42; 3 * 1024 * 1024];
+        let compressed = compress(&plaintext).unwrap();
+        let mut dec = SnappyDecompressor::new();
+        let mut reconstructed = Vec::new();
+
+        let mut chunk = dec.feed(&compressed).unwrap();
+        loop {
+            assert!(chunk.len() <= 128 * 1024);
+            if chunk.is_empty() {
+                break;
+            }
+            reconstructed.extend_from_slice(&chunk);
+            chunk = dec.feed(&[]).unwrap();
+        }
+
+        assert_eq!(reconstructed, plaintext);
+        assert!(dec.buffered_capacity() <= 2 * 1024 * 1024);
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn snappy_accepts_three_megabytes_of_incompressible_framed_input() {
+        let plaintext: Vec<u8> = (0usize..3 * 1024 * 1024)
+            .map(|i| (i.wrapping_mul(131) >> 7) as u8)
+            .collect();
+        let compressed = compress(&plaintext).unwrap();
+        let mut dec = SnappyDecompressor::new();
+        let mut reconstructed = Vec::new();
+        let mut chunk = dec.feed(&compressed).unwrap();
+        while !chunk.is_empty() {
+            reconstructed.extend_from_slice(&chunk);
+            chunk = dec.feed(&[]).unwrap();
+        }
+        assert_eq!(reconstructed, plaintext);
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn snappy_skippable_frame_storm_uses_one_contiguous_pending_buffer() {
+        let mut storm = Vec::with_capacity(400_000);
+        for _ in 0..100_000 {
+            storm.extend_from_slice(&[0xfe, 0, 0, 0]);
+        }
+        let mut dec = SnappyDecompressor::new();
+        let mut output = Vec::new();
+
+        let status = dec.feed_into_progress(&storm, &mut output).unwrap();
+        assert!(output.is_empty());
+        assert!(status.has_more_complete);
+        assert_eq!(dec.buffered_segments(), 1);
+        assert!(dec.buffered_capacity() <= 16 * 1024 * 1024);
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn public_progress_api_unambiguously_drains_metadata_storm_then_data() {
+        let mut input = Vec::with_capacity(400_128);
+        for _ in 0..100_000 {
+            input.extend_from_slice(&[0xfe, 0, 0, 0]);
+        }
+        input.extend_from_slice(&compress(b"after-storm").unwrap());
+        let mut dec = SnappyDecompressor::new();
+        let mut output = Vec::new();
+        let mut calls = 0usize;
+        let mut status = dec.feed_into_progress(&input, &mut output).unwrap();
+
+        loop {
+            calls += 1;
+            if !output.is_empty() {
+                assert_eq!(output, b"after-storm");
+            }
+            if !status.has_more_complete {
+                break;
+            }
+            status = dec.feed_into_progress(&[], &mut output).unwrap();
+        }
+
+        assert!(calls > 1, "work budget must split the metadata storm");
+        assert!(calls < 200, "each call must make bounded forward progress");
+        assert!(!status.has_pending_partial);
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn legacy_feed_rejects_excessive_metadata_work_with_progress_guidance() {
+        let mut storm = Vec::with_capacity(16 * 1024 * 1024);
+        for _ in 0..(16 * 1024 * 1024 / 4) {
+            storm.extend_from_slice(&[0xfe, 0, 0, 0]);
+        }
+        let mut dec = SnappyDecompressor::new();
+
+        let error = dec.feed(&storm).unwrap_err();
+        assert!(error.contains("feed_into_progress"), "unexpected: {error}");
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn snappy_rejects_oversized_header_before_copying_same_feed_payload() {
+        let declared = 256 * 1024_u32;
+        let mut input = vec![0u8; 300 * 1024];
+        input[..4].copy_from_slice(&[
+            0x00,
+            declared as u8,
+            (declared >> 8) as u8,
+            (declared >> 16) as u8,
+        ]);
+        let mut dec = SnappyDecompressor::new();
+
+        let error = dec.feed(&input).unwrap_err();
+        assert!(error.contains("chunk length"), "unexpected error: {error}");
+        assert!(dec.buffered_capacity() < input.len());
     }
 
     #[test]

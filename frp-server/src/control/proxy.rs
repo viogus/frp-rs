@@ -240,7 +240,7 @@ pub(crate) async fn handle_ping<W: AsyncWriteExt + Unpin>(
             .read()
             .await
             .get(&ctx.run_id)
-            .cloned()
+            .map(|(subject, _)| subject.clone())
             .unwrap_or_default();
         verifier
             .verify_ping(

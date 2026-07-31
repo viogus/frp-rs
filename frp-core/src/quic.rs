@@ -47,6 +47,12 @@ impl Default for QuicTransportParams {
     }
 }
 
+impl QuicTransportParams {
+    fn effective_max_incoming_streams(&self) -> u32 {
+        self.max_incoming_streams.max(1)
+    }
+}
+
 /// A QUIC bidirectional stream wrapped as a unified read/write type.
 ///
 /// QUIC streams have separate send and receive halves; this struct
@@ -127,6 +133,16 @@ impl QuicConnection {
     pub fn remote_address(&self) -> std::net::SocketAddr {
         self.conn.remote_address()
     }
+
+    /// Close the QUIC connection immediately with an application reason.
+    pub fn close(&self, reason: &[u8]) {
+        self.conn.close(0u32.into(), reason);
+    }
+
+    /// Increase or reduce the peer-initiated bidirectional stream credit.
+    pub fn set_max_concurrent_bi_streams(&self, count: u32) {
+        self.conn.set_max_concurrent_bi_streams(count.max(1).into());
+    }
 }
 
 /// QUIC listener — binds a UDP socket and accepts QUIC connections.
@@ -141,6 +157,11 @@ pub struct QuicListener {
 }
 
 impl QuicListener {
+    /// Return the UDP address bound by this listener.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.endpoint.local_addr()
+    }
+
     /// Bind a QUIC listener with default transport parameters.
     /// `cert_pem` and `key_pem` are the server's TLS certificate and key (PEM format).
     pub fn new(addr: SocketAddr, cert_pem: &str, key_pem: &str) -> io::Result<Self> {
@@ -195,7 +216,7 @@ impl QuicListener {
         transport.keep_alive_interval(Some(std::time::Duration::from_secs(
             params.keepalive_period_secs as u64,
         )));
-        transport.max_concurrent_bidi_streams(params.max_incoming_streams.into());
+        transport.max_concurrent_bidi_streams(params.effective_max_incoming_streams().into());
 
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_tls));
         server_config.transport_config(Arc::new(transport));
@@ -261,6 +282,23 @@ pub async fn dial_quic_with_params(
     key_file: Option<&str>,
     params: QuicTransportParams,
 ) -> io::Result<(QuicStream, QuicConnection)> {
+    let connection =
+        dial_quic_connection_with_params(addr, server_name, ca_file, cert_file, key_file, params)
+            .await?;
+    let stream = connection.open_bi().await?;
+    Ok((stream, connection))
+}
+
+/// Dial and authenticate a QUIC connection without opening its first stream.
+/// This is useful to separate connection admission from stream admission.
+pub async fn dial_quic_connection_with_params(
+    addr: &str,
+    server_name: &str,
+    ca_file: Option<&str>,
+    cert_file: Option<&str>,
+    key_file: Option<&str>,
+    params: QuicTransportParams,
+) -> io::Result<QuicConnection> {
     let remote: SocketAddr = addr.parse().map_err(io::Error::other)?;
 
     let roots = crate::transport::build_root_store(ca_file)
@@ -317,7 +355,7 @@ pub async fn dial_quic_with_params(
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(
         params.keepalive_period_secs as u64,
     )));
-    transport.max_concurrent_bidi_streams(params.max_incoming_streams.into());
+    transport.max_concurrent_bidi_streams(params.effective_max_incoming_streams().into());
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
     client_config.transport_config(Arc::new(transport));
@@ -344,14 +382,7 @@ pub async fn dial_quic_with_params(
         .await
         .map_err(|e| io::Error::other(format!("quinn connecting: {e}")))?;
 
-    let (send, recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| io::Error::other(format!("quinn open stream: {e}")))?;
-
-    let qc = QuicConnection { conn: conn.clone() };
-    let stream = QuicStream::new(conn, send, recv);
-    Ok((stream, qc))
+    Ok(QuicConnection { conn })
 }
 
 // ---- AsyncRead / AsyncWrite ----
@@ -385,5 +416,32 @@ impl AsyncWrite for QuicStream {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.send).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incoming_stream_limit_preserves_public_default_and_explicit_values() {
+        let params = QuicTransportParams::default();
+        assert_eq!(params.max_incoming_streams, 100_000);
+        assert_eq!(params.effective_max_incoming_streams(), 100_000);
+
+        let custom = QuicTransportParams {
+            max_incoming_streams: 1_024,
+            ..params
+        };
+        assert_eq!(custom.effective_max_incoming_streams(), 1_024);
+    }
+
+    #[test]
+    fn incoming_stream_limit_never_advertises_zero() {
+        let params = QuicTransportParams {
+            max_incoming_streams: 0,
+            ..Default::default()
+        };
+        assert_eq!(params.effective_max_incoming_streams(), 1);
     }
 }

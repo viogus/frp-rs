@@ -58,12 +58,6 @@ fn make_decompressor(use_compression: bool) -> Option<encryption::SnappyDecompre
     }
 }
 
-/// Maximum factor by which decompressed output may exceed the bridge buffer
-/// size before it is treated as a decompression bomb.  4x is generous for
-/// normal Snappy ratios (1.5-2x after framing overhead) while blocking
-/// maliciously crafted payloads that would occupy excessive memory.
-const MAX_DECOMPRESS_FACTOR: usize = 4;
-
 /// Feed a chunk through the decompressor into a reusable buffer.
 /// Returns `None` on decompress error — the caller should break its loop.
 #[inline]
@@ -74,24 +68,14 @@ fn decompress_chunk_into<'a>(
 ) -> Option<&'a [u8]> {
     match dec {
         Some(d) => {
-            d.feed_into(data, buf)
+            d.feed_into_progress(data, buf)
                 .inspect_err(|_e| {
                     #[cfg(feature = "compression")]
                     tracing::warn!(error = %_e, "snappy decompress error in bridge: {}", _e);
                 })
                 .ok()?;
-            // Reject decompression bombs: decompressed output should be
-            // proportional to the bridge buffer size.
-            let limit = MAX_DECOMPRESS_FACTOR * *crate::buffer_pool::BUFFER_SIZE;
-            if buf.len() > limit {
-                #[cfg(feature = "compression")]
-                tracing::warn!(
-                    len = buf.len(),
-                    limit,
-                    "bridge: decompressed output exceeds limit, possible decompression bomb"
-                );
-                return None;
-            }
+            // SnappyDecompressor validates each declared chunk and decoded
+            // size before allocation and enforces a fixed per-feed ceiling.
             Some(buf.as_slice())
         }
         None => Some(data),
@@ -238,7 +222,7 @@ async fn bridge_work_to_user(
     let cap = buf.as_mut_slice().len();
     let mut decomp_buf = Vec::new();
     let mut decompressor = make_decompressor(use_compression);
-    loop {
+    'read_loop: loop {
         let n = match work_r.read(buf.as_mut_slice()).await {
             Ok(0) => break,
             Ok(n) => {
@@ -251,16 +235,30 @@ async fn bridge_work_to_user(
             }
         };
 
-        let plaintext =
-            match decompress_chunk_into(&mut decompressor, &buf.raw_buf()[..n], &mut decomp_buf) {
-                Some(p) => p,
-                None => {
-                    tracing::warn!("bridge work_to_user: decompression failed");
-                    break;
+        let mut compressed_input = &buf.raw_buf()[..n];
+        loop {
+            let plaintext =
+                match decompress_chunk_into(&mut decompressor, compressed_input, &mut decomp_buf) {
+                    Some(p) => p,
+                    None => {
+                        tracing::warn!("bridge work_to_user: decompression failed");
+                        break 'read_loop;
+                    }
+                };
+            compressed_input = &[];
+            if plaintext.is_empty() {
+                if decompressor
+                    .as_ref()
+                    .is_some_and(encryption::SnappyDecompressor::has_complete_frame)
+                {
+                    // Metadata-only batches are deliberately bounded inside
+                    // feed_into_progress; yield before draining the next batch.
+                    tokio::task::yield_now().await;
+                    continue;
                 }
-            };
+                break;
+            }
 
-        if !plaintext.is_empty() {
             // Apply read bandwidth limit before writing to user
             if let Some(ref mut lim) = read_limiter {
                 lim.consume(plaintext.len()).await;
@@ -268,7 +266,7 @@ async fn bridge_work_to_user(
 
             if let Err(e) = user_w.write_all(plaintext).await {
                 tracing::debug!(error = %e, "bridge work_to_user: write error");
-                break;
+                break 'read_loop;
             }
             if let Some(ref m) = metrics {
                 m.bytes_out
@@ -277,32 +275,19 @@ async fn bridge_work_to_user(
             if use_compression || n < cap {
                 if let Err(e) = user_w.flush().await {
                     tracing::debug!(error = %e, "bridge work_to_user: flush error");
-                    break;
+                    break 'read_loop;
                 }
             }
         }
     }
 
-    // Flush remaining buffered compressed data
+    // Every complete frame is drained before the next transport read. At EOF,
+    // only validate that no partial frame remains; never invoke the synchronous
+    // legacy flush path, whose compatibility semantics may scan metadata.
     if let Some(ref mut dec) = decompressor {
-        match dec.flush() {
-            Ok(plaintext) if !plaintext.is_empty() => {
-                if let Err(e) = user_w.write_all(&plaintext).await {
-                    tracing::debug!(error = %e, "bridge flush: user_w.write_all failed");
-                }
-                if let Some(ref m) = metrics {
-                    m.bytes_out
-                        .fetch_add(plaintext.len() as u64, Ordering::Relaxed);
-                }
-                if let Err(e) = user_w.flush().await {
-                    tracing::debug!(error = %e, "bridge flush: user_w.flush failed");
-                }
-            }
+        if let Err(e) = dec.validate_partial_eof() {
             #[cfg(feature = "compression")]
-            Err(e) => {
-                tracing::warn!(error = %e, "snappy flush error in bridge: {}", e);
-            }
-            _ => {}
+            tracing::warn!(error = %e, "snappy EOF validation failed in bridge: {}", e);
         }
     }
 
@@ -864,6 +849,82 @@ mod tests {
         let out =
             decompress_chunk_into(&mut dec, &comp_buf, &mut decomp_buf).expect("decompress ok");
         assert_eq!(out, original);
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn decompress_chunk_accepts_legal_one_megabyte_multi_chunk_read() {
+        let original = vec![0x42; 1024 * 1024];
+        let mut comp_buf = Vec::new();
+        compress_chunk_into(&original, true, &mut comp_buf).expect("compress ok");
+        let mut dec = make_decompressor(true);
+        let mut decomp_buf = Vec::new();
+
+        let mut output = Vec::new();
+        let mut input = comp_buf.as_slice();
+        loop {
+            let out = decompress_chunk_into(&mut dec, input, &mut decomp_buf)
+                .expect("legal multi-chunk read must decompress");
+            input = &[];
+            if out.is_empty() {
+                break;
+            }
+            assert!(out.len() <= 128 * 1024);
+            output.extend_from_slice(out);
+        }
+        assert_eq!(output, original);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "compression")]
+    async fn work_to_user_drains_all_compressed_chunks_after_peer_eof() {
+        let original = vec![0x42; 3 * 1024 * 1024];
+        let compressed = encryption::compress(&original).unwrap();
+        let (mut work_tx, work_rx) = tokio::io::duplex(64 * 1024);
+        let (user_tx, mut user_rx) = tokio::io::duplex(64 * 1024);
+
+        let bridge = tokio::spawn(async move {
+            bridge_work_to_user(work_rx, user_tx, true, None, None).await;
+        });
+        let writer = tokio::spawn(async move {
+            work_tx.write_all(&compressed).await.unwrap();
+            work_tx.shutdown().await.unwrap();
+        });
+
+        let mut received = Vec::new();
+        user_rx.read_to_end(&mut received).await.unwrap();
+        writer.await.unwrap();
+        bridge.await.unwrap();
+        assert_eq!(received, original);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "compression")]
+    async fn metadata_storm_drain_yields_to_runtime_timers() {
+        let storm = [0xfe, 0, 0, 0].repeat(300_000);
+        let (mut work_tx, work_rx) = tokio::io::duplex(64 * 1024);
+        let (user_tx, mut user_rx) = tokio::io::duplex(64 * 1024);
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let timer_ticks = ticks.clone();
+
+        let bridge = tokio::spawn(async move {
+            bridge_work_to_user(work_rx, user_tx, true, None, None).await;
+        });
+        let timer = tokio::spawn(async move {
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+                timer_ticks.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        work_tx.write_all(&storm).await.unwrap();
+        work_tx.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        user_rx.read_to_end(&mut received).await.unwrap();
+        timer.await.unwrap();
+        bridge.await.unwrap();
+
+        assert!(received.is_empty());
+        assert_eq!(ticks.load(Ordering::Relaxed), 5);
     }
 
     #[test]

@@ -124,19 +124,37 @@ pub(crate) async fn handle_visitor_conn_inner(
         }
     };
 
-    // --- allow_users check (Go frp compat: XTCP/STCP access control) ---
+    // Bind fresh visitor authorization to an existing authenticated control.
     if let Some(proxy_info) = state.proxy_manager.get(&proxy_name).await {
-        if !proxy_info.allow_users.is_empty() {
-            let visitor_run_id = msg.run_id.as_deref().unwrap_or("");
-            if !proxy_info.allow_users.iter().any(|u| u == visitor_run_id) {
-                warn!(visitor_run_id = %visitor_run_id, proxy_name = %proxy_name, "STCP visitor '{}' not in allow_users for proxy '{}'", visitor_run_id, proxy_name);
-                let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
-                    proxy_name: proxy_name.clone(),
-                    error: Some("visitor not allowed".into()),
-                });
-                let _ = write_msg(&mut stream, &resp, v2).await;
-                return;
-            }
+        let visitor_identity = if let Some(visitor_run_id) = msg.run_id.as_deref() {
+            state
+                .run_id_to_ctl_tx
+                .read()
+                .await
+                .get(visitor_run_id)
+                .map(|control| control.user.clone())
+        } else {
+            None
+        };
+        let allowed = if proxy_info.allow_users.iter().any(|user| user == "*") {
+            true
+        } else {
+            visitor_identity.as_deref().is_some_and(|identity| {
+                if proxy_info.allow_users.is_empty() {
+                    identity == proxy_info.user
+                } else {
+                    proxy_info.allow_users.iter().any(|user| user == identity)
+                }
+            })
+        };
+        if !allowed {
+            warn!(visitor_run_id = ?msg.run_id, proxy_name = %proxy_name, "STCP visitor has no trusted identity allowed for proxy '{}'", proxy_name);
+            let resp = FrpMessage::NewVisitorConnResp(msg::NewVisitorConnResp {
+                proxy_name: proxy_name.clone(),
+                error: Some("visitor not allowed".into()),
+            });
+            let _ = write_msg(&mut stream, &resp, v2).await;
+            return;
         }
     }
 
@@ -300,8 +318,7 @@ pub(crate) async fn handle_nat_hole_visitor(
     if msg.pre_check {
         // Validate allow_users: on fresh TCP, visitorUser is not known.
         // Only allow if allow_users is unrestricted (empty or "*" wildcard).
-        let allowed =
-            proxy_info.allow_users.is_empty() || proxy_info.allow_users.iter().any(|u| u == "*");
+        let allowed = proxy_info.allow_users.iter().any(|u| u == "*");
         if !allowed {
             debug!(
                 proxy_name = %proxy_name,
@@ -407,8 +424,8 @@ pub(crate) async fn handle_nat_hole_visitor(
         // If the proxy restricts visitors via allow_users, reject fresh
         // connections outright; authorized visitors must use the control
         // channel path (control/mod.rs NatHoleVisitor handler).
-        if !proxy_info.allow_users.is_empty() {
-            warn!(proxy_name = %proxy_name, "NatHoleVisitor: proxy has allow_users configured — rejecting fresh connection (use control channel)");
+        if !proxy_info.allow_users.iter().any(|user| user == "*") {
+            warn!(proxy_name = %proxy_name, "NatHoleVisitor: fresh connection lacks authenticated visitor identity — rejecting restricted proxy");
             let mut writer = stream.into_split().unwrap().1;
             let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
                 transaction_id: transaction_id.clone(),
@@ -758,6 +775,55 @@ pub(crate) async fn dispatch_v2_message(
     visitor_addr: Option<String>,
     crypto_ctx: Option<frp_core::v2_handshake::CryptoContext>,
 ) {
+    dispatch_v2_message_inner(
+        io,
+        payload,
+        state,
+        addr,
+        incoming,
+        visitor_addr,
+        crypto_ctx,
+        None,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "quic")]
+pub(crate) async fn dispatch_v2_message_with_auth_signal(
+    io: IoStream,
+    payload: Vec<u8>,
+    state: std::sync::Arc<AppState>,
+    addr: std::net::SocketAddr,
+    incoming: Option<frp_core::mux::IncomingStreams>,
+    visitor_addr: Option<String>,
+    crypto_ctx: Option<frp_core::v2_handshake::CryptoContext>,
+    auth_success: tokio::sync::oneshot::Sender<()>,
+) {
+    dispatch_v2_message_inner(
+        io,
+        payload,
+        state,
+        addr,
+        incoming,
+        visitor_addr,
+        crypto_ctx,
+        Some(auth_success),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_v2_message_inner(
+    io: IoStream,
+    payload: Vec<u8>,
+    state: std::sync::Arc<AppState>,
+    addr: std::net::SocketAddr,
+    incoming: Option<frp_core::mux::IncomingStreams>,
+    visitor_addr: Option<String>,
+    crypto_ctx: Option<frp_core::v2_handshake::CryptoContext>,
+    auth_success: Option<tokio::sync::oneshot::Sender<()>>,
+) {
     if payload.len() < 2 {
         warn!(addr = %addr, "V2 message payload too short from {}", addr);
         return;
@@ -772,17 +838,32 @@ pub(crate) async fn dispatch_v2_message(
     };
     match msg {
         FrpMessage::Login(login) => {
-            control::handle_control(
-                io,
-                *login,
-                state,
-                Some(addr),
-                incoming,
-                true,
-                crypto_ctx,
-                false,
-            )
-            .await;
+            if let Some(auth_success) = auth_success {
+                control::handle_control_with_auth_signal(
+                    io,
+                    *login,
+                    state,
+                    Some(addr),
+                    incoming,
+                    true,
+                    crypto_ctx,
+                    false,
+                    auth_success,
+                )
+                .await;
+            } else {
+                control::handle_control(
+                    io,
+                    *login,
+                    state,
+                    Some(addr),
+                    incoming,
+                    true,
+                    crypto_ctx,
+                    false,
+                )
+                .await;
+            }
         }
         FrpMessage::NewWorkConn(nwc) => {
             handle_work_conn_inner(io, nwc, state).await;
@@ -887,7 +968,7 @@ pub(crate) async fn validate_new_work_conn_auth(
             .read()
             .await
             .get(run_id)
-            .cloned()
+            .map(|(subject, _)| subject.clone())
             .unwrap_or_default();
         verifier
             .verify_new_work_conn(msg.privilege_key.as_deref().unwrap_or(""), &expected_sub)

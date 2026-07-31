@@ -33,11 +33,9 @@ pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
     tracing::trace!(
         type_byte = %type_byte,
         payload_len = payload_len,
-        payload_text = %String::from_utf8_lossy(&buf[V1_HEADER_LEN..]),
-        "V1 frame: type=0x{:02x} len={} payload={}",
+        "V1 frame: type=0x{:02x} len={}",
         type_byte,
-        payload_len,
-        String::from_utf8_lossy(&buf[V1_HEADER_LEN..])
+        payload_len
     );
 
     writer
@@ -556,7 +554,129 @@ pub async fn write_msg<W: AsyncWriteExt + Unpin>(
 mod tests {
     use super::*;
     use crate::msg;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
     use tokio::io::duplex;
+
+    #[derive(Clone)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_v1_trace_does_not_log_message_credentials() {
+        const PRIVILEGE_SENTINEL: &str = "OIDC_OR_PRIVILEGE_SENTINEL_7fc923";
+        const GROUP_KEY_SENTINEL: &str = "GROUP_KEY_SENTINEL_949fa1";
+        const PROXY_SK_SENTINEL: &str = "PROXY_SK_SENTINEL_18d2c4";
+        const HTTP_PASSWORD_SENTINEL: &str = "HTTP_PASSWORD_SENTINEL_62b07e";
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .without_time()
+            .with_writer({
+                let output = output.clone();
+                move || CapturedLogs(output.clone())
+            })
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let msg = FrpMessage::Login(Box::new(msg::Login {
+            version: Some("test".into()),
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: None,
+            client_id: None,
+            pool_count: None,
+            timestamp: Some(1_234_567_890),
+            privilege_key: Some(PRIVILEGE_SENTINEL.into()),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        }));
+        let (mut writer, _reader) = duplex(4096);
+
+        write_v1_frame(&mut writer, &msg).await.unwrap();
+        let proxy = FrpMessage::NewProxy(Box::new(msg::NewProxy {
+            proxy_name: "safe-proxy".into(),
+            proxy_type: "tcp".into(),
+            use_encryption: None,
+            use_compression: None,
+            group: None,
+            group_key: Some(GROUP_KEY_SENTINEL.into()),
+            local_str: None,
+            remote_port: None,
+            sk: Some(PROXY_SK_SENTINEL.into()),
+            custom_domains: None,
+            subdomain: None,
+            locations: None,
+            http_user: None,
+            http_pwd: Some(HTTP_PASSWORD_SENTINEL.into()),
+            host_header_rewrite: None,
+            headers: None,
+            response_headers: None,
+            route_by_http_user: None,
+            allow_users: None,
+            bandwidth_limit: None,
+            bandwidth_limit_mode: None,
+            annotations: None,
+            metas: None,
+            multiplexer: None,
+            virtual_net: None,
+            proxy_protocol_version: None,
+            advertise_subnet: None,
+            vnet_ip: None,
+            vnet_netmask: None,
+            vnet_mtu: None,
+        }));
+        write_v1_frame(&mut writer, &proxy).await.unwrap();
+
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("V1 frame"));
+        for sentinel in [
+            PRIVILEGE_SENTINEL,
+            GROUP_KEY_SENTINEL,
+            PROXY_SK_SENTINEL,
+            HTTP_PASSWORD_SENTINEL,
+        ] {
+            assert!(!logs.contains(sentinel), "credential leaked: {logs}");
+        }
+        assert!(!logs.contains("1234567890"), "timestamp leaked: {logs}");
+    }
+
+    #[test]
+    fn test_nat_hole_debug_log_does_not_log_auth_proof() {
+        const PROOF_SENTINEL: &str = "NAT_HOLE_PROOF_SENTINEL_531aae";
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_writer({
+                let output = output.clone();
+                move || CapturedLogs(output.clone())
+            })
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let payload = format!(
+            r#"{{"transaction_id":"safe-id","proxy_name":"safe-proxy","pre_check":true,"sign_key":"{PROOF_SENTINEL}","timestamp":1234567890}}"#
+        );
+
+        deserialize_v1(msg::TYPE_NAT_HOLE_VISITOR, payload.as_bytes()).unwrap();
+
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("NatHoleVisitor"));
+        assert!(!logs.contains(PROOF_SENTINEL), "proof leaked: {logs}");
+        assert!(!logs.contains("1234567890"), "timestamp leaked: {logs}");
+    }
 
     #[tokio::test]
     async fn test_v1_frame_roundtrip() {

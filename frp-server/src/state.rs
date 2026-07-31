@@ -238,7 +238,8 @@ impl TcpGroupCtl {
 /// OIDC verification state.
 pub struct OidcState {
     pub verifier: Option<Arc<OidcVerifier>>,
-    pub subjects: Arc<RwLock<HashMap<String, String>>>,
+    /// run_id -> (verified subject, control generation)
+    pub subjects: Arc<RwLock<HashMap<String, (String, u64)>>>,
 }
 
 /// XTCP NAT-hole-punch coordination state.

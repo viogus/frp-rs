@@ -26,6 +26,180 @@ use super::pool::{PendingRequest, PoolEntry, WORK_POOL_EXTRA};
 use super::proxy_ops::{err_msg, unregister_control};
 use super::{write_ctl_msg, ControlContext, ControlState};
 
+/// Identity used for authorization decisions. OIDC binds authorization to the
+/// verified JWT subject; token auth retains Go-compatible `login.user` semantics.
+pub(crate) fn authenticated_user(claimed_user: Option<&str>, oidc_subject: Option<&str>) -> String {
+    oidc_subject
+        .or(claimed_user)
+        .unwrap_or_default()
+        .to_string()
+}
+
+async fn remove_oidc_subject_generation(state: &AppState, run_id: &str, control_id: u64) {
+    let mut subjects = state.oidc.subjects.write().await;
+    if subjects
+        .get(run_id)
+        .is_some_and(|(_, generation)| *generation == control_id)
+    {
+        subjects.remove(run_id);
+    }
+}
+
+async fn flush_login_response_and_signal<W>(
+    stream: &mut W,
+    auth_success: Option<oneshot::Sender<()>>,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    stream.flush().await?;
+    if let Some(auth_success) = auth_success {
+        let _ = auth_success.send(());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod auth_signal_tests {
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    use tokio::io::AsyncWrite;
+
+    use super::flush_login_response_and_signal;
+
+    fn test_state() -> Arc<crate::state::AppState> {
+        let cfg = frp_core::config::ServerConfig::default();
+        Arc::new(crate::state::AppState::new(
+            frp_core::auth::AuthConfig::with_token("expected-token"),
+            "127.0.0.1".into(),
+            frp_core::encryption::derive_key("expected-token"),
+            vec![(1, u16::MAX)],
+            String::new(),
+            true,
+            30,
+            7200,
+            90,
+            1500,
+            false,
+            None,
+            0,
+            60,
+            10,
+            false,
+            String::new(),
+            Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
+            168,
+            true,
+            0,
+            0,
+            frp_core::config::ServerConfigSnapshot::from_config(&cfg),
+        ))
+    }
+
+    struct FlushWriter {
+        fail_flush: bool,
+    }
+
+    impl AsyncWrite for FlushWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.fail_flush {
+                Poll::Ready(Err(io::Error::other("injected flush failure")))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_flush_signals_before_blocked_prewarm_work() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut writer = FlushWriter { fail_flush: false };
+
+        let task = tokio::spawn(async move {
+            flush_login_response_and_signal(&mut writer, Some(tx))
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), rx)
+            .await
+            .expect("auth signal must not wait for prewarm")
+            .expect("successful flush must signal");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn flush_failure_returns_error_without_auth_signal() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut writer = FlushWriter { fail_flush: true };
+
+        assert!(flush_login_response_and_signal(&mut writer, Some(tx))
+            .await
+            .is_err());
+        assert!(
+            rx.await.is_err(),
+            "flush failure must drop the unsent signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_token_returns_without_auth_signal() {
+        let (server, mut client) = tokio::io::duplex(4096);
+        let drain = tokio::spawn(async move {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut client, &mut Vec::new()).await;
+        });
+        let login = frp_core::msg::Login {
+            version: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            user: None,
+            run_id: None,
+            client_id: None,
+            pool_count: None,
+            timestamp: None,
+            privilege_key: Some("bad-token".into()),
+            metas: None,
+            client_spec: None,
+            multiplexer: None,
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let result = super::authenticate(
+            Box::new(server),
+            &login,
+            test_state(),
+            Some("127.0.0.1:12345".parse().unwrap()),
+            None,
+            false,
+            None,
+            false,
+            Some(tx),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(rx.await.is_err(), "bad token must drop the unsent signal");
+        drain.abort();
+    }
+}
+
 /// Authenticate a new control connection and set up per-client state.
 /// On success returns all state needed by the main select! loop.
 /// On failure sends LoginResp with an error and returns `Err(())`.
@@ -42,6 +216,7 @@ pub(crate) async fn authenticate(
     v2: bool,
     crypto_ctx: Option<frp_core::v2_handshake::CryptoContext>,
     internal: bool,
+    auth_success: Option<oneshot::Sender<()>>,
 ) -> Result<
     (
         ControlContext,
@@ -118,6 +293,10 @@ pub(crate) async fn authenticate(
         let token = login.privilege_key.as_deref().unwrap_or("");
         match verifier.verify_login(token).await {
             Ok(oidc_token) => {
+                if oidc_token.subject.trim().is_empty() {
+                    warn!(peer = ?peer, "OIDC auth failed: subject claim is empty");
+                    return Err(());
+                }
                 info!(subject = %oidc_token.subject, "OIDC login verified: subject={}", oidc_token.subject);
                 Some(oidc_token.subject)
             }
@@ -231,22 +410,13 @@ pub(crate) async fn authenticate(
     };
 
     let reloadable = state.reloadable.read_ok().clone();
+    let authenticated_user = authenticated_user(login.user.as_deref(), oidc_subject.as_deref());
 
     let run_id = login
         .run_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     info!(peer = ?peer, run_id = %run_id, "Client {:?} logged in with run_id: {}", peer, run_id);
-
-    // Store OIDC subject for ping/NWC verification
-    if let Some(ref sub) = oidc_subject {
-        state
-            .oidc
-            .subjects
-            .write()
-            .await
-            .insert(run_id.clone(), sub.clone());
-    }
 
     // --- Server plugin: login hook ---
     let login_content = serde_json::json!({
@@ -268,10 +438,6 @@ pub(crate) async fn authenticate(
             server_additional_auth_scopes: None,
         });
         let _ = write_ctl_msg(&mut writer, &resp, v2).await;
-        // Clean up OIDC subject inserted before login validation.
-        if oidc_subject.is_some() {
-            state.oidc.subjects.write().await.remove(&run_id);
-        }
         return Err(());
     }
 
@@ -283,6 +449,15 @@ pub(crate) async fn authenticate(
     // Assign a monotonically increasing control_id to distinguish this
     // control generation from any previous one with the same run_id.
     let control_id = state.control_id_counter.fetch_add(1, Ordering::SeqCst);
+
+    if let Some(ref subject) = oidc_subject {
+        state
+            .oidc
+            .subjects
+            .write()
+            .await
+            .insert(run_id.clone(), (subject.clone(), control_id));
+    }
 
     // Acquire per-runID mutex to serialize lifecycle transitions.
     // This prevents two concurrent logins for the same run_id from racing.
@@ -331,7 +506,10 @@ pub(crate) async fn authenticate(
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0),
                 pool_stats: pool_stats.clone(),
-                user: login.user.clone().unwrap_or_default(),
+                // Proxy ownership/access control must use the verified OIDC
+                // subject. Proxy names and registry keys above intentionally
+                // retain the claimed user for Go wire compatibility.
+                user: authenticated_user.clone(),
                 control_id,
             },
         );
@@ -382,7 +560,7 @@ pub(crate) async fn authenticate(
         unregister_control(&state, &run_id, false).await;
         // Clean up OIDC subject
         if oidc_subject.is_some() {
-            state.oidc.subjects.write().await.remove(&run_id);
+            remove_oidc_subject_generation(&state, &run_id, control_id).await;
         }
         return Err(());
     }
@@ -438,13 +616,21 @@ pub(crate) async fn authenticate(
             .mark_offline_by_run_id_and_control_id(&run_id, control_id);
         // Clean up OIDC subject
         if oidc_subject.is_some() {
-            state.oidc.subjects.write().await.remove(&run_id);
+            remove_oidc_subject_generation(&state, &run_id, control_id).await;
         }
         return Err(());
     }
     // Flush TLS stream to ensure LoginResp reaches KCP before we wrap in CipherStream
-    if let Err(e) = stream.flush().await {
+    if let Err(e) = flush_login_response_and_signal(&mut *stream, auth_success).await {
         warn!(peer = ?peer, error = %e, "Failed to flush after LoginResp: {}", e);
+        unregister_control(&state, &run_id, false).await;
+        state
+            .client_registry
+            .mark_offline_by_run_id_and_control_id(&run_id, control_id);
+        if oidc_subject.is_some() {
+            remove_oidc_subject_generation(&state, &run_id, control_id).await;
+        }
+        return Err(());
     }
     info!(peer = ?peer, run_id = %run_id, "LoginResp sent to {:?}, flushed", peer);
 
@@ -595,6 +781,7 @@ pub(crate) async fn authenticate(
             pool_cap,
             internal_tx: internal_tx.clone(),
             peer,
+            authenticated_user,
         },
         ControlState {
             shutting_down,

@@ -48,6 +48,8 @@ pub struct ServerConfig {
     pub tls_key_file: String,
     #[serde(default)]
     pub tls_ca_file: String,
+    #[serde(default, alias = "tlsServerName")]
+    pub tls_server_name: String,
     /// When true, the main bind_port only accepts TLS connections.
     /// Plain TCP and WebSocket upgrades are rejected.
     /// The client must have tls_enable = true to connect.
@@ -316,6 +318,7 @@ impl Default for ServerConfig {
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             tls_ca_file: String::new(),
+            tls_server_name: String::new(),
             tls_only: false,
             auth: AuthServerConfig::default(),
             log: LogConfig::default(),
@@ -955,7 +958,6 @@ pub struct ClientConfig {
     pub heartbeat_interval: i64,
     /// Heartbeat timeout in seconds. Disconnect if no Pong received within
     /// this interval. Default: 90. Go frp compat: transport.heartbeatTimeout.
-    /// Set to -1 when tcp_mux is enabled (yamux provides keepalive).
     #[serde(default = "default_heartbeat_timeout", alias = "heartbeatTimeout")]
     pub heartbeat_timeout: i64,
     #[serde(default, alias = "dnsServer")]
@@ -1023,7 +1025,7 @@ impl Default for ClientConfig {
             tls_key_file: String::new(),
             tls_ca_file: String::new(),
             tls_server_name: String::new(),
-            disable_custom_tls_first_byte: false,
+            disable_custom_tls_first_byte: true,
             log: LogConfig::default(),
             login_fail_exit: true,
             pool_count: 1,
@@ -1051,14 +1053,6 @@ impl ClientConfig {
     /// Apply conditional defaults matching Go frp dev (fatedier/frp@d486018)
     /// `ClientCommonConfig.Complete()` + `ClientTransportConfig.Complete()`.
     /// Call after deserialization, before consuming the config.
-    ///
-    /// NOTE: This compares against the serde default value (30) to decide
-    /// whether to disable heartbeats when tcp_mux is true. A user who
-    /// explicitly sets `heartbeat_interval = 30` will also have it overridden
-    /// to -1 because we cannot distinguish "serde default" from "user intent"
-    /// with the current integer type. Go frp uses `util.EmptyOr()` which
-    /// distinguishes "not set" from "explicitly set to 30" via pointer nils.
-    /// Future: switch to `Option<i64>` for these fields to match Go semantics.
     pub fn complete(&mut self) {
         // MEDIUM-7: Fallback to http_proxy/HTTP_PROXY env var when proxy_url is empty
         if self.proxy_url.is_empty() {
@@ -1070,29 +1064,6 @@ impl ClientConfig {
                 if !proxy.is_empty() {
                     self.proxy_url = proxy;
                 }
-            }
-        }
-
-        if self.tcp_mux {
-            // When tcpMux is enabled, heartbeat of application layer is
-            // unnecessary — rely on yamux keepalive instead (Go compat).
-            if self.heartbeat_interval == default_heartbeat_interval() {
-                self.heartbeat_interval = -1;
-                tracing::warn!(
-                    "heartbeat_interval overridden to -1 because tcp_mux is enabled; \
-                     if heartbeat_interval was explicitly set to {} it is also overridden \
-                     (cannot distinguish default from explicit with i64 type)",
-                    default_heartbeat_interval(),
-                );
-            }
-            if self.heartbeat_timeout == default_heartbeat_timeout() {
-                self.heartbeat_timeout = -1;
-                tracing::warn!(
-                    "heartbeat_timeout overridden to -1 because tcp_mux is enabled; \
-                     if heartbeat_timeout was explicitly set to {} it is also overridden \
-                     (cannot distinguish default from explicit with i64 type)",
-                    default_heartbeat_timeout(),
-                );
             }
         }
     }
@@ -1644,6 +1615,34 @@ fn normalize_server_config(value: &mut toml::Value) {
             &[],
         );
 
+        // Flatten canonical Go frp [transport.tls] fields to the legacy
+        // top-level Rust TLS fields. Explicit top-level values keep precedence.
+        let transport_tls = table
+            .get_mut("transport")
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|transport| transport.remove("tls"));
+        if let Some(Value::Table(tls_table)) = transport_tls {
+            let tls_enable = tls_table.get("force").and_then(Value::as_bool) == Some(true)
+                || tls_table.contains_key("certFile")
+                || tls_table.contains_key("keyFile");
+            for (key, value) in tls_table {
+                let flat_key = match key.as_str() {
+                    "force" => "tls_only",
+                    "certFile" => "tls_cert_file",
+                    "keyFile" => "tls_key_file",
+                    "trustedCaFile" => "tls_ca_file",
+                    "serverName" => "tls_server_name",
+                    other => other,
+                };
+                table.entry(flat_key.to_string()).or_insert(value);
+            }
+            if tls_enable {
+                table
+                    .entry("tls_enable".to_string())
+                    .or_insert(Value::Boolean(true));
+            }
+        }
+
         // MEDIUM-9: Normalize legacy top-level transport fields into [transport]
         flatten_to_table(
             table,
@@ -1811,7 +1810,12 @@ fn normalize_client_config(value: &mut toml::Value) {
                         table.insert("v2".to_string(), Value::Boolean(true));
                     }
                 } else {
-                    table.entry(k).or_insert(v);
+                    let flat_key = match k.as_str() {
+                        "protocol" => "transport_protocol",
+                        "tcpMux" => "tcp_mux",
+                        other => other,
+                    };
+                    table.entry(flat_key.to_string()).or_insert(v);
                 }
             }
         }
@@ -2354,6 +2358,8 @@ fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "tls_cert_file",
         "tls_key_file",
         "tls_ca_file",
+        "tls_server_name",
+        "tlsServerName",
         "tls_only",
         "auth",
         "log",
@@ -2571,6 +2577,7 @@ fn check_strict(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_parse_client_toml() {
@@ -2835,6 +2842,249 @@ token = "test-token"
 "#;
         let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
         assert!(cfg.tcp_mux);
+    }
+
+    #[test]
+    fn test_tcp_mux_keeps_application_heartbeat_liveness_enabled() {
+        let cfg = load_client_config_from_str("server_addr = '127.0.0.1'").unwrap();
+
+        assert!(cfg.tcp_mux);
+        assert_eq!(cfg.heartbeat_interval, default_heartbeat_interval());
+        assert_eq!(cfg.heartbeat_timeout, default_heartbeat_timeout());
+    }
+
+    #[test]
+    fn test_explicit_disabled_client_heartbeat_is_preserved() {
+        let cfg = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+[transport]
+heartbeatInterval = -1
+heartbeatTimeout = -1
+"#,
+        )
+        .unwrap();
+
+        assert!(cfg.tcp_mux);
+        assert_eq!(cfg.heartbeat_interval, -1);
+        assert_eq!(cfg.heartbeat_timeout, -1);
+    }
+
+    #[test]
+    fn test_go_v0701_client_transport_toml() {
+        let toml_str = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[transport]
+protocol = "quic"
+tcpMux = false
+
+[transport.tls]
+enable = false
+serverName = "frps.example.com"
+disableCustomTLSFirstByte = false
+"#;
+        let cfg = load_client_config_from_str(toml_str).unwrap();
+
+        assert_eq!(cfg.transport_protocol, "quic");
+        assert!(!cfg.tcp_mux);
+        assert!(!cfg.tls_enable);
+        assert_eq!(cfg.tls_server_name, "frps.example.com");
+        assert!(!cfg.disable_custom_tls_first_byte);
+    }
+
+    #[test]
+    fn test_go_v0701_server_transport_tls_toml() {
+        let toml_str = r#"
+bindPort = 7000
+
+[transport.tls]
+force = true
+certFile = "/etc/frp/server.crt"
+keyFile = "/etc/frp/server.key"
+trustedCaFile = "/etc/frp/clients-ca.crt"
+serverName = "frps.example.com"
+"#;
+        let cfg = load_server_config_from_str(toml_str).unwrap();
+
+        assert!(cfg.tls_only);
+        assert!(cfg.tls_enable);
+        assert_eq!(cfg.tls_cert_file, "/etc/frp/server.crt");
+        assert_eq!(cfg.tls_key_file, "/etc/frp/server.key");
+        assert_eq!(cfg.tls_ca_file, "/etc/frp/clients-ca.crt");
+        assert_eq!(cfg.tls_server_name, "frps.example.com");
+    }
+
+    #[test]
+    fn test_server_legacy_tls_fields_override_canonical_transport_tls() {
+        let toml_str = r#"
+tls_enable = false
+tls_cert_file = "/legacy/server.crt"
+tls_key_file = "/legacy/server.key"
+tls_ca_file = "/legacy/clients-ca.crt"
+
+[transport.tls]
+force = true
+certFile = "/canonical/server.crt"
+keyFile = "/canonical/server.key"
+trustedCaFile = "/canonical/clients-ca.crt"
+serverName = "frps.example.com"
+"#;
+        let cfg = load_server_config_from_str(toml_str).unwrap();
+
+        assert!(!cfg.tls_enable);
+        assert_eq!(cfg.tls_cert_file, "/legacy/server.crt");
+        assert_eq!(cfg.tls_key_file, "/legacy/server.key");
+        assert_eq!(cfg.tls_ca_file, "/legacy/clients-ca.crt");
+        assert!(cfg.tls_only);
+        assert_eq!(cfg.tls_server_name, "frps.example.com");
+    }
+
+    #[test]
+    fn test_server_legacy_tls_only_overrides_canonical_force() {
+        let cfg = load_server_config_from_str(
+            r#"
+tls_only = false
+
+[transport.tls]
+force = true
+"#,
+        )
+        .unwrap();
+
+        assert!(!cfg.tls_only);
+    }
+
+    #[test]
+    fn test_server_canonical_trusted_ca_alone_forces_tls_only_on_complete() {
+        let cfg = load_server_config_from_str(
+            r#"
+[transport.tls]
+trustedCaFile = "/etc/frp/clients-ca.crt"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.tls_ca_file, "/etc/frp/clients-ca.crt");
+        assert!(cfg.tls_only);
+    }
+
+    #[test]
+    fn test_client_legacy_transport_tls_fields_override_canonical_nested_fields() {
+        let cfg = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+transport_protocol = "tcp"
+tcp_mux = true
+tls_enable = false
+tls_cert_file = "/legacy/client.crt"
+tls_key_file = "/legacy/client.key"
+tls_ca_file = "/legacy/server-ca.crt"
+tls_server_name = "legacy.example.com"
+disable_custom_tls_first_byte = true
+
+[transport]
+protocol = "quic"
+tcpMux = false
+
+[transport.tls]
+enable = true
+certFile = "/canonical/client.crt"
+keyFile = "/canonical/client.key"
+trustedCaFile = "/canonical/server-ca.crt"
+serverName = "canonical.example.com"
+disableCustomTLSFirstByte = false
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.transport_protocol, "tcp");
+        assert!(cfg.tcp_mux);
+        assert!(!cfg.tls_enable);
+        assert_eq!(cfg.tls_cert_file, "/legacy/client.crt");
+        assert_eq!(cfg.tls_key_file, "/legacy/client.key");
+        assert_eq!(cfg.tls_ca_file, "/legacy/server-ca.crt");
+        assert_eq!(cfg.tls_server_name, "legacy.example.com");
+        assert!(cfg.disable_custom_tls_first_byte);
+    }
+
+    #[test]
+    fn test_strict_mode_accepts_go_v0701_transport_keys() {
+        let mut client_file = tempfile::NamedTempFile::new().unwrap();
+        client_file
+            .write_all(
+                br#"serverAddr = "127.0.0.1"
+[transport]
+protocol = "quic"
+tcpMux = false
+[transport.tls]
+enable = true
+serverName = "frps.example.com"
+disableCustomTLSFirstByte = false
+"#,
+            )
+            .unwrap();
+        load_client_config(client_file.path().to_str().unwrap(), true).unwrap();
+
+        let mut server_file = tempfile::NamedTempFile::new().unwrap();
+        server_file
+            .write_all(
+                br#"bindPort = 7000
+[transport.tls]
+force = true
+certFile = "/etc/frp/server.crt"
+keyFile = "/etc/frp/server.key"
+trustedCaFile = "/etc/frp/clients-ca.crt"
+serverName = "frps.example.com"
+"#,
+            )
+            .unwrap();
+        load_server_config(server_file.path().to_str().unwrap(), true).unwrap();
+    }
+
+    #[test]
+    fn test_strict_mode_rejects_transport_and_tls_typos() {
+        let mut client_file = tempfile::NamedTempFile::new().unwrap();
+        client_file
+            .write_all(
+                br#"serverAddr = "127.0.0.1"
+[transport]
+protcol = "quic"
+[transport.tls]
+enabel = true
+"#,
+            )
+            .unwrap();
+
+        let error = load_client_config(client_file.path().to_str().unwrap(), true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("protcol"));
+        assert!(error.contains("enabel"));
+    }
+
+    #[test]
+    fn test_strict_mode_accepts_server_tls_server_name_alias() {
+        let mut server_file = tempfile::NamedTempFile::new().unwrap();
+        server_file
+            .write_all(
+                br#"bindPort = 7000
+tlsServerName = "frps.example.com"
+"#,
+            )
+            .unwrap();
+
+        let cfg = load_server_config(server_file.path().to_str().unwrap(), true).unwrap();
+        assert_eq!(cfg.tls_server_name, "frps.example.com");
+    }
+
+    #[test]
+    fn test_client_disable_custom_tls_first_byte_defaults_match_go() {
+        assert!(ClientConfig::default().disable_custom_tls_first_byte);
+
+        let cfg: ClientConfig = toml::from_str("server_addr = '127.0.0.1'").unwrap();
+        assert!(cfg.disable_custom_tls_first_byte);
     }
 
     #[test]

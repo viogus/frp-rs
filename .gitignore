@@ -3,6 +3,7 @@
 *.swp
 *.swo
 .DS_Store
+*.bak
 *.toml.bak
 *.bak
 Cargo.lock

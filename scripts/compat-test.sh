@@ -4410,11 +4410,96 @@ test_auth_r2g_reject() {
     fi
 }
 
+# -----------------------------------------------------------------------------
+# Test: Rust frpc -> Go frps authenticated HeartBeats over tcpMux.
+# Both configs require the HeartBeats scope. Go frps rejects an unauthenticated
+# Ping, so keeping the proxy alive across multiple 1s heartbeat intervals proves
+# Rust frpc emitted token-authenticated Ping messages compatible with Go v0.70.1.
+# -----------------------------------------------------------------------------
+test_auth_r2g_heartbeats() {
+    local name="test_auth_r2g_heartbeats"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="auth-test-token-r2g-heartbeats"
+
+    mkdir -p "$TEST_DIR/$name"
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    cat > "$TEST_DIR/$name/frps.toml" << TOML
+bindAddr = "127.0.0.1"
+bindPort = $frps_port
+
+auth.method = "token"
+auth.token = "$token"
+auth.additionalScopes = ["HeartBeats"]
+
+transport.tcpMux = true
+transport.heartbeatTimeout = 5
+log.to = "$TEST_DIR/$name/go-frps.log"
+log.level = "debug"
+TOML
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    cat > "$TEST_DIR/$name/frpc.toml" << TOML
+server_addr = "127.0.0.1"
+server_port = $frps_port
+token = "$token"
+login_fail_exit = true
+heartbeat_interval = 1
+heartbeat_timeout = 4
+tcp_mux = true
+
+[auth]
+method = "token"
+token = "$token"
+additionalAuthScopes = ["HeartBeats"]
+
+[[proxies]]
+name = "heartbeat-auth"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = $echo_port
+remote_port = $proxy_port
+TOML
+    RUST_LOG=debug "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    wait_for_port_safe 127.0.0.1 "$proxy_port" 10 || {
+        fail_test "$name" "proxy did not register"
+        return
+    }
+    sleep 3
+
+    local result
+    result=$(send_and_expect "$proxy_port" "heartbeat-auth-data" "heartbeat-auth-data" 5)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
 # --- Run tests ---
 if ! ${XTCP_ONLY:-false}; then
 # Phase 1: Auth compatibility (cross-boundary token verification)
 run_test test_auth_g2r_reject
 run_test test_auth_r2g_reject
+run_test test_auth_r2g_heartbeats
 
 # Phase 2: Go frpc -> Rust frps TCP data plane
 run_test test_g2r_tcp_plain

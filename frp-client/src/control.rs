@@ -499,10 +499,14 @@ impl ControlConnection {
         stream: &mut IoStream,
     ) -> Result<msg::NewProxyResp, frp_core::Error> {
         let np = proxy::create_new_proxy_msg(p, local_addr);
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let json = serde_json::to_string(&np).unwrap_or_default();
-            debug!(json = %json, "NewProxy JSON: {}", json);
-        }
+        debug!(
+            name = %p.name,
+            proxy_type = %p.proxy_type,
+            remote_port = p.remote_port,
+            encrypted = p.use_encryption,
+            compressed = p.use_compression,
+            "NewProxy message prepared"
+        );
         info!(name = %p.name, proxy_type = %p.proxy_type, remote_port = %p.remote_port, local_addr = %local_addr,
             "Registering proxy '{}' type={} remote_port={} local={}",
             p.name, p.proxy_type, p.remote_port, local_addr);
@@ -542,7 +546,7 @@ impl ControlConnection {
                     continue;
                 }
                 other => {
-                    warn!(proxy_name = %p.name, message = ?other, "Unexpected message during NewProxy registration for '{}': {:?}", p.name, other);
+                    warn!(proxy_name = %p.name, type_byte = other.v1_type_byte(), "Unexpected message during NewProxy registration");
                     continue;
                 }
             }
@@ -567,10 +571,12 @@ impl ControlConnection {
             Some(self.user.as_str()).filter(|s| !s.is_empty()),
             Some(self.run_id.as_str()).filter(|s| !s.is_empty()),
         );
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let json = serde_json::to_string(&nvc).unwrap_or_default();
-            debug!(server_name = %v.server_name, json = %json, "NewVisitorConn for '{}': {}", v.server_name, json);
-        }
+        debug!(
+            server_name = %v.server_name,
+            encrypted = v.use_encryption,
+            compressed = v.use_compression,
+            "NewVisitorConn message prepared"
+        );
         info!(visitor_name = %v.name, proxy_name = %v.server_name, "Registering visitor '{}' for proxy '{}'", v.name, v.server_name);
         if self.v2 {
             stream.write_v2_frame(&nvc).await?;
@@ -612,7 +618,7 @@ impl ControlConnection {
                     });
                 }
                 other => {
-                    warn!(visitor_name = %v.name, message = ?other, "Unexpected message during NewVisitorConn registration for '{}': {:?}", v.name, other);
+                    warn!(visitor_name = %v.name, type_byte = other.v1_type_byte(), "Unexpected message during NewVisitorConn registration");
                     continue;
                 }
             }

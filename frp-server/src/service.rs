@@ -56,9 +56,180 @@ fn is_v2_magic(buf: &[u8]) -> bool {
 /// All V1 type bytes are ASCII alphanumeric (e.g., 'o'=Login, '1'=LoginResp,
 /// 'w'=NewWorkConn, 'h'=Ping). Used to distinguish raw V1 data from yamux
 /// headers (which start with 0x00).
+#[cfg(all(test, feature = "quic"))]
+mod quic_admission_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn simulated_silent_first_frame(
+        limiter: Arc<tokio::sync::Semaphore>,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    ) {
+        let _permit = limiter.acquire_owned().await.unwrap();
+        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+        max_active.fetch_max(now, Ordering::SeqCst);
+        let _ = tokio::time::timeout(Duration::from_millis(10), std::future::pending::<()>()).await;
+        active.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_silent_streams_are_bounded_and_timeout_releases_permits() {
+        let limit = 4;
+        let limiter = Arc::new(tokio::sync::Semaphore::new(limit));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for _ in 0..64 {
+            tasks.spawn(simulated_silent_first_frame(
+                limiter.clone(),
+                active.clone(),
+                max_active.clone(),
+            ));
+        }
+        while tasks.join_next().await.is_some() {}
+
+        assert_eq!(max_active.load(Ordering::SeqCst), limit);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(limiter.available_permits(), limit);
+    }
+
+    #[tokio::test]
+    async fn preauth_stream_admission_uses_small_safety_cap() {
+        let limiter = new_quic_preauth_stream_limiter();
+        let mut permits = Vec::new();
+        for _ in 0..QUIC_PREAUTH_STREAM_LIMIT {
+            permits.push(limiter.clone().try_acquire_owned().unwrap());
+        }
+        assert!(limiter.clone().try_acquire_owned().is_err());
+        drop(permits.pop());
+        assert!(limiter.clone().try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn authenticated_stream_admission_preserves_configured_boundary_above_256() {
+        let configured = 1_024usize;
+        let limiter = new_quic_authenticated_stream_limiter(configured);
+        let mut permits = Vec::new();
+        for _ in 0..configured {
+            permits.push(limiter.clone().try_acquire_owned().unwrap());
+        }
+        assert!(limiter.clone().try_acquire_owned().is_err());
+        drop(permits.pop());
+        assert!(limiter.clone().try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn first_control_accept_obeys_absolute_preauth_deadline() {
+        let cancel = CancellationToken::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+        let result = await_quic_preauth(std::future::pending::<()>(), deadline, &cancel).await;
+        assert!(matches!(result, Err(QuicPreauthError::TimedOut)));
+    }
+
+    #[tokio::test]
+    async fn real_quic_connection_without_first_stream_times_out() {
+        let tls = frp_core::transport::generate_self_signed_tls_config().unwrap();
+        let listener = frp_core::quic::QuicListener::new_with_tls_config(
+            "127.0.0.1:0".parse().unwrap(),
+            tls,
+            frp_core::quic::QuicTransportParams::default(),
+        )
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            frp_core::quic::dial_quic_connection_with_params(
+                &address.to_string(),
+                "localhost",
+                None,
+                None,
+                None,
+                frp_core::quic::QuicTransportParams::default(),
+            )
+            .await
+            .unwrap()
+        });
+        let server = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("server should complete QUIC handshake")
+            .unwrap();
+        let _client = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("client should complete QUIC handshake")
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+
+        let result = await_quic_preauth(server.accept_bi(), deadline, &cancel).await;
+        assert!(matches!(result, Err(QuicPreauthError::TimedOut)));
+        server.close(b"test timeout");
+    }
+
+    #[tokio::test]
+    async fn cancelling_stream_tasks_reclaims_all_admission_permits() {
+        let limit = 8;
+        let limiter = Arc::new(tokio::sync::Semaphore::new(limit));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..limit {
+            let permit = limiter.clone().acquire_owned().await.unwrap();
+            tasks.spawn(async move {
+                let _permit = permit;
+                std::future::pending::<()>().await;
+            });
+        }
+        assert_eq!(limiter.available_permits(), 0);
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        assert_eq!(limiter.available_permits(), limit);
+    }
+}
+
 #[inline]
 fn is_v1_type_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric()
+}
+
+#[cfg(feature = "quic")]
+const QUIC_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(feature = "quic")]
+const QUIC_PREAUTH_STREAM_LIMIT: usize = 32;
+
+#[cfg(feature = "quic")]
+fn new_quic_preauth_stream_limiter() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(QUIC_PREAUTH_STREAM_LIMIT))
+}
+
+#[cfg(feature = "quic")]
+fn new_quic_authenticated_stream_limiter(configured: usize) -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(configured.max(1)))
+}
+
+#[cfg(feature = "quic")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuicPreauthError {
+    TimedOut,
+    Cancelled,
+}
+
+#[cfg(feature = "quic")]
+async fn await_quic_preauth<F, T>(
+    future: F,
+    deadline: tokio::time::Instant,
+    cancel: &CancellationToken,
+) -> Result<T, QuicPreauthError>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(QuicPreauthError::Cancelled),
+        result = tokio::time::timeout_at(deadline, future) => {
+            result.map_err(|_| QuicPreauthError::TimedOut)
+        }
+    }
 }
 
 /// Run V2 handshake then read the first message frame. Returns `None` on error
@@ -1131,6 +1302,19 @@ impl Service {
         #[cfg(feature = "quic")]
         if self.cfg.quic_bind_port > 0 {
             let quic_state = self.state.clone();
+            let quic_options = self.cfg.transport.quic_options.clone().unwrap_or_default();
+            let quic_params = frp_core::quic::QuicTransportParams {
+                keepalive_period_secs: quic_options.keepalive_period.max(0) as u32,
+                max_idle_timeout_secs: quic_options.max_idle_timeout.max(1) as u32,
+                max_incoming_streams: quic_options.max_incoming_streams.clamp(1, u32::MAX as i64)
+                    as u32,
+            };
+            let authenticated_stream_limit = quic_params.max_incoming_streams as usize;
+            let mut listener_quic_params = quic_params.clone();
+            listener_quic_params.max_incoming_streams = quic_params
+                .max_incoming_streams
+                .min(QUIC_PREAUTH_STREAM_LIMIT as u32)
+                .max(1);
             let quic_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.quic_bind_port);
             let quic_addr2 = quic_addr.clone();
             let (quic_bind_tx, quic_bind_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1154,7 +1338,12 @@ impl Service {
                         std::fs::read_to_string(&key_path),
                     ) {
                         (Ok(cert_pem), Ok(key_pem)) => {
-                            match frp_core::quic::QuicListener::new(sockaddr, &cert_pem, &key_pem) {
+                            match frp_core::quic::QuicListener::new_with_params(
+                                sockaddr,
+                                &cert_pem,
+                                &key_pem,
+                                listener_quic_params.clone(),
+                            ) {
                                 Ok(l) => l,
                                 Err(e) => {
                                     tracing::error!(
@@ -1185,7 +1374,7 @@ impl Service {
                             match frp_core::quic::QuicListener::new_with_tls_config(
                                 sockaddr,
                                 tls_config,
-                                frp_core::quic::QuicTransportParams::default(),
+                                listener_quic_params.clone(),
                             ) {
                                 Ok(l) => l,
                                 Err(e) => {
@@ -1216,7 +1405,7 @@ impl Service {
                     match frp_core::quic::QuicListener::new_with_tls_config(
                         sockaddr,
                         tls_config,
-                        frp_core::quic::QuicTransportParams::default(),
+                        listener_quic_params.clone(),
                     ) {
                         Ok(l) => l,
                         Err(e) => {
@@ -1259,14 +1448,37 @@ impl Service {
                                             // This is inside the handler, not in the accept loop —
                                             // matching Go frp's HandleQUICListener pattern where
                                             // the accept loop never blocks on a stream.
-                                            let stream = match conn.accept_bi().await {
-                                                Ok(s) => s,
-                                                Err(e) => {
+                                            let deadline = tokio::time::Instant::now()
+                                                + QUIC_FIRST_FRAME_TIMEOUT;
+                                            let stream = match await_quic_preauth(
+                                                conn.accept_bi(),
+                                                deadline,
+                                                &state.shutdown_token,
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(stream)) => stream,
+                                                Ok(Err(e)) => {
                                                     tracing::warn!(error = %e, "QUIC: failed to accept first stream: {e}");
                                                     return;
                                                 }
+                                                Err(QuicPreauthError::TimedOut) => {
+                                                    tracing::warn!(addr = %quic_addr, "QUIC connection timed out before opening control stream");
+                                                    conn.close(b"control stream timeout");
+                                                    return;
+                                                }
+                                                Err(QuicPreauthError::Cancelled) => {
+                                                    conn.close(b"server shutdown");
+                                                    return;
+                                                }
                                             };
-                                            handle_quic_stream(stream, conn, state).await;
+                                            handle_quic_stream(
+                                                stream,
+                                                conn,
+                                                state,
+                                                deadline,
+                                                authenticated_stream_limit,
+                                            ).await;
                                         }));
                                     }
                             Err(e) => {
@@ -1301,6 +1513,8 @@ impl Service {
             first_stream: frp_core::quic::QuicStream,
             conn: frp_core::quic::QuicConnection,
             state: Arc<AppState>,
+            first_frame_deadline: tokio::time::Instant,
+            authenticated_stream_limit: usize,
         ) {
             let mut ctl = frp_core::transport::IoStream::Quic(first_stream);
 
@@ -1308,70 +1522,142 @@ impl Service {
             // Per-stream independence: each QUIC stream gets its own
             // V2 detection, matching Go frp's WriteMagicIfV2() per stream.
             let mut magic = [0u8; 7];
-            let is_v2 = match ctl.read_exact(&mut magic).await {
-                Ok(_) => is_v2_magic(&magic),
-                Err(_) => false,
-            };
+            let is_v2 =
+                match tokio::time::timeout_at(first_frame_deadline, ctl.read_exact(&mut magic))
+                    .await
+                {
+                    Ok(Ok(_)) => is_v2_magic(&magic),
+                    Ok(Err(_)) => false,
+                    Err(_) => {
+                        tracing::warn!("QUIC control stream timed out before protocol magic");
+                        return;
+                    }
+                };
 
             if is_v2 {
                 // --- V2 path ---
-                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(
-                    &mut ctl,
-                )
-                .await
-                {
+                let first_message = tokio::time::timeout_at(first_frame_deadline, async {
+                    match frp_core::v2_handshake::v2_handshake_server(&mut ctl).await {
                     Ok((Some(p), crypto)) => (p, crypto),
                     Ok((None, crypto)) => match ctl.read_raw_v2_frame().await {
                         Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                         Ok((ft, _, _)) => {
                             tracing::warn!(frame_type = ?ft, "QUIC V2: unexpected frame type {} after handshake", ft);
-                            return;
+                            return None;
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "QUIC V2: failed to read message after handshake: {}", e);
-                            return;
+                            return None;
                         }
                     },
                     Err(e) => {
                         tracing::warn!(error = %e, "QUIC V2 handshake error: {}", e);
+                        return None;
+                    }
+                    }.into()
+                }).await;
+                let (msg_payload, crypto_ctx) = match first_message {
+                    Ok(Some(message)) => message,
+                    Ok(None) => return,
+                    Err(_) => {
+                        tracing::warn!("QUIC V2 control stream timed out before first message");
                         return;
                     }
                 };
 
                 let addr: std::net::SocketAddr = conn.remote_address();
-                let cancel = spawn_quic_drain(conn, Arc::clone(&state), "V2");
-                crate::handlers::dispatch_v2_message(
+                let (auth_tx, auth_rx) = tokio::sync::oneshot::channel();
+                let control = crate::handlers::dispatch_v2_message_with_auth_signal(
                     ctl,
                     msg_payload,
-                    state,
+                    Arc::clone(&state),
                     addr,
                     None,
                     None,
                     crypto_ctx,
-                )
-                .await;
-                cancel.cancel();
+                    auth_tx,
+                );
+                tokio::pin!(control);
+                tokio::select! {
+                    biased;
+                    _ = &mut control => {}
+                    auth = auth_rx => {
+                        if auth.is_err() {
+                            return;
+                        }
+                        conn.set_max_concurrent_bi_streams(
+                            authenticated_stream_limit.min(u32::MAX as usize) as u32,
+                        );
+                        let cancel = spawn_quic_drain(
+                            conn,
+                            Arc::clone(&state),
+                            "V2",
+                            authenticated_stream_limit,
+                        );
+                        control.await;
+                        cancel.cancel();
+                    }
+                }
             } else {
                 // --- V1 fallback ---
                 let mut ctl =
                     frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ctl));
 
-                match frp_core::protocol::read_msg_v1(&mut ctl).await {
-                    Ok(frp_core::msg::FrpMessage::Login(login)) => {
-                        let cancel = spawn_quic_drain(conn, Arc::clone(&state), "V1");
-                        control::handle_control(ctl, *login, state, None, None, false, None, false)
-                            .await;
-                        cancel.cancel();
+                match tokio::time::timeout_at(
+                    first_frame_deadline,
+                    frp_core::protocol::read_msg_v1(&mut ctl),
+                )
+                .await
+                {
+                    Err(_) => {
+                        tracing::warn!("QUIC V1 control stream timed out before Login");
                     }
-                    Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
-                        crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
-                    }
-                    Ok(other) => {
-                        tracing::warn!(other = ?other.v1_type_byte(), "Unexpected QUIC message: {:?}", other.v1_type_byte());
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "QUIC read error: {}", e);
-                    }
+                    Ok(result) => match result {
+                        Ok(frp_core::msg::FrpMessage::Login(login)) => {
+                            let (auth_tx, auth_rx) = tokio::sync::oneshot::channel();
+                            let control = control::handle_control_with_auth_signal(
+                                ctl,
+                                *login,
+                                Arc::clone(&state),
+                                None,
+                                None,
+                                false,
+                                None,
+                                false,
+                                auth_tx,
+                            );
+                            tokio::pin!(control);
+                            tokio::select! {
+                                biased;
+                                _ = &mut control => {}
+                                auth = auth_rx => {
+                                    if auth.is_err() {
+                                        return;
+                                    }
+                                    conn.set_max_concurrent_bi_streams(
+                                        authenticated_stream_limit.min(u32::MAX as usize) as u32,
+                                    );
+                                    let cancel = spawn_quic_drain(
+                                        conn,
+                                        Arc::clone(&state),
+                                        "V1",
+                                        authenticated_stream_limit,
+                                    );
+                                    control.await;
+                                    cancel.cancel();
+                                }
+                            }
+                        }
+                        Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                            crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
+                        }
+                        Ok(other) => {
+                            tracing::warn!(other = ?other.v1_type_byte(), "Unexpected QUIC message: {:?}", other.v1_type_byte());
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "QUIC read error: {}", e);
+                        }
+                    },
                 }
             }
         }
@@ -1383,55 +1669,77 @@ impl Service {
             conn: frp_core::quic::QuicConnection,
             state: Arc<AppState>,
             tag: &'static str,
+            authenticated_stream_limit: usize,
         ) -> CancellationToken {
             let cancel = CancellationToken::new();
             let drain_cancel = cancel.clone();
             let drain_conn = conn;
             tokio::spawn(async move {
                 tracing::debug!(tag, "QUIC drain ({tag}) started");
+                let preauth_limiter = new_quic_preauth_stream_limiter();
+                let authenticated_limiter =
+                    new_quic_authenticated_stream_limiter(authenticated_stream_limit);
+                let mut stream_tasks = tokio::task::JoinSet::new();
                 loop {
                     tokio::select! {
+                        biased;
                         _ = drain_cancel.cancelled() => {
                             tracing::debug!(tag, "QUIC drain ({tag}) cancelled");
                             break;
                         }
-                        result = drain_conn.accept_bi() => {
+                        Some(result) = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
+                            if let Err(e) = result {
+                                tracing::debug!(error = %e, tag, "QUIC stream task ended with error");
+                            }
+                        }
+                        permit = preauth_limiter.clone().acquire_owned() => {
+                            let Ok(preauth_permit) = permit else { break; };
+                            let result = tokio::select! {
+                                biased;
+                                _ = drain_cancel.cancelled() => break,
+                                result = drain_conn.accept_bi() => result,
+                            };
                             match result {
                                 Ok(work_stream) => {
                                     tracing::debug!(tag, "QUIC drain ({tag}): accepted new stream");
                                     let s = Arc::clone(&state);
-                                    tokio::spawn(async move {
+                                    let authenticated_limiter = authenticated_limiter.clone();
+                                    stream_tasks.spawn(async move {
+                                        let preauth_permit = preauth_permit;
                                         let mut wc = frp_core::transport::IoStream::Quic(work_stream);
-                                        let mut wmagic = [0u8; 7];
-                                        let w_is_v2 = match wc.read_exact(&mut wmagic).await {
-                                            Ok(_) => is_v2_magic(&wmagic),
-                                            Err(_) => false,
-                                        };
-                                        if w_is_v2 {
-                                            match wc.read_v2_frame().await {
-                                                Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
-                                                    crate::handlers::handle_work_conn_inner(wc, nwc, s).await;
+                                        let request = tokio::time::timeout(QUIC_FIRST_FRAME_TIMEOUT, async {
+                                            let mut wmagic = [0u8; 7];
+                                            let w_is_v2 = match wc.read_exact(&mut wmagic).await {
+                                                Ok(_) => is_v2_magic(&wmagic),
+                                                Err(e) => return Err(e.into()),
+                                            };
+                                            if w_is_v2 {
+                                                match wc.read_v2_frame().await {
+                                                    Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => Ok((wc, nwc)),
+                                                    Ok(other) => Err(frp_core::Error::Protocol(format!("unexpected QUIC V2 message {:?}", other.v2_type_id()).into())),
+                                                    Err(e) => Err(e),
                                                 }
-                                                Ok(other) => {
-                                                    tracing::warn!(msg_type_id = ?other.v2_type_id(), "QUIC drain: unexpected V2 msg type_id={:?}", other.v2_type_id());
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(error = %e, "QUIC drain: V2 read error: {}", e);
-                                                }
-                                            }
-                                        } else {
-                                            let mut wc = frp_core::transport::IoStream::BufferedRead(wmagic.to_vec(), 0, Box::new(wc));
-                                            match frp_core::protocol::read_msg_v1(&mut wc).await {
-                                                Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
-                                                    crate::handlers::handle_work_conn_inner(wc, nwc, s).await;
-                                                }
-                                                Ok(other) => {
-                                                    tracing::warn!(msg_type_byte = ?other.v1_type_byte(), "QUIC drain: unexpected V1 msg type_byte={:?}", other.v1_type_byte());
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(error = %e, "QUIC drain: V1 read error: {}", e);
+                                            } else {
+                                                wc = frp_core::transport::IoStream::BufferedRead(wmagic.to_vec(), 0, Box::new(wc));
+                                                match frp_core::protocol::read_msg_v1(&mut wc).await {
+                                                    Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => Ok((wc, nwc)),
+                                                    Ok(other) => Err(frp_core::Error::Protocol(format!("unexpected QUIC V1 message {:?}", other.v1_type_byte()).into())),
+                                                    Err(e) => Err(e),
                                                 }
                                             }
+                                        }).await;
+                                        match request {
+                                            Ok(Ok((wc, nwc))) => {
+                                                drop(preauth_permit);
+                                                let Ok(_authenticated_permit) =
+                                                    authenticated_limiter.acquire_owned().await
+                                                else {
+                                                    return;
+                                                };
+                                                crate::handlers::handle_work_conn_inner(wc, nwc, s).await
+                                            },
+                                            Ok(Err(e)) => tracing::warn!(error = %e, "QUIC drain: invalid first frame"),
+                                            Err(_) => tracing::warn!(timeout_secs = QUIC_FIRST_FRAME_TIMEOUT.as_secs(), "QUIC work stream first-frame timeout"),
                                         }
                                     });
                                 }
@@ -1443,6 +1751,8 @@ impl Service {
                         }
                     }
                 }
+                stream_tasks.abort_all();
+                while stream_tasks.join_next().await.is_some() {}
             });
             cancel
         }

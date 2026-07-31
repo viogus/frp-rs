@@ -78,6 +78,9 @@ pub(crate) struct ControlContext {
     pub pool_cap: usize,
     pub internal_tx: tokio::sync::mpsc::Sender<crate::state::InternalMsg>,
     pub peer: Option<std::net::SocketAddr>,
+    /// Verified authorization identity. This differs from the claimed/login
+    /// user under OIDC, while token auth intentionally keeps Go semantics.
+    pub authenticated_user: String,
 }
 
 /// Handle a control connection from a frpc client.
@@ -99,6 +102,56 @@ pub async fn handle_control<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    handle_control_inner(
+        stream, login, state, peer, incoming, v2, crypto_ctx, internal, None,
+    )
+    .await;
+}
+
+/// QUIC control variant that signals only after Login authentication and
+/// LoginResp flush have completed successfully.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_control_with_auth_signal<S>(
+    stream: S,
+    login: msg::Login,
+    state: Arc<AppState>,
+    peer: Option<SocketAddr>,
+    incoming: Option<IncomingStreams>,
+    v2: bool,
+    crypto_ctx: Option<frp_core::v2_handshake::CryptoContext>,
+    internal: bool,
+    auth_success: tokio::sync::oneshot::Sender<()>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    handle_control_inner(
+        stream,
+        login,
+        state,
+        peer,
+        incoming,
+        v2,
+        crypto_ctx,
+        internal,
+        Some(auth_success),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_control_inner<S>(
+    stream: S,
+    login: msg::Login,
+    state: Arc<AppState>,
+    peer: Option<SocketAddr>,
+    incoming: Option<IncomingStreams>,
+    v2: bool,
+    crypto_ctx: Option<frp_core::v2_handshake::CryptoContext>,
+    internal: bool,
+    auth_success: Option<tokio::sync::oneshot::Sender<()>>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     info!(peer = ?peer, "New control connection from {:?}", peer);
     // Box stream to erase type — authenticate is type-erased to avoid
     // monomorphization (saves ~30KB per copy in release binary).
@@ -106,7 +159,15 @@ pub async fn handle_control<S>(
     // 1. Authenticate and set up per-client state (login.rs)
     let (mut ctx, mut ctl, _internal_tx, mut internal_rx, mut reader, mut writer, mut incoming) =
         match login::authenticate(
-            stream, &login, state, peer, incoming, v2, crypto_ctx, internal,
+            stream,
+            &login,
+            state,
+            peer,
+            incoming,
+            v2,
+            crypto_ctx,
+            internal,
+            auth_success,
         )
         .await
         {
@@ -121,7 +182,7 @@ pub async fn handle_control<S>(
     let pool_stats = ctx.pool_stats.clone();
     let v2 = ctx.v2;
     let peer = ctx.peer;
-    let login_user = login.user.clone().unwrap_or_default();
+    let authenticated_user = ctx.authenticated_user.clone();
 
     // --- Main select loop ---
     // Cache heartbeat timeout duration (never changes during the loop).
@@ -175,9 +236,8 @@ pub async fn handle_control<S>(
         }
 
         tokio::select! {
-            biased;
-
-            // Prefer internal messages to reduce latency for proxy connections
+            // Keep selection fair: an always-ready internal queue must not
+            // starve control reads (including heartbeat pings) or shutdown.
             internal = internal_rx.recv() => {
                 match internal {
                     Some(msg) => {
@@ -265,7 +325,7 @@ pub async fn handle_control<S>(
             msg = read_ctl_msg(&mut reader, v2) => {
                 match msg {
                     Ok(msg) => {
-                        if dispatch::dispatch_frp_message(&mut ctx, &mut ctl, &mut writer, msg, &login_user).await.is_err() {
+                        if dispatch::dispatch_frp_message(&mut ctx, &mut ctl, &mut writer, msg, &authenticated_user).await.is_err() {
                             break;
                         }
                     }
@@ -302,5 +362,96 @@ pub async fn handle_control<S>(
     // that the old handler's cleanup is complete.
     if let Some(done) = ctl.shutdown_done.take() {
         let _ = done.send(());
+    }
+}
+
+#[cfg(test)]
+mod fairness_tests {
+    use std::time::{Duration, Instant};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fair_four_lane_pressure_bounds_control_p99_and_preserves_internal_throughput() {
+        const CONTROL_MESSAGES: usize = 500;
+        let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel(1024);
+        let (incoming_tx, mut incoming_rx) = tokio::sync::mpsc::channel(1024);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(CONTROL_MESSAGES);
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+        for _ in 0..1024 {
+            internal_tx.try_send(()).unwrap();
+            incoming_tx.try_send(()).unwrap();
+        }
+        for _ in 0..CONTROL_MESSAGES {
+            control_tx.try_send(Instant::now()).unwrap();
+        }
+
+        let started = Instant::now();
+        let mut internal_ops = 0usize;
+        let mut control_latency = Vec::with_capacity(CONTROL_MESSAGES);
+        while control_latency.len() < CONTROL_MESSAGES {
+            tokio::select! {
+                Some(()) = internal_rx.recv() => {
+                    internal_ops += 1;
+                    tokio::task::yield_now().await; // model non-zero dispatch cost
+                    internal_tx.try_send(()).unwrap();
+                }
+                Some(()) = incoming_rx.recv() => {
+                    tokio::task::yield_now().await; // model stream validation cost
+                    incoming_tx.try_send(()).unwrap();
+                }
+                Some(queued_at) = control_rx.recv() => {
+                    control_latency.push(queued_at.elapsed());
+                }
+                _ = shutdown_rx.recv() => break,
+            }
+        }
+
+        control_latency.sort_unstable();
+        let p99 = control_latency[CONTROL_MESSAGES * 99 / 100];
+        let internal_ops_per_second = internal_ops as f64 / started.elapsed().as_secs_f64();
+
+        let (biased_internal_tx, mut biased_internal_rx) = tokio::sync::mpsc::channel(1);
+        let (biased_control_tx, mut biased_control_rx) = tokio::sync::mpsc::channel(1);
+        biased_internal_tx.try_send(()).unwrap();
+        biased_control_tx.try_send(()).unwrap();
+        let biased_started = Instant::now();
+        let mut biased_internal_ops = 0usize;
+        let mut biased_control_ops = 0usize;
+        for _ in 0..internal_ops.max(1_000) {
+            tokio::select! {
+                biased;
+                Some(()) = biased_internal_rx.recv() => {
+                    biased_internal_ops += 1;
+                    tokio::task::yield_now().await;
+                    biased_internal_tx.try_send(()).unwrap();
+                }
+                Some(()) = biased_control_rx.recv() => {
+                    biased_control_ops += 1;
+                    biased_control_tx.try_send(()).unwrap();
+                }
+            }
+        }
+        let biased_internal_ops_per_second =
+            biased_internal_ops as f64 / biased_started.elapsed().as_secs_f64();
+        eprintln!(
+            "fair control p99={p99:?}, fair internal={internal_ops_per_second:.0} ops/s, biased internal={biased_internal_ops_per_second:.0} ops/s, biased control ops={biased_control_ops}"
+        );
+
+        assert!(p99 < Duration::from_millis(250), "control p99 was {p99:?}");
+        assert!(
+            internal_ops_per_second >= biased_internal_ops_per_second * 0.20,
+            "fair throughput {internal_ops_per_second:.0} ops/s was under 20% of biased baseline {biased_internal_ops_per_second:.0} ops/s"
+        );
+        assert_eq!(
+            biased_control_ops, 0,
+            "biased baseline should starve control"
+        );
+        assert!(
+            include_str!("mod.rs")
+                .matches(concat!("biased", ";"))
+                .count()
+                == 1,
+            "control select must remain fair under sustained internal pressure"
+        );
     }
 }
