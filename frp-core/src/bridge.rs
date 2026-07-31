@@ -9,6 +9,12 @@ use crate::cipher_stream::{CipherReader, CipherWriter};
 use crate::encryption;
 use crate::transport::IoStream;
 
+/// Upper bound for the reusable work→user batch buffer. Frames returned by
+/// the decompressor are accumulated up to this cap, then written/flushed once,
+/// so a transport read containing many small frames costs one write instead of
+/// one write per frame.
+const MAX_WORK_TO_USER_BATCH: usize = 256 * 1024;
+
 /// Emit a TRACE-level event with a hex-encoded field.
 ///
 /// In release builds (`debug_assertions` off), the entire call is compiled
@@ -221,6 +227,7 @@ async fn bridge_work_to_user(
     let mut buf = PoolGuard::acquire();
     let cap = buf.as_mut_slice().len();
     let mut decomp_buf = Vec::new();
+    let mut batch_buf = Vec::new();
     let mut decompressor = make_decompressor(use_compression);
     'read_loop: loop {
         let n = match work_r.read(buf.as_mut_slice()).await {
@@ -263,21 +270,46 @@ async fn bridge_work_to_user(
             if let Some(ref mut lim) = read_limiter {
                 lim.consume(plaintext.len()).await;
             }
-
-            if let Err(e) = user_w.write_all(plaintext).await {
-                tracing::debug!(error = %e, "bridge work_to_user: write error");
-                break 'read_loop;
-            }
             if let Some(ref m) = metrics {
                 m.bytes_out
                     .fetch_add(plaintext.len() as u64, Ordering::Relaxed);
             }
-            if use_compression || n < cap {
-                if let Err(e) = user_w.flush().await {
-                    tracing::debug!(error = %e, "bridge work_to_user: flush error");
+            if decompressor.is_some() {
+                batch_buf.extend_from_slice(plaintext);
+                if batch_buf.len() >= MAX_WORK_TO_USER_BATCH {
+                    if let Err(e) = user_w.write_all(&batch_buf).await {
+                        tracing::debug!(error = %e, "bridge work_to_user: write error (batch)");
+                        break 'read_loop;
+                    }
+                    if let Err(e) = user_w.flush().await {
+                        tracing::debug!(error = %e, "bridge work_to_user: flush error (batch)");
+                        break 'read_loop;
+                    }
+                    batch_buf.clear();
+                }
+            } else {
+                if let Err(e) = user_w.write_all(plaintext).await {
+                    tracing::debug!(error = %e, "bridge work_to_user: write error");
                     break 'read_loop;
                 }
+                if n < cap {
+                    if let Err(e) = user_w.flush().await {
+                        tracing::debug!(error = %e, "bridge work_to_user: flush error");
+                        break 'read_loop;
+                    }
+                }
             }
+        }
+        if !batch_buf.is_empty() {
+            if let Err(e) = user_w.write_all(&batch_buf).await {
+                tracing::debug!(error = %e, "bridge work_to_user: write error (batch)");
+                break 'read_loop;
+            }
+            if let Err(e) = user_w.flush().await {
+                tracing::debug!(error = %e, "bridge work_to_user: flush error (batch)");
+                break 'read_loop;
+            }
+            batch_buf.clear();
         }
     }
 
@@ -685,6 +717,87 @@ mod tests {
             1,
             "expected batched flush, got per-chunk"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "compression")]
+    async fn bridge_work_to_user_batches_compressed_frames() {
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+        struct CountingWriter {
+            writes: Arc<AtomicUsize>,
+            flushes: Arc<AtomicUsize>,
+        }
+        impl AsyncWrite for CountingWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                b: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Ok(b.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                self.flushes.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        // Reader that yields one transport chunk containing three snappy
+        // frames (each decompresses to 64 KiB), then EOF.
+        struct OneShot(Option<Vec<u8>>);
+        impl AsyncRead for OneShot {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                let Some(data) = self.0.take() else {
+                    return Poll::Ready(Ok(()));
+                };
+                let n = data.len().min(buf.remaining());
+                buf.put_slice(&data[..n]);
+                if n < data.len() {
+                    self.0 = Some(data[n..].to_vec());
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut frames = Vec::new();
+        let payload = vec![0x42u8; 64 * 1024];
+        for _ in 0..3 {
+            frames.extend_from_slice(&crate::encryption::compress(&payload).unwrap());
+        }
+
+        let writes = Arc::new(AtomicUsize::new(0));
+        let flushes = Arc::new(AtomicUsize::new(0));
+        bridge_work_to_user(
+            OneShot(Some(frames)),
+            CountingWriter {
+                writes: writes.clone(),
+                flushes: flushes.clone(),
+            },
+            true,
+            None,
+            None,
+        )
+        .await;
+
+        // Three 64 KiB frames in one read => one batched write, plus the
+        // final EOF flush. The old path wrote and flushed once per frame.
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        assert_eq!(flushes.load(Ordering::SeqCst), 2);
     }
 
     // ── Extracted helper unit tests (bridge_user_to_work, bridge_work_to_user) ──

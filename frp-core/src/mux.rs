@@ -21,7 +21,10 @@ use tokio::sync::{mpsc, oneshot};
 #[cfg(feature = "tcp-mux")]
 use futures_util::future::poll_fn;
 #[cfg(feature = "tcp-mux")]
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 #[cfg(feature = "tcp-mux")]
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 #[cfg(feature = "tcp-mux")]
@@ -31,6 +34,16 @@ use tracing::{debug, warn};
 use yamux::{Config, Connection, Mode, Stream};
 
 const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Maximum consecutive keepalive intervals with zero inbound transport I/O
+/// before the session is considered dead. Healthy yamux peers exchange
+/// PING/PONG at least every 10 seconds, so with the default 30s keepalive a
+/// live session always resets this counter. The 12-tick bound is deliberately
+/// generous so a peer with a much longer keepalive interval is never falsely
+/// disconnected, while still bounding dead-session retention well below the
+/// OS TCP keepalive default.
+#[cfg(feature = "tcp-mux")]
+const MAX_IDLE_KEEPALIVE_TICKS: u32 = 12;
 
 /// Wrapper type for a yamux stream compatible with tokio's AsyncRead/AsyncWrite.
 #[cfg(feature = "tcp-mux")]
@@ -113,6 +126,81 @@ impl Default for TcpMuxConfig {
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
             max_stream_window_size: 6 * 1024 * 1024,
         }
+    }
+}
+
+/// Tracks whether the yamux connection has observed any inbound transport
+/// bytes (data, PING or PONG frames) since the last keepalive check.
+#[cfg(feature = "tcp-mux")]
+#[derive(Default)]
+struct ActivityState {
+    saw_read: AtomicBool,
+}
+
+#[cfg(feature = "tcp-mux")]
+impl ActivityState {
+    fn mark(&self) {
+        self.saw_read.store(true, Ordering::Release);
+    }
+
+    fn take(&self) -> bool {
+        self.saw_read.swap(false, Ordering::AcqRel)
+    }
+}
+
+/// Wraps the yamux socket so inbound I/O (including internal PING/PONG)
+/// can be observed without inspecting yamux's private RTT state.
+#[cfg(feature = "tcp-mux")]
+struct ActivityIo<T> {
+    inner: T,
+    state: Arc<ActivityState>,
+}
+
+#[cfg(feature = "tcp-mux")]
+impl<T> ActivityIo<T> {
+    fn new(inner: T, state: Arc<ActivityState>) -> Self {
+        Self { inner, state }
+    }
+}
+
+#[cfg(feature = "tcp-mux")]
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ActivityIo<T> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+        if result.is_ready() {
+            this.state.mark();
+        }
+        result
+    }
+}
+
+#[cfg(feature = "tcp-mux")]
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ActivityIo<T> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
@@ -213,7 +301,8 @@ pub async fn server_mux<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let compat = stream.compat();
+    let activity = Arc::new(ActivityState::default());
+    let compat = ActivityIo::new(stream, activity.clone()).compat();
     let yamux_cfg = yamux_config(mux_cfg);
     let mut conn = Connection::new(compat, yamux_cfg, Mode::Server);
 
@@ -242,6 +331,7 @@ where
     // poll picks up queued stream writes into pending_frames; the second
     // poll actually sends them on the wire.
     let keepalive = normalized_keepalive_interval(mux_cfg.keepalive_interval);
+    let mut consecutive_idle = 0u32;
     tokio::task::spawn(async move {
         loop {
             let result = tokio::time::timeout(
@@ -264,6 +354,19 @@ where
                     // Keepalive: idle connection. poll_next_inbound was
                     // called (driving I/O including internal PING/PONG), but
                     // no new stream arrived within keepalive_interval.
+                    if activity.take() {
+                        consecutive_idle = 0;
+                    } else {
+                        consecutive_idle += 1;
+                    }
+                    if consecutive_idle >= MAX_IDLE_KEEPALIVE_TICKS {
+                        warn!(
+                            ticks = consecutive_idle,
+                            keepalive_secs = keepalive.as_secs(),
+                            "yamux server: no transport I/O for too many keepalive intervals; closing dead session"
+                        );
+                        break;
+                    }
                     // Check if the control handler was replaced/dropped
                     // (Go frp compat: interruptReadAndClose on old control).
                     if matches!(
@@ -345,7 +448,8 @@ pub async fn client_mux<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let compat = stream.compat();
+    let activity = Arc::new(ActivityState::default());
+    let compat = ActivityIo::new(stream, activity.clone()).compat();
     let yamux_cfg = yamux_config(mux_cfg);
     let mut conn = Connection::new(compat, yamux_cfg, Mode::Client);
 
@@ -362,6 +466,7 @@ where
     let conn = Arc::new(Mutex::new(conn));
     let bg_conn = conn.clone();
     let keepalive = normalized_keepalive_interval(mux_cfg.keepalive_interval);
+    let mut consecutive_idle = 0u32;
 
     tokio::task::spawn(async move {
         loop {
@@ -439,7 +544,7 @@ where
                     // Drive I/O to allow yamux internal PING/PONG processing.
                     // yamux-rs 0.14's RTT module sends PING every 10s and
                     // expects PONG, but does NOT timeout on AwaitingPong.
-                    let activity = poll_fn(|cx| {
+                    let poll_result = poll_fn(|cx| {
                         Poll::Ready(
                             bg_conn
                                 .lock()
@@ -447,7 +552,7 @@ where
                                 .poll_next_inbound(cx),
                         )
                     }).await;
-                    match activity {
+                    match poll_result {
                         Poll::Ready(Some(Ok(_))) => {
                             debug!("yamux client: inbound stream received on keepalive poll");
                         }
@@ -462,6 +567,19 @@ where
                         Poll::Pending => {
                             debug!("yamux client: idle keepalive poll completed");
                         }
+                    }
+                    if activity.take() {
+                        consecutive_idle = 0;
+                    } else {
+                        consecutive_idle += 1;
+                    }
+                    if consecutive_idle >= MAX_IDLE_KEEPALIVE_TICKS {
+                        warn!(
+                            ticks = consecutive_idle,
+                            keepalive_secs = keepalive.as_secs(),
+                            "yamux client: no transport I/O for too many keepalive intervals; closing dead session"
+                        );
+                        break;
                     }
                 }
             }

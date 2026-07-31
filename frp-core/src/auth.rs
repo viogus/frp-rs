@@ -276,6 +276,27 @@ mod oidc_impl {
         refresh_after: std::time::Duration,
     }
 
+    /// Internal verification error that also records whether a JWKS refresh
+    /// could plausibly fix the failure (signature/key material changed) as
+    /// opposed to a semantic token error (expired, missing claims, etc.).
+    struct OidcVerifyError {
+        message: String,
+        refresh_warranted: bool,
+    }
+
+    pub(crate) fn is_key_related_error(err: &jsonwebtoken::errors::Error) -> bool {
+        use jsonwebtoken::errors::ErrorKind;
+        matches!(
+            err.kind(),
+            ErrorKind::InvalidSignature
+                | ErrorKind::InvalidRsaKey(_)
+                | ErrorKind::InvalidEcdsaKey
+                | ErrorKind::InvalidKeyFormat
+                | ErrorKind::InvalidAlgorithm
+                | ErrorKind::Crypto(_)
+        )
+    }
+
     /// Server-side OIDC verifier. Discovers JWKS from issuer, verifies JWT tokens,
     /// and enforces subject binding for ping/NewWorkConn.
     pub struct OidcVerifier {
@@ -429,6 +450,15 @@ mod oidc_impl {
                     jsonwebtoken::DecodingKey::from_base64_secret(k)
                         .map_err(|e| format!("OIDC: invalid oct JWK: {e}"))
                 }
+                "OKP" => {
+                    let crv = key["crv"].as_str().ok_or("OIDC: missing OKP crv in JWK")?;
+                    if crv != "Ed25519" {
+                        return Err(format!("OIDC: unsupported OKP curve: {crv}"));
+                    }
+                    let x = key["x"].as_str().ok_or("OIDC: missing OKP x in JWK")?;
+                    jsonwebtoken::DecodingKey::from_ed_components(x)
+                        .map_err(|e| format!("OIDC: invalid OKP/Ed25519 JWK: {e}"))
+                }
                 _ => Err(format!("OIDC: unsupported JWK key type: {kty}")),
             }
         }
@@ -510,17 +540,17 @@ mod oidc_impl {
             match first_result {
                 Ok(tok) => Ok(tok),
                 Err(first_err) => {
-                    // Refresh JWKS and retry once.
-                    // NOTE: this triggers on ALL verification failures,
-                    // not just signature/key-mismatch errors. A future
-                    // improvement would be to only refresh on signature-
-                    // related errors (e.g. InvalidSignature, InvalidRsaKey)
-                    // and skip the refresh for semantic errors like expired
-                    // tokens or missing claims.
+                    // Refresh JWKS and retry once, but only when the failure
+                    // could be caused by stale/rotated key material. Semantic
+                    // errors (expired token, wrong issuer/audience, missing
+                    // claims) must not trigger outbound JWKS refreshes.
+                    if !first_err.refresh_warranted {
+                        return Err(first_err.message);
+                    }
                     self.refresh_jwks().await?;
                     self.try_verify_token(token, &validation, kid.as_deref())
                         .await
-                        .map_err(|_| first_err)
+                        .map_err(|_| first_err.message)
                 }
             }
         }
@@ -531,16 +561,21 @@ mod oidc_impl {
             token: &str,
             validation: &jsonwebtoken::Validation,
             kid: Option<&str>,
-        ) -> Result<LoginOidcToken, String> {
+        ) -> Result<LoginOidcToken, OidcVerifyError> {
             let cache = self.jwks.read().await;
-            let jwks = cache
-                .as_ref()
-                .ok_or_else(|| "OIDC: no JWKS cached".to_string())?;
+            let jwks = cache.as_ref().ok_or_else(|| OidcVerifyError {
+                message: "OIDC: no JWKS cached".to_string(),
+                refresh_warranted: true,
+            })?;
             let keys = jwks.keys["keys"]
                 .as_array()
-                .ok_or_else(|| "OIDC: JWKS has no 'keys' array".to_string())?;
+                .ok_or_else(|| OidcVerifyError {
+                    message: "OIDC: JWKS has no 'keys' array".to_string(),
+                    refresh_warranted: true,
+                })?;
 
             let mut last_err = String::new();
+            let mut refresh_warranted = false;
 
             for key in keys {
                 // If kid present in header, only try matching key
@@ -554,6 +589,7 @@ mod oidc_impl {
                     Ok(k) => k,
                     Err(e) => {
                         last_err = e;
+                        refresh_warranted = true;
                         continue;
                     }
                 };
@@ -566,6 +602,7 @@ mod oidc_impl {
                         // could still be the empty string.
                         if sub.is_empty() {
                             last_err = "OIDC: JWT subject (sub) is empty".to_string();
+                            refresh_warranted = false;
                             continue;
                         }
                         let exp = data.claims["exp"].as_i64().unwrap_or(0);
@@ -576,11 +613,15 @@ mod oidc_impl {
                     }
                     Err(e) => {
                         last_err = e.to_string();
+                        refresh_warranted = is_key_related_error(&e);
                     }
                 }
             }
 
-            Err(format!("OIDC: JWT verification failed: {last_err}"))
+            Err(OidcVerifyError {
+                message: format!("OIDC: JWT verification failed: {last_err}"),
+                refresh_warranted,
+            })
         }
 
         /// Verify a ping JWT — also checks subject matches.
@@ -1175,6 +1216,79 @@ mod tests {
         });
         let key = OidcVerifier::decoding_key_from_jwk(&jwk);
         assert!(key.is_ok(), "EC JWK should parse: {:?}", key.err());
+    }
+
+    #[test]
+    #[cfg(feature = "oidc")]
+    fn test_decoding_key_from_okp_jwk() {
+        // Ed25519 public key from RFC 8032 test vector 1.
+        let jwk = serde_json::json!({
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"
+        });
+        let key = OidcVerifier::decoding_key_from_jwk(&jwk);
+        assert!(key.is_ok(), "OKP/Ed25519 JWK should parse: {:?}", key.err());
+    }
+
+    #[test]
+    #[cfg(feature = "oidc")]
+    fn test_decoding_key_from_okp_rejects_unknown_curve() {
+        let jwk = serde_json::json!({
+            "kty": "OKP",
+            "crv": "Ed448",
+            "x": "AAAAAAAA"
+        });
+        let result = OidcVerifier::decoding_key_from_jwk(&jwk);
+        let error = result.err().expect("unknown OKP curve must fail");
+        assert!(
+            error.contains("unsupported OKP curve"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "oidc")]
+    fn test_key_related_error_classification() {
+        use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
+
+        let future_exp = serde_json::json!({"sub": "user", "exp": 4_102_444_800_u64});
+        let token = jsonwebtoken::encode(
+            &Header::default(),
+            &future_exp,
+            &EncodingKey::from_secret(b"correct-key"),
+        )
+        .expect("encode token");
+        let validation = Validation::new(Algorithm::HS256);
+
+        let wrong_key_err = jsonwebtoken::decode::<serde_json::Value>(
+            &token,
+            &DecodingKey::from_secret(b"wrong-key"),
+            &validation,
+        )
+        .expect_err("wrong key must fail");
+        assert!(
+            super::oidc_impl::is_key_related_error(&wrong_key_err),
+            "signature mismatch should warrant a JWKS refresh: {wrong_key_err}"
+        );
+
+        let expired = serde_json::json!({"sub": "user", "exp": 1_000_000_000_u64});
+        let expired_token = jsonwebtoken::encode(
+            &Header::default(),
+            &expired,
+            &EncodingKey::from_secret(b"correct-key"),
+        )
+        .expect("encode expired token");
+        let expired_err = jsonwebtoken::decode::<serde_json::Value>(
+            &expired_token,
+            &DecodingKey::from_secret(b"correct-key"),
+            &validation,
+        )
+        .expect_err("expired token must fail");
+        assert!(
+            !super::oidc_impl::is_key_related_error(&expired_err),
+            "expired token should not trigger a JWKS refresh: {expired_err}"
+        );
     }
 
     #[test]

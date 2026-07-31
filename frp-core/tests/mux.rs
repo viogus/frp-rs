@@ -280,3 +280,33 @@ async fn server_acceptor_exits_on_transport_error() {
         "transport error must terminate the acceptor"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn dead_peer_session_closes_after_bounded_idle_keepalive_ticks() {
+    let interval = Duration::from_secs(1);
+    let config = mux_config(interval);
+    let (_server_control, mut incoming, _client_control, session) =
+        connected_mux_pair(config.clone(), config).await;
+
+    // Paused time suppresses yamux's real-time PING/PONG, so neither driver
+    // observes transport I/O. The bounded liveness counter must close both
+    // sides after MAX_IDLE_KEEPALIVE_TICKS (12) rather than retaining the
+    // session indefinitely.
+    advance_keepalive_ticks(interval, 13).await;
+
+    let server_next = tokio::time::timeout(Duration::from_secs(1), incoming.recv())
+        .await
+        .expect("server incoming channel must close after the liveness bound");
+    assert!(
+        server_next.is_none(),
+        "server acceptor must close a peer with zero transport I/O"
+    );
+
+    let client_stream = tokio::time::timeout(Duration::from_secs(1), session.open_stream())
+        .await
+        .expect("open_stream must complete after the client liveness bound");
+    assert!(
+        client_stream.is_none(),
+        "client session must close a peer with zero transport I/O"
+    );
+}

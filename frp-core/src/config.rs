@@ -686,9 +686,9 @@ fn default_quic_max_incoming_streams() -> i64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerTransportConfig {
-    #[serde(default = "default_tcp_mux_option")]
+    #[serde(default = "default_tcp_mux_option", alias = "tcpMux")]
     pub tcp_mux: Option<bool>,
-    #[serde(default)]
+    #[serde(default, alias = "tcpMuxKeepaliveInterval")]
     pub tcp_mux_keepalive_interval: i64,
     /// Heartbeat timeout in seconds. Server disconnects if no Ping
     /// received within this interval. Default: 90.
@@ -735,7 +735,11 @@ impl ServerTransportConfig {
     /// `ServerTransportConfig.Complete()`. Call after deserialization,
     /// before consuming the config.
     pub fn complete(&mut self) {
-        if self.tcp_mux.unwrap_or(true) {
+        self.complete_with_heartbeat_timeout_set(false);
+    }
+
+    fn complete_with_heartbeat_timeout_set(&mut self, heartbeat_timeout_set: bool) {
+        if self.tcp_mux.unwrap_or(true) && !heartbeat_timeout_set {
             // When tcpMux is enabled, heartbeat of application layer is
             // unnecessary — rely on yamux keepalive instead (Go compat).
             if self.heartbeat_timeout == default_heartbeat_timeout() || self.heartbeat_timeout == 0
@@ -1054,6 +1058,14 @@ impl ClientConfig {
     /// `ClientCommonConfig.Complete()` + `ClientTransportConfig.Complete()`.
     /// Call after deserialization, before consuming the config.
     pub fn complete(&mut self) {
+        self.complete_with_heartbeat_set(false, false);
+    }
+
+    fn complete_with_heartbeat_set(
+        &mut self,
+        heartbeat_interval_set: bool,
+        heartbeat_timeout_set: bool,
+    ) {
         // MEDIUM-7: Fallback to http_proxy/HTTP_PROXY env var when proxy_url is empty
         if self.proxy_url.is_empty() {
             if let Ok(proxy) = std::env::var("http_proxy") {
@@ -1065,6 +1077,23 @@ impl ClientConfig {
                     self.proxy_url = proxy;
                 }
             }
+        }
+
+        // Go v0.70.1: with tcpMux enabled, application-layer heartbeats are
+        // disabled by default (-1) and yamux keepalive covers liveness. An
+        // explicit value is preserved (Option-style set tracking).
+        if self.tcp_mux {
+            if !heartbeat_interval_set {
+                self.heartbeat_interval = -1;
+            }
+            if !heartbeat_timeout_set {
+                self.heartbeat_timeout = -1;
+            }
+        }
+
+        // Go v0.70.1: dialServerTimeout = 0 means "use the default" (10s).
+        if self.dial_server_timeout == 0 {
+            self.dial_server_timeout = default_dial_server_timeout();
         }
     }
 }
@@ -1307,11 +1336,13 @@ pub fn load_server_config_from_str(
     let mut value: toml::Value =
         toml::from_str(content).map_err(|e| format!("TOML parse error: {e}"))?;
     normalize_server_config(&mut value);
+    let presence = ConfigPresence::from_normalized_value(&value);
     let json_value = toml_to_json(value);
     let mut cfg: ServerConfig =
         serde_json::from_value(json_value).map_err(|e| format!("config validation error: {e}"))?;
     validate_server_config(&cfg)?;
-    cfg.transport.complete();
+    cfg.transport
+        .complete_with_heartbeat_timeout_set(presence.server_heartbeat_timeout_set);
     cfg.complete();
     Ok(cfg)
 }
@@ -1322,11 +1353,47 @@ pub fn load_client_config_from_str(
     let mut value: toml::Value =
         toml::from_str(content).map_err(|e| format!("TOML parse error: {e}"))?;
     normalize_client_config(&mut value);
+    let presence = ConfigPresence::from_normalized_value(&value);
     let mut cfg: ClientConfig = serde_json::from_value(toml_to_json(value))
         .map_err(|e| format!("config validation error: {e}"))?;
     validate_client_config(&cfg)?;
-    cfg.complete();
+    cfg.complete_with_heartbeat_set(
+        presence.client_heartbeat_interval_set,
+        presence.client_heartbeat_timeout_set,
+    );
     Ok(cfg)
+}
+
+/// Presence flags for fields whose Go default depends on whether the user
+/// explicitly configured them. Computed from the normalized TOML value so
+/// serde defaults cannot be confused with explicit values.
+#[derive(Debug, Clone, Copy, Default)]
+struct ConfigPresence {
+    server_heartbeat_timeout_set: bool,
+    client_heartbeat_interval_set: bool,
+    client_heartbeat_timeout_set: bool,
+}
+
+impl ConfigPresence {
+    fn from_normalized_value(value: &toml::Value) -> Self {
+        let mut presence = Self::default();
+        let Some(table) = value.as_table() else {
+            return presence;
+        };
+        presence.client_heartbeat_interval_set =
+            table.contains_key("heartbeat_interval") || table.contains_key("heartbeatInterval");
+        presence.client_heartbeat_timeout_set =
+            table.contains_key("heartbeat_timeout") || table.contains_key("heartbeatTimeout");
+        presence.server_heartbeat_timeout_set = presence.client_heartbeat_timeout_set
+            || table
+                .get("transport")
+                .and_then(toml::Value::as_table)
+                .is_some_and(|transport| {
+                    transport.contains_key("heartbeat_timeout")
+                        || transport.contains_key("heartbeatTimeout")
+                });
+        presence
+    }
 }
 
 /// Validate proxy configs after deserialization. Catches invalid bandwidth
@@ -1530,7 +1597,7 @@ fn load_config_from_file<C: serde::de::DeserializeOwned>(
     known_keys: fn() -> std::collections::HashSet<&'static str>,
     normalize: fn(&mut toml::Value),
     validate: fn(&C) -> Result<(), String>,
-) -> Result<C, Box<dyn std::error::Error>> {
+) -> Result<(C, ConfigPresence), Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("{path}: failed to read config file: {e}"))?;
     let format = detect_format(path);
@@ -1539,6 +1606,7 @@ fn load_config_from_file<C: serde::de::DeserializeOwned>(
     let base_dir = Path::new(path).parent().unwrap_or(Path::new("."));
     process_includes(&mut value, base_dir)?;
     normalize(&mut value);
+    let presence = ConfigPresence::from_normalized_value(&value);
     if strict_config {
         run_strict_check(&value, &known_keys(), path)?;
     }
@@ -1546,7 +1614,7 @@ fn load_config_from_file<C: serde::de::DeserializeOwned>(
     let cfg: C = serde_json::from_value(json_value)
         .map_err(|e| format!("{path}: config validation error: {e}"))?;
     validate(&cfg).map_err(|e| format!("{path}: {e}"))?;
-    Ok(cfg)
+    Ok((cfg, presence))
 }
 
 fn normalize_server_config(value: &mut toml::Value) {
@@ -1655,6 +1723,23 @@ fn normalize_server_config(value: &mut toml::Value) {
             "transport",
             &[],
         );
+
+        // Normalize canonical Go frp camelCase keys inside [transport] to
+        // snake_case so serde aliases and presence tracking see one shape.
+        if let Some(transport) = table.get_mut("transport").and_then(Value::as_table_mut) {
+            const RENAMES: &[(&str, &str)] = &[
+                ("tcpMux", "tcp_mux"),
+                ("tcpMuxKeepaliveInterval", "tcp_mux_keepalive_interval"),
+                ("heartbeatTimeout", "heartbeat_timeout"),
+                ("maxPoolCount", "max_pool_count"),
+                ("tcpKeepalive", "tcp_keepalive"),
+            ];
+            for (from, to) in RENAMES {
+                if let Some(v) = transport.remove(*from) {
+                    transport.entry((*to).to_string()).or_insert(v);
+                }
+            }
+        }
 
         // MEDIUM-5: Normalize [auth.oidc] sub-table → auth.oidc_* flat fields
         if let Some(toml::Value::Table(ref mut auth_table)) = table.get_mut("auth") {
@@ -1813,6 +1898,9 @@ fn normalize_client_config(value: &mut toml::Value) {
                     let flat_key = match k.as_str() {
                         "protocol" => "transport_protocol",
                         "tcpMux" => "tcp_mux",
+                        "heartbeatInterval" => "heartbeat_interval",
+                        "heartbeatTimeout" => "heartbeat_timeout",
+                        "dialServerTimeout" => "dial_server_timeout",
                         other => other,
                     };
                     table.entry(flat_key.to_string()).or_insert(v);
@@ -1968,14 +2056,15 @@ pub fn load_server_config(
     path: &str,
     strict_config: bool,
 ) -> Result<ServerConfig, Box<dyn std::error::Error>> {
-    let mut cfg = load_config_from_file::<ServerConfig>(
+    let (mut cfg, presence) = load_config_from_file::<ServerConfig>(
         path,
         strict_config,
         known_server_keys,
         normalize_server_config,
         validate_server_config,
     )?;
-    cfg.transport.complete();
+    cfg.transport
+        .complete_with_heartbeat_timeout_set(presence.server_heartbeat_timeout_set);
     cfg.complete();
     Ok(cfg)
 }
@@ -1986,14 +2075,17 @@ pub fn load_client_config(
     path: &str,
     strict_config: bool,
 ) -> Result<ClientConfig, Box<dyn std::error::Error>> {
-    let mut cfg = load_config_from_file::<ClientConfig>(
+    let (mut cfg, presence) = load_config_from_file::<ClientConfig>(
         path,
         strict_config,
         known_client_keys,
         normalize_client_config,
         validate_client_config,
     )?;
-    cfg.complete();
+    cfg.complete_with_heartbeat_set(
+        presence.client_heartbeat_interval_set,
+        presence.client_heartbeat_timeout_set,
+    );
     Ok(cfg)
 }
 
@@ -2401,6 +2493,11 @@ fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "enable_prometheus",
         "tcp_mux",
         "tcp_mux_keepalive_interval",
+        "tcpMux",
+        "tcpMuxKeepaliveInterval",
+        "heartbeatTimeout",
+        "maxPoolCount",
+        "tcpKeepalive",
         "max_connections",
         "max_accept_rate",
         "graceful_shutdown_timeout",
@@ -2845,12 +2942,89 @@ token = "test-token"
     }
 
     #[test]
-    fn test_tcp_mux_keeps_application_heartbeat_liveness_enabled() {
+    fn test_tcp_mux_defaults_application_heartbeats_disabled_go_compat() {
         let cfg = load_client_config_from_str("server_addr = '127.0.0.1'").unwrap();
 
         assert!(cfg.tcp_mux);
+        assert_eq!(cfg.heartbeat_interval, -1);
+        assert_eq!(cfg.heartbeat_timeout, -1);
+    }
+
+    #[test]
+    fn test_tcp_mux_preserves_explicit_application_heartbeats() {
+        let cfg = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+[transport]
+heartbeatInterval = 15
+heartbeatTimeout = 45
+"#,
+        )
+        .unwrap();
+
+        assert!(cfg.tcp_mux);
+        assert_eq!(cfg.heartbeat_interval, 15);
+        assert_eq!(cfg.heartbeat_timeout, 45);
+    }
+
+    #[test]
+    fn test_tcp_mux_disabled_keeps_application_heartbeat_defaults() {
+        let cfg = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+[transport]
+tcpMux = false
+"#,
+        )
+        .unwrap();
+
+        assert!(!cfg.tcp_mux);
         assert_eq!(cfg.heartbeat_interval, default_heartbeat_interval());
         assert_eq!(cfg.heartbeat_timeout, default_heartbeat_timeout());
+    }
+
+    #[test]
+    fn test_dial_server_timeout_zero_means_default() {
+        let cfg = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+[transport]
+dialServerTimeout = 0
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.dial_server_timeout, default_dial_server_timeout());
+    }
+
+    #[test]
+    fn test_go_v0701_server_transport_mux_toml() {
+        let cfg = load_server_config_from_str(
+            r#"
+bindPort = 7000
+[transport]
+tcpMux = false
+tcpMuxKeepaliveInterval = 15
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.transport.tcp_mux, Some(false));
+        assert_eq!(cfg.transport.tcp_mux_keepalive_interval, 15);
+    }
+
+    #[test]
+    fn test_explicit_server_heartbeat_timeout_90_is_preserved_with_tcp_mux() {
+        let cfg = load_server_config_from_str(
+            r#"
+bindPort = 7000
+[transport]
+heartbeatTimeout = 90
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.transport.heartbeat_timeout, 90);
     }
 
     #[test]
@@ -3031,6 +3205,9 @@ disableCustomTLSFirstByte = false
         server_file
             .write_all(
                 br#"bindPort = 7000
+[transport]
+tcpMux = false
+tcpMuxKeepaliveInterval = 30
 [transport.tls]
 force = true
 certFile = "/etc/frp/server.crt"

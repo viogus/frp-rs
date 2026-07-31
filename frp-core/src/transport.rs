@@ -58,6 +58,12 @@ pub enum ConnectionType {
 /// The WebSocket path used by frp (matching the Go version).
 pub const FRP_WEBSOCKET_PATH: &str = "/~!frp";
 
+/// Maximum WebSocket frame payload accepted by the raw decoder. The V2
+/// framing layer permits 64 KiB messages, so the transport must not clamp
+/// below that; the V1 10 KiB limit stays enforced by `protocol.rs`.
+#[cfg(feature = "websocket")]
+const MAX_WS_FRAME_PAYLOAD: u64 = crate::protocol::V2_MAX_FRAME_PAYLOAD as u64;
+
 /// Transport protocol variant.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransportProtocol {
@@ -472,9 +478,7 @@ impl AsyncRead for WsByteStream {
                                             filled: 0,
                                         };
                                     } else {
-                                        if raw_len
-                                            > crate::protocol::V1_MAX_MSG_LENGTH as u64 + 4096
-                                        {
+                                        if raw_len > MAX_WS_FRAME_PAYLOAD {
                                             *raw_read_state = RawReadState::Idle;
                                             return Poll::Ready(Err(io::Error::new(
                                                 io::ErrorKind::InvalidData,
@@ -532,9 +536,7 @@ impl AsyncRead for WsByteStream {
                                         return Poll::Pending;
                                     }
                                     let payload_len = u16::from_be_bytes(*ext) as u64;
-                                    if payload_len
-                                        > crate::protocol::V1_MAX_MSG_LENGTH as u64 + 4096
-                                    {
+                                    if payload_len > MAX_WS_FRAME_PAYLOAD {
                                         *raw_read_state = RawReadState::Idle;
                                         return Poll::Ready(Err(io::Error::new(
                                             io::ErrorKind::InvalidData,
@@ -591,9 +593,7 @@ impl AsyncRead for WsByteStream {
                                         return Poll::Pending;
                                     }
                                     let payload_len = u64::from_be_bytes(*ext);
-                                    if payload_len
-                                        > crate::protocol::V1_MAX_MSG_LENGTH as u64 + 4096
-                                    {
+                                    if payload_len > MAX_WS_FRAME_PAYLOAD {
                                         *raw_read_state = RawReadState::Idle;
                                         return Poll::Ready(Err(io::Error::new(
                                             io::ErrorKind::InvalidData,
@@ -2950,7 +2950,13 @@ pub fn build_tls_acceptor(
 /// Uses ECDSA P-256 (ring backend) — Go frp uses RSA 2048 but the algorithm
 /// difference is irrelevant for TLS compatibility.
 #[cfg(feature = "tls")]
-pub fn generate_self_signed_tls_config() -> Result<rustls::ServerConfig, crate::Error> {
+fn generate_self_signed_cert_and_key() -> Result<
+    (
+        rustls::pki_types::CertificateDer<'static>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    crate::Error,
+> {
     use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
 
     let key_pair = KeyPair::generate().map_err(|e| {
@@ -2981,8 +2987,15 @@ pub fn generate_self_signed_tls_config() -> Result<rustls::ServerConfig, crate::
     })?;
 
     let cert_der = cert.der().clone();
-    let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into();
+    let key_der: rustls::pki_types::PrivateKeyDer<'static> =
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into();
 
+    Ok((cert_der, key_der))
+}
+
+#[cfg(feature = "tls")]
+pub fn generate_self_signed_tls_config() -> Result<rustls::ServerConfig, crate::Error> {
+    let (cert_der, key_der) = generate_self_signed_cert_and_key()?;
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)
@@ -2995,26 +3008,72 @@ pub fn generate_self_signed_tls_config() -> Result<rustls::ServerConfig, crate::
     Ok(config)
 }
 
+/// Build a self-signed server identity, optionally requiring and verifying
+/// client certificates against `ca_file` (mTLS). Go frp does this whenever
+/// `trustedCaFile` is set, even with a generated server certificate.
+#[cfg(feature = "tls")]
+fn generate_self_signed_tls_config_with_ca(
+    ca_file: Option<&str>,
+) -> Result<rustls::ServerConfig, crate::Error> {
+    let (cert_der, key_der) = generate_self_signed_cert_and_key()?;
+    match ca_file {
+        Some(ca_path) if !ca_path.is_empty() => {
+            let roots = build_root_store(Some(ca_path))?.ok_or_else(|| {
+                crate::Error::Transport(TransportError::Other("empty client CA store".into()))
+            })?;
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!(
+                        "build client cert verifier: {e}"
+                    )))
+                })?;
+            rustls::ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(vec![cert_der], key_der)
+                .map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!(
+                        "build mTLS config from generated cert: {e}"
+                    )))
+                })
+        }
+        _ => rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .map_err(|e| {
+                crate::Error::Transport(TransportError::Other(format!(
+                    "build TLS config from generated cert: {e}"
+                )))
+            }),
+    }
+}
+
 /// Build a [`TlsAcceptor`] from cert/key files, or auto-generate a self-signed
 /// cert when no files are configured (matching Go frp behavior).
 ///
 /// When both `cert_file` and `key_file` are non-empty, this delegates to
-/// [`build_tls_acceptor`]. Otherwise, it calls [`generate_self_signed_tls_config`]
-/// to create an ephemeral self-signed certificate.
-///
-/// Auto-generated certs never enable mTLS (CA verification) — if you need
-/// mTLS, provide explicit cert files and a CA file.
+/// [`build_tls_acceptor`]. When `ca_file` is non-empty, the acceptor always
+/// requires and verifies client certificates (mTLS), even when the server
+/// identity is a generated self-signed certificate (Go frp compat).
+/// Providing exactly one of cert/key is a startup error.
 #[cfg(feature = "tls")]
 pub fn build_tls_acceptor_or_generate(
     cert_file: &str,
     key_file: &str,
     ca_file: Option<&str>,
 ) -> Result<TlsAcceptor, crate::Error> {
-    if !cert_file.is_empty() && !key_file.is_empty() {
+    let cert_set = !cert_file.is_empty();
+    let key_set = !key_file.is_empty();
+    if cert_set != key_set {
+        return Err(crate::Error::Transport(TransportError::Other(
+            "TLS requires both cert_file and key_file to be set; got only one".into(),
+        )));
+    }
+    if cert_set {
         return build_tls_acceptor(cert_file, key_file, ca_file);
     }
     tracing::info!("No TLS cert files configured — auto-generating self-signed certificate");
-    let config = generate_self_signed_tls_config()?;
+    let config = generate_self_signed_tls_config_with_ca(ca_file)?;
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
@@ -3407,6 +3466,153 @@ mod tests {
         assert!(
             result.is_err(),
             "TLS acceptor with missing files should fail"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tls")]
+    fn test_build_tls_acceptor_or_generate_rejects_partial_cert_key() {
+        let cert_only = build_tls_acceptor_or_generate("/tmp/cert.pem", "", None)
+            .err()
+            .expect("cert without key must fail");
+        assert!(
+            cert_only
+                .to_string()
+                .contains("both cert_file and key_file"),
+            "unexpected error: {cert_only}"
+        );
+        let key_only = build_tls_acceptor_or_generate("", "/tmp/key.pem", None)
+            .err()
+            .expect("key without cert must fail");
+        assert!(
+            key_only.to_string().contains("both cert_file and key_file"),
+            "unexpected error: {key_only}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "tls")]
+    async fn test_generated_mtls_rejects_client_without_cert() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        use rustls::pki_types::ServerName;
+        use std::io::Write;
+        use std::sync::Arc;
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio_rustls::TlsConnector;
+
+        let mut ca_params =
+            CertificateParams::new(Vec::<String>::default()).expect("empty SAN is valid");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .key_usages
+            .push(rcgen::KeyUsagePurpose::DigitalSignature);
+        ca_params
+            .key_usages
+            .push(rcgen::KeyUsagePurpose::KeyCertSign);
+        ca_params.key_usages.push(rcgen::KeyUsagePurpose::CrlSign);
+        let ca_key = KeyPair::generate().expect("generate CA key");
+        let ca_cert = ca_params
+            .self_signed(&ca_key)
+            .expect("self-sign CA certificate");
+
+        let mut ca_file = tempfile::NamedTempFile::new().expect("create CA tempfile");
+        let ca_der = ca_cert.der();
+        let ca_b64 = data_encoding::BASE64.encode(ca_der.as_ref());
+        let mut ca_pem = String::from("-----BEGIN CERTIFICATE-----\n");
+        for chunk in ca_b64.as_bytes().chunks(64) {
+            ca_pem.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
+            ca_pem.push('\n');
+        }
+        ca_pem.push_str("-----END CERTIFICATE-----\n");
+        ca_file.write_all(ca_pem.as_bytes()).expect("write CA PEM");
+
+        let acceptor = build_tls_acceptor_or_generate(
+            "",
+            "",
+            Some(ca_file.path().to_str().expect("temp path")),
+        )
+        .expect("generated identity with CA must build");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept connection");
+            acceptor.accept(stream).await
+        });
+
+        let client_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(InsecureSkipVerify))
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let tcp = TcpStream::connect(addr).await.expect("connect to server");
+        let _handshake = connector
+            .connect(ServerName::try_from("frp").expect("valid server name"), tcp)
+            .await;
+
+        let server_result = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server handshake must not hang")
+            .expect("server task must complete");
+        assert!(
+            server_result.is_err(),
+            "mTLS acceptor must reject a client without a certificate"
+        );
+    }
+
+    #[cfg(feature = "websocket")]
+    fn ws_binary_frame(payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0x82];
+        if payload.len() <= 125 {
+            frame.push(payload.len() as u8);
+        } else if payload.len() <= u16::MAX as usize {
+            frame.push(126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            frame.push(127);
+            frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "websocket")]
+    async fn ws_raw_accepts_v2_sized_frames_and_rejects_oversized() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut server_io, client_io) = tokio::io::duplex(1024 * 1024);
+        let mut ws = WsByteStream::from_raw(Box::new(client_io), false);
+
+        // Between the old 14 KiB clamp and the V2 64 KiB cap: the WS
+        // transport must accept it; V1 enforcement happens in protocol.rs.
+        let payload = vec![0x5a; 20 * 1024];
+        server_io
+            .write_all(&ws_binary_frame(&payload))
+            .await
+            .unwrap();
+        let mut out = vec![0u8; payload.len()];
+        let n = ws.read(&mut out).await.unwrap();
+        assert_eq!(n, payload.len());
+        assert_eq!(&out[..n], &payload[..]);
+
+        // Exactly 64 KiB is the V2 limit and must pass the WS decoder.
+        let big = vec![0x6b; 64 * 1024];
+        server_io.write_all(&ws_binary_frame(&big)).await.unwrap();
+        let mut big_out = vec![0u8; big.len()];
+        let n2 = ws.read(&mut big_out).await.unwrap();
+        assert_eq!(n2, big.len());
+        assert_eq!(&big_out[..n2], &big[..]);
+
+        // One byte over the V2 cap is rejected at the transport layer.
+        let huge = vec![0x6c; 64 * 1024 + 1];
+        server_io.write_all(&ws_binary_frame(&huge)).await.unwrap();
+        let err = ws.read(&mut big_out).await.unwrap_err();
+        assert!(
+            err.to_string().contains("WS frame too large"),
+            "unexpected error: {err}"
         );
     }
 }

@@ -132,6 +132,10 @@ pub fn decompress(_data: &[u8]) -> Result<Vec<u8>, String> {
 pub struct SnappyDecompressor {
     buf: Vec<u8>,
     offset: usize,
+    /// Reusable decompressed-output scratch. Kept at the largest frame size
+    /// seen so far so `decompress` overwrites it in place instead of paying
+    /// a per-frame zero-fill or allocation.
+    scratch: Vec<u8>,
 }
 
 /// State returned by [`SnappyDecompressor::feed_into_progress`].
@@ -156,6 +160,7 @@ impl SnappyDecompressor {
         Self {
             buf: Vec::new(),
             offset: 0,
+            scratch: Vec::new(),
         }
     }
 
@@ -284,14 +289,17 @@ impl SnappyDecompressor {
                             "snappy: decompressed output {decompressed_len} exceeds per-chunk {MAX_SNAPPY_CHUNK} byte limit"
                         ));
                     }
-                    out.resize(decompressed_len, 0);
+                    if self.scratch.len() < decompressed_len {
+                        self.scratch.resize(decompressed_len, 0);
+                    }
                     let mut decoder = snap::raw::Decoder::new();
                     let written = decoder
-                        .decompress(compressed, out)
+                        .decompress(compressed, &mut self.scratch[..decompressed_len])
                         .map_err(|e| format!("snappy decompress: {e}"))?;
                     if written != decompressed_len {
                         return Err("snappy: decompressed output length changed".into());
                     }
+                    out.extend_from_slice(&self.scratch[..written]);
                     self.offset += total;
                     return Ok(());
                 }
