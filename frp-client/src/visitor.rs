@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -9,6 +10,9 @@ use tracing::{debug, info, warn};
 
 use frp_core::msg::{self, FrpMessage};
 use frp_core::transport::{dial_server, DialOptions, TransportProtocol};
+
+#[cfg(feature = "vnet")]
+type VnetTunTxMap = Arc<tokio::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
 
 /// Configuration for an STCP/XTCP visitor listener.
 pub(crate) struct VisitorListenerConfig {
@@ -70,6 +74,10 @@ pub(crate) struct VirtualNetVisitorConfig {
     /// Shared client-side vnet controller used for route registration and
     /// inbound packet delivery.
     pub controller: Arc<frp_vnet::controller::ClientVnetController>,
+    /// TUN delivery channels keyed by proxy name. Tunnel ingress packets are
+    /// forwarded into the local TUN-backed vnet proxy so return traffic from
+    /// a remote `virtual_net` plugin reaches the local TUN.
+    pub vnet_tun_tx: VnetTunTxMap,
     /// Graceful shutdown signal. When true, the tunnel exits and the route is
     /// unregistered.
     pub shutdown: Arc<AtomicBool>,
@@ -721,6 +729,7 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         run_id,
         destination_cidr,
         controller,
+        vnet_tun_tx,
         shutdown,
     } = config;
 
@@ -847,11 +856,13 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
                             tunnel_closed = true;
                         }
                         Ok(n) => {
-                            // frp-rs routes return traffic as control-conn
-                            // VnetPackets to local TUN-backed proxies, so bytes
-                            // arriving on the tunnel itself are not forwarded to
-                            // a TUN here yet.
-                            debug!(visitor_name = %name, n = %n, "Virtual net visitor tunnel ingress bytes ignored");
+                            // Return traffic sent by the remote provider on the
+                            // tunnel is delivered through the same TUN channels
+                            // used by control-connection VnetPackets.
+                            if !deliver_tunnel_ingress(&name, buf[..n].to_vec(), &vnet_tun_tx).await
+                            {
+                                debug!(visitor_name = %name, n = %n, "Virtual net visitor tunnel ingress bytes have no TUN target");
+                            }
                         }
                         Err(e) => {
                             warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': tunnel read error: {}", name, e);
@@ -871,6 +882,34 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
             return;
         }
     }
+}
+
+/// Deliver bytes received from a `virtual_net` visitor tunnel into the local
+/// TUN delivery channels used by control-connection [`FrpMessage::VnetPacket`]s.
+///
+/// Returns `true` when at least one TUN channel accepted the packet.
+#[cfg(feature = "vnet")]
+async fn deliver_tunnel_ingress(
+    visitor_name: &str,
+    packet: Vec<u8>,
+    vnet_tun_tx: &VnetTunTxMap,
+) -> bool {
+    let txs = vnet_tun_tx.lock().await;
+    let mut delivered = false;
+    for (proxy, tx) in txs.iter() {
+        match tx.try_send(packet.clone()) {
+            Ok(()) => delivered = true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    visitor_name = %visitor_name,
+                    proxy_name = %proxy,
+                    "virtual_net visitor TUN queue full; dropping packet"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+    delivered
 }
 
 /// Wait for `shutdown` or `delay`, whichever comes first. Returns `true` when
@@ -993,4 +1032,36 @@ fn list_local_ips() -> Vec<String> {
     }
 
     ips
+}
+
+#[cfg(all(test, feature = "vnet"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tunnel_ingress_delivers_to_local_tun_channels() {
+        let txs: VnetTunTxMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(16);
+        txs.lock().await.insert("tun-proxy".to_string(), tx);
+
+        assert!(
+            deliver_tunnel_ingress("vnet-visitor", vec![0x45], &txs).await,
+            "open TUN channel must accept the packet"
+        );
+        assert_eq!(rx.recv().await, Some(vec![0x45]));
+
+        let (closed_tx, closed_rx) = mpsc::channel::<Vec<u8>>(16);
+        txs.lock().await.insert("gone-tun".to_string(), closed_tx);
+        drop(closed_rx);
+        assert!(
+            deliver_tunnel_ingress("vnet-visitor", vec![0x46], &txs).await,
+            "an open channel still counts as delivered"
+        );
+
+        let empty: VnetTunTxMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        assert!(
+            !deliver_tunnel_ingress("vnet-visitor", vec![0x47], &empty).await,
+            "no TUN target must report undelivered"
+        );
+    }
 }

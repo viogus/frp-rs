@@ -490,7 +490,7 @@ Per-proxy client plugin configuration. The plugin runs on the client side and ha
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
-| `type` | `string` | — | `type` | Plugin type: `"http_proxy"`, `"socks5"`, `"static_file"`, `"unix_domain_socket"`, `"http2https"`, `"https2http"`, `"https2https"`, `"http2http"`, `"tls2raw"`. |
+| `type` | `string` | — | `type` | Plugin type: `"http_proxy"`, `"socks5"`, `"static_file"`, `"unix_domain_socket"`, `"http2https"`, `"https2http"`, `"https2https"`, `"http2http"`, `"tls2raw"`, `"virtual_net"`. |
 | `http_user` | `string` | `""` | `httpUser` | HTTP basic auth username for the plugin. |
 | `http_password` | `string` | `""` | `httpPassword` | HTTP basic auth password for the plugin. |
 | `local_addr` | `string` | `""` | `localAddr` | Local address for the plugin listener (e.g. `"127.0.0.1:3128"`). |
@@ -505,6 +505,9 @@ Per-proxy client plugin configuration. The plugin runs on the client side and ha
 | `secret_key` | `string` | `""` | `sk` | Secret key for STCP/XTCP visitor plugin auth. |
 | `bind_addr` | `string` | `""` | `bindAddr` | Local address for the visitor plugin listener. |
 | `bind_port` | `i32` | `0` | `bindPort` | Local port for the visitor plugin listener. `-1` disables binding. |
+
+`type = "virtual_net"` does not bind a listener; work connections are handed
+to the vnet controller and require a non-empty IPv4 `[virtualNet] address`.
 
 ### Proxy TOML Examples
 

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
@@ -83,7 +83,9 @@ pub(crate) struct WorkConnConfig {
     #[cfg(feature = "vnet")]
     pub vnet_tuns: VnetTunMap,
     #[cfg(feature = "vnet")]
-    pub vnet_routes: Arc<RwLock<frp_vnet::router::RouteTable>>,
+    pub vnet_controller: Arc<frp_vnet::controller::ClientVnetController>,
+    #[cfg(feature = "vnet")]
+    pub vnet_tun_tx: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
 }
 
 /// Bundled parameters for work connection transport acquisition.
@@ -359,6 +361,136 @@ async fn run_udp_work_conn(
     }
 }
 
+/// Bridge a `virtual_net` plugin work connection to the shared vnet controller.
+///
+/// Equivalent to Go frp's `VnetController.StartServerConnReadLoop`: bytes
+/// arriving from the remote visitor tunnel are written into the local TUN,
+/// and the remote source IP is registered so TUN return packets are written
+/// back to this work connection.
+#[cfg(feature = "vnet")]
+async fn run_virtual_net_plugin_work_conn(
+    work: IoStream,
+    proxy_name: String,
+    vnet_controller: Arc<frp_vnet::controller::ClientVnetController>,
+    vnet_tun_tx: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+) {
+    let tun_tx = {
+        let txs = vnet_tun_tx.lock().await;
+        txs.get(&proxy_name).cloned()
+    };
+    let Some(tun_tx) = tun_tx else {
+        warn!(proxy_name = %proxy_name, "virtual_net plugin: no TUN channel for '{}'", proxy_name);
+        return;
+    };
+
+    let (mut work_r, mut work_w) = work.into_split().expect("work conn split");
+    let (return_tx, mut return_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+    let reader_name = proxy_name.clone();
+    let reader_ctrl = vnet_controller.clone();
+    let reader_rtx = return_tx.clone();
+    let reader_tun = tun_tx;
+    let mut reader_cancel = cancel_rx.clone();
+    let reader = async move {
+        let mut registered_ips = Vec::<std::net::Ipv4Addr>::new();
+        let mut buf = vec![0u8; 1420];
+        loop {
+            tokio::select! {
+                biased;
+                changed = reader_cancel.changed() => {
+                    if changed.is_err() || *reader_cancel.borrow() { break; }
+                }
+                n = work_r.read(&mut buf) => {
+                    match n {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let packet = buf[..n].to_vec();
+                            // Learn the remote host's source IP so return
+                            // packets can be routed back on this connection.
+                            if packet.len() >= 20 && (packet[0] >> 4) == 4 {
+                                let src_ip = std::net::Ipv4Addr::new(
+                                    packet[12], packet[13], packet[14], packet[15],
+                                );
+                                reader_ctrl
+                                    .register_server_conn(src_ip, reader_rtx.clone())
+                                    .await;
+                                registered_ips.push(src_ip);
+                            }
+                            if let Err(e) = reader_tun.try_send(packet) {
+                                match e {
+                                    mpsc::error::TrySendError::Full(_) => {
+                                        warn!(
+                                            proxy_name = %reader_name,
+                                            "virtual_net plugin TUN queue full; dropping packet"
+                                        );
+                                    }
+                                    mpsc::error::TrySendError::Closed(_) => break,
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                proxy_name = %reader_name,
+                                error = %e,
+                                "virtual_net plugin work conn read error: {}",
+                                e
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        for src_ip in &registered_ips {
+            reader_ctrl
+                .unregister_server_conn_if_matches(src_ip, &reader_rtx)
+                .await;
+        }
+    };
+
+    let writer_name = proxy_name;
+    let mut writer_cancel = cancel_rx;
+    let writer = async move {
+        loop {
+            tokio::select! {
+                biased;
+                changed = writer_cancel.changed() => {
+                    if changed.is_err() || *writer_cancel.borrow() { break; }
+                }
+                pkt = return_rx.recv() => {
+                    match pkt {
+                        Some(pkt) => {
+                            if let Err(e) = work_w.write_all(&pkt).await {
+                                warn!(
+                                    proxy_name = %writer_name,
+                                    error = %e,
+                                    "virtual_net plugin work conn write error: {}",
+                                    e
+                                );
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    };
+
+    tokio::pin!(reader, writer);
+    tokio::select! {
+        _ = &mut reader => {
+            let _ = cancel_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_millis(100), &mut writer).await;
+        }
+        _ = &mut writer => {
+            let _ = cancel_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_millis(100), &mut reader).await;
+        }
+    }
+}
+
 /// Spawn a single work connection task.
 ///
 /// The task:
@@ -409,7 +541,9 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             #[cfg(feature = "vnet")]
                 vnet_tuns: _vnet_tuns,
             #[cfg(feature = "vnet")]
-                vnet_routes: _vnet_routes,
+            vnet_controller,
+            #[cfg(feature = "vnet")]
+            vnet_tun_tx,
         } = cfg;
 
         let label = if pool_id >= 0 {
@@ -758,6 +892,19 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     return;
                 }
 
+                #[cfg(feature = "vnet")]
+                if info.plugin == "virtual_net" {
+                    info!(label = %label, proxy_name = %proxy_name, "Work conn {} handed to virtual_net plugin controller", label);
+                    run_virtual_net_plugin_work_conn(
+                        work,
+                        proxy_name.clone(),
+                        vnet_controller,
+                        vnet_tun_tx,
+                    )
+                    .await;
+                    return;
+                }
+
                 if info.proxy_type == "udp" {
                     // UDP proxy: bridge work conn ↔ local UDP socket
                     let sock = {
@@ -977,7 +1124,9 @@ mod tests {
             #[cfg(feature = "vnet")]
             vnet_tuns: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "vnet")]
-            vnet_routes: Arc::new(RwLock::new(frp_vnet::router::RouteTable::new())),
+            vnet_controller: Arc::new(frp_vnet::controller::ClientVnetController::new()),
+            #[cfg(feature = "vnet")]
+            vnet_tun_tx: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1148,5 +1297,52 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn virtual_net_plugin_work_conn_round_trips_packets() {
+        use std::net::Ipv4Addr;
+        use tokio::io::AsyncWriteExt;
+
+        let controller = Arc::new(frp_vnet::controller::ClientVnetController::new());
+        let tun_txs = Arc::new(Mutex::new(HashMap::new()));
+        let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(16);
+        tun_txs
+            .lock()
+            .await
+            .insert("vnet-proxy".to_string(), tun_tx);
+
+        let (work, mut peer) = tokio::io::duplex(4096);
+        let task = tokio::spawn(run_virtual_net_plugin_work_conn(
+            IoStream::SshChannel(Box::new(work)),
+            "vnet-proxy".to_string(),
+            controller.clone(),
+            tun_txs,
+        ));
+
+        let inbound = vec![
+            0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, 100, 86, 0, 1,
+            100, 86, 0, 2,
+        ];
+        peer.write_all(&inbound).await.unwrap();
+        assert_eq!(tun_rx.recv().await, Some(inbound.clone()));
+
+        let src = Ipv4Addr::new(100, 86, 0, 1);
+        let return_tx = controller
+            .server_conn_sender(&src)
+            .await
+            .expect("remote source IP must be registered for return traffic");
+        return_tx.try_send(inbound.clone()).unwrap();
+        let mut buf = vec![0u8; 64];
+        let n = peer.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &inbound[..]);
+
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(controller.server_conn_sender(&src).await.is_none());
     }
 }

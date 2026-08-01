@@ -1755,12 +1755,43 @@ fn validate_client_config(cfg: &ClientConfig) -> Result<(), String> {
         };
         validate_auth_token_source(token, &auth.token_source)?;
     }
-    if (!cfg.virtual_net.address.is_empty() || cfg.visitors.iter().any(is_virtual_net_visitor))
+    if (!cfg.virtual_net.address.is_empty()
+        || cfg.visitors.iter().any(is_virtual_net_visitor)
+        || cfg.proxies.iter().any(is_virtual_net_proxy_plugin))
         && !cfg.feature.gates.get(VIRTUAL_NET).copied().unwrap_or(false)
     {
         return Err(format!(
             "VirtualNet feature is not enabled; enable it by setting [featureGates] {VIRTUAL_NET} = true"
         ));
+    }
+    for p in cfg
+        .proxies
+        .iter()
+        .filter(|p| is_virtual_net_proxy_plugin(p))
+    {
+        if p.proxy_type != "tcp" {
+            return Err(format!(
+                "proxy '{}': virtual_net plugin requires proxy type tcp",
+                p.name
+            ));
+        }
+        if cfg.virtual_net.address.is_empty() {
+            return Err(format!(
+                "proxy '{}': virtual_net plugin requires [virtualNet] address",
+                p.name
+            ));
+        }
+        if cfg
+            .virtual_net
+            .address
+            .parse::<std::net::Ipv4Addr>()
+            .is_err()
+        {
+            return Err(format!(
+                "proxy '{}': invalid [virtualNet] address [{}]",
+                p.name, cfg.virtual_net.address
+            ));
+        }
     }
     for v in cfg.visitors.iter().filter(|v| is_virtual_net_visitor(v)) {
         let Some(plugin) = &v.plugin else {
@@ -1786,6 +1817,12 @@ fn is_virtual_net_visitor(v: &VisitorConfig) -> bool {
     v.plugin
         .as_ref()
         .is_some_and(|p| p.plugin_type == "virtual_net")
+}
+
+fn is_virtual_net_proxy_plugin(p: &ProxyConfig) -> bool {
+    p.plugin
+        .as_ref()
+        .is_some_and(|pl| pl.plugin_type == "virtual_net")
 }
 
 /// Reject duplicate proxy or visitor names. Go frp v0.70.0 compat:
@@ -3684,6 +3721,117 @@ destinationIP = "not-an-ip"
         .unwrap_err()
         .to_string();
         assert!(err.contains("invalid destination IP address"), "{err}");
+    }
+
+    #[test]
+    fn test_virtual_net_proxy_plugin_nested_and_flat_config() {
+        let nested = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[featureGates]
+VirtualNet = true
+
+[virtualNet]
+address = "10.0.0.2"
+
+[[proxies]]
+name = "vnet-provider"
+type = "tcp"
+remotePort = 0
+
+[proxies.plugin]
+type = "virtual_net"
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(nested).unwrap();
+        let plugin = cfg.proxies[0]
+            .plugin
+            .as_ref()
+            .expect("nested virtual_net plugin");
+        assert_eq!(plugin.plugin_type, "virtual_net");
+
+        let flat = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[featureGates]
+VirtualNet = true
+
+[virtualNet]
+address = "10.0.0.2"
+
+[[proxies]]
+name = "vnet-provider"
+type = "tcp"
+remotePort = 0
+plugin = "virtual_net"
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(flat).unwrap();
+        let plugin = cfg.proxies[0]
+            .plugin
+            .as_ref()
+            .expect("flat virtual_net plugin");
+        assert_eq!(plugin.plugin_type, "virtual_net");
+    }
+
+    #[test]
+    fn test_virtual_net_proxy_plugin_validation() {
+        // Feature gate required.
+        let err = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+
+[virtualNet]
+address = "10.0.0.2"
+
+[[proxies]]
+name = "vnet-provider"
+type = "tcp"
+plugin = "virtual_net"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("VirtualNet feature is not enabled"), "{err}");
+
+        // [virtualNet] address is required.
+        let err = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+
+[featureGates]
+VirtualNet = true
+
+[[proxies]]
+name = "vnet-provider"
+type = "tcp"
+plugin = "virtual_net"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires [virtualNet] address"), "{err}");
+
+        // The plugin is only valid on tcp proxies.
+        let err = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+
+[featureGates]
+VirtualNet = true
+
+[virtualNet]
+address = "10.0.0.2"
+
+[[proxies]]
+name = "vnet-provider"
+type = "stcp"
+plugin = "virtual_net"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires proxy type tcp"), "{err}");
     }
 
     #[test]

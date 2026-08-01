@@ -345,6 +345,11 @@ impl Service {
 
         for p in &cfg.proxies {
             if let Some(ref plugin_cfg) = p.plugin {
+                // virtual_net is not a local-listener plugin; work connections
+                // are handed to the shared vnet controller in work_conn.rs.
+                if plugin_cfg.plugin_type == "virtual_net" {
+                    continue;
+                }
                 let result = if plugin_cfg.plugin_type == "tls2raw" {
                     // Propagate proxy-level proxyProtocolVersion into the
                     // plugin config so the tls2raw handler can read+strip
@@ -803,71 +808,88 @@ impl Service {
                         }
 
                         #[cfg(feature = "vnet")]
-                        if p.proxy_type == "vnet" && !p.vnet_ip.is_empty() {
+                        {
                             use std::net::Ipv4Addr;
-                            let ip: Ipv4Addr = match p.vnet_ip.parse() {
-                                Ok(ip) => ip,
-                                Err(e) => {
-                                    warn!(proxy_name = %p.name, error = %e, "invalid vnet_ip '{}'", p.vnet_ip);
-                                    continue;
-                                }
-                            };
-                            let netmask: Ipv4Addr = match p.vnet_netmask.parse() {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    warn!(proxy_name = %p.name, error = %e, "invalid vnet_netmask '{}'", p.vnet_netmask);
-                                    continue;
-                                }
-                            };
-                            let mtu = p.vnet_mtu;
+                            let is_vnet_proxy = p.proxy_type == "vnet" && !p.vnet_ip.is_empty();
+                            let is_vnet_plugin = p
+                                .plugin
+                                .as_ref()
+                                .is_some_and(|pl| pl.plugin_type == "virtual_net")
+                                && !cfg_local.virtual_net.address.is_empty();
+                            if is_vnet_proxy || is_vnet_plugin {
+                                let (ip, netmask, mtu) = if is_vnet_proxy {
+                                    (p.vnet_ip.clone(), p.vnet_netmask.clone(), p.vnet_mtu)
+                                } else {
+                                    (
+                                        cfg_local.virtual_net.address.clone(),
+                                        "255.255.255.0".to_string(),
+                                        1420,
+                                    )
+                                };
+                                let ip: Ipv4Addr = match ip.parse() {
+                                    Ok(ip) => ip,
+                                    Err(e) => {
+                                        warn!(proxy_name = %p.name, error = %e, "invalid vnet address '{}'", ip);
+                                        continue;
+                                    }
+                                };
+                                let netmask: Ipv4Addr = match netmask.parse() {
+                                    Ok(m) => m,
+                                    Err(e) => {
+                                        warn!(proxy_name = %p.name, error = %e, "invalid vnet_netmask '{}'", netmask);
+                                        continue;
+                                    }
+                                };
 
-                            match frp_vnet::tun::open_tun("").await {
-                                Ok(tun) => {
-                                    let tun_name = tun.name().to_string();
-                                    if let Err(e) = tun.configure(ip, netmask, mtu) {
-                                        warn!(proxy_name = %p.name, error = %e, "TUN configure failed");
-                                    } else {
-                                        info!(proxy_name = %p.name, name = %tun_name, "TUN device ready");
-                                    }
-                                    // Store TUN name for OS route injection
-                                    {
-                                        let mut names = self.vnet_tun_names.lock().await;
-                                        names.insert(p.name.clone(), tun_name);
-                                    }
-                                    // Store TUN device for later controller spawning.
-                                    // The controller is spawned after the control
-                                    // connection writer is created.
-                                    {
-                                        let mut tuns = self.vnet_tuns.lock().await;
-                                        tuns.insert(p.name.clone(), Some(tun));
-                                    }
-                                    // Send VnetRouteAdvertise if subnet is configured
-                                    if !p.advertise_subnet.is_empty() {
-                                        let adv = FrpMessage::VnetRouteAdvertise(
-                                            msg::VnetRouteAdvertise {
-                                                proxy_name: p.name.clone(),
-                                                subnet: p.advertise_subnet.clone(),
-                                                virtual_net: if p.virtual_net.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(p.virtual_net.clone())
+                                match frp_vnet::tun::open_tun("").await {
+                                    Ok(tun) => {
+                                        let tun_name = tun.name().to_string();
+                                        if let Err(e) = tun.configure(ip, netmask, mtu) {
+                                            warn!(proxy_name = %p.name, error = %e, "TUN configure failed");
+                                        } else {
+                                            info!(proxy_name = %p.name, name = %tun_name, "TUN device ready");
+                                        }
+                                        // Store TUN name for OS route injection
+                                        {
+                                            let mut names = self.vnet_tun_names.lock().await;
+                                            names.insert(p.name.clone(), tun_name);
+                                        }
+                                        // Store TUN device for later controller spawning.
+                                        // The controller is spawned after the control
+                                        // connection writer is created.
+                                        {
+                                            let mut tuns = self.vnet_tuns.lock().await;
+                                            tuns.insert(p.name.clone(), Some(tun));
+                                        }
+                                        // Send VnetRouteAdvertise if the proxy owns a subnet.
+                                        if p.proxy_type == "vnet" && !p.advertise_subnet.is_empty()
+                                        {
+                                            let adv = FrpMessage::VnetRouteAdvertise(
+                                                msg::VnetRouteAdvertise {
+                                                    proxy_name: p.name.clone(),
+                                                    subnet: p.advertise_subnet.clone(),
+                                                    virtual_net: if p.virtual_net.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(p.virtual_net.clone())
+                                                    },
                                                 },
-                                            },
-                                        );
-                                        let send_result = if v2 {
-                                            control_stream.write_v2_frame(&adv).await
-                                        } else {
-                                            control_stream.write_v1_frame(&adv).await
-                                        };
-                                        if let Err(e) = send_result {
-                                            warn!(proxy_name = %p.name, error = %e, "failed to send VnetRouteAdvertise");
-                                        } else {
-                                            info!(proxy_name = %p.name, subnet = %p.advertise_subnet, "VnetRouteAdvertise sent");
+                                            );
+                                            let send_result = if v2 {
+                                                control_stream.write_v2_frame(&adv).await
+                                            } else {
+                                                control_stream.write_v1_frame(&adv).await
+                                            };
+                                            if let Err(e) = send_result {
+                                                warn!(proxy_name = %p.name, error = %e, "failed to send VnetRouteAdvertise");
+                                            } else {
+                                                info!(proxy_name = %p.name, subnet = %p.advertise_subnet, "VnetRouteAdvertise sent");
+                                            }
                                         }
                                     }
-                                }
-                                Err(e) => {
-                                    warn!(proxy_name = %p.name, error = %e, "TUN open failed (need root/CAP_NET_ADMIN?)");
+                                    Err(e) => {
+                                        warn!(proxy_name = %p.name, error = %e, "TUN open failed (need root/CAP_NET_ADMIN?)");
+                                    }
                                 }
                             }
                         }
@@ -940,11 +962,14 @@ impl Service {
                             txs.insert(proxy_name.clone(), tun_tx);
                         }
                         let ctl_writer = writer.clone();
-                        let routes = self.vnet_controller.route_table();
+                        let client_controller = self.vnet_controller.clone();
                         let pn = proxy_name.clone();
                         tokio::spawn(async move {
-                            let ctrl =
-                                frp_vnet::controller::VnetController::new(pn.clone(), routes, v2);
+                            let ctrl = frp_vnet::controller::VnetController::new(
+                                pn.clone(),
+                                client_controller,
+                                v2,
+                            );
                             if let Err(e) = ctrl.run(tun, ctl_writer, tun_rx).await {
                                 tracing::error!(proxy_name = %pn, error = %e, "vnet controller exited with error");
                             }
@@ -1048,7 +1073,9 @@ impl Service {
                         #[cfg(feature = "vnet")]
                         vnet_tuns: self.vnet_tuns.clone(),
                         #[cfg(feature = "vnet")]
-                        vnet_routes: self.vnet_controller.route_table(),
+                        vnet_controller: self.vnet_controller.clone(),
+                        #[cfg(feature = "vnet")]
+                        vnet_tun_tx: self.vnet_tun_tx.clone(),
                     }
                 }};
             }
@@ -1108,6 +1135,7 @@ impl Service {
                             let user = cfg_local.user.clone();
                             let rid = run_id.clone();
                             let controller = self.vnet_controller.clone();
+                            let vnet_tun_tx = self.vnet_tun_tx.clone();
                             let shutdown = visitor_shutdown.clone();
                             let handle = tokio::spawn(async move {
                                 crate::visitor::run_virtual_net_visitor(
@@ -1128,6 +1156,7 @@ impl Service {
                                         run_id: rid,
                                         destination_cidr: adv.subnet,
                                         controller,
+                                        vnet_tun_tx,
                                         shutdown,
                                     },
                                 )
@@ -2249,6 +2278,9 @@ impl Service {
         proxy_name: &str,
         plugin_cfg: &frp_core::config::PluginConfig,
     ) -> Option<PluginHandle> {
+        if plugin_cfg.plugin_type == "virtual_net" {
+            return None;
+        }
         let result = if plugin_cfg.plugin_type == "visitor_plugin" {
             let current_cfg = self.cfg.read().await.clone();
             let ctx = PluginContext {

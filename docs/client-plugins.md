@@ -1,12 +1,15 @@
 # Client Plugin Reference
 
-frpc supports 9 client-side plugins. Plugins run as local servers on the frpc
-host, handling application-level protocols before forwarding traffic through
-the frp tunnel. When a proxy config includes a `[proxies.plugin]` section, frpc
-starts the plugin server instead of connecting to an existing local TCP port.
+frpc supports 10 client-side plugin types. Most plugins run as local servers
+on the frpc host, handling application-level protocols before forwarding
+traffic through the frp tunnel. When a proxy config includes a
+`[proxies.plugin]` section, frpc starts the plugin server instead of
+connecting to an existing local TCP port. The `virtual_net` plugin is the
+exception: it has no local listener and instead hands work connections to the
+vnet controller.
 
-All 9 plugins use `type = "tcp"` for the proxy. Each plugin binds its own
-local listener on `127.0.0.1:0` (OS-assigned port) and the frp tunnel
+Local-listener plugins use `type = "tcp"` for the proxy. Each plugin binds its
+own local listener on `127.0.0.1:0` (OS-assigned port) and the frp tunnel
 forwards traffic to it.
 
 Plugin configuration fields are documented in the TOML `[proxies.plugin]`
@@ -461,9 +464,37 @@ All fields available in the `[proxies.plugin]` section:
 | https2http       | **yes**              | no            | `local_addr`, `crt_file`, `key_file` |
 | https2https      | **yes**              | no            | `local_addr`, `crt_file`, `key_file` |
 | tls2raw          | **yes**              | no            | `local_addr`                  |
+| virtual_net      | no                   | no            | `[virtualNet] address`        |
 
 Plugins compiled without the required feature will return a descriptive error
 at startup rather than silently failing.
+
+------------------------------------------------------------------------------
+
+## Proxy Virtual Net Plugin (`[proxies.plugin] type = "virtual_net"`)
+
+The Go frp v0.70.1 `virtual_net` proxy plugin exposes the client's TUN device
+to remote `virtual_net` visitors. It does not bind a local listener. When the
+server assigns a work connection to this proxy, frpc hands the connection to
+the vnet controller: bytes from the remote tunnel are written into the local
+TUN, and the remote source IP is registered so TUN return packets go back over
+the same work connection.
+
+```toml
+[virtualNet]
+address = "10.0.0.2"
+
+[[proxies]]
+name = "vnet-provider"
+type = "tcp"
+
+[proxies.plugin]
+type = "virtual_net"
+```
+
+The Go-style flat form `plugin = "virtual_net"` is also accepted. Requires
+`[feature] VirtualNet = true`, the `vnet` build feature, and a valid IPv4
+`[virtualNet] address`.
 
 ------------------------------------------------------------------------------
 
@@ -490,5 +521,6 @@ Requires `[feature] VirtualNet = true` and the `vnet` build feature (on by
 default). frp-rs parses, validates, advertises/removes the `destinationIP`
 route over the control connection, and forwards inbound `VnetPacket`s into
 the STCP/XTCP visitor tunnel. The visitor tunnel is a no-bind tunnel: raw IP
-packets are written into it, while return traffic to the local TUN uses the
-existing control-connection `VnetPacket` path to TUN-backed vnet proxies.
+packets are written into it, and return traffic arriving on the tunnel is
+delivered through the same TUN channels used by control-connection
+`VnetPacket`s to local TUN-backed vnet proxies.
