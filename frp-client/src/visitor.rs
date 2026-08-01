@@ -134,38 +134,6 @@ struct VisitorTransportConfig {
 }
 
 impl VisitorTransportConfig {
-    fn from_listener_config(cfg: &VisitorListenerConfig) -> Self {
-        Self {
-            tcp_mux: cfg.tcp_mux,
-            tcp_mux_keepalive_interval: cfg.tcp_mux_keepalive_interval,
-            proxy_url: cfg.proxy_url.clone(),
-            dns_server: cfg.dns_server.clone(),
-            dial_timeout_secs: cfg.dial_timeout_secs,
-            keepalive_secs: cfg.keepalive_secs,
-            connect_bind_addr: cfg.connect_bind_addr.clone(),
-            disable_custom_tls_first_byte: cfg.disable_custom_tls_first_byte,
-            tls_cert_file: cfg.tls_cert_file.clone(),
-            tls_key_file: cfg.tls_key_file.clone(),
-            v2: cfg.v2,
-        }
-    }
-
-    #[cfg(feature = "vnet")]
-    fn from_vnet_config(cfg: &VirtualNetVisitorConfig) -> Self {
-        Self {
-            tcp_mux: cfg.tcp_mux,
-            tcp_mux_keepalive_interval: cfg.tcp_mux_keepalive_interval,
-            proxy_url: cfg.proxy_url.clone(),
-            dns_server: cfg.dns_server.clone(),
-            dial_timeout_secs: cfg.dial_timeout_secs,
-            keepalive_secs: cfg.keepalive_secs,
-            connect_bind_addr: cfg.connect_bind_addr.clone(),
-            disable_custom_tls_first_byte: cfg.disable_custom_tls_first_byte,
-            tls_cert_file: cfg.tls_cert_file.clone(),
-            tls_key_file: cfg.tls_key_file.clone(),
-            v2: cfg.v2,
-        }
-    }
 }
 
 /// Result of visitor dial planning: the DialOptions to pass to
@@ -388,33 +356,22 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                 let pp = p2p_protocol.clone();
                 let u = user.clone();
                 let rid = run_id.clone();
-                let cfg_tls_cert = tls_cert_file.clone();
-                let cfg_tls_key = tls_key_file.clone();
-                let cfg_dns = dns_server.clone();
-                let cfg_nocustomtls = disable_custom_tls_first_byte;
-                let cfg_keepalive = keepalive_secs;
-                let cfg_cbind = connect_bind_addr.clone();
-                let cfg_proxy = proxy_url.clone();
-                let cfg_dto = dial_timeout_secs;
-                let cfg_tcp_mux = tcp_mux;
-                let cfg_tcp_mux_keepalive = tcp_mux_keepalive_interval;
-                let cfg_v2 = v2;
+                let transport = VisitorTransportConfig {
+                    tcp_mux,
+                    tcp_mux_keepalive_interval,
+                    proxy_url: proxy_url.clone(),
+                    dns_server: dns_server.clone(),
+                    dial_timeout_secs,
+                    keepalive_secs,
+                    connect_bind_addr: connect_bind_addr.clone(),
+                    disable_custom_tls_first_byte,
+                    tls_cert_file: tls_cert_file.clone(),
+                    tls_key_file: tls_key_file.clone(),
+                    v2,
+                };
 
                 tokio::spawn(async move {
                     // Dial options for STCP fallback (fresh connections only).
-                    let transport = VisitorTransportConfig {
-                        tcp_mux: cfg_tcp_mux,
-                        tcp_mux_keepalive_interval: cfg_tcp_mux_keepalive,
-                        proxy_url: cfg_proxy.clone(),
-                        dns_server: cfg_dns.clone(),
-                        dial_timeout_secs: cfg_dto,
-                        keepalive_secs: cfg_keepalive,
-                        connect_bind_addr: cfg_cbind.clone(),
-                        disable_custom_tls_first_byte: cfg_nocustomtls,
-                        tls_cert_file: cfg_tls_cert.clone(),
-                        tls_key_file: cfg_tls_key.clone(),
-                        v2: cfg_v2,
-                    };
                     let plan = plan_visitor_dial(
                         &sa, sp, &pt, tls_enable, &tls_sn, &tls_ca, &transport,
                     );
@@ -1593,38 +1550,12 @@ mod transport_tests {
         assert_eq!(plan.opts.v2, true);
     }
 
-    /// VisitorListenerConfig → VisitorTransportConfig round-trips all
-    /// transport fields without loss.
+    /// Building a VisitorTransportConfig inline (the pattern used by
+    /// run_visitor_listener) and passing it to plan_visitor_dial preserves
+    /// all fields through to the DialOptions.
     #[test]
-    fn listener_config_to_transport_round_trip() {
-        let (tx, _rx) = tokio::sync::mpsc::channel::<crate::service::VisitorRequest>(1);
-        let cfg = VisitorListenerConfig {
-            server_addr: "frps.example.com".into(),
-            server_port: 7443,
-            protocol: TransportProtocol::Tcp,
-            server_name: "test".into(),
-            server_user: String::new(),
-            secret_key: "sk".into(),
-            bind_addr: "0.0.0.0:6001".into(),
-            use_encryption: false,
-            use_compression: false,
-            name: "v".into(),
-            tls_enable: false,
-            tls_server_name: String::new(),
-            tls_ca_file: None,
-            visitor_type: "stcp".into(),
-            fallback_timeout_ms: 5000,
-            keep_tunnel_open: false,
-            max_retries_an_hour: 0,
-            min_retry_interval: 0,
-            stun_server: String::new(),
-            p2p_protocol: "kcp".into(),
-            visitor_tx: tx,
-            fallback_to: String::new(),
-            disable_assisted_addrs: false,
-            shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            user: String::new(),
-            run_id: String::new(),
+    fn inline_transport_to_dial_options_round_trip() {
+        let transport = VisitorTransportConfig {
             tcp_mux: true,
             tcp_mux_keepalive_interval: 45,
             proxy_url: Some("http://p:8080".into()),
@@ -1637,18 +1568,25 @@ mod transport_tests {
             tls_key_file: Some("/k.pem".into()),
             v2: false,
         };
-        let t = VisitorTransportConfig::from_listener_config(&cfg);
+        let plan = plan_visitor_dial(
+            "frps.example.com",
+            7443,
+            &TransportProtocol::Tcp,
+            false,
+            "",
+            &None,
+            &transport,
+        );
 
-        assert_eq!(t.tcp_mux, true);
-        assert_eq!(t.tcp_mux_keepalive_interval, 45);
-        assert_eq!(t.proxy_url.as_deref(), Some("http://p:8080"));
-        assert_eq!(t.dns_server.as_deref(), Some("1.1.1.1"));
-        assert_eq!(t.dial_timeout_secs, 25);
-        assert_eq!(t.keepalive_secs, 90);
-        assert_eq!(t.connect_bind_addr.as_deref(), Some("192.168.0.1"));
-        assert_eq!(t.disable_custom_tls_first_byte, false);
-        assert_eq!(t.tls_cert_file.as_deref(), Some("/c.pem"));
-        assert_eq!(t.tls_key_file.as_deref(), Some("/k.pem"));
-        assert_eq!(t.v2, false);
+        assert_eq!(plan.yamux_keepalive_secs, Some(45));
+        assert_eq!(plan.opts.proxy_url.as_deref(), Some("http://p:8080"));
+        assert_eq!(plan.opts.dns_server.as_deref(), Some("1.1.1.1"));
+        assert_eq!(plan.opts.dial_timeout_secs, 25);
+        assert_eq!(plan.opts.keepalive_secs, 90);
+        assert_eq!(plan.opts.bind_addr.as_deref(), Some("192.168.0.1"));
+        assert_eq!(plan.opts.disable_custom_tls_first_byte, false);
+        assert_eq!(plan.opts.tls_cert_file.as_deref(), Some("/c.pem"));
+        assert_eq!(plan.opts.tls_key_file.as_deref(), Some("/k.pem"));
+        assert_eq!(plan.opts.v2, false);
     }
 }
