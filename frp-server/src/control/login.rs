@@ -288,7 +288,14 @@ pub(crate) async fn authenticate(
         }
     } else {
         let auth_cfg = state.reloadable.read_ok().auth_cfg.clone();
-        if let Err(e) = auth_cfg.validate_login(login.privilege_key.as_deref(), login.timestamp) {
+        let login_auth = auth_cfg.resolve_token().and_then(|token| {
+            auth_cfg.validate_login_with_token(
+                &token,
+                login.privilege_key.as_deref(),
+                login.timestamp,
+            )
+        });
+        if let Err(e) = login_auth {
             warn!(peer = ?peer, error = %e, "Authentication failed for {:?}: {}", peer, e);
             // Emit WebSocket event for dashboard subscribers
             #[cfg(feature = "dashboard")]

@@ -47,6 +47,7 @@ Authentication configuration for control connections.
 |-------|------|---------|-------------------|-------------|
 | `method` | `string` | `"token"` | `auth.method` | Authentication method: `"token"` or `"oidc"`. |
 | `token` | `string` | `""` | `auth.token` | Shared secret token for MD5-based authentication. Must match the client's token. |
+| `token_source` | `table` | `null` | `auth.tokenSource` | Dynamic token source. Mutually exclusive with `token`. |
 | `oidc_issuer` | `string` | `""` | `auth.oidcIssuer` | OIDC issuer URL. Used when `method = "oidc"`. |
 | `oidc_audience` | `string` | `""` | `auth.oidcAudience` | OIDC expected audience claim. |
 | `oidc_token_endpoint` | `string` | `""` | `auth.oidcTokenEndpoint` | OIDC token verification endpoint URL. |
@@ -54,6 +55,19 @@ Authentication configuration for control connections.
 | `oidc_skip_issuer` | `bool` | `false` | `auth.oidcSkipIssuer` | Skip OIDC issuer validation. For development only. |
 | `oidc_proxy_url` | `string` | `""` | `auth.oidcProxyURL` | HTTP/SOCKS5 proxy URL for OIDC provider HTTP requests. |
 | `additional_auth_scopes` | `string[]` | `[]` | `auth.additionalAuthScopes` | Extra auth scopes: `"HeartBeats"`, `"NewWorkConns"`. When listed, those message types require authentication in addition to `Login`. |
+
+`auth.tokenSource` supports two source types:
+
+- `type = "file"` reads `file.path` and trims the file contents.
+- `type = "exec"` runs `exec.command` with `exec.args` and optional `exec.env` entries (`{ name, value }`), then trims stdout. Exec sources require the `TokenSourceExec` unsafe feature (`--allow-unsafe TokenSourceExec`).
+
+Example:
+
+```toml
+[auth.tokenSource]
+type = "file"
+file.path = "/run/secrets/frp-token"
+```
 
 ### `[log]` Section
 
@@ -268,6 +282,7 @@ Full OIDC authentication configuration. When `method = "oidc"`, the client obtai
 |-------|------|---------|-------------------|-------------|
 | `method` | `string` | `"token"` | `auth.method` | Authentication method: `"token"` or `"oidc"`. |
 | `token` | `string` | `""` | `auth.token` | Shared secret token (when `method = "token"`). |
+| `token_source` | `table` | `null` | `auth.tokenSource` | Dynamic token source. Mutually exclusive with `token`. |
 | `oidc_client_id` | `string` | `""` | `auth.oidcClientId` | OIDC client ID for the token endpoint. |
 | `oidc_client_secret` | `string` | `""` | `auth.oidcClientSecret` | OIDC client secret for the token endpoint. |
 | `oidc_audience` | `string` | `""` | `auth.oidcAudience` | OIDC audience claim to request. |
@@ -279,6 +294,8 @@ Full OIDC authentication configuration. When `method = "oidc"`, the client obtai
 | `oidc_tls_insecure_skip_verify` | `bool` | `false` | `auth.insecureSkipVerify` | Skip TLS certificate verification for OIDC provider. For development only. |
 | `oidc_proxy_url` | `string` | `""` | `auth.oidcProxyURL` | HTTP/SOCKS5 proxy URL for OIDC provider HTTP requests. |
 | `additional_auth_scopes` | `string[]` | `[]` | `auth.additionalAuthScopes` | Client-side auth scopes. Unioned with the server's scopes. Values: `"HeartBeats"`, `"NewWorkConns"`. |
+
+The client `auth.tokenSource` table has the same shape as the server version: `type = "file"` with `file.path`, or `type = "exec"` with `exec.command`, `exec.args`, and `exec.env`. Exec sources require `--allow-unsafe TokenSourceExec`.
 
 ### `[web_server]` Section (Client Admin API)
 

@@ -217,13 +217,29 @@ impl Service {
         #[cfg(not(feature = "oidc"))]
         let auth_method = AuthMethod::Token;
 
-        let auth_cfg = AuthConfig {
-            method: auth_method.clone(),
-            token: frp_core::auth::resolve_dynamic_token_checked(&cfg.token, &unsafe_features)
+        let auth_token_source = cfg.auth.as_ref().and_then(|a| a.token_source.clone());
+        let token = if let Some(ref source) = auth_token_source {
+            source
+                .validate()
+                .map_err(|e| format!("invalid auth.tokenSource: {e}"))
+                .map_err(std::io::Error::other)?;
+            frp_core::auth::validate_token_source_unsafe(source, &unsafe_features)
+                .map_err(std::io::Error::other)?;
+            source
+                .resolve()
+                .map_err(|e| format!("failed to resolve auth.tokenSource: {e}"))
+                .map_err(std::io::Error::other)?
+        } else {
+            frp_core::auth::resolve_dynamic_token_checked(&cfg.token, &unsafe_features)
                 .unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
                     String::new()
-                }),
+                })
+        };
+        let auth_cfg = AuthConfig {
+            method: auth_method.clone(),
+            token,
+            token_source: auth_token_source,
             oidc_issuer: cfg
                 .auth
                 .as_ref()
@@ -938,7 +954,6 @@ impl Service {
             }
 
             // Spawn initial pool work connections
-            let auth_token = self.auth_cfg.token.clone();
             let client_scopes: Vec<String> = cfg_local
                 .auth
                 .as_ref()
@@ -963,7 +978,7 @@ impl Service {
                         proxy_info_map: self.proxy_info_map.clone(),
                         enc_key: self.encryption_key,
                         pool_id: $pool_id,
-                        auth_token: auth_token.clone(),
+                        auth_cfg: self.auth_cfg.clone(),
                         tls_enable: cfg_local.tls_enable,
                         tls_server_name: cfg_local.tls_server_name.clone(),
                         tls_ca_file: opt_if_empty!(cfg_local.tls_ca_file),
@@ -1275,9 +1290,16 @@ impl Service {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs() as i64;
-                                let ping_auth = AuthConfig::with_token(self.auth_cfg.token.clone());
-                                ping_msg.privilege_key = ping_auth.generate_login_key(ts);
-                                ping_msg.timestamp = Some(ts);
+                                match self.auth_cfg.try_generate_login_key(ts) {
+                                    Ok(key) => {
+                                        ping_msg.privilege_key = Some(key);
+                                        ping_msg.timestamp = Some(ts);
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "Ping token source failed: {}. Reconnecting...", e);
+                                        break;
+                                    }
+                                }
                             }
                         }
                         let ping = FrpMessage::Ping(ping_msg);

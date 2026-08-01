@@ -295,18 +295,30 @@ async fn v2_handshake_and_read(
 fn build_auth_config(
     auth: &frp_core::config::AuthServerConfig,
     unsafe_features: &UnsafeFeatures,
-) -> AuthConfig {
-    AuthConfig {
+) -> Result<AuthConfig, String> {
+    let token_source = auth.token_source.clone();
+    let token = if let Some(ref source) = token_source {
+        frp_core::config::validate_auth_token_source(&auth.token, &auth.token_source)?;
+        frp_core::auth::validate_token_source_unsafe(source, unsafe_features)?;
+        source
+            .resolve()
+            .map_err(|e| format!("failed to resolve auth.tokenSource: {e}"))?
+    } else {
+        frp_core::auth::resolve_dynamic_token_checked(&auth.token, unsafe_features).unwrap_or_else(
+            |e| {
+                tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
+                String::new()
+            },
+        )
+    };
+    Ok(AuthConfig {
         method: match auth.method.to_lowercase().as_str() {
             #[cfg(feature = "oidc")]
             "oidc" => AuthMethod::Oidc,
             _ => AuthMethod::Token,
         },
-        token: frp_core::auth::resolve_dynamic_token_checked(&auth.token, unsafe_features)
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
-                String::new()
-            }),
+        token,
+        token_source,
         oidc_issuer: auth.oidc_issuer.clone(),
         oidc_audience: auth.oidc_audience.clone(),
         oidc_skip_expiry: auth.oidc_skip_expiry,
@@ -318,7 +330,7 @@ fn build_auth_config(
         authentication_timeout: auth.authentication_timeout,
         token_auth_timeout: auth.token_auth_timeout,
         use_encryption: auth.use_encryption,
-    }
+    })
 }
 
 /// Resolve the allow-ports ranges from a server config: explicit `allow_ports`
@@ -383,7 +395,7 @@ impl Service {
         config_file: Option<String>,
         unsafe_features: UnsafeFeatures,
     ) -> Result<Self, String> {
-        let auth_cfg = build_auth_config(&cfg.auth, &unsafe_features);
+        let auth_cfg = build_auth_config(&cfg.auth, &unsafe_features)?;
         auth_cfg
             .check_startup()
             .map_err(|e| format!("security misconfiguration: {e}"))?;
@@ -2922,7 +2934,7 @@ impl Service {
         let mut changes: Vec<String> = Vec::new();
 
         // Build new reloadable state
-        let new_auth_cfg = build_auth_config(&new_cfg.auth, &self.unsafe_features);
+        let new_auth_cfg = build_auth_config(&new_cfg.auth, &self.unsafe_features)?;
         new_auth_cfg
             .check_startup()
             .map_err(|e| format!("security misconfiguration: {e}"))?;

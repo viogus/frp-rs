@@ -428,12 +428,93 @@ impl Default for SshTunnelGatewayConfig {
     }
 }
 
+/// Dynamic value source used to resolve the auth token at runtime.
+/// Go frp v0.70.1 compat: ValueSource with file and exec sub-sources.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ValueSource {
+    #[serde(rename = "type")]
+    pub source_type: String,
+    #[serde(default)]
+    pub file: Option<FileSource>,
+    #[serde(default)]
+    pub exec: Option<ExecSource>,
+}
+
+impl ValueSource {
+    /// Validate the source shape. Returns `Ok(())` when the source is
+    /// structurally valid, otherwise a human-readable config error.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.source_type.as_str() {
+            "file" => {
+                let file = self.file.as_ref().ok_or_else(|| {
+                    "file configuration is required when type is 'file'".to_string()
+                })?;
+                if file.path.is_empty() {
+                    return Err("file path cannot be empty".into());
+                }
+                Ok(())
+            }
+            "exec" => {
+                let exec = self.exec.as_ref().ok_or_else(|| {
+                    "exec configuration is required when type is 'exec'".to_string()
+                })?;
+                if exec.command.is_empty() {
+                    return Err("exec command cannot be empty".into());
+                }
+                for env in &exec.env {
+                    if env.name.is_empty() {
+                        return Err("exec env name cannot be empty".into());
+                    }
+                    if env.name.contains('=') {
+                        return Err("exec env name cannot contain '='".into());
+                    }
+                }
+                Ok(())
+            }
+            other => Err(format!(
+                "unsupported value source type: {other} (only 'file' and 'exec' are supported)"
+            )),
+        }
+    }
+}
+
+/// File source for [`ValueSource`].
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FileSource {
+    #[serde(default)]
+    pub path: String,
+}
+
+/// Exec source for [`ValueSource`].
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExecSource {
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<ExecEnvVar>,
+}
+
+/// Additional environment variable for [`ExecSource`].
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExecEnvVar {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthServerConfig {
     #[serde(default)]
     pub method: String,
     #[serde(default)]
     pub token: String,
+    /// Dynamic source for the auth token. Mutually exclusive with `token`.
+    /// Go frp v0.70.1 compat: auth.tokenSource.
+    #[serde(default, alias = "tokenSource")]
+    pub token_source: Option<ValueSource>,
     #[serde(default)]
     pub oidc_issuer: String,
     #[serde(default)]
@@ -485,6 +566,7 @@ impl Default for AuthServerConfig {
         Self {
             method: "token".into(),
             token: String::new(),
+            token_source: None,
             oidc_issuer: String::new(),
             oidc_audience: String::new(),
             oidc_token_endpoint: String::new(),
@@ -865,6 +947,10 @@ pub struct AuthClientConfig {
     pub method: String,
     #[serde(default)]
     pub token: String,
+    /// Dynamic source for the auth token. Mutually exclusive with `token`.
+    /// Go frp v0.70.1 compat: auth.tokenSource.
+    #[serde(default, alias = "tokenSource")]
+    pub token_source: Option<ValueSource>,
     #[serde(default, alias = "oidcClientId")]
     pub oidc_client_id: String,
     #[serde(default, alias = "oidcClientSecret")]
@@ -919,6 +1005,7 @@ impl Default for AuthClientConfig {
         Self {
             method: "token".into(),
             token: String::new(),
+            token_source: None,
             oidc_client_id: String::new(),
             oidc_client_secret: String::new(),
             oidc_audience: String::new(),
@@ -1588,7 +1675,25 @@ fn validate_proxy_configs(proxies: &[ProxyConfig]) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_server_config(_cfg: &ServerConfig) -> Result<(), String> {
+/// Validate token/tokenSource mutual exclusivity and source structure.
+/// Go frp v0.70.1 compat: validation/auth.go validateAuthTokenSource.
+pub fn validate_auth_token_source(
+    token: &str,
+    token_source: &Option<ValueSource>,
+) -> Result<(), String> {
+    if !token.is_empty() && token_source.is_some() {
+        return Err("cannot specify both auth.token and auth.tokenSource".into());
+    }
+    if let Some(source) = token_source {
+        source
+            .validate()
+            .map_err(|e| format!("invalid auth.tokenSource: {e}"))?;
+    }
+    Ok(())
+}
+
+fn validate_server_config(cfg: &ServerConfig) -> Result<(), String> {
+    validate_auth_token_source(&cfg.auth.token, &cfg.auth.token_source)?;
     // ServerConfig has no inline proxy definitions — proxies are registered
     // by clients at runtime. No proxy-level validation to do here.
     Ok(())
@@ -1597,6 +1702,14 @@ fn validate_server_config(_cfg: &ServerConfig) -> Result<(), String> {
 fn validate_client_config(cfg: &ClientConfig) -> Result<(), String> {
     validate_proxy_configs(&cfg.proxies)?;
     validate_no_duplicate_names(&cfg.proxies, &cfg.visitors)?;
+    if let Some(auth) = &cfg.auth {
+        let token = if cfg.token.is_empty() {
+            auth.token.as_str()
+        } else {
+            cfg.token.as_str()
+        };
+        validate_auth_token_source(token, &auth.token_source)?;
+    }
     Ok(())
 }
 
@@ -3588,6 +3701,120 @@ remote_port = 7001
         assert!(cfg.oidc_scope.is_empty());
         assert!(cfg.oidc_issuer.is_empty());
         assert!(cfg.additional_endpoint_params.is_empty());
+    }
+
+    #[test]
+    fn test_parse_server_token_source_file() {
+        let toml_str = r#"
+bind_port = 7000
+
+[auth.tokenSource]
+type = "file"
+file.path = "/tmp/frp-token"
+"#;
+        let cfg: ServerConfig = load_server_config_from_str(toml_str).unwrap();
+        let source = cfg.auth.token_source.expect("tokenSource should parse");
+        assert_eq!(source.source_type, "file");
+        assert_eq!(source.file.unwrap().path, "/tmp/frp-token");
+        assert!(source.exec.is_none());
+    }
+
+    #[test]
+    fn test_parse_client_token_source_exec() {
+        let toml_str = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+
+[auth.tokenSource]
+type = "exec"
+exec.command = "/bin/sh"
+exec.args = ["-c", "printf '%s' \"$TOKEN\""]
+exec.env = [{ name = "TOKEN", value = "secret" }]
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+        let source = cfg
+            .auth
+            .unwrap()
+            .token_source
+            .expect("tokenSource should parse");
+        assert_eq!(source.source_type, "exec");
+        let exec = source.exec.expect("exec source should parse");
+        assert_eq!(exec.command, "/bin/sh");
+        assert_eq!(exec.args, vec!["-c", "printf '%s' \"$TOKEN\""]);
+        assert_eq!(exec.env.len(), 1);
+        assert_eq!(exec.env[0].name, "TOKEN");
+        assert_eq!(exec.env[0].value, "secret");
+    }
+
+    #[test]
+    fn test_reject_token_and_token_source_server() {
+        let toml_str = r#"
+bind_port = 7000
+
+[auth]
+token = "static-token"
+
+[auth.tokenSource]
+type = "file"
+file.path = "/tmp/frp-token"
+"#;
+        let err = load_server_config_from_str(toml_str)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot specify both auth.token and auth.tokenSource"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_reject_token_and_token_source_client() {
+        let toml_str = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+token = "static-token"
+
+[auth.tokenSource]
+type = "file"
+file.path = "/tmp/frp-token"
+"#;
+        let err = load_client_config_from_str(toml_str)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot specify both auth.token and auth.tokenSource"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_reject_unsupported_token_source_type() {
+        let toml_str = r#"
+bind_port = 7000
+
+[auth.tokenSource]
+type = "env"
+file.path = "/tmp/frp-token"
+"#;
+        let err = load_server_config_from_str(toml_str)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported value source type"), "{err}");
+    }
+
+    #[test]
+    fn test_reject_token_source_missing_file_path() {
+        let toml_str = r#"
+bind_port = 7000
+
+[auth.tokenSource]
+type = "file"
+file = {}
+"#;
+        let err = load_server_config_from_str(toml_str)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("file path cannot be empty"), "{err}");
     }
 
     #[test]

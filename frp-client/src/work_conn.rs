@@ -56,7 +56,7 @@ pub(crate) struct WorkConnConfig {
     pub proxy_info_map: Arc<RwLock<HashMap<String, ProxyRuntimeInfo>>>,
     pub enc_key: [u8; 16],
     pub pool_id: i32,
-    pub auth_token: String,
+    pub auth_cfg: Arc<AuthConfig>,
     pub tls_enable: bool,
     pub tls_server_name: String,
     pub tls_ca_file: Option<String>,
@@ -384,7 +384,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             proxy_info_map,
             enc_key,
             pool_id,
-            auth_token,
+            auth_cfg,
             tls_enable,
             tls_server_name,
             tls_ca_file,
@@ -481,7 +481,6 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
         // Send NewWorkConn — required for both yamux and raw transports.
         // Go frps needs the run_id and auth to associate the stream.
         {
-            let nwc_token = auth_token.clone();
             let mut nwc_msg = msg::NewWorkConn {
                 run_id: Some(run_id.clone()),
                 timestamp: None,
@@ -499,9 +498,16 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as i64;
-                    let auth_cfg = AuthConfig::with_token(nwc_token);
-                    nwc_msg.privilege_key = auth_cfg.generate_login_key(timestamp);
-                    nwc_msg.timestamp = Some(timestamp);
+                    match auth_cfg.try_generate_login_key(timestamp) {
+                        Ok(key) => {
+                            nwc_msg.privilege_key = Some(key);
+                            nwc_msg.timestamp = Some(timestamp);
+                        }
+                        Err(e) => {
+                            warn!(label = %label, error = %e, "Work conn {} token source failed: {}", label, e);
+                            return;
+                        }
+                    }
                 }
             }
             // Write V2 magic before NewWorkConn on work connection streams.
@@ -946,7 +952,7 @@ mod tests {
             proxy_info_map: Arc::new(RwLock::new(HashMap::new())),
             enc_key: [0; 16],
             pool_id,
-            auth_token: String::new(),
+            auth_cfg: Arc::new(AuthConfig::with_token("test-token")),
             tls_enable: false,
             tls_server_name: String::new(),
             tls_ca_file: None,

@@ -249,10 +249,16 @@ pub(crate) async fn handle_ping<W: AsyncWriteExt + Unpin>(
             )
             .await
     } else {
-        ctx.reloadable
-            .auth_cfg
-            .validate_login(ping_msg.privilege_key.as_deref(), ping_msg.timestamp)
-            .map(|_| ())
+        ctx.reloadable.auth_cfg.resolve_token().and_then(|token| {
+            ctx.reloadable
+                .auth_cfg
+                .validate_login_with_token(
+                    &token,
+                    ping_msg.privilege_key.as_deref(),
+                    ping_msg.timestamp,
+                )
+                .map(|_| ())
+        })
     };
     if let Err(e) = ping_auth_result {
         warn!(peer = ?ctx.peer, error = %e, "Ping auth failed from {:?}: {}", ctx.peer, e);
