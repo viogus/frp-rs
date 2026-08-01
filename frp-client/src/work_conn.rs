@@ -2,12 +2,16 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(feature = "vnet")]
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use frp_core::auth::{AuthConfig, OidcClient};
+#[cfg(feature = "vnet")]
+use frp_core::cipher_stream::{CipherReader, CipherWriter};
 use frp_core::encryption;
 use frp_core::metrics::ProxyMetricsRegistry;
 use frp_core::msg::{self, FrpMessage};
@@ -22,6 +26,176 @@ use crate::proxy_runtime::ProxyRuntimeInfo;
 
 #[cfg(feature = "vnet")]
 type VnetTunMap = Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>;
+
+/// Maximum framed vnet message size, matching Go frp `maxMessageSize`.
+#[cfg(feature = "vnet")]
+const MAX_VNET_MESSAGE: u32 = 1024 * 1024;
+
+/// Reads length-prefixed IP packets from a `virtual_net` tunnel.
+///
+/// Go frp v0.70.1 frames every packet as `[u32 LE length][data]` before the
+/// optional compression/encryption layers. The reader first decodes the
+/// transport chunk stream (decompressing Snappy when enabled), buffers the
+/// decoded bytes, and then parses complete length-prefixed messages so TCP or
+/// yamux coalescing/splitting cannot corrupt packet boundaries.
+#[cfg(feature = "vnet")]
+pub(crate) struct TunnelPacketReader<R> {
+    inner: R,
+    decompressor: Option<frp_core::encryption::SnappyDecompressor>,
+    stream_buf: Vec<u8>,
+    buf: Vec<u8>,
+    eof: bool,
+}
+
+#[cfg(feature = "vnet")]
+impl<R: tokio::io::AsyncRead + Unpin> TunnelPacketReader<R> {
+    pub(crate) fn new(inner: R, use_compression: bool) -> Self {
+        let decompressor = if use_compression {
+            #[cfg(feature = "compression")]
+            {
+                Some(frp_core::encryption::SnappyDecompressor::new())
+            }
+            #[cfg(not(feature = "compression"))]
+            {
+                None
+            }
+        } else {
+            None
+        };
+        Self {
+            inner,
+            decompressor,
+            stream_buf: Vec::new(),
+            buf: vec![0u8; 4096],
+            eof: false,
+        }
+    }
+
+    /// Return the next packet, or `None` at EOF.
+    pub(crate) async fn next_packet(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        loop {
+            // Try to extract a complete framed message from buffered bytes.
+            if let Some(packet) = self.take_complete_message()? {
+                return Ok(Some(packet));
+            }
+            if self.eof {
+                return Ok(None);
+            }
+            let n = self.inner.read(&mut self.buf).await?;
+            if n == 0 {
+                self.eof = true;
+                if !self.stream_buf.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "vnet tunnel closed with an incomplete framed packet",
+                    ));
+                }
+                return Ok(None);
+            }
+            if let Some(decompressor) = &mut self.decompressor {
+                // Decompressed output may contain zero, one, or several framed
+                // messages; drain complete frames without blocking.
+                let mut input = &self.buf[..n];
+                loop {
+                    let mut out = Vec::new();
+                    let status = decompressor
+                        .feed_into_progress(input, &mut out)
+                        .map_err(std::io::Error::other)?;
+                    input = &[];
+                    self.stream_buf.extend_from_slice(&out);
+                    if !status.has_more_complete {
+                        break;
+                    }
+                }
+            } else {
+                self.stream_buf.extend_from_slice(&self.buf[..n]);
+            }
+        }
+    }
+
+    /// Extract one `[u32 LE length][data]` message from `stream_buf`.
+    fn take_complete_message(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        if self.stream_buf.len() < 4 {
+            return Ok(None);
+        }
+        let len = u32::from_le_bytes(self.stream_buf[..4].try_into().unwrap()) as usize;
+        if len == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "vnet framed message length is 0",
+            ));
+        }
+        if len as u32 > MAX_VNET_MESSAGE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("vnet message too large: {len} > {MAX_VNET_MESSAGE}"),
+            ));
+        }
+        if self.stream_buf.len() < 4 + len {
+            return Ok(None);
+        }
+        let packet = self.stream_buf[4..4 + len].to_vec();
+        self.stream_buf.drain(..4 + len);
+        Ok(Some(packet))
+    }
+}
+
+/// Writes length-prefixed IP packets to a `virtual_net` tunnel, applying
+/// Snappy compression before AES-128-CFB encryption when enabled.
+#[cfg(feature = "vnet")]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum TunnelPacketWriter<W: tokio::io::AsyncWrite + Unpin> {
+    Plain(W),
+    Encrypted(CipherWriter<W>),
+}
+
+#[cfg(feature = "vnet")]
+impl<W: tokio::io::AsyncWrite + Unpin> TunnelPacketWriter<W> {
+    pub(crate) async fn write_packet(
+        &mut self,
+        packet: &[u8],
+        use_compression: bool,
+    ) -> std::io::Result<()> {
+        let len = packet.len() as u32;
+        if len == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "vnet packet data length is 0",
+            ));
+        }
+        if len > MAX_VNET_MESSAGE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("vnet packet too large: {len} > {MAX_VNET_MESSAGE}"),
+            ));
+        }
+        let mut frame = Vec::with_capacity(4 + len as usize);
+        frame.extend_from_slice(&len.to_le_bytes());
+        frame.extend_from_slice(packet);
+        if use_compression {
+            let mut compressed = Vec::new();
+            frp_core::encryption::compress_into(&frame, &mut compressed)
+                .map_err(std::io::Error::other)?;
+            self.write_all(&compressed).await
+        } else {
+            self.write_all(&frame).await
+        }
+    }
+
+    pub(crate) async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(w) => w.write_all(data).await,
+            Self::Encrypted(w) => w.write_all(data).await,
+        }
+    }
+
+    pub(crate) async fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(w) => w.flush().await,
+            Self::Encrypted(w) => w.flush().await,
+        }
+    }
+}
 
 /// Conditional type for the QUIC connection parameter.
 /// When the `quic` feature is disabled, the parameter is `()` (ZST, no-op).
@@ -56,7 +230,7 @@ pub(crate) struct WorkConnConfig {
     pub proxy_info_map: Arc<RwLock<HashMap<String, ProxyRuntimeInfo>>>,
     pub enc_key: [u8; 16],
     pub pool_id: i32,
-    pub auth_token: String,
+    pub auth_cfg: Arc<AuthConfig>,
     pub tls_enable: bool,
     pub tls_server_name: String,
     pub tls_ca_file: Option<String>,
@@ -83,7 +257,9 @@ pub(crate) struct WorkConnConfig {
     #[cfg(feature = "vnet")]
     pub vnet_tuns: VnetTunMap,
     #[cfg(feature = "vnet")]
-    pub vnet_routes: Arc<RwLock<frp_vnet::router::RouteTable>>,
+    pub vnet_controller: Arc<frp_vnet::controller::ClientVnetController>,
+    #[cfg(feature = "vnet")]
+    pub vnet_tun_tx: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
 }
 
 /// Bundled parameters for work connection transport acquisition.
@@ -359,6 +535,157 @@ async fn run_udp_work_conn(
     }
 }
 
+/// Bridge a `virtual_net` plugin work connection to the shared vnet controller.
+///
+/// Equivalent to Go frp's `VnetController.StartServerConnReadLoop`: bytes
+/// arriving from the remote visitor tunnel are written into the local TUN,
+/// and the remote source IP is registered so TUN return packets are written
+/// back to this work connection.
+#[cfg(feature = "vnet")]
+async fn run_virtual_net_plugin_work_conn(
+    work: IoStream,
+    proxy_name: String,
+    vnet_controller: Arc<frp_vnet::controller::ClientVnetController>,
+    vnet_tun_tx: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+    use_encryption: bool,
+    use_compression: bool,
+    enc_key: [u8; 16],
+) {
+    let tun_tx = {
+        let txs = vnet_tun_tx.lock().await;
+        txs.get(&proxy_name).cloned()
+    };
+    let Some(tun_tx) = tun_tx else {
+        warn!(proxy_name = %proxy_name, "virtual_net plugin: no TUN channel for '{}'", proxy_name);
+        return;
+    };
+
+    let (work_r, work_w) = work.into_split().expect("work conn split");
+    let work_r: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if use_encryption {
+        Box::new(CipherReader::new(work_r, enc_key))
+    } else {
+        Box::new(work_r)
+    };
+    let mut packet_reader = TunnelPacketReader::new(work_r, use_compression);
+    let mut packet_writer = if use_encryption {
+        TunnelPacketWriter::Encrypted(CipherWriter::new(work_w, enc_key))
+    } else {
+        TunnelPacketWriter::Plain(work_w)
+    };
+    // Eagerly send the encrypted writer's IV so the peer's CipherReader can
+    // proceed even before the first return packet arrives.
+    if let Err(e) = packet_writer.flush().await {
+        warn!(
+            proxy_name = %proxy_name,
+            error = %e,
+            "virtual_net plugin work conn IV flush failed: {}",
+            e
+        );
+        return;
+    }
+
+    let (return_tx, mut return_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+    let reader_name = proxy_name.clone();
+    let reader_ctrl = vnet_controller.clone();
+    let reader_rtx = return_tx.clone();
+    let reader_tun = tun_tx;
+    let mut reader_cancel = cancel_rx.clone();
+    let reader = async move {
+        let mut registered_ips = Vec::<std::net::IpAddr>::new();
+        loop {
+            tokio::select! {
+                biased;
+                changed = reader_cancel.changed() => {
+                    if changed.is_err() || *reader_cancel.borrow() { break; }
+                }
+                packet = packet_reader.next_packet() => {
+                    match packet {
+                        Ok(None) => break,
+                        Ok(Some(packet)) => {
+                            // Learn the remote host's source IP so return
+                            // packets can be routed back on this connection.
+                            if let Some(src_ip) = frp_vnet::router::packet_src_ip(&packet) {
+                                reader_ctrl
+                                    .register_server_conn(src_ip, reader_rtx.clone())
+                                    .await;
+                                registered_ips.push(src_ip);
+                            }
+                            if let Err(e) = reader_tun.try_send(packet) {
+                                match e {
+                                    mpsc::error::TrySendError::Full(_) => {
+                                        warn!(
+                                            proxy_name = %reader_name,
+                                            "virtual_net plugin TUN queue full; dropping packet"
+                                        );
+                                    }
+                                    mpsc::error::TrySendError::Closed(_) => break,
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                proxy_name = %reader_name,
+                                error = %e,
+                                "virtual_net plugin work conn read error: {}",
+                                e
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        for src_ip in &registered_ips {
+            reader_ctrl
+                .unregister_server_conn_if_matches(src_ip, &reader_rtx)
+                .await;
+        }
+    };
+
+    let writer_name = proxy_name;
+    let mut writer_cancel = cancel_rx;
+    let writer = async move {
+        loop {
+            tokio::select! {
+                biased;
+                changed = writer_cancel.changed() => {
+                    if changed.is_err() || *writer_cancel.borrow() { break; }
+                }
+                pkt = return_rx.recv() => {
+                    match pkt {
+                        Some(pkt) => {
+                            if let Err(e) = packet_writer.write_packet(&pkt, use_compression).await {
+                                warn!(
+                                    proxy_name = %writer_name,
+                                    error = %e,
+                                    "virtual_net plugin work conn write error: {}",
+                                    e
+                                );
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    };
+
+    tokio::pin!(reader, writer);
+    tokio::select! {
+        _ = &mut reader => {
+            let _ = cancel_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_millis(100), &mut writer).await;
+        }
+        _ = &mut writer => {
+            let _ = cancel_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_millis(100), &mut reader).await;
+        }
+    }
+}
+
 /// Spawn a single work connection task.
 ///
 /// The task:
@@ -384,7 +711,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             proxy_info_map,
             enc_key,
             pool_id,
-            auth_token,
+            auth_cfg,
             tls_enable,
             tls_server_name,
             tls_ca_file,
@@ -409,7 +736,9 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             #[cfg(feature = "vnet")]
                 vnet_tuns: _vnet_tuns,
             #[cfg(feature = "vnet")]
-                vnet_routes: _vnet_routes,
+            vnet_controller,
+            #[cfg(feature = "vnet")]
+            vnet_tun_tx,
         } = cfg;
 
         let label = if pool_id >= 0 {
@@ -481,7 +810,6 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
         // Send NewWorkConn — required for both yamux and raw transports.
         // Go frps needs the run_id and auth to associate the stream.
         {
-            let nwc_token = auth_token.clone();
             let mut nwc_msg = msg::NewWorkConn {
                 run_id: Some(run_id.clone()),
                 timestamp: None,
@@ -499,9 +827,16 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as i64;
-                    let auth_cfg = AuthConfig::with_token(nwc_token);
-                    nwc_msg.privilege_key = auth_cfg.generate_login_key(timestamp);
-                    nwc_msg.timestamp = Some(timestamp);
+                    match auth_cfg.try_generate_login_key(timestamp) {
+                        Ok(key) => {
+                            nwc_msg.privilege_key = Some(key);
+                            nwc_msg.timestamp = Some(timestamp);
+                        }
+                        Err(e) => {
+                            warn!(label = %label, error = %e, "Work conn {} token source failed: {}", label, e);
+                            return;
+                        }
+                    }
                 }
             }
             // Write V2 magic before NewWorkConn on work connection streams.
@@ -752,6 +1087,24 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                     return;
                 }
 
+                #[cfg(feature = "vnet")]
+                if info.plugin == "virtual_net" {
+                    info!(label = %label, proxy_name = %proxy_name, "Work conn {} handed to virtual_net plugin controller", label);
+                    let use_enc = swc.use_encryption.unwrap_or(info.use_encryption);
+                    let use_comp = swc.use_compression.unwrap_or(info.use_compression);
+                    run_virtual_net_plugin_work_conn(
+                        work,
+                        proxy_name.clone(),
+                        vnet_controller,
+                        vnet_tun_tx,
+                        use_enc,
+                        use_comp,
+                        enc_key,
+                    )
+                    .await;
+                    return;
+                }
+
                 if info.proxy_type == "udp" {
                     // UDP proxy: bridge work conn ↔ local UDP socket
                     let sock = {
@@ -946,7 +1299,7 @@ mod tests {
             proxy_info_map: Arc::new(RwLock::new(HashMap::new())),
             enc_key: [0; 16],
             pool_id,
-            auth_token: String::new(),
+            auth_cfg: Arc::new(AuthConfig::with_token("test-token")),
             tls_enable: false,
             tls_server_name: String::new(),
             tls_ca_file: None,
@@ -971,7 +1324,9 @@ mod tests {
             #[cfg(feature = "vnet")]
             vnet_tuns: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "vnet")]
-            vnet_routes: Arc::new(RwLock::new(frp_vnet::router::RouteTable::new())),
+            vnet_controller: Arc::new(frp_vnet::controller::ClientVnetController::new()),
+            #[cfg(feature = "vnet")]
+            vnet_tun_tx: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1142,5 +1497,184 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn virtual_net_plugin_work_conn_round_trips_packets() {
+        use std::net::Ipv4Addr;
+        use tokio::io::AsyncWriteExt;
+
+        let controller = Arc::new(frp_vnet::controller::ClientVnetController::new());
+        let tun_txs = Arc::new(Mutex::new(HashMap::new()));
+        let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(16);
+        tun_txs
+            .lock()
+            .await
+            .insert("vnet-proxy".to_string(), tun_tx);
+
+        let (work, mut peer) = tokio::io::duplex(4096);
+        let task = tokio::spawn(run_virtual_net_plugin_work_conn(
+            IoStream::SshChannel(Box::new(work)),
+            "vnet-proxy".to_string(),
+            controller.clone(),
+            tun_txs,
+            false,
+            false,
+            [0; 16],
+        ));
+
+        let inbound = vec![
+            0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, 100, 86, 0, 1,
+            100, 86, 0, 2,
+        ];
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&(inbound.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&inbound);
+        peer.write_all(&framed).await.unwrap();
+        assert_eq!(tun_rx.recv().await, Some(inbound.clone()));
+
+        let src = std::net::IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1));
+        let return_tx = controller
+            .server_conn_sender(&src)
+            .await
+            .expect("remote source IP must be registered for return traffic");
+        return_tx.try_send(inbound.clone()).unwrap();
+        let mut buf = vec![0u8; framed.len()];
+        let n = peer.read(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf[..n],
+            &framed[..],
+            "return traffic must be length-framed"
+        );
+
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(controller.server_conn_sender(&src).await.is_none());
+    }
+
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn virtual_net_plugin_work_conn_wraps_encrypted_compressed_wire_bytes() {
+        use std::net::IpAddr;
+        use tokio::io::AsyncWriteExt;
+
+        let key = frp_core::encryption::derive_key("vnet-test-secret");
+        let controller = Arc::new(frp_vnet::controller::ClientVnetController::new());
+        let tun_txs = Arc::new(Mutex::new(HashMap::new()));
+        let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(16);
+        tun_txs
+            .lock()
+            .await
+            .insert("vnet-proxy".to_string(), tun_tx);
+
+        let (work, mut peer) = tokio::io::duplex(8192);
+        let task = tokio::spawn(run_virtual_net_plugin_work_conn(
+            IoStream::SshChannel(Box::new(work)),
+            "vnet-proxy".to_string(),
+            controller.clone(),
+            tun_txs,
+            true,
+            true,
+            key,
+        ));
+
+        let inbound = vec![
+            0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x20, 0x01, 0x0d, 0xb8,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ];
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&(inbound.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&inbound);
+        let mut compressed = Vec::new();
+        frp_core::encryption::compress_into(&framed, &mut compressed).unwrap();
+        let wire = frp_core::encryption::encrypt(&compressed, &key).unwrap();
+        peer.write_all(&wire).await.unwrap();
+        assert_eq!(tun_rx.recv().await, Some(inbound.clone()));
+
+        let src: IpAddr = "2001:db8::2".parse().unwrap();
+        let return_tx = controller
+            .server_conn_sender(&src)
+            .await
+            .expect("IPv6 source must be registered for return traffic");
+        return_tx.try_send(inbound.clone()).unwrap();
+
+        let mut raw = vec![0u8; wire.len()];
+        peer.read_exact(&mut raw).await.unwrap();
+        assert_ne!(raw, wire, "return traffic must be re-wrapped, not replayed");
+        let decrypted = frp_core::encryption::decrypt(&raw, &key).unwrap();
+        let framed_restored = frp_core::encryption::decompress(&decrypted).unwrap();
+        assert_eq!(framed_restored, framed, "wire must carry the framed packet");
+
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(controller.server_conn_sender(&src).await.is_none());
+    }
+
+    #[cfg(all(feature = "vnet", feature = "compression"))]
+    #[tokio::test]
+    async fn tunnel_packet_reader_drains_multiple_frames_before_next_transport_read() {
+        use tokio::io::AsyncWriteExt;
+
+        let packet_a = vec![0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06];
+        let packet_b = vec![0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x11];
+        let mut wire = Vec::new();
+        for packet in [&packet_a, &packet_b] {
+            let mut framed = Vec::new();
+            framed.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+            framed.extend_from_slice(packet);
+            let mut compressed = Vec::new();
+            frp_core::encryption::compress_into(&framed, &mut compressed).unwrap();
+            wire.extend_from_slice(&compressed);
+        }
+        let (mut writer, reader) = tokio::io::duplex(8192);
+        writer.write_all(&wire).await.unwrap();
+        drop(writer);
+
+        let mut packet_reader = TunnelPacketReader::new(reader, true);
+        assert_eq!(packet_reader.next_packet().await.unwrap(), Some(packet_a));
+        assert_eq!(packet_reader.next_packet().await.unwrap(), Some(packet_b));
+        assert_eq!(packet_reader.next_packet().await.unwrap(), None);
+    }
+
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn tunnel_packet_reader_handles_coalesced_and_split_frames_without_compression() {
+        use tokio::io::AsyncWriteExt;
+
+        let packet_a = vec![0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06];
+        let packet_b = vec![0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x11];
+        let packet_c = vec![0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x20, 0x01];
+        let frame = |p: &[u8]| -> Vec<u8> {
+            let mut f = Vec::new();
+            f.extend_from_slice(&(p.len() as u32).to_le_bytes());
+            f.extend_from_slice(p);
+            f
+        };
+
+        let (mut writer, reader) = tokio::io::duplex(8192);
+        let mut wire = frame(&packet_a);
+        wire.extend_from_slice(&frame(&packet_b));
+        writer.write_all(&wire).await.unwrap();
+
+        let mut packet_reader = TunnelPacketReader::new(reader, false);
+        assert_eq!(packet_reader.next_packet().await.unwrap(), Some(packet_a));
+        assert_eq!(packet_reader.next_packet().await.unwrap(), Some(packet_b));
+
+        // A frame split across transport reads must still reassemble.
+        let split = frame(&packet_c);
+        writer.write_all(&split[..2]).await.unwrap();
+        writer.write_all(&split[2..]).await.unwrap();
+        assert_eq!(packet_reader.next_packet().await.unwrap(), Some(packet_c));
+
+        drop(writer);
+        assert_eq!(packet_reader.next_packet().await.unwrap(), None);
     }
 }

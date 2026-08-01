@@ -75,6 +75,10 @@ pub struct AuthConfig {
     /// For defense-in-depth, a future version should use `secrecy::Secret` or
     /// the `zeroize` crate.
     pub token: String,
+    /// Dynamic source used to resolve the current token on demand.
+    /// When set, `resolve_token()` returns a fresh value for each auth
+    /// operation instead of the startup snapshot in `token`.
+    pub token_source: Option<crate::config::ValueSource>,
     pub oidc_issuer: String,
     pub oidc_audience: String,
     pub oidc_skip_expiry: bool,
@@ -121,6 +125,7 @@ impl AuthConfig {
         Self {
             method: AuthMethod::Token,
             token: token.into(),
+            token_source: None,
             oidc_issuer: String::new(),
             oidc_audience: String::new(),
             oidc_skip_expiry: false,
@@ -141,6 +146,7 @@ impl Default for AuthConfig {
         Self {
             method: AuthMethod::Token,
             token: String::new(),
+            token_source: None,
             oidc_issuer: String::new(),
             oidc_audience: String::new(),
             oidc_skip_expiry: false,
@@ -165,6 +171,20 @@ pub enum AuthMethod {
 }
 
 impl AuthConfig {
+    /// Resolve the current auth token.
+    ///
+    /// When `token_source` is configured, the source is re-read / re-executed
+    /// so the latest value is used for each Login, Ping, or NewWorkConn auth
+    /// operation. Otherwise the static `token` is returned.
+    pub fn resolve_token(&self) -> Result<String, String> {
+        match &self.token_source {
+            Some(source) => source
+                .resolve()
+                .map_err(|e| format!("failed to resolve auth.tokenSource: {e}")),
+            None => Ok(self.token.clone()),
+        }
+    }
+
     /// Validate a login attempt. Returns the subject string (empty for token
     /// auth, populated from JWT 'sub' claim for OIDC). Returns Err if invalid.
     pub fn validate_login(
@@ -172,11 +192,23 @@ impl AuthConfig {
         privilege_key: Option<&str>,
         timestamp: Option<i64>,
     ) -> Result<String, String> {
-        if self.token.is_empty() && self.method == AuthMethod::Token {
+        let token = self.resolve_token()?;
+        self.validate_login_with_token(token.as_str(), privilege_key, timestamp)
+    }
+
+    /// Validate a login attempt against an already-resolved token.
+    /// Used by callers that resolve a dynamic source once before validation.
+    pub fn validate_login_with_token(
+        &self,
+        token: &str,
+        privilege_key: Option<&str>,
+        timestamp: Option<i64>,
+    ) -> Result<String, String> {
+        if token.is_empty() && self.method == AuthMethod::Token {
             return Err(
                 "authentication token is empty. When auth.method = 'token', \
-                 you must set auth.token in the config file or use the --token CLI flag. \
-                 An empty token would accept ALL connections without authentication."
+                 you must set auth.token / auth.tokenSource in the config file or use the \
+                 --token CLI flag. An empty token would accept ALL connections."
                     .to_string(),
             );
         }
@@ -195,7 +227,7 @@ impl AuthConfig {
                 // relies on the server rejecting duplicate timestamps (not freshness).
                 // frp-rs strips authentication_timeout from token path to match
                 // Go behavior — OIDC path keeps the check.
-                let expected = generate_token(&self.token, ts);
+                let expected = generate_token(token, ts);
                 if !constant_time_eq(key.as_bytes(), expected.as_bytes()) {
                     return Err("invalid authentication token".into());
                 }
@@ -210,21 +242,41 @@ impl AuthConfig {
 
     /// Generate the privilege_key for a login message.
     pub fn generate_login_key(&self, timestamp: i64) -> Option<String> {
-        if self.token.is_empty() {
-            return None;
+        match self.try_generate_login_key(timestamp) {
+            Ok(key) => Some(key),
+            Err(e) => {
+                tracing::warn!(error = %e, "generate_login_key failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Resolve the current token and generate the privilege_key for a login
+    /// message, returning an error when the dynamic source cannot be resolved.
+    pub fn try_generate_login_key(&self, timestamp: i64) -> Result<String, String> {
+        let token = self.resolve_token()?;
+        if token.is_empty() {
+            return Err(
+                "authentication token is empty. When auth.method = 'token', \
+                 you must set auth.token or auth.tokenSource in the config file."
+                    .into(),
+            );
         }
         match self.method {
-            AuthMethod::Token => Some(generate_token(&self.token, timestamp)),
+            AuthMethod::Token => Ok(generate_token(&token, timestamp)),
             #[cfg(feature = "oidc")]
-            AuthMethod::Oidc => None,
+            AuthMethod::Oidc => Err("OIDC auth does not use token login keys".into()),
         }
     }
 
     /// Check for critical security misconfigurations at startup.
     /// Call this at server startup to reject dangerously insecure configurations.
     pub fn check_startup(&self) -> Result<(), String> {
-        if self.method == AuthMethod::Token && self.token.is_empty() {
-            return Err("CRITICAL: [auth].token is empty with token auth method — server would accept ALL connections. Set a strong token in the config file.".into());
+        if self.method == AuthMethod::Token {
+            let token = self.resolve_token()?;
+            if token.is_empty() {
+                return Err("CRITICAL: [auth].token / auth.tokenSource resolved empty with token auth method — server would accept ALL connections. Set a strong token in the config file.".into());
+            }
         }
         // OIDC configuration validation.
         #[cfg(feature = "oidc")]
@@ -1124,6 +1176,97 @@ fn resolve_dynamic_token_inner(
     }
 }
 
+impl crate::config::ValueSource {
+    /// Resolve the current value from the configured source.
+    /// File sources read and trim the file; exec sources run the command and
+    /// trim stdout.
+    pub fn resolve(&self) -> Result<String, String> {
+        self.validate()
+            .map_err(|e| format!("invalid auth.tokenSource: {e}"))?;
+        match self.source_type.as_str() {
+            "file" => {
+                let path = &self.file.as_ref().expect("validated").path;
+                std::fs::read_to_string(path)
+                    .map(|content| content.trim().to_string())
+                    .map_err(|e| format!("failed to read file {path}: {e}"))
+            }
+            "exec" => {
+                let exec = self.exec.as_ref().expect("validated");
+                let mut cmd = std::process::Command::new(&exec.command);
+                cmd.args(&exec.args);
+                for env in &exec.env {
+                    cmd.env(&env.name, &env.value);
+                }
+                cmd.stdout(std::process::Stdio::piped());
+                cmd.stderr(std::process::Stdio::piped());
+                const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+                let child = cmd
+                    .spawn()
+                    .map_err(|e| format!("failed to execute command {}: {e}", exec.command))?;
+                let pid = child.id();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let waiter = std::thread::spawn(move || {
+                    let output = child.wait_with_output();
+                    let _ = tx.send(output);
+                });
+                let output = match rx.recv_timeout(EXEC_TIMEOUT) {
+                    Ok(Ok(output)) => {
+                        let _ = waiter.join();
+                        output
+                    }
+                    Ok(Err(e)) => {
+                        let _ = waiter.join();
+                        return Err(format!("failed to execute command {}: {e}", exec.command));
+                    }
+                    Err(_) => {
+                        #[cfg(unix)]
+                        {
+                            let _ = std::process::Command::new("kill")
+                                .args(["-9", &pid.to_string()])
+                                .status();
+                        }
+                        let _ = waiter.join();
+                        return Err(format!(
+                            "failed to execute command {}: timed out after {}s",
+                            exec.command,
+                            EXEC_TIMEOUT.as_secs()
+                        ));
+                    }
+                };
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(format!(
+                        "failed to execute command {}: {} ({})",
+                        exec.command,
+                        output.status,
+                        stderr.trim()
+                    ));
+                }
+                Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            }
+            other => Err(format!("unsupported value source type: {other}")),
+        }
+    }
+}
+
+/// Gate exec-based token sources behind the `UnsafeFeatures` allowlist.
+/// Go frp v0.70.1 only treats exec sources as unsafe; file sources are allowed.
+pub fn validate_token_source_unsafe(
+    source: &crate::config::ValueSource,
+    unsafe_features: &crate::unsafe_features::UnsafeFeatures,
+) -> Result<(), String> {
+    if source.source_type == "exec"
+        && !unsafe_features.is_enabled(crate::unsafe_features::TOKEN_SOURCE_EXEC)
+    {
+        return Err(
+            "auth.tokenSource exec blocked: TokenSourceExec not in UnsafeFeatures allowlist. \
+             Pass --allow-unsafe TokenSourceExec to enable."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1161,6 +1304,7 @@ mod tests {
         let cfg = AuthConfig {
             method: AuthMethod::Oidc,
             token: String::new(),
+            token_source: None,
             oidc_issuer: "https://issuer.example.com".into(),
             oidc_audience: "my-audience".into(),
             oidc_skip_expiry: false,
@@ -1327,6 +1471,7 @@ mod tests {
         let cfg = AuthConfig {
             method: AuthMethod::Oidc,
             token: "secret".into(),
+            token_source: None,
             oidc_issuer: String::new(),
             oidc_audience: String::new(),
             oidc_skip_expiry: false,
@@ -1434,6 +1579,94 @@ mod tests {
         let result = resolve_dynamic_token_checked(&url, &uf);
         std::fs::remove_file(&path).ok();
         assert_eq!(result.unwrap(), "file-token-allowed");
+    }
+
+    #[test]
+    fn test_auth_config_file_token_source_resolves_on_demand() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b" first-token \n").unwrap();
+        file.flush().unwrap();
+        let mut cfg = AuthConfig::default();
+        cfg.token_source = Some(crate::config::ValueSource {
+            source_type: "file".into(),
+            file: Some(crate::config::FileSource {
+                path: file.path().display().to_string(),
+            }),
+            exec: None,
+        });
+
+        assert_eq!(cfg.resolve_token().unwrap(), "first-token");
+
+        std::fs::write(file.path(), b"\n second-token \n\n").unwrap();
+        assert_eq!(cfg.resolve_token().unwrap(), "second-token");
+    }
+
+    #[test]
+    fn test_auth_config_exec_token_source_resolves_with_args_env() {
+        let mut cfg = AuthConfig::default();
+        cfg.token_source = Some(crate::config::ValueSource {
+            source_type: "exec".into(),
+            file: None,
+            exec: Some(crate::config::ExecSource {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "printf '%s' \"$TOKEN\"".into()],
+                env: vec![crate::config::ExecEnvVar {
+                    name: "TOKEN".into(),
+                    value: "  secret-token\n".into(),
+                }],
+            }),
+        });
+
+        assert_eq!(cfg.resolve_token().unwrap(), "secret-token");
+    }
+
+    #[test]
+    fn test_auth_config_validate_login_uses_token_source() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"source-token\n").unwrap();
+        file.flush().unwrap();
+        let mut cfg = AuthConfig::default();
+        cfg.token_source = Some(crate::config::ValueSource {
+            source_type: "file".into(),
+            file: Some(crate::config::FileSource {
+                path: file.path().display().to_string(),
+            }),
+            exec: None,
+        });
+        let ts = 1_700_000_000;
+        let key = generate_token("source-token", ts);
+
+        assert!(cfg.validate_login(Some(&key), Some(ts)).is_ok());
+        assert!(cfg.validate_login(Some("wrong"), Some(ts)).is_err());
+        assert_eq!(
+            cfg.try_generate_login_key(ts).unwrap(),
+            generate_token("source-token", ts)
+        );
+    }
+
+    #[test]
+    fn test_token_source_exec_gated_by_unsafe_features() {
+        let source = crate::config::ValueSource {
+            source_type: "exec".into(),
+            file: None,
+            exec: Some(crate::config::ExecSource {
+                command: "/bin/echo".into(),
+                args: vec!["token".into()],
+                env: Vec::new(),
+            }),
+        };
+        let blocked = crate::unsafe_features::UnsafeFeatures::default();
+        let err = validate_token_source_unsafe(&source, &blocked).unwrap_err();
+        assert!(err.contains("TokenSourceExec"), "{err}");
+
+        let allowed = crate::unsafe_features::UnsafeFeatures::new(&[
+            crate::unsafe_features::TOKEN_SOURCE_EXEC,
+        ]);
+        assert!(validate_token_source_unsafe(&source, &allowed).is_ok());
     }
 
     // --- Authentication timeout tests ---

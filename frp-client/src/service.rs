@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
+#[cfg(feature = "vnet")]
+use tokio::sync::watch;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
 /// Internal request from a visitor task to the control loop.
@@ -32,6 +34,10 @@ use frp_core::unsafe_features::UnsafeFeatures;
 
 #[cfg(feature = "vnet")]
 type VnetTunMap = Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>;
+#[cfg(feature = "vnet")]
+type VnetTunTxMap = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
+#[cfg(feature = "vnet")]
+type VnetTunCancelMap = Arc<Mutex<HashMap<String, watch::Sender<bool>>>>;
 use frp_core::encryption;
 use frp_core::msg::{self, ClientSpec, FrpMessage};
 use frp_core::protocol::{read_msg, write_msg};
@@ -46,11 +52,33 @@ use crate::admin::AdminState;
 use crate::control::ControlConnection;
 use crate::plugin::{self, PluginContext, PluginHandle};
 use crate::proxy_runtime::{ProxyPhase, ProxyRuntimeInfo, ReloadRequest};
+use crate::store::{merge_client_config, StoreSource};
 use crate::util::opt_if_empty;
 use crate::work_conn::XtcpNotification;
 
+/// Go frp v0.70.1 visitor plugin type for virtual-net host routes.
+const VISITOR_PLUGIN_VIRTUAL_NET: &str = "virtual_net";
+
 fn heartbeat_requires_auth(client_scopes: &[String], server_scopes: &[String]) -> bool {
     crate::work_conn::scope_requires_auth(client_scopes, server_scopes, "HeartBeats")
+}
+
+/// Build a VnetRouteAdvertise for a `virtual_net` visitor, advertising its
+/// destinationIP as a host route through the frp vnet routing path.
+///
+#[cfg(feature = "vnet")]
+fn virtual_net_visitor_route_adv(
+    v: &frp_core::config::VisitorConfig,
+) -> Option<msg::VnetRouteAdvertise> {
+    if v.plugin.as_ref()?.plugin_type != VISITOR_PLUGIN_VIRTUAL_NET {
+        return None;
+    }
+    let ip: std::net::IpAddr = v.plugin.as_ref()?.destination_ip.parse().ok()?;
+    Some(msg::VnetRouteAdvertise {
+        proxy_name: v.name.clone(),
+        subnet: frp_vnet::router::host_route_cidr(&ip),
+        virtual_net: None,
+    })
 }
 
 fn reconnect_delay_after_session(
@@ -94,8 +122,10 @@ async fn dispatch_plugin_start(
 
 /// The main frpc service.
 pub struct Service {
-    cfg: ClientConfig,
-    proxies: Arc<Vec<frp_core::config::ProxyConfig>>,
+    cfg: Arc<RwLock<ClientConfig>>,
+    proxies: Arc<RwLock<Vec<frp_core::config::ProxyConfig>>>,
+    /// Optional file-backed store shared with the admin API.
+    store_source: Option<Arc<StoreSource>>,
     auth_cfg: Arc<AuthConfig>,
     encryption_key: [u8; 16],
     /// Map proxy_name -> runtime info for looking up where to connect
@@ -139,18 +169,29 @@ pub struct Service {
     /// Work connection tasks take ownership of the TUN device via Option::take().
     #[cfg(feature = "vnet")]
     vnet_tuns: VnetTunMap,
-    /// Shared routing table for vnet packet forwarding (TX direction).
-    /// Updated by the service when peer route advertisements arrive,
-    /// read by VnetController during packet forwarding.
+    /// Shared client-side vnet controller: routing table used by TUN-backed
+    /// VnetControllers (TX direction) plus virtual_net visitor tunnel
+    /// delivery channels (RX direction).
     #[cfg(feature = "vnet")]
-    vnet_routes: Arc<tokio::sync::RwLock<frp_vnet::router::RouteTable>>,
+    vnet_controller: Arc<frp_vnet::controller::ClientVnetController>,
     /// Per-proxy TX channels for forwarding received VnetPackets to TUN devices.
     /// Keyed by proxy name.
     #[cfg(feature = "vnet")]
     vnet_tun_tx: Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>>>,
+    /// Per-proxy cancellation senders for running vnet controllers.
+    #[cfg(feature = "vnet")]
+    vnet_tun_cancels: VnetTunCancelMap,
     /// Per-proxy TUN device names for OS route injection.
     #[cfg(feature = "vnet")]
     vnet_tun_names: Arc<Mutex<HashMap<String, String>>>,
+    /// Per-proxy subnet CIDR for directing virtual_net visitor return traffic.
+    #[cfg(feature = "vnet")]
+    vnet_tun_subnets: Arc<Mutex<HashMap<String, String>>>,
+    /// Peer proxy name → (advertised subnet, TUN interface) for OS routes that
+    /// were injected from VnetRouteAdvertise. Used to remove them on
+    /// VnetRouteRemove and on control disconnect.
+    #[cfg(feature = "vnet")]
+    vnet_peer_routes: Arc<Mutex<HashMap<String, (String, String)>>>,
 }
 
 impl Service {
@@ -164,10 +205,45 @@ impl Service {
 
     /// Create a new client Service with a custom unsafe features allowlist.
     pub async fn with_unsafe_features(
-        cfg: ClientConfig,
+        mut cfg: ClientConfig,
         config_file: Option<String>,
         unsafe_features: UnsafeFeatures,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Load the file-backed store when [store] path is set and overlay its
+        // proxies/visitors on the config file entries (Go frp v0.70.1 store
+        // source semantics).
+        let store_source = if let Some(ref store_cfg) = cfg.store {
+            if store_cfg.path.is_empty() {
+                None
+            } else {
+                Some(Arc::new(StoreSource::new(&store_cfg.path).map_err(
+                    |e| format!("failed to load store from {}: {e}", store_cfg.path),
+                )?))
+            }
+        } else {
+            None
+        };
+        if let Some(ref store) = store_source {
+            let merged = merge_client_config(&cfg, Some(store));
+            cfg.proxies = merged.proxies;
+            cfg.visitors = merged.visitors;
+            info!(
+                path = %store.path().display(),
+                proxies = %cfg.proxies.len(),
+                visitors = %cfg.visitors.len(),
+                "store enabled: {} proxies, {} visitors after merge",
+                cfg.proxies.len(),
+                cfg.visitors.len()
+            );
+        }
+        // Filter out disabled entries from the config source before running.
+        // Go frp source.Load() treats enabled=false as source-local filtering.
+        cfg.proxies.retain(|p| p.enabled);
+        cfg.visitors.retain(|v| v.enabled);
+        // Go frp FilterClientConfigurers applies `start` to visitors too, so
+        // visitors outside the allowlist must not register or start.
+        cfg.visitors = filter_active_visitors(&cfg, &cfg.visitors);
+
         // Determine auth method from [auth] section if present, otherwise token
         #[cfg(feature = "oidc")]
         let auth_method = if let Some(ref ac) = cfg.auth {
@@ -182,13 +258,29 @@ impl Service {
         #[cfg(not(feature = "oidc"))]
         let auth_method = AuthMethod::Token;
 
-        let auth_cfg = AuthConfig {
-            method: auth_method.clone(),
-            token: frp_core::auth::resolve_dynamic_token_checked(&cfg.token, &unsafe_features)
+        let auth_token_source = cfg.auth.as_ref().and_then(|a| a.token_source.clone());
+        let token = if let Some(ref source) = auth_token_source {
+            source
+                .validate()
+                .map_err(|e| format!("invalid auth.tokenSource: {e}"))
+                .map_err(std::io::Error::other)?;
+            frp_core::auth::validate_token_source_unsafe(source, &unsafe_features)
+                .map_err(std::io::Error::other)?;
+            source
+                .resolve()
+                .map_err(|e| format!("failed to resolve auth.tokenSource: {e}"))
+                .map_err(std::io::Error::other)?
+        } else {
+            frp_core::auth::resolve_dynamic_token_checked(&cfg.token, &unsafe_features)
                 .unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "resolve_dynamic_token error: {e}");
                     String::new()
-                }),
+                })
+        };
+        let auth_cfg = AuthConfig {
+            method: auth_method.clone(),
+            token,
+            token_source: auth_token_source,
             oidc_issuer: cfg
                 .auth
                 .as_ref()
@@ -268,6 +360,11 @@ impl Service {
 
         for p in &cfg.proxies {
             if let Some(ref plugin_cfg) = p.plugin {
+                // virtual_net is not a local-listener plugin; work connections
+                // are handed to the shared vnet controller in work_conn.rs.
+                if plugin_cfg.plugin_type == "virtual_net" {
+                    continue;
+                }
                 let result = if plugin_cfg.plugin_type == "tls2raw" {
                     // Propagate proxy-level proxyProtocolVersion into the
                     // plugin config so the tls2raw handler can read+strip
@@ -359,11 +456,17 @@ impl Service {
         #[cfg(feature = "vnet")]
         let vnet_tuns = Arc::new(Mutex::new(HashMap::new()));
         #[cfg(feature = "vnet")]
-        let vnet_routes = Arc::new(tokio::sync::RwLock::new(frp_vnet::router::RouteTable::new()));
+        let vnet_controller = Arc::new(frp_vnet::controller::ClientVnetController::new());
         #[cfg(feature = "vnet")]
         let vnet_tun_tx = Arc::new(Mutex::new(HashMap::new()));
         #[cfg(feature = "vnet")]
+        let vnet_tun_cancels = Arc::new(Mutex::new(HashMap::new()));
+        #[cfg(feature = "vnet")]
         let vnet_tun_names = Arc::new(Mutex::new(HashMap::new()));
+        #[cfg(feature = "vnet")]
+        let vnet_tun_subnets = Arc::new(Mutex::new(HashMap::new()));
+        #[cfg(feature = "vnet")]
+        let vnet_peer_routes = Arc::new(Mutex::new(HashMap::new()));
 
         let health_proxy_configs = Arc::new(Mutex::new(
             cfg.proxies
@@ -373,11 +476,12 @@ impl Service {
                 .collect(),
         ));
 
-        let proxies = Arc::new(cfg.proxies.clone());
+        let proxies = Arc::new(RwLock::new(cfg.proxies.clone()));
 
         Ok(Self {
-            cfg,
+            cfg: Arc::new(RwLock::new(cfg)),
             proxies,
+            store_source,
             auth_cfg: Arc::new(auth_cfg),
             encryption_key: enc_key,
             proxy_info_map,
@@ -400,11 +504,17 @@ impl Service {
             #[cfg(feature = "vnet")]
             vnet_tuns,
             #[cfg(feature = "vnet")]
-            vnet_routes,
+            vnet_controller,
             #[cfg(feature = "vnet")]
             vnet_tun_tx,
             #[cfg(feature = "vnet")]
+            vnet_tun_cancels,
+            #[cfg(feature = "vnet")]
             vnet_tun_names,
+            #[cfg(feature = "vnet")]
+            vnet_tun_subnets,
+            #[cfg(feature = "vnet")]
+            vnet_peer_routes,
         })
     }
 
@@ -504,65 +614,26 @@ impl Service {
         }
     }
 
-    #[instrument(skip(self), fields(server_addr = %self.cfg.server_addr, server_port = %self.cfg.server_port))]
+    #[instrument(skip(self))]
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let cfg_snapshot = self.cfg.read().await.clone();
         info!(
-            version = %frp_core::VERSION, server_addr = %self.cfg.server_addr, server_port = %self.cfg.server_port,
+            version = %frp_core::VERSION, server_addr = %cfg_snapshot.server_addr, server_port = %cfg_snapshot.server_port,
             "frpc (Rust) v{} connecting to {}:{}",
-            frp_core::VERSION, self.cfg.server_addr, self.cfg.server_port
+            frp_core::VERSION, cfg_snapshot.server_addr, cfg_snapshot.server_port
         );
 
-        let protocol: TransportProtocol = match self.cfg.transport_protocol.parse() {
+        let protocol: TransportProtocol = match cfg_snapshot.transport_protocol.parse() {
             Ok(p) => p,
             Err(_) => {
                 return Err(format!(
                     "unknown transport protocol '{}'. Valid transports: tcp, kcp, quic, websocket, wss",
-                    self.cfg.transport_protocol
+                    cfg_snapshot.transport_protocol
                 )
                 .into());
             }
         };
-        let pool_count = self.cfg.pool_count.max(0);
-        let proxies = Arc::clone(&self.proxies);
-
-        // Selective proxy start: if `start` is non-empty, only start proxies
-        // whose names are in the start list. Go frp compat.
-        let proxies: Vec<frp_core::config::ProxyConfig> = if self.cfg.start.is_empty() {
-            (*proxies).clone()
-        } else {
-            let start_set: std::collections::HashSet<&str> =
-                self.cfg.start.iter().map(|s| s.as_str()).collect();
-            let filtered: Vec<_> = proxies
-                .iter()
-                .filter(|p| start_set.contains(p.name.as_str()))
-                .cloned()
-                .collect();
-            info!(
-                active = %filtered.len(), total = %proxies.len(), start = ?self.cfg.start,
-                "Selective proxy start: {} of {} proxies active (start={:?})",
-                filtered.len(),
-                proxies.len(),
-                self.cfg.start,
-            );
-            filtered
-        };
-
-        // Filter out disabled proxies. Go frp compat: proxy.enabled.
-        let proxies: Vec<frp_core::config::ProxyConfig> =
-            proxies.into_iter().filter(|p| p.enabled).collect();
-        if proxies.len() < self.proxies.len() {
-            let disabled: Vec<&str> = self
-                .proxies
-                .iter()
-                .filter(|p| !p.enabled)
-                .map(|p| p.name.as_str())
-                .collect();
-            info!(disabled = ?disabled, "Disabled proxies (skipped): {:?}", disabled);
-        }
-
-        if proxies.is_empty() {
-            warn!("No proxies configured");
-        }
+        let pool_count = cfg_snapshot.pool_count.max(0);
 
         // Take the receiver from self (created in constructor, consumed once).
         let mut health_rx = self
@@ -577,7 +648,9 @@ impl Service {
         // Stored on self so try_reload() can cancel health checks for removed proxies.
         let health_cancels = self.health_cancels.clone();
 
-        self.spawn_health_checks(&proxies, &self.health_tx, &health_cancels)
+        let all_startup_proxies = self.proxies.read().await.clone();
+        let startup_proxies = filter_active_proxies(&cfg_snapshot, &all_startup_proxies);
+        self.spawn_health_checks(&startup_proxies, &self.health_tx, &health_cancels)
             .await;
 
         // Start admin HTTP server if configured
@@ -606,7 +679,7 @@ impl Service {
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         #[cfg(feature = "admin")]
-        self.spawn_admin_server(&_reload_tx, &_stop_tx);
+        self.spawn_admin_server(&_reload_tx, &_stop_tx).await;
 
         // Main session loop with reconnection.
         // Go frp dev two-phase fast-backoff:
@@ -627,40 +700,44 @@ impl Service {
         #[cfg(feature = "tcp-mux")]
         let mut prev_yamux: Option<std::sync::Arc<frp_core::mux::YamuxSession>> = None;
         loop {
+            let cfg_local = self.cfg.read().await.clone();
+            let all_proxies = self.proxies.read().await.clone();
+            let proxies = filter_active_proxies(&cfg_local, &all_proxies);
+
             // Go frp compat (d486018): drop previous yamux session before
             // creating a new control connection. This drops the sender channel,
             // causing the background yamux task to exit and close the TCP socket.
             #[cfg(feature = "tcp-mux")]
             drop(prev_yamux.take());
             let mut ctl = ControlConnection::new(
-                self.cfg.server_addr.clone(),
-                self.cfg.server_port,
+                cfg_local.server_addr.clone(),
+                cfg_local.server_port,
                 self.auth_cfg.clone(),
                 protocol.clone(),
                 pool_count,
-                self.cfg.user.clone(),
-                self.cfg.client_id.clone(),
-                self.cfg.tls_enable,
-                self.cfg.tls_server_name.clone(),
-                opt_if_empty!(self.cfg.tls_ca_file),
-                opt_if_empty!(self.cfg.tls_cert_file),
-                opt_if_empty!(self.cfg.tls_key_file),
-                opt_if_empty!(self.cfg.dns_server),
-                self.cfg.tcp_mux,
-                self.cfg.disable_custom_tls_first_byte,
-                self.cfg.dial_server_keepalive.max(0) as u64,
-                self.cfg.tcp_mux_keepalive_interval,
-                opt_if_empty!(self.cfg.connect_server_local_ip),
-                self.cfg.v2,
+                cfg_local.user.clone(),
+                cfg_local.client_id.clone(),
+                cfg_local.tls_enable,
+                cfg_local.tls_server_name.clone(),
+                opt_if_empty!(cfg_local.tls_ca_file),
+                opt_if_empty!(cfg_local.tls_cert_file),
+                opt_if_empty!(cfg_local.tls_key_file),
+                opt_if_empty!(cfg_local.dns_server),
+                cfg_local.tcp_mux,
+                cfg_local.disable_custom_tls_first_byte,
+                cfg_local.dial_server_keepalive.max(0) as u64,
+                cfg_local.tcp_mux_keepalive_interval,
+                opt_if_empty!(cfg_local.connect_server_local_ip),
+                cfg_local.v2,
                 self.oidc_client.clone(),
-                self.cfg.metas.clone(),
-                self.cfg.proxy_url.clone(),
+                cfg_local.metas.clone(),
+                cfg_local.proxy_url.clone(),
                 previous_run_id.clone(),
                 Some(ClientSpec {
                     client_type: Some("frpc".into()),
                     always_auth_pass: None,
                 }),
-                self.cfg.dial_server_timeout,
+                cfg_local.dial_server_timeout,
             );
 
             #[cfg(feature = "quic")]
@@ -686,7 +763,7 @@ impl Service {
                 Err(e) => {
                     consecutive_err_count += 1;
                     warn!(attempt = %consecutive_err_count, error = %e, "Login failed (attempt {}): {}", consecutive_err_count, e);
-                    if self.cfg.login_fail_exit && !did_login_once {
+                    if cfg_local.login_fail_exit && !did_login_once {
                         return Err(e.into());
                     }
                     let delay = if did_login_once {
@@ -721,7 +798,7 @@ impl Service {
             #[cfg(feature = "quic")]
             let quic_conn = quic_conn.map(std::sync::Arc::new);
             previous_run_id = run_id.clone();
-            let v2 = self.cfg.v2;
+            let v2 = cfg_local.v2;
             info!(run_id = %run_id, "Logged in. run_id: {}", run_id);
 
             let session_alive = Arc::new(AtomicBool::new(true));
@@ -758,72 +835,9 @@ impl Service {
                         }
 
                         #[cfg(feature = "vnet")]
-                        if p.proxy_type == "vnet" && !p.vnet_ip.is_empty() {
-                            use std::net::Ipv4Addr;
-                            let ip: Ipv4Addr = match p.vnet_ip.parse() {
-                                Ok(ip) => ip,
-                                Err(e) => {
-                                    warn!(proxy_name = %p.name, error = %e, "invalid vnet_ip '{}'", p.vnet_ip);
-                                    continue;
-                                }
-                            };
-                            let netmask: Ipv4Addr = match p.vnet_netmask.parse() {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    warn!(proxy_name = %p.name, error = %e, "invalid vnet_netmask '{}'", p.vnet_netmask);
-                                    continue;
-                                }
-                            };
-                            let mtu = p.vnet_mtu;
-
-                            match frp_vnet::tun::open_tun("").await {
-                                Ok(tun) => {
-                                    let tun_name = tun.name().to_string();
-                                    if let Err(e) = tun.configure(ip, netmask, mtu) {
-                                        warn!(proxy_name = %p.name, error = %e, "TUN configure failed");
-                                    } else {
-                                        info!(proxy_name = %p.name, name = %tun_name, "TUN device ready");
-                                    }
-                                    // Store TUN name for OS route injection
-                                    {
-                                        let mut names = self.vnet_tun_names.lock().await;
-                                        names.insert(p.name.clone(), tun_name);
-                                    }
-                                    // Store TUN device for later controller spawning.
-                                    // The controller is spawned after the control
-                                    // connection writer is created.
-                                    {
-                                        let mut tuns = self.vnet_tuns.lock().await;
-                                        tuns.insert(p.name.clone(), Some(tun));
-                                    }
-                                    // Send VnetRouteAdvertise if subnet is configured
-                                    if !p.advertise_subnet.is_empty() {
-                                        let adv = FrpMessage::VnetRouteAdvertise(
-                                            msg::VnetRouteAdvertise {
-                                                proxy_name: p.name.clone(),
-                                                subnet: p.advertise_subnet.clone(),
-                                                virtual_net: if p.virtual_net.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(p.virtual_net.clone())
-                                                },
-                                            },
-                                        );
-                                        let send_result = if v2 {
-                                            control_stream.write_v2_frame(&adv).await
-                                        } else {
-                                            control_stream.write_v1_frame(&adv).await
-                                        };
-                                        if let Err(e) = send_result {
-                                            warn!(proxy_name = %p.name, error = %e, "failed to send VnetRouteAdvertise");
-                                        } else {
-                                            info!(proxy_name = %p.name, subnet = %p.advertise_subnet, "VnetRouteAdvertise sent");
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(proxy_name = %p.name, error = %e, "TUN open failed (need root/CAP_NET_ADMIN?)");
-                                }
+                        if vnet_tun_params(p, &cfg_local.virtual_net.address).is_some() {
+                            if let Err(e) = self.open_vnet_tun_for_proxy(p, &cfg_local).await {
+                                warn!(proxy_name = %p.name, error = %e, "TUN open/register failed (need root/CAP_NET_ADMIN?)");
                             }
                         }
                     }
@@ -841,13 +855,36 @@ impl Service {
             // Register STCP/XTCP visitors on the control connection.
             // Go frps v0.69.1 requires visitor registration before NatHoleVisitor
             // can be sent on the control connection (otherwise: "auth failed").
-            for v in &self.cfg.visitors {
+            let session_visitors = self.cfg.read().await.visitors.clone();
+            for v in &session_visitors {
+                if !v.enabled {
+                    continue;
+                }
                 if v.bind_port == 0 {
                     continue;
                 }
                 match ctl.register_visitor(v, &mut control_stream).await {
                     Ok(_) => {
                         info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}'", v.name, v.server_name);
+                        // Virtual-net visitors advertise their destination IP
+                        // as a host route instead of binding a local listener.
+                        #[cfg(feature = "vnet")]
+                        if let Some(adv) = virtual_net_visitor_route_adv(v) {
+                            let send_result = if v2 {
+                                control_stream
+                                    .write_v2_frame(&FrpMessage::VnetRouteAdvertise(adv))
+                                    .await
+                            } else {
+                                control_stream
+                                    .write_v1_frame(&FrpMessage::VnetRouteAdvertise(adv))
+                                    .await
+                            };
+                            if let Err(e) = send_result {
+                                warn!(visitor_name = %v.name, error = %e, "failed to send vnet route advertisement for visitor '{}'", v.name);
+                            } else {
+                                info!(visitor_name = %v.name, "vnet route advertised for visitor '{}'", v.name);
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!(visitor_name = %v.name, error = %e, "Failed to register visitor '{}': {}", v.name, e);
@@ -862,29 +899,24 @@ impl Service {
             // Spawn VnetControllers for all vnet proxies now that the
             // control connection writer is available.
             #[cfg(feature = "vnet")]
-            {
-                let mut tuns = self.vnet_tuns.lock().await;
-                for (proxy_name, tun_opt) in tuns.iter_mut() {
-                    if let Some(tun) = tun_opt.take() {
-                        let (tun_tx, tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
-                        {
-                            let mut txs = self.vnet_tun_tx.lock().await;
-                            txs.insert(proxy_name.clone(), tun_tx);
-                        }
-                        let ctl_writer = writer.clone();
-                        let routes = self.vnet_routes.clone();
-                        let pn = proxy_name.clone();
-                        tokio::spawn(async move {
-                            let ctrl =
-                                frp_vnet::controller::VnetController::new(pn.clone(), routes, v2);
-                            if let Err(e) = ctrl.run(tun, ctl_writer, tun_rx).await {
-                                tracing::error!(proxy_name = %pn, error = %e, "vnet controller exited with error");
-                            }
-                            tracing::info!(proxy_name = %pn, "vnet controller stopped");
-                        });
-                    }
+            for p in &proxies {
+                if vnet_tun_params(p, &cfg_local.virtual_net.address).is_none() {
+                    continue;
                 }
-                tuns.clear();
+                if spawn_vnet_tun_controller(
+                    &self.vnet_tuns,
+                    &self.vnet_tun_tx,
+                    &self.vnet_tun_cancels,
+                    &self.vnet_controller,
+                    &p.name,
+                    &writer,
+                    v2,
+                )
+                .await
+                .is_some()
+                {
+                    send_vnet_route_advertise(&writer, v2, p).await;
+                }
             }
 
             // Bind local UDP sockets for UDP proxies.
@@ -931,9 +963,7 @@ impl Service {
             }
 
             // Spawn initial pool work connections
-            let auth_token = self.auth_cfg.token.clone();
-            let client_scopes: Vec<String> = self
-                .cfg
+            let client_scopes: Vec<String> = cfg_local
                 .auth
                 .as_ref()
                 .map(|a| a.additional_auth_scopes.clone())
@@ -950,17 +980,17 @@ impl Service {
                     #[cfg(not(feature = "quic"))]
                     let quic_arg = ();
                     crate::work_conn::WorkConnConfig {
-                        server_addr: self.cfg.server_addr.clone(),
-                        server_port: self.cfg.server_port,
+                        server_addr: cfg_local.server_addr.clone(),
+                        server_port: cfg_local.server_port,
                         protocol: protocol.clone(),
                         run_id: run_id.clone(),
                         proxy_info_map: self.proxy_info_map.clone(),
                         enc_key: self.encryption_key,
                         pool_id: $pool_id,
-                        auth_token: auth_token.clone(),
-                        tls_enable: self.cfg.tls_enable,
-                        tls_server_name: self.cfg.tls_server_name.clone(),
-                        tls_ca_file: opt_if_empty!(self.cfg.tls_ca_file),
+                        auth_cfg: self.auth_cfg.clone(),
+                        tls_enable: cfg_local.tls_enable,
+                        tls_server_name: cfg_local.tls_server_name.clone(),
+                        tls_ca_file: opt_if_empty!(cfg_local.tls_ca_file),
                         yamux: yamux.clone(),
                         quic_conn: quic_arg,
                         v2,
@@ -970,19 +1000,21 @@ impl Service {
                         proxy_metrics: self.proxy_metrics.clone(),
                         client_auth_scopes: client_scopes.clone(),
                         server_auth_scopes: server_scopes.clone(),
-                        disable_custom_tls_first_byte: self.cfg.disable_custom_tls_first_byte,
-                        keepalive_secs: self.cfg.dial_server_keepalive.max(0) as u64,
-                        bind_addr: opt_if_empty!(self.cfg.connect_server_local_ip),
-                        proxy_url: self.cfg.proxy_url.clone(),
-                        user: self.cfg.user.clone(),
-                        dial_timeout_secs: self.cfg.dial_server_timeout.max(1) as u64,
+                        disable_custom_tls_first_byte: cfg_local.disable_custom_tls_first_byte,
+                        keepalive_secs: cfg_local.dial_server_keepalive.max(0) as u64,
+                        bind_addr: opt_if_empty!(cfg_local.connect_server_local_ip),
+                        proxy_url: cfg_local.proxy_url.clone(),
+                        user: cfg_local.user.clone(),
+                        dial_timeout_secs: cfg_local.dial_server_timeout.max(1) as u64,
                         xtcp_tx: xtcp_tx.clone(),
                         session_alive: session_alive.clone(),
                         spawned_counter: None,
                         #[cfg(feature = "vnet")]
                         vnet_tuns: self.vnet_tuns.clone(),
                         #[cfg(feature = "vnet")]
-                        vnet_routes: self.vnet_routes.clone(),
+                        vnet_controller: self.vnet_controller.clone(),
+                        #[cfg(feature = "vnet")]
+                        vnet_tun_tx: self.vnet_tun_tx.clone(),
                     }
                 }};
             }
@@ -1009,12 +1041,75 @@ impl Service {
             }
 
             // Spawn STCP/XTCP visitor listeners
-            for v in &self.cfg.visitors {
+            let session_visitors = self.cfg.read().await.visitors.clone();
+            for v in &session_visitors {
+                if !v.enabled {
+                    continue;
+                }
                 if v.bind_port == 0 {
                     continue;
                 }
-                let sa = self.cfg.server_addr.clone();
-                let sp = self.cfg.server_port;
+                // Virtual_net visitors do not bind a local listener; they
+                // establish a persistent STCP/XTCP tunnel and register their
+                // destinationIP host route with the client vnet controller.
+                if v.plugin
+                    .as_ref()
+                    .is_some_and(|p| p.plugin_type == VISITOR_PLUGIN_VIRTUAL_NET)
+                {
+                    #[cfg(feature = "vnet")]
+                    {
+                        if let Some(adv) = virtual_net_visitor_route_adv(v) {
+                            let sa = cfg_local.server_addr.clone();
+                            let sp = cfg_local.server_port;
+                            let pt = protocol.clone();
+                            let server_name = v.server_name.clone();
+                            let server_user = v.server_user.clone();
+                            let secret_key = v.secret_key.clone();
+                            let use_enc = v.use_encryption;
+                            let use_comp = v.use_compression;
+                            let name = v.name.clone();
+                            let tls_enable = cfg_local.tls_enable;
+                            let tls_server_name = cfg_local.tls_server_name.clone();
+                            let tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
+                            let user = cfg_local.user.clone();
+                            let rid = run_id.clone();
+                            let controller = self.vnet_controller.clone();
+                            let vnet_tun_tx = self.vnet_tun_tx.clone();
+                            let tun_subnets = self.vnet_tun_subnets.clone();
+                            let shutdown = visitor_shutdown.clone();
+                            let handle = tokio::spawn(async move {
+                                crate::visitor::run_virtual_net_visitor(
+                                    crate::visitor::VirtualNetVisitorConfig {
+                                        server_addr: sa,
+                                        server_port: sp,
+                                        protocol: pt,
+                                        server_name,
+                                        server_user,
+                                        secret_key,
+                                        use_encryption: use_enc,
+                                        use_compression: use_comp,
+                                        name,
+                                        tls_enable,
+                                        tls_server_name,
+                                        tls_ca_file,
+                                        user,
+                                        run_id: rid,
+                                        destination_cidr: adv.subnet,
+                                        controller,
+                                        vnet_tun_tx,
+                                        tun_subnets,
+                                        shutdown,
+                                    },
+                                )
+                                .await;
+                            });
+                            visitor_handles.push(handle);
+                        }
+                    }
+                    continue;
+                }
+                let sa = cfg_local.server_addr.clone();
+                let sp = cfg_local.server_port;
                 let pt = protocol.clone();
                 let server_name = v.server_name.clone();
                 let server_user = v.server_user.clone();
@@ -1023,9 +1118,9 @@ impl Service {
                 let use_enc = v.use_encryption;
                 let use_comp = v.use_compression;
                 let name = v.name.clone();
-                let tls_enable = self.cfg.tls_enable;
-                let tls_server_name = self.cfg.tls_server_name.clone();
-                let tls_ca_file = opt_if_empty!(self.cfg.tls_ca_file);
+                let tls_enable = cfg_local.tls_enable;
+                let tls_server_name = cfg_local.tls_server_name.clone();
+                let tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
                 let visitor_type = v.visitor_type.clone();
                 let fallback_timeout_ms = v.fallback_timeout_ms;
                 let keep_tunnel_open = v.keep_tunnel_open;
@@ -1035,7 +1130,7 @@ impl Service {
                 let fallback_to = v.fallback_to.clone();
                 let disable_assisted_addrs = v.disable_assisted_addrs;
                 let p2p_protocol = v.protocol.clone();
-                let user = self.cfg.user.clone();
+                let user = cfg_local.user.clone();
                 let rid = run_id.clone();
                 let vtx = self.visitor_tx.clone();
                 let shutdown = visitor_shutdown.clone();
@@ -1088,8 +1183,8 @@ impl Service {
                 String,
                 oneshot::Sender<Result<msg::NatHoleResp, String>>,
             > = std::collections::HashMap::new();
-            let mut ping_interval = if self.cfg.heartbeat_interval > 0 {
-                let secs = self.cfg.heartbeat_interval as u64;
+            let mut ping_interval = if cfg_local.heartbeat_interval > 0 {
+                let secs = cfg_local.heartbeat_interval as u64;
                 info!(interval = %secs, "Heartbeat interval: {}s", secs);
                 Some(tokio::time::interval(Duration::from_secs(secs)))
             } else {
@@ -1103,7 +1198,7 @@ impl Service {
             proxy_retry_interval.tick().await; // Skip first immediate tick
 
             let mut last_pong = Instant::now();
-            let hb_timeout = self.cfg.heartbeat_timeout;
+            let hb_timeout = cfg_local.heartbeat_timeout;
             let hb_timeout_dur = Duration::from_secs(hb_timeout.max(0) as u64);
 
             loop {
@@ -1188,7 +1283,8 @@ impl Service {
                                 info!(subnet = %adv.subnet, proxy_name = %adv.proxy_name, "peer vnet route advertisement received");
                                 // Update the shared route table (TX direction lookup).
                                 {
-                                    let mut routes = self.vnet_routes.write().await;
+                                    let route_table = self.vnet_controller.route_table();
+                                    let mut routes = route_table.write().await;
                                     if let Err(e) = routes.insert(&adv.proxy_name, &adv.subnet) {
                                         warn!(%e, "failed to add vnet route");
                                     }
@@ -1200,6 +1296,10 @@ impl Service {
                                     let names = self.vnet_tun_names.lock().await;
                                     if let Some(tun_name) = names.values().next() {
                                         add_os_route(&adv.subnet, tun_name);
+                                        self.vnet_peer_routes.lock().await.insert(
+                                            adv.proxy_name.clone(),
+                                            (adv.subnet.clone(), tun_name.clone()),
+                                        );
                                     }
                                 }
                             }
@@ -1207,10 +1307,21 @@ impl Service {
                             Ok(FrpMessage::VnetPacket(vpkt)) => {
                                 match data_encoding::BASE64.decode(vpkt.data.as_bytes()) {
                                     Ok(packet) => {
-                                        let txs = self.vnet_tun_tx.lock().await;
-                                        if let Some(tx) = txs.get(&vpkt.proxy_name) {
-                                            if tx.try_send(packet).is_err() {
-                                                warn!(proxy_name = %vpkt.proxy_name, "vnet TUN channel closed");
+                                        // Virtual_net visitors first: deliver into
+                                        // the visitor's STCP/XTCP tunnel. TUN-backed
+                                        // vnet proxies fall back to their TUN channel.
+                                        let delivered = self
+                                            .vnet_controller
+                                            .deliver_visitor_packet(&vpkt.proxy_name, packet.clone())
+                                            .await;
+                                        if !delivered {
+                                            let txs = self.vnet_tun_tx.lock().await;
+                                            if let Some(tx) = txs.get(&vpkt.proxy_name) {
+                                                if tx.try_send(packet).is_err() {
+                                                    warn!(proxy_name = %vpkt.proxy_name, "vnet TUN channel closed");
+                                                }
+                                            } else {
+                                                debug!(proxy_name = %vpkt.proxy_name, "vnet packet dropped: no visitor or TUN target");
                                             }
                                         }
                                     }
@@ -1222,8 +1333,15 @@ impl Service {
                             #[cfg(feature = "vnet")]
                             Ok(FrpMessage::VnetRouteRemove(adv)) => {
                                 info!(proxy_name = %adv.proxy_name, "peer vnet route removed");
-                                let mut routes = self.vnet_routes.write().await;
-                                routes.remove(&adv.proxy_name);
+                                if let Some((subnet, tun_name)) =
+                                    self.vnet_peer_routes.lock().await.remove(&adv.proxy_name)
+                                {
+                                    remove_os_route(&subnet, &tun_name);
+                                }
+                                self.vnet_controller.route_table().write().await.remove(&adv.proxy_name);
+                                self.vnet_controller
+                                    .unregister_visitor_route(&adv.proxy_name)
+                                    .await;
                             }
                             Ok(_) => {
                                 // Other messages are ignored
@@ -1265,9 +1383,16 @@ impl Service {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs() as i64;
-                                let ping_auth = AuthConfig::with_token(self.auth_cfg.token.clone());
-                                ping_msg.privilege_key = ping_auth.generate_login_key(ts);
-                                ping_msg.timestamp = Some(ts);
+                                match self.auth_cfg.try_generate_login_key(ts) {
+                                    Ok(key) => {
+                                        ping_msg.privilege_key = Some(key);
+                                        ping_msg.timestamp = Some(ts);
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "Ping token source failed: {}. Reconnecting...", e);
+                                        break;
+                                    }
+                                }
                             }
                         }
                         let ping = FrpMessage::Ping(ping_msg);
@@ -1486,6 +1611,48 @@ impl Service {
                 }
             }
 
+            // Clean up vnet routes advertised by virtual_net visitors before
+            // dropping the control connection. The server also removes routes
+            // during control teardown; this mirrors Go frp's explicit
+            // VnetRouteRemove from the visitor plugin Close().
+            #[cfg(feature = "vnet")]
+            {
+                // Remove OS routes learned from peers and clear their route
+                // table entries so a reconnect starts from a clean slate.
+                {
+                    let peer_routes = self.vnet_peer_routes.lock().await;
+                    for (proxy_name, (subnet, tun_name)) in peer_routes.iter() {
+                        remove_os_route(subnet, tun_name);
+                        self.vnet_controller
+                            .route_table()
+                            .write()
+                            .await
+                            .remove(proxy_name);
+                    }
+                }
+                self.vnet_peer_routes.lock().await.clear();
+
+                let session_visitors = self.cfg.read().await.visitors.clone();
+                for v in &session_visitors {
+                    if v.plugin.as_ref().is_none() || !v.enabled {
+                        continue;
+                    }
+                    if let Some(adv) = virtual_net_visitor_route_adv(v) {
+                        self.vnet_controller.unregister_visitor_route(&v.name).await;
+                        let rem = msg::VnetRouteRemove {
+                            proxy_name: adv.proxy_name,
+                            virtual_net: adv.virtual_net,
+                        };
+                        let msg = FrpMessage::VnetRouteRemove(rem);
+                        if let Err(e) = write_msg(&mut *writer.lock().await, &msg, v2).await {
+                            warn!(visitor_name = %v.name, error = %e, "failed to remove vnet route for visitor '{}'", v.name);
+                        } else {
+                            info!(visitor_name = %v.name, "vnet route removed for visitor '{}'", v.name);
+                        }
+                    }
+                }
+            }
+
             // Go frp GracefulClose ordering: close proxies first, then visitors,
             // then the control connection. See /tmp/frp-source/client/control.go:203-210.
             // Step 1: Signal work connection pool to stop replenishment cascade.
@@ -1600,32 +1767,36 @@ impl Service {
     /// Start the admin HTTP server if configured.
     /// Spawns as a background task; returns immediately.
     #[cfg(feature = "admin")]
-    fn spawn_admin_server(
+    async fn spawn_admin_server(
         &self,
         reload_tx: &mpsc::Sender<ReloadRequest>,
         stop_tx: &mpsc::Sender<()>,
     ) {
-        if self.cfg.web_server.port > 0 {
-            let admin_addr =
-                frp_core::format_socket_addr(&self.cfg.web_server.addr, self.cfg.web_server.port);
+        let cfg_snapshot = self.cfg.read().await.clone();
+        if cfg_snapshot.web_server.port > 0 {
+            let admin_addr = frp_core::format_socket_addr(
+                &cfg_snapshot.web_server.addr,
+                cfg_snapshot.web_server.port,
+            );
             let admin_state = AdminState {
                 proxy_metrics: self.proxy_metrics.clone(),
                 proxies: self.proxy_info_map.clone(),
                 reload_tx: reload_tx.clone(),
                 stop_tx: stop_tx.clone(),
                 config_path: self.config_file.clone(),
+                store: self.store_source.clone(),
             };
-            let admin_auth_user = self.cfg.web_server.user.clone();
-            let admin_auth_pwd = self.cfg.web_server.password.clone();
-            let admin_tls_cert = if self.cfg.web_server.tls_cert_file.is_empty() {
+            let admin_auth_user = cfg_snapshot.web_server.user.clone();
+            let admin_auth_pwd = cfg_snapshot.web_server.password.clone();
+            let admin_tls_cert = if cfg_snapshot.web_server.tls_cert_file.is_empty() {
                 None
             } else {
-                Some(self.cfg.web_server.tls_cert_file.clone())
+                Some(cfg_snapshot.web_server.tls_cert_file.clone())
             };
-            let admin_tls_key = if self.cfg.web_server.tls_key_file.is_empty() {
+            let admin_tls_key = if cfg_snapshot.web_server.tls_key_file.is_empty() {
                 None
             } else {
-                Some(self.cfg.web_server.tls_key_file.clone())
+                Some(cfg_snapshot.web_server.tls_key_file.clone())
             };
             tokio::spawn(async move {
                 if let Err(e) = crate::admin::run_admin_server(
@@ -1641,7 +1812,7 @@ impl Service {
                     tracing::error!(error = %e, "frpc admin server failed: {}", e);
                 }
             });
-            info!(addr = %self.cfg.web_server.addr, port = %self.cfg.web_server.port, "frpc admin server starting on {}:{}", self.cfg.web_server.addr, self.cfg.web_server.port);
+            info!(addr = %cfg_snapshot.web_server.addr, port = %cfg_snapshot.web_server.port, "frpc admin server starting on {}:{}", cfg_snapshot.web_server.addr, cfg_snapshot.web_server.port);
         }
     }
 
@@ -1903,7 +2074,7 @@ impl Service {
         let xtcp_sockets_clone = xtcp_sockets.clone();
         let hp_timeout = hole_punch_timeout;
         let resp_writer = writer.clone();
-        let resp_v2 = self.cfg.v2;
+        let resp_v2 = self.cfg.read().await.v2;
         tokio::spawn(async move {
             // Retrieve the STUN socket persisted by the control loop.
             let stun_socket = {
@@ -2065,6 +2236,34 @@ impl Service {
         });
     }
 
+    /// Open and register the TUN device for a vnet proxy, if configured.
+    #[cfg(feature = "vnet")]
+    async fn open_vnet_tun_for_proxy(
+        &self,
+        proxy: &frp_core::config::ProxyConfig,
+        cfg: &frp_core::config::ClientConfig,
+    ) -> anyhow::Result<()> {
+        let Some(params) = vnet_tun_params(proxy, &cfg.virtual_net.address) else {
+            return Ok(());
+        };
+        let tun = frp_vnet::tun::open_tun("").await?;
+        register_vnet_tun(
+            &self.vnet_tuns,
+            &self.vnet_tun_names,
+            &proxy.name,
+            params,
+            tun,
+        )
+        .await?;
+        if let Some(cidr) = vnet_tun_cidr(proxy, &cfg.virtual_net.address) {
+            self.vnet_tun_subnets
+                .lock()
+                .await
+                .insert(proxy.name.clone(), cidr);
+        }
+        Ok(())
+    }
+
     /// Start a single plugin and return its handle with resolved bound address.
     /// Used during reload to restart plugins with updated config.
     /// Returns None if plugin_type is unknown or start fails (logged internally).
@@ -2073,14 +2272,18 @@ impl Service {
         proxy_name: &str,
         plugin_cfg: &frp_core::config::PluginConfig,
     ) -> Option<PluginHandle> {
+        if plugin_cfg.plugin_type == "virtual_net" {
+            return None;
+        }
         let result = if plugin_cfg.plugin_type == "visitor_plugin" {
+            let current_cfg = self.cfg.read().await.clone();
             let ctx = PluginContext {
-                server_addr: self.cfg.server_addr.clone(),
-                server_port: self.cfg.server_port,
-                transport_protocol: self.cfg.transport_protocol.clone(),
-                tls_enable: self.cfg.tls_enable,
-                tls_server_name: self.cfg.tls_server_name.clone(),
-                tls_ca_file: opt_if_empty!(self.cfg.tls_ca_file),
+                server_addr: current_cfg.server_addr.clone(),
+                server_port: current_cfg.server_port,
+                transport_protocol: current_cfg.transport_protocol.clone(),
+                tls_enable: current_cfg.tls_enable,
+                tls_server_name: current_cfg.tls_server_name.clone(),
+                tls_ca_file: opt_if_empty!(current_cfg.tls_ca_file),
                 use_encryption: true,
                 use_compression: false,
                 token: self.auth_cfg.token.clone(),
@@ -2126,13 +2329,70 @@ impl Service {
         strict: bool,
         writer: &Arc<Mutex<WriteHalf>>,
     ) -> Result<String, String> {
-        let delta = crate::reload::do_reload(&self.proxy_info_map, config_path, strict).await?;
+        self.reload_from_sources(config_path, strict, writer).await
+    }
+
+    /// Reload the config file, merge the optional store overlay, and apply the
+    /// resulting proxy/visitor changes to the running service.
+    ///
+    /// Also refreshes the in-memory config/proxy snapshots so the next session
+    /// and admin API see the merged result.
+    pub async fn reload_from_sources(
+        &self,
+        config_path: &str,
+        strict: bool,
+        writer: &Arc<Mutex<WriteHalf>>,
+    ) -> Result<String, String> {
+        let mut new_cfg = frp_core::config::load_client_config(config_path, strict)
+            .map_err(|e| format!("failed to load config: {e}"))?;
+        if let Some(ref store) = self.store_source {
+            if let Err(e) = store.reload() {
+                tracing::warn!(error = %e, "store reload failed, using in-memory state");
+            }
+            new_cfg = merge_client_config(&new_cfg, Some(store));
+        }
+        // Source-local enabled filtering, then apply the start allowlist so the
+        // reload diff never registers store/config proxies outside `start`.
+        new_cfg.proxies.retain(|p| p.enabled);
+        new_cfg.visitors.retain(|v| v.enabled);
+        let active_proxies = filter_active_proxies(&new_cfg, &new_cfg.proxies);
+        new_cfg.proxies = active_proxies;
+        new_cfg.visitors = filter_active_visitors(&new_cfg, &new_cfg.visitors);
+
+        #[cfg(feature = "vnet")]
+        let mut delta = crate::reload::do_reload(&self.proxy_info_map, new_cfg).await?;
+        #[cfg(not(feature = "vnet"))]
+        let delta = crate::reload::do_reload(&self.proxy_info_map, new_cfg).await?;
+
+        // reload::config_snapshot omits vnet-only fields; extend the delta so
+        // a subnet/IP/mask change still rebuilds the TUN during reload.
+        #[cfg(feature = "vnet")]
+        {
+            let old_cfg = self.cfg.read().await.clone();
+            let old_proxies = self.proxies.read().await.clone();
+            for p in &delta.new_config.proxies {
+                let old = old_proxies.iter().find(|old| old.name == p.name);
+                let vnet_field_changed =
+                    old.is_some_and(|old| vnet_proxy_snapshot(old) != vnet_proxy_snapshot(p));
+                let global_changed = old_cfg.virtual_net.address
+                    != delta.new_config.virtual_net.address
+                    && p.plugin
+                        .as_ref()
+                        .is_some_and(|pl| pl.plugin_type == "virtual_net");
+                if (vnet_field_changed || global_changed) && !delta.changed.contains(&p.name) {
+                    delta.changed.push(p.name.clone());
+                }
+            }
+        }
 
         if delta.removed.is_empty() && delta.added.is_empty() && delta.changed.is_empty() {
+            let merged = delta.new_config;
+            *self.cfg.write().await = merged;
+            *self.proxies.write().await = self.cfg.read().await.proxies.clone();
             return Ok(delta.summary);
         }
 
-        let v2 = self.cfg.v2;
+        let v2 = delta.new_config.v2;
 
         // Step 1: Cancel health checks and drop old PluginHandles for removed
         // and changed proxies. Health check tasks hold Arc<AtomicBool> cancel
@@ -2159,6 +2419,22 @@ impl Service {
             }
         }
 
+        // Drop TUN state for removed and changed proxies before recreating it.
+        // Changed proxies must get a fresh TUN and a fresh delivery channel.
+        #[cfg(feature = "vnet")]
+        for name in delta.removed.iter().chain(delta.changed.iter()) {
+            remove_vnet_tun(
+                &self.vnet_tuns,
+                &self.vnet_tun_tx,
+                &self.vnet_tun_cancels,
+                &self.vnet_tun_names,
+                &self.vnet_tun_subnets,
+                &self.vnet_controller.route_table(),
+                name,
+            )
+            .await;
+        }
+
         // Step 2: Start new plugins for added and changed proxies that have plugin config.
         // Collect actual bound addresses for use in NewProxy messages and map updates.
         let mut plugin_addrs: HashMap<String, String> = HashMap::new();
@@ -2176,6 +2452,32 @@ impl Service {
                     // If plugin start fails, plugin_addrs won't have an entry;
                     // the proxy uses configured local_ip:local_port as fallback.
                 }
+            }
+        }
+
+        // Open/register TUN devices and spawn controllers for added and
+        // changed vnet proxies before NewProxy is sent, so a work conn that
+        // arrives immediately can find the fresh delivery channel.
+        #[cfg(feature = "vnet")]
+        for name in delta.added.iter().chain(delta.changed.iter()) {
+            if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
+                if vnet_tun_params(p, &delta.new_config.virtual_net.address).is_none() {
+                    continue;
+                }
+                if let Err(e) = self.open_vnet_tun_for_proxy(p, &delta.new_config).await {
+                    warn!(proxy_name = %name, error = %e, "reload TUN open/register failed");
+                    continue;
+                }
+                spawn_vnet_tun_controller(
+                    &self.vnet_tuns,
+                    &self.vnet_tun_tx,
+                    &self.vnet_tun_cancels,
+                    &self.vnet_controller,
+                    name,
+                    writer,
+                    v2,
+                )
+                .await;
             }
         }
 
@@ -2258,6 +2560,15 @@ impl Service {
         }
         for name in &delta.added {
             tracing::info!(name = %name, "Reload: sent NewProxy for added '{}'", name);
+        }
+
+        // Advertise vnet subnets only after the corresponding NewProxy has
+        // been sent, so the server has a proxy to associate the route with.
+        #[cfg(feature = "vnet")]
+        for name in delta.added.iter().chain(delta.changed.iter()) {
+            if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
+                send_vnet_route_advertise(writer, v2, p).await;
+            }
         }
 
         // Step 4: Update proxy_info_map so admin API and work conn lookups
@@ -2345,10 +2656,256 @@ impl Service {
             }
         }
 
+        // Step 7: Refresh the in-memory config/proxy snapshots so the next
+        // session, reconnect, and admin status endpoint use the merged config.
+        *self.cfg.write().await = delta.new_config;
+        *self.proxies.write().await = self.cfg.read().await.proxies.clone();
+
         let summary = changes.join("; ");
         tracing::info!(summary = %summary, "Config reload summary: {}", summary);
         Ok(format!("reload success: {summary}"))
     }
+}
+
+/// Resolve the local TUN address, netmask, and MTU for a vnet proxy.
+#[cfg(feature = "vnet")]
+fn vnet_tun_params(
+    p: &frp_core::config::ProxyConfig,
+    global_address: &str,
+) -> Option<(std::net::Ipv4Addr, std::net::Ipv4Addr, u16)> {
+    let (ip, netmask, mtu) = if p.proxy_type == "vnet" && !p.vnet_ip.is_empty() {
+        (p.vnet_ip.clone(), p.vnet_netmask.clone(), p.vnet_mtu)
+    } else if p
+        .plugin
+        .as_ref()
+        .is_some_and(|pl| pl.plugin_type == "virtual_net")
+        && !global_address.is_empty()
+    {
+        (
+            global_address.to_string(),
+            "255.255.255.0".to_string(),
+            1420,
+        )
+    } else {
+        return None;
+    };
+    Some((ip.parse().ok()?, netmask.parse().ok()?, mtu))
+}
+
+/// Snapshot the vnet-relevant proxy fields that `reload::config_snapshot`
+/// currently omits, so TUN reloads also react to subnet/IP/mask changes.
+#[cfg(feature = "vnet")]
+fn vnet_proxy_snapshot(p: &frp_core::config::ProxyConfig) -> String {
+    let plugin_type = p
+        .plugin
+        .as_ref()
+        .map(|pl| pl.plugin_type.as_str())
+        .unwrap_or("");
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        p.proxy_type,
+        p.virtual_net,
+        p.advertise_subnet,
+        p.vnet_ip,
+        p.vnet_netmask,
+        p.vnet_mtu,
+        plugin_type
+    )
+}
+
+/// Compute the subnet CIDR owned by a local TUN proxy.
+#[cfg(feature = "vnet")]
+fn vnet_tun_cidr(p: &frp_core::config::ProxyConfig, global_address: &str) -> Option<String> {
+    let (ip, netmask, _) = vnet_tun_params(p, global_address)?;
+    let prefix = u32::from(netmask).count_ones();
+    if prefix > 32 {
+        return None;
+    }
+    let network = u32::from(ip) & u32::from(netmask);
+    Some(format!("{}/{}", std::net::Ipv4Addr::from(network), prefix))
+}
+
+/// Store an opened TUN device in the shared proxy maps.
+#[cfg(feature = "vnet")]
+async fn register_vnet_tun(
+    vnet_tuns: &VnetTunMap,
+    vnet_tun_names: &Arc<Mutex<HashMap<String, String>>>,
+    proxy_name: &str,
+    params: (std::net::Ipv4Addr, std::net::Ipv4Addr, u16),
+    tun: Box<dyn frp_vnet::tun::TunDevice>,
+) -> anyhow::Result<()> {
+    let tun_name = tun.name().to_string();
+    if let Err(e) = tun.configure(params.0, params.1, params.2) {
+        tracing::warn!(proxy_name = %proxy_name, error = %e, "TUN configure failed");
+    } else {
+        tracing::info!(proxy_name = %proxy_name, name = %tun_name, "TUN device ready");
+    }
+    vnet_tun_names
+        .lock()
+        .await
+        .insert(proxy_name.to_string(), tun_name);
+    vnet_tuns
+        .lock()
+        .await
+        .insert(proxy_name.to_string(), Some(tun));
+    Ok(())
+}
+
+/// Spawn the controller for a registered TUN and publish its TX channel.
+#[cfg(feature = "vnet")]
+async fn spawn_vnet_tun_controller(
+    vnet_tuns: &VnetTunMap,
+    vnet_tun_tx: &VnetTunTxMap,
+    vnet_tun_cancels: &VnetTunCancelMap,
+    vnet_controller: &Arc<frp_vnet::controller::ClientVnetController>,
+    proxy_name: &str,
+    writer: &Arc<Mutex<WriteHalf>>,
+    v2: bool,
+) -> Option<()> {
+    let tun = {
+        let mut tuns = vnet_tuns.lock().await;
+        tuns.get_mut(proxy_name)?.take()
+    }?;
+    let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(256);
+    vnet_tun_tx
+        .lock()
+        .await
+        .insert(proxy_name.to_string(), tun_tx);
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    vnet_tun_cancels
+        .lock()
+        .await
+        .insert(proxy_name.to_string(), cancel_tx);
+    let ctl_writer = writer.clone();
+    let client_controller = vnet_controller.clone();
+    let pn = proxy_name.to_string();
+    tokio::spawn(async move {
+        let ctrl = frp_vnet::controller::VnetController::new(pn.clone(), client_controller, v2);
+        tokio::select! {
+            result = ctrl.run(tun, ctl_writer, tun_rx) => {
+                if let Err(e) = result {
+                    tracing::error!(proxy_name = %pn, error = %e, "vnet controller exited with error");
+                }
+            }
+            changed = cancel_rx.changed() => {
+                if changed.is_err() || *cancel_rx.borrow() {
+                    tracing::info!(proxy_name = %pn, "vnet controller cancelled");
+                }
+            }
+        }
+        tracing::info!(proxy_name = %pn, "vnet controller stopped");
+    });
+    Some(())
+}
+
+/// Send a VnetRouteAdvertise for a `type = vnet` proxy that owns a subnet.
+#[cfg(feature = "vnet")]
+async fn send_vnet_route_advertise(
+    writer: &Arc<Mutex<WriteHalf>>,
+    v2: bool,
+    p: &frp_core::config::ProxyConfig,
+) {
+    if p.proxy_type != "vnet" || p.advertise_subnet.is_empty() {
+        return;
+    }
+    let adv = msg::VnetRouteAdvertise {
+        proxy_name: p.name.clone(),
+        subnet: p.advertise_subnet.clone(),
+        virtual_net: if p.virtual_net.is_empty() {
+            None
+        } else {
+            Some(p.virtual_net.clone())
+        },
+    };
+    let msg = FrpMessage::VnetRouteAdvertise(adv);
+    let mut w = writer.lock().await;
+    let result = write_msg(&mut *w, &msg, v2).await;
+    drop(w);
+    if let Err(e) = result {
+        tracing::warn!(proxy_name = %p.name, error = %e, "failed to send VnetRouteAdvertise");
+    } else {
+        tracing::info!(proxy_name = %p.name, subnet = %p.advertise_subnet, "VnetRouteAdvertise sent");
+    }
+}
+
+/// Drop a TUN proxy's maps, cancel its controller, and remove its routes.
+#[cfg(feature = "vnet")]
+async fn remove_vnet_tun(
+    vnet_tuns: &VnetTunMap,
+    vnet_tun_tx: &VnetTunTxMap,
+    vnet_tun_cancels: &VnetTunCancelMap,
+    vnet_tun_names: &Arc<Mutex<HashMap<String, String>>>,
+    vnet_tun_subnets: &Arc<Mutex<HashMap<String, String>>>,
+    route_table: &Arc<tokio::sync::RwLock<frp_vnet::router::RouteTable>>,
+    proxy_name: &str,
+) {
+    if let Some(cancel) = vnet_tun_cancels.lock().await.remove(proxy_name) {
+        let _ = cancel.send(true);
+    }
+    vnet_tuns.lock().await.remove(proxy_name);
+    vnet_tun_tx.lock().await.remove(proxy_name);
+    vnet_tun_names.lock().await.remove(proxy_name);
+    vnet_tun_subnets.lock().await.remove(proxy_name);
+    route_table.write().await.remove(proxy_name);
+}
+
+/// Apply the client `start` allowlist and `enabled` flag to a proxy list.
+/// Store-backed proxies go through the same filter as config-file proxies.
+pub(crate) fn filter_active_proxies(
+    cfg: &frp_core::config::ClientConfig,
+    proxies: &[frp_core::config::ProxyConfig],
+) -> Vec<frp_core::config::ProxyConfig> {
+    let mut active: Vec<frp_core::config::ProxyConfig> = if cfg.start.is_empty() {
+        proxies.to_vec()
+    } else {
+        let start_set: std::collections::HashSet<&str> =
+            cfg.start.iter().map(|s| s.as_str()).collect();
+        let filtered: Vec<_> = proxies
+            .iter()
+            .filter(|p| start_set.contains(p.name.as_str()))
+            .cloned()
+            .collect();
+        info!(
+            active = %filtered.len(), total = %proxies.len(), start = ?cfg.start,
+            "Selective proxy start: {} of {} proxies active (start={:?})",
+            filtered.len(),
+            proxies.len(),
+            cfg.start,
+        );
+        filtered
+    };
+    active.retain(|p| p.enabled);
+    active
+}
+
+/// Apply the client `start` allowlist and `enabled` flag to a visitor list.
+/// Mirrors Go frp v0.70.1 `FilterClientConfigurers`, which filters visitors by
+/// the same `start` set as proxies.
+pub(crate) fn filter_active_visitors(
+    cfg: &frp_core::config::ClientConfig,
+    visitors: &[frp_core::config::VisitorConfig],
+) -> Vec<frp_core::config::VisitorConfig> {
+    let mut active: Vec<frp_core::config::VisitorConfig> = if cfg.start.is_empty() {
+        visitors.to_vec()
+    } else {
+        let start_set: std::collections::HashSet<&str> =
+            cfg.start.iter().map(|s| s.as_str()).collect();
+        let filtered: Vec<_> = visitors
+            .iter()
+            .filter(|v| start_set.contains(v.name.as_str()))
+            .cloned()
+            .collect();
+        info!(
+            active = %filtered.len(), total = %visitors.len(), start = ?cfg.start,
+            "Selective visitor start: {} of {} visitors active (start={:?})",
+            filtered.len(),
+            visitors.len(),
+            cfg.start,
+        );
+        filtered
+    };
+    active.retain(|v| v.enabled);
+    active
 }
 
 /// Inject an OS-level route directing traffic for `subnet` through the
@@ -2373,6 +2930,31 @@ fn add_os_route(subnet: &str, tun_name: &str) {
         };
         let _ = std::process::Command::new("route")
             .args(["add", "-net", net, "-interface", tun_name])
+            .output();
+    }
+}
+
+/// Remove an OS-level route previously injected by [`add_os_route`].
+/// Best-effort: a missing route (e.g. after interface reset) is not fatal.
+#[cfg(feature = "vnet")]
+fn remove_os_route(subnet: &str, tun_name: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("ip")
+            .args(["route", "del", subnet, "dev", tun_name])
+            .output();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (net, _mask) = match subnet.split_once('/') {
+            Some(s) => s,
+            None => {
+                tracing::warn!("invalid subnet format for OS route: {subnet}");
+                return;
+            }
+        };
+        let _ = std::process::Command::new("route")
+            .args(["delete", "-net", net, "-interface", tun_name])
             .output();
     }
 }
@@ -2515,6 +3097,72 @@ mod tests {
         assert!(!heartbeat_requires_auth(&[], &unrelated));
     }
 
+    #[cfg(feature = "vnet")]
+    #[test]
+    fn virtual_net_visitor_route_advertisement() {
+        use frp_core::config::VisitorPluginConfig;
+
+        let visitor = frp_core::config::VisitorConfig {
+            name: "vnet-visitor".into(),
+            visitor_type: "stcp".into(),
+            server_name: "vnet-server".into(),
+            bind_port: -1,
+            plugin: Some(VisitorPluginConfig {
+                plugin_type: "virtual_net".into(),
+                destination_ip: "100.86.0.1".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let adv = virtual_net_visitor_route_adv(&visitor).expect("route advertisement");
+        assert_eq!(adv.proxy_name, "vnet-visitor");
+        assert_eq!(adv.subnet, "100.86.0.1/32");
+        assert_eq!(adv.virtual_net, None);
+
+        // Non-virtual-net plugins and invalid IPs produce no advertisement.
+        let plain = frp_core::config::VisitorConfig {
+            name: "plain".into(),
+            plugin: Some(VisitorPluginConfig {
+                plugin_type: "other".into(),
+                destination_ip: "100.86.0.1".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(virtual_net_visitor_route_adv(&plain).is_none());
+
+        let bad_ip = frp_core::config::VisitorConfig {
+            name: "bad".into(),
+            plugin: Some(VisitorPluginConfig {
+                plugin_type: "virtual_net".into(),
+                destination_ip: "not-an-ip".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(virtual_net_visitor_route_adv(&bad_ip).is_none());
+
+        // IPv6 destinations advertise a /128 host route.
+        let v6 = frp_core::config::VisitorConfig {
+            name: "v6".into(),
+            plugin: Some(VisitorPluginConfig {
+                plugin_type: "virtual_net".into(),
+                destination_ip: "2001:db8::1".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let adv6 = virtual_net_visitor_route_adv(&v6).expect("IPv6 route advertisement");
+        assert_eq!(adv6.proxy_name, "v6");
+        assert_eq!(adv6.subnet, "2001:db8::1/128");
+        // VnetRouteRemove is keyed only by proxy name, so the same advertisement
+        // can be converted for both IPv4 and IPv6 destinations.
+        let _remove = msg::VnetRouteRemove {
+            proxy_name: adv6.proxy_name,
+            virtual_net: adv6.virtual_net,
+        };
+    }
+
     #[test]
     fn stable_sessions_do_not_reset_backoff_escalation() {
         // Go frp v0.70.1's fastBackoffImpl resets only when the retry callback
@@ -2597,5 +3245,336 @@ mod tests {
         let m5 = mean_delay(5, 6); // phase2, 20s (capped)
         assert!(m2 > m1, "mean delay should grow: {m2} > {m1}");
         assert!(m5 > m2, "mean delay should grow: {m5} > {m2}");
+    }
+
+    #[cfg(feature = "vnet")]
+    #[test]
+    fn vnet_tun_params_and_cidr_for_plugin_and_vnet_proxies() {
+        let plugin = frp_core::config::ProxyConfig {
+            name: "plugin".into(),
+            proxy_type: "tcp".into(),
+            plugin: Some(frp_core::config::PluginConfig {
+                plugin_type: "virtual_net".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (ip, netmask, mtu) = vnet_tun_params(&plugin, "10.0.0.1").expect("plugin TUN params");
+        assert_eq!(ip, "10.0.0.1".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(
+            netmask,
+            "255.255.255.0".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+        assert_eq!(mtu, 1420);
+        assert_eq!(
+            vnet_tun_cidr(&plugin, "10.0.0.1").as_deref(),
+            Some("10.0.0.0/24")
+        );
+
+        let vnet = frp_core::config::ProxyConfig {
+            name: "vnet".into(),
+            proxy_type: "vnet".into(),
+            vnet_ip: "10.1.2.3".into(),
+            vnet_netmask: "255.255.0.0".into(),
+            vnet_mtu: 1400,
+            ..Default::default()
+        };
+        let (ip, netmask, mtu) = vnet_tun_params(&vnet, "").expect("vnet TUN params");
+        assert_eq!(ip, "10.1.2.3".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(
+            netmask,
+            "255.255.0.0".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+        assert_eq!(mtu, 1400);
+        assert_eq!(vnet_tun_cidr(&vnet, "").as_deref(), Some("10.1.0.0/16"));
+        assert!(vnet_tun_params(&vnet, "").is_some());
+    }
+
+    #[cfg(feature = "vnet")]
+    #[test]
+    fn vnet_proxy_snapshot_detects_tun_only_changes() {
+        let base = frp_core::config::ProxyConfig {
+            name: "vnet".into(),
+            proxy_type: "vnet".into(),
+            vnet_ip: "10.0.0.1".into(),
+            vnet_netmask: "255.255.255.0".into(),
+            ..Default::default()
+        };
+        let changed_ip = frp_core::config::ProxyConfig {
+            vnet_ip: "10.0.0.2".into(),
+            ..base.clone()
+        };
+        assert_ne!(vnet_proxy_snapshot(&base), vnet_proxy_snapshot(&changed_ip));
+    }
+
+    #[test]
+    fn filter_active_visitors_honors_start_allowlist_and_enabled() {
+        let cfg = frp_core::config::ClientConfig {
+            start: vec!["v1".into()],
+            ..Default::default()
+        };
+        let visitors = vec![
+            frp_core::config::VisitorConfig {
+                name: "v1".into(),
+                visitor_type: "stcp".into(),
+                ..Default::default()
+            },
+            frp_core::config::VisitorConfig {
+                name: "v2".into(),
+                visitor_type: "stcp".into(),
+                ..Default::default()
+            },
+            frp_core::config::VisitorConfig {
+                name: "v3".into(),
+                visitor_type: "stcp".into(),
+                enabled: false,
+                ..Default::default()
+            },
+        ];
+
+        let active = filter_active_visitors(&cfg, &visitors);
+        let names: Vec<&str> = active.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, vec!["v1"], "start allowlist must filter visitors");
+
+        let all = filter_active_visitors(&frp_core::config::ClientConfig::default(), &visitors);
+        let names: Vec<&str> = all.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, vec!["v1", "v2"], "disabled visitors stay filtered");
+    }
+
+    #[cfg(feature = "vnet")]
+    struct FakeTun {
+        inner: tokio::io::DuplexStream,
+        configured: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(feature = "vnet")]
+    impl tokio::io::AsyncRead for FakeTun {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    #[cfg(feature = "vnet")]
+    impl tokio::io::AsyncWrite for FakeTun {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[cfg(feature = "vnet")]
+    impl frp_vnet::tun::TunDevice for FakeTun {
+        fn configure(
+            &self,
+            _addr: std::net::Ipv4Addr,
+            _netmask: std::net::Ipv4Addr,
+            _mtu: u16,
+        ) -> anyhow::Result<()> {
+            self.configured
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "fake"
+        }
+
+        fn mtu(&self) -> u16 {
+            1420
+        }
+    }
+
+    #[cfg(feature = "vnet")]
+    fn fake_tun() -> (Box<FakeTun>, Arc<std::sync::atomic::AtomicBool>) {
+        let configured = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tun = Box::new(FakeTun {
+            inner: tokio::io::duplex(4096).0,
+            configured: configured.clone(),
+        });
+        (tun, configured)
+    }
+
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn register_and_remove_vnet_tun_updates_all_maps() {
+        let tuns: VnetTunMap = Arc::new(Mutex::new(HashMap::new()));
+        let tx: VnetTunTxMap = Arc::new(Mutex::new(HashMap::new()));
+        let cancels: VnetTunCancelMap = Arc::new(Mutex::new(HashMap::new()));
+        let names = Arc::new(Mutex::new(HashMap::new()));
+        let subnets = Arc::new(Mutex::new(HashMap::new()));
+        let route_table = Arc::new(tokio::sync::RwLock::new(frp_vnet::router::RouteTable::new()));
+        let (tun, configured) = fake_tun();
+
+        register_vnet_tun(
+            &tuns,
+            &names,
+            "vnet-a",
+            (
+                "10.0.0.1".parse().unwrap(),
+                "255.255.255.0".parse().unwrap(),
+                1420,
+            ),
+            tun,
+        )
+        .await
+        .unwrap();
+        assert!(configured.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(tuns.lock().await.contains_key("vnet-a"));
+        assert_eq!(
+            names.lock().await.get("vnet-a").map(String::as_str),
+            Some("fake")
+        );
+
+        route_table
+            .write()
+            .await
+            .insert("vnet-a", "10.0.0.0/24")
+            .unwrap();
+        remove_vnet_tun(
+            &tuns,
+            &tx,
+            &cancels,
+            &names,
+            &subnets,
+            &route_table,
+            "vnet-a",
+        )
+        .await;
+        assert!(tuns.lock().await.is_empty());
+        assert!(tx.lock().await.is_empty());
+        assert!(cancels.lock().await.is_empty());
+        assert!(names.lock().await.is_empty());
+        assert!(subnets.lock().await.is_empty());
+        assert!(route_table.read().await.is_empty());
+    }
+
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn reload_tun_controller_rebuilds_delivery_channel() {
+        let tuns: VnetTunMap = Arc::new(Mutex::new(HashMap::new()));
+        let tx_map: VnetTunTxMap = Arc::new(Mutex::new(HashMap::new()));
+        let cancels: VnetTunCancelMap = Arc::new(Mutex::new(HashMap::new()));
+        let names = Arc::new(Mutex::new(HashMap::new()));
+        let subnets = Arc::new(Mutex::new(HashMap::new()));
+        let route_table = Arc::new(tokio::sync::RwLock::new(frp_vnet::router::RouteTable::new()));
+        let controller = Arc::new(frp_vnet::controller::ClientVnetController::new());
+        let (_peer, writer_raw) = tokio::io::duplex(4096);
+        let writer_stream: Box<dyn frp_core::transport::AsyncReadWrite> = Box::new(writer_raw);
+        let (_, writer_half) = tokio::io::split(writer_stream);
+        let writer = Arc::new(Mutex::new(frp_core::transport::WriteHalf::SshChannel(
+            writer_half,
+        )));
+
+        let (tun, _) = fake_tun();
+        register_vnet_tun(
+            &tuns,
+            &names,
+            "vnet-a",
+            (
+                "10.0.0.1".parse().unwrap(),
+                "255.255.255.0".parse().unwrap(),
+                1420,
+            ),
+            tun,
+        )
+        .await
+        .unwrap();
+        spawn_vnet_tun_controller(
+            &tuns,
+            &tx_map,
+            &cancels,
+            &controller,
+            "vnet-a",
+            &writer,
+            false,
+        )
+        .await
+        .expect("first controller should spawn");
+        let old_tx = tx_map
+            .lock()
+            .await
+            .get("vnet-a")
+            .cloned()
+            .expect("first delivery channel");
+
+        remove_vnet_tun(
+            &tuns,
+            &tx_map,
+            &cancels,
+            &names,
+            &subnets,
+            &route_table,
+            "vnet-a",
+        )
+        .await;
+        assert!(tx_map.lock().await.is_empty());
+
+        let (tun, _) = fake_tun();
+        register_vnet_tun(
+            &tuns,
+            &names,
+            "vnet-a",
+            (
+                "10.0.0.2".parse().unwrap(),
+                "255.255.255.0".parse().unwrap(),
+                1420,
+            ),
+            tun,
+        )
+        .await
+        .unwrap();
+        spawn_vnet_tun_controller(
+            &tuns,
+            &tx_map,
+            &cancels,
+            &controller,
+            "vnet-a",
+            &writer,
+            false,
+        )
+        .await
+        .expect("second controller should spawn");
+        let new_tx = tx_map
+            .lock()
+            .await
+            .get("vnet-a")
+            .cloned()
+            .expect("rebuilt delivery channel");
+        assert!(
+            !old_tx.same_channel(&new_tx),
+            "reload must not reuse the old TUN delivery channel"
+        );
+
+        remove_vnet_tun(
+            &tuns,
+            &tx_map,
+            &cancels,
+            &names,
+            &subnets,
+            &route_table,
+            "vnet-a",
+        )
+        .await;
     }
 }

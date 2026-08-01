@@ -154,6 +154,34 @@ pub(crate) async fn handle_vnet_packet_forward<W: AsyncWriteExt + Unpin>(
     }
 }
 
+/// Forward a VNet route advertisement to the client via the control channel.
+#[cfg(feature = "vnet")]
+pub(crate) async fn handle_vnet_route_advertise_forward<W: AsyncWriteExt + Unpin>(
+    ctx: &ControlContext,
+    _ctl: &mut ControlState,
+    writer: &mut W,
+    adv: msg::VnetRouteAdvertise,
+) {
+    let forward = FrpMessage::VnetRouteAdvertise(adv);
+    if let Err(e) = write_ctl_msg(writer, &forward, ctx.v2).await {
+        warn!(error = %e, "Failed to forward VnetRouteAdvertise: {}", e);
+    }
+}
+
+/// Forward a VNet route removal to the client via the control channel.
+#[cfg(feature = "vnet")]
+pub(crate) async fn handle_vnet_route_remove_forward<W: AsyncWriteExt + Unpin>(
+    ctx: &ControlContext,
+    _ctl: &mut ControlState,
+    writer: &mut W,
+    rem: msg::VnetRouteRemove,
+) {
+    let forward = FrpMessage::VnetRouteRemove(rem);
+    if let Err(e) = write_ctl_msg(writer, &forward, ctx.v2).await {
+        warn!(error = %e, "Failed to forward VnetRouteRemove: {}", e);
+    }
+}
+
 // ── FrpMessage handlers ─────────────────────────────────────────────
 
 /// Handle NatHoleClient from the provider: forward to NAT hole coordinator.
@@ -851,6 +879,9 @@ pub(crate) async fn handle_vnet_route_advertise(
         "vnet route advertised: {} → {}",
         adv.subnet, adv.proxy_name
     );
+    ctx.state
+        .broadcast_vnet_route_advertise(&ctx.run_id, &adv)
+        .await;
 }
 
 /// Look up target proxy and forward a VNet packet via internal message.
@@ -861,12 +892,24 @@ pub(crate) async fn handle_vnet_packet(
     _writer: &mut (impl AsyncWriteExt + Unpin),
     pkt: msg::VnetPacket,
 ) {
-    if let Some(target_info) = ctx.state.proxy_manager.get(&pkt.proxy_name).await {
-        let target_run_id = target_info.run_id.clone();
-        if target_run_id == ctx.run_id {
-            // Same client — no forwarding needed (client handles locally)
-            debug!(proxy_name = %pkt.proxy_name, "vnet packet target is self, skipping forward");
-        } else if let Some(ctl_tx) = ctx.state.run_id_to_ctl_tx.read().await.get(&target_run_id) {
+    let target_run_id =
+        if let Some(target_info) = ctx.state.proxy_manager.get(&pkt.proxy_name).await {
+            if target_info.run_id == ctx.run_id {
+                // Same client and it owns a registered proxy: the client handles
+                // the packet locally and does not need a control-conn echo.
+                None
+            } else {
+                Some(target_info.run_id.clone())
+            }
+        } else {
+            // Not a proxy: resolve virtual_net visitor routes advertised over the
+            // control connection (visitor name → advertising client) and deliver
+            // the packet back to that client's control connection.
+            let routes = ctx.state.vnet_routes.read().await;
+            vnet_visitor_route_target_run_id(&routes, &pkt.proxy_name)
+        };
+    if let Some(target_run_id) = target_run_id {
+        if let Some(ctl_tx) = ctx.state.run_id_to_ctl_tx.read().await.get(&target_run_id) {
             let _ = ctl_tx.tx.try_send(InternalMsg::VnetPacketForward {
                 proxy_name: pkt.proxy_name.clone(),
                 data: pkt.data.clone(),
@@ -884,9 +927,31 @@ pub(crate) async fn handle_vnet_route_remove(
     rem: msg::VnetRouteRemove,
 ) {
     let vn = rem.virtual_net.clone().unwrap_or_default();
-    let mut routes = ctx.state.vnet_routes.write().await;
-    routes.retain(|(vn_k, _), (_, name)| !(vn_k == &vn && name == &rem.proxy_name));
+    {
+        let mut routes = ctx.state.vnet_routes.write().await;
+        // Only the run_id that advertised the route may remove it. A stale or
+        // replayed remove from an older control must not clobber a newer one.
+        routes.retain(|(vn_k, _), (run_id, name)| {
+            !(run_id == &ctx.run_id && vn_k == &vn && name == &rem.proxy_name)
+        });
+    }
     info!(proxy_name = %rem.proxy_name, "vnet route removed: {}", rem.proxy_name);
+    ctx.state
+        .broadcast_vnet_route_remove(&ctx.run_id, &rem)
+        .await;
+}
+
+/// Resolve the run_id that advertised `proxy_name` as a virtual_net visitor
+/// route. Returns `None` when the name is not a known visitor route.
+#[cfg(feature = "vnet")]
+fn vnet_visitor_route_target_run_id(
+    routes: &std::collections::HashMap<(String, String), (String, String)>,
+    proxy_name: &str,
+) -> Option<String> {
+    routes
+        .values()
+        .find(|(_, name)| name == proxy_name)
+        .map(|(run_id, _)| run_id.clone())
 }
 
 #[cfg(test)]
@@ -936,5 +1001,269 @@ mod identity_binding_tests {
             "owner",
             &["A".to_string()]
         ));
+    }
+
+    #[cfg(feature = "vnet")]
+    #[test]
+    fn vnet_visitor_route_resolves_advertising_run_id() {
+        use std::collections::HashMap;
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            (String::new(), "10.0.0.1/32".to_string()),
+            ("run-a".to_string(), "vnet-visitor".to_string()),
+        );
+        routes.insert(
+            (String::new(), "10.0.0.0/24".to_string()),
+            ("run-b".to_string(), "vnet-proxy-b".to_string()),
+        );
+
+        assert_eq!(
+            super::vnet_visitor_route_target_run_id(&routes, "vnet-visitor"),
+            Some("run-a".to_string())
+        );
+        // Route advertisements from regular vnet proxies also appear in the
+        // table; proxy_manager remains the primary resolver for those names.
+        assert_eq!(
+            super::vnet_visitor_route_target_run_id(&routes, "vnet-proxy-b"),
+            Some("run-b".to_string())
+        );
+        assert_eq!(
+            super::vnet_visitor_route_target_run_id(&routes, "missing"),
+            None
+        );
+    }
+}
+
+#[cfg(all(test, feature = "vnet"))]
+mod vnet_route_tests {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Arc;
+    use std::time::Instant as StdInstant;
+
+    use tokio::sync::mpsc;
+    use tokio::time::Instant;
+
+    use frp_core::msg::{self, FrpMessage};
+    use frp_core::protocol::read_msg_v1;
+
+    use crate::control::{ControlContext, ControlState};
+    use crate::state::{AppState, ControlTx, InternalMsg, PoolStats};
+
+    fn test_state() -> Arc<AppState> {
+        let cfg = frp_core::config::ServerConfig::default();
+        Arc::new(AppState::new(
+            frp_core::auth::AuthConfig::with_token("test-token"),
+            "127.0.0.1".into(),
+            frp_core::encryption::derive_key("test-token"),
+            vec![(1, u16::MAX)],
+            String::new(),
+            true,
+            30,
+            7200,
+            90,
+            1500,
+            false,
+            None,
+            0,
+            60,
+            10,
+            false,
+            String::new(),
+            Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
+            168,
+            true,
+            0,
+            0,
+            frp_core::config::ServerConfigSnapshot::from_config(&cfg),
+        ))
+    }
+
+    async fn insert_control(state: &Arc<AppState>, run_id: &str) -> mpsc::Receiver<InternalMsg> {
+        let (tx, rx) = mpsc::channel(16);
+        let mut map = state.run_id_to_ctl_tx.write().await;
+        map.insert(
+            run_id.to_string(),
+            ControlTx {
+                tx,
+                client_addr: None,
+                login_time: StdInstant::now(),
+                login_time_unix: 0,
+                pool_stats: Arc::new(PoolStats::default()),
+                user: String::new(),
+                control_id: 1,
+            },
+        );
+        rx
+    }
+
+    fn test_context(state: &Arc<AppState>, run_id: &str) -> (ControlContext, ControlState) {
+        let (_, run_mu_guard) = state.get_run_mu(run_id);
+        let (internal_tx, _internal_rx) = mpsc::channel(16);
+        let ctx = ControlContext {
+            state: Arc::clone(state),
+            pool_stats: Arc::new(PoolStats::default()),
+            reloadable: state.reloadable.read().unwrap().clone(),
+            v2: false,
+            run_id: run_id.to_string(),
+            control_id: 1,
+            pool_cap: 0,
+            internal_tx,
+            peer: None,
+            authenticated_user: String::new(),
+            _run_mu_guard: run_mu_guard,
+        };
+        let ctl = ControlState {
+            shutting_down: false,
+            shutdown_done: None,
+            work_pool: VecDeque::new(),
+            pending_requests: VecDeque::new(),
+            pending_udp: VecDeque::new(),
+            pending_nat_hole_sids: VecDeque::new(),
+            listener_handles: HashMap::new(),
+            udp_sockets: HashMap::new(),
+            udp_local_to_proxy: HashMap::new(),
+            last_ping: Instant::now(),
+        };
+        (ctx, ctl)
+    }
+
+    fn assert_advertise_eq(actual: &msg::VnetRouteAdvertise, expected: &msg::VnetRouteAdvertise) {
+        assert_eq!(actual.proxy_name, expected.proxy_name);
+        assert_eq!(actual.subnet, expected.subnet);
+        assert_eq!(actual.virtual_net, expected.virtual_net);
+    }
+
+    fn assert_remove_eq(actual: &msg::VnetRouteRemove, expected: &msg::VnetRouteRemove) {
+        assert_eq!(actual.proxy_name, expected.proxy_name);
+        assert_eq!(actual.virtual_net, expected.virtual_net);
+    }
+
+    #[tokio::test]
+    async fn advertise_is_recorded_and_forwarded_to_other_online_clients() {
+        let state = test_state();
+        let mut sender_rx = insert_control(&state, "run-a").await;
+        let mut peer_rx = insert_control(&state, "run-b").await;
+        let (ctx, mut ctl) = test_context(&state, "run-a");
+        let adv = msg::VnetRouteAdvertise {
+            proxy_name: "vnet-visitor".to_string(),
+            subnet: "2001:db8::1/128".to_string(),
+            virtual_net: Some("vnet-a".to_string()),
+        };
+
+        super::handle_vnet_route_advertise(&ctx, &mut ctl, &mut tokio::io::sink(), adv.clone())
+            .await;
+
+        let routes = state.vnet_routes.read().await;
+        assert_eq!(
+            routes.get(&("vnet-a".to_string(), "2001:db8::1/128".to_string())),
+            Some(&("run-a".to_string(), "vnet-visitor".to_string()))
+        );
+        drop(routes);
+
+        match peer_rx.recv().await {
+            Some(InternalMsg::VnetRouteAdvertiseForward { msg }) => {
+                assert_advertise_eq(&msg, &adv);
+            }
+            other => panic!("expected forwarded advertise, got {:?}", other),
+        }
+        assert!(sender_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn route_remove_is_forwarded_to_other_online_clients() {
+        let state = test_state();
+        let mut sender_rx = insert_control(&state, "run-a").await;
+        let mut peer_rx = insert_control(&state, "run-b").await;
+        let (ctx, mut ctl) = test_context(&state, "run-a");
+        {
+            let mut routes = state.vnet_routes.write().await;
+            routes.insert(
+                ("vnet-a".to_string(), "10.0.0.0/24".to_string()),
+                ("run-a".to_string(), "vnet-visitor".to_string()),
+            );
+            routes.insert(
+                ("vnet-a".to_string(), "2001:db8::/64".to_string()),
+                ("run-a".to_string(), "vnet-visitor".to_string()),
+            );
+            routes.insert(
+                ("vnet-b".to_string(), "10.1.0.0/24".to_string()),
+                ("run-b".to_string(), "peer-proxy".to_string()),
+            );
+            // Same proxy name advertised by a different run_id must survive
+            // run-a's remove (run_id-guarded deletion).
+            routes.insert(
+                ("vnet-a".to_string(), "10.2.0.0/24".to_string()),
+                ("run-b".to_string(), "vnet-visitor".to_string()),
+            );
+        }
+        let rem = msg::VnetRouteRemove {
+            proxy_name: "vnet-visitor".to_string(),
+            virtual_net: Some("vnet-a".to_string()),
+        };
+
+        super::handle_vnet_route_remove(&ctx, &mut ctl, &mut tokio::io::sink(), rem.clone()).await;
+
+        let routes = state.vnet_routes.read().await;
+        assert!(routes.iter().all(|((vn, _), (rid, name))| {
+            !(vn == "vnet-a" && rid == "run-a" && name == "vnet-visitor")
+        }));
+        assert!(routes.contains_key(&("vnet-b".to_string(), "10.1.0.0/24".to_string())));
+        assert!(
+            routes.contains_key(&("vnet-a".to_string(), "10.2.0.0/24".to_string())),
+            "run-b's same-named route must not be removed by run-a"
+        );
+        drop(routes);
+
+        match peer_rx.recv().await {
+            Some(InternalMsg::VnetRouteRemoveForward { msg }) => {
+                assert_remove_eq(&msg, &rem);
+            }
+            other => panic!("expected forwarded remove, got {:?}", other),
+        }
+        assert!(sender_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_writes_forwarded_route_messages_to_client_writer() {
+        let state = test_state();
+        let (mut ctx, mut ctl) = test_context(&state, "run-b");
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let adv = msg::VnetRouteAdvertise {
+            proxy_name: "vnet-visitor".to_string(),
+            subnet: "2001:db8::1/128".to_string(),
+            virtual_net: Some("vnet-a".to_string()),
+        };
+
+        crate::control::dispatch::dispatch_internal(
+            &mut ctx,
+            &mut ctl,
+            &mut writer,
+            InternalMsg::VnetRouteAdvertiseForward { msg: adv.clone() },
+        )
+        .await
+        .unwrap();
+        match read_msg_v1(&mut reader).await.unwrap() {
+            FrpMessage::VnetRouteAdvertise(forwarded) => assert_advertise_eq(&forwarded, &adv),
+            other => panic!("expected advertise frame, got {:?}", other),
+        }
+
+        let rem = msg::VnetRouteRemove {
+            proxy_name: "vnet-visitor".to_string(),
+            virtual_net: Some("vnet-a".to_string()),
+        };
+        crate::control::dispatch::dispatch_internal(
+            &mut ctx,
+            &mut ctl,
+            &mut writer,
+            InternalMsg::VnetRouteRemoveForward { msg: rem.clone() },
+        )
+        .await
+        .unwrap();
+        match read_msg_v1(&mut reader).await.unwrap() {
+            FrpMessage::VnetRouteRemove(forwarded) => assert_remove_eq(&forwarded, &rem),
+            other => panic!("expected remove frame, got {:?}", other),
+        }
     }
 }

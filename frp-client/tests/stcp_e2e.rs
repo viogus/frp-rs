@@ -83,6 +83,7 @@ async fn test_stcp_e2e_relay() {
             health_check_http_headers: std::collections::HashMap::new(),
             proxy_protocol_version: String::new(),
             enabled: true,
+            disable_assisted_addrs: false,
             plugin: None,
         }],
         visitors: vec![VisitorConfig {
@@ -102,6 +103,8 @@ async fn test_stcp_e2e_relay() {
             max_retries_an_hour: 0,
             min_retry_interval: 0,
             protocol: "quic".into(),
+            enabled: true,
+            plugin: None,
         }],
         ..Default::default()
     };

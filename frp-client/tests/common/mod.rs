@@ -188,6 +188,7 @@ impl TestHarness {
                 health_check_http_headers: std::collections::HashMap::new(),
                 proxy_protocol_version: String::new(),
                 enabled: true,
+                disable_assisted_addrs: false,
             }],
             ..Default::default()
         };

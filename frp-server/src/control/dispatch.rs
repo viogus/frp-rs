@@ -88,6 +88,16 @@ fn match_internal_dispatch<'a, W: AsyncWriteExt + Unpin + Send + 'a>(
             super::nathole::handle_vnet_packet_forward(ctx, ctl, writer, proxy_name, data).await;
             Ok(())
         }),
+        #[cfg(feature = "vnet")]
+        InternalMsg::VnetRouteAdvertiseForward { msg } => Box::pin(async move {
+            super::nathole::handle_vnet_route_advertise_forward(ctx, ctl, writer, msg).await;
+            Ok(())
+        }),
+        #[cfg(feature = "vnet")]
+        InternalMsg::VnetRouteRemoveForward { msg } => Box::pin(async move {
+            super::nathole::handle_vnet_route_remove_forward(ctx, ctl, writer, msg).await;
+            Ok(())
+        }),
         InternalMsg::WriteCloseProxy { proxy_name } => Box::pin(async move {
             super::proxy::handle_write_close_proxy(ctx, ctl, writer, proxy_name).await;
             Ok(())

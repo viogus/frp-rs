@@ -95,9 +95,16 @@ frp-rs targets Go frp v0.70.1 wire compatibility. Core tunneling (TCP/UDP/HTTP/S
 | `https2https` | ✅ |
 | `http2http` | ✅ |
 | `tls2raw` | ✅ |
-| `virtual_net` | ✅ (proxy-level field for STCP/XTCP isolation; not a standalone plugin) |
+| `virtual_net` | ✅ Proxy work-conn plugin + visitor tunnel packet path |
 
-**9 of 9 plugins implemented. `virtual_net` is not a plugin type in Go frp — it is a per-proxy namespace field for STCP/XTCP isolation, implemented in ProxyConfig and server routing.**
+**10 of 10 client plugin types implemented. The Go frp v0.70.1 `virtual_net`
+proxy plugin hands work connections to the vnet controller (TUN ingress plus
+source-IP return routing), and the `virtual_net` visitor plugin delivers
+inbound `VnetPacket`s into its no-bind STCP/XTCP tunnel while forwarding
+tunnel return traffic to the local TUN. vnet routing is dual-stack
+(IPv4/IPv6), proxy/visitor transport encryption and compression are applied to
+tunnel bytes, and frps broadcasts vnet route advertisements/removals to peers
+with disconnect cleanup.**
 
 ---
 

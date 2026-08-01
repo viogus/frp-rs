@@ -1,20 +1,22 @@
 #![cfg(feature = "admin")]
 
 use axum::{
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, State},
     http::{header, StatusCode},
     routing::get,
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
 
 use frp_core::admin_auth::apply_admin_auth;
+use frp_core::config::{ProxyConfig, VisitorConfig};
 use frp_core::metrics::ProxyMetricsRegistry;
 
 use crate::proxy_runtime::{ProxyRuntimeInfo, ReloadRequest};
+use crate::store::{StoreError, StoreSource};
 
 // --- Types ---
 
@@ -37,6 +39,14 @@ pub struct AdminState {
     pub reload_tx: mpsc::Sender<ReloadRequest>,
     pub stop_tx: mpsc::Sender<()>,
     pub config_path: Option<String>,
+    /// Optional file-backed store. When present, `/api/store/*` routes are
+    /// registered and CRUD operations trigger a reload after persisting.
+    pub store: Option<Arc<StoreSource>>,
+}
+
+#[derive(Deserialize)]
+struct ReloadBody {
+    strict_config: Option<bool>,
 }
 
 // --- Handlers ---
@@ -135,12 +145,14 @@ async fn handle_status(State(state): State<AdminState>) -> Json<serde_json::Valu
 
 async fn handle_reload(
     State(state): State<AdminState>,
-    Json(body): Json<serde_json::Value>,
+    Json(body): Json<ReloadBody>,
 ) -> Result<String, (StatusCode, String)> {
-    let strict = body
-        .get("strictConfig")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let strict = body.strict_config.unwrap_or(false);
+    reload_and_wait(&state, strict).await
+}
+
+/// Send a reload request to the service run loop and wait for the result.
+async fn reload_and_wait(state: &AdminState, strict: bool) -> Result<String, (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
     let req = ReloadRequest { strict, reply: tx };
     state.reload_tx.send(req).await.map_err(|_| {
@@ -158,6 +170,180 @@ async fn handle_reload(
         )),
         Err(_) => Err((StatusCode::REQUEST_TIMEOUT, "reload timed out".into())),
     }
+}
+
+fn store_to_http_error(err: StoreError) -> (StatusCode, String) {
+    match err {
+        StoreError::InvalidArgument(msg) => (StatusCode::BAD_REQUEST, msg),
+        StoreError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+        StoreError::Conflict(msg) => (StatusCode::CONFLICT, msg),
+        StoreError::Persist(msg) | StoreError::Load(msg) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, msg)
+        }
+    }
+}
+
+fn store_or_error(state: &AdminState) -> Result<Arc<StoreSource>, (StatusCode, String)> {
+    state
+        .store
+        .clone()
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "store API is disabled".to_string()))
+}
+
+fn proxy_to_json(proxy: &ProxyConfig) -> Result<serde_json::Value, (StatusCode, String)> {
+    serde_json::to_value(proxy).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize proxy: {e}"),
+        )
+    })
+}
+
+fn visitor_to_json(visitor: &VisitorConfig) -> Result<serde_json::Value, (StatusCode, String)> {
+    serde_json::to_value(visitor).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize visitor: {e}"),
+        )
+    })
+}
+
+async fn handle_list_store_proxies(
+    State(state): State<AdminState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = store_or_error(&state)?;
+    let proxies: Vec<serde_json::Value> = store
+        .all_proxies()
+        .iter()
+        .map(proxy_to_json)
+        .collect::<Result<_, _>>()?;
+    Ok(Json(serde_json::json!({ "proxies": proxies })))
+}
+
+async fn handle_get_store_proxy(
+    State(state): State<AdminState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "proxy name is required".into()));
+    }
+    let store = store_or_error(&state)?;
+    let proxy = store
+        .get_proxy(&name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("proxy {name:?} not found")))?;
+    Ok(Json(proxy_to_json(&proxy)?))
+}
+
+async fn handle_create_store_proxy(
+    State(state): State<AdminState>,
+    Json(proxy): Json<ProxyConfig>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = store_or_error(&state)?;
+    let created = store.add_proxy(proxy).map_err(store_to_http_error)?;
+    reload_and_wait(&state, false).await?;
+    Ok(Json(proxy_to_json(&created)?))
+}
+
+async fn handle_update_store_proxy(
+    State(state): State<AdminState>,
+    AxumPath(name): AxumPath<String>,
+    Json(proxy): Json<ProxyConfig>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "proxy name is required".into()));
+    }
+    if name != proxy.name {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "proxy name in URL must match name in body".into(),
+        ));
+    }
+    let store = store_or_error(&state)?;
+    let updated = store.update_proxy(proxy).map_err(store_to_http_error)?;
+    reload_and_wait(&state, false).await?;
+    Ok(Json(proxy_to_json(&updated)?))
+}
+
+async fn handle_delete_store_proxy(
+    State(state): State<AdminState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "proxy name is required".into()));
+    }
+    let store = store_or_error(&state)?;
+    store.remove_proxy(&name).map_err(store_to_http_error)?;
+    reload_and_wait(&state, false).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn handle_list_store_visitors(
+    State(state): State<AdminState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = store_or_error(&state)?;
+    let visitors: Vec<serde_json::Value> = store
+        .all_visitors()
+        .iter()
+        .map(visitor_to_json)
+        .collect::<Result<_, _>>()?;
+    Ok(Json(serde_json::json!({ "visitors": visitors })))
+}
+
+async fn handle_get_store_visitor(
+    State(state): State<AdminState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "visitor name is required".into()));
+    }
+    let store = store_or_error(&state)?;
+    let visitor = store
+        .get_visitor(&name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("visitor {name:?} not found")))?;
+    Ok(Json(visitor_to_json(&visitor)?))
+}
+
+async fn handle_create_store_visitor(
+    State(state): State<AdminState>,
+    Json(visitor): Json<VisitorConfig>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = store_or_error(&state)?;
+    let created = store.add_visitor(visitor).map_err(store_to_http_error)?;
+    reload_and_wait(&state, false).await?;
+    Ok(Json(visitor_to_json(&created)?))
+}
+
+async fn handle_update_store_visitor(
+    State(state): State<AdminState>,
+    AxumPath(name): AxumPath<String>,
+    Json(visitor): Json<VisitorConfig>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "visitor name is required".into()));
+    }
+    if name != visitor.name {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "visitor name in URL must match name in body".into(),
+        ));
+    }
+    let store = store_or_error(&state)?;
+    let updated = store.update_visitor(visitor).map_err(store_to_http_error)?;
+    reload_and_wait(&state, false).await?;
+    Ok(Json(visitor_to_json(&updated)?))
+}
+
+async fn handle_delete_store_visitor(
+    State(state): State<AdminState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "visitor name is required".into()));
+    }
+    let store = store_or_error(&state)?;
+    store.remove_visitor(&name).map_err(store_to_http_error)?;
+    reload_and_wait(&state, false).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn handle_stop(State(state): State<AdminState>) -> &'static str {
@@ -233,22 +419,9 @@ async fn handle_put_config(
         )
     })?;
     // Trigger reload after config update
-    let (tx, rx) = oneshot::channel();
-    let req = ReloadRequest {
-        strict: true,
-        reply: tx,
-    };
-    state.reload_tx.send(req).await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "reload channel closed".into(),
-        )
-    })?;
-    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-        Ok(Ok(_)) => Ok("update success"),
-        Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, e.to_string())),
-        Err(_) => Err((StatusCode::REQUEST_TIMEOUT, "reload timed out".into())),
-    }
+    reload_and_wait(&state, true)
+        .await
+        .map(|_| "update success")
 }
 
 // --- Local TlsListener (moved from frp-core to avoid axum in core) ---
@@ -333,6 +506,35 @@ pub async fn run_admin_server(
                 .put(handle_put_config)
                 .layer(DefaultBodyLimit::max(1024 * 1024)),
         );
+
+    // Store CRUD uses the Rust-native typed JSON body (full ProxyConfig /
+    // VisitorConfig objects). Go frp v0.70.1's admin API uses nested typed
+    // blocks (`ProxyDefinition` with tcp/udp/stcp...), so this endpoint is
+    // intentionally frp-rs-only and is not wire-compatible with Go clients.
+    let app = if state.store.is_some() {
+        app.route(
+            "/api/store/proxies",
+            get(handle_list_store_proxies).post(handle_create_store_proxy),
+        )
+        .route(
+            "/api/store/proxies/{name}",
+            get(handle_get_store_proxy)
+                .put(handle_update_store_proxy)
+                .delete(handle_delete_store_proxy),
+        )
+        .route(
+            "/api/store/visitors",
+            get(handle_list_store_visitors).post(handle_create_store_visitor),
+        )
+        .route(
+            "/api/store/visitors/{name}",
+            get(handle_get_store_visitor)
+                .put(handle_update_store_visitor)
+                .delete(handle_delete_store_visitor),
+        )
+    } else {
+        app
+    };
 
     let app = apply_admin_auth(app, &auth_user, &auth_password);
     let app = app.with_state(state);
@@ -442,5 +644,159 @@ fn redact_value(value: toml::Value) -> toml::Value {
     match value {
         toml::Value::String(_) => toml::Value::String("***".into()),
         _ => toml::Value::String("***".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use tower::ServiceExt;
+
+    fn test_state() -> (AdminState, mpsc::Receiver<ReloadRequest>) {
+        let path =
+            std::env::temp_dir().join(format!("frpc_admin_store_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(StoreSource::new(&path).unwrap());
+        let (reload_tx, reload_rx) = mpsc::channel(16);
+        let (stop_tx, _stop_rx) = mpsc::channel(1);
+        let state = AdminState {
+            proxy_metrics: Arc::new(frp_core::metrics::ProxyMetricsRegistry::new()),
+            proxies: Arc::new(RwLock::new(HashMap::new())),
+            reload_tx,
+            stop_tx,
+            config_path: None,
+            store: Some(store),
+        };
+        (state, reload_rx)
+    }
+
+    fn test_app(state: AdminState) -> Router {
+        Router::new()
+            .route(
+                "/api/store/proxies",
+                get(handle_list_store_proxies).post(handle_create_store_proxy),
+            )
+            .route(
+                "/api/store/proxies/{name}",
+                get(handle_get_store_proxy)
+                    .put(handle_update_store_proxy)
+                    .delete(handle_delete_store_proxy),
+            )
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn store_proxy_crud_round_trip() {
+        let (state, mut reload_rx) = test_state();
+        // The service run loop is not running in this test; answer reload
+        // requests so the handlers can complete.
+        tokio::spawn(async move {
+            while let Some(req) = reload_rx.recv().await {
+                let _ = req
+                    .reply
+                    .send(Ok("reload success: no changes detected".into()));
+            }
+        });
+        let app = test_app(state);
+
+        let create_body = serde_json::json!({
+            "name": "store-proxy",
+            "type": "tcp",
+            "local_ip": "127.0.0.1",
+            "local_port": 8080,
+            "remote_port": 9090
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/store/proxies")
+                    .header("content-type", "application/json")
+                    .body(Body::from(create_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(created["name"], "store-proxy");
+        assert_eq!(created["remote_port"], 9090);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/store/proxies/store-proxy")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let fetched: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fetched["local_port"], 8080);
+
+        let update_body = serde_json::json!({
+            "name": "store-proxy",
+            "type": "tcp",
+            "local_ip": "127.0.0.1",
+            "local_port": 8081,
+            "remote_port": 9091
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/store/proxies/store-proxy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(update_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/store/proxies/store-proxy")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/store/proxies/store-proxy")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let path =
+            std::env::temp_dir().join(format!("frpc_admin_store_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(path.with_extension("json.tmp"));
+        let _ = std::fs::remove_file(path);
     }
 }

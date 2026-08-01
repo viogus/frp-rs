@@ -982,12 +982,12 @@ pub(crate) async fn validate_new_work_conn_auth(
             .verify_new_work_conn(msg.privilege_key.as_deref().unwrap_or(""), &expected_sub)
             .await
     } else {
-        state
-            .reloadable
-            .read_ok()
-            .auth_cfg
-            .validate_login(msg.privilege_key.as_deref(), msg.timestamp)
-            .map(|_| ())
+        let auth_cfg = state.reloadable.read_ok().auth_cfg.clone();
+        auth_cfg.resolve_token().and_then(|token| {
+            auth_cfg
+                .validate_login_with_token(&token, msg.privilege_key.as_deref(), msg.timestamp)
+                .map(|_| ())
+        })
     }
 }
 

@@ -47,6 +47,7 @@ Authentication configuration for control connections.
 |-------|------|---------|-------------------|-------------|
 | `method` | `string` | `"token"` | `auth.method` | Authentication method: `"token"` or `"oidc"`. |
 | `token` | `string` | `""` | `auth.token` | Shared secret token for MD5-based authentication. Must match the client's token. |
+| `token_source` | `table` | `null` | `auth.tokenSource` | Dynamic token source. Mutually exclusive with `token`. |
 | `oidc_issuer` | `string` | `""` | `auth.oidcIssuer` | OIDC issuer URL. Used when `method = "oidc"`. |
 | `oidc_audience` | `string` | `""` | `auth.oidcAudience` | OIDC expected audience claim. |
 | `oidc_token_endpoint` | `string` | `""` | `auth.oidcTokenEndpoint` | OIDC token verification endpoint URL. |
@@ -54,6 +55,19 @@ Authentication configuration for control connections.
 | `oidc_skip_issuer` | `bool` | `false` | `auth.oidcSkipIssuer` | Skip OIDC issuer validation. For development only. |
 | `oidc_proxy_url` | `string` | `""` | `auth.oidcProxyURL` | HTTP/SOCKS5 proxy URL for OIDC provider HTTP requests. |
 | `additional_auth_scopes` | `string[]` | `[]` | `auth.additionalAuthScopes` | Extra auth scopes: `"HeartBeats"`, `"NewWorkConns"`. When listed, those message types require authentication in addition to `Login`. |
+
+`auth.tokenSource` supports two source types:
+
+- `type = "file"` reads `file.path` and trims the file contents.
+- `type = "exec"` runs `exec.command` with `exec.args` and optional `exec.env` entries (`{ name, value }`), then trims stdout. Exec sources require the `TokenSourceExec` unsafe feature (`--allow-unsafe TokenSourceExec`).
+
+Example:
+
+```toml
+[auth.tokenSource]
+type = "file"
+file.path = "/run/secrets/frp-token"
+```
 
 ### `[log]` Section
 
@@ -268,6 +282,7 @@ Full OIDC authentication configuration. When `method = "oidc"`, the client obtai
 |-------|------|---------|-------------------|-------------|
 | `method` | `string` | `"token"` | `auth.method` | Authentication method: `"token"` or `"oidc"`. |
 | `token` | `string` | `""` | `auth.token` | Shared secret token (when `method = "token"`). |
+| `token_source` | `table` | `null` | `auth.tokenSource` | Dynamic token source. Mutually exclusive with `token`. |
 | `oidc_client_id` | `string` | `""` | `auth.oidcClientId` | OIDC client ID for the token endpoint. |
 | `oidc_client_secret` | `string` | `""` | `auth.oidcClientSecret` | OIDC client secret for the token endpoint. |
 | `oidc_audience` | `string` | `""` | `auth.oidcAudience` | OIDC audience claim to request. |
@@ -279,6 +294,8 @@ Full OIDC authentication configuration. When `method = "oidc"`, the client obtai
 | `oidc_tls_insecure_skip_verify` | `bool` | `false` | `auth.insecureSkipVerify` | Skip TLS certificate verification for OIDC provider. For development only. |
 | `oidc_proxy_url` | `string` | `""` | `auth.oidcProxyURL` | HTTP/SOCKS5 proxy URL for OIDC provider HTTP requests. |
 | `additional_auth_scopes` | `string[]` | `[]` | `auth.additionalAuthScopes` | Client-side auth scopes. Unioned with the server's scopes. Values: `"HeartBeats"`, `"NewWorkConns"`. |
+
+The client `auth.tokenSource` table has the same shape as the server version: `type = "file"` with `file.path`, or `type = "exec"` with `exec.command`, `exec.args`, and `exec.env`. Exec sources require `--allow-unsafe TokenSourceExec`.
 
 ### `[web_server]` Section (Client Admin API)
 
@@ -380,6 +397,9 @@ custom_404_page = ""
 [feature]
 # experimental_feature = true
 
+[virtualNet]
+address = ""
+
 [[proxies]]
 name = "ssh"
 type = "tcp"
@@ -470,7 +490,7 @@ Per-proxy client plugin configuration. The plugin runs on the client side and ha
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
-| `type` | `string` | — | `type` | Plugin type: `"http_proxy"`, `"socks5"`, `"static_file"`, `"unix_domain_socket"`, `"http2https"`, `"https2http"`, `"https2https"`, `"http2http"`, `"tls2raw"`. |
+| `type` | `string` | — | `type` | Plugin type: `"http_proxy"`, `"socks5"`, `"static_file"`, `"unix_domain_socket"`, `"http2https"`, `"https2http"`, `"https2https"`, `"http2http"`, `"tls2raw"`, `"virtual_net"`. |
 | `http_user` | `string` | `""` | `httpUser` | HTTP basic auth username for the plugin. |
 | `http_password` | `string` | `""` | `httpPassword` | HTTP basic auth password for the plugin. |
 | `local_addr` | `string` | `""` | `localAddr` | Local address for the plugin listener (e.g. `"127.0.0.1:3128"`). |
@@ -485,6 +505,9 @@ Per-proxy client plugin configuration. The plugin runs on the client side and ha
 | `secret_key` | `string` | `""` | `sk` | Secret key for STCP/XTCP visitor plugin auth. |
 | `bind_addr` | `string` | `""` | `bindAddr` | Local address for the visitor plugin listener. |
 | `bind_port` | `i32` | `0` | `bindPort` | Local port for the visitor plugin listener. `-1` disables binding. |
+
+`type = "virtual_net"` does not bind a listener; work connections are handed
+to the vnet controller and require a non-empty IPv4 `[virtualNet] address`.
 
 ### Proxy TOML Examples
 
@@ -593,6 +616,7 @@ through the frps server to a remote STCP/XTCP proxy.
 | `server_user` | `string` | `""` | `serverUser` | Optional server-side user for auth matching. |
 | `bind_addr` | `string` | `"0.0.0.0"` | `bindAddr` | Local address to bind for accepting visitor connections. |
 | `bind_port` | `u16` | `0` | `bindPort` | Local port for the visitor listener. 0 = disabled. |
+| `plugin` | `[visitors.plugin]` | — | `plugin` | Optional visitor plugin. `type = "virtual_net"` with `destinationIP` advertises the IP as a vnet host route instead of binding a local listener. |
 | `fallback_timeout_ms` | `u64` | `5000` | `fallbackTimeoutMs` | XTCP fallback timeout in milliseconds. After this time without a successful hole punch, fall back to the `fallback_to` visitor (usually STCP). |
 | `fallback_to` | `string` | `""` | `fallbackTo` | Fallback visitor name if XTCP hole punch fails. Typically points to an STCP visitor. |
 | `disable_assisted_addrs` | `bool` | `false` | `disableAssistedAddrs` | Disable NAT traversal assisted address reporting (STUN-discovered mapped addresses shared between peers during XTCP hole punching). |
@@ -635,6 +659,29 @@ min_retry_interval = 30
 use_encryption = true
 use_compression = false
 ```
+
+**Virtual net visitor:**
+
+```toml
+[[visitors]]
+name = "vnet-visitor"
+type = "stcp"
+server_name = "vnet-server"
+secret_key = "shared-secret"
+bind_port = -1
+
+[visitors.plugin]
+type = "virtual_net"
+destinationIP = "100.86.0.1"
+```
+
+The `virtual_net` visitor plugin requires `[feature] VirtualNet = true`.
+It registers a host route for `destinationIP` (IPv4 `/32` or IPv6 `/128`)
+through the vnet routing path; the local TCP listener is not started for this
+visitor. Instead, a no-bind STCP/XTCP tunnel is opened to the server, the
+visitor's `use_encryption`/`use_compression` settings are applied to the
+tunnel byte stream, and inbound `VnetPacket`s for the visitor are written into
+that tunnel.
 
 ---
 
@@ -718,6 +765,16 @@ All other features gate only the runtime behavior. Their config fields are alway
 | `ssh` | `[ssh_tunnel_gateway]` section | SSH gateway not compiled |
 | `dashboard` | `[web_server]` section | Dashboard HTTP endpoints not compiled |
 | `http-proxy` | `type = "http_proxy"` plugin config | HTTP proxy plugin not compiled |
+
+---
+
+### Parse-Only Compatibility Fields
+
+Some Go frp v0.70.1 fields are parsed and validated for source-level
+compatibility but are not yet consumed by the frp-rs runtime. They are
+accepted so Go frp configs load unchanged; setting them currently has no
+runtime effect: `log.disablePrintColor`, `webServer.assetsDir`,
+`webServer.pprofEnable`, and plugin `enableHTTP2`.
 
 ---
 

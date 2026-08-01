@@ -343,7 +343,11 @@ impl ControlConnection {
                 .await
                 .map_err(|e| frp_core::Error::Auth(format!("OIDC login: {e}").into()))?;
         } else {
-            login.privilege_key = self.auth_cfg.generate_login_key(timestamp);
+            login.privilege_key = Some(
+                self.auth_cfg
+                    .try_generate_login_key(timestamp)
+                    .map_err(|e| frp_core::Error::Auth(e.into()))?,
+            );
         }
 
         let login = FrpMessage::Login(Box::new(login));

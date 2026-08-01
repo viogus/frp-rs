@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::feature_gate::VIRTUAL_NET;
+
 // ---------------------------------------------------------------
 // Server Configuration
 // ---------------------------------------------------------------
@@ -428,12 +430,93 @@ impl Default for SshTunnelGatewayConfig {
     }
 }
 
+/// Dynamic value source used to resolve the auth token at runtime.
+/// Go frp v0.70.1 compat: ValueSource with file and exec sub-sources.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ValueSource {
+    #[serde(rename = "type")]
+    pub source_type: String,
+    #[serde(default)]
+    pub file: Option<FileSource>,
+    #[serde(default)]
+    pub exec: Option<ExecSource>,
+}
+
+impl ValueSource {
+    /// Validate the source shape. Returns `Ok(())` when the source is
+    /// structurally valid, otherwise a human-readable config error.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.source_type.as_str() {
+            "file" => {
+                let file = self.file.as_ref().ok_or_else(|| {
+                    "file configuration is required when type is 'file'".to_string()
+                })?;
+                if file.path.is_empty() {
+                    return Err("file path cannot be empty".into());
+                }
+                Ok(())
+            }
+            "exec" => {
+                let exec = self.exec.as_ref().ok_or_else(|| {
+                    "exec configuration is required when type is 'exec'".to_string()
+                })?;
+                if exec.command.is_empty() {
+                    return Err("exec command cannot be empty".into());
+                }
+                for env in &exec.env {
+                    if env.name.is_empty() {
+                        return Err("exec env name cannot be empty".into());
+                    }
+                    if env.name.contains('=') {
+                        return Err("exec env name cannot contain '='".into());
+                    }
+                }
+                Ok(())
+            }
+            other => Err(format!(
+                "unsupported value source type: {other} (only 'file' and 'exec' are supported)"
+            )),
+        }
+    }
+}
+
+/// File source for [`ValueSource`].
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FileSource {
+    #[serde(default)]
+    pub path: String,
+}
+
+/// Exec source for [`ValueSource`].
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExecSource {
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<ExecEnvVar>,
+}
+
+/// Additional environment variable for [`ExecSource`].
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExecEnvVar {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthServerConfig {
     #[serde(default)]
     pub method: String,
     #[serde(default)]
     pub token: String,
+    /// Dynamic source for the auth token. Mutually exclusive with `token`.
+    /// Go frp v0.70.1 compat: auth.tokenSource.
+    #[serde(default, alias = "tokenSource")]
+    pub token_source: Option<ValueSource>,
     #[serde(default)]
     pub oidc_issuer: String,
     #[serde(default)]
@@ -485,6 +568,7 @@ impl Default for AuthServerConfig {
         Self {
             method: "token".into(),
             token: String::new(),
+            token_source: None,
             oidc_issuer: String::new(),
             oidc_audience: String::new(),
             oidc_token_endpoint: String::new(),
@@ -510,6 +594,8 @@ pub struct LogConfig {
     pub file: String,
     #[serde(default = "default_max_days", alias = "maxDays")]
     pub max_days: i32,
+    #[serde(default, alias = "disablePrintColor")]
+    pub disable_print_color: bool,
 }
 
 impl Default for LogConfig {
@@ -518,6 +604,7 @@ impl Default for LogConfig {
             level: default_log_level(),
             file: default_log_file(),
             max_days: default_max_days(),
+            disable_print_color: false,
         }
     }
 }
@@ -585,12 +672,16 @@ pub struct WebServerConfig {
     pub password: String,
     #[serde(default, alias = "enablePrometheus")]
     pub enable_prometheus: bool,
+    #[serde(default, alias = "assetsDir")]
+    pub assets_dir: String,
+    #[serde(default, alias = "pprofEnable")]
+    pub pprof_enable: bool,
     /// TLS certificate file path. When both tls_cert_file and tls_key_file
     /// are non-empty, dashboard/admin server starts with TLS.
-    #[serde(default)]
+    #[serde(default, alias = "certFile")]
     pub tls_cert_file: String,
     /// TLS private key file path.
-    #[serde(default)]
+    #[serde(default, alias = "keyFile")]
     pub tls_key_file: String,
     /// Custom 404 page body (HTML). When non-empty, VHost and TCPMux
     /// 404 responses include this content with Content-Type: text/html.
@@ -607,6 +698,8 @@ impl Default for WebServerConfig {
             user: String::new(),
             password: String::new(),
             enable_prometheus: false,
+            assets_dir: String::new(),
+            pprof_enable: false,
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             custom_404_page: String::new(),
@@ -640,6 +733,10 @@ pub struct HttpPluginConfig {
     /// When false (default), the plugin is notify-only.
     #[serde(default)]
     pub enable_control: bool,
+    /// Whether to verify the plugin server TLS certificate.
+    /// Go frp compat: tlsVerify.
+    #[serde(default, alias = "tlsVerify")]
+    pub tls_verify: bool,
 }
 
 fn default_plugin_timeout() -> u64 {
@@ -811,6 +908,14 @@ pub struct PluginConfig {
     /// Go frp compat: proxyProtocolVersion.
     #[serde(default, alias = "proxyProtocolVersion")]
     pub proxy_protocol_version: String,
+    /// Request headers to inject on plugin HTTP requests.
+    /// Go frp compat: requestHeaders.set.
+    #[serde(default)]
+    pub request_headers: std::collections::HashMap<String, String>,
+    /// Enable HTTP/2 for the plugin tunnel (https2http/https2https).
+    /// Go frp compat: enableHTTP2.
+    #[serde(default, alias = "enableHTTP2")]
+    pub enable_http2: Option<bool>,
 }
 
 /// Feature gate configuration ([feature] section in frps.toml / frpc.toml).
@@ -826,6 +931,16 @@ pub struct FeatureConfig {
 // Client Configuration
 // ---------------------------------------------------------------
 
+/// File-backed store configuration ([store] section in frpc.toml).
+/// Go frp v0.70.1 compat: StoreConfig.path.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StoreConfig {
+    /// Path to the JSON file that persists dynamically managed proxies and
+    /// visitors. Empty disables the store.
+    #[serde(default)]
+    pub path: String,
+}
+
 /// Client-side authentication configuration ([auth] section in frpc.toml).
 /// Mirrors Go frp v0.69.1 AuthClientConfig.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -834,6 +949,10 @@ pub struct AuthClientConfig {
     pub method: String,
     #[serde(default)]
     pub token: String,
+    /// Dynamic source for the auth token. Mutually exclusive with `token`.
+    /// Go frp v0.70.1 compat: auth.tokenSource.
+    #[serde(default, alias = "tokenSource")]
+    pub token_source: Option<ValueSource>,
     #[serde(default, alias = "oidcClientId")]
     pub oidc_client_id: String,
     #[serde(default, alias = "oidcClientSecret")]
@@ -888,6 +1007,7 @@ impl Default for AuthClientConfig {
         Self {
             method: "token".into(),
             token: String::new(),
+            token_source: None,
             oidc_client_id: String::new(),
             oidc_client_secret: String::new(),
             oidc_audience: String::new(),
@@ -903,6 +1023,15 @@ impl Default for AuthClientConfig {
             token_auth_timeout: true,
         }
     }
+}
+
+/// Client virtual network controller configuration ([virtualNet] section in frpc.toml).
+/// Go frp v0.70.1 compat: VirtualNetConfig.address.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VirtualNetConfig {
+    /// TUN device address configured on the client controller.
+    #[serde(default, alias = "address")]
+    pub address: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -945,6 +1074,12 @@ pub struct ClientConfig {
     /// Go frp compat: includes.
     #[serde(default)]
     pub includes: Vec<String>,
+    /// File-backed runtime config store. When path is set, proxies and
+    /// visitors managed through the store API are loaded from and persisted
+    /// to the JSON file, overlaying config-file entries with the same name.
+    /// Go frp v0.70.1 compat: [store] section.
+    #[serde(default, alias = "store")]
+    pub store: Option<StoreConfig>,
     #[serde(default = "default_true")]
     pub tls_enable: bool,
     #[serde(default)]
@@ -1006,6 +1141,10 @@ pub struct ClientConfig {
     pub visitors: Vec<VisitorConfig>,
     #[serde(default, alias = "webServer")]
     pub web_server: WebServerConfig,
+    /// Client virtual network controller configuration.
+    /// Go frp v0.70.1 compat: [virtualNet] section.
+    #[serde(default, alias = "virtualNet")]
+    pub virtual_net: VirtualNetConfig,
     /// Experimental feature gates. Go frp compat: [feature] section.
     #[serde(default, alias = "featureGates")]
     pub feature: FeatureConfig,
@@ -1034,6 +1173,7 @@ impl Default for ClientConfig {
             nat_hole_stun_server: default_nat_hole_stun_server(),
             start: Vec::new(),
             includes: Vec::new(),
+            store: None,
             tls_enable: true,
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
@@ -1056,6 +1196,7 @@ impl Default for ClientConfig {
             proxies: vec![],
             visitors: vec![],
             web_server: WebServerConfig::default(),
+            virtual_net: VirtualNetConfig::default(),
             feature: FeatureConfig::default(),
             udp_packet_size: default_udp_packet_size_i64(),
             observability: ObservabilityConfig::default(),
@@ -1105,6 +1246,43 @@ impl ClientConfig {
         if self.dial_server_timeout == 0 {
             self.dial_server_timeout = default_dial_server_timeout();
         }
+    }
+
+    /// Merge file-stored proxies/visitors over this config.
+    ///
+    /// Go frp v0.70.1 uses the store source as a higher-priority overlay:
+    /// store entries with the same name replace config-file entries, and names
+    /// present only in one source are carried through unchanged. Disabled
+    /// entries are filtered by the caller before merging (Go frp source-local
+    /// filtering), so they do not reach this function.
+    pub fn merge_store_items(
+        &self,
+        store_proxies: impl IntoIterator<Item = ProxyConfig>,
+        store_visitors: impl IntoIterator<Item = VisitorConfig>,
+    ) -> Self {
+        let mut merged = self.clone();
+        let mut proxy_map: std::collections::HashMap<String, ProxyConfig> = merged
+            .proxies
+            .into_iter()
+            .map(|p| (p.name.clone(), p))
+            .collect();
+        for p in store_proxies {
+            proxy_map.insert(p.name.clone(), p);
+        }
+        merged.proxies = proxy_map.into_values().collect();
+        merged.proxies.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let mut visitor_map: std::collections::HashMap<String, VisitorConfig> = merged
+            .visitors
+            .into_iter()
+            .map(|v| (v.name.clone(), v))
+            .collect();
+        for v in store_visitors {
+            visitor_map.insert(v.name.clone(), v);
+        }
+        merged.visitors = visitor_map.into_values().collect();
+        merged.visitors.sort_by(|a, b| a.name.cmp(&b.name));
+        merged
     }
 }
 
@@ -1230,6 +1408,10 @@ pub struct ProxyConfig {
     /// Go frp compat: enabled. Default: true.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Disable NAT traversal assisted address reporting for XTCP.
+    /// Go frp compat: natTraversal.disableAssistedAddrs.
+    #[serde(default, alias = "disableAssistedAddrs")]
+    pub disable_assisted_addrs: bool,
 }
 
 /// STCP/XTCP visitor configuration — used by frpc to expose a local port
@@ -1264,6 +1446,10 @@ pub struct VisitorConfig {
     /// and negative values mean "don't bind".
     #[serde(default, alias = "bindPort")]
     pub bind_port: i32,
+    /// Optional visitor plugin ([visitors.plugin] section).
+    /// Go frp v0.70.1 compat: Plugin.
+    #[serde(default)]
+    pub plugin: Option<VisitorPluginConfig>,
     /// Fallback timeout in milliseconds before switching from XTCP to STCP.
     /// Go frp compat: fallbackTimeoutMs. Default: 1000 (1 second, Go frp compat)
     #[serde(default = "default_fallback_timeout_ms", alias = "fallbackTimeoutMs")]
@@ -1295,6 +1481,10 @@ pub struct VisitorConfig {
     /// Go frp compat: minRetryInterval. Default: 90 (Go frp compat)
     #[serde(default = "default_min_retry_interval", alias = "minRetryInterval")]
     pub min_retry_interval: i64,
+    /// Whether this visitor is enabled. Disabled visitors are not started.
+    /// Go frp compat: enabled. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 impl Default for VisitorConfig {
@@ -1307,6 +1497,7 @@ impl Default for VisitorConfig {
             server_user: String::new(),
             bind_addr: default_visitor_bind_addr(),
             bind_port: 0,
+            plugin: None,
             fallback_timeout_ms: default_fallback_timeout_ms(),
             fallback_to: String::new(),
             disable_assisted_addrs: false,
@@ -1316,8 +1507,33 @@ impl Default for VisitorConfig {
             max_retries_an_hour: default_max_retries_an_hour(),
             min_retry_interval: default_min_retry_interval(),
             protocol: default_xtcp_protocol(),
+            enabled: true,
         }
     }
+}
+
+/// Visitor plugin configuration ([visitors.plugin] section).
+/// Go frp v0.70.1 compat: TypedVisitorPluginOptions.
+///
+/// Only `type = "virtual_net"` (with `destinationIP`) is supported by frp-rs
+/// today. The remaining fields are accepted for the STCP/XTCP `visitor_plugin`
+/// extension used by older frp-rs configs.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VisitorPluginConfig {
+    #[serde(rename = "type", default)]
+    pub plugin_type: String,
+    #[serde(default, alias = "serverName")]
+    pub server_name: String,
+    #[serde(default, alias = "sk")]
+    pub secret_key: String,
+    #[serde(default, alias = "bindAddr")]
+    pub bind_addr: String,
+    #[serde(default, alias = "bindPort")]
+    pub bind_port: i32,
+    /// Destination IP advertised as a host route by the virtual_net visitor plugin.
+    /// Go frp v0.70.1 compat: destinationIP.
+    #[serde(default, alias = "destinationIP")]
+    pub destination_ip: String,
 }
 
 fn default_max_retries_an_hour() -> i32 {
@@ -1506,7 +1722,25 @@ fn validate_proxy_configs(proxies: &[ProxyConfig]) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_server_config(_cfg: &ServerConfig) -> Result<(), String> {
+/// Validate token/tokenSource mutual exclusivity and source structure.
+/// Go frp v0.70.1 compat: validation/auth.go validateAuthTokenSource.
+pub fn validate_auth_token_source(
+    token: &str,
+    token_source: &Option<ValueSource>,
+) -> Result<(), String> {
+    if !token.is_empty() && token_source.is_some() {
+        return Err("cannot specify both auth.token and auth.tokenSource".into());
+    }
+    if let Some(source) = token_source {
+        source
+            .validate()
+            .map_err(|e| format!("invalid auth.tokenSource: {e}"))?;
+    }
+    Ok(())
+}
+
+fn validate_server_config(cfg: &ServerConfig) -> Result<(), String> {
+    validate_auth_token_source(&cfg.auth.token, &cfg.auth.token_source)?;
     // ServerConfig has no inline proxy definitions — proxies are registered
     // by clients at runtime. No proxy-level validation to do here.
     Ok(())
@@ -1515,7 +1749,82 @@ fn validate_server_config(_cfg: &ServerConfig) -> Result<(), String> {
 fn validate_client_config(cfg: &ClientConfig) -> Result<(), String> {
     validate_proxy_configs(&cfg.proxies)?;
     validate_no_duplicate_names(&cfg.proxies, &cfg.visitors)?;
+    if let Some(auth) = &cfg.auth {
+        let token = if cfg.token.is_empty() {
+            auth.token.as_str()
+        } else {
+            cfg.token.as_str()
+        };
+        validate_auth_token_source(token, &auth.token_source)?;
+    }
+    if (!cfg.virtual_net.address.is_empty()
+        || cfg.visitors.iter().any(is_virtual_net_visitor)
+        || cfg.proxies.iter().any(is_virtual_net_proxy_plugin))
+        && !cfg.feature.gates.get(VIRTUAL_NET).copied().unwrap_or(false)
+    {
+        return Err(format!(
+            "VirtualNet feature is not enabled; enable it by setting [featureGates] {VIRTUAL_NET} = true"
+        ));
+    }
+    for p in cfg
+        .proxies
+        .iter()
+        .filter(|p| is_virtual_net_proxy_plugin(p))
+    {
+        if p.proxy_type != "tcp" {
+            return Err(format!(
+                "proxy '{}': virtual_net plugin requires proxy type tcp",
+                p.name
+            ));
+        }
+        if cfg.virtual_net.address.is_empty() {
+            return Err(format!(
+                "proxy '{}': virtual_net plugin requires [virtualNet] address",
+                p.name
+            ));
+        }
+        if cfg
+            .virtual_net
+            .address
+            .parse::<std::net::Ipv4Addr>()
+            .is_err()
+        {
+            return Err(format!(
+                "proxy '{}': invalid [virtualNet] address [{}]",
+                p.name, cfg.virtual_net.address
+            ));
+        }
+    }
+    for v in cfg.visitors.iter().filter(|v| is_virtual_net_visitor(v)) {
+        let Some(plugin) = &v.plugin else {
+            continue;
+        };
+        if plugin.destination_ip.is_empty() {
+            return Err(format!(
+                "visitor '{}': virtual_net plugin requires destinationIP",
+                v.name
+            ));
+        }
+        if plugin.destination_ip.parse::<std::net::IpAddr>().is_err() {
+            return Err(format!(
+                "visitor '{}': invalid destination IP address [{}]",
+                v.name, plugin.destination_ip
+            ));
+        }
+    }
     Ok(())
+}
+
+fn is_virtual_net_visitor(v: &VisitorConfig) -> bool {
+    v.plugin
+        .as_ref()
+        .is_some_and(|p| p.plugin_type == "virtual_net")
+}
+
+fn is_virtual_net_proxy_plugin(p: &ProxyConfig) -> bool {
+    p.plugin
+        .as_ref()
+        .is_some_and(|pl| pl.plugin_type == "virtual_net")
 }
 
 /// Reject duplicate proxy or visitor names. Go frp v0.70.0 compat:
@@ -1642,6 +1951,7 @@ fn normalize_server_config(value: &mut toml::Value) {
         if let Some(v) = table.remove("webServer") {
             table.entry("web_server").or_insert(v);
         }
+        normalize_web_server_section(table);
         if let Some(v) = table.remove("featureGates") {
             table.entry("feature").or_insert(v);
         }
@@ -1650,6 +1960,7 @@ fn normalize_server_config(value: &mut toml::Value) {
         if let Some(v) = table.remove("webServer") {
             table.entry("web_server").or_insert(v);
         }
+        normalize_web_server_section(table);
         if let Some(v) = table.remove("httpPlugins") {
             table.entry("http_plugins").or_insert(v);
         }
@@ -2031,6 +2342,28 @@ fn normalize_client_config(value: &mut toml::Value) {
     }
 }
 
+/// Normalize canonical Go `[webServer.tls]` (and `[web_server.tls]`) into the
+/// existing flat `web_server.tls_cert_file` / `tls_key_file` fields.
+fn normalize_web_server_section(table: &mut toml::Table) {
+    use toml::Value;
+
+    let Some(Value::Table(ws)) = table.get_mut("web_server") else {
+        return;
+    };
+    if let Some(Value::Table(tls)) = ws.remove("tls") {
+        for (k, v) in tls {
+            let flat_key = match k.as_str() {
+                "certFile" => "tls_cert_file",
+                "keyFile" => "tls_key_file",
+                "trustedCaFile" => "tls_ca_file",
+                "serverName" => "tls_server_name",
+                other => other,
+            };
+            ws.entry(flat_key.to_string()).or_insert(v);
+        }
+    }
+}
+
 /// Normalize Go-format proxy sub-tables into flat fields for each proxy entry.
 ///
 /// Handles:
@@ -2080,7 +2413,27 @@ fn normalize_proxies(table: &mut toml::Table) {
                     "maxFailed" => "health_check_max_failed",
                     other => other,
                 };
-                proxy_table.entry(flat_key.to_string()).or_insert(v);
+                let value = if k == "httpHeaders" {
+                    match v {
+                        Value::Array(items) => {
+                            let mut map = toml::Table::new();
+                            for item in items {
+                                if let Some(t) = item.as_table() {
+                                    let name =
+                                        t.get("name").and_then(Value::as_str).unwrap_or_default();
+                                    let value =
+                                        t.get("value").and_then(Value::as_str).unwrap_or_default();
+                                    map.insert(name.to_string(), Value::String(value.to_string()));
+                                }
+                            }
+                            Value::Table(map)
+                        }
+                        other => other,
+                    }
+                } else {
+                    v
+                };
+                proxy_table.entry(flat_key.to_string()).or_insert(value);
             }
         }
 
@@ -2090,6 +2443,17 @@ fn normalize_proxies(table: &mut toml::Table) {
                 let flat_key = match k.as_str() {
                     "group" => "group",
                     "groupKey" => "group_key",
+                    other => other,
+                };
+                proxy_table.entry(flat_key.to_string()).or_insert(v);
+            }
+        }
+
+        // Flatten [proxies.natTraversal] sub-table
+        if let Some(Value::Table(nt)) = proxy_table.remove("natTraversal") {
+            for (k, v) in nt {
+                let flat_key = match k.as_str() {
+                    "disableAssistedAddrs" => "disable_assisted_addrs",
                     other => other,
                 };
                 proxy_table.entry(flat_key.to_string()).or_insert(v);
@@ -2169,6 +2533,30 @@ fn normalize_proxies(table: &mut toml::Table) {
                 proxy_table.insert("plugin".to_string(), Value::Table(plugin_table));
             }
         }
+
+        // Normalize [proxies.plugin.requestHeaders.set] → request_headers map,
+        // including nested `[proxies.plugin]` tables.
+        if let Some(Value::Table(rh)) = proxy_table
+            .get_mut("plugin")
+            .and_then(Value::as_table_mut)
+            .and_then(|t| t.remove("requestHeaders"))
+        {
+            if let Some(Value::Table(set)) = rh.get("set") {
+                if let Some(Value::Table(existing)) = proxy_table
+                    .get_mut("plugin")
+                    .and_then(Value::as_table_mut)
+                    .and_then(|t| t.get_mut("request_headers"))
+                {
+                    for (k, v) in set.clone() {
+                        existing.entry(k).or_insert(v);
+                    }
+                } else if let Some(plugin) =
+                    proxy_table.get_mut("plugin").and_then(Value::as_table_mut)
+                {
+                    plugin.insert("request_headers".to_string(), Value::Table(set.clone()));
+                }
+            }
+        }
     }
 }
 
@@ -2208,6 +2596,22 @@ fn normalize_visitors(table: &mut toml::Table) {
                 };
                 visitor_table.entry(flat_key.to_string()).or_insert(v);
             }
+        }
+
+        // Normalize Go-style [visitors.plugin] tables into the nested plugin
+        // shape used by frp-rs. destinationIP is converted to snake_case; the
+        // remaining keys (type, serverName, bindPort, ...) are handled by
+        // serde aliases on VisitorPluginConfig.
+        if let Some(Value::Table(plugin)) = visitor_table.remove("plugin") {
+            let mut plugin_table = toml::Table::new();
+            for (k, v) in plugin {
+                let flat_key = match k.as_str() {
+                    "destinationIP" => "destination_ip",
+                    other => other,
+                };
+                plugin_table.entry(flat_key.to_string()).or_insert(v);
+            }
+            visitor_table.insert("plugin".to_string(), Value::Table(plugin_table));
         }
     }
 }
@@ -2698,6 +3102,7 @@ fn known_client_keys() -> std::collections::HashSet<&'static str> {
         "start",
         "includes",
         "include",
+        "store",
         "tls_enable",
         "tls_cert_file",
         "tls_key_file",
@@ -2722,6 +3127,8 @@ fn known_client_keys() -> std::collections::HashSet<&'static str> {
         "proxies",
         "visitors",
         "web_server",
+        "virtual_net",
+        "virtualNet",
         "feature",
         "common",
         "protocol",
@@ -2858,9 +3265,88 @@ remote_port = 7001
     }
 
     #[test]
+    fn test_parse_client_store_config() {
+        let toml_str = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+
+[store]
+path = "./frpc_store.json"
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+        assert_eq!(
+            cfg.store.as_ref().unwrap().path,
+            "./frpc_store.json",
+            "[store] path should be parsed"
+        );
+    }
+
+    #[test]
+    fn test_parse_client_store_defaults_to_none() {
+        let cfg: ClientConfig = load_client_config_from_str("server_addr = '127.0.0.1'").unwrap();
+        assert!(
+            cfg.store.is_none(),
+            "store defaults to None without [store]"
+        );
+    }
+
+    #[test]
     fn test_xtcp_visitor_defaults_to_kcp() {
         let visitor = VisitorConfig::default();
         assert_eq!(visitor.protocol, "kcp", "XTCP visitor must advertise KCP");
+    }
+
+    #[test]
+    fn test_merge_store_items_overlays_by_name() {
+        let base = ClientConfig {
+            server_addr: "127.0.0.1".into(),
+            proxies: vec![
+                ProxyConfig {
+                    name: "shared".into(),
+                    proxy_type: "tcp".into(),
+                    local_port: 1000,
+                    ..Default::default()
+                },
+                ProxyConfig {
+                    name: "config-only".into(),
+                    proxy_type: "tcp".into(),
+                    local_port: 2000,
+                    ..Default::default()
+                },
+            ],
+            visitors: vec![VisitorConfig {
+                name: "shared-visitor".into(),
+                visitor_type: "stcp".into(),
+                bind_port: 3000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let store_proxies = vec![ProxyConfig {
+            name: "shared".into(),
+            proxy_type: "tcp".into(),
+            local_port: 4000,
+            enabled: false,
+            ..Default::default()
+        }];
+        let store_visitors = vec![VisitorConfig {
+            name: "store-visitor".into(),
+            visitor_type: "xtcp".into(),
+            bind_port: 5000,
+            ..Default::default()
+        }];
+
+        let merged = base.merge_store_items(store_proxies, store_visitors);
+        let shared = merged.proxies.iter().find(|p| p.name == "shared").unwrap();
+        assert_eq!(shared.local_port, 4000, "store entry overlays config entry");
+        assert!(
+            merged.proxies.iter().any(|p| p.name == "config-only"),
+            "config-only proxy is preserved"
+        );
+        assert!(
+            merged.visitors.iter().any(|v| v.name == "store-visitor"),
+            "store visitor is added"
+        );
     }
 
     #[test]
@@ -3128,6 +3614,324 @@ disableAssistedAddrs = true
     }
 
     #[test]
+    fn test_go_virtual_net_client_config() {
+        let toml_str = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[featureGates]
+VirtualNet = true
+
+[virtualNet]
+address = "10.0.0.1"
+
+[[visitors]]
+name = "vnet-visitor"
+type = "stcp"
+serverName = "vnet-server"
+secretKey = "secret"
+bindPort = -1
+
+[visitors.plugin]
+type = "virtual_net"
+destinationIP = "100.86.0.1"
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+        assert_eq!(cfg.virtual_net.address, "10.0.0.1");
+        assert_eq!(cfg.feature.gates.get(VIRTUAL_NET), Some(&true));
+
+        let visitor = &cfg.visitors[0];
+        assert_eq!(visitor.bind_port, -1);
+        let plugin = visitor.plugin.as_ref().expect("visitor plugin");
+        assert_eq!(plugin.plugin_type, "virtual_net");
+        assert_eq!(plugin.destination_ip, "100.86.0.1");
+    }
+
+    #[test]
+    fn test_virtual_net_feature_gate_required() {
+        // [virtualNet] without the gate enabled is rejected.
+        let err = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+
+[virtualNet]
+address = "10.0.0.1"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("VirtualNet feature is not enabled"), "{err}");
+
+        // virtual_net visitor plugin without the gate enabled is rejected.
+        let err = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+
+[[visitors]]
+name = "vnet-visitor"
+type = "stcp"
+serverName = "vnet-server"
+bindPort = -1
+
+[visitors.plugin]
+type = "virtual_net"
+destinationIP = "100.86.0.1"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("VirtualNet feature is not enabled"), "{err}");
+    }
+
+    #[test]
+    fn test_virtual_net_visitor_destination_ip_validation() {
+        // Missing destinationIP is rejected.
+        let err = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+
+[featureGates]
+VirtualNet = true
+
+[[visitors]]
+name = "vnet-visitor"
+type = "stcp"
+serverName = "vnet-server"
+bindPort = -1
+
+[visitors.plugin]
+type = "virtual_net"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires destinationIP"), "{err}");
+
+        // Invalid IP is rejected.
+        let err = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+
+[featureGates]
+VirtualNet = true
+
+[[visitors]]
+name = "vnet-visitor"
+type = "stcp"
+serverName = "vnet-server"
+bindPort = -1
+
+[visitors.plugin]
+type = "virtual_net"
+destinationIP = "not-an-ip"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("invalid destination IP address"), "{err}");
+    }
+
+    #[test]
+    fn test_virtual_net_proxy_plugin_nested_and_flat_config() {
+        let nested = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[featureGates]
+VirtualNet = true
+
+[virtualNet]
+address = "10.0.0.2"
+
+[[proxies]]
+name = "vnet-provider"
+type = "tcp"
+remotePort = 0
+
+[proxies.plugin]
+type = "virtual_net"
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(nested).unwrap();
+        let plugin = cfg.proxies[0]
+            .plugin
+            .as_ref()
+            .expect("nested virtual_net plugin");
+        assert_eq!(plugin.plugin_type, "virtual_net");
+
+        let flat = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[featureGates]
+VirtualNet = true
+
+[virtualNet]
+address = "10.0.0.2"
+
+[[proxies]]
+name = "vnet-provider"
+type = "tcp"
+remotePort = 0
+plugin = "virtual_net"
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(flat).unwrap();
+        let plugin = cfg.proxies[0]
+            .plugin
+            .as_ref()
+            .expect("flat virtual_net plugin");
+        assert_eq!(plugin.plugin_type, "virtual_net");
+    }
+
+    #[test]
+    fn test_virtual_net_proxy_plugin_validation() {
+        // Feature gate required.
+        let err = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+
+[virtualNet]
+address = "10.0.0.2"
+
+[[proxies]]
+name = "vnet-provider"
+type = "tcp"
+plugin = "virtual_net"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("VirtualNet feature is not enabled"), "{err}");
+
+        // [virtualNet] address is required.
+        let err = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+
+[featureGates]
+VirtualNet = true
+
+[[proxies]]
+name = "vnet-provider"
+type = "tcp"
+plugin = "virtual_net"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires [virtualNet] address"), "{err}");
+
+        // The plugin is only valid on tcp proxies.
+        let err = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+
+[featureGates]
+VirtualNet = true
+
+[virtualNet]
+address = "10.0.0.2"
+
+[[proxies]]
+name = "vnet-provider"
+type = "stcp"
+plugin = "virtual_net"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires proxy type tcp"), "{err}");
+    }
+
+    #[test]
+    fn test_go_extended_server_config_fields() {
+        let toml_str = r#"
+bindAddr = "127.0.0.1"
+bindPort = 7000
+
+[log]
+disablePrintColor = true
+
+[webServer]
+assetsDir = "/srv/assets"
+pprofEnable = true
+
+[webServer.tls]
+certFile = "/etc/frps/dash.crt"
+keyFile = "/etc/frps/dash.key"
+
+[[httpPlugins]]
+name = "hook"
+addr = "http://127.0.0.1:4000"
+path = "/handler"
+ops = ["login"]
+tlsVerify = true
+"#;
+        let cfg: ServerConfig = load_server_config_from_str(toml_str).unwrap();
+        assert!(cfg.log.disable_print_color);
+        assert_eq!(cfg.web_server.assets_dir, "/srv/assets");
+        assert!(cfg.web_server.pprof_enable);
+        assert_eq!(cfg.web_server.tls_cert_file, "/etc/frps/dash.crt");
+        assert_eq!(cfg.web_server.tls_key_file, "/etc/frps/dash.key");
+        assert!(cfg.http_plugins[0].tls_verify);
+    }
+
+    #[test]
+    fn test_go_extended_proxy_visitor_config_fields() {
+        let toml_str = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "web"
+type = "http"
+remotePort = 80
+
+[proxies.natTraversal]
+disableAssistedAddrs = true
+
+[proxies.healthCheck]
+type = "http"
+url = "http://localhost/health"
+httpHeaders = [{ name = "X-Token", value = "abc" }]
+
+[proxies.plugin]
+type = "https2http"
+crtPath = "/crt"
+keyPath = "/key"
+enableHTTP2 = true
+
+[proxies.plugin.requestHeaders.set]
+X-Custom = "v"
+
+[[visitors]]
+name = "vis"
+type = "stcp"
+serverName = "s"
+bindPort = 1234
+enabled = false
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+        let proxy = &cfg.proxies[0];
+        assert!(proxy.disable_assisted_addrs);
+        assert_eq!(
+            proxy
+                .health_check_http_headers
+                .get("X-Token")
+                .map(String::as_str),
+            Some("abc")
+        );
+        let plugin = proxy.plugin.as_ref().expect("plugin");
+        assert_eq!(plugin.crt_file, "/crt");
+        assert_eq!(plugin.key_file, "/key");
+        assert_eq!(plugin.enable_http2, Some(true));
+        assert_eq!(
+            plugin.request_headers.get("X-Custom").map(String::as_str),
+            Some("v")
+        );
+        assert!(!cfg.visitors[0].enabled);
+    }
+
+    #[test]
     fn test_parse_allow_ports() {
         // Empty → empty
         assert!(parse_allow_ports("").is_empty());
@@ -3264,6 +4068,120 @@ remote_port = 7001
         assert!(cfg.oidc_scope.is_empty());
         assert!(cfg.oidc_issuer.is_empty());
         assert!(cfg.additional_endpoint_params.is_empty());
+    }
+
+    #[test]
+    fn test_parse_server_token_source_file() {
+        let toml_str = r#"
+bind_port = 7000
+
+[auth.tokenSource]
+type = "file"
+file.path = "/tmp/frp-token"
+"#;
+        let cfg: ServerConfig = load_server_config_from_str(toml_str).unwrap();
+        let source = cfg.auth.token_source.expect("tokenSource should parse");
+        assert_eq!(source.source_type, "file");
+        assert_eq!(source.file.unwrap().path, "/tmp/frp-token");
+        assert!(source.exec.is_none());
+    }
+
+    #[test]
+    fn test_parse_client_token_source_exec() {
+        let toml_str = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+
+[auth.tokenSource]
+type = "exec"
+exec.command = "/bin/sh"
+exec.args = ["-c", "printf '%s' \"$TOKEN\""]
+exec.env = [{ name = "TOKEN", value = "secret" }]
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+        let source = cfg
+            .auth
+            .unwrap()
+            .token_source
+            .expect("tokenSource should parse");
+        assert_eq!(source.source_type, "exec");
+        let exec = source.exec.expect("exec source should parse");
+        assert_eq!(exec.command, "/bin/sh");
+        assert_eq!(exec.args, vec!["-c", "printf '%s' \"$TOKEN\""]);
+        assert_eq!(exec.env.len(), 1);
+        assert_eq!(exec.env[0].name, "TOKEN");
+        assert_eq!(exec.env[0].value, "secret");
+    }
+
+    #[test]
+    fn test_reject_token_and_token_source_server() {
+        let toml_str = r#"
+bind_port = 7000
+
+[auth]
+token = "static-token"
+
+[auth.tokenSource]
+type = "file"
+file.path = "/tmp/frp-token"
+"#;
+        let err = load_server_config_from_str(toml_str)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot specify both auth.token and auth.tokenSource"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_reject_token_and_token_source_client() {
+        let toml_str = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+token = "static-token"
+
+[auth.tokenSource]
+type = "file"
+file.path = "/tmp/frp-token"
+"#;
+        let err = load_client_config_from_str(toml_str)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot specify both auth.token and auth.tokenSource"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_reject_unsupported_token_source_type() {
+        let toml_str = r#"
+bind_port = 7000
+
+[auth.tokenSource]
+type = "env"
+file.path = "/tmp/frp-token"
+"#;
+        let err = load_server_config_from_str(toml_str)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported value source type"), "{err}");
+    }
+
+    #[test]
+    fn test_reject_token_source_missing_file_path() {
+        let toml_str = r#"
+bind_port = 7000
+
+[auth.tokenSource]
+type = "file"
+file = {}
+"#;
+        let err = load_server_config_from_str(toml_str)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("file path cannot be empty"), "{err}");
     }
 
     #[test]

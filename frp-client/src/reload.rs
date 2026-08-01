@@ -38,6 +38,11 @@ pub(crate) fn config_snapshot(p: &ProxyConfig) -> String {
     fields.push(("group_key", p.group_key.clone()));
     fields.push(("multiplexer", p.multiplexer.clone()));
     fields.push(("proxy_protocol_version", p.proxy_protocol_version.clone()));
+    fields.push(("vnet_ip", p.vnet_ip.clone()));
+    fields.push(("vnet_netmask", p.vnet_netmask.clone()));
+    fields.push(("vnet_mtu", p.vnet_mtu.to_string()));
+    fields.push(("advertise_subnet", p.advertise_subnet.clone()));
+    fields.push(("virtual_net", p.virtual_net.clone()));
 
     // Plugin fields — needed for detecting plugin config changes during reload
     if let Some(ref pl) = p.plugin {
@@ -84,12 +89,8 @@ pub(crate) struct ReloadDelta {
 /// state updates so it can use the correct plugin bound addresses.
 pub(crate) async fn do_reload(
     proxy_info_map: &Arc<RwLock<HashMap<String, ProxyRuntimeInfo>>>,
-    config_path: &str,
-    strict: bool,
+    new_cfg: ClientConfig,
 ) -> Result<ReloadDelta, String> {
-    let new_cfg: ClientConfig = frp_core::config::load_client_config(config_path, strict)
-        .map_err(|e| format!("failed to load config: {e}"))?;
-
     // Diff old vs new proxy names
     let old_names: HashSet<String> = { proxy_info_map.read().await.keys().cloned().collect() };
     let new_names: HashSet<String> = new_cfg.proxies.iter().map(|p| p.name.clone()).collect();
@@ -113,20 +114,6 @@ pub(crate) async fn do_reload(
                 }
             }
         }
-    }
-
-    if strict && (!removed.is_empty() || !added.is_empty() || !changed.is_empty()) {
-        let mut parts: Vec<String> = Vec::new();
-        if !removed.is_empty() {
-            parts.push(format!("removed: {:?}", removed));
-        }
-        if !added.is_empty() {
-            parts.push(format!("added: {:?}", added));
-        }
-        if !changed.is_empty() {
-            parts.push(format!("changed: {:?}", changed));
-        }
-        return Err(format!("config changed — {}", parts.join("; ")));
     }
 
     if removed.is_empty() && added.is_empty() && changed.is_empty() {

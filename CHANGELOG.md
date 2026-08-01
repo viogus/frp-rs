@@ -48,6 +48,29 @@ Second parallel audit pass focused on the staged 0.7.1 review-fix wave:
   `additionalScopes`, OIDC `skipExpiryCheck`/`skipIssuerCheck`, visitor
   `[transport]`/`[natTraversal]`, plugin `unixPath`/`crtPath`/`keyPath`, and
   legacy flat `plugin_*` fields.
+- **Config audit phase 2**: parse `healthCheck.httpHeaders` Go arrays,
+  `webServer.assetsDir`/`pprofEnable`/`webServer.tls`, `log.disablePrintColor`,
+  `httpPlugins.tlsVerify`, plugin `requestHeaders`/`enableHTTP2`, visitor
+  `enabled`, and proxy `natTraversal`.
+- **Store**: implement Go frp `[store] path` file-backed proxy/visitor store
+  with admin API CRUD at `/api/store/proxies` and `/api/store/visitors`, plus
+  config+store merging and `start` allowlist filtering.
+- **Auth tokenSource**: implement Go frp `auth.tokenSource` file/exec dynamic
+  token sources for client Login/Ping/NewWorkConn and server validation.
+- **VirtualNet**: add `[virtualNet] address`, `virtual_net` proxy plugin, and
+  `virtual_net` visitor plugin with route advertisement and bidirectional
+  packet delivery. vnet routing is dual-stack (IPv4/IPv6), tunnel bytes honor
+  `use_encryption`/`use_compression`, reload re-creates plugin TUNs, visitor
+  return traffic is targeted to the owning TUN subnet instead of broadcast,
+  and frps broadcasts vnet route advertisements/removals to peers with
+  disconnect cleanup.
+- **PR review fixes**: `start` allowlist now also filters visitors; vnet OS
+  routes injected from peer advertisements are removed on route removal and
+  disconnect; vnet tunnels use Go-compatible `[u32 LE length][packet]`
+  framing even without compression; `auth.tokenSource` exec commands have a
+  10s timeout and kill on expiry; server vnet route removal is guarded by the
+  advertising run_id; store files persist with `0600` and validate entries on
+  load; `/api/store/*` is documented as a frp-rs-native contract.
 - **Concurrency**: per-run_id lifecycle mutexes are reclaimed; ClientRegistry
   lock order is canonical; post-login AEAD failure cleanup is generation-safe.
 - **KCP**: login throttling uses the real peer address instead of a shared key.

@@ -177,6 +177,7 @@ async fn handle_visitor_conn(
     let auth_cfg = AuthConfig {
         method: AuthMethod::Token,
         token: auth_token.to_string(),
+        token_source: None,
         oidc_issuer: String::new(),
         oidc_audience: String::new(),
         oidc_skip_expiry: false,
