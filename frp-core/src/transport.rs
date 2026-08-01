@@ -61,8 +61,10 @@ pub const FRP_WEBSOCKET_PATH: &str = "/~!frp";
 /// Maximum WebSocket frame payload accepted by the raw decoder. The V2
 /// framing layer permits 64 KiB messages, so the transport must not clamp
 /// below that; the V1 10 KiB limit stays enforced by `protocol.rs`.
+/// +128 bytes covers the V2 AEAD overhead (AES-256-GCM tag + nonce) so an
+/// encrypted V2 frame at the payload cap is not rejected by the transport.
 #[cfg(feature = "websocket")]
-const MAX_WS_FRAME_PAYLOAD: u64 = crate::protocol::V2_MAX_FRAME_PAYLOAD as u64;
+const MAX_WS_FRAME_PAYLOAD: u64 = crate::protocol::V2_MAX_FRAME_PAYLOAD as u64 + 128;
 
 /// Transport protocol variant.
 #[derive(Debug, Clone, PartialEq)]
@@ -883,6 +885,56 @@ impl AsyncWrite for WsByteStream {
 /// use as a dyn-compatible trait object in IoStream::Tls.
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+
+/// Stream wrapper that serves a byte prefix before delegating to the
+/// underlying stream. Used by the WebSocket client upgrade path to feed
+/// leftover bytes (a WS frame that arrived in the same TCP segment as the
+/// HTTP 101 response) through the raw WS frame parser instead of exposing
+/// them as application bytes.
+#[cfg(feature = "websocket")]
+struct PrependStream {
+    prepend: Vec<u8>,
+    pos: usize,
+    inner: Box<dyn AsyncReadWrite>,
+}
+
+#[cfg(feature = "websocket")]
+impl AsyncRead for PrependStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.pos < self.prepend.len() {
+            let n = (self.prepend.len() - self.pos).min(buf.remaining());
+            buf.put_slice(&self.prepend[self.pos..self.pos + n]);
+            self.pos += n;
+            if self.pos >= self.prepend.len() {
+                self.prepend.clear();
+                self.pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl AsyncWrite for PrependStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
 
 /// Unified stream type for TCP, TLS, KCP, and WebSocket.
 /// WebSocket variant wraps a WsByteStream adapter so all variants
@@ -2848,11 +2900,20 @@ where
         crate::Error::Transport("WS raw connect: timeout waiting for 101 response".into())
     })??;
 
-    let mut ws = WsByteStream::from_raw(Box::new(stream), true);
-    if !leftover.is_empty() {
-        ws.read_buf = leftover;
-        ws.read_pos = 0;
-    }
+    let mut ws = if leftover.is_empty() {
+        WsByteStream::from_raw(Box::new(stream), true)
+    } else {
+        // Go frps may pipeline the first WS frame in the same TCP segment
+        // as the 101 response. Feed the leftover bytes through the raw WS
+        // frame parser (PrependStream) so frame headers are consumed and
+        // only the payload reaches the application.
+        let prepend = PrependStream {
+            prepend: leftover,
+            pos: 0,
+            inner: Box::new(stream),
+        };
+        WsByteStream::from_raw(Box::new(prepend), true)
+    };
     Ok(IoStream::WebSocket(ws))
 }
 
@@ -3462,6 +3523,66 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "websocket")]
+    fn ws_frame_cap_covers_v2_aead_overhead() {
+        // The transport frame cap must accept a full-size V2 frame plus the
+        // AEAD overhead (tag + nonce), not just the plaintext cap.
+        assert!(MAX_WS_FRAME_PAYLOAD >= crate::protocol::V2_MAX_FRAME_PAYLOAD as u64 + 128);
+    }
+
+    /// Go frps may send the first WS frame in the same TCP segment as the
+    /// HTTP 101 response. The client must parse the frame instead of
+    /// exposing frame bytes as application bytes.
+    #[tokio::test]
+    #[cfg(feature = "websocket")]
+    async fn ws_client_parses_pipelined_frame_after_upgrade() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, mut server) = tokio::io::duplex(8192);
+        let payload: &[u8] = b"hello-from-go-frps";
+        let mut frame = vec![0x82u8, payload.len() as u8]; // FIN + BINARY
+        frame.extend_from_slice(payload);
+
+        let server_task = tokio::spawn(async move {
+            // Consume the upgrade request up to the blank line.
+            let mut req = vec![0u8; 4096];
+            let mut total = 0usize;
+            loop {
+                let n = server.read(&mut req[total..]).await.expect("read request");
+                assert!(n > 0, "client closed before request completed");
+                total += n;
+                if req[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // 101 response + first WS frame in a single segment.
+            server
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\n\
+                      Upgrade: websocket\r\n\
+                      Connection: Upgrade\r\n\
+                      \r\n",
+                )
+                .await
+                .expect("write 101");
+            server.write_all(&frame).await.expect("write pipelined frame");
+        });
+
+        let mut io = connect_ws_raw(client, "example.com", 7000, FRP_WEBSOCKET_PATH, "http")
+            .await
+            .expect("ws upgrade");
+
+        let mut buf = [0u8; 64];
+        let n = io.read(&mut buf).await.expect("read ws payload");
+        assert_eq!(
+            &buf[..n], payload,
+            "read must return the frame payload only, got: {:?}",
+            &buf[..n]
+        );
+        server_task.await.expect("server task");
+    }
+
+    #[test]
     #[cfg(feature = "tls")]
     fn test_build_tls_connector_with_platform_verifier() {
         let result = build_tls_connector(None, None, None);
@@ -3618,8 +3739,20 @@ mod tests {
         assert_eq!(n2, big.len());
         assert_eq!(&big_out[..n2], &big[..]);
 
-        // One byte over the V2 cap is rejected at the transport layer.
-        let huge = vec![0x6c; 64 * 1024 + 1];
+        // A V2 frame at the cap plus AEAD overhead (128 bytes) is accepted —
+        // the transport must not clamp encrypted V2 frames below the cap.
+        let aead_padded = vec![0x6c; 64 * 1024 + 128];
+        server_io
+            .write_all(&ws_binary_frame(&aead_padded))
+            .await
+            .unwrap();
+        let mut padded_out = vec![0u8; aead_padded.len()];
+        let n3 = ws.read(&mut padded_out).await.unwrap();
+        assert_eq!(n3, aead_padded.len());
+        assert_eq!(&padded_out[..n3], &aead_padded[..]);
+
+        // One byte over the cap + AEAD overhead is rejected at the transport.
+        let huge = vec![0x6c; 64 * 1024 + 129];
         server_io.write_all(&ws_binary_frame(&huge)).await.unwrap();
         let err = ws.read(&mut big_out).await.unwrap_err();
         assert!(
