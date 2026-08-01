@@ -1002,6 +1002,7 @@ pub(crate) async fn run_new_work_conn_plugin(run_id: &str, state: &AppState) -> 
         .plugin_manager
         .notify("new_work_conn", nwc_content)
         .await
+        .map(|_| ())
 }
 
 /// Handle an incoming work connection. Verifies auth, then routes the
