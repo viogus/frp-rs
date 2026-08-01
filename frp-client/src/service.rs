@@ -761,6 +761,12 @@ impl Service {
                     always_auth_pass: None,
                 }),
                 cfg_local.dial_server_timeout,
+                #[cfg(feature = "quic")]
+                frp_core::quic::quic_params_from_option_values(
+                    cfg_local.quic_options.as_ref().map(|q| q.keepalive_period).unwrap_or(0),
+                    cfg_local.quic_options.as_ref().map(|q| q.max_idle_timeout).unwrap_or(0),
+                    cfg_local.quic_options.as_ref().map(|q| q.max_incoming_streams).unwrap_or(0),
+                ),
             );
 
             #[cfg(feature = "quic")]
@@ -1014,6 +1020,8 @@ impl Service {
                         tls_enable: cfg_local.tls_enable,
                         tls_server_name: cfg_local.tls_server_name.clone(),
                         tls_ca_file: opt_if_empty!(cfg_local.tls_ca_file),
+                        tls_cert_file: opt_if_empty!(cfg_local.tls_cert_file),
+                        tls_key_file: opt_if_empty!(cfg_local.tls_key_file),
                         yamux: yamux.clone(),
                         quic_conn: quic_arg,
                         v2,
