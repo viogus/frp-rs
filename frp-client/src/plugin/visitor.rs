@@ -114,12 +114,14 @@ pub async fn start_visitor_plugin(
                             let tp = transport_protocol.clone();
                             let oidc = oidc_client.clone();
 
+                            let ctx_v2 = ctx.v2;
+
                             let dns = ctx_dns.clone();
-                                let bind = ctx_bind.clone();
-                                let tls_cert = ctx_tls_cert.clone();
-                                let tls_key = ctx_tls_key.clone();
-                                let proxy = ctx_proxy.clone();
-                                tokio::spawn(async move {
+                            let bind = ctx_bind.clone();
+                            let tls_cert = ctx_tls_cert.clone();
+                            let tls_key = ctx_tls_key.clone();
+                            let proxy = ctx_proxy.clone();
+                            tokio::spawn(async move {
                                 if let Err(e) = handle_visitor_conn(
                                     user_conn, &sn, &sk, &at, &sa, sp, te, &tsn,
                                     tcf.as_deref(), ue, uc, &tp, oidc,
@@ -127,6 +129,7 @@ pub async fn start_visitor_plugin(
                                     &dns, ctx_keepalive, &bind,
                                     &tls_cert, &tls_key, &proxy,
                                     ctx_nocustomtls, ctx_dial_timeout,
+                                    ctx_v2,
                                 ).await {
                                     debug!(error = %e, "visitor plugin handler: {}", e);
                                 }
@@ -176,6 +179,7 @@ async fn handle_visitor_conn(
     proxy_url: &Option<String>,
     disable_custom_tls_first_byte: bool,
     dial_timeout_secs: u64,
+    v2: bool,
 ) -> Result<(), String> {
     // 1. Dial frps server
     let protocol = match transport_protocol {
@@ -202,7 +206,7 @@ async fn handle_visitor_conn(
         bind_addr: bind_addr.clone(),
         proxy_url: proxy_url.clone(),
         dial_timeout_secs,
-        v2: false,
+        v2,
     };
     let raw_stream = transport::dial_server(&opts)
         .await

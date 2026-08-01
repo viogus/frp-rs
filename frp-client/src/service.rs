@@ -400,6 +400,7 @@ impl Service {
                         disable_custom_tls_first_byte: cfg.disable_custom_tls_first_byte,
                         tls_cert_file: opt_if_empty!(cfg.tls_cert_file.clone()),
                         tls_key_file: opt_if_empty!(cfg.tls_key_file.clone()),
+                        v2: cfg.v2,
                     };
                     dispatch_plugin_start(plugin_cfg, Some(plugin_ctx)).await
                 } else {
@@ -1125,6 +1126,7 @@ impl Service {
                                         disable_custom_tls_first_byte: transport_nocustomtls,
                                         tls_cert_file: transport_tls_cert.clone(),
                                         tls_key_file: transport_tls_key.clone(),
+                                        v2: cfg_local.v2,
                                         destination_cidr: adv.subnet,
                                         controller,
                                         vnet_tun_tx,
@@ -1213,6 +1215,7 @@ impl Service {
                         disable_custom_tls_first_byte: transport_nocustomtls,
                         tls_cert_file: transport_tls_cert.clone(),
                         tls_key_file: transport_tls_key.clone(),
+                        v2: cfg_local.v2,
                     })
                     .await;
                 });
@@ -2354,6 +2357,7 @@ impl Service {
                 disable_custom_tls_first_byte: current_cfg.disable_custom_tls_first_byte,
                 tls_cert_file: opt_if_empty!(current_cfg.tls_cert_file.clone()),
                 tls_key_file: opt_if_empty!(current_cfg.tls_key_file.clone()),
+                v2: current_cfg.v2,
             };
             dispatch_plugin_start(plugin_cfg, Some(ctx)).await
         } else {

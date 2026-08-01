@@ -24,4 +24,5 @@ pub struct PluginContext {
     pub disable_custom_tls_first_byte: bool,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
+    pub v2: bool,
 }

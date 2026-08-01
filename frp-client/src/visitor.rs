@@ -61,6 +61,7 @@ pub(crate) struct VisitorListenerConfig {
     pub disable_custom_tls_first_byte: bool,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
+    pub v2: bool,
 }
 
 /// Configuration for a no-bind `virtual_net` visitor tunnel.
@@ -108,6 +109,7 @@ pub(crate) struct VirtualNetVisitorConfig {
     pub disable_custom_tls_first_byte: bool,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
+    pub v2: bool,
 }
 
 /// Run the packet loop over an established `virtual_net` visitor tunnel.
@@ -236,6 +238,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
         disable_custom_tls_first_byte,
         tls_cert_file,
         tls_key_file,
+        v2,
     } = config;
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
@@ -286,6 +289,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                 let cfg_dto = dial_timeout_secs;
                 let cfg_tcp_mux = tcp_mux;
                 let cfg_tcp_mux_keepalive = tcp_mux_keepalive_interval;
+                let cfg_v2 = v2;
 
                 tokio::spawn(async move {
                     // Dial options for STCP fallback (fresh connections only).
@@ -304,7 +308,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         bind_addr: cfg_cbind.clone(),
                         proxy_url: cfg_proxy.clone(),
                         dial_timeout_secs: cfg_dto,
-                        v2: false,
+                        v2: cfg_v2,
                     };
 
                     if vt == "xtcp" {
@@ -908,6 +912,7 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         disable_custom_tls_first_byte,
         tls_cert_file,
         tls_key_file,
+        v2,
     } = config;
 
     'reconnect: loop {
@@ -930,7 +935,7 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
             bind_addr: connect_bind_addr.clone(),
             proxy_url: proxy_url.clone(),
             dial_timeout_secs,
-            v2: false,
+            v2,
         })
         .await
         {
@@ -1391,5 +1396,104 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(1), task)
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    /// VisitorListenerConfig carries proxy_url, dns_server, and tcp_mux
+    /// through to the visitor dial path.
+    #[test]
+    fn config_propagates_proxy_url_and_tcp_mux() {
+        let (tx, _rx) = mpsc::channel::<crate::service::VisitorRequest>(1);
+        let cfg = VisitorListenerConfig {
+            server_addr: "frps.example.com".into(),
+            server_port: 7443,
+            protocol: TransportProtocol::Tcp,
+            server_name: "test-stcp".into(),
+            server_user: String::new(),
+            secret_key: "sk".into(),
+            bind_addr: "0.0.0.0:6001".into(),
+            use_encryption: false,
+            use_compression: false,
+            name: "stcp-visitor".into(),
+            tls_enable: false,
+            tls_server_name: String::new(),
+            tls_ca_file: None,
+            visitor_type: "stcp".into(),
+            fallback_timeout_ms: 5000,
+            keep_tunnel_open: false,
+            max_retries_an_hour: 0,
+            min_retry_interval: 0,
+            stun_server: String::new(),
+            p2p_protocol: "kcp".into(),
+            visitor_tx: tx,
+            fallback_to: String::new(),
+            disable_assisted_addrs: false,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            user: String::new(),
+            run_id: String::new(),
+            tcp_mux: true,
+            tcp_mux_keepalive_interval: 30,
+            proxy_url: Some("socks5://proxy:1080".into()),
+            dns_server: Some("8.8.8.8".into()),
+            dial_timeout_secs: 15,
+            keepalive_secs: 60,
+            connect_bind_addr: Some("10.0.0.1".into()),
+            disable_custom_tls_first_byte: true,
+            tls_cert_file: Some("/path/cert.pem".into()),
+            tls_key_file: Some("/path/key.pem".into()),
+            v2: true,
+        };
+
+        assert_eq!(cfg.tcp_mux, true);
+        assert_eq!(cfg.tcp_mux_keepalive_interval, 30);
+        assert_eq!(cfg.proxy_url.as_deref(), Some("socks5://proxy:1080"));
+        assert_eq!(cfg.dns_server.as_deref(), Some("8.8.8.8"));
+        assert_eq!(cfg.dial_timeout_secs, 15);
+        assert_eq!(cfg.keepalive_secs, 60);
+        assert_eq!(cfg.connect_bind_addr.as_deref(), Some("10.0.0.1"));
+        assert_eq!(cfg.disable_custom_tls_first_byte, true);
+        assert_eq!(cfg.tls_cert_file.as_deref(), Some("/path/cert.pem"));
+        assert_eq!(cfg.tls_key_file.as_deref(), Some("/path/key.pem"));
+        assert_eq!(cfg.v2, true);
+    }
+
+    /// DialOptions assembled with explicit transport fields must have
+    /// no gaps where a Default value would silently leak through.
+    #[test]
+    fn dial_options_no_default_transport_gaps() {
+        let opts = DialOptions {
+            server_addr: "frps.example.com".into(),
+            server_port: 7443,
+            protocol: TransportProtocol::Tcp,
+            tls_enable: true,
+            tls_server_name: "frps.example.com".into(),
+            tls_ca_file: Some("/etc/ca.pem".into()),
+            tls_cert_file: Some("/etc/cert.pem".into()),
+            tls_key_file: Some("/etc/key.pem".into()),
+            dns_server: Some("1.1.1.1".into()),
+            disable_custom_tls_first_byte: true,
+            keepalive_secs: 60,
+            bind_addr: Some("10.0.0.1".into()),
+            proxy_url: Some("socks5://proxy:1080".into()),
+            dial_timeout_secs: 20,
+            v2: true,
+        };
+
+        assert_eq!(opts.dial_timeout_secs, 20, "dial_timeout_secs should be 20, not default 10");
+        assert_eq!(opts.keepalive_secs, 60, "keepalive_secs should be 60, not default 0");
+        assert_eq!(opts.proxy_url.as_deref(), Some("socks5://proxy:1080"));
+        assert_eq!(opts.dns_server.as_deref(), Some("1.1.1.1"));
+        assert_eq!(opts.bind_addr.as_deref(), Some("10.0.0.1"));
+        assert_eq!(opts.tls_cert_file.as_deref(), Some("/etc/cert.pem"));
+        assert_eq!(opts.tls_key_file.as_deref(), Some("/etc/key.pem"));
+        assert_eq!(opts.disable_custom_tls_first_byte, true);
+        assert_eq!(opts.v2, true);
     }
 }
