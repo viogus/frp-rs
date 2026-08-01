@@ -861,12 +861,24 @@ pub(crate) async fn handle_vnet_packet(
     _writer: &mut (impl AsyncWriteExt + Unpin),
     pkt: msg::VnetPacket,
 ) {
-    if let Some(target_info) = ctx.state.proxy_manager.get(&pkt.proxy_name).await {
-        let target_run_id = target_info.run_id.clone();
-        if target_run_id == ctx.run_id {
-            // Same client — no forwarding needed (client handles locally)
-            debug!(proxy_name = %pkt.proxy_name, "vnet packet target is self, skipping forward");
-        } else if let Some(ctl_tx) = ctx.state.run_id_to_ctl_tx.read().await.get(&target_run_id) {
+    let target_run_id =
+        if let Some(target_info) = ctx.state.proxy_manager.get(&pkt.proxy_name).await {
+            if target_info.run_id == ctx.run_id {
+                // Same client and it owns a registered proxy: the client handles
+                // the packet locally and does not need a control-conn echo.
+                None
+            } else {
+                Some(target_info.run_id.clone())
+            }
+        } else {
+            // Not a proxy: resolve virtual_net visitor routes advertised over the
+            // control connection (visitor name → advertising client) and deliver
+            // the packet back to that client's control connection.
+            let routes = ctx.state.vnet_routes.read().await;
+            vnet_visitor_route_target_run_id(&routes, &pkt.proxy_name)
+        };
+    if let Some(target_run_id) = target_run_id {
+        if let Some(ctl_tx) = ctx.state.run_id_to_ctl_tx.read().await.get(&target_run_id) {
             let _ = ctl_tx.tx.try_send(InternalMsg::VnetPacketForward {
                 proxy_name: pkt.proxy_name.clone(),
                 data: pkt.data.clone(),
@@ -887,6 +899,19 @@ pub(crate) async fn handle_vnet_route_remove(
     let mut routes = ctx.state.vnet_routes.write().await;
     routes.retain(|(vn_k, _), (_, name)| !(vn_k == &vn && name == &rem.proxy_name));
     info!(proxy_name = %rem.proxy_name, "vnet route removed: {}", rem.proxy_name);
+}
+
+/// Resolve the run_id that advertised `proxy_name` as a virtual_net visitor
+/// route. Returns `None` when the name is not a known visitor route.
+#[cfg(feature = "vnet")]
+fn vnet_visitor_route_target_run_id(
+    routes: &std::collections::HashMap<(String, String), (String, String)>,
+    proxy_name: &str,
+) -> Option<String> {
+    routes
+        .values()
+        .find(|(_, name)| name == proxy_name)
+        .map(|(run_id, _)| run_id.clone())
 }
 
 #[cfg(test)]
@@ -936,5 +961,36 @@ mod identity_binding_tests {
             "owner",
             &["A".to_string()]
         ));
+    }
+
+    #[cfg(feature = "vnet")]
+    #[test]
+    fn vnet_visitor_route_resolves_advertising_run_id() {
+        use std::collections::HashMap;
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            (String::new(), "10.0.0.1/32".to_string()),
+            ("run-a".to_string(), "vnet-visitor".to_string()),
+        );
+        routes.insert(
+            (String::new(), "10.0.0.0/24".to_string()),
+            ("run-b".to_string(), "vnet-proxy-b".to_string()),
+        );
+
+        assert_eq!(
+            super::vnet_visitor_route_target_run_id(&routes, "vnet-visitor"),
+            Some("run-a".to_string())
+        );
+        // Route advertisements from regular vnet proxies also appear in the
+        // table; proxy_manager remains the primary resolver for those names.
+        assert_eq!(
+            super::vnet_visitor_route_target_run_id(&routes, "vnet-proxy-b"),
+            Some("run-b".to_string())
+        );
+        assert_eq!(
+            super::vnet_visitor_route_target_run_id(&routes, "missing"),
+            None
+        );
     }
 }

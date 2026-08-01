@@ -4,6 +4,7 @@
 //! TX: TUN read → route lookup → VnetPacket → write_msg on ctl_writer (control conn)
 //! RX: tun_packet_rx → TUN write
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
@@ -136,5 +137,148 @@ impl VnetController {
             }
         }
         Ok(())
+    }
+}
+
+/// Shared client-side virtual network controller.
+///
+/// Owns the routing table used by every TUN-backed [`VnetController`] on the
+/// client and tracks `virtual_net` visitor tunnels so inbound [`VnetPacket`]s
+/// can be delivered to the correct STCP/XTCP visitor connection.
+pub struct ClientVnetController {
+    /// Local routing table: subnet → proxy/visitor name (TX direction).
+    routes: Arc<RwLock<RouteTable>>,
+    /// Packet delivery channels for `virtual_net` visitor tunnels, keyed by
+    /// visitor name. Inbound packets from the server are forwarded into the
+    /// channel, and the visitor task writes them into the tunnel connection.
+    visitor_txs: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+}
+
+impl ClientVnetController {
+    pub fn new() -> Self {
+        Self {
+            routes: Arc::new(RwLock::new(RouteTable::new())),
+            visitor_txs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Return the shared route table used by TUN-backed controllers.
+    pub fn route_table(&self) -> Arc<RwLock<RouteTable>> {
+        Arc::clone(&self.routes)
+    }
+
+    /// Register a `virtual_net` visitor host route (e.g. `100.86.0.1/32`)
+    /// mapped to the visitor name and its packet delivery channel.
+    pub async fn register_visitor_route(
+        &self,
+        name: &str,
+        cidr: &str,
+        packet_tx: mpsc::Sender<Vec<u8>>,
+    ) -> anyhow::Result<()> {
+        self.routes.write().await.insert(name, cidr)?;
+        self.visitor_txs
+            .lock()
+            .await
+            .insert(name.to_string(), packet_tx);
+        tracing::info!(visitor_name = %name, cidr = %cidr, "virtual_net visitor route registered");
+        Ok(())
+    }
+
+    /// Remove a `virtual_net` visitor route and its delivery channel.
+    pub async fn unregister_visitor_route(&self, name: &str) {
+        self.routes.write().await.remove(name);
+        self.visitor_txs.lock().await.remove(name);
+        tracing::info!(visitor_name = %name, "virtual_net visitor route removed");
+    }
+
+    /// Deliver an inbound packet to a visitor tunnel.
+    ///
+    /// Returns `true` when the visitor route exists (including when the
+    /// bounded channel is full and the packet is dropped), and `false` when
+    /// no visitor is registered for `name` or its channel is closed.
+    pub async fn deliver_visitor_packet(&self, name: &str, packet: Vec<u8>) -> bool {
+        let mut txs = self.visitor_txs.lock().await;
+        let Some(tx) = txs.get(name) else {
+            return false;
+        };
+        match tx.try_send(packet) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(packet)) => {
+                tracing::warn!(
+                    visitor_name = %name,
+                    "virtual_net visitor packet queue full; dropping packet"
+                );
+                drop(packet);
+                true
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // The visitor task is gone; remove the stale registration.
+                txs.remove(name);
+                false
+            }
+        }
+    }
+}
+
+impl Default for ClientVnetController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn register_and_unregister_visitor_route() {
+        let ctrl = ClientVnetController::new();
+        let (tx, _rx) = mpsc::channel(16);
+        ctrl.register_visitor_route("vnet-visitor", "100.86.0.1/32", tx)
+            .await
+            .unwrap();
+
+        let routes = ctrl.route_table();
+        assert_eq!(
+            routes.read().await.lookup(&Ipv4Addr::new(100, 86, 0, 1)),
+            Some("vnet-visitor")
+        );
+
+        ctrl.unregister_visitor_route("vnet-visitor").await;
+        assert_eq!(
+            routes.read().await.lookup(&Ipv4Addr::new(100, 86, 0, 1)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_packet_to_visitor_connection() {
+        let ctrl = ClientVnetController::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        ctrl.register_visitor_route("vnet-visitor", "100.86.0.1/32", tx)
+            .await
+            .unwrap();
+
+        let packet = vec![0x45, 0x00, 0x00, 0x14, 0x01, 0x02];
+        assert!(
+            ctrl.deliver_visitor_packet("vnet-visitor", packet.clone())
+                .await
+        );
+        assert_eq!(rx.recv().await, Some(packet));
+    }
+
+    #[tokio::test]
+    async fn deliver_to_unregistered_or_closed_visitor_fails() {
+        let ctrl = ClientVnetController::new();
+        assert!(!ctrl.deliver_visitor_packet("missing", vec![0x45]).await);
+
+        let (tx, rx) = mpsc::channel(16);
+        ctrl.register_visitor_route("gone", "10.0.0.1/32", tx)
+            .await
+            .unwrap();
+        drop(rx);
+        assert!(!ctrl.deliver_visitor_packet("gone", vec![0x45]).await);
+        // The stale registration is removed after the closed channel is detected.
+        assert!(!ctrl.deliver_visitor_packet("gone", vec![0x45]).await);
     }
 }

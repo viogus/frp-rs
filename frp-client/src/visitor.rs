@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+#[cfg(feature = "vnet")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
@@ -43,6 +45,36 @@ pub(crate) struct VisitorListenerConfig {
     /// Current session run_id for NewVisitorConn (Go frp compat).
     pub run_id: String,
 }
+
+/// Configuration for a no-bind `virtual_net` visitor tunnel.
+#[cfg(feature = "vnet")]
+pub(crate) struct VirtualNetVisitorConfig {
+    pub server_addr: String,
+    pub server_port: u16,
+    pub protocol: TransportProtocol,
+    pub server_name: String,
+    pub server_user: String,
+    pub secret_key: String,
+    pub use_encryption: bool,
+    pub use_compression: bool,
+    pub name: String,
+    pub tls_enable: bool,
+    pub tls_server_name: String,
+    pub tls_ca_file: Option<String>,
+    /// Client's user name for proxy_name prefix (Go frp BuildTargetServerProxyName compat).
+    pub user: String,
+    /// Current session run_id for NewVisitorConn (Go frp compat).
+    pub run_id: String,
+    /// Host-route CIDR advertised for this visitor (destinationIP/32).
+    pub destination_cidr: String,
+    /// Shared client-side vnet controller used for route registration and
+    /// inbound packet delivery.
+    pub controller: Arc<frp_vnet::controller::ClientVnetController>,
+    /// Graceful shutdown signal. When true, the tunnel exits and the route is
+    /// unregistered.
+    pub shutdown: Arc<AtomicBool>,
+}
+
 /// Run an STCP/XTCP visitor listener.
 /// Binds a local port, accepts connections, and tunnels them
 /// through the frps server to the remote STCP proxy.
@@ -659,6 +691,213 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                 break;
             }
         }
+    }
+}
+
+/// Run a no-bind `virtual_net` visitor tunnel.
+///
+/// Establishes an STCP/XTCP tunnel connection to the remote proxy and
+/// registers the visitor's `destinationIP` host route with the shared client
+/// vnet controller. Inbound [`VnetPacket`]s addressed to the visitor name are
+/// delivered into the tunnel connection; when the connection closes the route
+/// is unregistered. The tunnel is re-established after a short backoff so a
+/// transient remote-side failure does not permanently disable the visitor.
+#[cfg(feature = "vnet")]
+pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
+    let VirtualNetVisitorConfig {
+        server_addr,
+        server_port,
+        protocol,
+        server_name,
+        server_user,
+        secret_key,
+        use_encryption,
+        use_compression,
+        name,
+        tls_enable,
+        tls_server_name,
+        tls_ca_file,
+        user,
+        run_id,
+        destination_cidr,
+        controller,
+        shutdown,
+    } = config;
+
+    'reconnect: loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let mut server_conn = match dial_server(&DialOptions {
+            server_addr: server_addr.clone(),
+            server_port,
+            protocol: protocol.clone(),
+            tls_enable,
+            tls_server_name: tls_server_name.clone(),
+            tls_ca_file: tls_ca_file.clone(),
+            ..Default::default()
+        })
+        .await
+        {
+            Ok(io) => io,
+            Err(e) => {
+                warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': dial server failed: {}", name, e);
+                if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+                    return;
+                }
+                continue 'reconnect;
+            }
+        };
+
+        let nvc = crate::proxy::create_visitor_conn_msg(
+            &server_name,
+            &secret_key,
+            use_encryption,
+            use_compression,
+            Some(server_user.as_str()).filter(|s| !s.is_empty()),
+            Some(user.as_str()).filter(|s| !s.is_empty()),
+            Some(run_id.as_str()).filter(|s| !s.is_empty()),
+        );
+        if let Err(e) = server_conn.write_v1_frame(&nvc).await {
+            warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': send NewVisitorConn failed: {}", name, e);
+            if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+                return;
+            }
+            continue 'reconnect;
+        }
+        debug!(visitor_name = %name, sn = %server_name, "Virtual net visitor '{}': sent NewVisitorConn for '{}'", name, server_name);
+
+        match server_conn.read_v1_frame().await {
+            Ok(FrpMessage::NewVisitorConnResp(resp)) => {
+                if let Some(err) = resp.error {
+                    warn!(visitor_name = %name, error = %err, "Virtual net visitor '{}': tunnel setup failed: {}", name, err);
+                    if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+                        return;
+                    }
+                    continue 'reconnect;
+                }
+                debug!(visitor_name = %name, proxy_name = %resp.proxy_name, "Virtual net visitor '{}': tunnel ready for '{}'", name, resp.proxy_name);
+            }
+            Ok(FrpMessage::ReqWorkConn(_)) => {
+                // Go frps responds to NewVisitorConn with ReqWorkConn; treat as success.
+                debug!(visitor_name = %name, "Virtual net visitor '{}': tunnel ready (Go frps ReqWorkConn)", name);
+            }
+            Ok(other) => {
+                warn!(visitor_name = %name, type_byte = %other.v1_type_byte(), "Virtual net visitor received unexpected response type");
+                if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+                    return;
+                }
+                continue 'reconnect;
+            }
+            Err(e) => {
+                warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': read tunnel response failed: {}", name, e);
+                if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+                    return;
+                }
+                continue 'reconnect;
+            }
+        }
+
+        let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(256);
+        if let Err(e) = controller
+            .register_visitor_route(&name, &destination_cidr, packet_tx)
+            .await
+        {
+            warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': route registration failed: {}", name, e);
+            if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+                return;
+            }
+            continue 'reconnect;
+        }
+        info!(
+            visitor_name = %name,
+            destination = %destination_cidr,
+            "Virtual net visitor '{}' tunnel established, host route {} registered",
+            name,
+            destination_cidr
+        );
+
+        let mut buf = vec![0u8; 1420];
+        let mut tunnel_closed = false;
+        while !tunnel_closed {
+            tokio::select! {
+                _ = wait_for_shutdown_signal(&shutdown) => {
+                    info!(visitor_name = %name, "Virtual net visitor '{}' shutting down", name);
+                    break;
+                }
+                packet = packet_rx.recv() => {
+                    match packet {
+                        Some(pkt) => {
+                            if let Err(e) = server_conn.write_all(&pkt).await {
+                                warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': tunnel write error: {}", name, e);
+                                tunnel_closed = true;
+                            }
+                        }
+                        None => {
+                            debug!(visitor_name = %name, "Virtual net visitor packet channel closed");
+                            tunnel_closed = true;
+                        }
+                    }
+                }
+                n = server_conn.read(&mut buf) => {
+                    match n {
+                        Ok(0) => {
+                            debug!(visitor_name = %name, "Virtual net visitor tunnel closed by peer");
+                            tunnel_closed = true;
+                        }
+                        Ok(n) => {
+                            // frp-rs routes return traffic as control-conn
+                            // VnetPackets to local TUN-backed proxies, so bytes
+                            // arriving on the tunnel itself are not forwarded to
+                            // a TUN here yet.
+                            debug!(visitor_name = %name, n = %n, "Virtual net visitor tunnel ingress bytes ignored");
+                        }
+                        Err(e) => {
+                            warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': tunnel read error: {}", name, e);
+                            tunnel_closed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        controller.unregister_visitor_route(&name).await;
+        info!(visitor_name = %name, "Virtual net visitor '{}' tunnel closed, route removed", name);
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+            return;
+        }
+    }
+}
+
+/// Wait for `shutdown` or `delay`, whichever comes first. Returns `true` when
+/// shutdown was requested so the caller can exit.
+#[cfg(feature = "vnet")]
+async fn wait_for_shutdown_or_delay(shutdown: &Arc<AtomicBool>, delay: Duration) -> bool {
+    let deadline = Instant::now() + delay;
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep((deadline - now).min(Duration::from_millis(100))).await;
+    }
+}
+
+/// Resolves when the graceful shutdown signal is set.
+#[cfg(feature = "vnet")]
+async fn wait_for_shutdown_signal(shutdown: &Arc<AtomicBool>) {
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

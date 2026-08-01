@@ -168,11 +168,11 @@ pub struct Service {
     /// Work connection tasks take ownership of the TUN device via Option::take().
     #[cfg(feature = "vnet")]
     vnet_tuns: VnetTunMap,
-    /// Shared routing table for vnet packet forwarding (TX direction).
-    /// Updated by the service when peer route advertisements arrive,
-    /// read by VnetController during packet forwarding.
+    /// Shared client-side vnet controller: routing table used by TUN-backed
+    /// VnetControllers (TX direction) plus virtual_net visitor tunnel
+    /// delivery channels (RX direction).
     #[cfg(feature = "vnet")]
-    vnet_routes: Arc<tokio::sync::RwLock<frp_vnet::router::RouteTable>>,
+    vnet_controller: Arc<frp_vnet::controller::ClientVnetController>,
     /// Per-proxy TX channels for forwarding received VnetPackets to TUN devices.
     /// Keyed by proxy name.
     #[cfg(feature = "vnet")]
@@ -436,7 +436,7 @@ impl Service {
         #[cfg(feature = "vnet")]
         let vnet_tuns = Arc::new(Mutex::new(HashMap::new()));
         #[cfg(feature = "vnet")]
-        let vnet_routes = Arc::new(tokio::sync::RwLock::new(frp_vnet::router::RouteTable::new()));
+        let vnet_controller = Arc::new(frp_vnet::controller::ClientVnetController::new());
         #[cfg(feature = "vnet")]
         let vnet_tun_tx = Arc::new(Mutex::new(HashMap::new()));
         #[cfg(feature = "vnet")]
@@ -478,7 +478,7 @@ impl Service {
             #[cfg(feature = "vnet")]
             vnet_tuns,
             #[cfg(feature = "vnet")]
-            vnet_routes,
+            vnet_controller,
             #[cfg(feature = "vnet")]
             vnet_tun_tx,
             #[cfg(feature = "vnet")]
@@ -940,7 +940,7 @@ impl Service {
                             txs.insert(proxy_name.clone(), tun_tx);
                         }
                         let ctl_writer = writer.clone();
-                        let routes = self.vnet_routes.clone();
+                        let routes = self.vnet_controller.route_table();
                         let pn = proxy_name.clone();
                         tokio::spawn(async move {
                             let ctrl =
@@ -1048,7 +1048,7 @@ impl Service {
                         #[cfg(feature = "vnet")]
                         vnet_tuns: self.vnet_tuns.clone(),
                         #[cfg(feature = "vnet")]
-                        vnet_routes: self.vnet_routes.clone(),
+                        vnet_routes: self.vnet_controller.route_table(),
                     }
                 }};
             }
@@ -1083,13 +1083,59 @@ impl Service {
                 if v.bind_port == 0 {
                     continue;
                 }
-                // virtual_net visitors do not bind a local listener; the
-                // route advertisement above is their entire runtime surface
-                // until the packet path is wired to a controller connection.
+                // Virtual_net visitors do not bind a local listener; they
+                // establish a persistent STCP/XTCP tunnel and register their
+                // destinationIP host route with the client vnet controller.
                 if v.plugin
                     .as_ref()
                     .is_some_and(|p| p.plugin_type == VISITOR_PLUGIN_VIRTUAL_NET)
                 {
+                    #[cfg(feature = "vnet")]
+                    {
+                        if let Some(adv) = virtual_net_visitor_route_adv(v) {
+                            let sa = cfg_local.server_addr.clone();
+                            let sp = cfg_local.server_port;
+                            let pt = protocol.clone();
+                            let server_name = v.server_name.clone();
+                            let server_user = v.server_user.clone();
+                            let secret_key = v.secret_key.clone();
+                            let use_enc = v.use_encryption;
+                            let use_comp = v.use_compression;
+                            let name = v.name.clone();
+                            let tls_enable = cfg_local.tls_enable;
+                            let tls_server_name = cfg_local.tls_server_name.clone();
+                            let tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
+                            let user = cfg_local.user.clone();
+                            let rid = run_id.clone();
+                            let controller = self.vnet_controller.clone();
+                            let shutdown = visitor_shutdown.clone();
+                            let handle = tokio::spawn(async move {
+                                crate::visitor::run_virtual_net_visitor(
+                                    crate::visitor::VirtualNetVisitorConfig {
+                                        server_addr: sa,
+                                        server_port: sp,
+                                        protocol: pt,
+                                        server_name,
+                                        server_user,
+                                        secret_key,
+                                        use_encryption: use_enc,
+                                        use_compression: use_comp,
+                                        name,
+                                        tls_enable,
+                                        tls_server_name,
+                                        tls_ca_file,
+                                        user,
+                                        run_id: rid,
+                                        destination_cidr: adv.subnet,
+                                        controller,
+                                        shutdown,
+                                    },
+                                )
+                                .await;
+                            });
+                            visitor_handles.push(handle);
+                        }
+                    }
                     continue;
                 }
                 let sa = cfg_local.server_addr.clone();
@@ -1267,7 +1313,8 @@ impl Service {
                                 info!(subnet = %adv.subnet, proxy_name = %adv.proxy_name, "peer vnet route advertisement received");
                                 // Update the shared route table (TX direction lookup).
                                 {
-                                    let mut routes = self.vnet_routes.write().await;
+                                    let route_table = self.vnet_controller.route_table();
+                                    let mut routes = route_table.write().await;
                                     if let Err(e) = routes.insert(&adv.proxy_name, &adv.subnet) {
                                         warn!(%e, "failed to add vnet route");
                                     }
@@ -1286,10 +1333,21 @@ impl Service {
                             Ok(FrpMessage::VnetPacket(vpkt)) => {
                                 match data_encoding::BASE64.decode(vpkt.data.as_bytes()) {
                                     Ok(packet) => {
-                                        let txs = self.vnet_tun_tx.lock().await;
-                                        if let Some(tx) = txs.get(&vpkt.proxy_name) {
-                                            if tx.try_send(packet).is_err() {
-                                                warn!(proxy_name = %vpkt.proxy_name, "vnet TUN channel closed");
+                                        // Virtual_net visitors first: deliver into
+                                        // the visitor's STCP/XTCP tunnel. TUN-backed
+                                        // vnet proxies fall back to their TUN channel.
+                                        let delivered = self
+                                            .vnet_controller
+                                            .deliver_visitor_packet(&vpkt.proxy_name, packet.clone())
+                                            .await;
+                                        if !delivered {
+                                            let txs = self.vnet_tun_tx.lock().await;
+                                            if let Some(tx) = txs.get(&vpkt.proxy_name) {
+                                                if tx.try_send(packet).is_err() {
+                                                    warn!(proxy_name = %vpkt.proxy_name, "vnet TUN channel closed");
+                                                }
+                                            } else {
+                                                debug!(proxy_name = %vpkt.proxy_name, "vnet packet dropped: no visitor or TUN target");
                                             }
                                         }
                                     }
@@ -1301,8 +1359,9 @@ impl Service {
                             #[cfg(feature = "vnet")]
                             Ok(FrpMessage::VnetRouteRemove(adv)) => {
                                 info!(proxy_name = %adv.proxy_name, "peer vnet route removed");
-                                let mut routes = self.vnet_routes.write().await;
-                                routes.remove(&adv.proxy_name);
+                                self.vnet_controller
+                                    .unregister_visitor_route(&adv.proxy_name)
+                                    .await;
                             }
                             Ok(_) => {
                                 // Other messages are ignored
@@ -1584,6 +1643,7 @@ impl Service {
                         continue;
                     }
                     if let Some(adv) = virtual_net_visitor_route_adv(v) {
+                        self.vnet_controller.unregister_visitor_route(&v.name).await;
                         let rem = msg::VnetRouteRemove {
                             proxy_name: adv.proxy_name,
                             virtual_net: adv.virtual_net,

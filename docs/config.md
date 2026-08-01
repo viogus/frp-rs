@@ -674,7 +674,9 @@ destinationIP = "100.86.0.1"
 
 The `virtual_net` visitor plugin requires `[feature] VirtualNet = true`.
 It registers a host route for `destinationIP` through the vnet routing path;
-the local TCP listener is not started for this visitor.
+the local TCP listener is not started for this visitor. Instead, a no-bind
+STCP/XTCP tunnel is opened to the server and inbound `VnetPacket`s for the
+visitor are written into that tunnel.
 
 ---
 

@@ -487,7 +487,8 @@ destinationIP = "100.86.0.1"
 ```
 
 Requires `[feature] VirtualNet = true` and the `vnet` build feature (on by
-default). frp-rs currently parses, validates, and advertises/removes the
-`destinationIP` route over the control connection. The in-process controller
-connection that forwards raw IP packets to the STCP/XTCP visitor tunnel is not
-wired yet.
+default). frp-rs parses, validates, advertises/removes the `destinationIP`
+route over the control connection, and forwards inbound `VnetPacket`s into
+the STCP/XTCP visitor tunnel. The visitor tunnel is a no-bind tunnel: raw IP
+packets are written into it, while return traffic to the local TUN uses the
+existing control-connection `VnetPacket` path to TUN-backed vnet proxies.
