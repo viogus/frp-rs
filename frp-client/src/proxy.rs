@@ -139,14 +139,52 @@ pub fn create_new_proxy_msg(p: &frp_core::config::ProxyConfig, local_addr: &str,
 /// Connects to a local service and returns the TCP stream.
 ///
 /// `addr` may be a hostname like `"localhost:8080"` or an IP literal.
+/// Resolves hostnames via the system resolver.
 pub async fn connect_local(addr: &str) -> Result<TcpStream, frp_core::Error> {
+    connect_local_with_dns(addr, None).await
+}
+
+/// Connects to a local service, resolving hostnames via `dns_server` when
+/// set (Go frp compat: `dnsServer` applies to local backend dials too).
+pub async fn connect_local_with_dns(
+    addr: &str,
+    dns_server: Option<&str>,
+) -> Result<TcpStream, frp_core::Error> {
     connect_local_with_resolver(
         addr,
         std::time::Duration::from_secs(5),
         |query| async move {
-            tokio::net::lookup_host(query)
-                .await
-                .map(|addresses| addresses.collect())
+            match dns_server.filter(|d| !d.is_empty()) {
+                Some(dns) => {
+                    // Split host:port, resolve host via the custom DNS server.
+                    let (host, port) = match query.rsplit_once(':') {
+                        Some((h, p)) => (h, p),
+                        None => (query.as_str(), ""),
+                    };
+                    if host.parse::<std::net::IpAddr>().is_ok() {
+                        tokio::net::lookup_host(query)
+                            .await
+                            .map(|addresses| addresses.collect())
+                    } else {
+                        match frp_core::transport::resolve_host_with_dns(host, dns).await {
+                            Ok(ip) => {
+                                let addr = if port.is_empty() {
+                                    ip
+                                } else {
+                                    format!("{ip}:{port}")
+                                };
+                                tokio::net::lookup_host(&addr)
+                                    .await
+                                    .map(|addresses| addresses.collect())
+                            }
+                            Err(e) => Err(std::io::Error::other(e.to_string())),
+                        }
+                    }
+                }
+                None => tokio::net::lookup_host(query)
+                    .await
+                    .map(|addresses| addresses.collect()),
+            }
         },
     )
     .await

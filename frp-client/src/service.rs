@@ -156,6 +156,9 @@ pub struct Service {
     visitor_tx: mpsc::Sender<VisitorRequest>,
     /// Receiver side of visitor channel — consumed by run().
     visitor_rx: std::sync::Mutex<Option<mpsc::Receiver<VisitorRequest>>>,
+    /// Set when a reload changed visitors; the session loop restarts so the
+    /// new visitor set is fully rebuilt (visitors are session-scoped).
+    visitor_reload_needed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Per-proxy health check cancel flags. Keyed by proxy name.
     /// Set to true on CloseProxy/CloseProxyResp; entry removed in try_reload.
     health_cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
@@ -520,6 +523,7 @@ impl Service {
             xtcp_rx: std::sync::Mutex::new(Some(xtcp_rx)),
             visitor_tx,
             visitor_rx: std::sync::Mutex::new(Some(visitor_rx)),
+            visitor_reload_needed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             health_cancels: Arc::new(Mutex::new(HashMap::new())),
             health_proxy_configs,
             health_tx,
@@ -1022,6 +1026,7 @@ impl Service {
                         tls_ca_file: opt_if_empty!(cfg_local.tls_ca_file),
                         tls_cert_file: opt_if_empty!(cfg_local.tls_cert_file),
                         tls_key_file: opt_if_empty!(cfg_local.tls_key_file),
+                        dns_server: opt_if_empty!(cfg_local.dns_server),
                         yamux: yamux.clone(),
                         quic_conn: quic_arg,
                         v2,
@@ -1563,6 +1568,14 @@ impl Service {
                             Some(path) => self.try_reload(path, req.strict, &writer).await,
                             None => Err("no config file path stored".into()),
                         };
+                        if result.is_ok()
+                            && self.visitor_reload_needed.swap(false, Ordering::AcqRel)
+                        {
+                            // Visitor changes require a clean session restart.
+                            tracing::info!("Visitor config changed — restarting session");
+                            let _ = req.reply.send(Ok("reload success: visitor changes applied on session restart".into()));
+                            break;
+                        }
                         let _ = req.reply.send(result);
                     }
 
@@ -2449,10 +2462,11 @@ impl Service {
         new_cfg.visitors = filter_active_visitors(&new_cfg, &new_cfg.visitors);
 
         let user = new_cfg.user.clone();
+        let old_visitors = self.cfg.read().await.visitors.clone();
         #[cfg(feature = "vnet")]
-        let mut delta = crate::reload::do_reload(&self.proxy_info_map, new_cfg, &user).await?;
+        let mut delta = crate::reload::do_reload(&self.proxy_info_map, &old_visitors, new_cfg, &user).await?;
         #[cfg(not(feature = "vnet"))]
-        let delta = crate::reload::do_reload(&self.proxy_info_map, new_cfg, &user).await?;
+        let delta = crate::reload::do_reload(&self.proxy_info_map, &old_visitors, new_cfg, &user).await?;
 
         // reload::config_snapshot omits vnet-only fields; extend the delta so
         // a subnet/IP/mask change still rebuilds the TUN during reload.
@@ -2475,12 +2489,25 @@ impl Service {
             }
         }
 
-        if delta.removed.is_empty() && delta.added.is_empty() && delta.changed.is_empty() {
+        if delta.removed.is_empty()
+            && delta.added.is_empty()
+            && delta.changed.is_empty()
+            && delta.visitor_removed.is_empty()
+            && delta.visitor_added.is_empty()
+            && delta.visitor_changed.is_empty()
+        {
             let merged = delta.new_config;
             *self.cfg.write().await = merged;
             *self.proxies.write().await = self.cfg.read().await.proxies.clone();
             return Ok(delta.summary);
         }
+
+        // Visitor listeners are session-scoped; a visitor change requires a
+        // clean session restart so the new visitor set is fully rebuilt
+        // (Go frp's visitor_manager stop/start equivalent).
+        let visitor_changed = !delta.visitor_removed.is_empty()
+            || !delta.visitor_added.is_empty()
+            || !delta.visitor_changed.is_empty();
 
         let v2 = delta.new_config.v2;
 
@@ -2753,6 +2780,12 @@ impl Service {
         // session, reconnect, and admin status endpoint use the merged config.
         *self.cfg.write().await = delta.new_config;
         *self.proxies.write().await = self.cfg.read().await.proxies.clone();
+
+        if visitor_changed {
+            // Signal the session loop to restart so visitors are rebuilt.
+            self.visitor_reload_needed.store(true, Ordering::Release);
+            tracing::info!("Reload changed visitors — requesting session restart");
+        }
 
         let summary = changes.join("; ");
         tracing::info!(summary = %summary, "Config reload summary: {}", summary);

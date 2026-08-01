@@ -30,6 +30,10 @@ struct ProxyStatusEntry {
     remote_addr: String,
     plugin: String,
     err: String,
+    /// Go frp compat: "store" when the proxy comes from the file-backed
+    /// store (client/http/model status source field).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
 }
 
 #[derive(Clone)]
@@ -118,6 +122,10 @@ async fn handle_status(State(state): State<AdminState>) -> Json<serde_json::Valu
         } else {
             "online"
         };
+        let source = match &state.store {
+            Some(store) if store.get_proxy(name).is_some() => Some("store".to_string()),
+            _ => None,
+        };
         let entry = ProxyStatusEntry {
             name: name.clone(),
             proxy_type: info.proxy_type.clone(),
@@ -126,6 +134,7 @@ async fn handle_status(State(state): State<AdminState>) -> Json<serde_json::Valu
             remote_addr: info.remote_addr.clone(),
             plugin: info.plugin.clone(),
             err: info.err.clone(),
+            source,
         };
         by_type
             .entry(info.proxy_type.clone())
@@ -382,6 +391,63 @@ async fn handle_get_config(
     })
 }
 
+/// Go frp compat: GET /api/proxy/{name}/config — returns the proxy config
+/// from the file-backed store when present, else from the config file.
+async fn handle_get_proxy_config(
+    State(state): State<AdminState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "proxy name is required".into()));
+    }
+    if let Some(store) = &state.store {
+        if let Some(proxy) = store.get_proxy(&name) {
+            return Ok(Json(proxy_to_json(&proxy)?));
+        }
+    }
+    let cfg = config_from_file(&state)?;
+    if let Some(p) = cfg.proxies.iter().find(|p| p.name == name) {
+        return Ok(Json(proxy_to_json(p)?));
+    }
+    Err((StatusCode::NOT_FOUND, format!("proxy {name:?} not found")))
+}
+
+/// Go frp compat: GET /api/visitor/{name}/config.
+async fn handle_get_visitor_config(
+    State(state): State<AdminState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "visitor name is required".into()));
+    }
+    if let Some(store) = &state.store {
+        if let Some(visitor) = store.get_visitor(&name) {
+            return Ok(Json(visitor_to_json(&visitor)?));
+        }
+    }
+    let cfg = config_from_file(&state)?;
+    if let Some(v) = cfg.visitors.iter().find(|v| v.name == name) {
+        return Ok(Json(visitor_to_json(v)?));
+    }
+    Err((StatusCode::NOT_FOUND, format!("visitor {name:?} not found")))
+}
+
+/// Load the client config from the stored config path.
+fn config_from_file(
+    state: &AdminState,
+) -> Result<frp_core::config::ClientConfig, (StatusCode, String)> {
+    let path = state
+        .config_path
+        .as_ref()
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "no config file path stored".into()))?;
+    frp_core::config::load_client_config(path, false).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to load config: {e}"),
+        )
+    })
+}
+
 async fn handle_put_config(
     State(state): State<AdminState>,
     headers: axum::http::HeaderMap,
@@ -498,8 +564,20 @@ pub async fn run_admin_server(
     let app = Router::new()
         .route("/api/status", get(handle_status))
         .route("/api/metrics", get(handle_metrics))
-        .route("/api/reload", axum::routing::post(handle_reload))
+        // Go frp compat: GET /api/reload (Go uses GET; keep POST too).
+        .route(
+            "/api/reload",
+            get(handle_reload).post(handle_reload),
+        )
         .route("/api/stop", axum::routing::post(handle_stop))
+        .route(
+            "/api/proxy/{name}/config",
+            get(handle_get_proxy_config),
+        )
+        .route(
+            "/api/visitor/{name}/config",
+            get(handle_get_visitor_config),
+        )
         .route(
             "/api/config",
             get(handle_get_config)
@@ -614,6 +692,7 @@ const SENSITIVE_KEYS: &[&str] = &[
     "oidc_client_secret",
     "user",
     "password",
+    "secret_key",
 ];
 
 /// Recursively redact sensitive values in TOML, returning a copy with

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing;
 
-use frp_core::config::{ClientConfig, ProxyConfig};
+use frp_core::config::{ClientConfig, ProxyConfig, VisitorConfig};
 
 use crate::proxy_runtime::ProxyRuntimeInfo;
 
@@ -79,6 +79,11 @@ pub(crate) struct ReloadDelta {
     pub removed: Vec<String>,
     pub added: Vec<String>,
     pub changed: Vec<String>,
+    /// Visitors removed/added/changed by this reload. Visitor listeners are
+    /// session-scoped, so a non-empty set forces a clean session restart.
+    pub visitor_removed: Vec<String>,
+    pub visitor_added: Vec<String>,
+    pub visitor_changed: Vec<String>,
     pub new_config: ClientConfig,
 }
 
@@ -89,6 +94,7 @@ pub(crate) struct ReloadDelta {
 /// state updates so it can use the correct plugin bound addresses.
 pub(crate) async fn do_reload(
     proxy_info_map: &Arc<RwLock<HashMap<String, ProxyRuntimeInfo>>>,
+    old_visitors: &[VisitorConfig],
     new_cfg: ClientConfig,
     user: &str,
 ) -> Result<ReloadDelta, String> {
@@ -127,31 +133,62 @@ pub(crate) async fn do_reload(
         }
     }
 
-    if removed.is_empty() && added.is_empty() && changed.is_empty() {
+    // Diff visitors (Go frp compat: reload also applies visitor changes).
+    let old_visitor_names: HashSet<String> =
+        old_visitors.iter().map(|v| v.name.clone()).collect();
+    let new_visitor_names: HashSet<String> =
+        new_cfg.visitors.iter().map(|v| v.name.clone()).collect();
+    let visitor_removed: Vec<String> =
+        old_visitor_names.difference(&new_visitor_names).cloned().collect();
+    let visitor_added: Vec<String> =
+        new_visitor_names.difference(&old_visitor_names).cloned().collect();
+
+    if removed.is_empty() && added.is_empty() && changed.is_empty()
+        && visitor_removed.is_empty() && visitor_added.is_empty()
+    {
         return Ok(ReloadDelta {
             summary: "reload success: no changes detected".into(),
             removed,
             added,
             changed,
+            visitor_removed,
+            visitor_added,
+            visitor_changed: Vec::new(),
             new_config: new_cfg,
         });
     }
 
+    // Detect changed visitors (same name, different config).
+    let visitor_changed: Vec<String> = new_cfg
+        .visitors
+        .iter()
+        .filter(|v| old_visitors.iter().any(|old| old.name == v.name && *old != **v))
+        .map(|v| v.name.clone())
+        .collect();
+
     let summary = format!(
-        "reload: +{} added, ~{} changed, -{} removed",
+        "reload: +{} added, ~{} changed, -{} removed, visitors +{}/-{}",
         added.len(),
         changed.len(),
-        removed.len()
+        removed.len(),
+        visitor_added.len(),
+        visitor_removed.len()
     );
     tracing::info!(added = %added.len(), changed = %changed.len(), removed = %removed.len(),
-        "Config diff: +{} added, ~{} changed, -{} removed",
-        added.len(), changed.len(), removed.len());
+        visitor_added = %visitor_added.len(), visitor_removed = %visitor_removed.len(),
+        "Config diff: +{} added, ~{} changed, -{} removed, visitors +{}/-{}",
+        added.len(), changed.len(), removed.len(),
+        visitor_added.len(), visitor_removed.len());
 
     Ok(ReloadDelta {
         summary,
         removed,
         added,
         changed,
+        visitor_removed,
+        visitor_added,
+        visitor_changed,
         new_config: new_cfg,
     })
 }
+

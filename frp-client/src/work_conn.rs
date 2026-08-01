@@ -236,6 +236,8 @@ pub(crate) struct WorkConnConfig {
     pub tls_ca_file: Option<String>,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
+    /// Custom DNS server for resolving server_addr (and local backends).
+    pub dns_server: Option<String>,
     pub yamux: Option<Arc<YamuxSession>>,
     pub quic_conn: QuicConnOpt,
     pub v2: bool,
@@ -767,6 +769,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             tls_ca_file,
             tls_cert_file,
             tls_key_file,
+            dns_server,
             yamux,
             quic_conn: _quic_conn,
             v2,
@@ -1192,7 +1195,9 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                         return;
                     }
                     // TCP/HTTP/STCP: connect to local TCP service and bridge
-                    match proxy::connect_local(&info.local_addr).await {
+                    match proxy::connect_local_with_dns(&info.local_addr, dns_server.as_deref())
+                        .await
+                    {
                         Ok(mut local) => {
                             // Write PROXY protocol header if configured
                             if !info.proxy_protocol_version.is_empty() {
@@ -1350,6 +1355,7 @@ mod tests {
             tls_ca_file: None,
             tls_cert_file: None,
             tls_key_file: None,
+            dns_server: None,
             yamux: None,
             quic_conn,
             v2: false,

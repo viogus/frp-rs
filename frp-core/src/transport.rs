@@ -1755,7 +1755,7 @@ impl Default for DialOptions {
 /// Sends a standard DNS A-record query over UDP. Handles name compression
 /// pointers in the response. IPv6 (AAAA) is not supported — the custom DNS
 /// server option is typically used with IPv4-only internal resolvers.
-async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<String, crate::Error> {
+pub async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<String, crate::Error> {
     use std::net::SocketAddr;
     use std::str::FromStr;
     use tokio::net::UdpSocket;
@@ -1975,7 +1975,7 @@ async fn connect_via_proxy(
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::time::{timeout, Duration};
 
-    let (scheme, proxy_host, proxy_port) = parse_proxy_url(proxy_url)?;
+    let (scheme, auth, proxy_host, proxy_port) = parse_proxy_url(proxy_url)?;
     let proxy_addr = format!("{proxy_host}:{proxy_port}");
     let proxy_peer: std::net::SocketAddr = proxy_addr.parse().map_err(|e| {
         crate::Error::Transport(format!("invalid proxy address '{proxy_addr}': {e}").into())
@@ -1991,9 +1991,17 @@ async fn connect_via_proxy(
 
     match scheme {
         "http" | "https" => {
-            // HTTP CONNECT tunnel
+            // HTTP CONNECT tunnel. Go golib: proxy auth via Basic
+            // Authorization on the CONNECT request.
+            let auth_header = match auth {
+                Some((user, pass)) => format!(
+                    "Proxy-Authorization: Basic {}\r\n",
+                    base64_encode(format!("{user}:{pass}").as_bytes())
+                ),
+                None => String::new(),
+            };
             let connect_req = format!(
-                "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n\r\n"
+                "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n{auth_header}\r\n"
             );
             timeout(
                 Duration::from_secs(dial_timeout_secs),
@@ -2069,12 +2077,21 @@ async fn connect_via_proxy(
                 }
             }
         }
-        "socks5" => {
-            // SOCKS5 handshake
-            // 1. Auth negotiation: send [0x05, 0x01, 0x00] (SOCKS5, 1 method, no auth)
+        "socks5" | "socks5h" => {
+            // SOCKS5 handshake. Go golib semantics:
+            // - "socks5": target hostname resolved locally (must be an IP
+            //   by the time it reaches us); "socks5h": remote DNS — the
+            //   hostname is sent to the proxy via ATYP 0x03.
+            // - userinfo → RFC 1929 username/password auth (method 0x02).
+            let use_auth = auth.is_some();
+            let methods: &[u8] = if use_auth {
+                &[0x05, 0x02, 0x00, 0x02] // no-auth + user/pass
+            } else {
+                &[0x05, 0x01, 0x00] // no-auth only
+            };
             timeout(
                 Duration::from_secs(dial_timeout_secs),
-                stream.write_all(&[0x05, 0x01, 0x00]),
+                stream.write_all(methods),
             )
             .await
             .map_err(|_| crate::Error::Transport("SOCKS5 auth write timeout".into()))?
@@ -2090,29 +2107,81 @@ async fn connect_via_proxy(
             .map_err(|_| crate::Error::Transport("SOCKS5 auth read timeout".into()))?
             .map_err(|e| crate::Error::Transport(format!("SOCKS5 auth read: {e}").into()))?;
 
-            if auth_resp[0] != 0x05 || auth_resp[1] != 0x00 {
+            if auth_resp[0] != 0x05 {
                 return Err(crate::Error::Transport(
                     format!("SOCKS5 auth rejected: {:02x?}", auth_resp).into(),
                 ));
             }
 
-            // 3. Resolve target address and build connect request
-            let target_ip: std::net::IpAddr = target_host.parse().map_err(|_| {
-                crate::Error::Transport(
-                    format!("SOCKS5: cannot resolve hostname '{target_host}' — use IP").into(),
+            if auth_resp[1] == 0x02 {
+                // RFC 1929 username/password sub-negotiation.
+                let (user, pass) = auth.expect("method 0x02 requires userinfo");
+                let mut auth_msg = Vec::with_capacity(3 + user.len() + pass.len());
+                auth_msg.push(0x01);
+                auth_msg.push(user.len() as u8);
+                auth_msg.extend_from_slice(user.as_bytes());
+                auth_msg.push(pass.len() as u8);
+                auth_msg.extend_from_slice(pass.as_bytes());
+                timeout(
+                    Duration::from_secs(dial_timeout_secs),
+                    stream.write_all(&auth_msg),
                 )
-            })?;
-
-            let mut connect_req = Vec::with_capacity(10);
-            connect_req.extend_from_slice(&[0x05, 0x01, 0x00]); // SOCKS5, CONNECT, reserved
-            match target_ip {
-                std::net::IpAddr::V4(ip) => {
-                    connect_req.push(0x01); // IPv4
-                    connect_req.extend_from_slice(&ip.octets());
+                .await
+                .map_err(|_| crate::Error::Transport("SOCKS5 user/pass write timeout".into()))?
+                .map_err(|e| {
+                    crate::Error::Transport(format!("SOCKS5 user/pass write: {e}").into())
+                })?;
+                let mut auth_status = [0u8; 2];
+                timeout(
+                    Duration::from_secs(dial_timeout_secs),
+                    stream.read_exact(&mut auth_status),
+                )
+                .await
+                .map_err(|_| crate::Error::Transport("SOCKS5 user/pass read timeout".into()))?
+                .map_err(|e| {
+                    crate::Error::Transport(format!("SOCKS5 user/pass read: {e}").into())
+                })?;
+                if auth_status[0] != 0x01 || auth_status[1] != 0x00 {
+                    return Err(crate::Error::Transport(
+                        format!("SOCKS5 user/pass auth failed: {:02x?}", auth_status).into(),
+                    ));
                 }
-                std::net::IpAddr::V6(ip) => {
-                    connect_req.push(0x04); // IPv6
-                    connect_req.extend_from_slice(&ip.octets());
+            } else if auth_resp[1] != 0x00 {
+                return Err(crate::Error::Transport(
+                    format!("SOCKS5 auth rejected: method={}", auth_resp[1]).into(),
+                ));
+            }
+
+            // 3. Build the CONNECT request. socks5h sends the hostname as a
+            // domain (ATYP 0x03) so the proxy performs remote DNS; plain
+            // socks5 requires an IP (resolved locally).
+            let mut connect_req = Vec::with_capacity(10 + target_host.len());
+            connect_req.extend_from_slice(&[0x05, 0x01, 0x00]); // SOCKS5, CONNECT, reserved
+            if scheme == "socks5h" {
+                let domain = target_host.as_bytes();
+                if domain.is_empty() || domain.len() > 255 {
+                    return Err(crate::Error::Transport(
+                        "SOCKS5h: invalid domain length".into(),
+                    ));
+                }
+                connect_req.push(0x03); // domain
+                connect_req.push(domain.len() as u8);
+                connect_req.extend_from_slice(domain);
+            } else {
+                let target_ip: std::net::IpAddr = target_host.parse().map_err(|_| {
+                    crate::Error::Transport(
+                        format!("SOCKS5: cannot resolve hostname '{target_host}' — use socks5h or an IP").into(),
+                    )
+                })?;
+                match target_ip {
+                    std::net::IpAddr::V4(ip) => {
+                        connect_req.push(0x01); // IPv4
+                        connect_req.extend_from_slice(&ip.octets());
+                    }
+                    std::net::IpAddr::V6(ip) => {
+                        connect_req.push(0x04); // IPv6
+                        connect_req.extend_from_slice(&ip.octets());
+                    }
                 }
             }
             connect_req.extend_from_slice(&target_port.to_be_bytes());
@@ -2165,7 +2234,7 @@ async fn connect_via_proxy(
         }
         other => {
             return Err(crate::Error::Transport(
-                format!("unsupported proxy scheme: '{other}'. Supported: http, socks5").into(),
+                format!("unsupported proxy scheme: '{other}'. Supported: http, socks5, socks5h").into(),
             ));
         }
     }
@@ -2176,13 +2245,30 @@ async fn connect_via_proxy(
     Ok(stream)
 }
 
-/// Parse a proxy URL into (scheme, host, port).
-fn parse_proxy_url(url: &str) -> Result<(&str, &str, u16), crate::Error> {
+/// Parse a proxy URL into (scheme, auth, host, port).
+///
+/// Supports `scheme://host:port` and `scheme://user:pass@host:port`
+/// (Go golib `ParseProxyURL` semantics). `auth` is `Some((user, pass))`
+/// when userinfo is present.
+#[allow(clippy::type_complexity)]
+fn parse_proxy_url(url: &str) -> Result<(&str, Option<(&str, &str)>, &str, u16), crate::Error> {
     let (scheme, rest) = url.split_once("://").ok_or_else(|| {
         crate::Error::Transport(format!("invalid proxy URL '{url}': missing scheme").into())
     })?;
 
-    let (host, port_str) = if let Some((h, p)) = rest.rsplit_once(':') {
+    // Optional userinfo: "user:pass@host:port" (golib ParseProxyURL).
+    let (auth, hostport) = match rest.rsplit_once('@') {
+        Some((userinfo, hostport)) if !userinfo.is_empty() && !hostport.is_empty() => {
+            let (user, pass) = match userinfo.split_once(':') {
+                Some((u, p)) => (u, p),
+                None => (userinfo, ""),
+            };
+            (Some((user, pass)), hostport)
+        }
+        _ => (None, rest),
+    };
+
+    let (host, port_str) = if let Some((h, p)) = hostport.rsplit_once(':') {
         (h, p)
     } else {
         return Err(crate::Error::Transport(
@@ -2200,7 +2286,7 @@ fn parse_proxy_url(url: &str) -> Result<(&str, &str, u16), crate::Error> {
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
 
-    Ok((scheme, host, port))
+    Ok((scheme, auth, host, port))
 }
 
 /// Connect to the server with the given options.
@@ -2318,9 +2404,16 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             // Empty string = direct connection
             connect_direct(&addr, peer, opts).await?
         } else {
+            // socks5h: the proxy resolves the hostname (remote DNS) — pass the
+            // original server_addr instead of the locally resolved IP.
+            let proxy_target = if proxy_url.starts_with("socks5h://") {
+                &opts.server_addr
+            } else {
+                &target_ip
+            };
             connect_via_proxy(
                 proxy_url,
-                &target_ip,
+                proxy_target,
                 opts.server_port,
                 opts.dial_timeout_secs,
             )

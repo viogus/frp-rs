@@ -1423,7 +1423,7 @@ pub struct ProxyConfig {
 
 /// STCP/XTCP visitor configuration — used by frpc to expose a local port
 /// that tunnels traffic to a remote STCP/XTCP proxy through the frps server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VisitorConfig {
     /// Name for this visitor (used in logs).
     #[serde(default)]
@@ -1525,7 +1525,7 @@ impl Default for VisitorConfig {
 /// Only `type = "virtual_net"` (with `destinationIP`) is supported by frp-rs
 /// today. The remaining fields are accepted for the STCP/XTCP `visitor_plugin`
 /// extension used by older frp-rs configs.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct VisitorPluginConfig {
     #[serde(rename = "type", default)]
     pub plugin_type: String,
