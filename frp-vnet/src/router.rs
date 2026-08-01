@@ -142,9 +142,32 @@ impl RouteTable {
     }
 }
 
+/// Format an IP address as a host-route CIDR: /32 for IPv4, /128 for IPv6.
+///
+/// Used by the virtual_net visitor plugin to advertise `destinationIP` as a
+/// route through the frp vnet controller (Go frp v0.70.1 behavior).
+pub fn host_route_cidr(ip: &std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => format!("{v4}/32"),
+        std::net::IpAddr::V6(v6) => format!("{v6}/128"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_host_route_cidr() {
+        assert_eq!(
+            host_route_cidr(&std::net::IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1))),
+            "100.86.0.1/32"
+        );
+        assert_eq!(
+            host_route_cidr(&"2001:db8::1".parse().unwrap()),
+            "2001:db8::1/128"
+        );
+    }
 
     #[test]
     fn test_cidr_parse() {

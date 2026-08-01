@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::feature_gate::VIRTUAL_NET;
+
 // ---------------------------------------------------------------
 // Server Configuration
 // ---------------------------------------------------------------
@@ -1023,6 +1025,15 @@ impl Default for AuthClientConfig {
     }
 }
 
+/// Client virtual network controller configuration ([virtualNet] section in frpc.toml).
+/// Go frp v0.70.1 compat: VirtualNetConfig.address.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VirtualNetConfig {
+    /// TUN device address configured on the client controller.
+    #[serde(default, alias = "address")]
+    pub address: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     pub server_addr: String,
@@ -1130,6 +1141,10 @@ pub struct ClientConfig {
     pub visitors: Vec<VisitorConfig>,
     #[serde(default, alias = "webServer")]
     pub web_server: WebServerConfig,
+    /// Client virtual network controller configuration.
+    /// Go frp v0.70.1 compat: [virtualNet] section.
+    #[serde(default, alias = "virtualNet")]
+    pub virtual_net: VirtualNetConfig,
     /// Experimental feature gates. Go frp compat: [feature] section.
     #[serde(default, alias = "featureGates")]
     pub feature: FeatureConfig,
@@ -1181,6 +1196,7 @@ impl Default for ClientConfig {
             proxies: vec![],
             visitors: vec![],
             web_server: WebServerConfig::default(),
+            virtual_net: VirtualNetConfig::default(),
             feature: FeatureConfig::default(),
             udp_packet_size: default_udp_packet_size_i64(),
             observability: ObservabilityConfig::default(),
@@ -1428,6 +1444,10 @@ pub struct VisitorConfig {
     /// and negative values mean "don't bind".
     #[serde(default, alias = "bindPort")]
     pub bind_port: i32,
+    /// Optional visitor plugin ([visitors.plugin] section).
+    /// Go frp v0.70.1 compat: Plugin.
+    #[serde(default)]
+    pub plugin: Option<VisitorPluginConfig>,
     /// Fallback timeout in milliseconds before switching from XTCP to STCP.
     /// Go frp compat: fallbackTimeoutMs. Default: 1000 (1 second, Go frp compat)
     #[serde(default = "default_fallback_timeout_ms", alias = "fallbackTimeoutMs")]
@@ -1475,6 +1495,7 @@ impl Default for VisitorConfig {
             server_user: String::new(),
             bind_addr: default_visitor_bind_addr(),
             bind_port: 0,
+            plugin: None,
             fallback_timeout_ms: default_fallback_timeout_ms(),
             fallback_to: String::new(),
             disable_assisted_addrs: false,
@@ -1487,6 +1508,30 @@ impl Default for VisitorConfig {
             enabled: true,
         }
     }
+}
+
+/// Visitor plugin configuration ([visitors.plugin] section).
+/// Go frp v0.70.1 compat: TypedVisitorPluginOptions.
+///
+/// Only `type = "virtual_net"` (with `destinationIP`) is supported by frp-rs
+/// today. The remaining fields are accepted for the STCP/XTCP `visitor_plugin`
+/// extension used by older frp-rs configs.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VisitorPluginConfig {
+    #[serde(rename = "type", default)]
+    pub plugin_type: String,
+    #[serde(default, alias = "serverName")]
+    pub server_name: String,
+    #[serde(default, alias = "sk")]
+    pub secret_key: String,
+    #[serde(default, alias = "bindAddr")]
+    pub bind_addr: String,
+    #[serde(default, alias = "bindPort")]
+    pub bind_port: i32,
+    /// Destination IP advertised as a host route by the virtual_net visitor plugin.
+    /// Go frp v0.70.1 compat: destinationIP.
+    #[serde(default, alias = "destinationIP")]
+    pub destination_ip: String,
 }
 
 fn default_max_retries_an_hour() -> i32 {
@@ -1710,7 +1755,37 @@ fn validate_client_config(cfg: &ClientConfig) -> Result<(), String> {
         };
         validate_auth_token_source(token, &auth.token_source)?;
     }
+    if (!cfg.virtual_net.address.is_empty() || cfg.visitors.iter().any(is_virtual_net_visitor))
+        && !cfg.feature.gates.get(VIRTUAL_NET).copied().unwrap_or(false)
+    {
+        return Err(format!(
+            "VirtualNet feature is not enabled; enable it by setting [featureGates] {VIRTUAL_NET} = true"
+        ));
+    }
+    for v in cfg.visitors.iter().filter(|v| is_virtual_net_visitor(v)) {
+        let Some(plugin) = &v.plugin else {
+            continue;
+        };
+        if plugin.destination_ip.is_empty() {
+            return Err(format!(
+                "visitor '{}': virtual_net plugin requires destinationIP",
+                v.name
+            ));
+        }
+        if plugin.destination_ip.parse::<std::net::IpAddr>().is_err() {
+            return Err(format!(
+                "visitor '{}': invalid destination IP address [{}]",
+                v.name, plugin.destination_ip
+            ));
+        }
+    }
     Ok(())
+}
+
+fn is_virtual_net_visitor(v: &VisitorConfig) -> bool {
+    v.plugin
+        .as_ref()
+        .is_some_and(|p| p.plugin_type == "virtual_net")
 }
 
 /// Reject duplicate proxy or visitor names. Go frp v0.70.0 compat:
@@ -2483,6 +2558,22 @@ fn normalize_visitors(table: &mut toml::Table) {
                 visitor_table.entry(flat_key.to_string()).or_insert(v);
             }
         }
+
+        // Normalize Go-style [visitors.plugin] tables into the nested plugin
+        // shape used by frp-rs. destinationIP is converted to snake_case; the
+        // remaining keys (type, serverName, bindPort, ...) are handled by
+        // serde aliases on VisitorPluginConfig.
+        if let Some(Value::Table(plugin)) = visitor_table.remove("plugin") {
+            let mut plugin_table = toml::Table::new();
+            for (k, v) in plugin {
+                let flat_key = match k.as_str() {
+                    "destinationIP" => "destination_ip",
+                    other => other,
+                };
+                plugin_table.entry(flat_key.to_string()).or_insert(v);
+            }
+            visitor_table.insert("plugin".to_string(), Value::Table(plugin_table));
+        }
     }
 }
 
@@ -2997,6 +3088,8 @@ fn known_client_keys() -> std::collections::HashSet<&'static str> {
         "proxies",
         "visitors",
         "web_server",
+        "virtual_net",
+        "virtualNet",
         "feature",
         "common",
         "protocol",
@@ -3473,6 +3566,124 @@ disableAssistedAddrs = true
         assert!(visitor.use_encryption);
         assert!(visitor.use_compression);
         assert!(visitor.disable_assisted_addrs);
+    }
+
+    #[test]
+    fn test_go_virtual_net_client_config() {
+        let toml_str = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[featureGates]
+VirtualNet = true
+
+[virtualNet]
+address = "10.0.0.1"
+
+[[visitors]]
+name = "vnet-visitor"
+type = "stcp"
+serverName = "vnet-server"
+secretKey = "secret"
+bindPort = -1
+
+[visitors.plugin]
+type = "virtual_net"
+destinationIP = "100.86.0.1"
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+        assert_eq!(cfg.virtual_net.address, "10.0.0.1");
+        assert_eq!(cfg.feature.gates.get(VIRTUAL_NET), Some(&true));
+
+        let visitor = &cfg.visitors[0];
+        assert_eq!(visitor.bind_port, -1);
+        let plugin = visitor.plugin.as_ref().expect("visitor plugin");
+        assert_eq!(plugin.plugin_type, "virtual_net");
+        assert_eq!(plugin.destination_ip, "100.86.0.1");
+    }
+
+    #[test]
+    fn test_virtual_net_feature_gate_required() {
+        // [virtualNet] without the gate enabled is rejected.
+        let err = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+
+[virtualNet]
+address = "10.0.0.1"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("VirtualNet feature is not enabled"), "{err}");
+
+        // virtual_net visitor plugin without the gate enabled is rejected.
+        let err = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+
+[[visitors]]
+name = "vnet-visitor"
+type = "stcp"
+serverName = "vnet-server"
+bindPort = -1
+
+[visitors.plugin]
+type = "virtual_net"
+destinationIP = "100.86.0.1"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("VirtualNet feature is not enabled"), "{err}");
+    }
+
+    #[test]
+    fn test_virtual_net_visitor_destination_ip_validation() {
+        // Missing destinationIP is rejected.
+        let err = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+
+[featureGates]
+VirtualNet = true
+
+[[visitors]]
+name = "vnet-visitor"
+type = "stcp"
+serverName = "vnet-server"
+bindPort = -1
+
+[visitors.plugin]
+type = "virtual_net"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires destinationIP"), "{err}");
+
+        // Invalid IP is rejected.
+        let err = load_client_config_from_str(
+            r#"
+serverAddr = "127.0.0.1"
+
+[featureGates]
+VirtualNet = true
+
+[[visitors]]
+name = "vnet-visitor"
+type = "stcp"
+serverName = "vnet-server"
+bindPort = -1
+
+[visitors.plugin]
+type = "virtual_net"
+destinationIP = "not-an-ip"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("invalid destination IP address"), "{err}");
     }
 
     #[test]

@@ -415,6 +415,39 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_persists_virtual_net_visitor_plugin() {
+        let path = std::env::temp_dir().join(format!(
+            "frpc_store_vnet_visitor_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.tmp"));
+        let store = StoreSource::new(&path).unwrap();
+        store
+            .add_visitor(VisitorConfig {
+                name: "vnet-visitor".into(),
+                visitor_type: "stcp".into(),
+                server_name: "vnet-server".into(),
+                bind_port: -1,
+                plugin: Some(frp_core::config::VisitorPluginConfig {
+                    plugin_type: "virtual_net".into(),
+                    destination_ip: "100.86.0.1".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let reopened = StoreSource::new(&path).unwrap();
+        let visitor = reopened.get_visitor("vnet-visitor").unwrap();
+        let plugin = visitor.plugin.expect("visitor plugin persisted");
+        assert_eq!(plugin.plugin_type, "virtual_net");
+        assert_eq!(plugin.destination_ip, "100.86.0.1");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.tmp"));
+    }
+
+    #[test]
     fn add_update_remove_with_rollback_on_conflict() {
         let path =
             std::env::temp_dir().join(format!("frpc_store_crud_{}.json", std::process::id()));

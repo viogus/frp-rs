@@ -50,8 +50,34 @@ use crate::store::{merge_client_config, StoreSource};
 use crate::util::opt_if_empty;
 use crate::work_conn::XtcpNotification;
 
+/// Go frp v0.70.1 visitor plugin type for virtual-net host routes.
+const VISITOR_PLUGIN_VIRTUAL_NET: &str = "virtual_net";
+
 fn heartbeat_requires_auth(client_scopes: &[String], server_scopes: &[String]) -> bool {
     crate::work_conn::scope_requires_auth(client_scopes, server_scopes, "HeartBeats")
+}
+
+/// Build a VnetRouteAdvertise for a `virtual_net` visitor, advertising its
+/// destinationIP as a host route through the frp vnet routing path.
+///
+/// frp-rs routing tables are IPv4-only today, so IPv6 destinations are
+/// accepted by config validation but cannot be advertised yet.
+#[cfg(feature = "vnet")]
+fn virtual_net_visitor_route_adv(
+    v: &frp_core::config::VisitorConfig,
+) -> Option<msg::VnetRouteAdvertise> {
+    if v.plugin.as_ref()?.plugin_type != VISITOR_PLUGIN_VIRTUAL_NET {
+        return None;
+    }
+    let ip: std::net::IpAddr = v.plugin.as_ref()?.destination_ip.parse().ok()?;
+    let std::net::IpAddr::V4(v4) = ip else {
+        return None;
+    };
+    Some(msg::VnetRouteAdvertise {
+        proxy_name: v.name.clone(),
+        subnet: frp_vnet::router::host_route_cidr(&std::net::IpAddr::V4(v4)),
+        virtual_net: None,
+    })
 }
 
 fn reconnect_delay_after_session(
@@ -871,6 +897,25 @@ impl Service {
                 match ctl.register_visitor(v, &mut control_stream).await {
                     Ok(_) => {
                         info!(visitor_name = %v.name, proxy_name = %v.server_name, "Visitor '{}' registered for proxy '{}'", v.name, v.server_name);
+                        // Virtual-net visitors advertise their destination IP
+                        // as a host route instead of binding a local listener.
+                        #[cfg(feature = "vnet")]
+                        if let Some(adv) = virtual_net_visitor_route_adv(v) {
+                            let send_result = if v2 {
+                                control_stream
+                                    .write_v2_frame(&FrpMessage::VnetRouteAdvertise(adv))
+                                    .await
+                            } else {
+                                control_stream
+                                    .write_v1_frame(&FrpMessage::VnetRouteAdvertise(adv))
+                                    .await
+                            };
+                            if let Err(e) = send_result {
+                                warn!(visitor_name = %v.name, error = %e, "failed to send vnet route advertisement for visitor '{}'", v.name);
+                            } else {
+                                info!(visitor_name = %v.name, "vnet route advertised for visitor '{}'", v.name);
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!(visitor_name = %v.name, error = %e, "Failed to register visitor '{}': {}", v.name, e);
@@ -1036,6 +1081,15 @@ impl Service {
                     continue;
                 }
                 if v.bind_port == 0 {
+                    continue;
+                }
+                // virtual_net visitors do not bind a local listener; the
+                // route advertisement above is their entire runtime surface
+                // until the packet path is wired to a controller connection.
+                if v.plugin
+                    .as_ref()
+                    .is_some_and(|p| p.plugin_type == VISITOR_PLUGIN_VIRTUAL_NET)
+                {
                     continue;
                 }
                 let sa = cfg_local.server_addr.clone();
@@ -1513,6 +1567,32 @@ impl Service {
                         if last_pong.elapsed() > hb_timeout_dur {
                             warn!("Heartbeat timeout ({}s), reconnecting...", hb_timeout);
                             break;
+                        }
+                    }
+                }
+            }
+
+            // Clean up vnet routes advertised by virtual_net visitors before
+            // dropping the control connection. The server also removes routes
+            // during control teardown; this mirrors Go frp's explicit
+            // VnetRouteRemove from the visitor plugin Close().
+            #[cfg(feature = "vnet")]
+            {
+                let session_visitors = self.cfg.read().await.visitors.clone();
+                for v in &session_visitors {
+                    if v.plugin.as_ref().is_none() || !v.enabled {
+                        continue;
+                    }
+                    if let Some(adv) = virtual_net_visitor_route_adv(v) {
+                        let rem = msg::VnetRouteRemove {
+                            proxy_name: adv.proxy_name,
+                            virtual_net: adv.virtual_net,
+                        };
+                        let msg = FrpMessage::VnetRouteRemove(rem);
+                        if let Err(e) = write_msg(&mut *writer.lock().await, &msg, v2).await {
+                            warn!(visitor_name = %v.name, error = %e, "failed to remove vnet route for visitor '{}'", v.name);
+                        } else {
+                            info!(visitor_name = %v.name, "vnet route removed for visitor '{}'", v.name);
                         }
                     }
                 }
@@ -2616,6 +2696,64 @@ mod tests {
         assert!(heartbeat_requires_auth(&[], &heartbeat));
         assert!(!heartbeat_requires_auth(&unrelated, &[]));
         assert!(!heartbeat_requires_auth(&[], &unrelated));
+    }
+
+    #[cfg(feature = "vnet")]
+    #[test]
+    fn virtual_net_visitor_route_advertisement() {
+        use frp_core::config::VisitorPluginConfig;
+
+        let visitor = frp_core::config::VisitorConfig {
+            name: "vnet-visitor".into(),
+            visitor_type: "stcp".into(),
+            server_name: "vnet-server".into(),
+            bind_port: -1,
+            plugin: Some(VisitorPluginConfig {
+                plugin_type: "virtual_net".into(),
+                destination_ip: "100.86.0.1".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let adv = virtual_net_visitor_route_adv(&visitor).expect("route advertisement");
+        assert_eq!(adv.proxy_name, "vnet-visitor");
+        assert_eq!(adv.subnet, "100.86.0.1/32");
+        assert_eq!(adv.virtual_net, None);
+
+        // Non-virtual-net plugins and invalid IPs produce no advertisement.
+        let plain = frp_core::config::VisitorConfig {
+            name: "plain".into(),
+            plugin: Some(VisitorPluginConfig {
+                plugin_type: "other".into(),
+                destination_ip: "100.86.0.1".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(virtual_net_visitor_route_adv(&plain).is_none());
+
+        let bad_ip = frp_core::config::VisitorConfig {
+            name: "bad".into(),
+            plugin: Some(VisitorPluginConfig {
+                plugin_type: "virtual_net".into(),
+                destination_ip: "not-an-ip".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(virtual_net_visitor_route_adv(&bad_ip).is_none());
+
+        // IPv6 destinations are config-valid but not yet routable.
+        let v6 = frp_core::config::VisitorConfig {
+            name: "v6".into(),
+            plugin: Some(VisitorPluginConfig {
+                plugin_type: "virtual_net".into(),
+                destination_ip: "2001:db8::1".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(virtual_net_visitor_route_adv(&v6).is_none());
     }
 
     #[test]

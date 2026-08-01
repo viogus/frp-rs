@@ -397,6 +397,9 @@ custom_404_page = ""
 [feature]
 # experimental_feature = true
 
+[virtualNet]
+address = ""
+
 [[proxies]]
 name = "ssh"
 type = "tcp"
@@ -610,6 +613,7 @@ through the frps server to a remote STCP/XTCP proxy.
 | `server_user` | `string` | `""` | `serverUser` | Optional server-side user for auth matching. |
 | `bind_addr` | `string` | `"0.0.0.0"` | `bindAddr` | Local address to bind for accepting visitor connections. |
 | `bind_port` | `u16` | `0` | `bindPort` | Local port for the visitor listener. 0 = disabled. |
+| `plugin` | `[visitors.plugin]` | — | `plugin` | Optional visitor plugin. `type = "virtual_net"` with `destinationIP` advertises the IP as a vnet host route instead of binding a local listener. |
 | `fallback_timeout_ms` | `u64` | `5000` | `fallbackTimeoutMs` | XTCP fallback timeout in milliseconds. After this time without a successful hole punch, fall back to the `fallback_to` visitor (usually STCP). |
 | `fallback_to` | `string` | `""` | `fallbackTo` | Fallback visitor name if XTCP hole punch fails. Typically points to an STCP visitor. |
 | `disable_assisted_addrs` | `bool` | `false` | `disableAssistedAddrs` | Disable NAT traversal assisted address reporting (STUN-discovered mapped addresses shared between peers during XTCP hole punching). |
@@ -652,6 +656,25 @@ min_retry_interval = 30
 use_encryption = true
 use_compression = false
 ```
+
+**Virtual net visitor:**
+
+```toml
+[[visitors]]
+name = "vnet-visitor"
+type = "stcp"
+server_name = "vnet-server"
+secret_key = "shared-secret"
+bind_port = -1
+
+[visitors.plugin]
+type = "virtual_net"
+destinationIP = "100.86.0.1"
+```
+
+The `virtual_net` visitor plugin requires `[feature] VirtualNet = true`.
+It registers a host route for `destinationIP` through the vnet routing path;
+the local TCP listener is not started for this visitor.
 
 ---
 

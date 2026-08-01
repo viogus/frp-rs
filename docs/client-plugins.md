@@ -464,3 +464,30 @@ All fields available in the `[proxies.plugin]` section:
 
 Plugins compiled without the required feature will return a descriptive error
 at startup rather than silently failing.
+
+------------------------------------------------------------------------------
+
+## Visitor Virtual Net Plugin (`[visitors.plugin] type = "virtual_net"`)
+
+Go frp v0.70.1 also supports a visitor-side `virtual_net` plugin. It does not
+bind a local TCP listener; instead it advertises `destinationIP` as a host
+route through the virtual network routing path.
+
+```toml
+[[visitors]]
+name = "vnet-visitor"
+type = "stcp"
+server_name = "vnet-server"
+secret_key = "shared-secret"
+bind_port = -1
+
+[visitors.plugin]
+type = "virtual_net"
+destinationIP = "100.86.0.1"
+```
+
+Requires `[feature] VirtualNet = true` and the `vnet` build feature (on by
+default). frp-rs currently parses, validates, and advertises/removes the
+`destinationIP` route over the control connection. The in-process controller
+connection that forwards raw IP packets to the STCP/XTCP visitor tunnel is not
+wired yet.
