@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock};
+#[cfg(feature = "vnet")]
+use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
 /// Internal request from a visitor task to the control loop.
 /// Visitor sends NatHoleVisitor on the control connection (Go frps compat:
@@ -2319,7 +2321,10 @@ impl Service {
         let active_proxies = filter_active_proxies(&new_cfg, &new_cfg.proxies);
         new_cfg.proxies = active_proxies;
 
+        #[cfg(feature = "vnet")]
         let mut delta = crate::reload::do_reload(&self.proxy_info_map, new_cfg).await?;
+        #[cfg(not(feature = "vnet"))]
+        let delta = crate::reload::do_reload(&self.proxy_info_map, new_cfg).await?;
 
         // reload::config_snapshot omits vnet-only fields; extend the delta so
         // a subnet/IP/mask change still rebuilds the TUN during reload.

@@ -1,14 +1,16 @@
+#[cfg(feature = "vnet")]
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-#[cfg(feature = "vnet")]
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
 use frp_core::msg::{self, FrpMessage};
-use frp_core::transport::{dial_server, DialOptions, IoStream, TransportProtocol};
+#[cfg(feature = "vnet")]
+use frp_core::transport::IoStream;
+use frp_core::transport::{dial_server, DialOptions, TransportProtocol};
 
 #[cfg(feature = "vnet")]
 type VnetTunTxMap = Arc<tokio::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
@@ -35,7 +37,7 @@ pub(crate) struct VisitorListenerConfig {
     pub min_retry_interval: i64,
     pub stun_server: String,
     /// XTCP P2P data plane protocol: "kcp" or "quic" (Go frp v0.70.1 compat).
-    /// Default: "quic" matching Go frp.
+    /// Default: "kcp" because the frp-rs data plane only implements KCP.
     pub p2p_protocol: String,
     pub visitor_tx: mpsc::Sender<crate::service::VisitorRequest>,
     pub fallback_to: String,
