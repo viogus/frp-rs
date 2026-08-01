@@ -51,7 +51,7 @@ fn propose_mux_for_transport(tcp_mux: bool, protocol: &TransportProtocol) -> boo
 
 /// Wrap an established client transport stream in yamux (matching Go frp
 /// v0.70.1, which wraps the connector result for every non-QUIC transport).
-async fn wrap_client_mux(
+pub(crate) async fn wrap_client_mux(
     raw_stream: IoStream,
     keepalive_interval: i64,
 ) -> Result<(IoStream, Option<YamuxSession>), frp_core::Error> {

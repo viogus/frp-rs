@@ -11,6 +11,7 @@ use frp_core::msg::{self, FrpMessage};
 #[cfg(feature = "vnet")]
 use frp_core::transport::IoStream;
 use frp_core::transport::{dial_server, DialOptions, TransportProtocol};
+use frp_core::mux::YamuxSession;
 
 #[cfg(feature = "vnet")]
 type VnetTunTxMap = Arc<tokio::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
@@ -49,6 +50,17 @@ pub(crate) struct VisitorListenerConfig {
     pub user: String,
     /// Current session run_id for NewVisitorConn (Go frp compat).
     pub run_id: String,
+    // --- Transport options matching DialOptions / Go frp connector ---
+    pub tcp_mux: bool,
+    pub tcp_mux_keepalive_interval: i64,
+    pub proxy_url: Option<String>,
+    pub dns_server: Option<String>,
+    pub dial_timeout_secs: u64,
+    pub keepalive_secs: u64,
+    pub connect_bind_addr: Option<String>,
+    pub disable_custom_tls_first_byte: bool,
+    pub tls_cert_file: Option<String>,
+    pub tls_key_file: Option<String>,
 }
 
 /// Configuration for a no-bind `virtual_net` visitor tunnel.
@@ -85,6 +97,17 @@ pub(crate) struct VirtualNetVisitorConfig {
     /// Graceful shutdown signal. When true, the tunnel exits and the route is
     /// unregistered.
     pub shutdown: Arc<AtomicBool>,
+    // --- Transport options matching DialOptions / Go frp connector ---
+    pub tcp_mux: bool,
+    pub tcp_mux_keepalive_interval: i64,
+    pub proxy_url: Option<String>,
+    pub dns_server: Option<String>,
+    pub dial_timeout_secs: u64,
+    pub keepalive_secs: u64,
+    pub connect_bind_addr: Option<String>,
+    pub disable_custom_tls_first_byte: bool,
+    pub tls_cert_file: Option<String>,
+    pub tls_key_file: Option<String>,
 }
 
 /// Run the packet loop over an established `virtual_net` visitor tunnel.
@@ -203,6 +226,16 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
         shutdown,
         user,
         run_id,
+        tcp_mux,
+        tcp_mux_keepalive_interval,
+        proxy_url,
+        dns_server,
+        dial_timeout_secs,
+        keepalive_secs,
+        connect_bind_addr,
+        disable_custom_tls_first_byte,
+        tls_cert_file,
+        tls_key_file,
     } = config;
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
@@ -243,6 +276,16 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                 let pp = p2p_protocol.clone();
                 let u = user.clone();
                 let rid = run_id.clone();
+                let cfg_tls_cert = tls_cert_file.clone();
+                let cfg_tls_key = tls_key_file.clone();
+                let cfg_dns = dns_server.clone();
+                let cfg_nocustomtls = disable_custom_tls_first_byte;
+                let cfg_keepalive = keepalive_secs;
+                let cfg_cbind = connect_bind_addr.clone();
+                let cfg_proxy = proxy_url.clone();
+                let cfg_dto = dial_timeout_secs;
+                let cfg_tcp_mux = tcp_mux;
+                let cfg_tcp_mux_keepalive = tcp_mux_keepalive_interval;
 
                 tokio::spawn(async move {
                     // Dial options for STCP fallback (fresh connections only).
@@ -253,7 +296,15 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         tls_enable,
                         tls_server_name: tls_sn,
                         tls_ca_file: tls_ca,
-                        ..Default::default()
+                        tls_cert_file: cfg_tls_cert.clone(),
+                        tls_key_file: cfg_tls_key.clone(),
+                        dns_server: cfg_dns.clone(),
+                        disable_custom_tls_first_byte: cfg_nocustomtls,
+                        keepalive_secs: cfg_keepalive,
+                        bind_addr: cfg_cbind.clone(),
+                        proxy_url: cfg_proxy.clone(),
+                        dial_timeout_secs: cfg_dto,
+                        v2: false,
                     };
 
                     if vt == "xtcp" {
@@ -598,12 +649,25 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         // "custom listener for [X] doesn't exist". This is expected — Go frp's
                         // XTCP fallback uses a separate STCP proxy+visitor, not the same proxy.
                         // Open a NEW connection for STCP relay
-                        let mut server_conn = match dial_server(&opts).await {
+                        let raw_stream = match dial_server(&opts).await {
                             Ok(io) => io,
                             Err(e) => {
                                 debug!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STCP fallback dial failed: {}", visitor_name, e);
                                 return;
                             }
+                        };
+                        // Wrap in yamux when tcp_mux is enabled (Go frp compat).
+                        let mut _yamux_sess_fb: Option<YamuxSession> = None;
+                        let mut server_conn = if cfg_tcp_mux {
+                            match crate::control::wrap_client_mux(raw_stream, cfg_tcp_mux_keepalive).await {
+                                Ok((io, session)) => { _yamux_sess_fb = session; io }
+                                Err(e) => {
+                                    warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': yamux wrap failed: {}", visitor_name, e);
+                                    return;
+                                }
+                            }
+                        } else {
+                            raw_stream
                         };
 
                         let stcp_proxy_name = if fb_to.is_empty() {
@@ -704,12 +768,25 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         // --- STCP relay path (TCP-based visitors) ---
                         // Handles: stcp, and sudp (TCP fallback until dedicated
                         // SUDP visitor is implemented).
-                        let mut server_conn = match dial_server(&opts).await {
+                        let raw_stream = match dial_server(&opts).await {
                             Ok(io) => io,
                             Err(e) => {
                                 warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': dial server failed: {}", visitor_name, e);
                                 return;
                             }
+                        };
+                        // Wrap in yamux when tcp_mux is enabled (Go frp compat).
+                        let mut _yamux_sess_stcp: Option<YamuxSession> = None;
+                        let mut server_conn = if cfg_tcp_mux {
+                            match crate::control::wrap_client_mux(raw_stream, cfg_tcp_mux_keepalive).await {
+                                Ok((io, session)) => { _yamux_sess_stcp = session; io }
+                                Err(e) => {
+                                    warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': yamux wrap failed: {}", visitor_name, e);
+                                    return;
+                                }
+                            }
+                        } else {
+                            raw_stream
                         };
 
                         let nvc = crate::proxy::create_visitor_conn_msg(
@@ -821,6 +898,16 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         vnet_tun_tx,
         tun_subnets,
         shutdown,
+        tcp_mux,
+        tcp_mux_keepalive_interval,
+        proxy_url,
+        dns_server,
+        dial_timeout_secs,
+        keepalive_secs,
+        connect_bind_addr,
+        disable_custom_tls_first_byte,
+        tls_cert_file,
+        tls_key_file,
     } = config;
 
     'reconnect: loop {
@@ -828,14 +915,22 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
             return;
         }
 
-        let mut server_conn = match dial_server(&DialOptions {
+        let raw_stream = match dial_server(&DialOptions {
             server_addr: server_addr.clone(),
             server_port,
             protocol: protocol.clone(),
             tls_enable,
             tls_server_name: tls_server_name.clone(),
             tls_ca_file: tls_ca_file.clone(),
-            ..Default::default()
+            tls_cert_file: tls_cert_file.clone(),
+            tls_key_file: tls_key_file.clone(),
+            dns_server: dns_server.clone(),
+            disable_custom_tls_first_byte,
+            keepalive_secs,
+            bind_addr: connect_bind_addr.clone(),
+            proxy_url: proxy_url.clone(),
+            dial_timeout_secs,
+            v2: false,
         })
         .await
         {
@@ -847,6 +942,22 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
                 }
                 continue 'reconnect;
             }
+        };
+        // Wrap in yamux when tcp_mux is enabled (Go frp compat).
+        let mut _yamux_sess_vnet: Option<YamuxSession> = None;
+        let mut server_conn = if tcp_mux {
+            match crate::control::wrap_client_mux(raw_stream, tcp_mux_keepalive_interval).await {
+                Ok((io, session)) => { _yamux_sess_vnet = session; io }
+                Err(e) => {
+                    warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': yamux wrap failed: {}", name, e);
+                    if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+                        return;
+                    }
+                    continue 'reconnect;
+                }
+            }
+        } else {
+            raw_stream
         };
 
         let nvc = crate::proxy::create_visitor_conn_msg(

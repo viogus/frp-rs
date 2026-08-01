@@ -390,6 +390,16 @@ impl Service {
                         use_compression: p.use_compression,
                         token: auth_cfg.token.clone(),
                         oidc_client: oidc_client.clone(),
+                        tcp_mux: cfg.tcp_mux,
+                        tcp_mux_keepalive_interval: cfg.tcp_mux_keepalive_interval,
+                        proxy_url: opt_if_empty!(cfg.proxy_url.clone()),
+                        dns_server: opt_if_empty!(cfg.dns_server.clone()),
+                        dial_timeout_secs: cfg.dial_server_timeout.max(1) as u64,
+                        keepalive_secs: cfg.dial_server_keepalive.max(0) as u64,
+                        connect_bind_addr: opt_if_empty!(cfg.connect_server_local_ip.clone()),
+                        disable_custom_tls_first_byte: cfg.disable_custom_tls_first_byte,
+                        tls_cert_file: opt_if_empty!(cfg.tls_cert_file.clone()),
+                        tls_key_file: opt_if_empty!(cfg.tls_key_file.clone()),
                     };
                     dispatch_plugin_start(plugin_cfg, Some(plugin_ctx)).await
                 } else {
@@ -1072,6 +1082,16 @@ impl Service {
                             let tls_enable = cfg_local.tls_enable;
                             let tls_server_name = cfg_local.tls_server_name.clone();
                             let tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
+                            let transport_proxy_url = opt_if_empty!(cfg_local.proxy_url.clone());
+                            let transport_dns = opt_if_empty!(cfg_local.dns_server.clone());
+                            let transport_bind = opt_if_empty!(cfg_local.connect_server_local_ip.clone());
+                            let transport_tls_cert = opt_if_empty!(cfg_local.tls_cert_file.clone());
+                            let transport_tls_key = opt_if_empty!(cfg_local.tls_key_file.clone());
+                            let transport_tcp_mux = cfg_local.tcp_mux;
+                            let transport_tcp_mux_keepalive = cfg_local.tcp_mux_keepalive_interval;
+                            let transport_dial_timeout = cfg_local.dial_server_timeout.max(1) as u64;
+                            let transport_keepalive = cfg_local.dial_server_keepalive.max(0) as u64;
+                            let transport_nocustomtls = cfg_local.disable_custom_tls_first_byte;
                             let user = cfg_local.user.clone();
                             let rid = run_id.clone();
                             let controller = self.vnet_controller.clone();
@@ -1095,6 +1115,16 @@ impl Service {
                                         tls_ca_file,
                                         user,
                                         run_id: rid,
+                                        tcp_mux: transport_tcp_mux,
+                                        tcp_mux_keepalive_interval: transport_tcp_mux_keepalive,
+                                        proxy_url: transport_proxy_url.clone(),
+                                        dns_server: transport_dns.clone(),
+                                        dial_timeout_secs: transport_dial_timeout,
+                                        keepalive_secs: transport_keepalive,
+                                        connect_bind_addr: transport_bind.clone(),
+                                        disable_custom_tls_first_byte: transport_nocustomtls,
+                                        tls_cert_file: transport_tls_cert.clone(),
+                                        tls_key_file: transport_tls_key.clone(),
                                         destination_cidr: adv.subnet,
                                         controller,
                                         vnet_tun_tx,
@@ -1122,6 +1152,16 @@ impl Service {
                 let tls_enable = cfg_local.tls_enable;
                 let tls_server_name = cfg_local.tls_server_name.clone();
                 let tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
+                let transport_proxy_url = opt_if_empty!(cfg_local.proxy_url.clone());
+                let transport_dns = opt_if_empty!(cfg_local.dns_server.clone());
+                let transport_bind = opt_if_empty!(cfg_local.connect_server_local_ip.clone());
+                let transport_tls_cert = opt_if_empty!(cfg_local.tls_cert_file.clone());
+                let transport_tls_key = opt_if_empty!(cfg_local.tls_key_file.clone());
+                let transport_tcp_mux = cfg_local.tcp_mux;
+                let transport_tcp_mux_keepalive = cfg_local.tcp_mux_keepalive_interval;
+                let transport_dial_timeout = cfg_local.dial_server_timeout.max(1) as u64;
+                let transport_keepalive = cfg_local.dial_server_keepalive.max(0) as u64;
+                let transport_nocustomtls = cfg_local.disable_custom_tls_first_byte;
                 let visitor_type = v.visitor_type.clone();
                 let fallback_timeout_ms = v.fallback_timeout_ms;
                 let keep_tunnel_open = v.keep_tunnel_open;
@@ -1163,6 +1203,16 @@ impl Service {
                         shutdown,
                         user,
                         run_id: rid,
+                        tcp_mux: transport_tcp_mux,
+                        tcp_mux_keepalive_interval: transport_tcp_mux_keepalive,
+                        proxy_url: transport_proxy_url.clone(),
+                        dns_server: transport_dns.clone(),
+                        dial_timeout_secs: transport_dial_timeout,
+                        keepalive_secs: transport_keepalive,
+                        connect_bind_addr: transport_bind.clone(),
+                        disable_custom_tls_first_byte: transport_nocustomtls,
+                        tls_cert_file: transport_tls_cert.clone(),
+                        tls_key_file: transport_tls_key.clone(),
                     })
                     .await;
                 });
@@ -2294,6 +2344,16 @@ impl Service {
                 use_compression: false,
                 token: self.auth_cfg.token.clone(),
                 oidc_client: self.oidc_client.clone(),
+                tcp_mux: current_cfg.tcp_mux,
+                tcp_mux_keepalive_interval: current_cfg.tcp_mux_keepalive_interval,
+                proxy_url: opt_if_empty!(current_cfg.proxy_url.clone()),
+                dns_server: opt_if_empty!(current_cfg.dns_server.clone()),
+                dial_timeout_secs: current_cfg.dial_server_timeout.max(1) as u64,
+                keepalive_secs: current_cfg.dial_server_keepalive.max(0) as u64,
+                connect_bind_addr: opt_if_empty!(current_cfg.connect_server_local_ip.clone()),
+                disable_custom_tls_first_byte: current_cfg.disable_custom_tls_first_byte,
+                tls_cert_file: opt_if_empty!(current_cfg.tls_cert_file.clone()),
+                tls_key_file: opt_if_empty!(current_cfg.tls_key_file.clone()),
             };
             dispatch_plugin_start(plugin_cfg, Some(ctx)).await
         } else {

@@ -8,6 +8,7 @@ use frp_core::config::PluginConfig;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::{self, DialOptions, TransportProtocol};
+use frp_core::mux::YamuxSession;
 use frp_core::VERSION;
 
 use super::{PluginContext, PluginHandle};
@@ -74,6 +75,16 @@ pub async fn start_visitor_plugin(
     let use_compression = ctx.use_compression;
     let transport_protocol = ctx.transport_protocol.clone();
     let oidc_client = ctx.oidc_client.clone();
+    let ctx_tcp_mux = ctx.tcp_mux;
+    let ctx_tcp_mux_keepalive = ctx.tcp_mux_keepalive_interval;
+    let ctx_dns = ctx.dns_server.clone();
+    let ctx_keepalive = ctx.keepalive_secs;
+    let ctx_bind = ctx.connect_bind_addr.clone();
+    let ctx_tls_cert = ctx.tls_cert_file.clone();
+    let ctx_tls_key = ctx.tls_key_file.clone();
+    let ctx_proxy = ctx.proxy_url.clone();
+    let ctx_nocustomtls = ctx.disable_custom_tls_first_byte;
+    let ctx_dial_timeout = ctx.dial_timeout_secs;
 
     let task = tokio::spawn(async move {
         debug!(local_addr = %local_addr, "visitor plugin listening on {}", local_addr);
@@ -103,10 +114,19 @@ pub async fn start_visitor_plugin(
                             let tp = transport_protocol.clone();
                             let oidc = oidc_client.clone();
 
-                            tokio::spawn(async move {
+                            let dns = ctx_dns.clone();
+                                let bind = ctx_bind.clone();
+                                let tls_cert = ctx_tls_cert.clone();
+                                let tls_key = ctx_tls_key.clone();
+                                let proxy = ctx_proxy.clone();
+                                tokio::spawn(async move {
                                 if let Err(e) = handle_visitor_conn(
                                     user_conn, &sn, &sk, &at, &sa, sp, te, &tsn,
                                     tcf.as_deref(), ue, uc, &tp, oidc,
+                                    ctx_tcp_mux, ctx_tcp_mux_keepalive,
+                                    &dns, ctx_keepalive, &bind,
+                                    &tls_cert, &tls_key, &proxy,
+                                    ctx_nocustomtls, ctx_dial_timeout,
                                 ).await {
                                     debug!(error = %e, "visitor plugin handler: {}", e);
                                 }
@@ -145,6 +165,17 @@ async fn handle_visitor_conn(
     use_compression: bool,
     transport_protocol: &str,
     oidc_client: Option<Arc<frp_core::auth::OidcClient>>,
+    // Transport options
+    tcp_mux: bool,
+    tcp_mux_keepalive_interval: i64,
+    dns_server: &Option<String>,
+    keepalive_secs: u64,
+    bind_addr: &Option<String>,
+    tls_cert_file: &Option<String>,
+    tls_key_file: &Option<String>,
+    proxy_url: &Option<String>,
+    disable_custom_tls_first_byte: bool,
+    dial_timeout_secs: u64,
 ) -> Result<(), String> {
     // 1. Dial frps server
     let protocol = match transport_protocol {
@@ -163,11 +194,29 @@ async fn handle_visitor_conn(
         tls_enable,
         tls_server_name: tls_server_name.to_string(),
         tls_ca_file: tls_ca_file.map(|s| s.to_string()),
-        ..Default::default()
+        tls_cert_file: tls_cert_file.clone(),
+        tls_key_file: tls_key_file.clone(),
+        dns_server: dns_server.clone(),
+        disable_custom_tls_first_byte,
+        keepalive_secs,
+        bind_addr: bind_addr.clone(),
+        proxy_url: proxy_url.clone(),
+        dial_timeout_secs,
+        v2: false,
     };
-    let mut server_stream = transport::dial_server(&opts)
+    let raw_stream = transport::dial_server(&opts)
         .await
         .map_err(|e| format!("dial server: {e}"))?;
+    // Wrap in yamux when tcp_mux is enabled (Go frp compat).
+    let mut _yamux_sess: Option<YamuxSession> = None;
+    let mut server_stream = if tcp_mux {
+        match crate::control::wrap_client_mux(raw_stream, tcp_mux_keepalive_interval).await {
+            Ok((io, session)) => { _yamux_sess = session; io }
+            Err(e) => return Err(format!("yamux wrap: {e}"))
+        }
+    } else {
+        raw_stream
+    };
 
     // 2. Login
     let timestamp = std::time::SystemTime::now()
