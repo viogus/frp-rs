@@ -41,6 +41,13 @@ Second parallel audit pass focused on the staged 0.7.1 review-fix wave:
 - **Config aliases**: proxy `localIP` / `localPort` camelCase fields are now
   parsed, matching Go frp configs that previously left `local_port` at 0 and
   made frpc dial `127.0.0.1:0`.
+- **Config audit**: additional Go camelCase mappings added for `webServer`,
+  `httpPlugins`, `featureGates`, `allowPorts` arrays, `customDomains`,
+  proxy/visitor `metadatas`, `subDomainHost`, `tcpmuxPassthrough`,
+  `detailedErrorsToClient`, `enablePrometheus`, `poolCount`,
+  `additionalScopes`, OIDC `skipExpiryCheck`/`skipIssuerCheck`, visitor
+  `[transport]`/`[natTraversal]`, plugin `unixPath`/`crtPath`/`keyPath`, and
+  legacy flat `plugin_*` fields.
 - **Concurrency**: per-run_id lifecycle mutexes are reclaimed; ClientRegistry
   lock order is canonical; post-login AEAD failure cleanup is generation-safe.
 - **KCP**: login throttling uses the real peer address instead of a shared key.
