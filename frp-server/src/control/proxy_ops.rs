@@ -103,7 +103,15 @@ mod unregister_generation_tests {
     }
 
     async fn insert_control(state: &Arc<AppState>, run_id: &str, control_id: u64) {
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let _rx = insert_control_rx(state, run_id, control_id).await;
+    }
+
+    async fn insert_control_rx(
+        state: &Arc<AppState>,
+        run_id: &str,
+        control_id: u64,
+    ) -> mpsc::Receiver<InternalMsg> {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
         let mut map = state.run_id_to_ctl_tx.write().await;
         map.insert(
             run_id.to_string(),
@@ -117,6 +125,7 @@ mod unregister_generation_tests {
                 control_id,
             },
         );
+        rx
     }
 
     #[tokio::test]
@@ -132,6 +141,50 @@ mod unregister_generation_tests {
         // The replacement itself may still clean up its own generation.
         unregister_control(&state, "run-1", 7, false).await;
         assert!(!state.run_id_to_ctl_tx.read().await.contains_key("run-1"));
+    }
+
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn unregister_control_removes_run_id_vnet_routes_and_broadcasts_remove() {
+        let state = test_state();
+        let mut peer_rx = insert_control_rx(&state, "run-b", 2).await;
+        insert_control(&state, "run-a", 1).await;
+        {
+            let mut routes = state.vnet_routes.write().await;
+            routes.insert(
+                ("vnet-a".to_string(), "10.0.0.0/24".to_string()),
+                ("run-a".to_string(), "proxy-a".to_string()),
+            );
+            routes.insert(
+                ("vnet-a".to_string(), "2001:db8::/64".to_string()),
+                ("run-a".to_string(), "visitor-v6".to_string()),
+            );
+            routes.insert(
+                ("vnet-b".to_string(), "10.1.0.0/24".to_string()),
+                ("run-b".to_string(), "proxy-b".to_string()),
+            );
+        }
+
+        unregister_control(&state, "run-a", 1, false).await;
+
+        let routes = state.vnet_routes.read().await;
+        assert!(routes.iter().all(|(_, (run_id, _))| run_id != "run-a"));
+        assert!(routes.contains_key(&("vnet-b".to_string(), "10.1.0.0/24".to_string())));
+        drop(routes);
+
+        let mut removes = Vec::new();
+        for _ in 0..2 {
+            match peer_rx.recv().await {
+                Some(InternalMsg::VnetRouteRemoveForward { msg }) => removes.push(msg),
+                other => panic!("expected forwarded remove, got {:?}", other),
+            }
+        }
+        assert!(removes
+            .iter()
+            .any(|m| { m.proxy_name == "proxy-a" && m.virtual_net.as_deref() == Some("vnet-a") }));
+        assert!(removes.iter().any(|m| {
+            m.proxy_name == "visitor-v6" && m.virtual_net.as_deref() == Some("vnet-a")
+        }));
     }
 }
 
@@ -1023,10 +1076,7 @@ pub(crate) async fn unregister_control(
         state.proxy_metrics.remove(&p.name).await;
     }
     #[cfg(feature = "vnet")]
-    {
-        let mut routes = state.vnet_routes.write().await;
-        routes.retain(|_, (_, name)| !proxies.iter().any(|p| &p.name == name));
-    }
+    state.remove_run_id_vnet_routes(run_id).await;
     // Clean up OIDC subject mapping for this client.
     // Map key is run_id; remove it directly rather than scanning values
     // (which are OIDC subject strings, not proxy names — retain would

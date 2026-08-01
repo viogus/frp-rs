@@ -11,6 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use frp_core::auth::{AuthConfig, OidcVerifier};
 use frp_core::metrics::ProxyMetricsRegistry;
+#[cfg(feature = "vnet")]
+use frp_core::msg::{self, VnetRouteAdvertise, VnetRouteRemove};
 use frp_core::transport::IoStream;
 
 use crate::nathole::controller::Controller;
@@ -90,6 +92,16 @@ pub enum InternalMsg {
     VnetPacketForward {
         proxy_name: String,
         data: String, // base64-encoded IP packet
+    },
+    /// Forward a vnet route advertisement to a peer client's control handler.
+    #[cfg(feature = "vnet")]
+    VnetRouteAdvertiseForward {
+        msg: VnetRouteAdvertise,
+    },
+    /// Forward a vnet route removal to a peer client's control handler.
+    #[cfg(feature = "vnet")]
+    VnetRouteRemoveForward {
+        msg: VnetRouteRemove,
     },
 }
 
@@ -634,6 +646,67 @@ impl AppState {
             entry: entry.clone(),
         };
         (entry.mu.clone(), guard)
+    }
+}
+
+#[cfg(feature = "vnet")]
+impl AppState {
+    /// Queue a route advertisement to every online control except `exclude_run_id`.
+    pub(crate) async fn broadcast_vnet_route_advertise(
+        &self,
+        exclude_run_id: &str,
+        adv: &msg::VnetRouteAdvertise,
+    ) {
+        for tx in self.other_control_txs(exclude_run_id).await {
+            let _ = tx.try_send(InternalMsg::VnetRouteAdvertiseForward { msg: adv.clone() });
+        }
+    }
+
+    /// Queue a route removal to every online control except `exclude_run_id`.
+    pub(crate) async fn broadcast_vnet_route_remove(
+        &self,
+        exclude_run_id: &str,
+        rem: &msg::VnetRouteRemove,
+    ) {
+        for tx in self.other_control_txs(exclude_run_id).await {
+            let _ = tx.try_send(InternalMsg::VnetRouteRemoveForward { msg: rem.clone() });
+        }
+    }
+
+    /// Remove every route registered by `run_id` and broadcast matching removals.
+    pub(crate) async fn remove_run_id_vnet_routes(&self, run_id: &str) {
+        let removed = {
+            let mut routes = self.vnet_routes.write().await;
+            let removed: Vec<(String, String)> = routes
+                .iter()
+                .filter(|(_, (rid, _))| rid == run_id)
+                .map(|((vn, _), (_, proxy_name))| (vn.clone(), proxy_name.clone()))
+                .collect();
+            routes.retain(|_, (rid, _)| rid != run_id);
+            removed
+        };
+
+        let mut seen = HashSet::new();
+        for (vn, proxy_name) in removed {
+            if seen.insert((vn.clone(), proxy_name.clone())) {
+                self.broadcast_vnet_route_remove(
+                    run_id,
+                    &msg::VnetRouteRemove {
+                        proxy_name,
+                        virtual_net: (!vn.is_empty()).then_some(vn),
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn other_control_txs(&self, exclude_run_id: &str) -> Vec<mpsc::Sender<InternalMsg>> {
+        let map = self.run_id_to_ctl_tx.read().await;
+        map.iter()
+            .filter(|(run_id, _)| run_id.as_str() != exclude_run_id)
+            .map(|(_, ctl)| ctl.tx.clone())
+            .collect()
     }
 }
 

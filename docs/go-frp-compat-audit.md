@@ -101,7 +101,10 @@ frp-rs targets Go frp v0.70.1 wire compatibility. Core tunneling (TCP/UDP/HTTP/S
 proxy plugin hands work connections to the vnet controller (TUN ingress plus
 source-IP return routing), and the `virtual_net` visitor plugin delivers
 inbound `VnetPacket`s into its no-bind STCP/XTCP tunnel while forwarding
-tunnel return traffic to the local TUN.**
+tunnel return traffic to the local TUN. vnet routing is dual-stack
+(IPv4/IPv6), proxy/visitor transport encryption and compression are applied to
+tunnel bytes, and frps broadcasts vnet route advertisements/removals to peers
+with disconnect cleanup.**
 
 ---
 

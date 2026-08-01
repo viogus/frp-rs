@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(feature = "vnet")]
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,6 +10,8 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use frp_core::auth::{AuthConfig, OidcClient};
+#[cfg(feature = "vnet")]
+use frp_core::cipher_stream::{CipherReader, CipherWriter};
 use frp_core::encryption;
 use frp_core::metrics::ProxyMetricsRegistry;
 use frp_core::msg::{self, FrpMessage};
@@ -22,6 +26,138 @@ use crate::proxy_runtime::ProxyRuntimeInfo;
 
 #[cfg(feature = "vnet")]
 type VnetTunMap = Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>;
+
+/// Reads raw IP packets from a `virtual_net` tunnel, decompressing Snappy
+/// frames that arrive in arbitrary transport chunk sizes.
+#[cfg(feature = "vnet")]
+pub(crate) struct TunnelPacketReader<R> {
+    inner: R,
+    decompressor: Option<frp_core::encryption::SnappyDecompressor>,
+    pending: VecDeque<Vec<u8>>,
+    buf: Vec<u8>,
+    eof: bool,
+}
+
+#[cfg(feature = "vnet")]
+impl<R: tokio::io::AsyncRead + Unpin> TunnelPacketReader<R> {
+    pub(crate) fn new(inner: R, use_compression: bool) -> Self {
+        let decompressor = if use_compression {
+            #[cfg(feature = "compression")]
+            {
+                Some(frp_core::encryption::SnappyDecompressor::new())
+            }
+            #[cfg(not(feature = "compression"))]
+            {
+                None
+            }
+        } else {
+            None
+        };
+        Self {
+            inner,
+            decompressor,
+            pending: VecDeque::new(),
+            buf: vec![0u8; 4096],
+            eof: false,
+        }
+    }
+
+    /// Return the next packet, or `None` at EOF.
+    pub(crate) async fn next_packet(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        loop {
+            if let Some(packet) = self.pending.pop_front() {
+                return Ok(Some(packet));
+            }
+            if let Some(decompressor) = &mut self.decompressor {
+                // Drain complete frames already buffered by the decompressor
+                // before blocking on more transport bytes.
+                loop {
+                    let mut out = Vec::new();
+                    let status = decompressor
+                        .feed_into_progress(&[], &mut out)
+                        .map_err(std::io::Error::other)?;
+                    if !out.is_empty() {
+                        self.pending.push_back(out);
+                        break;
+                    }
+                    if !status.has_more_complete {
+                        break;
+                    }
+                }
+                if let Some(packet) = self.pending.pop_front() {
+                    return Ok(Some(packet));
+                }
+            }
+            if self.eof {
+                return Ok(None);
+            }
+            let n = self.inner.read(&mut self.buf).await?;
+            if n == 0 {
+                self.eof = true;
+                return Ok(None);
+            }
+            let Some(decompressor) = &mut self.decompressor else {
+                return Ok(Some(self.buf[..n].to_vec()));
+            };
+            let mut input = &self.buf[..n];
+            loop {
+                let mut out = Vec::new();
+                let status = decompressor
+                    .feed_into_progress(input, &mut out)
+                    .map_err(std::io::Error::other)?;
+                input = &[];
+                if !out.is_empty() {
+                    self.pending.push_back(out);
+                    break;
+                }
+                if !status.has_more_complete {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Writes raw IP packets to a `virtual_net` tunnel, applying Snappy
+/// compression before AES-128-CFB encryption when enabled.
+#[cfg(feature = "vnet")]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum TunnelPacketWriter<W: tokio::io::AsyncWrite + Unpin> {
+    Plain(W),
+    Encrypted(CipherWriter<W>),
+}
+
+#[cfg(feature = "vnet")]
+impl<W: tokio::io::AsyncWrite + Unpin> TunnelPacketWriter<W> {
+    pub(crate) async fn write_packet(
+        &mut self,
+        packet: &[u8],
+        use_compression: bool,
+    ) -> std::io::Result<()> {
+        if use_compression {
+            let mut compressed = Vec::new();
+            frp_core::encryption::compress_into(packet, &mut compressed)
+                .map_err(std::io::Error::other)?;
+            self.write_all(&compressed).await
+        } else {
+            self.write_all(packet).await
+        }
+    }
+
+    pub(crate) async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(w) => w.write_all(data).await,
+            Self::Encrypted(w) => w.write_all(data).await,
+        }
+    }
+
+    pub(crate) async fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(w) => w.flush().await,
+            Self::Encrypted(w) => w.flush().await,
+        }
+    }
+}
 
 /// Conditional type for the QUIC connection parameter.
 /// When the `quic` feature is disabled, the parameter is `()` (ZST, no-op).
@@ -373,6 +509,9 @@ async fn run_virtual_net_plugin_work_conn(
     proxy_name: String,
     vnet_controller: Arc<frp_vnet::controller::ClientVnetController>,
     vnet_tun_tx: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+    use_encryption: bool,
+    use_compression: bool,
+    enc_key: [u8; 16],
 ) {
     let tun_tx = {
         let txs = vnet_tun_tx.lock().await;
@@ -383,7 +522,30 @@ async fn run_virtual_net_plugin_work_conn(
         return;
     };
 
-    let (mut work_r, mut work_w) = work.into_split().expect("work conn split");
+    let (work_r, work_w) = work.into_split().expect("work conn split");
+    let work_r: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if use_encryption {
+        Box::new(CipherReader::new(work_r, enc_key))
+    } else {
+        Box::new(work_r)
+    };
+    let mut packet_reader = TunnelPacketReader::new(work_r, use_compression);
+    let mut packet_writer = if use_encryption {
+        TunnelPacketWriter::Encrypted(CipherWriter::new(work_w, enc_key))
+    } else {
+        TunnelPacketWriter::Plain(work_w)
+    };
+    // Eagerly send the encrypted writer's IV so the peer's CipherReader can
+    // proceed even before the first return packet arrives.
+    if let Err(e) = packet_writer.flush().await {
+        warn!(
+            proxy_name = %proxy_name,
+            error = %e,
+            "virtual_net plugin work conn IV flush failed: {}",
+            e
+        );
+        return;
+    }
+
     let (return_tx, mut return_rx) = mpsc::channel::<Vec<u8>>(256);
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
@@ -393,25 +555,20 @@ async fn run_virtual_net_plugin_work_conn(
     let reader_tun = tun_tx;
     let mut reader_cancel = cancel_rx.clone();
     let reader = async move {
-        let mut registered_ips = Vec::<std::net::Ipv4Addr>::new();
-        let mut buf = vec![0u8; 1420];
+        let mut registered_ips = Vec::<std::net::IpAddr>::new();
         loop {
             tokio::select! {
                 biased;
                 changed = reader_cancel.changed() => {
                     if changed.is_err() || *reader_cancel.borrow() { break; }
                 }
-                n = work_r.read(&mut buf) => {
-                    match n {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let packet = buf[..n].to_vec();
+                packet = packet_reader.next_packet() => {
+                    match packet {
+                        Ok(None) => break,
+                        Ok(Some(packet)) => {
                             // Learn the remote host's source IP so return
                             // packets can be routed back on this connection.
-                            if packet.len() >= 20 && (packet[0] >> 4) == 4 {
-                                let src_ip = std::net::Ipv4Addr::new(
-                                    packet[12], packet[13], packet[14], packet[15],
-                                );
+                            if let Some(src_ip) = frp_vnet::router::packet_src_ip(&packet) {
                                 reader_ctrl
                                     .register_server_conn(src_ip, reader_rtx.clone())
                                     .await;
@@ -461,7 +618,7 @@ async fn run_virtual_net_plugin_work_conn(
                 pkt = return_rx.recv() => {
                     match pkt {
                         Some(pkt) => {
-                            if let Err(e) = work_w.write_all(&pkt).await {
+                            if let Err(e) = packet_writer.write_packet(&pkt, use_compression).await {
                                 warn!(
                                     proxy_name = %writer_name,
                                     error = %e,
@@ -895,11 +1052,16 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                 #[cfg(feature = "vnet")]
                 if info.plugin == "virtual_net" {
                     info!(label = %label, proxy_name = %proxy_name, "Work conn {} handed to virtual_net plugin controller", label);
+                    let use_enc = swc.use_encryption.unwrap_or(info.use_encryption);
+                    let use_comp = swc.use_compression.unwrap_or(info.use_compression);
                     run_virtual_net_plugin_work_conn(
                         work,
                         proxy_name.clone(),
                         vnet_controller,
                         vnet_tun_tx,
+                        use_enc,
+                        use_comp,
+                        enc_key,
                     )
                     .await;
                     return;
@@ -1319,6 +1481,9 @@ mod tests {
             "vnet-proxy".to_string(),
             controller.clone(),
             tun_txs,
+            false,
+            false,
+            [0; 16],
         ));
 
         let inbound = vec![
@@ -1328,7 +1493,7 @@ mod tests {
         peer.write_all(&inbound).await.unwrap();
         assert_eq!(tun_rx.recv().await, Some(inbound.clone()));
 
-        let src = Ipv4Addr::new(100, 86, 0, 1);
+        let src = std::net::IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1));
         let return_tx = controller
             .server_conn_sender(&src)
             .await
@@ -1344,5 +1509,87 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(controller.server_conn_sender(&src).await.is_none());
+    }
+
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn virtual_net_plugin_work_conn_wraps_encrypted_compressed_wire_bytes() {
+        use std::net::IpAddr;
+        use tokio::io::AsyncWriteExt;
+
+        let key = frp_core::encryption::derive_key("vnet-test-secret");
+        let controller = Arc::new(frp_vnet::controller::ClientVnetController::new());
+        let tun_txs = Arc::new(Mutex::new(HashMap::new()));
+        let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(16);
+        tun_txs
+            .lock()
+            .await
+            .insert("vnet-proxy".to_string(), tun_tx);
+
+        let (work, mut peer) = tokio::io::duplex(8192);
+        let task = tokio::spawn(run_virtual_net_plugin_work_conn(
+            IoStream::SshChannel(Box::new(work)),
+            "vnet-proxy".to_string(),
+            controller.clone(),
+            tun_txs,
+            true,
+            true,
+            key,
+        ));
+
+        let inbound = vec![
+            0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x20, 0x01, 0x0d, 0xb8,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ];
+        let mut compressed = Vec::new();
+        frp_core::encryption::compress_into(&inbound, &mut compressed).unwrap();
+        let wire = frp_core::encryption::encrypt(&compressed, &key).unwrap();
+        peer.write_all(&wire).await.unwrap();
+        assert_eq!(tun_rx.recv().await, Some(inbound.clone()));
+
+        let src: IpAddr = "2001:db8::2".parse().unwrap();
+        let return_tx = controller
+            .server_conn_sender(&src)
+            .await
+            .expect("IPv6 source must be registered for return traffic");
+        return_tx.try_send(inbound.clone()).unwrap();
+
+        let mut raw = vec![0u8; wire.len()];
+        peer.read_exact(&mut raw).await.unwrap();
+        assert_ne!(raw, wire, "return traffic must be re-wrapped, not replayed");
+        let decrypted = frp_core::encryption::decrypt(&raw, &key).unwrap();
+        let restored = frp_core::encryption::decompress(&decrypted).unwrap();
+        assert_eq!(restored, inbound);
+
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(controller.server_conn_sender(&src).await.is_none());
+    }
+
+    #[cfg(all(feature = "vnet", feature = "compression"))]
+    #[tokio::test]
+    async fn tunnel_packet_reader_drains_multiple_frames_before_next_transport_read() {
+        use tokio::io::AsyncWriteExt;
+
+        let packet_a = vec![0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06];
+        let packet_b = vec![0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x11];
+        let mut wire = Vec::new();
+        for packet in [&packet_a, &packet_b] {
+            let mut compressed = Vec::new();
+            frp_core::encryption::compress_into(packet, &mut compressed).unwrap();
+            wire.extend_from_slice(&compressed);
+        }
+        let (mut writer, reader) = tokio::io::duplex(8192);
+        writer.write_all(&wire).await.unwrap();
+        drop(writer);
+
+        let mut packet_reader = TunnelPacketReader::new(reader, true);
+        assert_eq!(packet_reader.next_packet().await.unwrap(), Some(packet_a));
+        assert_eq!(packet_reader.next_packet().await.unwrap(), Some(packet_b));
+        assert_eq!(packet_reader.next_packet().await.unwrap(), None);
     }
 }

@@ -38,6 +38,11 @@ pub(crate) fn config_snapshot(p: &ProxyConfig) -> String {
     fields.push(("group_key", p.group_key.clone()));
     fields.push(("multiplexer", p.multiplexer.clone()));
     fields.push(("proxy_protocol_version", p.proxy_protocol_version.clone()));
+    fields.push(("vnet_ip", p.vnet_ip.clone()));
+    fields.push(("vnet_netmask", p.vnet_netmask.clone()));
+    fields.push(("vnet_mtu", p.vnet_mtu.to_string()));
+    fields.push(("advertise_subnet", p.advertise_subnet.clone()));
+    fields.push(("virtual_net", p.virtual_net.clone()));
 
     // Plugin fields — needed for detecting plugin config changes during reload
     if let Some(ref pl) = p.plugin {

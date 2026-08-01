@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock};
 
 /// Internal request from a visitor task to the control loop.
 /// Visitor sends NatHoleVisitor on the control connection (Go frps compat:
@@ -32,6 +32,10 @@ use frp_core::unsafe_features::UnsafeFeatures;
 
 #[cfg(feature = "vnet")]
 type VnetTunMap = Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>;
+#[cfg(feature = "vnet")]
+type VnetTunTxMap = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
+#[cfg(feature = "vnet")]
+type VnetTunCancelMap = Arc<Mutex<HashMap<String, watch::Sender<bool>>>>;
 use frp_core::encryption;
 use frp_core::msg::{self, ClientSpec, FrpMessage};
 use frp_core::protocol::{read_msg, write_msg};
@@ -60,8 +64,6 @@ fn heartbeat_requires_auth(client_scopes: &[String], server_scopes: &[String]) -
 /// Build a VnetRouteAdvertise for a `virtual_net` visitor, advertising its
 /// destinationIP as a host route through the frp vnet routing path.
 ///
-/// frp-rs routing tables are IPv4-only today, so IPv6 destinations are
-/// accepted by config validation but cannot be advertised yet.
 #[cfg(feature = "vnet")]
 fn virtual_net_visitor_route_adv(
     v: &frp_core::config::VisitorConfig,
@@ -70,12 +72,9 @@ fn virtual_net_visitor_route_adv(
         return None;
     }
     let ip: std::net::IpAddr = v.plugin.as_ref()?.destination_ip.parse().ok()?;
-    let std::net::IpAddr::V4(v4) = ip else {
-        return None;
-    };
     Some(msg::VnetRouteAdvertise {
         proxy_name: v.name.clone(),
-        subnet: frp_vnet::router::host_route_cidr(&std::net::IpAddr::V4(v4)),
+        subnet: frp_vnet::router::host_route_cidr(&ip),
         virtual_net: None,
     })
 }
@@ -177,9 +176,15 @@ pub struct Service {
     /// Keyed by proxy name.
     #[cfg(feature = "vnet")]
     vnet_tun_tx: Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>>>,
+    /// Per-proxy cancellation senders for running vnet controllers.
+    #[cfg(feature = "vnet")]
+    vnet_tun_cancels: VnetTunCancelMap,
     /// Per-proxy TUN device names for OS route injection.
     #[cfg(feature = "vnet")]
     vnet_tun_names: Arc<Mutex<HashMap<String, String>>>,
+    /// Per-proxy subnet CIDR for directing virtual_net visitor return traffic.
+    #[cfg(feature = "vnet")]
+    vnet_tun_subnets: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Service {
@@ -445,7 +450,11 @@ impl Service {
         #[cfg(feature = "vnet")]
         let vnet_tun_tx = Arc::new(Mutex::new(HashMap::new()));
         #[cfg(feature = "vnet")]
+        let vnet_tun_cancels = Arc::new(Mutex::new(HashMap::new()));
+        #[cfg(feature = "vnet")]
         let vnet_tun_names = Arc::new(Mutex::new(HashMap::new()));
+        #[cfg(feature = "vnet")]
+        let vnet_tun_subnets = Arc::new(Mutex::new(HashMap::new()));
 
         let health_proxy_configs = Arc::new(Mutex::new(
             cfg.proxies
@@ -487,7 +496,11 @@ impl Service {
             #[cfg(feature = "vnet")]
             vnet_tun_tx,
             #[cfg(feature = "vnet")]
+            vnet_tun_cancels,
+            #[cfg(feature = "vnet")]
             vnet_tun_names,
+            #[cfg(feature = "vnet")]
+            vnet_tun_subnets,
         })
     }
 
@@ -808,89 +821,9 @@ impl Service {
                         }
 
                         #[cfg(feature = "vnet")]
-                        {
-                            use std::net::Ipv4Addr;
-                            let is_vnet_proxy = p.proxy_type == "vnet" && !p.vnet_ip.is_empty();
-                            let is_vnet_plugin = p
-                                .plugin
-                                .as_ref()
-                                .is_some_and(|pl| pl.plugin_type == "virtual_net")
-                                && !cfg_local.virtual_net.address.is_empty();
-                            if is_vnet_proxy || is_vnet_plugin {
-                                let (ip, netmask, mtu) = if is_vnet_proxy {
-                                    (p.vnet_ip.clone(), p.vnet_netmask.clone(), p.vnet_mtu)
-                                } else {
-                                    (
-                                        cfg_local.virtual_net.address.clone(),
-                                        "255.255.255.0".to_string(),
-                                        1420,
-                                    )
-                                };
-                                let ip: Ipv4Addr = match ip.parse() {
-                                    Ok(ip) => ip,
-                                    Err(e) => {
-                                        warn!(proxy_name = %p.name, error = %e, "invalid vnet address '{}'", ip);
-                                        continue;
-                                    }
-                                };
-                                let netmask: Ipv4Addr = match netmask.parse() {
-                                    Ok(m) => m,
-                                    Err(e) => {
-                                        warn!(proxy_name = %p.name, error = %e, "invalid vnet_netmask '{}'", netmask);
-                                        continue;
-                                    }
-                                };
-
-                                match frp_vnet::tun::open_tun("").await {
-                                    Ok(tun) => {
-                                        let tun_name = tun.name().to_string();
-                                        if let Err(e) = tun.configure(ip, netmask, mtu) {
-                                            warn!(proxy_name = %p.name, error = %e, "TUN configure failed");
-                                        } else {
-                                            info!(proxy_name = %p.name, name = %tun_name, "TUN device ready");
-                                        }
-                                        // Store TUN name for OS route injection
-                                        {
-                                            let mut names = self.vnet_tun_names.lock().await;
-                                            names.insert(p.name.clone(), tun_name);
-                                        }
-                                        // Store TUN device for later controller spawning.
-                                        // The controller is spawned after the control
-                                        // connection writer is created.
-                                        {
-                                            let mut tuns = self.vnet_tuns.lock().await;
-                                            tuns.insert(p.name.clone(), Some(tun));
-                                        }
-                                        // Send VnetRouteAdvertise if the proxy owns a subnet.
-                                        if p.proxy_type == "vnet" && !p.advertise_subnet.is_empty()
-                                        {
-                                            let adv = FrpMessage::VnetRouteAdvertise(
-                                                msg::VnetRouteAdvertise {
-                                                    proxy_name: p.name.clone(),
-                                                    subnet: p.advertise_subnet.clone(),
-                                                    virtual_net: if p.virtual_net.is_empty() {
-                                                        None
-                                                    } else {
-                                                        Some(p.virtual_net.clone())
-                                                    },
-                                                },
-                                            );
-                                            let send_result = if v2 {
-                                                control_stream.write_v2_frame(&adv).await
-                                            } else {
-                                                control_stream.write_v1_frame(&adv).await
-                                            };
-                                            if let Err(e) = send_result {
-                                                warn!(proxy_name = %p.name, error = %e, "failed to send VnetRouteAdvertise");
-                                            } else {
-                                                info!(proxy_name = %p.name, subnet = %p.advertise_subnet, "VnetRouteAdvertise sent");
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(proxy_name = %p.name, error = %e, "TUN open failed (need root/CAP_NET_ADMIN?)");
-                                    }
-                                }
+                        if vnet_tun_params(p, &cfg_local.virtual_net.address).is_some() {
+                            if let Err(e) = self.open_vnet_tun_for_proxy(p, &cfg_local).await {
+                                warn!(proxy_name = %p.name, error = %e, "TUN open/register failed (need root/CAP_NET_ADMIN?)");
                             }
                         }
                     }
@@ -952,32 +885,24 @@ impl Service {
             // Spawn VnetControllers for all vnet proxies now that the
             // control connection writer is available.
             #[cfg(feature = "vnet")]
-            {
-                let mut tuns = self.vnet_tuns.lock().await;
-                for (proxy_name, tun_opt) in tuns.iter_mut() {
-                    if let Some(tun) = tun_opt.take() {
-                        let (tun_tx, tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
-                        {
-                            let mut txs = self.vnet_tun_tx.lock().await;
-                            txs.insert(proxy_name.clone(), tun_tx);
-                        }
-                        let ctl_writer = writer.clone();
-                        let client_controller = self.vnet_controller.clone();
-                        let pn = proxy_name.clone();
-                        tokio::spawn(async move {
-                            let ctrl = frp_vnet::controller::VnetController::new(
-                                pn.clone(),
-                                client_controller,
-                                v2,
-                            );
-                            if let Err(e) = ctrl.run(tun, ctl_writer, tun_rx).await {
-                                tracing::error!(proxy_name = %pn, error = %e, "vnet controller exited with error");
-                            }
-                            tracing::info!(proxy_name = %pn, "vnet controller stopped");
-                        });
-                    }
+            for p in &proxies {
+                if vnet_tun_params(p, &cfg_local.virtual_net.address).is_none() {
+                    continue;
                 }
-                tuns.clear();
+                if spawn_vnet_tun_controller(
+                    &self.vnet_tuns,
+                    &self.vnet_tun_tx,
+                    &self.vnet_tun_cancels,
+                    &self.vnet_controller,
+                    &p.name,
+                    &writer,
+                    v2,
+                )
+                .await
+                .is_some()
+                {
+                    send_vnet_route_advertise(&writer, v2, p).await;
+                }
             }
 
             // Bind local UDP sockets for UDP proxies.
@@ -1136,6 +1061,7 @@ impl Service {
                             let rid = run_id.clone();
                             let controller = self.vnet_controller.clone();
                             let vnet_tun_tx = self.vnet_tun_tx.clone();
+                            let tun_subnets = self.vnet_tun_subnets.clone();
                             let shutdown = visitor_shutdown.clone();
                             let handle = tokio::spawn(async move {
                                 crate::visitor::run_virtual_net_visitor(
@@ -1157,6 +1083,7 @@ impl Service {
                                         destination_cidr: adv.subnet,
                                         controller,
                                         vnet_tun_tx,
+                                        tun_subnets,
                                         shutdown,
                                     },
                                 )
@@ -2270,6 +2197,34 @@ impl Service {
         });
     }
 
+    /// Open and register the TUN device for a vnet proxy, if configured.
+    #[cfg(feature = "vnet")]
+    async fn open_vnet_tun_for_proxy(
+        &self,
+        proxy: &frp_core::config::ProxyConfig,
+        cfg: &frp_core::config::ClientConfig,
+    ) -> anyhow::Result<()> {
+        let Some(params) = vnet_tun_params(proxy, &cfg.virtual_net.address) else {
+            return Ok(());
+        };
+        let tun = frp_vnet::tun::open_tun("").await?;
+        register_vnet_tun(
+            &self.vnet_tuns,
+            &self.vnet_tun_names,
+            &proxy.name,
+            params,
+            tun,
+        )
+        .await?;
+        if let Some(cidr) = vnet_tun_cidr(proxy, &cfg.virtual_net.address) {
+            self.vnet_tun_subnets
+                .lock()
+                .await
+                .insert(proxy.name.clone(), cidr);
+        }
+        Ok(())
+    }
+
     /// Start a single plugin and return its handle with resolved bound address.
     /// Used during reload to restart plugins with updated config.
     /// Returns None if plugin_type is unknown or start fails (logged internally).
@@ -2364,7 +2319,28 @@ impl Service {
         let active_proxies = filter_active_proxies(&new_cfg, &new_cfg.proxies);
         new_cfg.proxies = active_proxies;
 
-        let delta = crate::reload::do_reload(&self.proxy_info_map, new_cfg).await?;
+        let mut delta = crate::reload::do_reload(&self.proxy_info_map, new_cfg).await?;
+
+        // reload::config_snapshot omits vnet-only fields; extend the delta so
+        // a subnet/IP/mask change still rebuilds the TUN during reload.
+        #[cfg(feature = "vnet")]
+        {
+            let old_cfg = self.cfg.read().await.clone();
+            let old_proxies = self.proxies.read().await.clone();
+            for p in &delta.new_config.proxies {
+                let old = old_proxies.iter().find(|old| old.name == p.name);
+                let vnet_field_changed =
+                    old.is_some_and(|old| vnet_proxy_snapshot(old) != vnet_proxy_snapshot(p));
+                let global_changed = old_cfg.virtual_net.address
+                    != delta.new_config.virtual_net.address
+                    && p.plugin
+                        .as_ref()
+                        .is_some_and(|pl| pl.plugin_type == "virtual_net");
+                if (vnet_field_changed || global_changed) && !delta.changed.contains(&p.name) {
+                    delta.changed.push(p.name.clone());
+                }
+            }
+        }
 
         if delta.removed.is_empty() && delta.added.is_empty() && delta.changed.is_empty() {
             let merged = delta.new_config;
@@ -2400,6 +2376,22 @@ impl Service {
             }
         }
 
+        // Drop TUN state for removed and changed proxies before recreating it.
+        // Changed proxies must get a fresh TUN and a fresh delivery channel.
+        #[cfg(feature = "vnet")]
+        for name in delta.removed.iter().chain(delta.changed.iter()) {
+            remove_vnet_tun(
+                &self.vnet_tuns,
+                &self.vnet_tun_tx,
+                &self.vnet_tun_cancels,
+                &self.vnet_tun_names,
+                &self.vnet_tun_subnets,
+                &self.vnet_controller.route_table(),
+                name,
+            )
+            .await;
+        }
+
         // Step 2: Start new plugins for added and changed proxies that have plugin config.
         // Collect actual bound addresses for use in NewProxy messages and map updates.
         let mut plugin_addrs: HashMap<String, String> = HashMap::new();
@@ -2417,6 +2409,32 @@ impl Service {
                     // If plugin start fails, plugin_addrs won't have an entry;
                     // the proxy uses configured local_ip:local_port as fallback.
                 }
+            }
+        }
+
+        // Open/register TUN devices and spawn controllers for added and
+        // changed vnet proxies before NewProxy is sent, so a work conn that
+        // arrives immediately can find the fresh delivery channel.
+        #[cfg(feature = "vnet")]
+        for name in delta.added.iter().chain(delta.changed.iter()) {
+            if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
+                if vnet_tun_params(p, &delta.new_config.virtual_net.address).is_none() {
+                    continue;
+                }
+                if let Err(e) = self.open_vnet_tun_for_proxy(p, &delta.new_config).await {
+                    warn!(proxy_name = %name, error = %e, "reload TUN open/register failed");
+                    continue;
+                }
+                spawn_vnet_tun_controller(
+                    &self.vnet_tuns,
+                    &self.vnet_tun_tx,
+                    &self.vnet_tun_cancels,
+                    &self.vnet_controller,
+                    name,
+                    writer,
+                    v2,
+                )
+                .await;
             }
         }
 
@@ -2499,6 +2517,15 @@ impl Service {
         }
         for name in &delta.added {
             tracing::info!(name = %name, "Reload: sent NewProxy for added '{}'", name);
+        }
+
+        // Advertise vnet subnets only after the corresponding NewProxy has
+        // been sent, so the server has a proxy to associate the route with.
+        #[cfg(feature = "vnet")]
+        for name in delta.added.iter().chain(delta.changed.iter()) {
+            if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
+                send_vnet_route_advertise(writer, v2, p).await;
+            }
         }
 
         // Step 4: Update proxy_info_map so admin API and work conn lookups
@@ -2595,6 +2622,188 @@ impl Service {
         tracing::info!(summary = %summary, "Config reload summary: {}", summary);
         Ok(format!("reload success: {summary}"))
     }
+}
+
+/// Resolve the local TUN address, netmask, and MTU for a vnet proxy.
+#[cfg(feature = "vnet")]
+fn vnet_tun_params(
+    p: &frp_core::config::ProxyConfig,
+    global_address: &str,
+) -> Option<(std::net::Ipv4Addr, std::net::Ipv4Addr, u16)> {
+    let (ip, netmask, mtu) = if p.proxy_type == "vnet" && !p.vnet_ip.is_empty() {
+        (p.vnet_ip.clone(), p.vnet_netmask.clone(), p.vnet_mtu)
+    } else if p
+        .plugin
+        .as_ref()
+        .is_some_and(|pl| pl.plugin_type == "virtual_net")
+        && !global_address.is_empty()
+    {
+        (
+            global_address.to_string(),
+            "255.255.255.0".to_string(),
+            1420,
+        )
+    } else {
+        return None;
+    };
+    Some((ip.parse().ok()?, netmask.parse().ok()?, mtu))
+}
+
+/// Snapshot the vnet-relevant proxy fields that `reload::config_snapshot`
+/// currently omits, so TUN reloads also react to subnet/IP/mask changes.
+#[cfg(feature = "vnet")]
+fn vnet_proxy_snapshot(p: &frp_core::config::ProxyConfig) -> String {
+    let plugin_type = p
+        .plugin
+        .as_ref()
+        .map(|pl| pl.plugin_type.as_str())
+        .unwrap_or("");
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        p.proxy_type,
+        p.virtual_net,
+        p.advertise_subnet,
+        p.vnet_ip,
+        p.vnet_netmask,
+        p.vnet_mtu,
+        plugin_type
+    )
+}
+
+/// Compute the subnet CIDR owned by a local TUN proxy.
+#[cfg(feature = "vnet")]
+fn vnet_tun_cidr(p: &frp_core::config::ProxyConfig, global_address: &str) -> Option<String> {
+    let (ip, netmask, _) = vnet_tun_params(p, global_address)?;
+    let prefix = u32::from(netmask).count_ones();
+    if prefix > 32 {
+        return None;
+    }
+    let network = u32::from(ip) & u32::from(netmask);
+    Some(format!("{}/{}", std::net::Ipv4Addr::from(network), prefix))
+}
+
+/// Store an opened TUN device in the shared proxy maps.
+#[cfg(feature = "vnet")]
+async fn register_vnet_tun(
+    vnet_tuns: &VnetTunMap,
+    vnet_tun_names: &Arc<Mutex<HashMap<String, String>>>,
+    proxy_name: &str,
+    params: (std::net::Ipv4Addr, std::net::Ipv4Addr, u16),
+    tun: Box<dyn frp_vnet::tun::TunDevice>,
+) -> anyhow::Result<()> {
+    let tun_name = tun.name().to_string();
+    if let Err(e) = tun.configure(params.0, params.1, params.2) {
+        tracing::warn!(proxy_name = %proxy_name, error = %e, "TUN configure failed");
+    } else {
+        tracing::info!(proxy_name = %proxy_name, name = %tun_name, "TUN device ready");
+    }
+    vnet_tun_names
+        .lock()
+        .await
+        .insert(proxy_name.to_string(), tun_name);
+    vnet_tuns
+        .lock()
+        .await
+        .insert(proxy_name.to_string(), Some(tun));
+    Ok(())
+}
+
+/// Spawn the controller for a registered TUN and publish its TX channel.
+#[cfg(feature = "vnet")]
+async fn spawn_vnet_tun_controller(
+    vnet_tuns: &VnetTunMap,
+    vnet_tun_tx: &VnetTunTxMap,
+    vnet_tun_cancels: &VnetTunCancelMap,
+    vnet_controller: &Arc<frp_vnet::controller::ClientVnetController>,
+    proxy_name: &str,
+    writer: &Arc<Mutex<WriteHalf>>,
+    v2: bool,
+) -> Option<()> {
+    let tun = {
+        let mut tuns = vnet_tuns.lock().await;
+        tuns.get_mut(proxy_name)?.take()
+    }?;
+    let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(256);
+    vnet_tun_tx
+        .lock()
+        .await
+        .insert(proxy_name.to_string(), tun_tx);
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    vnet_tun_cancels
+        .lock()
+        .await
+        .insert(proxy_name.to_string(), cancel_tx);
+    let ctl_writer = writer.clone();
+    let client_controller = vnet_controller.clone();
+    let pn = proxy_name.to_string();
+    tokio::spawn(async move {
+        let ctrl = frp_vnet::controller::VnetController::new(pn.clone(), client_controller, v2);
+        tokio::select! {
+            result = ctrl.run(tun, ctl_writer, tun_rx) => {
+                if let Err(e) = result {
+                    tracing::error!(proxy_name = %pn, error = %e, "vnet controller exited with error");
+                }
+            }
+            changed = cancel_rx.changed() => {
+                if changed.is_err() || *cancel_rx.borrow() {
+                    tracing::info!(proxy_name = %pn, "vnet controller cancelled");
+                }
+            }
+        }
+        tracing::info!(proxy_name = %pn, "vnet controller stopped");
+    });
+    Some(())
+}
+
+/// Send a VnetRouteAdvertise for a `type = vnet` proxy that owns a subnet.
+#[cfg(feature = "vnet")]
+async fn send_vnet_route_advertise(
+    writer: &Arc<Mutex<WriteHalf>>,
+    v2: bool,
+    p: &frp_core::config::ProxyConfig,
+) {
+    if p.proxy_type != "vnet" || p.advertise_subnet.is_empty() {
+        return;
+    }
+    let adv = msg::VnetRouteAdvertise {
+        proxy_name: p.name.clone(),
+        subnet: p.advertise_subnet.clone(),
+        virtual_net: if p.virtual_net.is_empty() {
+            None
+        } else {
+            Some(p.virtual_net.clone())
+        },
+    };
+    let msg = FrpMessage::VnetRouteAdvertise(adv);
+    let mut w = writer.lock().await;
+    let result = write_msg(&mut *w, &msg, v2).await;
+    drop(w);
+    if let Err(e) = result {
+        tracing::warn!(proxy_name = %p.name, error = %e, "failed to send VnetRouteAdvertise");
+    } else {
+        tracing::info!(proxy_name = %p.name, subnet = %p.advertise_subnet, "VnetRouteAdvertise sent");
+    }
+}
+
+/// Drop a TUN proxy's maps, cancel its controller, and remove its routes.
+#[cfg(feature = "vnet")]
+async fn remove_vnet_tun(
+    vnet_tuns: &VnetTunMap,
+    vnet_tun_tx: &VnetTunTxMap,
+    vnet_tun_cancels: &VnetTunCancelMap,
+    vnet_tun_names: &Arc<Mutex<HashMap<String, String>>>,
+    vnet_tun_subnets: &Arc<Mutex<HashMap<String, String>>>,
+    route_table: &Arc<tokio::sync::RwLock<frp_vnet::router::RouteTable>>,
+    proxy_name: &str,
+) {
+    if let Some(cancel) = vnet_tun_cancels.lock().await.remove(proxy_name) {
+        let _ = cancel.send(true);
+    }
+    vnet_tuns.lock().await.remove(proxy_name);
+    vnet_tun_tx.lock().await.remove(proxy_name);
+    vnet_tun_names.lock().await.remove(proxy_name);
+    vnet_tun_subnets.lock().await.remove(proxy_name);
+    route_table.write().await.remove(proxy_name);
 }
 
 /// Apply the client `start` allowlist and `enabled` flag to a proxy list.
@@ -2835,7 +3044,7 @@ mod tests {
         };
         assert!(virtual_net_visitor_route_adv(&bad_ip).is_none());
 
-        // IPv6 destinations are config-valid but not yet routable.
+        // IPv6 destinations advertise a /128 host route.
         let v6 = frp_core::config::VisitorConfig {
             name: "v6".into(),
             plugin: Some(VisitorPluginConfig {
@@ -2845,7 +3054,15 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(virtual_net_visitor_route_adv(&v6).is_none());
+        let adv6 = virtual_net_visitor_route_adv(&v6).expect("IPv6 route advertisement");
+        assert_eq!(adv6.proxy_name, "v6");
+        assert_eq!(adv6.subnet, "2001:db8::1/128");
+        // VnetRouteRemove is keyed only by proxy name, so the same advertisement
+        // can be converted for both IPv4 and IPv6 destinations.
+        let _remove = msg::VnetRouteRemove {
+            proxy_name: adv6.proxy_name,
+            virtual_net: adv6.virtual_net,
+        };
     }
 
     #[test]
@@ -2930,5 +3147,302 @@ mod tests {
         let m5 = mean_delay(5, 6); // phase2, 20s (capped)
         assert!(m2 > m1, "mean delay should grow: {m2} > {m1}");
         assert!(m5 > m2, "mean delay should grow: {m5} > {m2}");
+    }
+
+    #[cfg(feature = "vnet")]
+    #[test]
+    fn vnet_tun_params_and_cidr_for_plugin_and_vnet_proxies() {
+        let plugin = frp_core::config::ProxyConfig {
+            name: "plugin".into(),
+            proxy_type: "tcp".into(),
+            plugin: Some(frp_core::config::PluginConfig {
+                plugin_type: "virtual_net".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (ip, netmask, mtu) = vnet_tun_params(&plugin, "10.0.0.1").expect("plugin TUN params");
+        assert_eq!(ip, "10.0.0.1".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(
+            netmask,
+            "255.255.255.0".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+        assert_eq!(mtu, 1420);
+        assert_eq!(
+            vnet_tun_cidr(&plugin, "10.0.0.1").as_deref(),
+            Some("10.0.0.0/24")
+        );
+
+        let vnet = frp_core::config::ProxyConfig {
+            name: "vnet".into(),
+            proxy_type: "vnet".into(),
+            vnet_ip: "10.1.2.3".into(),
+            vnet_netmask: "255.255.0.0".into(),
+            vnet_mtu: 1400,
+            ..Default::default()
+        };
+        let (ip, netmask, mtu) = vnet_tun_params(&vnet, "").expect("vnet TUN params");
+        assert_eq!(ip, "10.1.2.3".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(
+            netmask,
+            "255.255.0.0".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+        assert_eq!(mtu, 1400);
+        assert_eq!(vnet_tun_cidr(&vnet, "").as_deref(), Some("10.1.0.0/16"));
+        assert!(vnet_tun_params(&vnet, "").is_some());
+    }
+
+    #[cfg(feature = "vnet")]
+    #[test]
+    fn vnet_proxy_snapshot_detects_tun_only_changes() {
+        let base = frp_core::config::ProxyConfig {
+            name: "vnet".into(),
+            proxy_type: "vnet".into(),
+            vnet_ip: "10.0.0.1".into(),
+            vnet_netmask: "255.255.255.0".into(),
+            ..Default::default()
+        };
+        let changed_ip = frp_core::config::ProxyConfig {
+            vnet_ip: "10.0.0.2".into(),
+            ..base.clone()
+        };
+        assert_ne!(vnet_proxy_snapshot(&base), vnet_proxy_snapshot(&changed_ip));
+    }
+
+    #[cfg(feature = "vnet")]
+    struct FakeTun {
+        inner: tokio::io::DuplexStream,
+        configured: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(feature = "vnet")]
+    impl tokio::io::AsyncRead for FakeTun {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    #[cfg(feature = "vnet")]
+    impl tokio::io::AsyncWrite for FakeTun {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[cfg(feature = "vnet")]
+    impl frp_vnet::tun::TunDevice for FakeTun {
+        fn configure(
+            &self,
+            _addr: std::net::Ipv4Addr,
+            _netmask: std::net::Ipv4Addr,
+            _mtu: u16,
+        ) -> anyhow::Result<()> {
+            self.configured
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "fake"
+        }
+
+        fn mtu(&self) -> u16 {
+            1420
+        }
+    }
+
+    #[cfg(feature = "vnet")]
+    fn fake_tun() -> (Box<FakeTun>, Arc<std::sync::atomic::AtomicBool>) {
+        let configured = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tun = Box::new(FakeTun {
+            inner: tokio::io::duplex(4096).0,
+            configured: configured.clone(),
+        });
+        (tun, configured)
+    }
+
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn register_and_remove_vnet_tun_updates_all_maps() {
+        let tuns: VnetTunMap = Arc::new(Mutex::new(HashMap::new()));
+        let tx: VnetTunTxMap = Arc::new(Mutex::new(HashMap::new()));
+        let cancels: VnetTunCancelMap = Arc::new(Mutex::new(HashMap::new()));
+        let names = Arc::new(Mutex::new(HashMap::new()));
+        let subnets = Arc::new(Mutex::new(HashMap::new()));
+        let route_table = Arc::new(tokio::sync::RwLock::new(frp_vnet::router::RouteTable::new()));
+        let (tun, configured) = fake_tun();
+
+        register_vnet_tun(
+            &tuns,
+            &names,
+            "vnet-a",
+            (
+                "10.0.0.1".parse().unwrap(),
+                "255.255.255.0".parse().unwrap(),
+                1420,
+            ),
+            tun,
+        )
+        .await
+        .unwrap();
+        assert!(configured.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(tuns.lock().await.contains_key("vnet-a"));
+        assert_eq!(
+            names.lock().await.get("vnet-a").map(String::as_str),
+            Some("fake")
+        );
+
+        route_table
+            .write()
+            .await
+            .insert("vnet-a", "10.0.0.0/24")
+            .unwrap();
+        remove_vnet_tun(
+            &tuns,
+            &tx,
+            &cancels,
+            &names,
+            &subnets,
+            &route_table,
+            "vnet-a",
+        )
+        .await;
+        assert!(tuns.lock().await.is_empty());
+        assert!(tx.lock().await.is_empty());
+        assert!(cancels.lock().await.is_empty());
+        assert!(names.lock().await.is_empty());
+        assert!(subnets.lock().await.is_empty());
+        assert!(route_table.read().await.is_empty());
+    }
+
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn reload_tun_controller_rebuilds_delivery_channel() {
+        let tuns: VnetTunMap = Arc::new(Mutex::new(HashMap::new()));
+        let tx_map: VnetTunTxMap = Arc::new(Mutex::new(HashMap::new()));
+        let cancels: VnetTunCancelMap = Arc::new(Mutex::new(HashMap::new()));
+        let names = Arc::new(Mutex::new(HashMap::new()));
+        let subnets = Arc::new(Mutex::new(HashMap::new()));
+        let route_table = Arc::new(tokio::sync::RwLock::new(frp_vnet::router::RouteTable::new()));
+        let controller = Arc::new(frp_vnet::controller::ClientVnetController::new());
+        let (_peer, writer_raw) = tokio::io::duplex(4096);
+        let writer_stream: Box<dyn frp_core::transport::AsyncReadWrite> = Box::new(writer_raw);
+        let (_, writer_half) = tokio::io::split(writer_stream);
+        let writer = Arc::new(Mutex::new(frp_core::transport::WriteHalf::SshChannel(
+            writer_half,
+        )));
+
+        let (tun, _) = fake_tun();
+        register_vnet_tun(
+            &tuns,
+            &names,
+            "vnet-a",
+            (
+                "10.0.0.1".parse().unwrap(),
+                "255.255.255.0".parse().unwrap(),
+                1420,
+            ),
+            tun,
+        )
+        .await
+        .unwrap();
+        spawn_vnet_tun_controller(
+            &tuns,
+            &tx_map,
+            &cancels,
+            &controller,
+            "vnet-a",
+            &writer,
+            false,
+        )
+        .await
+        .expect("first controller should spawn");
+        let old_tx = tx_map
+            .lock()
+            .await
+            .get("vnet-a")
+            .cloned()
+            .expect("first delivery channel");
+
+        remove_vnet_tun(
+            &tuns,
+            &tx_map,
+            &cancels,
+            &names,
+            &subnets,
+            &route_table,
+            "vnet-a",
+        )
+        .await;
+        assert!(tx_map.lock().await.is_empty());
+
+        let (tun, _) = fake_tun();
+        register_vnet_tun(
+            &tuns,
+            &names,
+            "vnet-a",
+            (
+                "10.0.0.2".parse().unwrap(),
+                "255.255.255.0".parse().unwrap(),
+                1420,
+            ),
+            tun,
+        )
+        .await
+        .unwrap();
+        spawn_vnet_tun_controller(
+            &tuns,
+            &tx_map,
+            &cancels,
+            &controller,
+            "vnet-a",
+            &writer,
+            false,
+        )
+        .await
+        .expect("second controller should spawn");
+        let new_tx = tx_map
+            .lock()
+            .await
+            .get("vnet-a")
+            .cloned()
+            .expect("rebuilt delivery channel");
+        assert!(
+            !old_tx.same_channel(&new_tx),
+            "reload must not reuse the old TUN delivery channel"
+        );
+
+        remove_vnet_tun(
+            &tuns,
+            &tx_map,
+            &cancels,
+            &names,
+            &subnets,
+            &route_table,
+            "vnet-a",
+        )
+        .await;
     }
 }

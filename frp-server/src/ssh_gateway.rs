@@ -841,6 +841,8 @@ async fn handle_work_conn_requests(mut work_rx: mpsc::Receiver<WorkConnRequest>,
 
 /// Clean up a disconnected SSH session: remove all registered proxies.
 pub async fn cleanup_session(run_id: &str, state: &Arc<AppState>) {
+    #[cfg(feature = "vnet")]
+    state.remove_run_id_vnet_routes(run_id).await;
     state.proxy_manager.remove_client(run_id).await;
     tracing::info!(run_id = %run_id, "SSH session {} cleaned up", run_id);
 }

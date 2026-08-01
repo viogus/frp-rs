@@ -478,7 +478,9 @@ to remote `virtual_net` visitors. It does not bind a local listener. When the
 server assigns a work connection to this proxy, frpc hands the connection to
 the vnet controller: bytes from the remote tunnel are written into the local
 TUN, and the remote source IP is registered so TUN return packets go back over
-the same work connection.
+the same work connection. The proxy's `use_encryption`/`use_compression`
+transport settings are applied to the work-connection byte stream, and config
+reload re-creates the TUN device for added or changed `virtual_net` proxies.
 
 ```toml
 [virtualNet]
@@ -519,8 +521,9 @@ destinationIP = "100.86.0.1"
 
 Requires `[feature] VirtualNet = true` and the `vnet` build feature (on by
 default). frp-rs parses, validates, advertises/removes the `destinationIP`
-route over the control connection, and forwards inbound `VnetPacket`s into
-the STCP/XTCP visitor tunnel. The visitor tunnel is a no-bind tunnel: raw IP
-packets are written into it, and return traffic arriving on the tunnel is
-delivered through the same TUN channels used by control-connection
-`VnetPacket`s to local TUN-backed vnet proxies.
+route (IPv4 `/32` or IPv6 `/128`) over the control connection, and forwards
+inbound `VnetPacket`s into the STCP/XTCP visitor tunnel. The visitor tunnel is
+a no-bind tunnel: raw IP packets are written into it with the visitor's
+`use_encryption`/`use_compression` settings applied, and return traffic
+arriving on the tunnel is delivered to the local TUN whose subnet contains the
+packet destination instead of being broadcast to every TUN.

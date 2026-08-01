@@ -3,13 +3,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 #[cfg(feature = "vnet")]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
 use frp_core::msg::{self, FrpMessage};
-use frp_core::transport::{dial_server, DialOptions, TransportProtocol};
+use frp_core::transport::{dial_server, DialOptions, IoStream, TransportProtocol};
 
 #[cfg(feature = "vnet")]
 type VnetTunTxMap = Arc<tokio::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
@@ -78,9 +77,97 @@ pub(crate) struct VirtualNetVisitorConfig {
     /// forwarded into the local TUN-backed vnet proxy so return traffic from
     /// a remote `virtual_net` plugin reaches the local TUN.
     pub vnet_tun_tx: VnetTunTxMap,
+    /// Proxy name → subnet CIDR used to direct tunnel ingress packets to the
+    /// correct local TUN instead of broadcasting to every TUN.
+    pub tun_subnets: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     /// Graceful shutdown signal. When true, the tunnel exits and the route is
     /// unregistered.
     pub shutdown: Arc<AtomicBool>,
+}
+
+/// Run the packet loop over an established `virtual_net` visitor tunnel.
+///
+/// After the NewVisitorConn handshake, tunnel bytes are wrapped in the same
+/// compress → encrypt / decrypt → decompress pipeline used by work conns.
+#[cfg(feature = "vnet")]
+#[allow(clippy::too_many_arguments)]
+async fn run_virtual_net_tunnel_io(
+    server_conn: IoStream,
+    name: String,
+    packet_rx: mpsc::Receiver<Vec<u8>>,
+    vnet_tun_tx: VnetTunTxMap,
+    tun_subnets: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    shutdown: Arc<AtomicBool>,
+    use_encryption: bool,
+    use_compression: bool,
+    key: [u8; 16],
+) {
+    let mut packet_rx = packet_rx;
+    let (server_r, server_w) = match server_conn.into_split() {
+        Ok(parts) => parts,
+        Err(e) => {
+            warn!(visitor_name = %name, error = %e, "virtual_net visitor tunnel split failed: {}", e);
+            return;
+        }
+    };
+    let server_r: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if use_encryption {
+        Box::new(frp_core::cipher_stream::CipherReader::new(server_r, key))
+    } else {
+        Box::new(server_r)
+    };
+    let mut packet_reader = crate::work_conn::TunnelPacketReader::new(server_r, use_compression);
+    let mut packet_writer = if use_encryption {
+        crate::work_conn::TunnelPacketWriter::Encrypted(frp_core::cipher_stream::CipherWriter::new(
+            server_w, key,
+        ))
+    } else {
+        crate::work_conn::TunnelPacketWriter::Plain(server_w)
+    };
+    if let Err(e) = packet_writer.flush().await {
+        warn!(visitor_name = %name, error = %e, "virtual_net visitor tunnel IV flush failed: {}", e);
+        return;
+    }
+
+    let mut tunnel_closed = false;
+    while !tunnel_closed {
+        tokio::select! {
+            _ = wait_for_shutdown_signal(&shutdown) => {
+                info!(visitor_name = %name, "virtual_net visitor '{}' shutting down", name);
+                break;
+            }
+            packet = packet_rx.recv() => {
+                match packet {
+                    Some(pkt) => {
+                        if let Err(e) = packet_writer.write_packet(&pkt, use_compression).await {
+                            warn!(visitor_name = %name, error = %e, "virtual_net visitor '{}': tunnel write error: {}", name, e);
+                            tunnel_closed = true;
+                        }
+                    }
+                    None => {
+                        debug!(visitor_name = %name, "virtual_net visitor packet channel closed");
+                        tunnel_closed = true;
+                    }
+                }
+            }
+            packet = packet_reader.next_packet() => {
+                match packet {
+                    Ok(None) => {
+                        debug!(visitor_name = %name, "virtual_net visitor tunnel closed by peer");
+                        tunnel_closed = true;
+                    }
+                    Ok(Some(pkt)) => {
+                        if !deliver_tunnel_ingress(&name, pkt, &vnet_tun_tx, &tun_subnets).await {
+                            debug!(visitor_name = %name, "virtual_net visitor tunnel ingress bytes have no TUN target");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(visitor_name = %name, error = %e, "virtual_net visitor '{}': tunnel read error: {}", name, e);
+                        tunnel_closed = true;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Run an STCP/XTCP visitor listener.
@@ -730,6 +817,7 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         destination_cidr,
         controller,
         vnet_tun_tx,
+        tun_subnets,
         shutdown,
     } = config;
 
@@ -808,7 +896,7 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
             }
         }
 
-        let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(256);
         if let Err(e) = controller
             .register_visitor_route(&name, &destination_cidr, packet_tx)
             .await
@@ -827,51 +915,19 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
             destination_cidr
         );
 
-        let mut buf = vec![0u8; 1420];
-        let mut tunnel_closed = false;
-        while !tunnel_closed {
-            tokio::select! {
-                _ = wait_for_shutdown_signal(&shutdown) => {
-                    info!(visitor_name = %name, "Virtual net visitor '{}' shutting down", name);
-                    break;
-                }
-                packet = packet_rx.recv() => {
-                    match packet {
-                        Some(pkt) => {
-                            if let Err(e) = server_conn.write_all(&pkt).await {
-                                warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': tunnel write error: {}", name, e);
-                                tunnel_closed = true;
-                            }
-                        }
-                        None => {
-                            debug!(visitor_name = %name, "Virtual net visitor packet channel closed");
-                            tunnel_closed = true;
-                        }
-                    }
-                }
-                n = server_conn.read(&mut buf) => {
-                    match n {
-                        Ok(0) => {
-                            debug!(visitor_name = %name, "Virtual net visitor tunnel closed by peer");
-                            tunnel_closed = true;
-                        }
-                        Ok(n) => {
-                            // Return traffic sent by the remote provider on the
-                            // tunnel is delivered through the same TUN channels
-                            // used by control-connection VnetPackets.
-                            if !deliver_tunnel_ingress(&name, buf[..n].to_vec(), &vnet_tun_tx).await
-                            {
-                                debug!(visitor_name = %name, n = %n, "Virtual net visitor tunnel ingress bytes have no TUN target");
-                            }
-                        }
-                        Err(e) => {
-                            warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': tunnel read error: {}", name, e);
-                            tunnel_closed = true;
-                        }
-                    }
-                }
-            }
-        }
+        let key = frp_core::encryption::derive_key(&secret_key);
+        run_virtual_net_tunnel_io(
+            server_conn,
+            name.clone(),
+            packet_rx,
+            vnet_tun_tx.clone(),
+            tun_subnets.clone(),
+            shutdown.clone(),
+            use_encryption,
+            use_compression,
+            key,
+        )
+        .await;
 
         controller.unregister_visitor_route(&name).await;
         info!(visitor_name = %name, "Virtual net visitor '{}' tunnel closed, route removed", name);
@@ -893,23 +949,62 @@ async fn deliver_tunnel_ingress(
     visitor_name: &str,
     packet: Vec<u8>,
     vnet_tun_tx: &VnetTunTxMap,
+    tun_subnets: &Arc<tokio::sync::Mutex<HashMap<String, String>>>,
 ) -> bool {
     let txs = vnet_tun_tx.lock().await;
+    let subnets = tun_subnets.lock().await;
+    let dst = frp_vnet::router::packet_dst_ip(&packet);
     let mut delivered = false;
     for (proxy, tx) in txs.iter() {
-        match tx.try_send(packet.clone()) {
-            Ok(()) => delivered = true,
+        let matched = dst.as_ref().is_some_and(|ip| {
+            subnets.get(proxy).is_some_and(|cidr| {
+                let mut rt = frp_vnet::router::RouteTable::new();
+                rt.insert(proxy, cidr)
+                    .is_ok_and(|_| rt.lookup(ip) == Some(proxy))
+            })
+        });
+        if matched {
+            match tx.try_send(packet.clone()) {
+                Ok(()) => delivered = true,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        visitor_name = %visitor_name,
+                        proxy_name = %proxy,
+                        "virtual_net visitor TUN queue full; dropping packet"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            }
+        }
+    }
+    if delivered {
+        return true;
+    }
+
+    // No subnet matched. A single local TUN is unambiguous and receives the
+    // packet; multiple TUNs would make the target ambiguous, so drop instead
+    // of broadcasting (the pre-fix behavior).
+    let open: Vec<&mpsc::Sender<Vec<u8>>> = txs.values().filter(|tx| !tx.is_closed()).collect();
+    if open.len() == 1 {
+        match open[0].try_send(packet) {
+            Ok(()) => return true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 warn!(
                     visitor_name = %visitor_name,
-                    proxy_name = %proxy,
                     "virtual_net visitor TUN queue full; dropping packet"
                 );
+                return true;
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
         }
     }
-    delivered
+    if open.len() > 1 {
+        warn!(
+            visitor_name = %visitor_name,
+            "virtual_net visitor ingress packet has no subnet match; dropping instead of broadcasting"
+        );
+    }
+    false
 }
 
 /// Wait for `shutdown` or `delay`, whichever comes first. Returns `true` when
@@ -1037,31 +1132,148 @@ fn list_local_ips() -> Vec<String> {
 #[cfg(all(test, feature = "vnet"))]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn tunnel_ingress_delivers_to_local_tun_channels() {
         let txs: VnetTunTxMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let subnets: Arc<tokio::sync::Mutex<HashMap<String, String>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(16);
         txs.lock().await.insert("tun-proxy".to_string(), tx);
+        subnets
+            .lock()
+            .await
+            .insert("tun-proxy".to_string(), "10.0.0.0/24".to_string());
 
         assert!(
-            deliver_tunnel_ingress("vnet-visitor", vec![0x45], &txs).await,
-            "open TUN channel must accept the packet"
+            deliver_tunnel_ingress("vnet-visitor", vec![0x45], &txs, &subnets).await,
+            "single open TUN channel must accept an unmatched packet as fallback"
         );
         assert_eq!(rx.recv().await, Some(vec![0x45]));
 
         let (closed_tx, closed_rx) = mpsc::channel::<Vec<u8>>(16);
         txs.lock().await.insert("gone-tun".to_string(), closed_tx);
+        subnets
+            .lock()
+            .await
+            .insert("gone-tun".to_string(), "10.0.1.0/24".to_string());
         drop(closed_rx);
         assert!(
-            deliver_tunnel_ingress("vnet-visitor", vec![0x46], &txs).await,
+            deliver_tunnel_ingress("vnet-visitor", vec![0x46], &txs, &subnets).await,
             "an open channel still counts as delivered"
         );
 
         let empty: VnetTunTxMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let empty_subnets: Arc<tokio::sync::Mutex<HashMap<String, String>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         assert!(
-            !deliver_tunnel_ingress("vnet-visitor", vec![0x47], &empty).await,
+            !deliver_tunnel_ingress("vnet-visitor", vec![0x47], &empty, &empty_subnets).await,
             "no TUN target must report undelivered"
         );
+    }
+
+    #[tokio::test]
+    async fn tunnel_ingress_directs_by_ip_family_subnet() {
+        let txs: VnetTunTxMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let subnets: Arc<tokio::sync::Mutex<HashMap<String, String>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (tx4, mut rx4) = mpsc::channel::<Vec<u8>>(16);
+        let (tx6, mut rx6) = mpsc::channel::<Vec<u8>>(16);
+        txs.lock().await.insert("tun-v4".to_string(), tx4);
+        txs.lock().await.insert("tun-v6".to_string(), tx6);
+        subnets
+            .lock()
+            .await
+            .insert("tun-v4".to_string(), "10.0.0.0/24".to_string());
+        subnets
+            .lock()
+            .await
+            .insert("tun-v6".to_string(), "2001:db8::/64".to_string());
+
+        let v4 = vec![
+            0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, 10, 0, 0, 2,
+            10, 0, 0, 5,
+        ];
+        let v6 = vec![
+            0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x20, 0x01, 0x0d, 0xb8,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
+        ];
+
+        assert!(deliver_tunnel_ingress("vnet-visitor", v4.clone(), &txs, &subnets).await);
+        assert_eq!(rx4.recv().await, Some(v4));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx6.recv())
+                .await
+                .is_err(),
+            "IPv4 packet must not be broadcast to the IPv6 TUN"
+        );
+
+        assert!(deliver_tunnel_ingress("vnet-visitor", v6.clone(), &txs, &subnets).await);
+        assert_eq!(rx6.recv().await, Some(v6));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx4.recv())
+                .await
+                .is_err(),
+            "IPv6 packet must not be broadcast to the IPv4 TUN"
+        );
+    }
+
+    #[cfg(feature = "compression")]
+    #[tokio::test]
+    async fn virtual_net_tunnel_io_wraps_encrypted_compressed_bytes() {
+        let key = frp_core::encryption::derive_key("visitor-secret");
+        let (server, mut peer) = tokio::io::duplex(8192);
+        let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(16);
+        let txs: VnetTunTxMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let subnets: Arc<tokio::sync::Mutex<HashMap<String, String>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(16);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        txs.lock().await.insert("tun-v4".to_string(), tun_tx);
+        subnets
+            .lock()
+            .await
+            .insert("tun-v4".to_string(), "10.0.0.0/24".to_string());
+
+        let task = tokio::spawn(run_virtual_net_tunnel_io(
+            frp_core::transport::IoStream::SshChannel(Box::new(server)),
+            "vnet-visitor".to_string(),
+            packet_rx,
+            txs,
+            subnets,
+            shutdown,
+            true,
+            true,
+            key,
+        ));
+
+        let inbound = vec![
+            0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, 10, 0, 0, 2,
+            10, 0, 0, 5,
+        ];
+        let mut compressed = Vec::new();
+        frp_core::encryption::compress_into(&inbound, &mut compressed).unwrap();
+        let wire = frp_core::encryption::encrypt(&compressed, &key).unwrap();
+        peer.write_all(&wire).await.unwrap();
+        assert_eq!(tun_rx.recv().await, Some(inbound.clone()));
+
+        packet_tx.send(inbound.clone()).await.unwrap();
+        let mut raw = vec![0u8; wire.len()];
+        peer.read_exact(&mut raw).await.unwrap();
+        assert_ne!(raw, wire);
+        let decrypted = frp_core::encryption::decrypt(&raw, &key).unwrap();
+        assert_eq!(
+            frp_core::encryption::decompress(&decrypted).unwrap(),
+            inbound
+        );
+
+        drop(packet_tx);
+        drop(peer);
+        let _ = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap();
     }
 }

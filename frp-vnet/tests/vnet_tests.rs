@@ -1,5 +1,5 @@
 use frp_vnet::router::RouteTable;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 #[test]
 fn test_route_table_integration() {
@@ -10,11 +10,17 @@ fn test_route_table_integration() {
     rt.insert("client-b", "10.0.1.0/24").unwrap();
 
     // Packets for client-a's subnet
-    assert_eq!(rt.lookup(&Ipv4Addr::new(10, 0, 0, 42)), Some("client-a"));
+    assert_eq!(
+        rt.lookup(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42))),
+        Some("client-a")
+    );
     // Packets for client-b's subnet
-    assert_eq!(rt.lookup(&Ipv4Addr::new(10, 0, 1, 99)), Some("client-b"));
+    assert_eq!(
+        rt.lookup(&IpAddr::V4(Ipv4Addr::new(10, 0, 1, 99))),
+        Some("client-b")
+    );
     // Packets for unknown subnet
-    assert_eq!(rt.lookup(&Ipv4Addr::new(192, 168, 1, 1)), None);
+    assert_eq!(rt.lookup(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))), None);
 }
 
 #[test]
