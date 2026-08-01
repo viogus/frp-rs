@@ -23,7 +23,7 @@ use tracing::debug;
 
 use frp_core::config::PluginConfig;
 #[cfg(feature = "tls")]
-use frp_core::transport::{build_tls_acceptor, build_tls_connector};
+use frp_core::transport::{build_tls_acceptor, build_tls_connector_skip_verify};
 
 #[cfg(feature = "tls")]
 use super::serve_plugin;
@@ -47,17 +47,28 @@ pub async fn start_https2https_plugin(cfg: &PluginConfig) -> Result<PluginHandle
         ));
     }
     let host_rewrite = cfg.host_header_rewrite.clone();
+    let request_headers = cfg.request_headers.clone();
     let tls_acceptor = build_tls_acceptor(&cfg.crt_file, &cfg.key_file, None)?;
-    let tls_connector = build_tls_connector(None, None, None).map_err(|e| {
+    // Go frp compat (https2https.go:45): the HTTPS backend is connected with
+    // InsecureSkipVerify — frp does not validate the backend certificate.
+    let tls_connector = build_tls_connector_skip_verify(None, None, None).map_err(|e| {
         frp_core::Error::Transport(format!("https2https plugin: TLS connector: {e}").into())
     })?;
     serve_plugin(
         "https2https",
-        (target_addr, host_rewrite, tls_acceptor, tls_connector),
-        |tcp, peer, (target, rewrite, acceptor, connector)| async move {
+        (
+            target_addr,
+            host_rewrite,
+            request_headers,
+            tls_acceptor,
+            tls_connector,
+        ),
+        |tcp, peer, (target, rewrite, headers, acceptor, connector)| async move {
             match acceptor.accept(tcp).await {
                 Ok(client_tls) => {
-                    if let Err(e) = handle_conn(client_tls, &target, &rewrite, &connector).await {
+                    if let Err(e) = handle_conn(client_tls, &target, &rewrite, &headers, &connector)
+                        .await
+                    {
                         debug!(%peer, error = %e, "https2https: {peer} error: {e}");
                     }
                 }
@@ -82,9 +93,15 @@ async fn handle_conn(
     mut client_tls: tokio_rustls::server::TlsStream<TcpStream>,
     target: &str,
     host_rewrite: &str,
+    request_headers: &std::collections::HashMap<String, String>,
     tls_connector: &tokio_rustls::TlsConnector,
 ) -> Result<(), String> {
-    let fwd = crate::plugin::read_request_and_build_forward(&mut client_tls, host_rewrite).await?;
+    let fwd = crate::plugin::read_request_and_build_forward(
+        &mut client_tls,
+        host_rewrite,
+        request_headers,
+    )
+    .await?;
 
     // Connect to HTTPS backend
     let (host, port) = split_host_port(target);
