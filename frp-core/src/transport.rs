@@ -2900,7 +2900,7 @@ where
         crate::Error::Transport("WS raw connect: timeout waiting for 101 response".into())
     })??;
 
-    let mut ws = if leftover.is_empty() {
+    let ws = if leftover.is_empty() {
         WsByteStream::from_raw(Box::new(stream), true)
     } else {
         // Go frps may pipeline the first WS frame in the same TCP segment
