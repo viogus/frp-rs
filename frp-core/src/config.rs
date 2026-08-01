@@ -35,7 +35,7 @@ pub struct ServerConfig {
     /// proxies share this port via HTTP CONNECT Host header routing.
     #[serde(default, alias = "tcpmuxHTTPConnectPort")]
     pub tcpmux_httpconnect_port: u16,
-    #[serde(default)]
+    #[serde(default, alias = "subDomainHost")]
     pub sub_domain_host: String,
     #[serde(default, alias = "websocketPort")]
     #[cfg(feature = "websocket")]
@@ -59,7 +59,7 @@ pub struct ServerConfig {
     pub auth: AuthServerConfig,
     #[serde(default)]
     pub log: LogConfig,
-    #[serde(default)]
+    #[serde(default, alias = "webServer")]
     pub web_server: WebServerConfig,
     #[serde(default)]
     pub transport: ServerTransportConfig,
@@ -79,7 +79,7 @@ pub struct ServerConfig {
     pub max_ports_per_client: u64,
     /// Timeout in seconds for backend HTTP response in VHost handler.
     /// Go frp compat: VhostHTTPTimeout. Default: 60.
-    #[serde(default = "default_vhost_http_timeout")]
+    #[serde(default = "default_vhost_http_timeout", alias = "vhostHTTPTimeout")]
     pub vhost_http_timeout: u64,
     /// Idle timeout in seconds on user-facing proxy connections.
     /// Go frp compat: UserConnTimeout. Default: 10.
@@ -88,7 +88,7 @@ pub struct ServerConfig {
     /// When true (default), internal error details are included in client-facing
     /// error responses. When false, generic messages replace full details.
     /// Go frp compat: detailedErrorsToClient. Default: true.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "detailedErrorsToClient")]
     pub detailed_errors_to_client: bool,
     /// Maximum time in seconds to wait for active connections to drain
     /// during graceful shutdown. After this timeout, remaining connections
@@ -98,7 +98,7 @@ pub struct ServerConfig {
     /// When tcp_mux is enabled and yamux init fails, forward raw bytes
     /// to the VHost handler instead of closing the connection.
     /// Go frp compat: TCPMuxPassthrough. Default: false.
-    #[serde(default)]
+    #[serde(default, alias = "tcpmuxPassthrough")]
     pub tcp_mux_passthrough: bool,
     /// UDP packet buffer size in bytes. Controls the receive buffer for UDP
     /// proxy datagrams. Default: 1500 (Go frp compat).
@@ -108,10 +108,10 @@ pub struct ServerConfig {
     /// Server-side HTTP plugin configurations. Each plugin is an external
     /// HTTP service called on lifecycle events (login, new_proxy, close_proxy).
     /// Go frp compat: http_plugins.
-    #[serde(default)]
+    #[serde(default, alias = "httpPlugins")]
     pub http_plugins: Vec<HttpPluginConfig>,
     /// Experimental feature gates. Go frp compat: [feature] section.
-    #[serde(default)]
+    #[serde(default, alias = "featureGates")]
     pub feature: FeatureConfig,
     /// Config file include patterns. Each entry is a glob pattern for
     /// additional TOML/INI config files to merge. Relative to the main
@@ -440,9 +440,9 @@ pub struct AuthServerConfig {
     pub oidc_audience: String,
     #[serde(default)]
     pub oidc_token_endpoint: String,
-    #[serde(default, alias = "oidcSkipExpiry")]
+    #[serde(default, alias = "oidcSkipExpiry", alias = "oidcSkipExpiryCheck")]
     pub oidc_skip_expiry: bool,
-    #[serde(default, alias = "oidcSkipIssuer")]
+    #[serde(default, alias = "oidcSkipIssuer", alias = "oidcSkipIssuerCheck")]
     pub oidc_skip_issuer: bool,
     #[serde(default, alias = "oidcSkipNbf")]
     pub oidc_skip_nbf: bool,
@@ -453,7 +453,7 @@ pub struct AuthServerConfig {
     /// Additional auth scopes: "HeartBeats", "NewWorkConns".
     /// When listed, corresponding message types require authentication.
     /// Go frp compat: additionalAuthScopes.
-    #[serde(default, alias = "additionalAuthScopes")]
+    #[serde(default, alias = "additionalAuthScopes", alias = "additionalScopes")]
     pub additional_auth_scopes: Vec<String>,
     /// Maximum allowed clock skew for timestamp-based replay protection,
     /// in seconds. 0 disables the check. Default: 15.
@@ -508,7 +508,7 @@ pub struct LogConfig {
     /// Both `to` and `file` are accepted; `file` takes precedence.
     #[serde(default = "default_log_file", alias = "to")]
     pub file: String,
-    #[serde(default = "default_max_days")]
+    #[serde(default = "default_max_days", alias = "maxDays")]
     pub max_days: i32,
 }
 
@@ -583,7 +583,7 @@ pub struct WebServerConfig {
     pub user: String,
     #[serde(default)]
     pub password: String,
-    #[serde(default)]
+    #[serde(default, alias = "enablePrometheus")]
     pub enable_prometheus: bool,
     /// TLS certificate file path. When both tls_cert_file and tls_key_file
     /// are non-empty, dashboard/admin server starts with TLS.
@@ -762,7 +762,7 @@ pub struct PluginConfig {
     pub http_user: String,
     #[serde(default, alias = "httpPassword")]
     pub http_password: String,
-    #[serde(default, alias = "localAddr")]
+    #[serde(default, alias = "localAddr", alias = "unixPath")]
     pub local_addr: String,
     #[serde(default, alias = "localPath")]
     pub local_path: String,
@@ -770,15 +770,25 @@ pub struct PluginConfig {
     pub strip_prefix: String,
     #[serde(default, alias = "hostHeaderRewrite")]
     pub host_header_rewrite: String,
-    #[serde(default)]
+    #[serde(default, alias = "user")]
     pub username: String,
-    #[serde(default)]
+    #[serde(default, alias = "passwd")]
     pub password: String,
     /// TLS certificate file for plugin listener (https2http, https2https).
-    #[serde(default, alias = "pluginCrtPath", alias = "plugin_crt_path")]
+    #[serde(
+        default,
+        alias = "pluginCrtPath",
+        alias = "plugin_crt_path",
+        alias = "crtPath"
+    )]
     pub crt_file: String,
     /// TLS key file for plugin listener (https2http, https2https).
-    #[serde(default, alias = "pluginKeyPath", alias = "plugin_key_path")]
+    #[serde(
+        default,
+        alias = "pluginKeyPath",
+        alias = "plugin_key_path",
+        alias = "keyPath"
+    )]
     pub key_file: String,
     /// Server name for STCP/XTCP visitor plugin (Go frp compat: serverName).
     #[serde(default, alias = "serverName")]
@@ -854,7 +864,7 @@ pub struct AuthClientConfig {
     /// Additional auth scopes: "HeartBeats", "NewWorkConns".
     /// Client-side scopes, unioned with server's scopes.
     /// Go frp compat: additionalAuthScopes.
-    #[serde(default, alias = "additionalAuthScopes")]
+    #[serde(default, alias = "additionalAuthScopes", alias = "additionalScopes")]
     pub additional_auth_scopes: Vec<String>,
     /// Maximum allowed clock skew for timestamp-based replay protection
     /// (server-side only; client ignores this field). 0 disables the check.
@@ -954,7 +964,7 @@ pub struct ClientConfig {
     pub log: LogConfig,
     #[serde(default = "default_true", alias = "loginFailExit")]
     pub login_fail_exit: bool,
-    #[serde(default = "default_pool_count")]
+    #[serde(default = "default_pool_count", alias = "poolCount")]
     pub pool_count: i32,
     /// Ping interval in seconds. Client sends a heartbeat Ping at this
     /// interval. Default: 30. Go frp compat: transport.heartbeatInterval.
@@ -994,10 +1004,10 @@ pub struct ClientConfig {
     pub proxies: Vec<ProxyConfig>,
     #[serde(default)]
     pub visitors: Vec<VisitorConfig>,
-    #[serde(default)]
+    #[serde(default, alias = "webServer")]
     pub web_server: WebServerConfig,
     /// Experimental feature gates. Go frp compat: [feature] section.
-    #[serde(default)]
+    #[serde(default, alias = "featureGates")]
     pub feature: FeatureConfig,
     /// UDP packet buffer size in bytes. Controls the receive buffer for UDP
     /// proxy datagrams. Default: 1500 (Go frp compat).
@@ -1131,21 +1141,21 @@ pub struct ProxyConfig {
     pub name: String,
     #[serde(rename = "type")]
     pub proxy_type: String,
-    #[serde(default = "default_local_ip", alias = "localIp")]
+    #[serde(default = "default_local_ip", alias = "localIp", alias = "localIP")]
     pub local_ip: String,
-    #[serde(default)]
+    #[serde(default, alias = "localPort")]
     pub local_port: u16,
     #[serde(default, alias = "remotePort")]
     pub remote_port: u16,
-    #[serde(default)]
+    #[serde(default, alias = "useEncryption")]
     pub use_encryption: bool,
-    #[serde(default)]
+    #[serde(default, alias = "useCompression")]
     pub use_compression: bool,
     #[serde(default, alias = "secretKey")]
     pub sk: String,
     #[serde(default)]
     pub plugin: Option<PluginConfig>,
-    #[serde(default)]
+    #[serde(default, alias = "customDomains")]
     pub custom_domains: Vec<String>,
     #[serde(default)]
     pub subdomain: String,
@@ -1173,7 +1183,7 @@ pub struct ProxyConfig {
     pub bandwidth_limit_mode: String,
     #[serde(default)]
     pub annotations: std::collections::HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, alias = "metadatas")]
     pub metas: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub multiplexer: String,
@@ -1246,7 +1256,7 @@ pub struct VisitorConfig {
     #[serde(default, alias = "serverUser")]
     pub server_user: String,
     /// Local address to bind for accepting connections.
-    #[serde(default = "default_visitor_bind_addr")]
+    #[serde(default = "default_visitor_bind_addr", alias = "bindAddr")]
     pub bind_addr: String,
     /// Local port for the visitor listener. 0 = disabled, -1 = no-bind (do not
     /// listen locally), positive values start a local listener. Go frp uses `int`
@@ -1255,7 +1265,7 @@ pub struct VisitorConfig {
     pub bind_port: i32,
     /// Fallback timeout in milliseconds before switching from XTCP to STCP.
     /// Go frp compat: fallbackTimeoutMs. Default: 1000 (1 second, Go frp compat)
-    #[serde(default = "default_fallback_timeout_ms")]
+    #[serde(default = "default_fallback_timeout_ms", alias = "fallbackTimeoutMs")]
     pub fallback_timeout_ms: u64,
     /// Fallback visitor name if this one fails.
     #[serde(default, alias = "fallbackTo")]
@@ -1266,10 +1276,10 @@ pub struct VisitorConfig {
     #[serde(default, alias = "disableAssistedAddrs")]
     pub disable_assisted_addrs: bool,
     /// Encrypt the tunnel traffic.
-    #[serde(default)]
+    #[serde(default, alias = "useEncryption")]
     pub use_encryption: bool,
     /// Compress the tunnel traffic.
-    #[serde(default)]
+    #[serde(default, alias = "useCompression")]
     pub use_compression: bool,
     /// Keep XTCP tunnel open after connection ends. When true, the
     /// visitor retries NAT hole punching instead of falling back to STCP.
@@ -1627,6 +1637,41 @@ fn normalize_server_config(value: &mut toml::Value) {
             }
         }
 
+        // Rename canonical Go camelCase section names.
+        if let Some(v) = table.remove("webServer") {
+            table.entry("web_server").or_insert(v);
+        }
+        if let Some(v) = table.remove("featureGates") {
+            table.entry("feature").or_insert(v);
+        }
+
+        // Rename canonical Go camelCase section names.
+        if let Some(v) = table.remove("webServer") {
+            table.entry("web_server").or_insert(v);
+        }
+        if let Some(v) = table.remove("httpPlugins") {
+            table.entry("http_plugins").or_insert(v);
+        }
+        if let Some(v) = table.remove("featureGates") {
+            table.entry("feature").or_insert(v);
+        }
+
+        // Go allowPorts is an array of {start,end} ranges; normalize to the
+        // existing comma-separated "start-end" string form.
+        if let Some(Value::Array(ranges)) = table.remove("allowPorts") {
+            let mut parts = Vec::new();
+            for range in ranges {
+                if let Some(t) = range.as_table() {
+                    let start = t.get("start").and_then(Value::as_integer).unwrap_or(0);
+                    let end = t.get("end").and_then(Value::as_integer).unwrap_or(start);
+                    parts.push(format!("{start}-{end}"));
+                }
+            }
+            if !parts.is_empty() {
+                table.insert("allow_ports".to_string(), Value::String(parts.join(",")));
+            }
+        }
+
         // Move bare `token` into [auth] table as well
         if let Some(v) = table.remove("token") {
             let auth_table = table
@@ -1665,6 +1710,7 @@ fn normalize_server_config(value: &mut toml::Value) {
                 "web_server_password",
                 "web_server_enable_prometheus",
                 "enable_prometheus",
+                "enablePrometheus",
                 "web_server_tls_cert_file",
                 "web_server_tls_key_file",
             ],
@@ -1750,7 +1796,9 @@ fn normalize_server_config(value: &mut toml::Value) {
                         "audience" => "oidc_audience",
                         "tokenEndpointUrl" | "tokenEndpointURL" => "oidc_token_endpoint",
                         "skipExpiry" => "oidc_skip_expiry",
+                        "skipExpiryCheck" => "oidc_skip_expiry",
                         "skipIssuer" => "oidc_skip_issuer",
+                        "skipIssuerCheck" => "oidc_skip_issuer",
                         "skipNbf" => "oidc_skip_nbf",
                         "proxyURL" => "oidc_proxy_url",
                         "additionalAuthScopes" => "additional_auth_scopes",
@@ -1901,9 +1949,33 @@ fn normalize_client_config(value: &mut toml::Value) {
                         "heartbeatInterval" => "heartbeat_interval",
                         "heartbeatTimeout" => "heartbeat_timeout",
                         "dialServerTimeout" => "dial_server_timeout",
+                        "poolCount" => "pool_count",
                         other => other,
                     };
                     table.entry(flat_key.to_string()).or_insert(v);
+                }
+            }
+        }
+
+        // Flatten canonical Go [auth.oidc] sub-table → auth.oidc_* flat fields.
+        if let Some(toml::Value::Table(ref mut auth_table)) = table.get_mut("auth") {
+            if let Some(toml::Value::Table(oidc_table)) = auth_table.remove("oidc") {
+                for (k, v) in oidc_table {
+                    let flat_key = match k.as_str() {
+                        "clientID" => "oidc_client_id",
+                        "clientSecret" => "oidc_client_secret",
+                        "audience" => "oidc_audience",
+                        "tokenEndpointUrl" | "tokenEndpointURL" => "oidc_token_endpoint",
+                        "scope" => "oidc_scope",
+                        "issuer" => "oidc_issuer",
+                        "additionalEndpointParams" => "additional_endpoint_params",
+                        "trustedCaFile" => "oidc_tls_trusted_ca_file",
+                        "insecureSkipVerify" => "oidc_tls_insecure_skip_verify",
+                        "proxyURL" => "oidc_proxy_url",
+                        "additionalAuthScopes" => "additional_auth_scopes",
+                        other => other,
+                    };
+                    auth_table.entry(flat_key.to_string()).or_insert(v);
                 }
             }
         }
@@ -1935,6 +2007,7 @@ fn normalize_client_config(value: &mut toml::Value) {
 
         // Normalize Go-format proxy sub-tables into flat fields
         normalize_proxies(table);
+        normalize_visitors(table);
 
         // Extract meta_* prefixed keys into metas map (Go frp legacy compat).
         let meta_keys: Vec<String> = table
@@ -2067,8 +2140,18 @@ fn normalize_proxies(table: &mut toml::Table) {
                     let flat_key = match key.as_str() {
                         "plugin_local_addr" | "pluginLocalAddr" => "local_addr",
                         "plugin_local_path" | "pluginLocalPath" => "local_path",
+                        "plugin_unix_path" | "pluginUnixPath" => "local_addr",
                         "plugin_http_user" | "pluginHttpUser" => "http_user",
-                        "plugin_http_password" | "pluginHttpPassword" => "http_password",
+                        "plugin_http_password"
+                        | "pluginHttpPassword"
+                        | "plugin_http_passwd"
+                        | "pluginHttpPasswd" => "http_password",
+                        "plugin_user" | "pluginUser" => "username",
+                        "plugin_passwd" | "pluginPasswd" => "password",
+                        "plugin_strip_prefix" | "pluginStripPrefix" => "strip_prefix",
+                        "plugin_host_header_rewrite" | "pluginHostHeaderRewrite" => {
+                            "host_header_rewrite"
+                        }
                         "plugin_crt_path" | "pluginCrtPath" => "plugin_crt_path",
                         "plugin_key_path" | "pluginKeyPath" => "plugin_key_path",
                         other => other,
@@ -2083,6 +2166,46 @@ fn normalize_proxies(table: &mut toml::Table) {
                 }
             } else {
                 proxy_table.insert("plugin".to_string(), Value::Table(plugin_table));
+            }
+        }
+    }
+}
+
+/// Normalize Go-format visitor sub-tables into flat fields for each visitor.
+///
+/// Handles `[visitors.transport]` and `[visitors.natTraversal]`.
+fn normalize_visitors(table: &mut toml::Table) {
+    use toml::Value;
+
+    let visitors = match table.get_mut("visitors") {
+        Some(Value::Array(arr)) => arr,
+        _ => return,
+    };
+
+    for visitor_val in visitors.iter_mut() {
+        let visitor_table = match visitor_val.as_table_mut() {
+            Some(t) => t,
+            _ => continue,
+        };
+
+        if let Some(Value::Table(transport)) = visitor_table.remove("transport") {
+            for (k, v) in transport {
+                let flat_key = match k.as_str() {
+                    "useEncryption" => "use_encryption",
+                    "useCompression" => "use_compression",
+                    other => other,
+                };
+                visitor_table.entry(flat_key.to_string()).or_insert(v);
+            }
+        }
+
+        if let Some(Value::Table(nat)) = visitor_table.remove("natTraversal") {
+            for (k, v) in nat {
+                let flat_key = match k.as_str() {
+                    "disableAssistedAddrs" => "disable_assisted_addrs",
+                    other => other,
+                };
+                visitor_table.entry(flat_key.to_string()).or_insert(v);
             }
         }
     }
@@ -2855,6 +2978,146 @@ plugin_http_password = "secret"
         assert_eq!(plugin.plugin_type, "http_proxy");
         assert_eq!(plugin.http_user, "alice");
         assert_eq!(plugin.http_password, "secret");
+    }
+
+    #[test]
+    fn test_go_proxy_camelcase_local_fields_toml() {
+        let toml_str = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "docker"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 2375
+remotePort = 6001
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+        assert_eq!(cfg.proxies[0].local_ip, "127.0.0.1");
+        assert_eq!(cfg.proxies[0].local_port, 2375);
+        assert_eq!(cfg.proxies[0].remote_port, 6001);
+    }
+
+    #[test]
+    fn test_go_camelcase_server_fields_and_allow_ports() {
+        let toml_str = r#"
+bindAddr = "0.0.0.0"
+bindPort = 7000
+subDomainHost = "example.com"
+vhostHTTPTimeout = 30
+detailedErrorsToClient = false
+tcpmuxPassthrough = true
+enablePrometheus = true
+allowPorts = [{ start = 2000, end = 3000 }, { start = 4000, end = 5000 }]
+
+[webServer]
+addr = "127.0.0.1"
+port = 7500
+user = "admin"
+password = "secret"
+
+[auth.oidc]
+skipExpiryCheck = true
+skipIssuerCheck = true
+
+[[httpPlugins]]
+name = "hook"
+addr = "http://127.0.0.1:4000"
+path = "/handler"
+ops = ["login"]
+
+[featureGates]
+VirtualNet = true
+"#;
+        let cfg: ServerConfig = load_server_config_from_str(toml_str).unwrap();
+        assert_eq!(cfg.bind_addr, "0.0.0.0");
+        assert_eq!(cfg.sub_domain_host, "example.com");
+        assert_eq!(cfg.vhost_http_timeout, 30);
+        assert!(!cfg.detailed_errors_to_client);
+        assert!(cfg.tcp_mux_passthrough);
+        assert_eq!(cfg.web_server.port, 7500);
+        assert!(cfg.web_server.enable_prometheus);
+        assert_eq!(cfg.allow_ports, "2000-3000,4000-5000");
+        assert_eq!(cfg.http_plugins.len(), 1);
+        assert!(cfg.auth.oidc_skip_expiry);
+        assert!(cfg.auth.oidc_skip_issuer);
+        assert_eq!(cfg.feature.gates.get("VirtualNet"), Some(&true));
+    }
+
+    #[test]
+    fn test_go_camelcase_client_sections_oidc_visitor_and_plugins() {
+        let toml_str = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[transport]
+poolCount = 5
+
+[webServer]
+port = 7500
+
+[auth.oidc]
+clientID = "client-1"
+clientSecret = "secret"
+tokenEndpointURL = "https://issuer.example.com/token"
+scope = "openid"
+
+[featureGates]
+VirtualNet = true
+
+[[proxies]]
+name = "web"
+type = "http"
+remotePort = 80
+customDomains = ["example.com"]
+metadatas = { env = "prod" }
+useEncryption = true
+useCompression = true
+plugin = "unix_domain_socket"
+plugin_unix_path = "/var/run/docker.sock"
+
+[[visitors]]
+name = "vis"
+type = "stcp"
+serverName = "s"
+bindAddr = "0.0.0.0"
+bindPort = 1234
+fallbackTimeoutMs = 500
+
+[visitors.transport]
+useEncryption = true
+useCompression = true
+
+[visitors.natTraversal]
+disableAssistedAddrs = true
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+        assert_eq!(cfg.pool_count, 5);
+        assert_eq!(cfg.web_server.port, 7500);
+        let auth = cfg.auth.as_ref().expect("auth");
+        assert_eq!(auth.oidc_client_id, "client-1");
+        assert_eq!(auth.oidc_client_secret, "secret");
+        assert_eq!(auth.oidc_token_endpoint, "https://issuer.example.com/token");
+        assert_eq!(auth.oidc_scope, "openid");
+        assert_eq!(cfg.feature.gates.get("VirtualNet"), Some(&true));
+
+        let proxy = &cfg.proxies[0];
+        assert_eq!(proxy.custom_domains, vec!["example.com".to_string()]);
+        assert_eq!(proxy.metas.get("env").map(String::as_str), Some("prod"));
+        assert!(proxy.use_encryption);
+        assert!(proxy.use_compression);
+        let plugin = proxy.plugin.as_ref().expect("plugin");
+        assert_eq!(plugin.plugin_type, "unix_domain_socket");
+        assert_eq!(plugin.local_addr, "/var/run/docker.sock");
+
+        let visitor = &cfg.visitors[0];
+        assert_eq!(visitor.bind_addr, "0.0.0.0");
+        assert_eq!(visitor.bind_port, 1234);
+        assert_eq!(visitor.fallback_timeout_ms, 500);
+        assert!(visitor.use_encryption);
+        assert!(visitor.use_compression);
+        assert!(visitor.disable_assisted_addrs);
     }
 
     #[test]
