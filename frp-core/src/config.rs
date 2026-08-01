@@ -965,9 +965,15 @@ pub struct AuthClientConfig {
     pub oidc_scope: String,
     #[serde(default, alias = "oidcIssuer")]
     pub oidc_issuer: String,
-    /// Extra params for token endpoint.
+    /// Extra params for token endpoint. Go frp v0.70.1 compat:
+    /// AuthOIDCClientConfig.AdditionalEndpointParams (map[string]string).
     #[serde(default, alias = "additionalEndpointParams")]
-    pub additional_endpoint_params: String,
+    pub additional_endpoint_params: std::collections::HashMap<String, String>,
+    /// Dynamic source for the OIDC token. Mutually exclusive with every
+    /// other field of `[auth.oidc]`. Go frp v0.70.1 compat: tokenSource
+    /// (normalized from the `[auth.oidc]` sub-table).
+    #[serde(default)]
+    pub oidc_token_source: Option<ValueSource>,
     /// Path to a custom CA certificate PEM file for OIDC provider TLS.
     /// Go frp compat: tls_trusted_ca_file.
     #[serde(default, alias = "tls_trusted_ca_file")]
@@ -1014,7 +1020,8 @@ impl Default for AuthClientConfig {
             oidc_token_endpoint: String::new(),
             oidc_scope: String::new(),
             oidc_issuer: String::new(),
-            additional_endpoint_params: String::new(),
+            additional_endpoint_params: std::collections::HashMap::new(),
+            oidc_token_source: None,
             oidc_tls_trusted_ca_file: String::new(),
             oidc_tls_insecure_skip_verify: false,
             oidc_proxy_url: String::new(),
@@ -1739,6 +1746,76 @@ pub fn validate_auth_token_source(
     Ok(())
 }
 
+/// Go frp v0.70.1 compat: `validation.ValidateOIDCClientCredentialsConfig`
+/// (`/tmp/frp-src-0.70.1/pkg/config/v1/validation/oidc.go`) plus the
+/// `tokenSource` mutual-exclusivity check from `validateOIDCConfig`
+/// (`client.go:84-94`).
+fn validate_oidc_client_config(auth: &AuthClientConfig) -> Result<(), String> {
+    // auth.oidc.tokenSource is mutually exclusive with every other field
+    // of auth.oidc (Go client.go:89-94).
+    if let Some(source) = &auth.oidc_token_source {
+        if !auth.oidc_client_id.is_empty()
+            || !auth.oidc_client_secret.is_empty()
+            || !auth.oidc_audience.is_empty()
+            || !auth.oidc_scope.is_empty()
+            || !auth.oidc_token_endpoint.is_empty()
+            || !auth.additional_endpoint_params.is_empty()
+            || !auth.oidc_tls_trusted_ca_file.is_empty()
+            || auth.oidc_tls_insecure_skip_verify
+            || !auth.oidc_proxy_url.is_empty()
+        {
+            return Err(
+                "cannot specify both auth.oidc.tokenSource and any other field of auth.oidc"
+                    .into(),
+            );
+        }
+        return source
+            .validate()
+            .map_err(|e| format!("invalid auth.oidc.tokenSource: {e}"));
+    }
+
+    // Client-credentials validation only applies to the OIDC method.
+    if auth.method != "oidc" {
+        return Ok(());
+    }
+
+    if auth.oidc_client_id.is_empty() {
+        return Err("auth.oidc.clientID is required".into());
+    }
+    if auth.oidc_token_endpoint.is_empty() && auth.oidc_issuer.is_empty() {
+        return Err(
+            "auth.oidc.tokenEndpointURL is required (or auth.oidc.issuer for discovery)".into(),
+        );
+    }
+    if !auth.oidc_token_endpoint.is_empty() {
+        let ep = &auth.oidc_token_endpoint;
+        let rest = if let Some(r) = ep.strip_prefix("https://") {
+            r
+        } else if let Some(r) = ep.strip_prefix("http://") {
+            r
+        } else {
+            return Err("auth.oidc.tokenEndpointURL must use http or https".into());
+        };
+        let host = rest.split('/').next().unwrap_or("");
+        if host.is_empty() {
+            return Err("auth.oidc.tokenEndpointURL must be an absolute http or https URL".into());
+        }
+    }
+    if auth.additional_endpoint_params.contains_key("scope") {
+        return Err(
+            "auth.oidc.additionalEndpointParams.scope is not allowed; use auth.oidc.scope instead"
+                .into(),
+        );
+    }
+    if !auth.oidc_audience.is_empty() && auth.additional_endpoint_params.contains_key("audience") {
+        return Err(
+            "cannot specify both auth.oidc.audience and auth.oidc.additionalEndpointParams.audience"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_server_config(cfg: &ServerConfig) -> Result<(), String> {
     validate_auth_token_source(&cfg.auth.token, &cfg.auth.token_source)?;
     // ServerConfig has no inline proxy definitions — proxies are registered
@@ -1756,6 +1833,7 @@ fn validate_client_config(cfg: &ClientConfig) -> Result<(), String> {
             cfg.token.as_str()
         };
         validate_auth_token_source(token, &auth.token_source)?;
+        validate_oidc_client_config(auth)?;
     }
     if (!cfg.virtual_net.address.is_empty()
         || cfg.visitors.iter().any(is_virtual_net_visitor)
@@ -2284,6 +2362,7 @@ fn normalize_client_config(value: &mut toml::Value) {
                         "trustedCaFile" => "oidc_tls_trusted_ca_file",
                         "insecureSkipVerify" => "oidc_tls_insecure_skip_verify",
                         "proxyURL" => "oidc_proxy_url",
+                        "tokenSource" => "oidc_token_source",
                         "additionalAuthScopes" => "additional_auth_scopes",
                         other => other,
                     };
@@ -3156,6 +3235,8 @@ fn known_client_keys() -> std::collections::HashSet<&'static str> {
         "oidc_scope",
         "oidc_issuer",
         "oidc_proxy_url",
+        "additional_endpoint_params",
+        "oidc_token_source",
     ])
 }
 
@@ -4511,6 +4592,114 @@ enabel = true
             .to_string();
         assert!(error.contains("protcol"));
         assert!(error.contains("enabel"));
+    }
+
+    #[test]
+    fn test_oidc_additional_endpoint_params_map() {
+        // Go frp v0.70.1: AuthOIDCClientConfig.AdditionalEndpointParams is a
+        // map[string]string — TOML table must parse into a HashMap, not a
+        // "k=v&k=v" string.
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            auth_method = "oidc"
+            [auth]
+            method = "oidc"
+            [auth.oidc]
+            clientID = "client-1"
+            tokenEndpointURL = "https://idp.example.com/token"
+            additionalEndpointParams = { tenant = "acme", region = "eu" }
+        "#;
+        let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+        let auth = cfg.auth.expect("auth section");
+        assert_eq!(auth.additional_endpoint_params.get("tenant").map(String::as_str), Some("acme"));
+        assert_eq!(auth.additional_endpoint_params.get("region").map(String::as_str), Some("eu"));
+    }
+
+    #[test]
+    fn test_oidc_token_source_parsed_from_subtable() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            auth_method = "oidc"
+            [auth]
+            method = "oidc"
+            [auth.oidc]
+            tokenSource = { type = "file", file = { path = "/tmp/oidc-token" } }
+        "#;
+        let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+        let auth = cfg.auth.expect("auth section");
+        let source = auth.oidc_token_source.expect("oidc.tokenSource should parse");
+        assert_eq!(source.source_type, "file");
+        assert_eq!(source.file.as_ref().map(|f| f.path.as_str()), Some("/tmp/oidc-token"));
+    }
+
+    #[test]
+    fn test_oidc_token_source_mutually_exclusive_with_other_fields() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            auth_method = "oidc"
+            [auth]
+            method = "oidc"
+            [auth.oidc]
+            clientID = "client-1"
+            tokenSource = { type = "file", file = { path = "/tmp/tok" } }
+        "#;
+        let err = super::load_client_config_from_str(toml).unwrap_err().to_string();
+        assert!(
+            err.contains("cannot specify both auth.oidc.tokenSource"),
+            "expected mutual-exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_oidc_requires_client_id_and_token_endpoint() {
+        // Missing clientID
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            auth_method = "oidc"
+            [auth]
+            method = "oidc"
+            [auth.oidc]
+            tokenEndpointURL = "https://idp.example.com/token"
+        "#;
+        let err = super::load_client_config_from_str(toml).unwrap_err().to_string();
+        assert!(err.contains("clientID is required"), "got: {err}");
+
+        // Missing token endpoint (and no issuer for discovery)
+        let toml2 = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            auth_method = "oidc"
+            [auth]
+            method = "oidc"
+            [auth.oidc]
+            clientID = "client-1"
+        "#;
+        let err2 = super::load_client_config_from_str(toml2).unwrap_err().to_string();
+        assert!(err2.contains("tokenEndpointURL is required"), "got: {err2}");
+    }
+
+    #[test]
+    fn test_oidc_additional_endpoint_params_scope_rejected() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            auth_method = "oidc"
+            [auth]
+            method = "oidc"
+            [auth.oidc]
+            clientID = "client-1"
+            tokenEndpointURL = "https://idp.example.com/token"
+            additionalEndpointParams = { scope = "openid" }
+        "#;
+        let err = super::load_client_config_from_str(toml).unwrap_err().to_string();
+        assert!(
+            err.contains("additionalEndpointParams.scope is not allowed"),
+            "got: {err}"
+        );
     }
 
     #[test]

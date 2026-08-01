@@ -312,6 +312,15 @@ impl Service {
                 .auth
                 .as_ref()
                 .ok_or("OIDC auth requires [auth] section in config")?;
+            // Go frp v0.70.1 compat: auth.oidc.tokenSource (dynamic token
+            // source, mutually exclusive with the client-credentials flow).
+            // The config validator enforces mutual exclusivity; exec sources
+            // additionally require the unsafe-features gate like auth.tokenSource.
+            let token_source = ac.oidc_token_source.clone();
+            if let Some(ref source) = token_source {
+                frp_core::auth::validate_token_source_unsafe(source, &unsafe_features)
+                    .map_err(std::io::Error::other)?;
+            }
             let client = OidcClient::new(
                 ac.oidc_client_id.clone(),
                 ac.oidc_client_secret.clone(),
@@ -323,6 +332,7 @@ impl Service {
                 Some(ac.oidc_tls_trusted_ca_file.clone()).filter(|s| !s.is_empty()),
                 ac.oidc_tls_insecure_skip_verify,
                 Some(ac.oidc_proxy_url.clone()).filter(|s| !s.is_empty()),
+                token_source,
             )
             .await
             .map_err(|e| format!("OIDC client init failed: {e}"))?;
