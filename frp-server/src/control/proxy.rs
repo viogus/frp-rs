@@ -240,7 +240,7 @@ pub(crate) async fn handle_ping<W: AsyncWriteExt + Unpin>(
             .read()
             .await
             .get(&ctx.run_id)
-            .cloned()
+            .map(|(subject, _)| subject.clone())
             .unwrap_or_default();
         verifier
             .verify_ping(
@@ -342,7 +342,7 @@ pub(crate) async fn cleanup<W: AsyncWriteExt + Unpin>(
                 run_id: ctx.run_id.clone(),
             });
     }
-    proxy_ops::unregister_control(&ctx.state, &ctx.run_id, ctl.shutting_down).await;
+    proxy_ops::unregister_control(&ctx.state, &ctx.run_id, ctx.control_id, ctl.shutting_down).await;
     // Remove only the proxies that existed at cleanup start.
     // Do NOT use remove_client() — it removes ALL proxies for this run_id,
     // which in supersession would delete the new handler's proxies.

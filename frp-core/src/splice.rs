@@ -37,12 +37,37 @@ fn create_pipe_pair() -> io::Result<(AsyncFd<OwnedFd>, AsyncFd<OwnedFd>)> {
     Ok((read_async, write_async))
 }
 
+/// Propagate a source FIN after its buffered bytes have reached `dst`.
+///
+/// `shutdown(SHUT_WR)` is idempotent for a connected TCP socket. A peer may
+/// have already closed the connection by the time the FIN is propagated, in
+/// which case Linux reports `ENOTCONN` or `EPIPE`; both mean there is no write
+/// half left to close and can be treated as successful completion.
+fn shutdown_write(dst_fd: libc::c_int) -> io::Result<()> {
+    loop {
+        // SAFETY: `dst_fd` is borrowed from a live AsyncFd for the duration of
+        // this call. shutdown does not take ownership of the descriptor.
+        if unsafe { libc::shutdown(dst_fd, libc::SHUT_WR) } == 0 {
+            return Ok(());
+        }
+
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::ENOTCONN | libc::EPIPE) => return Ok(()),
+            _ => return Err(err),
+        }
+    }
+}
+
 /// Relay data from `src` through a pipe to `dst`.
 ///
 /// Phase A: `splice(src → pipe_wr)` to move data into the kernel pipe.
 /// Phase B: `splice(pipe_rd → dst)` to drain the pipe to the destination.
 ///
-/// Returns when either side signals EOF (splice returns 0).
+/// When `src` signals EOF, drains already-completed pipe data and propagates
+/// that half-close to `dst` before returning. The opposite direction remains
+/// available to carry its response.
 ///
 /// # Readiness model (tokio `AsyncFd`)
 ///
@@ -101,7 +126,10 @@ async fn splice_direction(
             }
             if ret == 0 {
                 // Real EOF: splice returns 0 when the source has no more
-                // data (FIN received on socket).
+                // data (FIN received on socket). Phase B has fully drained
+                // all earlier reads before we reach Phase A again, so it is
+                // now safe to propagate the FIN to dst.
+                shutdown_write(dst_fd)?;
                 return Ok(());
             }
             let err = io::Error::last_os_error();
@@ -321,6 +349,60 @@ mod tests {
             Ok(Ok(Ok((u2w, w2u)))) => {
                 assert!(u2w > 0, "should have transferred data user→work");
                 assert!(w2u > 0, "should have transferred data work→user");
+            }
+            Ok(Ok(Err(e))) => {
+                panic!("bridge_splice error: {}", e);
+            }
+            Ok(Err(join_err)) => {
+                panic!("join error: {}", join_err);
+            }
+            Err(_timeout) => {
+                panic!("bridge_splice timed out after 5s — likely hung");
+            }
+        }
+    }
+
+    /// A client half-close must become a FIN at the backend only after all
+    /// request bytes have drained, while leaving the reverse direction open.
+    #[tokio::test]
+    async fn test_bridge_splice_propagates_half_close_after_drain() {
+        let ((bridge_user, mut test_user), (bridge_work, mut test_work)) =
+            socket_pairs().await.expect("socket pairs");
+
+        let handle = tokio::spawn(async move { bridge_splice(bridge_user, bridge_work).await });
+
+        let request = b"request body";
+        test_user.write_all(request).await.expect("write request");
+        test_user.shutdown().await.expect("shutdown client write");
+
+        let mut received_request = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            test_work.read_to_end(&mut received_request),
+        )
+        .await
+        .expect("backend should receive EOF after client half-close")
+        .expect("read request");
+        assert_eq!(received_request, request);
+
+        let response = b"response body";
+        test_work.write_all(response).await.expect("write response");
+        test_work.shutdown().await.expect("shutdown backend write");
+
+        let mut received_response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            test_user.read_to_end(&mut received_response),
+        )
+        .await
+        .expect("client should receive backend response and EOF")
+        .expect("read response");
+        assert_eq!(received_response, response);
+
+        match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+            Ok(Ok(Ok((u2w, w2u)))) => {
+                assert_eq!(u2w, request.len() as u64);
+                assert_eq!(w2u, response.len() as u64);
             }
             Ok(Ok(Err(e))) => {
                 panic!("bridge_splice error: {}", e);

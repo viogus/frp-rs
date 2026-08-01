@@ -3,8 +3,8 @@
 *.swp
 *.swo
 .DS_Store
-*.toml.bak
 *.bak
+*.toml.bak
 Cargo.lock
 .worktrees/
 .claude/

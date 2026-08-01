@@ -1,4 +1,5 @@
-use std::net::ToSocketAddrs;
+use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -32,17 +33,9 @@ pub fn create_visitor_conn_msg(
         None
     } else {
         let hash = frp_core::auth::generate_token(secret_key, timestamp);
-        // Redact secret key in logs: show only first 4 chars (safe on any UTF-8).
-        let sk_redacted: String = secret_key.chars().take(4).collect();
-        let sk_redacted = if sk_redacted.len() < secret_key.len() {
-            format!("{sk_redacted}...")
-        } else {
-            sk_redacted
-        };
         debug!(
-            secret_key = %sk_redacted, timestamp = %timestamp, sign_key = %hash,
-            "STCP visitor auth: sk='{}' ts={} sign_key={}",
-            sk_redacted, timestamp, hash
+            server_name = %server_name,
+            "STCP visitor auth credentials generated"
         );
         Some(hash)
     };
@@ -81,11 +74,7 @@ pub fn create_new_proxy_msg(p: &frp_core::config::ProxyConfig, local_addr: &str)
         } else {
             Some(p.remote_port as i32)
         },
-        sk: {
-            let sk_val = opt_if_empty!(p.sk);
-            debug!(name = %p.name, sk = ?sk_val, "NewProxy '{}': sk={:?}", p.name, sk_val);
-            sk_val
-        },
+        sk: opt_if_empty!(p.sk),
         custom_domains: opt_if_empty!(p.custom_domains),
         subdomain: opt_if_empty!(p.subdomain),
         locations: opt_if_empty!(p.locations),
@@ -137,38 +126,94 @@ pub fn create_new_proxy_msg(p: &frp_core::config::ProxyConfig, local_addr: &str)
 
 /// Connects to a local service and returns the TCP stream.
 ///
-/// Uses spawn_blocking + std TcpStream to avoid a tokio I/O driver hang that
-/// occurs in V2 plain work_conn tasks. The hang manifests as TcpStream::connect
-/// never returning, even with tokio::time::timeout. Using spawn_blocking
-/// bypasses the tokio I/O driver entirely for the connect.
-///
 /// `addr` may be a hostname like `"localhost:8080"` or an IP literal.
-/// DNS resolution happens on the async runtime (before spawn_blocking).
 pub async fn connect_local(addr: &str) -> Result<TcpStream, frp_core::Error> {
-    // Resolve hostname on the async runtime before spawn_blocking.
-    // Only the first resolved address is used — matches the original
-    // tokio::TcpStream::connect behavior.
-    let resolved: std::net::SocketAddr = addr
-        .to_socket_addrs()
-        .map_err(|e| frp_core::Error::Transport(format!("resolve {}: {}", addr, e).into()))?
-        .next()
-        .ok_or_else(|| {
-            frp_core::Error::Transport(format!("no address found for {}", addr).into())
-        })?;
-    let std_stream = tokio::task::spawn_blocking(move || {
-        std::net::TcpStream::connect_timeout(&resolved, std::time::Duration::from_secs(5))
-    })
+    connect_local_with_resolver(
+        addr,
+        std::time::Duration::from_secs(5),
+        |query| async move {
+            tokio::net::lookup_host(query)
+                .await
+                .map(|addresses| addresses.collect())
+        },
+    )
     .await
-    .map_err(|e| frp_core::Error::Transport(format!("spawn_blocking: {}", e).into()))?
-    .map_err(|e| frp_core::Error::Transport(format!("connect {}: {}", resolved, e).into()))?;
-    // Convert to tokio TcpStream
-    std_stream
-        .set_nonblocking(true)
-        .map_err(|e| frp_core::Error::Transport(format!("set_nonblocking: {}", e).into()))?;
-    let stream = TcpStream::from_std(std_stream)
-        .map_err(|e| frp_core::Error::Transport(format!("from_std: {}", e).into()))?;
-    frp_core::transport::set_nodelay(&stream);
-    Ok(stream)
+}
+
+async fn connect_local_with_resolver<R, F>(
+    addr: &str,
+    timeout: std::time::Duration,
+    resolver: R,
+) -> Result<TcpStream, frp_core::Error>
+where
+    R: FnOnce(String) -> F,
+    F: Future<Output = std::io::Result<Vec<SocketAddr>>>,
+{
+    // Bound each address attempt well below the overall wall deadline so a
+    // blackholed first address cannot consume the whole window and leave
+    // later addresses with zero remaining time.
+    let per_attempt_timeout = std::cmp::min(timeout, std::time::Duration::from_secs(1));
+    connect_local_with_resolver_and_connector(
+        addr,
+        timeout,
+        resolver,
+        TcpStream::connect,
+        per_attempt_timeout,
+    )
+    .await
+}
+
+async fn connect_local_with_resolver_and_connector<R, F, C, G>(
+    addr: &str,
+    timeout: std::time::Duration,
+    resolver: R,
+    connector: C,
+    per_attempt_timeout: std::time::Duration,
+) -> Result<TcpStream, frp_core::Error>
+where
+    R: FnOnce(String) -> F,
+    F: Future<Output = std::io::Result<Vec<SocketAddr>>>,
+    C: Fn(SocketAddr) -> G,
+    G: Future<Output = std::io::Result<TcpStream>>,
+{
+    // Resolved addresses are attempted sequentially under one wall deadline
+    // shared by DNS and all connects. Each attempt gets its own bounded timeout
+    // so a blackholed address cannot consume the whole window: on per-address
+    // timeout we continue with the next address until the wall deadline expires.
+    // This is deliberately not a Happy Eyeballs race.
+    let deadline = tokio::time::Instant::now() + timeout;
+    let addresses = tokio::time::timeout_at(deadline, resolver(addr.to_owned()))
+        .await
+        .map_err(|_| frp_core::Error::Transport(format!("resolve {}: timed out", addr).into()))?
+        .map_err(|e| frp_core::Error::Transport(format!("resolve {}: {}", addr, e).into()))?;
+
+    if addresses.is_empty() {
+        return Err(frp_core::Error::Transport(
+            format!("no address found for {}", addr).into(),
+        ));
+    }
+
+    let mut last_error = None;
+    for socket_addr in addresses {
+        let now = tokio::time::Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        let attempt_deadline = now + std::cmp::min(per_attempt_timeout, remaining);
+        match tokio::time::timeout_at(attempt_deadline, connector(socket_addr)).await {
+            Ok(Ok(stream)) => {
+                frp_core::transport::set_nodelay(&stream);
+                return Ok(stream);
+            }
+            Ok(Err(error)) => last_error = Some(error.to_string()),
+            Err(_) => {
+                last_error = Some("timed out".to_string());
+            }
+        }
+    }
+
+    let detail = last_error.unwrap_or_else(|| "no address succeeded".to_string());
+    Err(frp_core::Error::Transport(
+        format!("connect {}: {}", addr, detail).into(),
+    ))
 }
 
 /// Bridge data between two streams with optional encryption, compression,
@@ -291,6 +336,160 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
 mod tests {
     use super::*;
     use md5::Digest;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn slow_dns_does_not_starve_runtime_timers() {
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let timer_ticks = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            for _ in 0..5 {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                timer_ticks.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let result = connect_local_with_resolver(
+            "slow.invalid:80",
+            std::time::Duration::from_millis(20),
+            |_| std::future::pending(),
+        )
+        .await;
+        ticker.await.unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(ticks.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test]
+    async fn failed_dns_returns_transport_error() {
+        let result = connect_local_with_resolver(
+            "missing.invalid:80",
+            std::time::Duration::from_secs(1),
+            |_| async { Err(std::io::Error::other("injected DNS failure")) },
+        )
+        .await;
+
+        assert!(result.unwrap_err().to_string().contains("resolve"));
+    }
+
+    #[tokio::test]
+    async fn connect_tries_second_resolved_address_after_first_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let success = listener.local_addr().unwrap();
+        let failed: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let stream = connect_local_with_resolver(
+            "local.test:80",
+            std::time::Duration::from_secs(1),
+            move |_| async move { Ok(vec![failed, success]) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stream.peer_addr().unwrap(), success);
+    }
+
+    #[tokio::test]
+    async fn connect_supports_resolved_ipv6_loopback() {
+        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            return; // IPv6 may be disabled in a minimal CI network namespace.
+        };
+        let address = listener.local_addr().unwrap();
+
+        let stream = connect_local_with_resolver(
+            "ipv6.test:80",
+            std::time::Duration::from_secs(1),
+            move |_| async move { Ok(vec![address]) },
+        )
+        .await
+        .unwrap();
+
+        assert!(stream.peer_addr().unwrap().is_ipv6());
+    }
+
+    #[tokio::test]
+    async fn connect_continues_after_first_address_stalls_until_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let success = listener.local_addr().unwrap();
+        let stalled: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let stream = connect_local_with_resolver_and_connector(
+            "local.test:80",
+            std::time::Duration::from_secs(2),
+            move |_| async move { Ok(vec![stalled, success]) },
+            move |addr| {
+                async move {
+                    if addr.port() == 1 {
+                        // Simulate a blackholed first address: wait for the shared
+                        // deadline instead of returning an immediate error.
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        Err(std::io::Error::other("stalled address"))
+                    } else {
+                        tokio::net::TcpStream::connect(addr).await
+                    }
+                }
+            },
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stream.peer_addr().unwrap(), success);
+    }
+
+    #[derive(Clone)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_visitor_auth_debug_log_does_not_leak_secret_or_replay_proof() {
+        const SECRET_SENTINEL: &str = "S3KR-secret-key-sentinel";
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_writer({
+                let output = output.clone();
+                move || CapturedLogs(output.clone())
+            })
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let msg = create_visitor_conn_msg(
+            "proxy-safe-name",
+            SECRET_SENTINEL,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
+        let (proof, timestamp) = match msg {
+            FrpMessage::NewVisitorConn(nvc) => (nvc.sign_key.unwrap(), nvc.timestamp.unwrap()),
+            _ => unreachable!(),
+        };
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+
+        assert!(logs.contains("STCP visitor auth"));
+        assert!(!logs.contains("S3KR"), "secret prefix leaked: {logs}");
+        assert!(!logs.contains(&proof), "replay proof leaked: {logs}");
+        assert!(
+            !logs.contains(&timestamp.to_string()),
+            "auth timestamp leaked: {logs}"
+        );
+    }
 
     /// Compute the expected MD5 sign_key the same way `create_visitor_conn_msg`
     /// does internally via `frp_core::auth::generate_token(sk, timestamp)`.

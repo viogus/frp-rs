@@ -24,7 +24,7 @@ detect_target() {
     case "$(uname -m)" in
         x86_64|amd64)   arch="x86_64" ;;
         aarch64|arm64)  arch="aarch64" ;;
-        armv7l)         arch="armv7" ;;
+        armv7l)         arch="armv7"; os="unknown-linux-gnueabihf" ;;
         *)              echo "ERROR: unsupported arch: $(uname -m)" >&2; exit 1 ;;
     esac
     echo "${arch}-${os}"

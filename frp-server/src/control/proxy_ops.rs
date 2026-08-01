@@ -67,6 +67,74 @@ fn is_udp_port_bindable(bind_addr: &str, port: u16) -> bool {
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod unregister_generation_tests {
+    use super::*;
+
+    fn test_state() -> Arc<AppState> {
+        let cfg = frp_core::config::ServerConfig::default();
+        Arc::new(AppState::new(
+            frp_core::auth::AuthConfig::with_token("test-token"),
+            "127.0.0.1".into(),
+            frp_core::encryption::derive_key("test-token"),
+            vec![(1, u16::MAX)],
+            String::new(),
+            true,
+            30,
+            7200,
+            90,
+            1500,
+            false,
+            None,
+            0,
+            60,
+            10,
+            false,
+            String::new(),
+            Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
+            168,
+            true,
+            0,
+            0,
+            frp_core::config::ServerConfigSnapshot::from_config(&cfg),
+        ))
+    }
+
+    async fn insert_control(state: &Arc<AppState>, run_id: &str, control_id: u64) {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut map = state.run_id_to_ctl_tx.write().await;
+        map.insert(
+            run_id.to_string(),
+            crate::state::ControlTx {
+                tx,
+                client_addr: None,
+                login_time: std::time::Instant::now(),
+                login_time_unix: 0,
+                pool_stats: Arc::new(crate::state::PoolStats::default()),
+                user: String::new(),
+                control_id,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_failure_cannot_unregister_superseding_control() {
+        let state = test_state();
+        insert_control(&state, "run-1", 7).await;
+
+        // An older failing control (generation 3) must not delete the
+        // replacement's routing entry.
+        unregister_control(&state, "run-1", 3, false).await;
+        assert!(state.run_id_to_ctl_tx.read().await.contains_key("run-1"));
+
+        // The replacement itself may still clean up its own generation.
+        unregister_control(&state, "run-1", 7, false).await;
+        assert!(!state.run_id_to_ctl_tx.read().await.contains_key("run-1"));
+    }
+}
+
 /// Pure validation of NewProxy fields. Returns Ok(()) or an error message.
 /// Checks port range, proxy_name length/control chars, custom_domains length,
 /// and subdomain length. Extracted from the async state machine to reduce
@@ -858,27 +926,39 @@ pub(crate) async fn listen_and_proxy(
     }
 }
 
+/// Remove a control's routing/registry/OIDC state.
+///
+/// `control_id` is the removing control's own generation. The `run_id` map
+/// entry is only removed when it still belongs to that generation (or when
+/// `control_id` is 0 for legacy callers that do not track generations), so a
+/// slow post-login failure can never delete a superseding control's entry.
+/// `skip_ctl_unregister` is used by the supersession path where the new
+/// handler has already installed its replacement `ControlTx`.
 pub(crate) async fn unregister_control(
     state: &Arc<AppState>,
     run_id: &str,
+    control_id: u64,
     skip_ctl_unregister: bool,
 ) {
-    // When shutting down due to supersession (duplicate run_id), the new
-    // handler has already inserted its ControlTx. Skip removal to avoid
-    // deleting the replacement's entry. Also skip registry mark-offline
-    // because the new handler already registered with its own control_id.
-    if !skip_ctl_unregister {
-        let control_id = {
+    let removed_control_id = if !skip_ctl_unregister {
+        let current_control_id = {
             let map = state.run_id_to_ctl_tx.read().await;
             map.get(run_id).map(|c| c.control_id).unwrap_or(0)
         };
-        let mut map = state.run_id_to_ctl_tx.write().await;
-        map.remove(run_id);
-        // Mark the client offline in the registry, generation-aware.
-        state
-            .client_registry
-            .mark_offline_by_run_id_and_control_id(run_id, control_id);
-    }
+        if control_id != 0 && current_control_id != control_id {
+            None
+        } else {
+            let mut map = state.run_id_to_ctl_tx.write().await;
+            map.remove(run_id);
+            // Mark the client offline in the registry, generation-aware.
+            state
+                .client_registry
+                .mark_offline_by_run_id_and_control_id(run_id, current_control_id);
+            Some(current_control_id)
+        }
+    } else {
+        None
+    };
     // Release allocated ports and clean up sk/vhost entries for this client
     let proxies = state.proxy_manager.list_client(run_id).await;
     // TCP port cleanup
@@ -952,7 +1032,15 @@ pub(crate) async fn unregister_control(
     // (which are OIDC subject strings, not proxy names — retain would
     // never match and entries would leak unboundedly).
     {
-        state.oidc.subjects.write().await.remove(run_id);
+        let mut subjects = state.oidc.subjects.write().await;
+        if let Some(control_id) = removed_control_id {
+            if subjects
+                .get(run_id)
+                .is_some_and(|(_, generation)| *generation == control_id)
+            {
+                subjects.remove(run_id);
+            }
+        }
     }
 }
 

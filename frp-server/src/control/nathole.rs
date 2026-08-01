@@ -337,13 +337,11 @@ pub(crate) async fn handle_new_visitor_conn<W: AsyncWriteExt + Unpin>(
         // (accept loop) semantics. Empty = owner-only (Go frp compat);
         // if both owner and visitor have no user (empty string),
         // they are the same identity and access is allowed.
-        let user_ok = if proxy_info.allow_users.is_empty() {
-            login_user == proxy_info.user
-        } else if proxy_info.allow_users.iter().any(|u| u == "*") {
-            true
-        } else {
-            proxy_info.allow_users.iter().any(|u| u == login_user)
-        };
+        let user_ok = crate::handlers::visitor_user_allowed(
+            login_user,
+            &proxy_info.user,
+            &proxy_info.allow_users,
+        );
         if !user_ok {
             warn!(proxy_name = %nvc.proxy_name, "NewVisitorConn on ctl: user denied for proxy '{}'", nvc.proxy_name);
             false
@@ -360,17 +358,9 @@ pub(crate) async fn handle_new_visitor_conn<W: AsyncWriteExt + Unpin>(
             true // No sk configured
         }
     } else {
-        // Race: NewVisitorConn may arrive before proxy_manager
-        // registration completes. Fall back to sk_index
-        // (populated after successful registration).
-        if ts_fresh.is_err() {
-            false
-        } else {
-            let sk_map = ctx.state.xtcp.sk_index.read().await;
-            sk_map
-                .get(&nvc.proxy_name)
-                .is_some_and(|sk_raw| frp_core::auth::verify_token(sk_raw, timestamp, &sign_key))
-        }
+        // Without ProxyInfo the owner/allow_users policy is unknown. A shared
+        // secret alone is not an authenticated user identity, so fail closed.
+        false
     };
 
     if ok {
@@ -429,29 +419,19 @@ pub(crate) async fn handle_nat_hole_visitor_on_ctl<W: AsyncWriteExt + Unpin>(
     // Auth is enforced BEFORE pre_check response so Go frp's
     // pre_check permission model is preserved.
 
-    if proxy_info.allow_users.is_empty() {
-        // Empty = proxy owner only (Go frp compat).
-        // When both owner and visitor have no user set
-        // (default empty string), they are the same
-        // identity and access is allowed.
-        let owner = &proxy_info.user;
-        if login_user != *owner {
+    if !crate::handlers::visitor_user_allowed(login_user, &proxy_info.user, &proxy_info.allow_users)
+    {
+        let error = if proxy_info.allow_users.is_empty() {
+            let owner = &proxy_info.user;
             warn!(proxy_name = %proxy_name, user = %login_user, owner = %owner, "NatHoleVisitor: user '{}' not proxy owner '{}' for proxy '{}'", login_user, owner, proxy_name);
-            let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
-                transaction_id: transaction_id.clone(),
-                error: Some("access denied: owner only".into()),
-                ..Default::default()
-            }));
-            let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
-            return Ok(());
-        }
-    } else if proxy_info.allow_users.iter().any(|u| u == "*") {
-        // Wildcard — any authenticated user
-    } else if !proxy_info.allow_users.iter().any(|u| u == login_user) {
-        warn!(proxy_name = %proxy_name, user = %login_user, "NatHoleVisitor: user '{}' not in allow_users for proxy '{}'", login_user, proxy_name);
+            "access denied: owner only"
+        } else {
+            warn!(proxy_name = %proxy_name, user = %login_user, "NatHoleVisitor: user '{}' not in allow_users for proxy '{}'", login_user, proxy_name);
+            "access denied"
+        };
         let resp = FrpMessage::NatHoleResp(Box::new(msg::NatHoleResp {
             transaction_id: transaction_id.clone(),
-            error: Some("access denied".into()),
+            error: Some(error.into()),
             ..Default::default()
         }));
         let _ = write_ctl_msg(writer, &resp, ctx.v2).await;
@@ -907,4 +887,54 @@ pub(crate) async fn handle_vnet_route_remove(
     let mut routes = ctx.state.vnet_routes.write().await;
     routes.retain(|(vn_k, _), (_, name)| !(vn_k == &vn && name == &rem.proxy_name));
     info!(proxy_name = %rem.proxy_name, "vnet route removed: {}", rem.proxy_name);
+}
+
+#[cfg(test)]
+mod identity_binding_tests {
+    #[test]
+    fn oidc_keeps_claimed_user_a_even_when_subject_is_b() {
+        let identity = super::super::login::authenticated_user(Some("A"), Some("B"));
+        assert_eq!(identity, "A");
+        assert!(crate::handlers::visitor_user_allowed(
+            &identity,
+            "A",
+            &["A".to_string()]
+        ));
+        assert!(crate::handlers::visitor_user_allowed(&identity, "A", &[]));
+    }
+
+    #[test]
+    fn oidc_does_not_substitute_subject_a_for_claimed_user_b() {
+        let identity = super::super::login::authenticated_user(Some("B"), Some("A"));
+        assert_eq!(identity, "B");
+        assert!(!crate::handlers::visitor_user_allowed(
+            &identity,
+            "owner",
+            &["A".to_string()]
+        ));
+    }
+
+    #[test]
+    fn oidc_without_claimed_user_keeps_empty_go_identity() {
+        let identity = super::super::login::authenticated_user(None, Some("A"));
+        assert_eq!(identity, "");
+        assert!(crate::handlers::visitor_user_allowed(&identity, "", &[]));
+        assert!(!crate::handlers::visitor_user_allowed(
+            &identity,
+            "owner",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn token_auth_preserves_claimed_user_compatibility() {
+        let identity = super::super::login::authenticated_user(Some("A"), None);
+        assert_eq!(identity, "A");
+        assert!(crate::handlers::visitor_user_allowed(&identity, "A", &[]));
+        assert!(crate::handlers::visitor_user_allowed(
+            &identity,
+            "owner",
+            &["A".to_string()]
+        ));
+    }
 }

@@ -68,6 +68,7 @@ otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", 
 libc.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tower = "0.5"
 criterion.workspace = true
 proptest = "1.6"

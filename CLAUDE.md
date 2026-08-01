@@ -34,7 +34,7 @@ FRPS_BIN=/path/to/frps FRPC_BIN=/path/to/frpc cargo test --workspace --all-featu
 Four size tiers via feature flags. QUIC and dashboard are opt-in (not in defaults); SSH is default:
 
 ```bash
-# Default (no SSH, QUIC, dashboard; keeps TLS, KCP, WS, compression)
+# Default (SSH included; no QUIC/dashboard; keeps TLS, KCP, WS, compression)
 cargo build --release -p frps -p frpc
 # → frps (~5.6MB), frpc (~5.4MB)
 
@@ -42,7 +42,7 @@ cargo build --release -p frps -p frpc
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
 # → frps (~7.8MB), frpc (~6.0MB)
 
-# Tiny (no heavy protocols: QUIC/KCP/WS/SSH/OIDC/dashboard; keeps TLS)
+# Tiny (no QUIC/KCP/WS/SSH/OIDC/dashboard/compression; keeps TLS)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
 # → frps-tiny (~4.4MB), frpc-tiny (~3.8MB)
 
@@ -96,9 +96,9 @@ Every feature, fix, and test change follows three rules:
 | `cargo clippy` (default) | zero warnings |
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
-| `cargo test --workspace --all-features` | 522 passed, 2 ignored (35 suites) |
+| `cargo test --workspace --all-features` | 620 passed, 2 ignored (36 suites) |
 | `cargo build --release` | passes (frps ~5.6MB, frpc ~5.4MB default; ~7.8MB/6.0MB all-features) |
-| `compat-test.sh` (Go frp v0.70.1) | 67/67 passed (XTCP VPS-only) |
+| `compat-test.sh` (Go frp v0.70.1) | 68 non-XTCP + 16 XTCP scenarios |
 | `unsafe` blocks | 6 in frp-core, 3+ in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
 | `hex` crate | removed — inline `hex_encode` in frp-core |
@@ -125,17 +125,17 @@ The README gives a solid overview. The sections below cover details that reading
 
 **V1** (fully implemented): 9-byte header — 1 byte type + 8 bytes big-endian payload length (max 64 KiB) — followed by UTF-8 JSON payload. Defined in `frp-core/src/protocol.rs`.
 
-**V2** (fully implemented): 7-byte magic `FRP\0\x02\r\n` + different framing. V2 frame read/write (`write_v2_frame_raw`/`read_v2_frame_raw`), message dispatch (`write_msg_v2`/`read_msg_v2`), AEAD encryption (`v2_handshake.rs`: ClientHello/ServerHello, HKDF key derivation, `crypto.rs`: AeadAlgorithm trait for AES-256-GCM/ChaCha20-Poly1305), and capability negotiation all implemented. V2 compat tests guard behind `GO_FRP_V2=1` (require source-built Go frp; auto-detect locally, skip in CI).
+**V2** (fully implemented): 7-byte magic `FRP\0\x02\r\n` + different framing. V2 frame read/write (`write_v2_frame_raw`/`read_v2_frame_raw`), message dispatch (`write_msg_v2`/`read_msg_v2`), AEAD encryption (`v2_handshake.rs`: ClientHello/ServerHello, HKDF key derivation, `crypto.rs`: AeadAlgorithm trait for AES-256-GCM/ChaCha20-Poly1305), and capability negotiation all implemented. V2 compat tests run against the Go frp v0.70.1 pre-built binary.
 
 Message type bytes and structs live in `frp-core/src/msg.rs`. The `FrpMessage` enum is `#[serde(untagged)]` — serde matches the first variant whose fields intersect the JSON, which means ordering of the enum variants matters.
 
 ### Authentication
 
-Auth uses **MD5(token + timestamp)** → hex string. Matches Go frp v0.69.1 behavior — Go frp switched from HMAC-SHA256 to MD5 in commit `78f9394`. See `frp-core/src/auth.rs`.
+Auth uses **MD5(token + timestamp)** → hex string. Matches Go frp v0.70.1 behavior — Go frp switched from HMAC-SHA256 to MD5 in commit `78f9394`. See `frp-core/src/auth.rs`.
 
 ### Encryption Key Derivation
 
-Uses **PBKDF2-SHA1(token, salt="frp", iterations=64, keylen=16)** for AES-128-CFB control encryption. Go frp v0.69.1 pre-built binary uses PBKDF2 salt `"frp"` (NOT `"crypto"` — the golib source says `"crypto"` but the Go frp binary was compiled with salt `"frp"`). See `frp-core/src/encryption.rs`.
+Uses **PBKDF2-SHA1(token, salt="frp", iterations=64, keylen=16)** for AES-128-CFB control encryption. Go frp v0.70.1 pre-built binary uses PBKDF2 salt `"frp"` (NOT `"crypto"` — the golib source says `"crypto"` but the Go frp binary was compiled with salt `"frp"`). See `frp-core/src/encryption.rs`.
 
 ### Server Architecture: The InternalMsg Channel
 
@@ -185,7 +185,7 @@ Internal message variants drive the work connection lifecycle:
 
 **XTCP P2P encryption:** Go frp encrypts hole-punched P2P connections with PBKDF2-SHA1(SecretKey, salt="frp", iter=64, keylen=16) → AES-128-CFB. Both provider and visitor P2P paths use `bridge_encrypted` with `derive_key(&sk)` when `use_encryption` is true. The `sk` (secret key) is the proxy's `sk` field from `ProxyConfig`, NOT the auth token — this is stored in `ProxyRuntimeInfo` for access in NAT hole punch handler paths.
 
-Note: Go frp v0.69.1 golib source says salt `"crypto"` but the pre-built binary uses salt `"frp"`. This codebase uses `"frp"` for binary compatibility.
+Note: Go frp v0.70.1 golib source says salt `"crypto"` but the pre-built binary uses salt `"frp"`. This codebase uses `"frp"` for binary compatibility.
 
 ### Transport Abstraction
 
@@ -219,7 +219,7 @@ Note: Go frp v0.69.1 golib source says salt `"crypto"` but the pre-built binary 
 
 Two paths for visitor connections:
 1. **Fresh TCP connection** (accept loop): visitor sends `NatHoleVisitor` on a new TCP connection. Server creates session, sends `NatHoleSidOnWorkConn` internal msg → provider control handler writes `StartWorkConn`+`NatHoleSid` on work conn. Provider does STUN, sends `NatHoleClient` on control, server runs NAT analysis, sends `NatHoleResp` to both sides.
-2. **Control connection** (Go frp compat): Go frpc v0.69.1 sends `NatHoleVisitor` on its existing control channel. Server creates session with `create_session_with_ctl`, spawns task that waits for provider's `NatHoleClient` on control, runs NAT analysis (classify + analyzer), and sends `NatHoleResp` to both sides via `InternalMsg::WriteNatHoleSid`/`WriteNatHoleResp`/`WriteNatHoleReport`.
+2. **Control connection** (Go frp compat): Go frpc v0.70.1 sends `NatHoleVisitor` on its existing control channel. Server creates session with `create_session_with_ctl`, spawns task that waits for provider's `NatHoleClient` on control, runs NAT analysis (classify + analyzer), and sends `NatHoleResp` to both sides via `InternalMsg::WriteNatHoleSid`/`WriteNatHoleResp`/`WriteNatHoleReport`.
 
 Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkConn → StartWorkConn+NatHoleSid on work conn) → Provider does STUN → Provider→Server(NatHoleClient on control) → Server NAT analysis → Server→Visitor(NatHoleResp) + Server→Provider(NatHoleResp) → both sides TCP simultaneous open → bridge p2p → Provider→Server(NatHoleReport) → session complete.
 
@@ -231,9 +231,9 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 
 - **TCP**: fully implemented (control + work connections, TLS, WebSocket upgrade)
 - **WebSocket**: fully implemented — dial, accept, message dispatch (control + work connections)
-- **KCP**: fully implemented — dial, accept, TLS, yamux, message dispatch. Architecture: `KcpSocket` driver (UDP event loop), `KcpSession` per-peer (kcp crate + FEC), `KcpStream` (AsyncRead/AsyncWrite). `conv_index: HashMap<u32, SocketAddr>` provides O(1) write-path lookup. Write backpressure via `Arc<AtomicUsize>` shared between `KcpSocket` and `KcpStream` (gates `poll_write` at 1024 unprocessed messages). Go frps dispatch order (service.go:670-710): read 1 byte → TLS detect (0x17=strip, 0x16=replay) → TLS accept → if tcpMux: yamux wrap → V2/V1 detection. Our KCP handler follows same order. Verified with Go frpc v0.69.1: KCP+TLS+tcpMux+CipherStream all working (RTT ~76ms). Integration test in `frp-core/tests/kcp_integration.rs` (real UDP sockets).
+- **KCP**: fully implemented — dial, accept, TLS, yamux, message dispatch. Architecture: `KcpSocket` driver (UDP event loop), `KcpSession` per-peer (kcp crate + FEC), `KcpStream` (AsyncRead/AsyncWrite). `conv_index: HashMap<u32, SocketAddr>` provides O(1) write-path lookup. Write backpressure via `Arc<AtomicUsize>` shared between `KcpSocket` and `KcpStream` (gates `poll_write` at 1024 unprocessed messages). Go frps dispatch order (service.go:670-710): read 1 byte → TLS detect (0x17=strip, 0x16=replay) → TLS accept → if tcpMux: yamux wrap → V2/V1 detection. Our KCP handler follows same order. Verified with Go frpc v0.70.1: KCP+TLS+tcpMux+CipherStream all working (RTT ~76ms). Integration test in `frp-core/tests/kcp_integration.rs` (real UDP sockets).
 - **QUIC**: fully implemented — dial, accept, message dispatch (requires TLS cert on server)
-- **TcpMux** (`frp-core/src/mux.rs`, 382 lines): full yamux implementation — server and client mode, keepalive, stream accept/spawn via `server_mux`/`client_mux`. Double-poll pattern flushes pending frames to socket. `debug_assert!` guards `keepalive_interval > 0` (zero causes immediate timeout Elapsed in server, tight `select!` spin in client).
+- **TcpMux** (`frp-core/src/mux.rs`, 382 lines): full yamux implementation — server and client mode, keepalive, stream accept/spawn via `server_mux`/`client_mux`. Double-poll pattern flushes pending frames to socket. A zero keepalive interval is normalized to the 30s default instead of causing an immediate timeout or spin.
 - **Dashboard** (`frp-server/src/dashboard.rs`, 86 lines): basic status API with axum (version, uptime, client/proxy counts)
 - **VHost** (`frp-server/src/vhost.rs`, 394 lines): HTTP/HTTPS VHost routing with Host header parsing, SNI, pre-read byte forwarding
 
@@ -244,8 +244,8 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 - `ProxyRuntimeInfo` must include `sk: String` field — XTCP P2P encryption derives its AES-128 key from the proxy's SecretKey via `derive_key(&sk)`. Adding new fields to `ProxyRuntimeInfo` requires updating all construction sites: `Service::new()`, `do_reload()` in `reload.rs`, and any other future sites.
 - **KCP handler dispatch order** (`service.rs:520-826`): MUST match Go frps `service.go:670-710` exactly — TLS detection before yamux wrapping before V2/V1. Order: read bytes → V2 magic? → TLS detect → TLS accept → (tcpMux? yamux : direct) → V2/V1. Getting this wrong was root cause of both "invalid V1 message length" (yamux SYN interpreted as FRP) and TLS rejection bugs.
 - **NewVisitorConn race**: STCP/XTCP visitors may send `NewVisitorConn` before the server's `proxy_manager.register()` completes. Go frp handles this via `startVisitorListener()` — the listener is pre-registered during `proxy.Run()` before registration returns. frp-rs equivalent: pre-populate `sk_index` in `proxy_ops.rs` BEFORE calling `proxy_manager.register()`, and use `sk_index` as fallback in both `handlers.rs` (accept loop) and `control/mod.rs` (control channel) when `proxy_manager.get()` returns `None`. Without this, visitor auth fails with "proxy not found" when the visitor connects before registration is visible.
-- **Wire field naming**: NewProxy JSON fields MUST use snake_case for Go frp v0.70.0 wire compatibility (`http_user`, `http_pwd`, `host_header_rewrite`, `response_headers`, `route_by_http_user`, `bandwidth_limit_mode`, `proxy_protocol_version`). CamelCase variants are silently ignored by Go frp, causing silent config loss. Contract test in `msg.rs` verifies both serialize and deserialize paths.
-- **V1 type bytes 7/8, V2 types 19/20**: Rust-only extensions. Must NOT be sent to Go frp peers — Go frp v0.70.0 treats unknown message types as errors. Only send on Rust↔Rust connections after capability negotiation.
+- **Wire field naming**: NewProxy JSON fields MUST use snake_case for Go frp v0.70.1 wire compatibility (`http_user`, `http_pwd`, `host_header_rewrite`, `response_headers`, `route_by_http_user`, `bandwidth_limit_mode`, `proxy_protocol_version`). CamelCase variants are silently ignored by Go frp, causing silent config loss. Contract test in `msg.rs` verifies both serialize and deserialize paths.
+- **V1 type bytes 7/8, V2 types 19/20**: Rust-only extensions. Must NOT be sent to Go frp peers — Go frp v0.70.1 treats unknown message types as errors. Only send on Rust↔Rust connections after capability negotiation.
 
 ### Testing & Tooling
 
@@ -254,7 +254,7 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 - **Integration tests**: KCP real-UDP-socket test (`frp-core/tests/kcp_integration.rs`), XTCP hole-punch e2e (`frp-server/tests/xtcp_hole_punch.rs`), plus 13+ server integration tests covering control handler, vhost, proxy registration, OIDC, reload, graceful drain.
 - **Stress tests**: `scripts/stress-test.sh` runs frps + frpc under load with connection churn, monitored via `scripts/frp-stress/`. Weekly CI run in `stress-test.yml`.
 - **Perf baselines** (4-axis program, host-specific JSONL committed under `scripts/frp-stress/baselines/`): `scripts/throughput-baseline.sh` (MB/s per cipher/transport config), `scripts/latency-baseline.sh` (steady-state RTT + connection-setup percentiles), `scripts/memory-baseline.sh` (idle-hold + churn footprint via the `mem-profile` counting allocator + `ps` RSS). Run manually before/after a data-plane change; not blocking CI gates. Gate rule: a change to one axis must not regress the others (>5% throughput/MB/s, or RTT p99).
-- **Cross-compat tests**: `scripts/compat-test.sh` — 55 default + 18 guarded (XTCP 16-test pairwise matrix + V2 TCP `GO_FRP_V2=1`). Runs on every push via `compat.yml`. XTCP compat runs daily on VPS via `xtcp-compat.yml`.
+- **Cross-compat tests**: `scripts/compat-test.sh` — 68 non-XTCP tests + 16 XTCP pairwise scenarios against Go frp v0.70.1 (V2 included). Runs on every push via `compat.yml`; XTCP compat runs daily on VPS via `xtcp-compat.yml`.
 - **Security audit**: Run `cargo audit` and `cargo deny check` before each release to catch known vulnerabilities and license issues in the dependency tree.
 
 ### Test Coverage Gaps

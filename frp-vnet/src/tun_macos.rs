@@ -264,6 +264,11 @@ impl AsyncRead for MacOSTun {
                 }
             }) {
                 Ok(Ok(n)) => {
+                    if n == 0 {
+                        // utun fd closed/destroyed: read() returns 0 forever.
+                        // Signal EOF instead of spinning on the ready fd.
+                        return Poll::Ready(Ok(()));
+                    }
                     // macOS utun prepends a 4-byte AF header (AF_INET=2).
                     // Short read (n <= 4 means no packet data after AF header).
                     // Continue the read loop instead of returning 0 (which signals EOF).

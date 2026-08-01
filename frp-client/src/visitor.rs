@@ -497,7 +497,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             Some(u.as_str()).filter(|s| !s.is_empty()),
                             Some(rid.as_str()).filter(|s| !s.is_empty()),
                         );
-                        debug!(visitor_name = %visitor_name, json = %serde_json::to_string(&nvc).unwrap_or_default(), "Visitor '{}': NewVisitorConn JSON: {}", visitor_name, serde_json::to_string(&nvc).unwrap_or_default());
+                        debug!(visitor_name = %visitor_name, "NewVisitorConn message prepared");
                         if let Err(e) = server_conn.write_v1_frame(&nvc).await {
                             warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STCP fallback send NewVisitorConn failed: {}", visitor_name, e);
                             return;
@@ -514,7 +514,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                 debug!(visitor_name = %visitor_name, proxy_name = %resp.proxy_name, "Visitor '{}': STCP relay ready for '{}'", visitor_name, resp.proxy_name);
                             }
                             Ok(other) => {
-                                warn!(visitor_name = %visitor_name, type_byte = %other.v1_type_byte(), msg = ?other, "Visitor '{}': unexpected response type 0x{:02x}, msg={:?}", visitor_name, other.v1_type_byte(), other);
+                                warn!(visitor_name = %visitor_name, type_byte = %other.v1_type_byte(), "Visitor received unexpected response type");
                                 return;
                             }
                             Err(e) => {
@@ -592,7 +592,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                             Some(u.as_str()).filter(|s| !s.is_empty()),
                             Some(rid.as_str()).filter(|s| !s.is_empty()),
                         );
-                        debug!(visitor_name = %visitor_name, json = %serde_json::to_string(&nvc).unwrap_or_default(), "Visitor '{}': NewVisitorConn JSON: {}", visitor_name, serde_json::to_string(&nvc).unwrap_or_default());
+                        debug!(visitor_name = %visitor_name, "NewVisitorConn message prepared");
                         if let Err(e) = server_conn.write_v1_frame(&nvc).await {
                             warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': send NewVisitorConn failed: {}", visitor_name, e);
                             return;
@@ -609,7 +609,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                 debug!(visitor_name = %visitor_name, proxy_name = %resp.proxy_name, "Visitor '{}': STCP relay ready for '{}'", visitor_name, resp.proxy_name);
                             }
                             Ok(other) => {
-                                warn!(visitor_name = %visitor_name, type_byte = %other.v1_type_byte(), msg = ?other, "Visitor '{}': unexpected response type 0x{:02x}, msg={:?}", visitor_name, other.v1_type_byte(), other);
+                                warn!(visitor_name = %visitor_name, type_byte = %other.v1_type_byte(), "Visitor received unexpected response type");
                                 return;
                             }
                             Err(e) => {

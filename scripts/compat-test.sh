@@ -81,7 +81,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --frps-remote HOST  Remote VPS address for XTCP tests"
             echo "  --xtcp-only       Run only XTCP tests (skip all other phases)"
             echo "  --shard INDEX/TOTAL  Shard XTCP tests across N jobs (e.g. 0/4)"
-            echo "  --go-version VER  Go frp version (default: 0.70.0)"
+            echo "  --go-version VER  Go frp version (default: 0.70.1)"
             exit 0
             ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
@@ -100,6 +100,10 @@ if [[ -z "$GO_FRP_DIR_USER" ]]; then
     GO_FRPS="$GO_FRP_DIR/frps"
     GO_FRPC="$GO_FRP_DIR/frpc"
 fi
+
+# Pass the resolved Go frp version/path to remote-frps.sh for VPS XTCP runs.
+export GO_FRP_VERSION
+export GO_FRP_DIR
 
 # =============================================================================
 # Helpers
@@ -4410,11 +4414,96 @@ test_auth_r2g_reject() {
     fi
 }
 
+# -----------------------------------------------------------------------------
+# Test: Rust frpc -> Go frps authenticated HeartBeats over tcpMux.
+# Both configs require the HeartBeats scope. Go frps rejects an unauthenticated
+# Ping, so keeping the proxy alive across multiple 1s heartbeat intervals proves
+# Rust frpc emitted token-authenticated Ping messages compatible with Go v0.70.1.
+# -----------------------------------------------------------------------------
+test_auth_r2g_heartbeats() {
+    local name="test_auth_r2g_heartbeats"
+    should_run_test "$name" || return 0
+
+    log "=== $name ==="
+    local frps_port=$(random_port)
+    local proxy_port=$(random_port)
+    local echo_port=$(random_port)
+    local token="auth-test-token-r2g-heartbeats"
+
+    mkdir -p "$TEST_DIR/$name"
+    start_echo_server "$echo_port"
+    wait_for_port 127.0.0.1 "$echo_port" 3 || {
+        fail_test "$name" "echo server did not start"
+        return
+    }
+
+    cat > "$TEST_DIR/$name/frps.toml" << TOML
+bindAddr = "127.0.0.1"
+bindPort = $frps_port
+
+auth.method = "token"
+auth.token = "$token"
+auth.additionalScopes = ["HeartBeats"]
+
+transport.tcpMux = true
+transport.heartbeatTimeout = 5
+log.to = "$TEST_DIR/$name/go-frps.log"
+log.level = "debug"
+TOML
+    run_go "$GO_FRPS" -c "$TEST_DIR/$name/frps.toml" \
+        > "$TEST_DIR/$name/frps.log" 2>&1 &
+    track_pid $!
+    wait_for_port 127.0.0.1 "$frps_port" 5 || {
+        fail_test "$name" "Go frps did not start"
+        return
+    }
+
+    cat > "$TEST_DIR/$name/frpc.toml" << TOML
+server_addr = "127.0.0.1"
+server_port = $frps_port
+token = "$token"
+login_fail_exit = true
+heartbeat_interval = 1
+heartbeat_timeout = 4
+tcp_mux = true
+
+[auth]
+method = "token"
+token = "$token"
+additionalAuthScopes = ["HeartBeats"]
+
+[[proxies]]
+name = "heartbeat-auth"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = $echo_port
+remote_port = $proxy_port
+TOML
+    RUST_LOG=debug "$RUST_FRPC" -c "$TEST_DIR/$name/frpc.toml" \
+        > "$TEST_DIR/$name/frpc.log" 2>&1 &
+    track_pid $!
+
+    wait_for_port_safe 127.0.0.1 "$proxy_port" 10 || {
+        fail_test "$name" "proxy did not register"
+        return
+    }
+    sleep 3
+
+    local result
+    result=$(send_and_expect "$proxy_port" "heartbeat-auth-data" "heartbeat-auth-data" 5)
+    if [[ "$result" == OK:* ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "$result"
+    fi
+}
+
 # --- Run tests ---
 if ! ${XTCP_ONLY:-false}; then
 # Phase 1: Auth compatibility (cross-boundary token verification)
 run_test test_auth_g2r_reject
 run_test test_auth_r2g_reject
+run_test test_auth_r2g_heartbeats
 
 # Phase 2: Go frpc -> Rust frps TCP data plane
 run_test test_g2r_tcp_plain
@@ -6007,7 +6096,7 @@ run_test test_r2g_ws_encrypted
 run_test test_g2r_wss_plain
 run_test test_g2r_wss_encrypted
 run_test test_g2r_wss_mux
-# r2g: Rust frpc → Go frps — blocked by Go frp v0.70.0 vhostHTTPSPort TLS SNI bug.
+# r2g: Rust frpc → Go frps — blocked by Go frp v0.70.1 vhostHTTPSPort TLS SNI bug.
 # Go frps sends fatal UnrecognisedName alert (112). Rust frpc rustls aborts.
 # Go frps vhostHTTPSPort TLS config does not set ServerName for reverse WSS
 # connections. Monitor Go frp upstream for fix.
@@ -6049,7 +6138,7 @@ run_test test_kcp_rust_encrypted
 # QUIC Rust↔Rust: both sides use quinn crate, wire-compatible.
 run_test test_quic_rust_to_rust
 # QUIC Go↔Rust: multi-stream-per-connection enabled.
-# Go frp v0.70.0 uses quic-go (multi-stream), Rust accepts additional streams.
+# Go frp v0.70.1 uses quic-go (multi-stream), Rust accepts additional streams.
 # Go frp v0.70.1+ pre-built binaries work with release Rust build.
 run_test test_g2r_quic
 run_test test_r2g_quic

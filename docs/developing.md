@@ -218,7 +218,7 @@ Two paths for visitor connections:
 
 1. **Fresh TCP connection** (primary): visitor sends `NatHoleVisitor` on a new TCP connection. Server creates session, sends `NatHoleSidOnWorkConn` internal msg. Provider control handler writes `StartWorkConn`+`NatHoleSid` on work conn. Provider does STUN, sends `NatHoleClient` on control, server runs NAT analysis, sends `NatHoleResp` to both sides.
 
-2. **Control connection** (Go frp compat): Go frpc v0.69.1 sends `NatHoleVisitor` on its existing control channel. Server creates session with `create_session_with_ctl`, spawns task waiting for provider's `NatHoleClient` on control, runs NAT analysis, and sends `NatHoleResp` to both sides.
+2. **Control connection** (Go frp compat): Go frpc v0.70.1 sends `NatHoleVisitor` on its existing control channel. Server creates session with `create_session_with_ctl`, spawns task waiting for provider's `NatHoleClient` on control, runs NAT analysis, and sends `NatHoleResp` to both sides.
 
 **NAT analysis** (`frp-server/src/nathole/analysis.rs`): 5-mode behavior table with score-based `Analyzer`. Each mode tests how the NAT behaves for different address/port combinations. The analyzer learns from success feedback -- successful hole punches increase the score for the modes that predicted the correct behavior.
 
@@ -274,7 +274,7 @@ The `FrpMessage` enum is `#[serde(untagged)]` -- serde matches the first variant
 
 **V2** (fully implemented in `frp-core/src/protocol.rs`):
 
-V2 uses 7-byte magic `FRP\0\x02\r\n` + different framing with numeric type IDs (u16). Full AEAD encryption with capability negotiation via `frp-core/src/v2_handshake.rs` and `frp-core/src/crypto.rs` (AES-256-GCM or ChaCha20-Poly1305, HKDF-SHA256 key derivation). V2 frame read/write (`read_v2_frame_raw`/`write_v2_frame_raw`), message dispatch (`read_msg_v2`/`write_msg_v2`), and `deserialize_v2()` all fully operational. V2 compat tests auto-detect locally (require source-built Go frp), skipped in CI by default. Set `GO_FRP_V2=1` to enable in CI.
+V2 uses 7-byte magic `FRP\0\x02\r\n` + different framing with numeric type IDs (u16). Full AEAD encryption with capability negotiation via `frp-core/src/v2_handshake.rs` and `frp-core/src/crypto.rs` (AES-256-GCM or ChaCha20-Poly1305, HKDF-SHA256 key derivation). V2 frame read/write (`read_v2_frame_raw`/`write_v2_frame_raw`), message dispatch (`read_msg_v2`/`write_msg_v2`), and `deserialize_v2()` all fully operational. V2 compat tests run against the Go frp v0.70.1 pre-built binary.
 
 Encryption in the control handler is protocol-aware: V1 uses AES-128-CFB (`CipherStream`), V2 with AEAD keys wraps the stream in `AeadStream` after LoginResp.
 
@@ -286,11 +286,11 @@ Encryption in the control handler is protocol-aware: V1 uses AES-128-CFB (`Ciphe
 
 **V2 control:** AEAD (AES-256-GCM or ChaCha20-Poly1305). Keys derived via HKDF-SHA256 from the transcript hash. Implemented in `frp-core/src/crypto.rs`.
 
-**Important:** Go frp v0.69.1 golib source says PBKDF2 salt `"crypto"` but the pre-built binary uses salt `"frp"`. This codebase uses `"frp"` for binary compatibility.
+**Important:** Go frp v0.70.1 golib source says PBKDF2 salt `"crypto"` but the pre-built binary uses salt `"frp"`. This codebase uses `"frp"` for binary compatibility.
 
 ### Authentication
 
-Auth uses `MD5(token + timestamp)` -> hex string. Matches Go frp v0.69.1 behavior (Go frp switched from HMAC-SHA256 to MD5 in commit `78f9394`). See `frp-core/src/auth.rs`.
+Auth uses `MD5(token + timestamp)` -> hex string. Matches Go frp v0.70.1 behavior (Go frp switched from HMAC-SHA256 to MD5 in commit `78f9394`). See `frp-core/src/auth.rs`.
 
 OIDC authentication is also supported when the `oidc` feature is enabled. The server verifies JWTs against an OIDC provider and maps subjects to proxy names.
 
@@ -564,7 +564,7 @@ The compat tests require Go frp binaries. Download them first:
 bash scripts/download-go-frp.sh
 ```
 
-This downloads Go frp v0.69.1 binaries to `scripts/go-frp/`. The CI gate is `.github/workflows/compat.yml`.
+This downloads Go frp v0.70.1 binaries to `scripts/go-frp/`. The CI gate is `.github/workflows/compat.yml`.
 
 ### XTCP CI Tests
 

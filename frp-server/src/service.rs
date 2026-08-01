@@ -56,9 +56,209 @@ fn is_v2_magic(buf: &[u8]) -> bool {
 /// All V1 type bytes are ASCII alphanumeric (e.g., 'o'=Login, '1'=LoginResp,
 /// 'w'=NewWorkConn, 'h'=Ping). Used to distinguish raw V1 data from yamux
 /// headers (which start with 0x00).
+#[cfg(all(test, feature = "quic"))]
+mod quic_admission_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn simulated_silent_first_frame(
+        limiter: Arc<tokio::sync::Semaphore>,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    ) {
+        let _permit = limiter.acquire_owned().await.unwrap();
+        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+        max_active.fetch_max(now, Ordering::SeqCst);
+        let _ = tokio::time::timeout(Duration::from_millis(10), std::future::pending::<()>()).await;
+        active.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_silent_streams_are_bounded_and_timeout_releases_permits() {
+        let limit = 4;
+        let limiter = Arc::new(tokio::sync::Semaphore::new(limit));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for _ in 0..64 {
+            tasks.spawn(simulated_silent_first_frame(
+                limiter.clone(),
+                active.clone(),
+                max_active.clone(),
+            ));
+        }
+        while tasks.join_next().await.is_some() {}
+
+        assert_eq!(max_active.load(Ordering::SeqCst), limit);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(limiter.available_permits(), limit);
+    }
+
+    #[tokio::test]
+    async fn drain_preauth_limiter_bounds_concurrent_first_frame_waits() {
+        // Mirrors the drain loop: the stream is already accepted, then the
+        // preauth permit is acquired before the first-frame read. The
+        // limiter must cap concurrent waits at QUIC_PREAUTH_STREAM_LIMIT.
+        let limiter = new_quic_preauth_stream_limiter();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for _ in 0..(QUIC_PREAUTH_STREAM_LIMIT * 4) {
+            let limiter = limiter.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            tasks.spawn(async move {
+                let _permit = limiter.acquire_owned().await.unwrap();
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+
+        assert_eq!(max_active.load(Ordering::SeqCst), QUIC_PREAUTH_STREAM_LIMIT);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(limiter.available_permits(), QUIC_PREAUTH_STREAM_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn preauth_stream_admission_uses_small_safety_cap() {
+        let limiter = new_quic_preauth_stream_limiter();
+        let mut permits = Vec::new();
+        for _ in 0..QUIC_PREAUTH_STREAM_LIMIT {
+            permits.push(limiter.clone().try_acquire_owned().unwrap());
+        }
+        assert!(limiter.clone().try_acquire_owned().is_err());
+        drop(permits.pop());
+        assert!(limiter.clone().try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn authenticated_stream_admission_preserves_configured_boundary_above_256() {
+        let configured = 1_024usize;
+        let limiter = new_quic_authenticated_stream_limiter(configured);
+        let mut permits = Vec::new();
+        for _ in 0..configured {
+            permits.push(limiter.clone().try_acquire_owned().unwrap());
+        }
+        assert!(limiter.clone().try_acquire_owned().is_err());
+        drop(permits.pop());
+        assert!(limiter.clone().try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn first_control_accept_obeys_absolute_preauth_deadline() {
+        let cancel = CancellationToken::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+        let result = await_quic_preauth(std::future::pending::<()>(), deadline, &cancel).await;
+        assert!(matches!(result, Err(QuicPreauthError::TimedOut)));
+    }
+
+    #[tokio::test]
+    async fn real_quic_connection_without_first_stream_times_out() {
+        let tls = frp_core::transport::generate_self_signed_tls_config().unwrap();
+        let listener = frp_core::quic::QuicListener::new_with_tls_config(
+            "127.0.0.1:0".parse().unwrap(),
+            tls,
+            frp_core::quic::QuicTransportParams::default(),
+        )
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            frp_core::quic::dial_quic_connection_with_params(
+                &address.to_string(),
+                "localhost",
+                None,
+                None,
+                None,
+                frp_core::quic::QuicTransportParams::default(),
+            )
+            .await
+            .unwrap()
+        });
+        let server = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("server should complete QUIC handshake")
+            .unwrap();
+        let _client = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("client should complete QUIC handshake")
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+
+        let result = await_quic_preauth(server.accept_bi(), deadline, &cancel).await;
+        assert!(matches!(result, Err(QuicPreauthError::TimedOut)));
+        server.close(b"test timeout");
+    }
+
+    #[tokio::test]
+    async fn cancelling_stream_tasks_reclaims_all_admission_permits() {
+        let limit = 8;
+        let limiter = Arc::new(tokio::sync::Semaphore::new(limit));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..limit {
+            let permit = limiter.clone().acquire_owned().await.unwrap();
+            tasks.spawn(async move {
+                let _permit = permit;
+                std::future::pending::<()>().await;
+            });
+        }
+        assert_eq!(limiter.available_permits(), 0);
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        assert_eq!(limiter.available_permits(), limit);
+    }
+}
+
 #[inline]
 fn is_v1_type_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric()
+}
+
+#[cfg(feature = "quic")]
+const QUIC_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(feature = "quic")]
+const QUIC_PREAUTH_STREAM_LIMIT: usize = 32;
+
+#[cfg(feature = "quic")]
+fn new_quic_preauth_stream_limiter() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(QUIC_PREAUTH_STREAM_LIMIT))
+}
+
+#[cfg(feature = "quic")]
+fn new_quic_authenticated_stream_limiter(configured: usize) -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(configured.max(1)))
+}
+
+#[cfg(feature = "quic")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuicPreauthError {
+    TimedOut,
+    Cancelled,
+}
+
+#[cfg(feature = "quic")]
+async fn await_quic_preauth<F, T>(
+    future: F,
+    deadline: tokio::time::Instant,
+    cancel: &CancellationToken,
+) -> Result<T, QuicPreauthError>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(QuicPreauthError::Cancelled),
+        result = tokio::time::timeout_at(deadline, future) => {
+            result.map_err(|_| QuicPreauthError::TimedOut)
+        }
+    }
 }
 
 /// Run V2 handshake then read the first message frame. Returns `None` on error
@@ -426,14 +626,7 @@ impl Service {
                                                 Err(_) => false,
                                             };
 
-                                            if is_v2 {
-                                                // V2 path: ClientHello/ServerHello handshake
-                                                let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut ws, Some(addr), "WS V2").await {
-                                                    Some(v) => v,
-                                                    None => return,
-                                                };
-                                                crate::handlers::dispatch_v2_message(ws, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
-                                            } else if magic[0] == 0x16 {
+                                            if magic[0] == 0x16 {
                                                 #[cfg(feature = "tls")]
                                                 {
                                                     let tls_acceptor = match state.tls_acceptor.read_ok().clone() {
@@ -521,6 +714,54 @@ impl Service {
                                                 {
                                                     tracing::warn!(addr = %addr, "TLS ClientHello in WebSocket frame but TLS feature not enabled, dropping connection from {}", addr);
                                                 }
+                                            } else if state.tcp_mux {
+                                                // Plain WebSocket + tcp_mux: Go frp v0.70.1 wraps the
+                                                // upgraded stream in yamux before any FRP bytes, so
+                                                // wrap here and run V2/V1 detection on the yamux stream.
+                                                let stream = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
+                                                let mux_cfg = mux::TcpMuxConfig {
+                                                    keepalive_interval: std::time::Duration::from_secs(
+                                                        state.tcp_mux_keepalive.max(1) as u64
+                                                    ),
+
+                                                ..Default::default()
+                                                };
+                                                match mux::server_mux(stream, &mux_cfg).await {
+                                                    Ok((control_stream, incoming)) => {
+                                                        let mut io = IoStream::Yamux(control_stream);
+                                                        tracing::info!(addr = ?addr, "Yamux over WebSocket session established for {:?}", addr);
+
+                                                        // V2 detection on yamux stream
+                                                        let mut mux_magic = [0u8; 7];
+                                                        let is_v2 = match io.read_exact(&mut mux_magic).await {
+                                                            Ok(_) => is_v2_magic(&mux_magic),
+                                                            Err(_) => false,
+                                                        };
+                                                        if is_v2 {
+                                                            let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut io, Some(addr), "WS+yamux V2").await {
+                                                                Some(v) => v,
+                                                                None => return,
+                                                            };
+                                                            crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, Some(incoming), None, crypto_ctx).await;
+                                                        } else {
+                                                            // V1 over plain WS+yamux
+                                                            let io = IoStream::BufferedRead(
+                                                                mux_magic.to_vec(), 0, Box::new(io),
+                                                            );
+                                                            crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None).await;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(addr = ?addr, error = %e, "Failed to start yamux over WebSocket for {:?}: {}", addr, e);
+                                                    }
+                                                }
+                                            } else if is_v2 {
+                                                // V2 path: ClientHello/ServerHello handshake
+                                                let (msg_payload, crypto_ctx) = match v2_handshake_and_read(&mut ws, Some(addr), "WS V2").await {
+                                                    Some(v) => v,
+                                                    None => return,
+                                                };
+                                                crate::handlers::dispatch_v2_message(ws, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
                                             } else {
                                                 // V1 fallback: replay consumed 7 bytes
                                                 let ws = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
@@ -572,7 +813,10 @@ impl Service {
         }
 
         // Start HTTPS VHost listener if configured
-        if self.cfg.vhost_https_port > 0 && self.cfg.tls_enable {
+        // Go frp starts the HTTPS vhost listener whenever vhostHTTPSPort is
+        // configured; the shared TLS acceptor auto-generates a server identity
+        // when no cert/key files are set.
+        if self.cfg.vhost_https_port > 0 {
             let https_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.vhost_https_port);
             let https_addr2 = https_addr.clone();
             let https_state = self.state.clone();
@@ -737,10 +981,7 @@ impl Service {
                                                 return;
                                             }
                                         };
-                                        // KCP listener doesn't capture peer addr (matching V1 behavior).
-                                        // Use unspecified addr for dispatch_v2_message logging.
-                                        let peer_addr = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
-                                        crate::handlers::dispatch_v2_message(ctl, msg_payload, state, peer_addr, None, None, crypto_ctx).await;
+                                        crate::handlers::dispatch_v2_message(ctl, msg_payload, state, peer, None, None, crypto_ctx).await;
                                     } else {
                                         let first_byte = magic[0];
 
@@ -834,8 +1075,7 @@ impl Service {
                                                                         return;
                                                                     }
                                                                 };
-                                                                let peer_addr = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
-                                                                crate::handlers::dispatch_v2_message(io, msg_payload, state, peer_addr, Some(incoming), None, crypto_ctx).await;
+                                                                crate::handlers::dispatch_v2_message(io, msg_payload, state, peer, Some(incoming), None, crypto_ctx).await;
                                                             } else {
                                                                 let mut io = frp_core::transport::IoStream::BufferedRead(yamux_magic.to_vec(), 0, Box::new(io));
                                                                 match frp_core::protocol::read_msg_v1(&mut io).await {
@@ -901,8 +1141,7 @@ impl Service {
                                                             return;
                                                         }
                                                     };
-                                                    let peer_addr = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
-                                                    crate::handlers::dispatch_v2_message(ctl, msg_payload, state, peer_addr, None, None, crypto_ctx).await;
+                                                    crate::handlers::dispatch_v2_message(ctl, msg_payload, state, peer, None, None, crypto_ctx).await;
                                                 } else {
                                                     // After KCP TLS handshake, Go frpc's decrypted stream
                                                     // starts with non-FRP bytes (TLS Finished verify_data
@@ -957,7 +1196,7 @@ impl Service {
                                                             match frp_core::protocol::read_msg_v1(&mut ctl).await {
                                                                 Ok(frp_core::msg::FrpMessage::Login(login)) => {
                                                                     tracing::info!(peer = %peer, "KCP TLS Login from {}", peer);
-                                                                    control::handle_control(ctl, *login, state, None, None, false, None, false).await;
+                                                                    control::handle_control(ctl, *login, state, Some(peer), None, false, None, false).await;
                                                                 }
                                                                 Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                                                     tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP TLS NewWorkConn from {}", peer);
@@ -995,12 +1234,11 @@ impl Service {
                                                 warn!(peer = %peer, "TLS-only mode: rejected plain KCP from {}", peer);
                                                 return;
                                             }
-                                            // tcp_mux enabled: Go frpc wraps KCP conn in yamux
-                                            // before sending Login (matching Go frps flow).
-                                            // But Rust frpc only proposes yamux for TCP
-                                            // (control.rs:123), not KCP. If the first byte is
-                                            // a V1 type byte (e.g. 0x6f Login), skip yamux
-                                            // and handle as raw V1.
+                                            // tcp_mux enabled: Go frpc and frp-rs wrap KCP conns in
+                                            // yamux before sending Login (matching Go frps flow).
+                                            // If the first byte is a V1 type byte (e.g. 0x6f Login),
+                                            // this is a legacy Rust frpc or custom client sending raw
+                                            // V1; keep handling it directly so those clients work.
                                             if state.tcp_mux && !is_v1_type_byte(first_byte) {
                                             // Replay the 7 bytes consumed by magic check —
                                             // they are part of the yamux SYN header.
@@ -1083,8 +1321,8 @@ impl Service {
                                             let mut ctl = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ctl));
                                             match frp_core::protocol::read_msg_v1(&mut ctl).await {
                                                 Ok(frp_core::msg::FrpMessage::Login(login)) => {
-                                                    tracing::info!(peer = %peer, "KCP Login from {}", peer);
-                                                    control::handle_control(ctl, *login, state, None, None, false, None, false).await;
+                                                                    tracing::info!(peer = %peer, "KCP Login from {}", peer);
+                                                                    control::handle_control(ctl, *login, state, Some(peer), None, false, None, false).await;
                                                 }
                                                 Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
                                                     tracing::info!(peer = %peer, run_id = ?nwc.run_id, "KCP NewWorkConn from {}", peer);
@@ -1131,11 +1369,28 @@ impl Service {
         #[cfg(feature = "quic")]
         if self.cfg.quic_bind_port > 0 {
             let quic_state = self.state.clone();
+            let quic_options = self.cfg.transport.quic_options.clone().unwrap_or_default();
+            let quic_params = frp_core::quic::quic_params_from_option_values(
+                quic_options.keepalive_period,
+                quic_options.max_idle_timeout,
+                quic_options.max_incoming_streams,
+            );
+            let authenticated_stream_limit = quic_params.max_incoming_streams as usize;
+            let mut listener_quic_params = quic_params.clone();
+            listener_quic_params.max_incoming_streams = quic_params
+                .max_incoming_streams
+                .min(QUIC_PREAUTH_STREAM_LIMIT as u32)
+                .max(1);
             let quic_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.quic_bind_port);
             let quic_addr2 = quic_addr.clone();
             let (quic_bind_tx, quic_bind_rx) = tokio::sync::oneshot::channel::<()>();
             let cert_path = self.cfg.tls_cert_file.clone();
             let key_path = self.cfg.tls_key_file.clone();
+            let ca_path = if self.cfg.tls_ca_file.is_empty() {
+                None
+            } else {
+                Some(self.cfg.tls_ca_file.clone())
+            };
             spawn_boxed(Box::pin(async move {
                 let sockaddr: std::net::SocketAddr = match quic_addr.parse() {
                     Ok(a) => a,
@@ -1145,87 +1400,44 @@ impl Service {
                     }
                 };
 
-                // Try configured TLS cert/key files; fall back to auto-generated
-                // self-signed certs (Go frp compat: QUIC always starts when
-                // quicBindPort > 0, with or without TLS config).
-                let listener = if !cert_path.is_empty() && !key_path.is_empty() {
-                    match (
-                        std::fs::read_to_string(&cert_path),
-                        std::fs::read_to_string(&key_path),
-                    ) {
-                        (Ok(cert_pem), Ok(key_pem)) => {
-                            match frp_core::quic::QuicListener::new(sockaddr, &cert_pem, &key_pem) {
-                                Ok(l) => l,
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        "QUIC: listen failed with configured TLS certs"
-                                    );
-                                    return;
-                                }
-                            }
-                        }
-                        _ => {
-                            tracing::warn!(
-                                "QUIC: failed to read TLS cert/key files \
-                                 (cert={cert_path}, key={key_path}), \
-                                 falling back to auto-generated self-signed certificate"
-                            );
-                            let tls_config =
-                                match frp_core::transport::generate_self_signed_tls_config() {
-                                    Ok(c) => c,
-                                    Err(e) => {
-                                        tracing::error!(
-                                            error = %e,
-                                            "QUIC: failed to generate TLS cert"
-                                        );
-                                        return;
-                                    }
-                                };
-                            match frp_core::quic::QuicListener::new_with_tls_config(
-                                sockaddr,
-                                tls_config,
-                                frp_core::quic::QuicTransportParams::default(),
-                            ) {
-                                Ok(l) => l,
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        "QUIC: listen failed with auto-generated certs"
-                                    );
-                                    return;
-                                }
-                            }
-                        }
-                    }
+                // Build a TLS server config that honors `trustedCaFile`
+                // (mTLS) exactly like the TCP/TLS path, then hand it to the
+                // QUIC listener. Go frp reuses NewServerTLSConfig for QUIC.
+                let tls_config = if !cert_path.is_empty() && !key_path.is_empty() {
+                    frp_core::transport::build_tls_server_config(
+                        &cert_path,
+                        &key_path,
+                        ca_path.as_deref(),
+                    )
                 } else {
                     tracing::info!(
                         "QUIC: no TLS cert/key configured, \
                          auto-generating self-signed certificate"
                     );
-                    let tls_config = match frp_core::transport::generate_self_signed_tls_config() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "QUIC: failed to generate TLS cert"
-                            );
-                            return;
-                        }
-                    };
-                    match frp_core::quic::QuicListener::new_with_tls_config(
-                        sockaddr,
-                        tls_config,
-                        frp_core::quic::QuicTransportParams::default(),
-                    ) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "QUIC: listen failed with auto-generated certs"
-                            );
-                            return;
-                        }
+                    frp_core::transport::generate_self_signed_tls_config_with_ca(ca_path.as_deref())
+                };
+                let tls_config = match tls_config {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "QUIC: failed to build TLS config"
+                        );
+                        return;
+                    }
+                };
+                let listener = match frp_core::quic::QuicListener::new_with_tls_config(
+                    sockaddr,
+                    tls_config,
+                    listener_quic_params.clone(),
+                ) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "QUIC: listen failed with built TLS config"
+                        );
+                        return;
                     }
                 };
                 let _ = quic_bind_tx.send(());
@@ -1259,14 +1471,41 @@ impl Service {
                                             // This is inside the handler, not in the accept loop —
                                             // matching Go frp's HandleQUICListener pattern where
                                             // the accept loop never blocks on a stream.
-                                            let stream = match conn.accept_bi().await {
-                                                Ok(s) => s,
-                                                Err(e) => {
+                                            let stream = match await_quic_preauth(
+                                                conn.accept_bi(),
+                                                tokio::time::Instant::now()
+                                                    + QUIC_FIRST_FRAME_TIMEOUT,
+                                                &state.shutdown_token,
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(stream)) => stream,
+                                                Ok(Err(e)) => {
                                                     tracing::warn!(error = %e, "QUIC: failed to accept first stream: {e}");
                                                     return;
                                                 }
+                                                Err(QuicPreauthError::TimedOut) => {
+                                                    tracing::warn!(addr = %quic_addr, "QUIC connection timed out before opening control stream");
+                                                    conn.close(b"control stream timeout");
+                                                    return;
+                                                }
+                                                Err(QuicPreauthError::Cancelled) => {
+                                                    conn.close(b"server shutdown");
+                                                    return;
+                                                }
                                             };
-                                            handle_quic_stream(stream, conn, state).await;
+                                            // The first-frame budget starts after the stream is
+                                            // accepted, not while we are waiting for the peer to
+                                            // open it (Go frp applies the read deadline post-accept).
+                                            let deadline = tokio::time::Instant::now()
+                                                + QUIC_FIRST_FRAME_TIMEOUT;
+                                            handle_quic_stream(
+                                                stream,
+                                                conn,
+                                                state,
+                                                deadline,
+                                                authenticated_stream_limit,
+                                            ).await;
                                         }));
                                     }
                             Err(e) => {
@@ -1301,6 +1540,8 @@ impl Service {
             first_stream: frp_core::quic::QuicStream,
             conn: frp_core::quic::QuicConnection,
             state: Arc<AppState>,
+            first_frame_deadline: tokio::time::Instant,
+            authenticated_stream_limit: usize,
         ) {
             let mut ctl = frp_core::transport::IoStream::Quic(first_stream);
 
@@ -1308,70 +1549,149 @@ impl Service {
             // Per-stream independence: each QUIC stream gets its own
             // V2 detection, matching Go frp's WriteMagicIfV2() per stream.
             let mut magic = [0u8; 7];
-            let is_v2 = match ctl.read_exact(&mut magic).await {
-                Ok(_) => is_v2_magic(&magic),
-                Err(_) => false,
-            };
+            let is_v2 =
+                match tokio::time::timeout_at(first_frame_deadline, ctl.read_exact(&mut magic))
+                    .await
+                {
+                    Ok(Ok(_)) => is_v2_magic(&magic),
+                    Ok(Err(_)) => false,
+                    Err(_) => {
+                        tracing::warn!("QUIC control stream timed out before protocol magic");
+                        conn.close(b"control stream timeout");
+                        return;
+                    }
+                };
 
             if is_v2 {
                 // --- V2 path ---
-                let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(
-                    &mut ctl,
-                )
-                .await
-                {
+                let first_message = tokio::time::timeout_at(first_frame_deadline, async {
+                    match frp_core::v2_handshake::v2_handshake_server(&mut ctl).await {
                     Ok((Some(p), crypto)) => (p, crypto),
                     Ok((None, crypto)) => match ctl.read_raw_v2_frame().await {
                         Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                         Ok((ft, _, _)) => {
                             tracing::warn!(frame_type = ?ft, "QUIC V2: unexpected frame type {} after handshake", ft);
-                            return;
+                            return None;
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "QUIC V2: failed to read message after handshake: {}", e);
-                            return;
+                            return None;
                         }
                     },
                     Err(e) => {
                         tracing::warn!(error = %e, "QUIC V2 handshake error: {}", e);
+                        return None;
+                    }
+                    }.into()
+                }).await;
+                let (msg_payload, crypto_ctx) = match first_message {
+                    Ok(Some(message)) => message,
+                    Ok(None) => {
+                        conn.close(b"control stream error");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::warn!("QUIC V2 control stream timed out before first message");
+                        conn.close(b"control stream timeout");
                         return;
                     }
                 };
 
                 let addr: std::net::SocketAddr = conn.remote_address();
-                let cancel = spawn_quic_drain(conn, Arc::clone(&state), "V2");
-                crate::handlers::dispatch_v2_message(
+                let (auth_tx, auth_rx) = tokio::sync::oneshot::channel();
+                let control = crate::handlers::dispatch_v2_message_with_auth_signal(
                     ctl,
                     msg_payload,
-                    state,
+                    Arc::clone(&state),
                     addr,
                     None,
                     None,
                     crypto_ctx,
-                )
-                .await;
-                cancel.cancel();
+                    auth_tx,
+                );
+                tokio::pin!(control);
+                tokio::select! {
+                    biased;
+                    _ = &mut control => {}
+                    auth = auth_rx => {
+                        if auth.is_err() {
+                            return;
+                        }
+                        conn.set_max_concurrent_bi_streams(
+                            authenticated_stream_limit.min(u32::MAX as usize) as u32,
+                        );
+                        let cancel = spawn_quic_drain(
+                            conn,
+                            Arc::clone(&state),
+                            "V2",
+                            authenticated_stream_limit,
+                        );
+                        control.await;
+                        cancel.cancel();
+                    }
+                }
             } else {
                 // --- V1 fallback ---
                 let mut ctl =
                     frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ctl));
 
-                match frp_core::protocol::read_msg_v1(&mut ctl).await {
-                    Ok(frp_core::msg::FrpMessage::Login(login)) => {
-                        let cancel = spawn_quic_drain(conn, Arc::clone(&state), "V1");
-                        control::handle_control(ctl, *login, state, None, None, false, None, false)
-                            .await;
-                        cancel.cancel();
+                match tokio::time::timeout_at(
+                    first_frame_deadline,
+                    frp_core::protocol::read_msg_v1(&mut ctl),
+                )
+                .await
+                {
+                    Err(_) => {
+                        tracing::warn!("QUIC V1 control stream timed out before Login");
+                        conn.close(b"control stream timeout");
                     }
-                    Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
-                        crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
-                    }
-                    Ok(other) => {
-                        tracing::warn!(other = ?other.v1_type_byte(), "Unexpected QUIC message: {:?}", other.v1_type_byte());
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "QUIC read error: {}", e);
-                    }
+                    Ok(result) => match result {
+                        Ok(frp_core::msg::FrpMessage::Login(login)) => {
+                            let (auth_tx, auth_rx) = tokio::sync::oneshot::channel();
+                            let control = control::handle_control_with_auth_signal(
+                                ctl,
+                                *login,
+                                Arc::clone(&state),
+                                Some(conn.remote_address()),
+                                None,
+                                false,
+                                None,
+                                false,
+                                auth_tx,
+                            );
+                            tokio::pin!(control);
+                            tokio::select! {
+                                biased;
+                                _ = &mut control => {}
+                                auth = auth_rx => {
+                                    if auth.is_err() {
+                                        return;
+                                    }
+                                    conn.set_max_concurrent_bi_streams(
+                                        authenticated_stream_limit.min(u32::MAX as usize) as u32,
+                                    );
+                                    let cancel = spawn_quic_drain(
+                                        conn,
+                                        Arc::clone(&state),
+                                        "V1",
+                                        authenticated_stream_limit,
+                                    );
+                                    control.await;
+                                    cancel.cancel();
+                                }
+                            }
+                        }
+                        Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
+                            crate::handlers::handle_work_conn_inner(ctl, nwc, state).await;
+                        }
+                        Ok(other) => {
+                            tracing::warn!(other = ?other.v1_type_byte(), "Unexpected QUIC message: {:?}", other.v1_type_byte());
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "QUIC read error: {}", e);
+                            conn.close(b"control stream error");
+                        }
+                    },
                 }
             }
         }
@@ -1383,57 +1703,88 @@ impl Service {
             conn: frp_core::quic::QuicConnection,
             state: Arc<AppState>,
             tag: &'static str,
+            authenticated_stream_limit: usize,
         ) -> CancellationToken {
             let cancel = CancellationToken::new();
             let drain_cancel = cancel.clone();
             let drain_conn = conn;
             tokio::spawn(async move {
                 tracing::debug!(tag, "QUIC drain ({tag}) started");
+                let preauth_limiter = new_quic_preauth_stream_limiter();
+                let authenticated_limiter =
+                    new_quic_authenticated_stream_limiter(authenticated_stream_limit);
+                let mut stream_tasks = tokio::task::JoinSet::new();
+                let accept_next = drain_conn.accept_bi();
+                tokio::pin!(accept_next);
                 loop {
                     tokio::select! {
+                        biased;
                         _ = drain_cancel.cancelled() => {
                             tracing::debug!(tag, "QUIC drain ({tag}) cancelled");
                             break;
                         }
-                        result = drain_conn.accept_bi() => {
+                        Some(result) = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
+                            if let Err(e) = result {
+                                tracing::debug!(error = %e, tag, "QUIC stream task ended with error");
+                            }
+                        }
+                        result = &mut accept_next => {
+                            let result = if drain_cancel.is_cancelled() {
+                                break;
+                            } else {
+                                result
+                            };
                             match result {
                                 Ok(work_stream) => {
                                     tracing::debug!(tag, "QUIC drain ({tag}): accepted new stream");
                                     let s = Arc::clone(&state);
-                                    tokio::spawn(async move {
-                                        let mut wc = frp_core::transport::IoStream::Quic(work_stream);
-                                        let mut wmagic = [0u8; 7];
-                                        let w_is_v2 = match wc.read_exact(&mut wmagic).await {
-                                            Ok(_) => is_v2_magic(&wmagic),
-                                            Err(_) => false,
+                                    let authenticated_limiter = authenticated_limiter.clone();
+                                    let preauth_limiter = preauth_limiter.clone();
+                                    stream_tasks.spawn(async move {
+                                        // Bound concurrent unauthenticated first-frame waits:
+                                        // acquire only after the stream was accepted so the
+                                        // limiter caps actual reads, not the accept backlog.
+                                        let preauth_permit = match preauth_limiter.acquire_owned().await {
+                                            Ok(permit) => permit,
+                                            Err(_) => return,
                                         };
-                                        if w_is_v2 {
-                                            match wc.read_v2_frame().await {
-                                                Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
-                                                    crate::handlers::handle_work_conn_inner(wc, nwc, s).await;
+                                        let mut wc = frp_core::transport::IoStream::Quic(work_stream);
+                                        let request = tokio::time::timeout(QUIC_FIRST_FRAME_TIMEOUT, async {
+                                            let mut wmagic = [0u8; 7];
+                                            let w_is_v2 = match wc.read_exact(&mut wmagic).await {
+                                                Ok(_) => is_v2_magic(&wmagic),
+                                                Err(e) => return Err(e.into()),
+                                            };
+                                            if w_is_v2 {
+                                                match wc.read_v2_frame().await {
+                                                    Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => Ok((wc, nwc)),
+                                                    Ok(other) => Err(frp_core::Error::Protocol(format!("unexpected QUIC V2 message {:?}", other.v2_type_id()).into())),
+                                                    Err(e) => Err(e),
                                                 }
-                                                Ok(other) => {
-                                                    tracing::warn!(msg_type_id = ?other.v2_type_id(), "QUIC drain: unexpected V2 msg type_id={:?}", other.v2_type_id());
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(error = %e, "QUIC drain: V2 read error: {}", e);
-                                                }
-                                            }
-                                        } else {
-                                            let mut wc = frp_core::transport::IoStream::BufferedRead(wmagic.to_vec(), 0, Box::new(wc));
-                                            match frp_core::protocol::read_msg_v1(&mut wc).await {
-                                                Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => {
-                                                    crate::handlers::handle_work_conn_inner(wc, nwc, s).await;
-                                                }
-                                                Ok(other) => {
-                                                    tracing::warn!(msg_type_byte = ?other.v1_type_byte(), "QUIC drain: unexpected V1 msg type_byte={:?}", other.v1_type_byte());
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(error = %e, "QUIC drain: V1 read error: {}", e);
+                                            } else {
+                                                wc = frp_core::transport::IoStream::BufferedRead(wmagic.to_vec(), 0, Box::new(wc));
+                                                match frp_core::protocol::read_msg_v1(&mut wc).await {
+                                                    Ok(frp_core::msg::FrpMessage::NewWorkConn(nwc)) => Ok((wc, nwc)),
+                                                    Ok(other) => Err(frp_core::Error::Protocol(format!("unexpected QUIC V1 message {:?}", other.v1_type_byte()).into())),
+                                                    Err(e) => Err(e),
                                                 }
                                             }
+                                        }).await;
+                                        match request {
+                                            Ok(Ok((wc, nwc))) => {
+                                                drop(preauth_permit);
+                                                let Ok(_authenticated_permit) =
+                                                    authenticated_limiter.acquire_owned().await
+                                                else {
+                                                    return;
+                                                };
+                                                crate::handlers::handle_work_conn_inner(wc, nwc, s).await
+                                            },
+                                            Ok(Err(e)) => tracing::warn!(error = %e, "QUIC drain: invalid first frame"),
+                                            Err(_) => tracing::warn!(timeout_secs = QUIC_FIRST_FRAME_TIMEOUT.as_secs(), "QUIC work stream first-frame timeout"),
                                         }
                                     });
+                                    accept_next.set(drain_conn.accept_bi());
                                 }
                                 Err(e) => {
                                     tracing::debug!(error = %e, tag, "QUIC drain ({tag}) done: {e}");
@@ -1443,6 +1794,8 @@ impl Service {
                         }
                     }
                 }
+                stream_tasks.abort_all();
+                while stream_tasks.join_next().await.is_some() {}
             });
             cancel
         }
@@ -2095,30 +2448,7 @@ impl Service {
                                             Err(_) => false,
                                         };
 
-                                        if is_v2 {
-                                            // V2 path: ClientHello/ServerHello handshake
-                                            let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ws).await {
-                                                Ok((Some(p), crypto)) => (p, crypto),
-                                                Ok((None, crypto)) => {
-                                                    match ws.read_raw_v2_frame().await {
-                                                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-                                                        Ok((ft, _, _)) => {
-                                                            warn!(frame_type = ?ft, addr = %addr, "WS V2 (main): unexpected frame type {} after handshake from {}", ft, addr);
-                                                            return;
-                                                        }
-                                                        Err(e) => {
-                                                            warn!(addr = %addr, error = %e, "WS V2 (main): failed to read message after handshake from {}: {}", addr, e);
-                                                            return;
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    warn!(addr = %addr, error = %e, "WS V2 (main) handshake error from {}: {}", addr, e);
-                                                    return;
-                                                }
-                                            };
-                                            crate::handlers::dispatch_v2_message(ws, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
-                                        } else if magic[0] == 0x16 {
+                                        if magic[0] == 0x16 {
                                             // TLS-over-WebSocket: Go frpc (Docker default) sends
                                             // TLS ClientHello as first WebSocket frame payload.
                                             // Replay consumed bytes and wrap in TLS, matching
@@ -2250,6 +2580,86 @@ impl Service {
                                             {
                                                 warn!(addr = %addr, "TLS ClientHello in WebSocket frame but TLS feature not enabled, dropping connection from {}", addr);
                                             }
+                                        } else if state.tcp_mux {
+                                            // Plain WebSocket + tcp_mux: Go frp v0.70.1 wraps the
+                                            // upgraded stream in yamux before any FRP bytes, so
+                                            // wrap here and run V2/V1 detection on the yamux stream.
+                                            let stream = IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));
+                                            let mux_cfg = mux::TcpMuxConfig {
+                                                keepalive_interval: std::time::Duration::from_secs(
+                                                    state.tcp_mux_keepalive.max(1) as u64
+                                                ),
+
+                                            ..Default::default()
+                                            };
+                                            match mux::server_mux(stream, &mux_cfg).await {
+                                                Ok((control_stream, incoming)) => {
+                                                    let mut io = IoStream::Yamux(control_stream);
+                                                    info!(addr = ?addr, "Yamux over WebSocket session established for {:?}", addr);
+
+                                                    // V2 detection on yamux stream
+                                                    let mut mux_magic = [0u8; 7];
+                                                    let is_v2 = match io.read_exact(&mut mux_magic).await {
+                                                        Ok(_) => is_v2_magic(&mux_magic),
+                                                        Err(_) => false,
+                                                    };
+                                                    if is_v2 {
+                                                        let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
+                                                            Ok((Some(p), crypto)) => (p, crypto),
+                                                            Ok((None, crypto)) => {
+                                                                match io.read_raw_v2_frame().await {
+                                                                    Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                                    Ok((ft, _, _)) => {
+                                                                        warn!(frame_type = ?ft, addr = %addr, "WS+yamux V2: unexpected frame type {} from {}", ft, addr);
+                                                                        return;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        warn!(addr = %addr, error = %e, "WS+yamux V2: failed to read message from {}: {}", addr, e);
+                                                                        return;
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                warn!(addr = %addr, error = %e, "WS+yamux V2 handshake error from {}: {}", addr, e);
+                                                                return;
+                                                            }
+                                                        };
+                                                        crate::handlers::dispatch_v2_message(io, msg_payload, state.clone(), addr, Some(incoming), None, crypto_ctx).await;
+                                                    } else {
+                                                        // V1 over plain WS+yamux
+                                                        let io = IoStream::BufferedRead(
+                                                            mux_magic.to_vec(), 0, Box::new(io),
+                                                        );
+                                                        crate::handlers::dispatch_v1_message(io, state.clone(), Some(addr), Some(incoming), None).await;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(addr = ?addr, error = %e, "Failed to start yamux over WebSocket for {:?}: {}", addr, e);
+                                                }
+                                            }
+                                        } else if is_v2 {
+                                            // V2 path: ClientHello/ServerHello handshake
+                                            let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ws).await {
+                                                Ok((Some(p), crypto)) => (p, crypto),
+                                                Ok((None, crypto)) => {
+                                                    match ws.read_raw_v2_frame().await {
+                                                        Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                                                        Ok((ft, _, _)) => {
+                                                            warn!(frame_type = ?ft, addr = %addr, "WS V2 (main): unexpected frame type {} after handshake from {}", ft, addr);
+                                                            return;
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(addr = %addr, error = %e, "WS V2 (main): failed to read message after handshake from {}: {}", addr, e);
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(addr = %addr, error = %e, "WS V2 (main) handshake error from {}: {}", addr, e);
+                                                    return;
+                                                }
+                                            };
+                                            crate::handlers::dispatch_v2_message(ws, msg_payload, state.clone(), addr, None, None, crypto_ctx).await;
                                         } else {
                                             // V1 fallback: replay consumed 7 bytes
                                             let ws = frp_core::transport::IoStream::BufferedRead(magic.to_vec(), 0, Box::new(ws));

@@ -1,12 +1,12 @@
-# Go frp v0.70.0 → frp-rs Compatibility Audit
+# Go frp v0.70.1 → frp-rs Compatibility Audit
 
 > Source-level comparison. Updated 2026-07-14.
 
 ## Summary
 
-frp-rs targets Go frp v0.70.0 wire compatibility. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 9 client plugins, config coverage, SSH tunnel gateway, V2 AEAD protocol, and XTCP Go↔Rust cross-compat all match Go frp behavior.
+frp-rs targets Go frp v0.70.1 wire compatibility. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 9 client plugins, config coverage, SSH tunnel gateway, V2 AEAD protocol, and XTCP Go↔Rust cross-compat all match Go frp behavior.
 
-**73/73 cross-compatibility tests pass (including XTCP 16-test pairwise matrix and V2 TCP).**
+**68 non-XTCP compatibility tests and the 16-test XTCP pairwise matrix run against Go frp v0.70.1 (V2 included).**
 
 ---
 
@@ -116,7 +116,7 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 
 ## Resolved (2026-06-28)
 
-1. **V2 AEAD encryption + capability negotiation** — ✅ Full implementation: Login plaintext, AEAD after LoginResp, crypto negotiation in handshake. Compat tests guarded behind `GO_FRP_V2=1` (requires Go frp source build with V2 patches).
+1. **V2 AEAD encryption + capability negotiation** — ✅ Full implementation: Login plaintext, AEAD after LoginResp, crypto negotiation in handshake. V2 compat tests run against the Go frp v0.70.1 pre-built binary (V2 is included since v0.70.1).
 
 2. **XTCP Go frp cross-compat** — ✅ Full implementation: server coordinates NAT analysis with address exchange. Compat tests guarded behind `RUN_XTCP=1` (requires public internet for STUN/NAT probes).
 
@@ -125,11 +125,11 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 ## Out of Scope
 
 - **Pprof profiling endpoint** — out of scope (Go-specific; Rust equivalent is tokio-console)
-- **gRPC management API** — Go frp v0.69.1 has no gRPC; REST API covers all management
+- **gRPC management API** — Go frp v0.70.1 has no gRPC; REST API covers all management
 
 ### Recently Fixed (2026-06-27)
 
-- ✅ Client reconnect: exponential backoff `min(24s×n,720s)` × jitter `[0.8,1.2]` — matches Go frp v0.69.1
+- ✅ Client reconnect: two-phase fast backoff (escalating phase, 20s cap) — matches Go frp v0.70.1's `fastBackoffImpl`
 - ✅ Group load balancing: true round-robin with per-group atomic counter
 - ✅ Admin `/api/status`: reports actual `plugin`, `remote_addr`, `err`; status reflects registration state
 - ✅ Config reload: detects changed proxies via config_snapshot hash, supports CloseProxy+NewProxy cycle for add/remove/modify without restart
@@ -159,5 +159,5 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 | `enabled` per-proxy toggle | Disable individual proxies without removing config |
 | Selective `start` | Start only named proxies for testing/staging |
 | PROXY protocol v1+v2 | Both text and binary HAProxy PROXY protocol support |
-| SSH tunnel gateway | ✅ Full `ssh -R` support, beyond Go frp parity |
+| SSH tunnel gateway | ✅ SSH proxy-registration commands; `ssh -R` reverse forwarding explicitly disabled in 0.7.1 |
 | Rust type safety | Memory safety, no data races, compile-time guarantees |

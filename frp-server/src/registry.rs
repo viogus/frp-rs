@@ -130,8 +130,11 @@ impl ClientRegistry {
 
         let now = Instant::now();
 
-        let mut clients = self.clients.write_ok();
+        // Canonical lock order: run_index before clients. The offline path
+        // resolves the run_index first, so acquiring in this order avoids
+        // deadlocking concurrent register/mark-offline calls.
         let mut run_index = self.run_index.write_ok();
+        let mut clients = self.clients.write_ok();
 
         // Conflict check under write lock (atomic with registration, matching Go)
         if enforce_unique {
@@ -396,5 +399,17 @@ mod tests {
         r.mark_offline_by_run_id_and_control_id("run-1", 0);
         let info = r.get_by_key("u.c1").unwrap();
         assert!(!info.online);
+    }
+
+    #[test]
+    fn register_and_mark_offline_use_consistent_lock_order() {
+        let r = mk_registry();
+        register_test_client(&r, "u", "", "run-x");
+        r.mark_offline_by_run_id("run-x");
+        assert!(r.get_by_key("u.run-x").is_none());
+
+        let (_, conflict) = register_test_client(&r, "u", "", "run-x");
+        assert!(!conflict);
+        assert!(r.get_by_key("u.run-x").is_some());
     }
 }

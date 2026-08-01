@@ -1,9 +1,13 @@
-//! SSH Tunnel Gateway — `ssh -R` reverse tunnel → frp proxy.
+//! SSH Tunnel Gateway — SSH client registration → frp proxy.
 //!
 //! Users connect with a standard SSH client:
 //!   ssh -R :80:127.0.0.1:8080 v0@server -p 2200 tcp --proxy_name "web" --remote_port 9090
 //!
 //! The remote command string is parsed into a ProxyConfig.
+//!
+//! SSH reverse forwarding (`tcpip_forward` / `-R`) is disabled in this
+//! release: the port allocation/work-connection bridge was unsafe and
+//! non-functional, so `-R` requests are rejected explicitly.
 //!
 //! NOTE: russh 0.61 transitively depends on rsa 0.10.0-rc.18 which has a known
 //! timing sidechannel (RUSTSEC-2023-0071, Marvin Attack). Only affects the SSH
@@ -365,27 +369,20 @@ impl VirtualControl {
 /// Lifecycle:
 /// 1. `auth_succeeded` → store handle, spawn work-connection background task
 /// 2. `exec_request` → parse proxy args from SSH remote command
-/// 3. `tcpip_forward` → register an FRP proxy via VirtualControl, store listen port
+/// 3. `tcpip_forward` → rejected; SSH reverse forwarding is disabled
 /// 4. When a work connection is needed, the control handler sends
 ///    ReqWorkConn → VirtualControl intercepts → WorkConnRequest →
-///    background task opens TCP to SSH listen port → sends NewWorkConn.
+///    background task drops the request (no reverse tunnel is available).
 pub struct SshSession {
     /// Unique run_id for this SSH client (used as FRP run_id).
     pub run_id: String,
     /// Proxy names registered by this session (for cleanup).
     pub registered_proxies: Vec<String>,
-    /// Stored after auth_succeeded; used to open reverse-forward
-    /// channels and request work connections from the SSH client.
+    /// Stored after auth_succeeded; retained for session lifecycle handling.
+    /// Reverse-forward channels are not opened in this release.
     pub ssh_handle: Option<russh::server::Handle>,
     /// V1 frame sender into the VirtualControl channel (→ control handler).
-    frame_tx: mpsc::Sender<Vec<u8>>,
-    /// Receives WorkConnRequest from VirtualControl's AsyncWrite intercept.
-    /// Taken by the background task spawned in `auth_succeeded`.
-    work_conn_rx: Option<mpsc::Receiver<WorkConnRequest>>,
-    /// SSH listen ports allocated by `tcpip_forward`, consumed by the
-    /// work-connection background task to open TCP connections that
-    /// traverse the SSH reverse tunnel.
-    listen_ports: std::sync::Arc<tokio::sync::Mutex<std::collections::VecDeque<u16>>>,
+    frame_tx: Option<mpsc::Sender<Vec<u8>>>,
     /// Server auth token for password authentication.
     server_token: String,
     /// Allowed public keys (loaded from authorized_keys file).
@@ -394,13 +391,10 @@ pub struct SshSession {
     state: std::sync::Arc<AppState>,
     /// Set to true by auth_succeeded.
     authenticated: bool,
-    /// The raw exec command string from the SSH client.
-    pending_command: Option<String>,
-    /// Parsed proxy args from the exec command.
-    pending_proxy: Option<ParsedProxyArgs>,
-    /// Bind info from tcpip_forward (-R), consumed by exec_request.
-    /// (bind_address, allocated_ssh_port)
-    pending_bind: Option<(String, u16)>,
+    peer_addr: std::net::SocketAddr,
+    auth_complete_tx: tokio::sync::watch::Sender<bool>,
+    authenticated_run_id: Arc<std::sync::Mutex<Option<String>>>,
+    auth_deadline: tokio::time::Instant,
 }
 
 impl Drop for SshSession {
@@ -411,30 +405,37 @@ impl Drop for SshSession {
 
 impl SshSession {
     pub fn new(
-        run_id: String,
-        frame_tx: mpsc::Sender<Vec<u8>>,
-        work_conn_rx: mpsc::Receiver<WorkConnRequest>,
         server_token: String,
         authorized_keys: Vec<russh::keys::PublicKey>,
         state: std::sync::Arc<AppState>,
+        peer_addr: std::net::SocketAddr,
+        auth_complete_tx: tokio::sync::watch::Sender<bool>,
+        authenticated_run_id: Arc<std::sync::Mutex<Option<String>>>,
+        auth_deadline: tokio::time::Instant,
     ) -> Self {
         Self {
-            run_id,
+            run_id: String::new(),
             registered_proxies: Vec::new(),
             ssh_handle: None,
-            frame_tx,
-            work_conn_rx: Some(work_conn_rx),
-            listen_ports: std::sync::Arc::new(tokio::sync::Mutex::new(
-                std::collections::VecDeque::new(),
-            )),
+            frame_tx: None,
             server_token,
             authorized_keys,
             state,
             authenticated: false,
-            pending_command: None,
-            pending_proxy: None,
-            pending_bind: None,
+            peer_addr,
+            auth_complete_tx,
+            authenticated_run_id,
+            auth_deadline,
         }
+    }
+
+    fn begin_authentication(&mut self) -> bool {
+        if self.authenticated || tokio::time::Instant::now() >= self.auth_deadline {
+            return false;
+        }
+        self.authenticated = true;
+        let _ = self.auth_complete_tx.send(true);
+        true
     }
 }
 
@@ -508,6 +509,35 @@ fn none_if_empty(s: &str) -> Option<String> {
     }
 }
 
+/// Build the sanitized exec_request log line. Secret values (`--sk`,
+/// `--group_key`, `--http_pwd`) are never formatted here or passed to the
+/// logging macro; only proxy type/name, remote port, and boolean flags.
+fn exec_request_log_summary(args: &ParsedProxyArgs) -> String {
+    format!(
+        "exec_request type={} name={} remote_port={} encryption={} compression={}",
+        args.proxy_type,
+        args.proxy_name,
+        args.remote_port,
+        args.use_encryption,
+        args.use_compression
+    )
+}
+
+/// Log an SSH exec_request using sanitized fields only.
+fn log_exec_request(run_id: &str, args: &ParsedProxyArgs) {
+    tracing::info!(
+        run_id = %run_id,
+        proxy_type = %args.proxy_type,
+        proxy_name = %args.proxy_name,
+        remote_port = %args.remote_port,
+        use_encryption = %args.use_encryption,
+        use_compression = %args.use_compression,
+        "SSH session {}: {}",
+        run_id,
+        exec_request_log_summary(args)
+    );
+}
+
 /// Return None if the vec is empty, Some(v) otherwise.
 fn non_empty_vec(v: Vec<String>) -> Option<Vec<String>> {
     if v.is_empty() {
@@ -558,27 +588,65 @@ impl Handler for SshSession {
     }
 
     async fn auth_succeeded(&mut self, session: &mut Session) -> Result<(), Self::Error> {
+        if !self.begin_authentication() {
+            return Err(anyhow!("SSH authentication expired or already completed"));
+        }
+        self.run_id = uuid::Uuid::new_v4().to_string();
         self.ssh_handle = Some(session.handle());
-        self.authenticated = true;
+
+        let enc_key = frp_core::encryption::derive_key(&self.server_token);
+        let (vc, frame_tx, work_conn_rx, _phase2) = VirtualControl::channel(enc_key);
+        self.frame_tx = Some(frame_tx);
+
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let login = frp_core::msg::Login {
+            version: Some("0.69.1".into()),
+            hostname: Some("ssh-gateway".into()),
+            os: None,
+            arch: None,
+            user: Some("v0".into()),
+            run_id: Some(self.run_id.clone()),
+            client_id: None,
+            pool_count: Some(1),
+            timestamp: Some(now_ts),
+            privilege_key: Some(frp_core::auth::generate_token(&self.server_token, now_ts)),
+            metas: None,
+            client_spec: Some(frp_core::msg::ClientSpec {
+                client_type: None,
+                always_auth_pass: Some(true),
+            }),
+            multiplexer: None,
+        };
+        let ctrl_state = self.state.clone();
+        let peer_addr = self.peer_addr;
+        tokio::spawn(async move {
+            crate::control::handle_control(
+                vc,
+                login,
+                ctrl_state,
+                Some(peer_addr),
+                None,
+                false,
+                None,
+                true,
+            )
+            .await;
+        });
+
+        *self.authenticated_run_id.lock().unwrap() = Some(self.run_id.clone());
         tracing::info!(run_id = %self.run_id, "SSH session {} authenticated", self.run_id);
 
-        // Spawn a background task that handles work connection requests.
-        // When the control handler needs a work connection, it writes
-        // ReqWorkConn → VirtualControl intercepts → WorkConnRequest.
-        // This task receives WorkConnRequest, opens a TCP connection to
-        // the SSH listen port (which traverses the SSH reverse tunnel
-        // back to the client's local service), and sends the resulting
-        // stream as InternalMsg::NewWorkConn to the control handler.
-        let work_rx = self
-            .work_conn_rx
-            .take()
-            .ok_or_else(|| anyhow!("work_conn_rx already taken"))?;
-        let listen_ports = self.listen_ports.clone();
-        let state = self.state.clone();
+        // Spawn a background task that drains work-connection requests.
+        // Reverse forwarding is disabled, so there is no SSH reverse tunnel
+        // to bridge; the receiver is drained so the control handler never
+        // blocks on the bounded channel.
         let run_id = self.run_id.clone();
 
         tokio::spawn(async move {
-            handle_work_conn_requests(work_rx, listen_ports, state, run_id).await;
+            handle_work_conn_requests(work_conn_rx, run_id).await;
         });
 
         Ok(())
@@ -603,10 +671,6 @@ impl Handler for SshSession {
             ));
         }
 
-        self.pending_command = Some(cmd.clone());
-
-        tracing::info!(run_id = %self.run_id, cmd = %cmd, "SSH session {}: exec_request '{}'", self.run_id, cmd);
-
         let args = match parse_ssh_args(&cmd) {
             Ok(args) => args,
             Err(e) => {
@@ -614,20 +678,7 @@ impl Handler for SshSession {
                 return Err(anyhow!("{}", e));
             }
         };
-
-        // If -R bind hasn't arrived yet (unusual but possible), store args for later
-        let (_bind_addr, ssh_listen_port) = match self.pending_bind.take() {
-            Some(bind) => bind,
-            None => {
-                tracing::debug!(
-                    run_id = %self.run_id,
-                    "SSH session {}: exec before -R, storing pending proxy",
-                    self.run_id
-                );
-                self.pending_proxy = Some(args);
-                return Ok(());
-            }
-        };
+        log_exec_request(&self.run_id, &args);
 
         // Check per-client port limit (matching Go frp's GetUsedPortsNum logic).
         if self.state.max_ports_per_client > 0 {
@@ -660,30 +711,23 @@ impl Handler for SshSession {
         let v1_frame = build_v1_frame_from_args(&args, allocated)?;
 
         self.frame_tx
+            .as_ref()
+            .ok_or_else(|| anyhow!("SSH session control is not initialized"))?
             .try_send(v1_frame)
             .map_err(|_| anyhow!("virtual control channel closed"))?;
 
         let proxy_name = args.proxy_name.clone();
         self.registered_proxies.push(proxy_name.clone());
 
-        // Store the SSH listen port so the work-connection background task
-        // can open a TCP connection through the tunnel.
-        {
-            let mut ports = self.listen_ports.lock().await;
-            ports.push_back(ssh_listen_port);
-        }
-
         tracing::info!(
             proxy_name = %proxy_name,
             proxy_type = %args.proxy_type,
             remote_port = %allocated,
-            ssh_listen_port = %ssh_listen_port,
             run_id = %self.run_id,
-            "SSH gateway: registered proxy '{}' type={} remote_port={} ssh_listen_port={} (run_id={})",
+            "SSH gateway: registered proxy '{}' type={} remote_port={} (run_id={})",
             proxy_name,
             args.proxy_type,
             allocated,
-            ssh_listen_port,
             self.run_id
         );
 
@@ -694,31 +738,17 @@ impl Handler for SshSession {
 
     async fn tcpip_forward(
         &mut self,
-        _address: &str,
-        port: &mut u32,
+        address: &str,
+        _port: &mut u32,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        // SSH sends tcpip_forward (-R) BEFORE exec_request (remote command).
-        // Allocate a port for the SSH tunnel now; proxy registration happens
-        // in exec_request when we have both the bind info and the parsed args.
-        let state = self.state.clone();
-        let allocated = {
-            let mut used = state.used_ports.write().await;
-            let ranges = state.reloadable.read_ok().allow_ports.clone();
-            allocate_port_multi(&mut used, 0, &ranges, &state.proxy_bind_addr)
-                .ok_or_else(|| anyhow!("no port available in configured ranges"))?
-        };
-
-        self.pending_bind = Some((_address.to_string(), allocated));
-        *port = allocated as u32;
-
-        tracing::debug!(
-            address = %_address,
-            allocated_port = %allocated,
-            "SSH -R bind: {}:{} (SSH listen port {})",
-            _address, allocated, allocated
+        tracing::warn!(
+            run_id = %self.run_id,
+            address = %address,
+            "SSH -R reverse forwarding is disabled in this release; rejecting tcpip_forward for {}",
+            address
         );
-        Ok(true)
+        Ok(false)
     }
 
     // ── Environment / PTY ────────────────────────────────────
@@ -754,8 +784,14 @@ impl Handler for SshSession {
         _origin_port: u32,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        // Accept: work connections bridge through forwarded channels
-        Ok(true)
+        // Reverse forwarding is disabled; reject any forwarded-tcpip channels
+        // a client may still attempt to open.
+        tracing::debug!(
+            run_id = %self.run_id,
+            "SSH gateway {}: rejecting forwarded-tcpip channel (reverse forwarding disabled)",
+            self.run_id
+        );
+        Ok(false)
     }
 
     async fn channel_open_direct_tcpip(
@@ -786,86 +822,18 @@ impl Handler for SshSession {
 }
 
 /// Background task: receives WorkConnRequest signals from VirtualControl
-/// (which intercepted ReqWorkConn from the control handler), opens a TCP
-/// connection to the SSH listen port so it traverses the reverse tunnel
-/// back to the client's local service, and sends the stream as
-/// InternalMsg::NewWorkConn to the control handler for bridging.
-async fn handle_work_conn_requests(
-    mut work_rx: mpsc::Receiver<WorkConnRequest>,
-    listen_ports: std::sync::Arc<tokio::sync::Mutex<std::collections::VecDeque<u16>>>,
-    state: std::sync::Arc<AppState>,
-    run_id: String,
-) {
+/// (which intercepted ReqWorkConn from the control handler).
+///
+/// Reverse forwarding is disabled in this release, so there is no SSH
+/// reverse tunnel to bridge work connections through. The receiver is still
+/// drained so the control handler never blocks on the bounded channel.
+async fn handle_work_conn_requests(mut work_rx: mpsc::Receiver<WorkConnRequest>, run_id: String) {
     while let Some(_req) = work_rx.recv().await {
-        // Pop the next listen port allocated by tcpip_forward
-        let port = {
-            let mut ports = listen_ports.lock().await;
-            ports.pop_front()
-        };
-
-        let port = match port {
-            Some(p) => p,
-            None => {
-                tracing::warn!(
-                    run_id = %run_id,
-                    "SSH session {}: WorkConnRequest but no listen ports available",
-                    run_id
-                );
-                continue;
-            }
-        };
-
-        // Open a TCP connection to the SSH listen port. This connection
-        // traverses the SSH reverse tunnel: frps TCP → SSH forwarded-tcpip
-        // channel → SSH client → local service.
-        let stream = match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(
-                    run_id = %run_id,
-                    listen_port = %port,
-                    error = %e,
-                    "SSH session {}: failed to connect to SSH listen port {}: {}",
-                    run_id, port, e
-                );
-                continue;
-            }
-        };
-
-        // Interactive SSH-forwarded traffic — disable Nagle to cut latency.
-        frp_core::transport::set_nodelay(&stream);
-
-        // Look up the control handler's internal_tx from the global map
-        let ctl_tx = {
-            let map = state.run_id_to_ctl_tx.read().await;
-            map.get(&run_id).cloned()
-        };
-
-        match ctl_tx {
-            Some(tx) => {
-                use crate::service::InternalMsg;
-                let io_stream = frp_core::transport::IoStream::Tcp(stream);
-                if tx
-                    .tx
-                    .send(InternalMsg::NewWorkConn(io_stream))
-                    .await
-                    .is_err()
-                {
-                    tracing::error!(
-                        run_id = %run_id,
-                        "SSH session {}: control handler channel closed",
-                        run_id
-                    );
-                }
-            }
-            None => {
-                tracing::error!(
-                    run_id = %run_id,
-                    "SSH session {}: no control handler found for work connection",
-                    run_id
-                );
-            }
-        }
+        tracing::warn!(
+            run_id = %run_id,
+            "SSH gateway {}: dropping WorkConnRequest because SSH reverse forwarding is disabled",
+            run_id
+        );
     }
 
     tracing::debug!(run_id = %run_id, "SSH session {} work-connection handler exiting", run_id);
@@ -880,6 +848,331 @@ pub async fn cleanup_session(run_id: &str, state: &Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+
+    struct TestSshClient;
+
+    impl russh::client::Handler for TestSshClient {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &russh::keys::PublicKey,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    fn test_state(max_connections: usize) -> Arc<AppState> {
+        let cfg = frp_core::config::ServerConfig::default();
+        Arc::new(AppState::new(
+            frp_core::auth::AuthConfig::with_token("test-token"),
+            "127.0.0.1".into(),
+            frp_core::encryption::derive_key("test-token"),
+            vec![(1, u16::MAX)],
+            String::new(),
+            true,
+            30,
+            7200,
+            90,
+            1500,
+            false,
+            None,
+            0,
+            60,
+            10,
+            false,
+            String::new(),
+            Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+            0,
+            168,
+            true,
+            max_connections,
+            0,
+            frp_core::config::ServerConfigSnapshot::from_config(&cfg),
+        ))
+    }
+
+    fn pre_auth_session() -> (
+        SshSession,
+        tokio::sync::watch::Receiver<bool>,
+        Arc<std::sync::Mutex<Option<String>>>,
+    ) {
+        let (auth_tx, auth_rx) = tokio::sync::watch::channel(false);
+        let run_id = Arc::new(std::sync::Mutex::new(None));
+        let session = SshSession::new(
+            "test-token".into(),
+            Vec::new(),
+            test_state(1),
+            "127.0.0.1:2200".parse().unwrap(),
+            auth_tx,
+            run_id.clone(),
+            tokio::time::Instant::now() + SSH_AUTH_DEADLINE,
+        );
+        (session, auth_rx, run_id)
+    }
+
+    async fn start_test_ssh_listener(
+        auth_deadline: std::time::Duration,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AppState>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let state = test_state(1);
+        let mut rng = rand010::rng();
+        let host_key =
+            russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519).unwrap();
+        let listener = SshListener {
+            bind_addr: addr.ip().to_string(),
+            bind_port: addr.port(),
+            server_token: "test-token".into(),
+            state: state.clone(),
+            host_key,
+            authorized_keys: Vec::new(),
+            auth_deadline,
+        };
+        let task = tokio::spawn(async move {
+            listener.run().await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        (addr, state, task)
+    }
+
+    #[test]
+    fn test_pre_auth_session_has_no_internal_control_resources() {
+        let (session, auth_rx, run_id) = pre_auth_session();
+
+        assert!(session.run_id.is_empty());
+        assert!(session.frame_tx.is_none());
+        assert!(!session.authenticated);
+        assert!(run_id.lock().unwrap().is_none());
+        assert!(!*auth_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn test_valid_password_authentication_still_succeeds_without_pre_auth_control() {
+        let (mut session, _auth_rx, _run_id) = pre_auth_session();
+
+        let result = session.auth_password("v0", "test-token").await.unwrap();
+
+        assert!(matches!(result, Auth::Accept));
+        assert!(session.run_id.is_empty());
+        assert!(session.frame_tx.is_none());
+    }
+
+    #[test]
+    fn test_authentication_resource_initialization_is_idempotent() {
+        let (mut session, auth_rx, _run_id) = pre_auth_session();
+
+        assert!(session.begin_authentication());
+        assert!(*auth_rx.borrow());
+        assert!(!session.begin_authentication());
+    }
+
+    #[test]
+    fn test_authentication_cannot_begin_after_deadline() {
+        let (mut session, _auth_rx, _run_id) = pre_auth_session();
+        session.auth_deadline = tokio::time::Instant::now();
+
+        assert!(!session.begin_authentication());
+        assert!(!session.authenticated);
+    }
+
+    #[test]
+    fn test_ssh_connection_permit_is_bounded_and_released() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+        assert!(semaphore.clone().try_acquire_owned().is_err());
+        drop(permit);
+        assert!(semaphore.try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_hard_close_wakes_blocked_transport_and_confirms_drop() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(tokio::net::TcpStream::connect(addr));
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client_stream = client.await.unwrap().unwrap();
+        let (mut stream, closer) = CloseableSshStream::new(server_stream);
+        let blocked = tokio::spawn(async move {
+            let mut byte = [0u8; 1];
+            stream.read(&mut byte).await
+        });
+
+        closer.close();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), closer.wait_dropped())
+            .await
+            .expect("hard-close must make the transport owner drop its stream");
+        assert!(blocked.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_drop_notification_is_sticky_when_drop_precedes_wait() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(tokio::net::TcpStream::connect(addr));
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client_stream = client.await.unwrap().unwrap();
+        let (stream, closer) = CloseableSshStream::new(server_stream);
+        drop(stream);
+
+        tokio::time::timeout(std::time::Duration::from_millis(10), closer.wait_dropped())
+            .await
+            .expect("drop notification must remain observable after an early drop");
+    }
+
+    #[tokio::test]
+    async fn test_pending_disconnect_still_forces_io_close_and_finishes_chain() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(tokio::net::TcpStream::connect(addr));
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client_stream = client.await.unwrap().unwrap();
+        let (mut stream, closer) = CloseableSshStream::new(server_stream);
+        let mut session_task = tokio::spawn(async move {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await?;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            terminate_ssh_session(
+                std::future::pending(),
+                &mut session_task,
+                &closer,
+                std::time::Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("a stuck disconnect sender must not stall termination");
+
+        assert!(closer.0.dropped.is_cancelled());
+        assert!(session_task.is_finished());
+    }
+
+    #[tokio::test]
+    async fn test_real_unauthenticated_connection_times_out_without_control_and_releases_permit() {
+        let (addr, state, listener_task) =
+            start_test_ssh_listener(std::time::Duration::from_millis(500)).await;
+        let client = russh::client::connect(
+            Arc::new(russh::client::Config::default()),
+            addr,
+            TestSshClient,
+        )
+        .await
+        .expect("SSH key exchange should complete before the auth deadline");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !client.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("post-KEX unauthenticated SSH connection must close at deadline");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.conn_semaphore.as_ref().unwrap().available_permits() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.run_id_to_ctl_tx.read().await.is_empty());
+        listener_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_real_password_authentication_creates_one_control_and_releases_permit() {
+        let (addr, state, listener_task) =
+            start_test_ssh_listener(std::time::Duration::from_secs(2)).await;
+        let client_config = Arc::new(russh::client::Config::default());
+        let mut client = russh::client::connect(client_config, addr, TestSshClient)
+            .await
+            .unwrap();
+
+        let auth = client
+            .authenticate_password("v0", "test-token")
+            .await
+            .unwrap();
+        assert!(auth.success());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.run_id_to_ctl_tx.read().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(state.run_id_to_ctl_tx.read().await.len(), 1);
+        assert_eq!(
+            state.conn_semaphore.as_ref().unwrap().available_permits(),
+            0
+        );
+
+        client
+            .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+            .await
+            .unwrap();
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.conn_semaphore.as_ref().unwrap().available_permits() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        listener_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_real_authentication_just_before_deadline_wins_race() {
+        let (addr, state, listener_task) =
+            start_test_ssh_listener(std::time::Duration::from_millis(800)).await;
+        let mut client = russh::client::connect(
+            Arc::new(russh::client::Config::default()),
+            addr,
+            TestSshClient,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        let auth = client
+            .authenticate_password("v0", "test-token")
+            .await
+            .unwrap();
+
+        assert!(auth.success());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.run_id_to_ctl_tx.read().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        client
+            .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+            .await
+            .unwrap();
+        listener_task.abort();
+    }
 
     #[test]
     fn test_parse_ssh_args_tcp() {
@@ -965,13 +1258,185 @@ mod tests {
         let tokens = shell_split(r#"tcp --proxy_name """#);
         assert_eq!(tokens, vec!["tcp", "--proxy_name"]);
     }
+
+    #[test]
+    fn test_exec_request_log_summary_redacts_secrets() {
+        const SK: &str = "S3KR-sk-value";
+        const GROUP_KEY: &str = "S3KR-group-key-value";
+        const HTTP_PWD: &str = "S3KR-http-pwd-value";
+        let args = ParsedProxyArgs {
+            proxy_type: "tcp".into(),
+            proxy_name: "web".into(),
+            remote_port: 9090,
+            local_ip: "127.0.0.1".into(),
+            local_port: 8080,
+            custom_domains: Vec::new(),
+            subdomain: String::new(),
+            sk: SK.into(),
+            multiplexer: String::new(),
+            use_encryption: true,
+            use_compression: true,
+            group: String::new(),
+            group_key: GROUP_KEY.into(),
+            http_user: String::new(),
+            http_pwd: HTTP_PWD.into(),
+            host_header_rewrite: String::new(),
+            locations: Vec::new(),
+            bandwidth_limit: String::new(),
+            bandwidth_limit_mode: String::new(),
+        };
+
+        let summary = exec_request_log_summary(&args);
+        assert!(summary.contains("type=tcp"));
+        assert!(summary.contains("name=web"));
+        assert!(summary.contains("remote_port=9090"));
+        assert!(summary.contains("encryption=true"));
+        assert!(summary.contains("compression=true"));
+        for secret in [SK, GROUP_KEY, HTTP_PWD] {
+            assert!(
+                !summary.contains(secret),
+                "secret leaked into exec_request log summary: {summary}"
+            );
+        }
+    }
 }
 
 use std::borrow::Cow;
 use std::path::Path;
 
 use russh::server::Config;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
+
+const SSH_MAX_CONNECTIONS: usize = 128;
+const SSH_AUTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+const SSH_DISCONNECT_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+struct CloseableSshStream {
+    stream: tokio::net::TcpStream,
+    read_cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
+    write_cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
+    flush_cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
+    shutdown_cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
+    close_state: Arc<CloseState>,
+}
+
+struct CloseState {
+    token: tokio_util::sync::CancellationToken,
+    dropped: tokio_util::sync::CancellationToken,
+}
+
+#[derive(Clone)]
+struct SshStreamCloser(Arc<CloseState>);
+
+impl CloseableSshStream {
+    fn new(stream: tokio::net::TcpStream) -> (Self, SshStreamCloser) {
+        let token = tokio_util::sync::CancellationToken::new();
+        let state = Arc::new(CloseState {
+            token: token.clone(),
+            dropped: tokio_util::sync::CancellationToken::new(),
+        });
+        (
+            Self {
+                stream,
+                read_cancelled: Box::pin(token.clone().cancelled_owned()),
+                write_cancelled: Box::pin(token.clone().cancelled_owned()),
+                flush_cancelled: Box::pin(token.clone().cancelled_owned()),
+                shutdown_cancelled: Box::pin(token.cancelled_owned()),
+                close_state: state.clone(),
+            },
+            SshStreamCloser(state),
+        )
+    }
+}
+
+impl Drop for CloseableSshStream {
+    fn drop(&mut self) {
+        self.close_state.dropped.cancel();
+    }
+}
+
+impl AsyncRead for CloseableSshStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.close_state.token.is_cancelled() || self.read_cancelled.as_mut().poll(cx).is_ready()
+        {
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for CloseableSshStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.close_state.token.is_cancelled()
+            || self.write_cancelled.as_mut().poll(cx).is_ready()
+        {
+            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.close_state.token.is_cancelled()
+            || self.flush_cancelled.as_mut().poll(cx).is_ready()
+        {
+            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.close_state.token.is_cancelled()
+            || self.shutdown_cancelled.as_mut().poll(cx).is_ready()
+        {
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+impl SshStreamCloser {
+    fn close(&self) {
+        self.0.token.cancel();
+    }
+
+    async fn wait_dropped(&self) {
+        self.0.dropped.cancelled().await;
+    }
+}
+
+async fn terminate_ssh_session<D>(
+    disconnect: D,
+    session_task: &mut tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    stream_closer: &SshStreamCloser,
+    stage_timeout: std::time::Duration,
+) where
+    D: Future<Output = ()>,
+{
+    let _ = tokio::time::timeout(stage_timeout, disconnect).await;
+    stream_closer.close();
+
+    if tokio::time::timeout(stage_timeout, &mut *session_task)
+        .await
+        .is_err()
+    {
+        session_task.abort();
+        let _ = tokio::time::timeout(stage_timeout, &mut *session_task).await;
+    }
+
+    let _ = tokio::time::timeout(stage_timeout, stream_closer.wait_dropped()).await;
+}
 
 /// SSH tunnel gateway listener. Binds a TCP port and accepts SSH connections.
 pub struct SshListener {
@@ -981,6 +1446,7 @@ pub struct SshListener {
     state: std::sync::Arc<AppState>,
     host_key: russh::keys::PrivateKey,
     authorized_keys: Vec<russh::keys::PublicKey>,
+    auth_deadline: std::time::Duration,
 }
 
 impl SshListener {
@@ -1034,6 +1500,7 @@ impl SshListener {
             state,
             host_key,
             authorized_keys,
+            auth_deadline: SSH_AUTH_DEADLINE,
         }))
     }
 
@@ -1051,6 +1518,8 @@ impl SshListener {
             env!("CARGO_PKG_VERSION")
         )));
         let russh_config = std::sync::Arc::new(russh_config);
+        let ssh_connections = Arc::new(tokio::sync::Semaphore::new(SSH_MAX_CONNECTIONS));
+        let auth_timeout = self.auth_deadline;
 
         loop {
             // Check for graceful shutdown before blocking on accept.
@@ -1071,106 +1540,130 @@ impl SshListener {
             // SSH terminal traffic is the canonical small-message workload — disable Nagle.
             frp_core::transport::set_nodelay(&stream);
 
-            let run_id = uuid::Uuid::new_v4().to_string();
             let state = self.state.clone();
             let server_token = self.server_token.clone();
             let authorized_keys = self.authorized_keys.clone();
             let russh_config = russh_config.clone();
+            let auth_deadline = tokio::time::Instant::now() + auth_timeout;
+            let ssh_permit = match ssh_connections.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    tracing::warn!(peer_address = %peer_addr, "SSH connection limit reached");
+                    continue;
+                }
+            };
+            let global_permit = match state.conn_semaphore.as_ref() {
+                Some(semaphore) => match semaphore.clone().try_acquire_owned() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        tracing::warn!(peer_address = %peer_addr, "Global connection limit reached for SSH");
+                        continue;
+                    }
+                },
+                None => None,
+            };
 
             tokio::spawn(async move {
-                // Derive encryption key matching handle_control's CipherStream
-                let enc_key = frp_core::encryption::derive_key(&server_token);
-
-                // Create channels for virtual control and work conn requests.
-                // vc: duplex stream for handle_control (wrapped in CipherStream by handle_control)
-                // frame_tx: SSH session writes plain V1 frames into this
-                // work_conn_rx: receives WorkConnRequest when control handler needs work conn
-                let (vc, frame_tx, work_conn_rx, _phase2) = VirtualControl::channel(enc_key);
-
-                // Build synthetic Login message for the control handler.
-                // privilege_key must be MD5(token + timestamp), matching
-                // frpc client behavior and the server's validate_login check.
-                let now_ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                let privilege_key = frp_core::auth::generate_token(&server_token, now_ts);
-                let login = frp_core::msg::Login {
-                    version: Some("0.69.1".into()),
-                    hostname: Some("ssh-gateway".into()),
-                    os: None,
-                    arch: None,
-                    user: Some("v0".into()),
-                    run_id: Some(run_id.clone()),
-                    client_id: None,
-                    pool_count: Some(1),
-                    timestamp: Some(now_ts),
-                    privilege_key: Some(privilege_key),
-                    metas: None,
-                    // AlwaysAuthPass: internal SSH gateway connections bypass
-                    // token authentication (matching Go frp dev behavior where
-                    // sshTunnelGateway → HandleListener(internal=true)).
-                    client_spec: Some(frp_core::msg::ClientSpec {
-                        client_type: None,
-                        always_auth_pass: Some(true),
-                    }),
-                    multiplexer: None,
-                };
-
-                // Build SshSession — the russh Handler impl
+                let _ssh_permit = ssh_permit;
+                let _global_permit = global_permit;
+                let (stream, stream_closer) = CloseableSshStream::new(stream);
+                let (auth_complete_tx, mut auth_complete_rx) = tokio::sync::watch::channel(false);
+                let authenticated_run_id = Arc::new(std::sync::Mutex::new(None));
                 let session = SshSession::new(
-                    run_id.clone(),
-                    frame_tx,
-                    work_conn_rx,
                     server_token,
                     authorized_keys,
                     state.clone(),
+                    peer_addr,
+                    auth_complete_tx,
+                    authenticated_run_id.clone(),
+                    auth_deadline,
                 );
 
-                // Spawn control handler with virtual control stream
-                let ctrl_state = state.clone();
-                let ctrl_run_id = run_id.clone();
-                tokio::spawn(async move {
-                    crate::control::handle_control(
-                        vc,
-                        login,
-                        ctrl_state,
-                        Some(peer_addr),
-                        None,  // no incoming streams (not mux)
-                        false, // V1 protocol
-                        None,  // no crypto context (V1)
-                        true,  // internal: SSH gateway connection
-                    )
-                    .await;
-                });
-
-                // Run SSH session with russh
-                let running = match russh::server::run_stream(russh_config, stream, session).await {
-                    Ok(running) => running,
-                    Err(e) => {
-                        tracing::error!(
-                            run_id = %ctrl_run_id,
-                            error = ?e,
-                            "SSH session {} failed to start: {:?}",
-                            ctrl_run_id,
-                            e
-                        );
-                        cleanup_session(&ctrl_run_id, &state).await;
+                let running = match tokio::time::timeout_at(
+                    auth_deadline,
+                    russh::server::run_stream(russh_config, stream, session),
+                )
+                .await
+                {
+                    Ok(Ok(running)) => running,
+                    Ok(Err(e)) => {
+                        tracing::debug!(peer_address = %peer_addr, error = ?e, "SSH handshake failed");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::warn!(peer_address = %peer_addr, "SSH handshake timed out");
+                        let run_id = authenticated_run_id.lock().unwrap().clone();
+                        if let Some(run_id) = run_id {
+                            cleanup_session(&run_id, &state).await;
+                        }
                         return;
                     }
                 };
+                let session_handle = running.handle();
+                let mut session_task = tokio::spawn(running);
 
-                match running.await {
-                    Ok(()) => {
-                        tracing::info!(run_id = %ctrl_run_id, "SSH session {} ended normally", ctrl_run_id)
+                let pre_auth_result = if *auth_complete_rx.borrow() {
+                    None
+                } else {
+                    tokio::select! {
+                        biased;
+                        changed = auth_complete_rx.changed() => {
+                            let _ = changed;
+                            None
+                        }
+                        result = &mut session_task => Some(result),
+                        _ = tokio::time::sleep_until(auth_deadline) => {
+                            if *auth_complete_rx.borrow() {
+                                None
+                            } else {
+                                tracing::warn!(peer_address = %peer_addr, "SSH authentication timed out");
+                                terminate_ssh_session(
+                                    async {
+                                        let _ = session_handle.disconnect(
+                                        russh::Disconnect::ByApplication,
+                                        "SSH authentication timed out".into(),
+                                        String::new(),
+                                    )
+                                    .await;
+                                    },
+                                    &mut session_task,
+                                    &stream_closer,
+                                    SSH_DISCONNECT_GRACE,
+                                ).await;
+                                let run_id = authenticated_run_id.lock().unwrap().clone();
+                                if let Some(run_id) = run_id {
+                                    cleanup_session(&run_id, &state).await;
+                                }
+                                return;
+                            }
+                        }
+                    }
+                };
+
+                let result = match pre_auth_result {
+                    Some(result) => result,
+                    None => session_task.await,
+                };
+                let run_id = authenticated_run_id.lock().unwrap().clone();
+                match result {
+                    Ok(Ok(())) => {
+                        tracing::info!(run_id = ?run_id, "SSH session ended normally");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(
+                            run_id = ?run_id,
+                            error = ?e,
+                            "SSH session error"
+                        );
                     }
                     Err(e) => {
-                        tracing::error!(run_id = %ctrl_run_id, error = ?e, "SSH session {} error: {:#}", ctrl_run_id, e)
+                        tracing::debug!(run_id = ?run_id, error = %e, "SSH session task cancelled")
                     }
                 }
 
-                // Cleanup all proxies registered by this session
-                cleanup_session(&ctrl_run_id, &state).await;
+                if let Some(run_id) = run_id {
+                    cleanup_session(&run_id, &state).await;
+                }
             });
         }
     }

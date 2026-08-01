@@ -181,6 +181,124 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
     }
 }
 
+async fn run_udp_work_conn(
+    work_conn: IoStream,
+    sock: Arc<tokio::net::UdpSocket>,
+    proxy_name: String,
+    local_addr: Option<msg::UdpAddr>,
+    v2: bool,
+    udp_packet_size: usize,
+) {
+    let (mut w_r, mut w_w) = work_conn.into_split().unwrap();
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+    let sock_reader = sock.clone();
+    let reader_name = proxy_name.clone();
+    let mut reader_cancel = cancel_rx.clone();
+    let reader = async move {
+        debug!(proxy_name = %reader_name, "UDP work conn reader task started for '{}'", reader_name);
+        loop {
+            let result = tokio::select! {
+                biased;
+                changed = reader_cancel.changed() => {
+                    if changed.is_err() || *reader_cancel.borrow() { break; }
+                    continue;
+                }
+                result = async {
+                    if v2 { read_msg_v2(&mut w_r).await } else { read_msg_v1(&mut w_r).await }
+                } => result,
+            };
+            match result {
+                Ok(FrpMessage::UDPPacket(up)) => {
+                    if let Some(ref remote) = up.remote_addr {
+                        if let Err(e) = sock_reader.send_to(&up.content, remote.to_string()).await {
+                            debug!(proxy_name = %reader_name, error = %e,
+                                "UDP send_to failed for '{}': {}", reader_name, e);
+                        }
+                    }
+                }
+                Ok(FrpMessage::Ping(_)) | Ok(FrpMessage::Pong(_)) => continue,
+                Ok(other) => {
+                    debug!(proxy_name = %reader_name, msg_type = %other.v1_type_byte(),
+                        "UDP work conn for '{}': unexpected msg 0x{:02x}", reader_name, other.v1_type_byte());
+                }
+                Err(e) => {
+                    debug!(proxy_name = %reader_name, error = %e,
+                        "UDP work conn for '{}' read closed: {}", reader_name, e);
+                    break;
+                }
+            }
+        }
+    };
+
+    let writer_name = proxy_name.clone();
+    let mut writer_cancel = cancel_rx;
+    let writer = async move {
+        debug!(proxy_name = %writer_name, "UDP work conn writer task started for '{}'", writer_name);
+        let mut buf = vec![0u8; udp_packet_size];
+        loop {
+            let received = tokio::select! {
+                biased;
+                changed = writer_cancel.changed() => {
+                    if changed.is_err() || *writer_cancel.borrow() { break; }
+                    continue;
+                }
+                result = sock.recv_from(&mut buf) => result,
+            };
+            match received {
+                Ok((n, src)) => {
+                    let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
+                        content: buf[..n].to_vec(),
+                        local_addr: local_addr.clone(),
+                        remote_addr: Some(msg::UdpAddr {
+                            ip: src.ip().to_string(),
+                            port: src.port(),
+                            zone: String::new(),
+                        }),
+                    });
+                    let result = if v2 {
+                        write_msg_v2(&mut w_w, &pkt).await
+                    } else {
+                        write_msg_v1(&mut w_w, &pkt).await
+                    };
+                    if let Err(e) = result {
+                        debug!(proxy_name = %writer_name, error = %e,
+                            "UDP work conn write failed for '{}': {}", writer_name, e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    debug!(proxy_name = %writer_name, error = %e,
+                        "UDP recv_from error for '{}': {}", writer_name, e);
+                    break;
+                }
+            }
+        }
+    };
+
+    tokio::pin!(reader, writer);
+    tokio::select! {
+        _ = &mut reader => {
+            debug!(proxy_name = %proxy_name, "UDP reader exited; draining then cancelling writer");
+            let _ = cancel_tx.send(true);
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                &mut writer,
+            )
+            .await;
+        }
+        _ = &mut writer => {
+            debug!(proxy_name = %proxy_name, "UDP writer exited; draining then cancelling reader");
+            let _ = cancel_tx.send(true);
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                &mut reader,
+            )
+            .await;
+        }
+    }
+}
+
 /// Assign a work connection to a UDP proxy for bidirectional data forwarding.
 /// Matches Go frp v0.69.1 behavior: sends StartWorkConn, then bridges
 /// UDP socket ↔ work connection via UDPPacket messages.
@@ -225,84 +343,16 @@ pub(crate) async fn assign_udp_work_conn(
         warn!(proxy_name = %proxy_name, error = %e, "Failed to send StartWorkConn for UDP '{}': {}", proxy_name, e);
         return;
     }
-    debug!(proxy_name = %proxy_name, "UDP work conn assigned to '{}', starting bridge tasks", proxy_name);
+    debug!(proxy_name = %proxy_name, "UDP work conn assigned to '{}', starting bridge supervisor", proxy_name);
 
-    let (mut w_r, mut w_w) = work_conn.into_split().unwrap();
-
-    // Task: read UDPPacket from work conn → send to UDP socket
-    let sock_w = sock.clone();
-    let pn_w = proxy_name.clone();
-    tokio::spawn(async move {
-        debug!(proxy_name = %pn_w, "UDP work conn reader task started for '{}'", pn_w);
-        loop {
-            let result = if v2 {
-                read_msg_v2(&mut w_r).await
-            } else {
-                read_msg_v1(&mut w_r).await
-            };
-            match result {
-                Ok(FrpMessage::UDPPacket(up)) => {
-                    if let Some(ref remote) = up.remote_addr {
-                        let remote_str = remote.to_string();
-                        if let Err(e) = sock_w.send_to(&up.content, &remote_str).await {
-                            debug!(proxy_name = %pn_w, error = %e, "UDP send_to failed for '{}': {}", pn_w, e);
-                        }
-                    }
-                }
-                Ok(FrpMessage::Ping(_)) | Ok(FrpMessage::Pong(_)) => {
-                    // Heartbeat on work conn (Go frp compat) — ignore
-                    continue;
-                }
-                Ok(other) => {
-                    debug!(proxy_name = %pn_w, msg_type = %other.v1_type_byte(), "UDP work conn for '{}': unexpected msg 0x{:02x}", pn_w, other.v1_type_byte());
-                }
-                Err(e) => {
-                    debug!(proxy_name = %pn_w, error = %e, "UDP work conn for '{}' read closed: {}", pn_w, e);
-                    break;
-                }
-            }
-        }
-    });
-
-    // Task: read from UDP socket → write UDPPacket to work conn
-    let pn_w2 = proxy_name.clone();
-    tokio::spawn(async move {
-        debug!(proxy_name = %pn_w2, "UDP work conn writer task started for '{}'", pn_w2);
-        let mut buf = vec![0u8; udp_packet_size];
-        loop {
-            match sock.recv_from(&mut buf).await {
-                Ok((n, src)) => {
-                    debug!(proxy_name = %pn_w2, bytes = %n, source = %src, "UDP writer '{}' recv'd {} bytes from {}", pn_w2, n, src);
-                    let remote = msg::UdpAddr {
-                        ip: src.ip().to_string(),
-                        port: src.port(),
-                        zone: String::new(),
-                    };
-                    let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
-                        content: buf[..n].to_vec(),
-                        local_addr: local_addr.clone(),
-                        remote_addr: Some(remote),
-                    });
-                    debug!(proxy_name = %pn_w2, "UDP writer '{}' sending UDPPacket to work conn...", pn_w2);
-                    let write_result = if v2 {
-                        write_msg_v2(&mut w_w, &pkt).await
-                    } else {
-                        write_msg_v1(&mut w_w, &pkt).await
-                    };
-                    if let Err(e) = write_result {
-                        debug!(proxy_name = %pn_w2, error = %e, "UDP work conn write failed for '{}': {}", pn_w2, e);
-                        break;
-                    }
-                    debug!(bytes = %n, proxy_name = %pn_w2, "UDP work conn wrote {} bytes for '{}'", n, pn_w2);
-                }
-                Err(e) => {
-                    debug!(proxy_name = %pn_w2, error = %e, "UDP recv_from error for '{}': {}", pn_w2, e);
-                    break;
-                }
-            }
-        }
-        debug!(proxy_name = %pn_w2, "UDP writer '{}' task exiting", pn_w2);
-    });
+    tokio::spawn(run_udp_work_conn(
+        work_conn,
+        sock,
+        proxy_name,
+        local_addr,
+        v2,
+        udp_packet_size,
+    ));
 }
 
 /// Relay plain traffic between two IoStreams, preferring zero-copy splice
@@ -699,6 +749,13 @@ pub(crate) async fn assign_work_to_proxy(
                     )
                     .await;
                 }
+                // Reachable when frp-core's quic feature is enabled through a
+                // dev-dependency while frp-server's own quic feature is off.
+                #[allow(unreachable_patterns)]
+                _ => {
+                    warn!("unsupported IoStream variant in encrypted server bridge");
+                    return;
+                }
             }
         } else {
             // Pass VHost pre-read bytes through bridge_plain so the bridge
@@ -797,4 +854,172 @@ pub(crate) async fn assign_work_to_proxy(
         }
         debug!(proxy_name = %req.proxy_name, "Proxy '{}' bridge completed", req.proxy_name);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Work stream whose reads block forever and whose writes fail
+    /// deterministically, independent of platform TCP shutdown/RST timing.
+    struct FailingWorkStream;
+
+    impl AsyncRead for FailingWorkStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FailingWorkStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected writer failure",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept(),);
+        (client.unwrap(), accepted.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn udp_work_reader_eof_cancels_blocked_socket_writer() {
+        let (work, peer) = tcp_pair().await;
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket_addr = socket.local_addr().unwrap();
+        let retained_socket = socket.clone();
+
+        let bridge = tokio::spawn(run_udp_work_conn(
+            IoStream::Tcp(work),
+            socket,
+            "udp-test".to_string(),
+            None,
+            false,
+            1500,
+        ));
+        drop(peer);
+
+        tokio::time::timeout(std::time::Duration::from_millis(200), bridge)
+            .await
+            .expect("reader EOF must cancel the sibling blocked on UDP recv_from")
+            .unwrap();
+
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(b"after-stop", socket_addr).await.unwrap();
+        let mut buf = [0; 32];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            retained_socket.recv_from(&mut buf),
+        )
+        .await
+        .expect("stopped writer must not consume a later datagram")
+        .unwrap();
+        assert_eq!(&buf[..n], b"after-stop");
+    }
+
+    #[tokio::test]
+    async fn udp_work_writer_error_cancels_blocked_work_reader() {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket_addr = socket.local_addr().unwrap();
+
+        let bridge = tokio::spawn(run_udp_work_conn(
+            IoStream::SshChannel(Box::new(FailingWorkStream)),
+            socket,
+            "udp-test".to_string(),
+            None,
+            false,
+            1500,
+        ));
+        sender.send_to(b"force-write", socket_addr).await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), bridge)
+            .await
+            .expect("writer error must cancel the sibling blocked on work read")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_work_forwards_packets_and_addresses_bidirectionally() {
+        let (work, peer) = tcp_pair().await;
+        let mut peer = IoStream::Tcp(peer);
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let remote = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote.local_addr().unwrap();
+        let local_addr = msg::UdpAddr {
+            ip: "192.0.2.8".to_string(),
+            port: 7000,
+            zone: String::new(),
+        };
+        let bridge = tokio::spawn(run_udp_work_conn(
+            IoStream::Tcp(work),
+            socket.clone(),
+            "udp-test".to_string(),
+            Some(local_addr.clone()),
+            false,
+            1500,
+        ));
+
+        peer.write_v1_frame(&FrpMessage::UDPPacket(msg::UDPPacket {
+            content: b"request".to_vec(),
+            local_addr: None,
+            remote_addr: Some(msg::UdpAddr {
+                ip: remote_addr.ip().to_string(),
+                port: remote_addr.port(),
+                zone: String::new(),
+            }),
+        }))
+        .await
+        .unwrap();
+        let mut buf = [0u8; 32];
+        let (n, _) = remote.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"request");
+
+        remote
+            .send_to(b"response", socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        let response = peer.read_v1_frame().await.unwrap();
+        match response {
+            FrpMessage::UDPPacket(packet) => {
+                assert_eq!(packet.content, b"response");
+                assert_eq!(
+                    packet.local_addr.unwrap().to_string(),
+                    local_addr.to_string()
+                );
+                assert_eq!(
+                    packet.remote_addr.unwrap().to_string(),
+                    remote_addr.to_string()
+                );
+            }
+            other => panic!("expected UDPPacket, got type {}", other.v1_type_byte()),
+        }
+
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(1), bridge)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }
