@@ -2246,7 +2246,53 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             let stream = crate::kcp::dial_kcp(&addr, crate::kcp::default_kcp_client_config())
                 .await
                 .map_err(|e| crate::Error::Transport(format!("KCP dial: {e}").into()))?;
-            return Ok(IoStream::Kcp(stream));
+            // KCP+TLS (Go frp compat): Go frpc wraps the KCP stream in TLS
+            // with the 0x17 head byte; the server accept path handles both
+            // 0x17-prefixed and raw ClientHello.
+            if opts.tls_enable {
+                #[cfg(not(feature = "tls"))]
+                {
+                    Err(crate::Error::Transport(
+                        "TLS support not compiled (enable the 'tls' feature)".into(),
+                    ))
+                }
+                #[cfg(feature = "tls")]
+                {
+                    let mut stream = stream;
+                    if !opts.disable_custom_tls_first_byte {
+                        stream.write_all(&[FRP_TLS_HEAD_BYTE]).await.map_err(|e| {
+                            crate::Error::Transport(format!("write TLS head byte: {e}").into())
+                        })?;
+                    }
+                    let connector = build_tls_connector_skip_verify(
+                        opts.tls_ca_file.as_deref(),
+                        opts.tls_cert_file.as_deref(),
+                        opts.tls_key_file.as_deref(),
+                    )?;
+                    let server_name = if !opts.tls_server_name.is_empty() {
+                        opts.tls_server_name.clone()
+                    } else {
+                        opts.server_addr.clone()
+                    };
+                    let server_name = rustls::pki_types::ServerName::try_from(server_name)
+                        .map_err(|e| {
+                            crate::Error::Transport(format!("invalid server name: {e}").into())
+                        })?;
+                    let peer_addr = peer;
+                    let tls = connector
+                        .connect(server_name, stream)
+                        .await
+                        .map_err(|e| {
+                            crate::Error::Transport(format!("KCP TLS connect: {e}").into())
+                        })?;
+                    return Ok(IoStream::Tls(
+                        Box::new(tokio_rustls::TlsStream::Client(tls)),
+                        peer_addr,
+                    ));
+                }
+            } else {
+                return Ok(IoStream::Kcp(stream));
+            }
         }
         #[cfg(feature = "quic")]
         TransportProtocol::Quic => {
