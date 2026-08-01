@@ -813,7 +813,10 @@ impl Service {
         }
 
         // Start HTTPS VHost listener if configured
-        if self.cfg.vhost_https_port > 0 && self.cfg.tls_enable {
+        // Go frp starts the HTTPS vhost listener whenever vhostHTTPSPort is
+        // configured; the shared TLS acceptor auto-generates a server identity
+        // when no cert/key files are set.
+        if self.cfg.vhost_https_port > 0 {
             let https_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.vhost_https_port);
             let https_addr2 = https_addr.clone();
             let https_state = self.state.clone();
@@ -1383,6 +1386,11 @@ impl Service {
             let (quic_bind_tx, quic_bind_rx) = tokio::sync::oneshot::channel::<()>();
             let cert_path = self.cfg.tls_cert_file.clone();
             let key_path = self.cfg.tls_key_file.clone();
+            let ca_path = if self.cfg.tls_ca_file.is_empty() {
+                None
+            } else {
+                Some(self.cfg.tls_ca_file.clone())
+            };
             spawn_boxed(Box::pin(async move {
                 let sockaddr: std::net::SocketAddr = match quic_addr.parse() {
                     Ok(a) => a,
@@ -1392,92 +1400,44 @@ impl Service {
                     }
                 };
 
-                // Try configured TLS cert/key files; fall back to auto-generated
-                // self-signed certs (Go frp compat: QUIC always starts when
-                // quicBindPort > 0, with or without TLS config).
-                let listener = if !cert_path.is_empty() && !key_path.is_empty() {
-                    match (
-                        std::fs::read_to_string(&cert_path),
-                        std::fs::read_to_string(&key_path),
-                    ) {
-                        (Ok(cert_pem), Ok(key_pem)) => {
-                            match frp_core::quic::QuicListener::new_with_params(
-                                sockaddr,
-                                &cert_pem,
-                                &key_pem,
-                                listener_quic_params.clone(),
-                            ) {
-                                Ok(l) => l,
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        "QUIC: listen failed with configured TLS certs"
-                                    );
-                                    return;
-                                }
-                            }
-                        }
-                        _ => {
-                            tracing::warn!(
-                                "QUIC: failed to read TLS cert/key files \
-                                 (cert={cert_path}, key={key_path}), \
-                                 falling back to auto-generated self-signed certificate"
-                            );
-                            let tls_config =
-                                match frp_core::transport::generate_self_signed_tls_config() {
-                                    Ok(c) => c,
-                                    Err(e) => {
-                                        tracing::error!(
-                                            error = %e,
-                                            "QUIC: failed to generate TLS cert"
-                                        );
-                                        return;
-                                    }
-                                };
-                            match frp_core::quic::QuicListener::new_with_tls_config(
-                                sockaddr,
-                                tls_config,
-                                listener_quic_params.clone(),
-                            ) {
-                                Ok(l) => l,
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        "QUIC: listen failed with auto-generated certs"
-                                    );
-                                    return;
-                                }
-                            }
-                        }
-                    }
+                // Build a TLS server config that honors `trustedCaFile`
+                // (mTLS) exactly like the TCP/TLS path, then hand it to the
+                // QUIC listener. Go frp reuses NewServerTLSConfig for QUIC.
+                let tls_config = if !cert_path.is_empty() && !key_path.is_empty() {
+                    frp_core::transport::build_tls_server_config(
+                        &cert_path,
+                        &key_path,
+                        ca_path.as_deref(),
+                    )
                 } else {
                     tracing::info!(
                         "QUIC: no TLS cert/key configured, \
                          auto-generating self-signed certificate"
                     );
-                    let tls_config = match frp_core::transport::generate_self_signed_tls_config() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "QUIC: failed to generate TLS cert"
-                            );
-                            return;
-                        }
-                    };
-                    match frp_core::quic::QuicListener::new_with_tls_config(
-                        sockaddr,
-                        tls_config,
-                        listener_quic_params.clone(),
-                    ) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "QUIC: listen failed with auto-generated certs"
-                            );
-                            return;
-                        }
+                    frp_core::transport::generate_self_signed_tls_config_with_ca(ca_path.as_deref())
+                };
+                let tls_config = match tls_config {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "QUIC: failed to build TLS config"
+                        );
+                        return;
+                    }
+                };
+                let listener = match frp_core::quic::QuicListener::new_with_tls_config(
+                    sockaddr,
+                    tls_config,
+                    listener_quic_params.clone(),
+                ) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "QUIC: listen failed with built TLS config"
+                        );
+                        return;
                     }
                 };
                 let _ = quic_bind_tx.send(());
@@ -1692,7 +1652,7 @@ impl Service {
                                 ctl,
                                 *login,
                                 Arc::clone(&state),
-                                None,
+                                Some(conn.remote_address()),
                                 None,
                                 false,
                                 None,

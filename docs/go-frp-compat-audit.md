@@ -129,7 +129,7 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 
 ### Recently Fixed (2026-06-27)
 
-- ✅ Client reconnect: exponential backoff `min(24s×n,720s)` × jitter `[0.8,1.2]` — matches Go frp v0.70.1
+- ✅ Client reconnect: two-phase fast backoff (escalating phase, 20s cap) — matches Go frp v0.70.1's `fastBackoffImpl`
 - ✅ Group load balancing: true round-robin with per-group atomic counter
 - ✅ Admin `/api/status`: reports actual `plugin`, `remote_addr`, `err`; status reflects registration state
 - ✅ Config reload: detects changed proxies via config_snapshot hash, supports CloseProxy+NewProxy cycle for add/remove/modify without restart
@@ -159,5 +159,5 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 | `enabled` per-proxy toggle | Disable individual proxies without removing config |
 | Selective `start` | Start only named proxies for testing/staging |
 | PROXY protocol v1+v2 | Both text and binary HAProxy PROXY protocol support |
-| SSH tunnel gateway | ✅ Full `ssh -R` support, beyond Go frp parity |
+| SSH tunnel gateway | ✅ SSH proxy-registration commands; `ssh -R` reverse forwarding explicitly disabled in 0.7.1 |
 | Rust type safety | Memory safety, no data races, compile-time guarantees |

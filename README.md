@@ -281,7 +281,7 @@ tcp_mux_keepalive_interval = 30
 | `websocket_port` | `0` | WebSocket listener port (0 = disabled) |
 | `sub_domain_host` | `""` | Host for sub-domain proxy support |
 | `sudp_port` | `0` | Shared port for all SUDP proxies (0 = per-proxy ports) |
-| `tls_enable` | `true` | Enable TLS on the listener |
+| `tls_enable` | `false` | Enable TLS on the listener |
 | `tls_only` | `false` | Reject non-TLS connections |
 | `tls_cert_file` | `""` | Path to TLS certificate |
 | `tls_key_file` | `""` | Path to TLS private key |

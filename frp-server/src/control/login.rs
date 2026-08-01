@@ -31,11 +31,11 @@ use super::{write_ctl_msg, ControlContext, ControlState};
 /// Go frp never rewrites `LoginMsg.User` when OIDC is enabled: the claimed
 /// user drives proxy ownership and visitor `allow_users` checks, while the
 /// verified JWT subject is used only for NewWorkConn/Ping verification.
-pub(crate) fn authenticated_user(claimed_user: Option<&str>, oidc_subject: Option<&str>) -> String {
-    claimed_user
-        .or(oidc_subject)
-        .unwrap_or_default()
-        .to_string()
+pub(crate) fn authenticated_user(
+    claimed_user: Option<&str>,
+    _oidc_subject: Option<&str>,
+) -> String {
+    claimed_user.unwrap_or_default().to_string()
 }
 
 async fn remove_oidc_subject_generation(state: &AppState, run_id: &str, control_id: u64) {

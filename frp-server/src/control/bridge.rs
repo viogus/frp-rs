@@ -860,6 +860,41 @@ pub(crate) async fn assign_work_to_proxy(
 mod tests {
     use super::*;
 
+    /// Work stream whose reads block forever and whose writes fail
+    /// deterministically, independent of platform TCP shutdown/RST timing.
+    struct FailingWorkStream;
+
+    impl AsyncRead for FailingWorkStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FailingWorkStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected writer failure",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -905,15 +940,12 @@ mod tests {
 
     #[tokio::test]
     async fn udp_work_writer_error_cancels_blocked_work_reader() {
-        let (work, peer) = tcp_pair().await;
-        let peer = peer.into_std().unwrap();
-        peer.shutdown(std::net::Shutdown::Read).unwrap();
         let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let socket_addr = socket.local_addr().unwrap();
 
         let bridge = tokio::spawn(run_udp_work_conn(
-            IoStream::Tcp(work),
+            IoStream::SshChannel(Box::new(FailingWorkStream)),
             socket,
             "udp-test".to_string(),
             None,
@@ -926,7 +958,6 @@ mod tests {
             .await
             .expect("writer error must cancel the sibling blocked on work read")
             .unwrap();
-        drop(peer);
     }
 
     #[tokio::test]

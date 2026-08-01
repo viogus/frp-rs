@@ -915,13 +915,14 @@ mod identity_binding_tests {
     }
 
     #[test]
-    fn oidc_without_claimed_user_falls_back_to_subject() {
+    fn oidc_without_claimed_user_keeps_empty_go_identity() {
         let identity = super::super::login::authenticated_user(None, Some("A"));
-        assert_eq!(identity, "A");
-        assert!(crate::handlers::visitor_user_allowed(
+        assert_eq!(identity, "");
+        assert!(crate::handlers::visitor_user_allowed(&identity, "", &[]));
+        assert!(!crate::handlers::visitor_user_allowed(
             &identity,
             "owner",
-            &["A".to_string()]
+            &[]
         ));
     }
 

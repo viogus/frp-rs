@@ -22,7 +22,7 @@ Complete field reference for frp-rs `frps.toml` and `frpc.toml`. Every field map
 | `websocket_port` | `u16` | `0` | `websocketPort` | WebSocket transport listener port. 0 = disabled. Requires `websocket` feature. |
 | `sudp_port` | `u16` | `0` | `sudpPort` | Shared UDP port for all SUDP proxies. When > 0, SUDP proxies share this port instead of allocating individual ports. |
 | `sub_domain_host` | `string` | `""` | `subDomainHost` | Base domain for sub-domain proxy routing (e.g. `"example.com"`). A proxy with `subdomain = "web"` will be reachable at `web.example.com`. |
-| `tls_enable` | `bool` | `true` | `tlsEnable` | Enable TLS on the main listener. Requires `tls_cert_file` and `tls_key_file`. |
+| `tls_enable` | `bool` | `false` | `tlsEnable` | Enable TLS on the main listener. Requires `tls_cert_file` and `tls_key_file`. |
 | `tls_only` | `bool` | `false` | `tlsOnly` | When true, the main `bind_port` only accepts TLS connections. Plain TCP and WebSocket upgrades are rejected. Clients must also have `tls_enable = true`. |
 | `tls_cert_file` | `string` | `""` | `tlsCertFile` | Path to TLS certificate PEM file. |
 | `tls_key_file` | `string` | `""` | `tlsKeyFile` | Path to TLS private key PEM file. |
@@ -90,7 +90,10 @@ Transport-level settings for the server.
 
 ### `[ssh_tunnel_gateway]` Section
 
-SSH reverse tunnel gateway. When `bind_port > 0`, an embedded SSH server listens for `ssh -R` reverse tunnels.
+SSH tunnel gateway. When `bind_port > 0`, an embedded SSH server accepts SSH
+proxy-registration commands. Reverse forwarding (`ssh -R`) is disabled in
+0.7.1 and rejected explicitly; only the forward proxy-registration command
+path is supported.
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
@@ -158,7 +161,7 @@ quic_bind_port = 0
 websocket_port = 0
 sudp_port = 0
 sub_domain_host = "example.com"
-tls_enable = true
+tls_enable = false
 tls_only = false
 tls_cert_file = ""
 tls_key_file = ""

@@ -149,8 +149,18 @@ where
     R: FnOnce(String) -> F,
     F: Future<Output = std::io::Result<Vec<SocketAddr>>>,
 {
-    connect_local_with_resolver_and_connector(addr, timeout, resolver, TcpStream::connect, timeout)
-        .await
+    // Bound each address attempt well below the overall wall deadline so a
+    // blackholed first address cannot consume the whole window and leave
+    // later addresses with zero remaining time.
+    let per_attempt_timeout = std::cmp::min(timeout, std::time::Duration::from_secs(1));
+    connect_local_with_resolver_and_connector(
+        addr,
+        timeout,
+        resolver,
+        TcpStream::connect,
+        per_attempt_timeout,
+    )
+    .await
 }
 
 async fn connect_local_with_resolver_and_connector<R, F, C, G>(

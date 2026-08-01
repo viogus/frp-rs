@@ -2866,14 +2866,14 @@ pub struct TlsConfig {
     pub ca_file: Option<String>,
 }
 
-/// Create a TLS acceptor from PEM-encoded cert and key files.
-/// If ca_file is provided, client certificates will be verified against it (mTLS).
+/// Build a [`rustls::ServerConfig`] from PEM-encoded cert and key files.
+/// If `ca_file` is provided, client certificates are required and verified (mTLS).
 #[cfg(feature = "tls")]
-pub fn build_tls_acceptor(
+pub fn build_tls_server_config(
     cert_file: &str,
     key_file: &str,
     ca_file: Option<&str>,
-) -> Result<TlsAcceptor, crate::Error> {
+) -> Result<rustls::ServerConfig, crate::Error> {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -2938,6 +2938,18 @@ pub fn build_tls_acceptor(
             })?
     };
 
+    Ok(config)
+}
+
+/// Create a TLS acceptor from PEM-encoded cert and key files.
+/// If ca_file is provided, client certificates will be verified against it (mTLS).
+#[cfg(feature = "tls")]
+pub fn build_tls_acceptor(
+    cert_file: &str,
+    key_file: &str,
+    ca_file: Option<&str>,
+) -> Result<TlsAcceptor, crate::Error> {
+    let config = build_tls_server_config(cert_file, key_file, ca_file)?;
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
@@ -3012,7 +3024,7 @@ pub fn generate_self_signed_tls_config() -> Result<rustls::ServerConfig, crate::
 /// client certificates against `ca_file` (mTLS). Go frp does this whenever
 /// `trustedCaFile` is set, even with a generated server certificate.
 #[cfg(feature = "tls")]
-fn generate_self_signed_tls_config_with_ca(
+pub fn generate_self_signed_tls_config_with_ca(
     ca_file: Option<&str>,
 ) -> Result<rustls::ServerConfig, crate::Error> {
     let (cert_der, key_der) = generate_self_signed_cert_and_key()?;
