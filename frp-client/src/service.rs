@@ -1028,6 +1028,7 @@ impl Service {
                         oidc_client: self.oidc_client.clone(),
                         udp_sockets: udp_sockets.clone(),
                         udp_enc_cfg: udp_enc_cfg.clone(),
+                        udp_packet_size: cfg_local.udp_packet_size.max(0) as usize,
                         proxy_metrics: self.proxy_metrics.clone(),
                         client_auth_scopes: client_scopes.clone(),
                         server_auth_scopes: server_scopes.clone(),

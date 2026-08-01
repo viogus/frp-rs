@@ -242,6 +242,8 @@ pub(crate) struct WorkConnConfig {
     pub oidc_client: Option<Arc<OidcClient>>,
     pub udp_sockets: Arc<Mutex<HashMap<String, Arc<UdpSocket>>>>,
     pub udp_enc_cfg: Arc<Mutex<HashMap<String, (bool, bool)>>>,
+    /// UDP read buffer size. Go frp compat: clientCfg.UDPPacketSize.
+    pub udp_packet_size: usize,
     pub proxy_metrics: Arc<ProxyMetricsRegistry>,
     pub client_auth_scopes: Vec<String>,
     pub server_auth_scopes: Vec<String>,
@@ -369,6 +371,8 @@ async fn run_udp_work_conn(
     use_comp: bool,
     v2: bool,
     session_alive: Arc<AtomicBool>,
+    udp_packet_size: usize,
+    proxy_protocol_version: String,
 ) {
     let (mut w_r, mut w_w) = work.into_split().unwrap();
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -379,9 +383,18 @@ async fn run_udp_work_conn(
     let pn_r = proxy_name.clone();
     let last_remote_r = last_remote.clone();
     let session_alive_r = session_alive.clone();
+    // Reader needs its own copy; the writer moves the original.
+    let local_addr_str_r = local_addr_str.clone();
     let mut reader_cancel = cancel_rx.clone();
+    // Go frp compat (pkg/proto/udp/udp.go Forwarder): when
+    // proxyProtocolVersion is set, the PROXY header is prepended to the first
+    // packet written to the local UDP backend. Rust's bridge uses one socket
+    // per work conn (Go uses one per remote), so a single first-packet flag
+    // covers the common single-remote case.
+    let pp_version = proxy_protocol_version.clone();
     let reader = async move {
         debug!(proxy_name = %pn_r, "UDP reader '{}' started", pn_r);
+        let mut first_packet = true;
         loop {
             tokio::select! {
                 biased;
@@ -413,6 +426,34 @@ async fn run_udp_work_conn(
                                 if let Ok(d) = encryption::decompress(&payload) {
                                     payload = d;
                                 }
+                            }
+                            // Prepend PROXY header on the first packet of the
+                            // session (Go: first packet of each remote conn).
+                            if first_packet && !pp_version.is_empty() {
+                                if let Some(remote) = *last_remote_r.lock().unwrap() {
+                                    if let Ok(header) =
+                                        frp_core::proxy_protocol::build_proxy_protocol_header(
+                                            &remote.ip().to_string(),
+                                            local_addr_str_r
+                                                .split(':')
+                                                .next()
+                                                .unwrap_or("127.0.0.1"),
+                                            remote.port(),
+                                            local_addr_str_r
+                                                .rsplit_once(':')
+                                                .and_then(|(_, p)| p.parse().ok())
+                                                .unwrap_or(0),
+                                            &pp_version,
+                                        )
+                                    {
+                                        let mut final_buf =
+                                            Vec::with_capacity(header.len() + payload.len());
+                                        final_buf.extend_from_slice(&header);
+                                        final_buf.extend_from_slice(&payload);
+                                        payload = final_buf;
+                                    }
+                                }
+                                first_packet = false;
                             }
                             debug!(proxy_name = %pn_r, byte_count = n,
                                 "UDP reader '{}': forwarding {} bytes to local", pn_r, n);
@@ -449,10 +490,14 @@ async fn run_udp_work_conn(
     let last_remote_w = last_remote;
     let session_alive_w = session_alive;
     let mut writer_cancel = cancel_rx;
+    // Go frp compat: the UDP read buffer is sized by udp_packet_size
+    // (Go pkg/proto/udp/udp.go: pool.GetBuf(bufSize) with
+    // clientCfg.UDPPacketSize), not a hardcoded 65535.
+    let buf_size = udp_packet_size.max(1);
     let writer = async move {
         debug!(proxy_name = %pn_w, "UDP writer '{}' started", pn_w);
-        let mut buf = vec![0u8; 65535];
-        let mut payload = Vec::with_capacity(65535);
+        let mut buf = vec![0u8; buf_size];
+        let mut payload = Vec::with_capacity(buf_size);
         let mut keepalive = tokio::time::interval(Duration::from_secs(30));
         keepalive.tick().await;
         loop {
@@ -728,6 +773,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             oidc_client,
             udp_sockets,
             udp_enc_cfg,
+            udp_packet_size,
             proxy_metrics,
             client_auth_scopes: client_scopes,
             server_auth_scopes: server_scopes,
@@ -1135,6 +1181,8 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
                         use_comp,
                         v2,
                         session_alive.clone(),
+                        udp_packet_size,
+                        info.proxy_protocol_version.clone(),
                     )
                     .await;
                 } else {
@@ -1308,6 +1356,7 @@ mod tests {
             oidc_client: None,
             udp_sockets: Arc::new(Mutex::new(HashMap::new())),
             udp_enc_cfg: Arc::new(Mutex::new(HashMap::new())),
+            udp_packet_size: 65535,
             proxy_metrics: Arc::new(frp_core::metrics::ProxyMetricsRegistry::new()),
             client_auth_scopes: Vec::new(),
             server_auth_scopes: Vec::new(),
@@ -1399,6 +1448,8 @@ mod tests {
             false,
             false,
             session_alive,
+            65535,
+            String::new(),
         ));
         drop(peer);
 
@@ -1436,6 +1487,8 @@ mod tests {
             false,
             false,
             Arc::new(AtomicBool::new(true)),
+            65535,
+            String::new(),
         ));
         sender.send_to(b"force-write", socket_addr).await.unwrap();
 
@@ -1467,6 +1520,8 @@ mod tests {
             false,
             false,
             Arc::new(AtomicBool::new(true)),
+            65535,
+            String::new(),
         ));
 
         peer.write_v1_frame(&FrpMessage::UDPPacket(msg::UDPPacket {

@@ -6,16 +6,22 @@ use std::net::IpAddr;
 
 /// Build a PROXY protocol v1 text header.
 ///
-/// Produces `PROXY TCP4 <src> <dst> <sport> <dport>\r\n`.
-/// Only TCP4 is supported (matches Go frp behavior).
+/// Produces `PROXY TCP4 <src> <dst> <sport> <dport>\r\n` for IPv4 pairs and
+/// `PROXY TCP6 <src> <dst> <sport> <dport>\r\n` when either address is IPv6
+/// (matching Go's go-proxyproto: the v1 family is chosen from the addresses).
 pub fn build_proxy_protocol_v1(
     src_addr: &str,
     dst_addr: &str,
     src_port: u16,
     dst_port: u16,
 ) -> String {
+    let family = match (src_addr.parse::<IpAddr>(), dst_addr.parse::<IpAddr>()) {
+        (Ok(IpAddr::V4(_)), Ok(IpAddr::V4(_))) => "TCP4",
+        // Mixed or IPv6 pairs use TCP6.
+        _ => "TCP6",
+    };
     format!(
-        "PROXY TCP4 {} {} {} {}\r\n",
+        "PROXY {family} {} {} {} {}\r\n",
         src_addr, dst_addr, src_port, dst_port,
     )
 }
@@ -100,6 +106,16 @@ mod tests {
     fn test_v1_format() {
         let h = build_proxy_protocol_v1("10.0.0.1", "10.0.0.2", 1234, 5678);
         assert_eq!(h, "PROXY TCP4 10.0.0.1 10.0.0.2 1234 5678\r\n");
+    }
+
+    #[test]
+    fn test_v1_ipv6_emits_tcp6() {
+        // Either address being IPv6 selects TCP6 (Go go-proxyproto family).
+        let h = build_proxy_protocol_v1("::1", "2001:db8::2", 1234, 5678);
+        assert_eq!(h, "PROXY TCP6 ::1 2001:db8::2 1234 5678\r\n");
+        // Mixed families also use TCP6.
+        let mixed = build_proxy_protocol_v1("10.0.0.1", "::1", 1234, 5678);
+        assert_eq!(mixed, "PROXY TCP6 10.0.0.1 ::1 1234 5678\r\n");
     }
 
     #[test]
