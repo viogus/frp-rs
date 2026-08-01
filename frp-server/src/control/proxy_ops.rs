@@ -625,6 +625,12 @@ pub(crate) async fn handle_new_proxy(
                 let http_user = np.http_user.as_deref().unwrap_or("");
                 let http_pwd = np.http_pwd.as_deref().unwrap_or("");
                 let rubu = np.route_by_http_user.as_deref().unwrap_or("");
+                let headers: Vec<(String, String)> = np
+                    .headers
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
                 if let Err(conflict) = state
                     .vhost_manager
                     .register(
@@ -636,6 +642,7 @@ pub(crate) async fn handle_new_proxy(
                         http_user,
                         http_pwd,
                         rubu,
+                        &headers,
                     )
                     .await
                 {
@@ -692,6 +699,12 @@ pub(crate) async fn handle_new_proxy(
                 let http_user = np.http_user.as_deref().unwrap_or("");
                 let http_pwd = np.http_pwd.as_deref().unwrap_or("");
                 let rubu = np.route_by_http_user.as_deref().unwrap_or("");
+                let headers: Vec<(String, String)> = np
+                    .headers
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
                 if let Err(conflict) = state
                     .vhost_manager
                     .register(
@@ -703,6 +716,7 @@ pub(crate) async fn handle_new_proxy(
                         http_user,
                         http_pwd,
                         rubu,
+                        &headers,
                     )
                     .await
                 {
@@ -761,7 +775,18 @@ pub(crate) async fn handle_new_proxy(
                 let http_pwd = np.http_pwd.as_deref().unwrap_or("");
                 state
                     .tcpmux_manager
-                    .register(&np.proxy_name, &domains, run_id, http_user, http_pwd)
+                    .register(
+                        &np.proxy_name,
+                        &domains,
+                        run_id,
+                        http_user,
+                        http_pwd,
+                        &np.headers
+                            .clone()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect::<Vec<(String, String)>>(),
+                    )
                     .await;
                 info!(
                     proxy_name = %np.proxy_name, domains = ?domains, "TCPMux routes registered for '{}': domains={:?}",

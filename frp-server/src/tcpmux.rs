@@ -48,6 +48,7 @@ impl TcpMuxManager {
         run_id: &str,
         http_user: &str,
         http_pwd: &str,
+        _headers: &[(String, String)],
     ) {
         let route = TcpMuxRoute {
             proxy_name: proxy_name.to_string(),
@@ -379,7 +380,7 @@ mod tests {
     async fn test_tcpmux_manager_register_lookup_unregister() {
         let mgr = TcpMuxManager::new();
 
-        mgr.register("p1", &["a.example.com".into()], "run-1", "", "")
+        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", &[])
             .await;
 
         // Exact match
@@ -408,6 +409,7 @@ mod tests {
             "run-1",
             "",
             "",
+            &[],
         )
         .await;
 

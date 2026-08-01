@@ -23,6 +23,9 @@ pub struct VhostRoute {
     /// Per-user routing: extract username from Authorization header and route
     /// to proxy `{route_by_http_user}.{username}` (Go frp compat).
     pub route_by_http_user: String,
+    /// Request headers to inject before forwarding (Go frp compat:
+    /// requestHeaders). Set semantics — override same-name headers.
+    pub headers: Vec<(String, String)>,
 }
 
 /// Borrowed match result — avoids cloning VhostRoute (especially the locations Vec)
@@ -36,6 +39,8 @@ pub struct VhostRouteMatch {
     pub http_user: String,
     pub http_pwd: String,
     pub route_by_http_user: String,
+    /// Request headers to inject before forwarding (Go frp requestHeaders).
+    pub headers: Vec<(String, String)>,
 }
 
 impl VhostRouteMatch {
@@ -47,6 +52,7 @@ impl VhostRouteMatch {
             http_user: route.http_user.clone(),
             http_pwd: route.http_pwd.clone(),
             route_by_http_user: route.route_by_http_user.clone(),
+            headers: route.headers.clone(),
         }
     }
 }
@@ -163,6 +169,7 @@ impl VhostManager {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn register(
         &self,
         proxy_name: &str,
@@ -173,6 +180,7 @@ impl VhostManager {
         http_user: &str,
         http_pwd: &str,
         route_by_http_user: &str,
+        headers: &[(String, String)],
     ) -> Result<(), RouterConfigConflict> {
         let route = VhostRoute {
             proxy_name: proxy_name.to_string(),
@@ -182,6 +190,7 @@ impl VhostManager {
             http_user: http_user.to_string(),
             http_pwd: http_pwd.to_string(),
             route_by_http_user: route_by_http_user.to_string(),
+            headers: headers.to_vec(),
         };
 
         let mut tables = self.inner.write().await;
@@ -542,6 +551,11 @@ async fn serve_vhost_request<S>(
             pre_read
         };
 
+        // Go frp compat (pkg/util/vhost/http.go reverse proxy): inject
+        // X-Forwarded-For (append to existing value) and requestHeaders
+        // (Set semantics) into the forwarded request head.
+        let pre_read = inject_vhost_request_headers(&pre_read, peer, &route.headers);
+
         let internal_tx = {
             let map = state.run_id_to_ctl_tx.read().await;
             map.get(&target_run_id).cloned()
@@ -791,6 +805,87 @@ fn rewrite_host_header(data: &[u8], new_host: &str) -> Vec<u8> {
     result.extend_from_slice(new_header.as_bytes());
     result.extend_from_slice(&data[line_end..]);
     result
+}
+
+/// Inject `X-Forwarded-For` (append semantics, Go httputil.ReverseProxy) and
+/// configured requestHeaders (Set semantics, Go `req.Header.Set`) into the
+/// request head bytes. Only the header block up to `\r\n\r\n` is touched.
+fn inject_vhost_request_headers(
+    data: &[u8],
+    peer: std::net::SocketAddr,
+    request_headers: &[(String, String)],
+) -> Vec<u8> {
+    if request_headers.is_empty() {
+        return data.to_vec();
+    }
+    let header_end = data
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(data.len());
+    let head = &data[..header_end];
+    let tail = &data[header_end..];
+
+    // Collect header lines, dropping ones that request_headers will override
+    // (case-insensitive Set semantics) and X-Forwarded-For (re-emitted with
+    // the peer appended).
+    let mut lines: Vec<&[u8]> = Vec::new();
+    let mut existing_xff: Vec<u8> = Vec::new();
+    for line in head.split_inclusive(|&b| b == b'\n') {
+        let trimmed = line
+            .strip_suffix(b"\n")
+            .unwrap_or(line)
+            .strip_suffix(b"\r")
+            .unwrap_or_else(|| line.strip_suffix(b"\n").unwrap_or(line));
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = String::from_utf8_lossy(trimmed).to_lowercase();
+        let is_override = request_headers
+            .iter()
+            .any(|(k, _)| lower.starts_with(&format!("{}:", k.to_lowercase())));
+        if is_override {
+            continue;
+        }
+        if lower.starts_with("x-forwarded-for:") {
+            let value = match trimmed.iter().position(|&b| b == b':') {
+                Some(i) => &trimmed[i + 1..],
+                None => trimmed,
+            };
+            let value = value
+                .iter()
+                .position(|&b| b != b' ' && b != b'\t')
+                .map(|i| &value[i..])
+                .unwrap_or(value);
+            if !value.is_empty() {
+                existing_xff.extend_from_slice(value);
+                existing_xff.extend_from_slice(b", ");
+            }
+            continue;
+        }
+        lines.push(line);
+    }
+
+    let mut out = Vec::with_capacity(data.len() + 64 + request_headers.len() * 24);
+    for line in &lines {
+        out.extend_from_slice(line);
+    }
+    // X-Forwarded-For: append peer (Go ReverseProxy appends to prior value).
+    let mut xff = existing_xff;
+    xff.extend_from_slice(peer.ip().to_string().as_bytes());
+    out.extend_from_slice(b"X-Forwarded-For: ");
+    out.extend_from_slice(&xff);
+    out.extend_from_slice(b"\r\n");
+    // Configured request headers.
+    for (k, v) in request_headers {
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(tail);
+    out
 }
 
 /// Extract HTTP Basic Auth credentials from the Authorization header.

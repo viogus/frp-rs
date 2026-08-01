@@ -817,9 +817,15 @@ impl Service {
             }
         }
 
-        // Start HTTP VHost listener if configured
+        // Start HTTP VHost listener if configured. Go frp binds vhost
+        // listeners on proxyBindAddr when set (pkg/server/service.go).
         if self.cfg.vhost_http_port > 0 {
-            let http_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.vhost_http_port);
+            let vhost_bind = if self.cfg.proxy_bind_addr.is_empty() {
+                &self.cfg.bind_addr
+            } else {
+                &self.cfg.proxy_bind_addr
+            };
+            let http_addr = format_socket_addr(vhost_bind, self.cfg.vhost_http_port);
             let http_state = self.state.clone();
             let http_shutdown = self.state.shutdown_token.clone();
             tokio::spawn(async move {
@@ -838,7 +844,12 @@ impl Service {
         // configured; the shared TLS acceptor auto-generates a server identity
         // when no cert/key files are set.
         if self.cfg.vhost_https_port > 0 {
-            let https_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.vhost_https_port);
+            let vhost_bind = if self.cfg.proxy_bind_addr.is_empty() {
+                &self.cfg.bind_addr
+            } else {
+                &self.cfg.proxy_bind_addr
+            };
+            let https_addr = format_socket_addr(vhost_bind, self.cfg.vhost_https_port);
             let https_addr2 = https_addr.clone();
             let https_state = self.state.clone();
             let https_shutdown = self.state.shutdown_token.clone();
@@ -855,8 +866,12 @@ impl Service {
 
         // Start TCPMux HTTP CONNECT listener if configured
         if self.cfg.tcpmux_httpconnect_port > 0 {
-            let tcpmux_addr =
-                format_socket_addr(&self.cfg.bind_addr, self.cfg.tcpmux_httpconnect_port);
+            let mux_bind = if self.cfg.proxy_bind_addr.is_empty() {
+                &self.cfg.bind_addr
+            } else {
+                &self.cfg.proxy_bind_addr
+            };
+            let tcpmux_addr = format_socket_addr(mux_bind, self.cfg.tcpmux_httpconnect_port);
             let tcpmux_state = self.state.clone();
             let tcpmux_shutdown = self.state.shutdown_token.clone();
             tokio::spawn(async move {
