@@ -1131,9 +1131,9 @@ pub struct ProxyConfig {
     pub name: String,
     #[serde(rename = "type")]
     pub proxy_type: String,
-    #[serde(default = "default_local_ip", alias = "localIp")]
+    #[serde(default = "default_local_ip", alias = "localIp", alias = "localIP")]
     pub local_ip: String,
-    #[serde(default)]
+    #[serde(default, alias = "localPort")]
     pub local_port: u16,
     #[serde(default, alias = "remotePort")]
     pub remote_port: u16,
@@ -2855,6 +2855,25 @@ plugin_http_password = "secret"
         assert_eq!(plugin.plugin_type, "http_proxy");
         assert_eq!(plugin.http_user, "alice");
         assert_eq!(plugin.http_password, "secret");
+    }
+
+    #[test]
+    fn test_go_proxy_camelcase_local_fields_toml() {
+        let toml_str = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "docker"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 2375
+remotePort = 6001
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+        assert_eq!(cfg.proxies[0].local_ip, "127.0.0.1");
+        assert_eq!(cfg.proxies[0].local_port, 2375);
+        assert_eq!(cfg.proxies[0].remote_port, 6001);
     }
 
     #[test]
