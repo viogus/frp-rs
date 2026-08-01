@@ -187,6 +187,11 @@ pub struct Service {
     /// Per-proxy subnet CIDR for directing virtual_net visitor return traffic.
     #[cfg(feature = "vnet")]
     vnet_tun_subnets: Arc<Mutex<HashMap<String, String>>>,
+    /// Peer proxy name → (advertised subnet, TUN interface) for OS routes that
+    /// were injected from VnetRouteAdvertise. Used to remove them on
+    /// VnetRouteRemove and on control disconnect.
+    #[cfg(feature = "vnet")]
+    vnet_peer_routes: Arc<Mutex<HashMap<String, (String, String)>>>,
 }
 
 impl Service {
@@ -235,6 +240,9 @@ impl Service {
         // Go frp source.Load() treats enabled=false as source-local filtering.
         cfg.proxies.retain(|p| p.enabled);
         cfg.visitors.retain(|v| v.enabled);
+        // Go frp FilterClientConfigurers applies `start` to visitors too, so
+        // visitors outside the allowlist must not register or start.
+        cfg.visitors = filter_active_visitors(&cfg, &cfg.visitors);
 
         // Determine auth method from [auth] section if present, otherwise token
         #[cfg(feature = "oidc")]
@@ -457,6 +465,8 @@ impl Service {
         let vnet_tun_names = Arc::new(Mutex::new(HashMap::new()));
         #[cfg(feature = "vnet")]
         let vnet_tun_subnets = Arc::new(Mutex::new(HashMap::new()));
+        #[cfg(feature = "vnet")]
+        let vnet_peer_routes = Arc::new(Mutex::new(HashMap::new()));
 
         let health_proxy_configs = Arc::new(Mutex::new(
             cfg.proxies
@@ -503,6 +513,8 @@ impl Service {
             vnet_tun_names,
             #[cfg(feature = "vnet")]
             vnet_tun_subnets,
+            #[cfg(feature = "vnet")]
+            vnet_peer_routes,
         })
     }
 
@@ -1284,6 +1296,10 @@ impl Service {
                                     let names = self.vnet_tun_names.lock().await;
                                     if let Some(tun_name) = names.values().next() {
                                         add_os_route(&adv.subnet, tun_name);
+                                        self.vnet_peer_routes.lock().await.insert(
+                                            adv.proxy_name.clone(),
+                                            (adv.subnet.clone(), tun_name.clone()),
+                                        );
                                     }
                                 }
                             }
@@ -1317,6 +1333,12 @@ impl Service {
                             #[cfg(feature = "vnet")]
                             Ok(FrpMessage::VnetRouteRemove(adv)) => {
                                 info!(proxy_name = %adv.proxy_name, "peer vnet route removed");
+                                if let Some((subnet, tun_name)) =
+                                    self.vnet_peer_routes.lock().await.remove(&adv.proxy_name)
+                                {
+                                    remove_os_route(&subnet, &tun_name);
+                                }
+                                self.vnet_controller.route_table().write().await.remove(&adv.proxy_name);
                                 self.vnet_controller
                                     .unregister_visitor_route(&adv.proxy_name)
                                     .await;
@@ -1595,6 +1617,21 @@ impl Service {
             // VnetRouteRemove from the visitor plugin Close().
             #[cfg(feature = "vnet")]
             {
+                // Remove OS routes learned from peers and clear their route
+                // table entries so a reconnect starts from a clean slate.
+                {
+                    let peer_routes = self.vnet_peer_routes.lock().await;
+                    for (proxy_name, (subnet, tun_name)) in peer_routes.iter() {
+                        remove_os_route(subnet, tun_name);
+                        self.vnet_controller
+                            .route_table()
+                            .write()
+                            .await
+                            .remove(proxy_name);
+                    }
+                }
+                self.vnet_peer_routes.lock().await.clear();
+
                 let session_visitors = self.cfg.read().await.visitors.clone();
                 for v in &session_visitors {
                     if v.plugin.as_ref().is_none() || !v.enabled {
@@ -2320,6 +2357,7 @@ impl Service {
         new_cfg.visitors.retain(|v| v.enabled);
         let active_proxies = filter_active_proxies(&new_cfg, &new_cfg.proxies);
         new_cfg.proxies = active_proxies;
+        new_cfg.visitors = filter_active_visitors(&new_cfg, &new_cfg.visitors);
 
         #[cfg(feature = "vnet")]
         let mut delta = crate::reload::do_reload(&self.proxy_info_map, new_cfg).await?;
@@ -2840,6 +2878,36 @@ pub(crate) fn filter_active_proxies(
     active
 }
 
+/// Apply the client `start` allowlist and `enabled` flag to a visitor list.
+/// Mirrors Go frp v0.70.1 `FilterClientConfigurers`, which filters visitors by
+/// the same `start` set as proxies.
+pub(crate) fn filter_active_visitors(
+    cfg: &frp_core::config::ClientConfig,
+    visitors: &[frp_core::config::VisitorConfig],
+) -> Vec<frp_core::config::VisitorConfig> {
+    let mut active: Vec<frp_core::config::VisitorConfig> = if cfg.start.is_empty() {
+        visitors.to_vec()
+    } else {
+        let start_set: std::collections::HashSet<&str> =
+            cfg.start.iter().map(|s| s.as_str()).collect();
+        let filtered: Vec<_> = visitors
+            .iter()
+            .filter(|v| start_set.contains(v.name.as_str()))
+            .cloned()
+            .collect();
+        info!(
+            active = %filtered.len(), total = %visitors.len(), start = ?cfg.start,
+            "Selective visitor start: {} of {} visitors active (start={:?})",
+            filtered.len(),
+            visitors.len(),
+            cfg.start,
+        );
+        filtered
+    };
+    active.retain(|v| v.enabled);
+    active
+}
+
 /// Inject an OS-level route directing traffic for `subnet` through the
 /// given TUN interface. This makes the kernel send matching packets to
 /// the TUN device instead of the physical NIC / default gateway.
@@ -2862,6 +2930,31 @@ fn add_os_route(subnet: &str, tun_name: &str) {
         };
         let _ = std::process::Command::new("route")
             .args(["add", "-net", net, "-interface", tun_name])
+            .output();
+    }
+}
+
+/// Remove an OS-level route previously injected by [`add_os_route`].
+/// Best-effort: a missing route (e.g. after interface reset) is not fatal.
+#[cfg(feature = "vnet")]
+fn remove_os_route(subnet: &str, tun_name: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("ip")
+            .args(["route", "del", subnet, "dev", tun_name])
+            .output();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (net, _mask) = match subnet.split_once('/') {
+            Some(s) => s,
+            None => {
+                tracing::warn!("invalid subnet format for OS route: {subnet}");
+                return;
+            }
+        };
+        let _ = std::process::Command::new("route")
+            .args(["delete", "-net", net, "-interface", tun_name])
             .output();
     }
 }
@@ -3212,6 +3305,40 @@ mod tests {
             ..base.clone()
         };
         assert_ne!(vnet_proxy_snapshot(&base), vnet_proxy_snapshot(&changed_ip));
+    }
+
+    #[test]
+    fn filter_active_visitors_honors_start_allowlist_and_enabled() {
+        let cfg = frp_core::config::ClientConfig {
+            start: vec!["v1".into()],
+            ..Default::default()
+        };
+        let visitors = vec![
+            frp_core::config::VisitorConfig {
+                name: "v1".into(),
+                visitor_type: "stcp".into(),
+                ..Default::default()
+            },
+            frp_core::config::VisitorConfig {
+                name: "v2".into(),
+                visitor_type: "stcp".into(),
+                ..Default::default()
+            },
+            frp_core::config::VisitorConfig {
+                name: "v3".into(),
+                visitor_type: "stcp".into(),
+                enabled: false,
+                ..Default::default()
+            },
+        ];
+
+        let active = filter_active_visitors(&cfg, &visitors);
+        let names: Vec<&str> = active.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, vec!["v1"], "start allowlist must filter visitors");
+
+        let all = filter_active_visitors(&frp_core::config::ClientConfig::default(), &visitors);
+        let names: Vec<&str> = all.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, vec!["v1", "v2"], "disabled visitors stay filtered");
     }
 
     #[cfg(feature = "vnet")]

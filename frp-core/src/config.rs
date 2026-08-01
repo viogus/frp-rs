@@ -1251,9 +1251,10 @@ impl ClientConfig {
     /// Merge file-stored proxies/visitors over this config.
     ///
     /// Go frp v0.70.1 uses the store source as a higher-priority overlay:
-    /// store entries with the same name replace config-file entries, disabled
-    /// store entries are kept so they suppress the lower-priority entry, and
-    /// names present only in one source are carried through unchanged.
+    /// store entries with the same name replace config-file entries, and names
+    /// present only in one source are carried through unchanged. Disabled
+    /// entries are filtered by the caller before merging (Go frp source-local
+    /// filtering), so they do not reach this function.
     pub fn merge_store_items(
         &self,
         store_proxies: impl IntoIterator<Item = ProxyConfig>,

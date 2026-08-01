@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-#[cfg(feature = "vnet")]
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,13 +27,22 @@ use crate::proxy_runtime::ProxyRuntimeInfo;
 #[cfg(feature = "vnet")]
 type VnetTunMap = Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>;
 
-/// Reads raw IP packets from a `virtual_net` tunnel, decompressing Snappy
-/// frames that arrive in arbitrary transport chunk sizes.
+/// Maximum framed vnet message size, matching Go frp `maxMessageSize`.
+#[cfg(feature = "vnet")]
+const MAX_VNET_MESSAGE: u32 = 1024 * 1024;
+
+/// Reads length-prefixed IP packets from a `virtual_net` tunnel.
+///
+/// Go frp v0.70.1 frames every packet as `[u32 LE length][data]` before the
+/// optional compression/encryption layers. The reader first decodes the
+/// transport chunk stream (decompressing Snappy when enabled), buffers the
+/// decoded bytes, and then parses complete length-prefixed messages so TCP or
+/// yamux coalescing/splitting cannot corrupt packet boundaries.
 #[cfg(feature = "vnet")]
 pub(crate) struct TunnelPacketReader<R> {
     inner: R,
     decompressor: Option<frp_core::encryption::SnappyDecompressor>,
-    pending: VecDeque<Vec<u8>>,
+    stream_buf: Vec<u8>,
     buf: Vec<u8>,
     eof: bool,
 }
@@ -58,7 +65,7 @@ impl<R: tokio::io::AsyncRead + Unpin> TunnelPacketReader<R> {
         Self {
             inner,
             decompressor,
-            pending: VecDeque::new(),
+            stream_buf: Vec::new(),
             buf: vec![0u8; 4096],
             eof: false,
         }
@@ -67,28 +74,9 @@ impl<R: tokio::io::AsyncRead + Unpin> TunnelPacketReader<R> {
     /// Return the next packet, or `None` at EOF.
     pub(crate) async fn next_packet(&mut self) -> std::io::Result<Option<Vec<u8>>> {
         loop {
-            if let Some(packet) = self.pending.pop_front() {
+            // Try to extract a complete framed message from buffered bytes.
+            if let Some(packet) = self.take_complete_message()? {
                 return Ok(Some(packet));
-            }
-            if let Some(decompressor) = &mut self.decompressor {
-                // Drain complete frames already buffered by the decompressor
-                // before blocking on more transport bytes.
-                loop {
-                    let mut out = Vec::new();
-                    let status = decompressor
-                        .feed_into_progress(&[], &mut out)
-                        .map_err(std::io::Error::other)?;
-                    if !out.is_empty() {
-                        self.pending.push_back(out);
-                        break;
-                    }
-                    if !status.has_more_complete {
-                        break;
-                    }
-                }
-                if let Some(packet) = self.pending.pop_front() {
-                    return Ok(Some(packet));
-                }
             }
             if self.eof {
                 return Ok(None);
@@ -96,32 +84,64 @@ impl<R: tokio::io::AsyncRead + Unpin> TunnelPacketReader<R> {
             let n = self.inner.read(&mut self.buf).await?;
             if n == 0 {
                 self.eof = true;
+                if !self.stream_buf.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "vnet tunnel closed with an incomplete framed packet",
+                    ));
+                }
                 return Ok(None);
             }
-            let Some(decompressor) = &mut self.decompressor else {
-                return Ok(Some(self.buf[..n].to_vec()));
-            };
-            let mut input = &self.buf[..n];
-            loop {
-                let mut out = Vec::new();
-                let status = decompressor
-                    .feed_into_progress(input, &mut out)
-                    .map_err(std::io::Error::other)?;
-                input = &[];
-                if !out.is_empty() {
-                    self.pending.push_back(out);
-                    break;
+            if let Some(decompressor) = &mut self.decompressor {
+                // Decompressed output may contain zero, one, or several framed
+                // messages; drain complete frames without blocking.
+                let mut input = &self.buf[..n];
+                loop {
+                    let mut out = Vec::new();
+                    let status = decompressor
+                        .feed_into_progress(input, &mut out)
+                        .map_err(std::io::Error::other)?;
+                    input = &[];
+                    self.stream_buf.extend_from_slice(&out);
+                    if !status.has_more_complete {
+                        break;
+                    }
                 }
-                if !status.has_more_complete {
-                    break;
-                }
+            } else {
+                self.stream_buf.extend_from_slice(&self.buf[..n]);
             }
         }
     }
+
+    /// Extract one `[u32 LE length][data]` message from `stream_buf`.
+    fn take_complete_message(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        if self.stream_buf.len() < 4 {
+            return Ok(None);
+        }
+        let len = u32::from_le_bytes(self.stream_buf[..4].try_into().unwrap()) as usize;
+        if len == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "vnet framed message length is 0",
+            ));
+        }
+        if len as u32 > MAX_VNET_MESSAGE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("vnet message too large: {len} > {MAX_VNET_MESSAGE}"),
+            ));
+        }
+        if self.stream_buf.len() < 4 + len {
+            return Ok(None);
+        }
+        let packet = self.stream_buf[4..4 + len].to_vec();
+        self.stream_buf.drain(..4 + len);
+        Ok(Some(packet))
+    }
 }
 
-/// Writes raw IP packets to a `virtual_net` tunnel, applying Snappy
-/// compression before AES-128-CFB encryption when enabled.
+/// Writes length-prefixed IP packets to a `virtual_net` tunnel, applying
+/// Snappy compression before AES-128-CFB encryption when enabled.
 #[cfg(feature = "vnet")]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum TunnelPacketWriter<W: tokio::io::AsyncWrite + Unpin> {
@@ -136,13 +156,29 @@ impl<W: tokio::io::AsyncWrite + Unpin> TunnelPacketWriter<W> {
         packet: &[u8],
         use_compression: bool,
     ) -> std::io::Result<()> {
+        let len = packet.len() as u32;
+        if len == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "vnet packet data length is 0",
+            ));
+        }
+        if len > MAX_VNET_MESSAGE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("vnet packet too large: {len} > {MAX_VNET_MESSAGE}"),
+            ));
+        }
+        let mut frame = Vec::with_capacity(4 + len as usize);
+        frame.extend_from_slice(&len.to_le_bytes());
+        frame.extend_from_slice(packet);
         if use_compression {
             let mut compressed = Vec::new();
-            frp_core::encryption::compress_into(packet, &mut compressed)
+            frp_core::encryption::compress_into(&frame, &mut compressed)
                 .map_err(std::io::Error::other)?;
             self.write_all(&compressed).await
         } else {
-            self.write_all(packet).await
+            self.write_all(&frame).await
         }
     }
 
@@ -1492,7 +1528,10 @@ mod tests {
             0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, 100, 86, 0, 1,
             100, 86, 0, 2,
         ];
-        peer.write_all(&inbound).await.unwrap();
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&(inbound.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&inbound);
+        peer.write_all(&framed).await.unwrap();
         assert_eq!(tun_rx.recv().await, Some(inbound.clone()));
 
         let src = std::net::IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1));
@@ -1501,9 +1540,13 @@ mod tests {
             .await
             .expect("remote source IP must be registered for return traffic");
         return_tx.try_send(inbound.clone()).unwrap();
-        let mut buf = vec![0u8; 64];
+        let mut buf = vec![0u8; framed.len()];
         let n = peer.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], &inbound[..]);
+        assert_eq!(
+            &buf[..n],
+            &framed[..],
+            "return traffic must be length-framed"
+        );
 
         drop(peer);
         tokio::time::timeout(Duration::from_secs(1), task)
@@ -1544,8 +1587,11 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x20, 0x01, 0x0d, 0xb8,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
         ];
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&(inbound.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&inbound);
         let mut compressed = Vec::new();
-        frp_core::encryption::compress_into(&inbound, &mut compressed).unwrap();
+        frp_core::encryption::compress_into(&framed, &mut compressed).unwrap();
         let wire = frp_core::encryption::encrypt(&compressed, &key).unwrap();
         peer.write_all(&wire).await.unwrap();
         assert_eq!(tun_rx.recv().await, Some(inbound.clone()));
@@ -1561,8 +1607,8 @@ mod tests {
         peer.read_exact(&mut raw).await.unwrap();
         assert_ne!(raw, wire, "return traffic must be re-wrapped, not replayed");
         let decrypted = frp_core::encryption::decrypt(&raw, &key).unwrap();
-        let restored = frp_core::encryption::decompress(&decrypted).unwrap();
-        assert_eq!(restored, inbound);
+        let framed_restored = frp_core::encryption::decompress(&decrypted).unwrap();
+        assert_eq!(framed_restored, framed, "wire must carry the framed packet");
 
         drop(peer);
         tokio::time::timeout(Duration::from_secs(1), task)
@@ -1581,8 +1627,11 @@ mod tests {
         let packet_b = vec![0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x11];
         let mut wire = Vec::new();
         for packet in [&packet_a, &packet_b] {
+            let mut framed = Vec::new();
+            framed.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+            framed.extend_from_slice(packet);
             let mut compressed = Vec::new();
-            frp_core::encryption::compress_into(packet, &mut compressed).unwrap();
+            frp_core::encryption::compress_into(&framed, &mut compressed).unwrap();
             wire.extend_from_slice(&compressed);
         }
         let (mut writer, reader) = tokio::io::duplex(8192);
@@ -1592,6 +1641,40 @@ mod tests {
         let mut packet_reader = TunnelPacketReader::new(reader, true);
         assert_eq!(packet_reader.next_packet().await.unwrap(), Some(packet_a));
         assert_eq!(packet_reader.next_packet().await.unwrap(), Some(packet_b));
+        assert_eq!(packet_reader.next_packet().await.unwrap(), None);
+    }
+
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn tunnel_packet_reader_handles_coalesced_and_split_frames_without_compression() {
+        use tokio::io::AsyncWriteExt;
+
+        let packet_a = vec![0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06];
+        let packet_b = vec![0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x11];
+        let packet_c = vec![0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x20, 0x01];
+        let frame = |p: &[u8]| -> Vec<u8> {
+            let mut f = Vec::new();
+            f.extend_from_slice(&(p.len() as u32).to_le_bytes());
+            f.extend_from_slice(p);
+            f
+        };
+
+        let (mut writer, reader) = tokio::io::duplex(8192);
+        let mut wire = frame(&packet_a);
+        wire.extend_from_slice(&frame(&packet_b));
+        writer.write_all(&wire).await.unwrap();
+
+        let mut packet_reader = TunnelPacketReader::new(reader, false);
+        assert_eq!(packet_reader.next_packet().await.unwrap(), Some(packet_a));
+        assert_eq!(packet_reader.next_packet().await.unwrap(), Some(packet_b));
+
+        // A frame split across transport reads must still reassemble.
+        let split = frame(&packet_c);
+        writer.write_all(&split[..2]).await.unwrap();
+        writer.write_all(&split[2..]).await.unwrap();
+        assert_eq!(packet_reader.next_packet().await.unwrap(), Some(packet_c));
+
+        drop(writer);
         assert_eq!(packet_reader.next_packet().await.unwrap(), None);
     }
 }

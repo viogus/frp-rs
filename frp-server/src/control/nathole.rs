@@ -929,7 +929,11 @@ pub(crate) async fn handle_vnet_route_remove(
     let vn = rem.virtual_net.clone().unwrap_or_default();
     {
         let mut routes = ctx.state.vnet_routes.write().await;
-        routes.retain(|(vn_k, _), (_, name)| !(vn_k == &vn && name == &rem.proxy_name));
+        // Only the run_id that advertised the route may remove it. A stale or
+        // replayed remove from an older control must not clobber a newer one.
+        routes.retain(|(vn_k, _), (run_id, name)| {
+            !(run_id == &ctx.run_id && vn_k == &vn && name == &rem.proxy_name)
+        });
     }
     info!(proxy_name = %rem.proxy_name, "vnet route removed: {}", rem.proxy_name);
     ctx.state
@@ -1187,6 +1191,12 @@ mod vnet_route_tests {
                 ("vnet-b".to_string(), "10.1.0.0/24".to_string()),
                 ("run-b".to_string(), "peer-proxy".to_string()),
             );
+            // Same proxy name advertised by a different run_id must survive
+            // run-a's remove (run_id-guarded deletion).
+            routes.insert(
+                ("vnet-a".to_string(), "10.2.0.0/24".to_string()),
+                ("run-b".to_string(), "vnet-visitor".to_string()),
+            );
         }
         let rem = msg::VnetRouteRemove {
             proxy_name: "vnet-visitor".to_string(),
@@ -1200,6 +1210,10 @@ mod vnet_route_tests {
             !(vn == "vnet-a" && rid == "run-a" && name == "vnet-visitor")
         }));
         assert!(routes.contains_key(&("vnet-b".to_string(), "10.1.0.0/24".to_string())));
+        assert!(
+            routes.contains_key(&("vnet-a".to_string(), "10.2.0.0/24".to_string())),
+            "run-b's same-named route must not be removed by run-a"
+        );
         drop(routes);
 
         match peer_rx.recv().await {

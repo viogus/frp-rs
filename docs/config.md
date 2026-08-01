@@ -768,6 +768,16 @@ All other features gate only the runtime behavior. Their config fields are alway
 
 ---
 
+### Parse-Only Compatibility Fields
+
+Some Go frp v0.70.1 fields are parsed and validated for source-level
+compatibility but are not yet consumed by the frp-rs runtime. They are
+accepted so Go frp configs load unchanged; setting them currently has no
+runtime effect: `log.disablePrintColor`, `webServer.assetsDir`,
+`webServer.pprofEnable`, and plugin `enableHTTP2`.
+
+---
+
 ## Environment Variables
 
 Log level can be overridden at runtime:

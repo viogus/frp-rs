@@ -507,6 +507,10 @@ pub async fn run_admin_server(
                 .layer(DefaultBodyLimit::max(1024 * 1024)),
         );
 
+    // Store CRUD uses the Rust-native typed JSON body (full ProxyConfig /
+    // VisitorConfig objects). Go frp v0.70.1's admin API uses nested typed
+    // blocks (`ProxyDefinition` with tcp/udp/stcp...), so this endpoint is
+    // intentionally frp-rs-only and is not wire-compatible with Go clients.
     let app = if state.store.is_some() {
         app.route(
             "/api/store/proxies",

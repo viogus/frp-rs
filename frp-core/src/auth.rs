@@ -242,7 +242,13 @@ impl AuthConfig {
 
     /// Generate the privilege_key for a login message.
     pub fn generate_login_key(&self, timestamp: i64) -> Option<String> {
-        self.try_generate_login_key(timestamp).ok()
+        match self.try_generate_login_key(timestamp) {
+            Ok(key) => Some(key),
+            Err(e) => {
+                tracing::warn!(error = %e, "generate_login_key failed: {e}");
+                None
+            }
+        }
     }
 
     /// Resolve the current token and generate the privilege_key for a login
@@ -1191,9 +1197,42 @@ impl crate::config::ValueSource {
                 for env in &exec.env {
                     cmd.env(&env.name, &env.value);
                 }
-                let output = cmd
-                    .output()
+                cmd.stdout(std::process::Stdio::piped());
+                cmd.stderr(std::process::Stdio::piped());
+                const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+                let child = cmd
+                    .spawn()
                     .map_err(|e| format!("failed to execute command {}: {e}", exec.command))?;
+                let pid = child.id();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let waiter = std::thread::spawn(move || {
+                    let output = child.wait_with_output();
+                    let _ = tx.send(output);
+                });
+                let output = match rx.recv_timeout(EXEC_TIMEOUT) {
+                    Ok(Ok(output)) => {
+                        let _ = waiter.join();
+                        output
+                    }
+                    Ok(Err(e)) => {
+                        let _ = waiter.join();
+                        return Err(format!("failed to execute command {}: {e}", exec.command));
+                    }
+                    Err(_) => {
+                        #[cfg(unix)]
+                        {
+                            let _ = std::process::Command::new("kill")
+                                .args(["-9", &pid.to_string()])
+                                .status();
+                        }
+                        let _ = waiter.join();
+                        return Err(format!(
+                            "failed to execute command {}: timed out after {}s",
+                            exec.command,
+                            EXEC_TIMEOUT.as_secs()
+                        ));
+                    }
+                };
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     return Err(format!(

@@ -64,6 +64,13 @@ Second parallel audit pass focused on the staged 0.7.1 review-fix wave:
   return traffic is targeted to the owning TUN subnet instead of broadcast,
   and frps broadcasts vnet route advertisements/removals to peers with
   disconnect cleanup.
+- **PR review fixes**: `start` allowlist now also filters visitors; vnet OS
+  routes injected from peer advertisements are removed on route removal and
+  disconnect; vnet tunnels use Go-compatible `[u32 LE length][packet]`
+  framing even without compression; `auth.tokenSource` exec commands have a
+  10s timeout and kill on expiry; server vnet route removal is guarded by the
+  advertising run_id; store files persist with `0600` and validate entries on
+  load; `/api/store/*` is documented as a frp-rs-native contract.
 - **Concurrency**: per-run_id lifecycle mutexes are reclaimed; ClientRegistry
   lock order is canonical; post-login AEAD failure cleanup is generation-safe.
 - **KCP**: login throttling uses the real peer address instead of a shared key.

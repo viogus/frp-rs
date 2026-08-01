@@ -1256,8 +1256,11 @@ mod tests {
             0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, 10, 0, 0, 2,
             10, 0, 0, 5,
         ];
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&(inbound.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&inbound);
         let mut compressed = Vec::new();
-        frp_core::encryption::compress_into(&inbound, &mut compressed).unwrap();
+        frp_core::encryption::compress_into(&framed, &mut compressed).unwrap();
         let wire = frp_core::encryption::encrypt(&compressed, &key).unwrap();
         peer.write_all(&wire).await.unwrap();
         assert_eq!(tun_rx.recv().await, Some(inbound.clone()));
@@ -1269,7 +1272,7 @@ mod tests {
         let decrypted = frp_core::encryption::decrypt(&raw, &key).unwrap();
         assert_eq!(
             frp_core::encryption::decompress(&decrypted).unwrap(),
-            inbound
+            framed
         );
 
         drop(packet_tx);

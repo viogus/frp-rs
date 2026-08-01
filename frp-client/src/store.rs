@@ -300,23 +300,13 @@ fn load_from_file(path: &Path) -> Result<StoreMaps, StoreError> {
 
     let mut proxies = HashMap::with_capacity(stored.proxies.len());
     for p in stored.proxies {
-        if p.name.is_empty() {
-            return Err(StoreError::Load(format!(
-                "{}: proxy name cannot be empty",
-                path.display()
-            )));
-        }
+        validate_proxy(&p).map_err(|e| StoreError::Load(format!("{}: {e}", path.display())))?;
         proxies.insert(p.name.clone(), p);
     }
 
     let mut visitors = HashMap::with_capacity(stored.visitors.len());
     for v in stored.visitors {
-        if v.name.is_empty() {
-            return Err(StoreError::Load(format!(
-                "{}: visitor name cannot be empty",
-                path.display()
-            )));
-        }
+        validate_visitor(&v).map_err(|e| StoreError::Load(format!("{}: {e}", path.display())))?;
         visitors.insert(v.name.clone(), v);
     }
     Ok((proxies, visitors))
@@ -344,11 +334,14 @@ fn save_to_file(
     let tmp_path = path.with_extension("json.tmp");
     let result = (|| -> std::io::Result<()> {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut f = options.open(&tmp_path)?;
         f.write_all(&data)?;
         f.sync_all()?;
         Ok(())
@@ -443,6 +436,28 @@ mod tests {
         let plugin = visitor.plugin.expect("visitor plugin persisted");
         assert_eq!(plugin.plugin_type, "virtual_net");
         assert_eq!(plugin.destination_ip, "100.86.0.1");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.tmp"));
+    }
+
+    #[test]
+    fn load_rejects_hand_edited_invalid_entries() {
+        let path =
+            std::env::temp_dir().join(format!("frpc_store_invalid_{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"{"proxies":[{"name":"bad","type":"made_up"}],"visitors":[]}"#,
+        )
+        .unwrap();
+
+        let err = match StoreSource::new(&path) {
+            Ok(_) => panic!("invalid store entry must fail at load"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, StoreError::Load(_)),
+            "invalid store entry must fail at load: {err}"
+        );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("json.tmp"));
     }
