@@ -57,7 +57,6 @@ struct PluginResponse {
 /// can approve or reject operations.
 pub struct HttpPluginManager {
     plugins: Arc<Vec<PluginDef>>,
-    client: reqwest::Client,
 }
 
 struct PluginDef {
@@ -91,7 +90,6 @@ impl HttpPluginManager {
             .collect();
         Self {
             plugins: Arc::new(plugins),
-            client,
         }
     }
 
@@ -203,10 +201,7 @@ impl HttpPluginManager {
                     ));
                 }
             };
-            let pr: PluginResponse = match serde_json::from_str(&resp_text) {
-                Ok(pr) => pr,
-                Err(_) => PluginResponse::default(),
-            };
+            let pr: PluginResponse = serde_json::from_str(&resp_text).unwrap_or_default();
 
             if pr.reject {
                 let reason = if pr.reject_reason.is_empty() {
