@@ -48,6 +48,10 @@ Second parallel audit pass focused on the staged 0.7.1 review-fix wave:
   `additionalScopes`, OIDC `skipExpiryCheck`/`skipIssuerCheck`, visitor
   `[transport]`/`[natTraversal]`, plugin `unixPath`/`crtPath`/`keyPath`, and
   legacy flat `plugin_*` fields.
+- **Config audit phase 2**: parse `healthCheck.httpHeaders` Go arrays,
+  `webServer.assetsDir`/`pprofEnable`/`webServer.tls`, `log.disablePrintColor`,
+  `httpPlugins.tlsVerify`, plugin `requestHeaders`/`enableHTTP2`, visitor
+  `enabled`, and proxy `natTraversal`.
 - **Concurrency**: per-run_id lifecycle mutexes are reclaimed; ClientRegistry
   lock order is canonical; post-login AEAD failure cleanup is generation-safe.
 - **KCP**: login throttling uses the real peer address instead of a shared key.

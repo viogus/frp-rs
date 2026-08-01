@@ -842,6 +842,9 @@ impl Service {
             // Go frps v0.69.1 requires visitor registration before NatHoleVisitor
             // can be sent on the control connection (otherwise: "auth failed").
             for v in &self.cfg.visitors {
+                if !v.enabled {
+                    continue;
+                }
                 if v.bind_port == 0 {
                     continue;
                 }
@@ -1010,6 +1013,9 @@ impl Service {
 
             // Spawn STCP/XTCP visitor listeners
             for v in &self.cfg.visitors {
+                if !v.enabled {
+                    continue;
+                }
                 if v.bind_port == 0 {
                     continue;
                 }

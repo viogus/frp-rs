@@ -510,6 +510,8 @@ pub struct LogConfig {
     pub file: String,
     #[serde(default = "default_max_days", alias = "maxDays")]
     pub max_days: i32,
+    #[serde(default, alias = "disablePrintColor")]
+    pub disable_print_color: bool,
 }
 
 impl Default for LogConfig {
@@ -518,6 +520,7 @@ impl Default for LogConfig {
             level: default_log_level(),
             file: default_log_file(),
             max_days: default_max_days(),
+            disable_print_color: false,
         }
     }
 }
@@ -585,12 +588,16 @@ pub struct WebServerConfig {
     pub password: String,
     #[serde(default, alias = "enablePrometheus")]
     pub enable_prometheus: bool,
+    #[serde(default, alias = "assetsDir")]
+    pub assets_dir: String,
+    #[serde(default, alias = "pprofEnable")]
+    pub pprof_enable: bool,
     /// TLS certificate file path. When both tls_cert_file and tls_key_file
     /// are non-empty, dashboard/admin server starts with TLS.
-    #[serde(default)]
+    #[serde(default, alias = "certFile")]
     pub tls_cert_file: String,
     /// TLS private key file path.
-    #[serde(default)]
+    #[serde(default, alias = "keyFile")]
     pub tls_key_file: String,
     /// Custom 404 page body (HTML). When non-empty, VHost and TCPMux
     /// 404 responses include this content with Content-Type: text/html.
@@ -607,6 +614,8 @@ impl Default for WebServerConfig {
             user: String::new(),
             password: String::new(),
             enable_prometheus: false,
+            assets_dir: String::new(),
+            pprof_enable: false,
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             custom_404_page: String::new(),
@@ -640,6 +649,10 @@ pub struct HttpPluginConfig {
     /// When false (default), the plugin is notify-only.
     #[serde(default)]
     pub enable_control: bool,
+    /// Whether to verify the plugin server TLS certificate.
+    /// Go frp compat: tlsVerify.
+    #[serde(default, alias = "tlsVerify")]
+    pub tls_verify: bool,
 }
 
 fn default_plugin_timeout() -> u64 {
@@ -811,6 +824,14 @@ pub struct PluginConfig {
     /// Go frp compat: proxyProtocolVersion.
     #[serde(default, alias = "proxyProtocolVersion")]
     pub proxy_protocol_version: String,
+    /// Request headers to inject on plugin HTTP requests.
+    /// Go frp compat: requestHeaders.set.
+    #[serde(default)]
+    pub request_headers: std::collections::HashMap<String, String>,
+    /// Enable HTTP/2 for the plugin tunnel (https2http/https2https).
+    /// Go frp compat: enableHTTP2.
+    #[serde(default, alias = "enableHTTP2")]
+    pub enable_http2: Option<bool>,
 }
 
 /// Feature gate configuration ([feature] section in frps.toml / frpc.toml).
@@ -1230,6 +1251,10 @@ pub struct ProxyConfig {
     /// Go frp compat: enabled. Default: true.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Disable NAT traversal assisted address reporting for XTCP.
+    /// Go frp compat: natTraversal.disableAssistedAddrs.
+    #[serde(default, alias = "disableAssistedAddrs")]
+    pub disable_assisted_addrs: bool,
 }
 
 /// STCP/XTCP visitor configuration — used by frpc to expose a local port
@@ -1294,6 +1319,10 @@ pub struct VisitorConfig {
     /// Go frp compat: minRetryInterval. Default: 90 (Go frp compat)
     #[serde(default = "default_min_retry_interval", alias = "minRetryInterval")]
     pub min_retry_interval: i64,
+    /// Whether this visitor is enabled. Disabled visitors are not started.
+    /// Go frp compat: enabled. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 impl Default for VisitorConfig {
@@ -1315,6 +1344,7 @@ impl Default for VisitorConfig {
             max_retries_an_hour: default_max_retries_an_hour(),
             min_retry_interval: default_min_retry_interval(),
             protocol: default_xtcp_protocol(),
+            enabled: true,
         }
     }
 }
@@ -1641,6 +1671,7 @@ fn normalize_server_config(value: &mut toml::Value) {
         if let Some(v) = table.remove("webServer") {
             table.entry("web_server").or_insert(v);
         }
+        normalize_web_server_section(table);
         if let Some(v) = table.remove("featureGates") {
             table.entry("feature").or_insert(v);
         }
@@ -1649,6 +1680,7 @@ fn normalize_server_config(value: &mut toml::Value) {
         if let Some(v) = table.remove("webServer") {
             table.entry("web_server").or_insert(v);
         }
+        normalize_web_server_section(table);
         if let Some(v) = table.remove("httpPlugins") {
             table.entry("http_plugins").or_insert(v);
         }
@@ -2030,6 +2062,28 @@ fn normalize_client_config(value: &mut toml::Value) {
     }
 }
 
+/// Normalize canonical Go `[webServer.tls]` (and `[web_server.tls]`) into the
+/// existing flat `web_server.tls_cert_file` / `tls_key_file` fields.
+fn normalize_web_server_section(table: &mut toml::Table) {
+    use toml::Value;
+
+    let Some(Value::Table(ws)) = table.get_mut("web_server") else {
+        return;
+    };
+    if let Some(Value::Table(tls)) = ws.remove("tls") {
+        for (k, v) in tls {
+            let flat_key = match k.as_str() {
+                "certFile" => "tls_cert_file",
+                "keyFile" => "tls_key_file",
+                "trustedCaFile" => "tls_ca_file",
+                "serverName" => "tls_server_name",
+                other => other,
+            };
+            ws.entry(flat_key.to_string()).or_insert(v);
+        }
+    }
+}
+
 /// Normalize Go-format proxy sub-tables into flat fields for each proxy entry.
 ///
 /// Handles:
@@ -2079,7 +2133,27 @@ fn normalize_proxies(table: &mut toml::Table) {
                     "maxFailed" => "health_check_max_failed",
                     other => other,
                 };
-                proxy_table.entry(flat_key.to_string()).or_insert(v);
+                let value = if k == "httpHeaders" {
+                    match v {
+                        Value::Array(items) => {
+                            let mut map = toml::Table::new();
+                            for item in items {
+                                if let Some(t) = item.as_table() {
+                                    let name =
+                                        t.get("name").and_then(Value::as_str).unwrap_or_default();
+                                    let value =
+                                        t.get("value").and_then(Value::as_str).unwrap_or_default();
+                                    map.insert(name.to_string(), Value::String(value.to_string()));
+                                }
+                            }
+                            Value::Table(map)
+                        }
+                        other => other,
+                    }
+                } else {
+                    v
+                };
+                proxy_table.entry(flat_key.to_string()).or_insert(value);
             }
         }
 
@@ -2089,6 +2163,17 @@ fn normalize_proxies(table: &mut toml::Table) {
                 let flat_key = match k.as_str() {
                     "group" => "group",
                     "groupKey" => "group_key",
+                    other => other,
+                };
+                proxy_table.entry(flat_key.to_string()).or_insert(v);
+            }
+        }
+
+        // Flatten [proxies.natTraversal] sub-table
+        if let Some(Value::Table(nt)) = proxy_table.remove("natTraversal") {
+            for (k, v) in nt {
+                let flat_key = match k.as_str() {
+                    "disableAssistedAddrs" => "disable_assisted_addrs",
                     other => other,
                 };
                 proxy_table.entry(flat_key.to_string()).or_insert(v);
@@ -2166,6 +2251,30 @@ fn normalize_proxies(table: &mut toml::Table) {
                 }
             } else {
                 proxy_table.insert("plugin".to_string(), Value::Table(plugin_table));
+            }
+        }
+
+        // Normalize [proxies.plugin.requestHeaders.set] → request_headers map,
+        // including nested `[proxies.plugin]` tables.
+        if let Some(Value::Table(rh)) = proxy_table
+            .get_mut("plugin")
+            .and_then(Value::as_table_mut)
+            .and_then(|t| t.remove("requestHeaders"))
+        {
+            if let Some(Value::Table(set)) = rh.get("set") {
+                if let Some(Value::Table(existing)) = proxy_table
+                    .get_mut("plugin")
+                    .and_then(Value::as_table_mut)
+                    .and_then(|t| t.get_mut("request_headers"))
+                {
+                    for (k, v) in set.clone() {
+                        existing.entry(k).or_insert(v);
+                    }
+                } else if let Some(plugin) =
+                    proxy_table.get_mut("plugin").and_then(Value::as_table_mut)
+                {
+                    plugin.insert("request_headers".to_string(), Value::Table(set.clone()));
+                }
             }
         }
     }
@@ -3118,6 +3227,95 @@ disableAssistedAddrs = true
         assert!(visitor.use_encryption);
         assert!(visitor.use_compression);
         assert!(visitor.disable_assisted_addrs);
+    }
+
+    #[test]
+    fn test_go_extended_server_config_fields() {
+        let toml_str = r#"
+bindAddr = "127.0.0.1"
+bindPort = 7000
+
+[log]
+disablePrintColor = true
+
+[webServer]
+assetsDir = "/srv/assets"
+pprofEnable = true
+
+[webServer.tls]
+certFile = "/etc/frps/dash.crt"
+keyFile = "/etc/frps/dash.key"
+
+[[httpPlugins]]
+name = "hook"
+addr = "http://127.0.0.1:4000"
+path = "/handler"
+ops = ["login"]
+tlsVerify = true
+"#;
+        let cfg: ServerConfig = load_server_config_from_str(toml_str).unwrap();
+        assert!(cfg.log.disable_print_color);
+        assert_eq!(cfg.web_server.assets_dir, "/srv/assets");
+        assert!(cfg.web_server.pprof_enable);
+        assert_eq!(cfg.web_server.tls_cert_file, "/etc/frps/dash.crt");
+        assert_eq!(cfg.web_server.tls_key_file, "/etc/frps/dash.key");
+        assert!(cfg.http_plugins[0].tls_verify);
+    }
+
+    #[test]
+    fn test_go_extended_proxy_visitor_config_fields() {
+        let toml_str = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "web"
+type = "http"
+remotePort = 80
+
+[proxies.natTraversal]
+disableAssistedAddrs = true
+
+[proxies.healthCheck]
+type = "http"
+url = "http://localhost/health"
+httpHeaders = [{ name = "X-Token", value = "abc" }]
+
+[proxies.plugin]
+type = "https2http"
+crtPath = "/crt"
+keyPath = "/key"
+enableHTTP2 = true
+
+[proxies.plugin.requestHeaders.set]
+X-Custom = "v"
+
+[[visitors]]
+name = "vis"
+type = "stcp"
+serverName = "s"
+bindPort = 1234
+enabled = false
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+        let proxy = &cfg.proxies[0];
+        assert!(proxy.disable_assisted_addrs);
+        assert_eq!(
+            proxy
+                .health_check_http_headers
+                .get("X-Token")
+                .map(String::as_str),
+            Some("abc")
+        );
+        let plugin = proxy.plugin.as_ref().expect("plugin");
+        assert_eq!(plugin.crt_file, "/crt");
+        assert_eq!(plugin.key_file, "/key");
+        assert_eq!(plugin.enable_http2, Some(true));
+        assert_eq!(
+            plugin.request_headers.get("X-Custom").map(String::as_str),
+            Some("v")
+        );
+        assert!(!cfg.visitors[0].enabled);
     }
 
     #[test]
