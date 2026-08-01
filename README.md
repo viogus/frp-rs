@@ -33,6 +33,7 @@ suitable as a drop-in replacement for either the client or server side.
 | STCP / sk routing    | ✅     | ✅     |
 | XTCP (NAT hole punch)| ✅     | ✅     |
 | Token authentication | ✅     | ✅     |
+| Dynamic auth tokenSource | ✅ | ✅     |
 | OIDC authentication  | ✅     | ✅     |
 | Heartbeat (ping/pong)| ✅     | ✅     |
 | Auto port allocation | —      | ✅     |
@@ -56,8 +57,10 @@ suitable as a drop-in replacement for either the client or server side.
 | Config directory mode| ✅     | ✅     |
 | Client plugins       | ✅     | —      |
 | Visitor (STCP/XTCP)  | ✅     | —      |
+| Store (runtime config) | ✅   | —      |
+| VirtualNet (L3 VPN)  | ✅     | ✅     |
 
-Client plugins: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `http2https`, `https2http`, `https2https`, `http2http`, `tls2raw`.
+Client plugins: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `http2https`, `https2http`, `https2https`, `http2http`, `tls2raw`, `virtual_net`.
 
 ### Go frp Compatibility Notes
 
@@ -70,10 +73,11 @@ XTCP pairwise matrix on VPS and V2 over the v0.70.1 pre-built binaries).
 - **V2 wire protocol**: Full AEAD encryption + capability negotiation, verified against the
   Go frp v0.70.1 pre-built binary (V2 is included since v0.70.1).
 - **All transports**: TCP, WebSocket, TLS, KCP, QUIC — full interop verified.
-- **All 9 client plugins**: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `http2https`,
-  `https2http`, `https2https`, `http2http`, `tls2raw`.
+- **All 10 client plugins**: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `http2https`,
+  `https2http`, `https2https`, `http2http`, `tls2raw`, `virtual_net`.
 - **XTCP**: Full cross-compat with Go frp (requires public internet for STUN/NAT probes).
-  See [full audit](docs/go-frp-compat-audit.md) for details.
+  frp-rs XTCP visitors default to the KCP P2P data plane (Go frp defaults to
+  QUIC) so Go providers negotiate KCP. See [full audit](docs/go-frp-compat-audit.md) for details.
 
 ### Why frp-rs?
 
@@ -108,7 +112,7 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 
 ### frp-rs 核心优势
 
-**兼容性。** 完全兼容 Go frp v0.70.1 协议。所有传输层（TCP、WebSocket、TLS、KCP、QUIC）、全部代理类型（TCP/UDP/HTTP/HTTPS/STCP/XTCP/SUDP）、全部 9 种客户端插件（http_proxy、socks5、static_file、unix_domain_socket、http2https、https2http、https2https、http2http、tls2raw）均已通过跨兼容测试。CI 自动运行 68 项常规兼容性测试加 16 项 XTCP 两两矩阵测试。可直接替换 Go frps 或 Go frpc，配置文件、加密方式、认证机制完全一致，零迁移成本。
+**兼容性。** 完全兼容 Go frp v0.70.1 协议。所有传输层（TCP、WebSocket、TLS、KCP、QUIC）、全部代理类型（TCP/UDP/HTTP/HTTPS/STCP/XTCP/SUDP）、全部 10 种客户端插件（http_proxy、socks5、static_file、unix_domain_socket、http2https、https2http、https2https、http2http、tls2raw、virtual_net）均已通过跨兼容测试。CI 自动运行 68 项常规兼容性测试加 16 项 XTCP 两两矩阵测试。可直接替换 Go frps 或 Go frpc，配置文件、加密方式、认证机制完全一致，零迁移成本。
 
 **体积。** 基于 Rust 原生编译，无运行时、无 GC。默认版本 frps 仅 ~5.2 MB，frpc ~5.4 MB，约为 Go frp 的 1/2.5。全功能版本（full）frps ~7.8 MB，frpc ~6.0 MB。内存占用同样大幅降低：空闲状态下 ~2-4 MB，微核心版本（micro）仅 ~1-2 MB。无 GC 暂停保证负载下尾部延迟稳定。
 
@@ -377,6 +381,7 @@ use_compression = false
 | `server_port` | `7000` | Server control port |
 | `transport_protocol` | `"tcp"` | Transport: tcp, websocket/ws, wss, quic |
 | `token` | `""` | Authentication token (must match server) |
+| `auth.tokenSource` | — | Dynamic token source: `file://path` or `exec://command` (exec requires `TokenSourceExec` unsafe feature) |
 | `user` | `""` | User identity for multi-tenant setups |
 | `client_id` | `""` | Unique client identifier (auto-generated if empty) |
 | `tls_enable` | `true` | Enable TLS |
@@ -396,6 +401,8 @@ use_compression = false
 | `proxy_url` | `""` | Upstream HTTP/SOCKS5 proxy for control connection |
 | `start` | `[]` | Selective proxy start: only start proxies named in this list |
 | `includes` | `[]` | Glob patterns for additional config files to merge |
+| `store.path` | `""` | JSON file for runtime proxy/visitor store (admin API CRUD); entries overlay config-file entries |
+| `virtualNet.address` | `""` | Local TUN IPv4 address for the `virtual_net` proxy/visitor plugins (requires `[feature] VirtualNet = true`) |
 | `metas` | `{}` | Client-level metadata sent in Login message |
 | `dial_server_keepalive` | `7200` | TCP keepalive interval (seconds) for server connection |
 | `connect_server_local_ip` | `""` | Local IP to bind when connecting to server |

@@ -4,7 +4,7 @@
 
 ## Summary
 
-frp-rs targets Go frp v0.70.1 wire compatibility. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 9 client plugins, config coverage, SSH tunnel gateway, V2 AEAD protocol, and XTCP Go↔Rust cross-compat all match Go frp behavior.
+frp-rs targets Go frp v0.70.1 wire compatibility. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 10 client plugins, config coverage, SSH tunnel gateway, V2 AEAD protocol, and XTCP Go↔Rust cross-compat all match Go frp behavior.
 
 **68 non-XTCP compatibility tests and the 16-test XTCP pairwise matrix run against Go frp v0.70.1 (V2 included).**
 
@@ -140,7 +140,7 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 - ✅ Group load balancing: true round-robin with per-group atomic counter
 - ✅ Admin `/api/status`: reports actual `plugin`, `remote_addr`, `err`; status reflects registration state
 - ✅ Config reload: detects changed proxies via config_snapshot hash, supports CloseProxy+NewProxy cycle for add/remove/modify without restart
-- ✅ Go→Rust XTCP: server-side routing fixed (handle_client() for NatHoleResp wire path); compat test guarded — Go frp uses QUIC probes, frp-rs uses TCP simultaneous open
+- ✅ Go↔Rust XTCP: server-side routing fixed (handle_client() for NatHoleResp wire path); frp-rs visitors default the P2P protocol to KCP so Go providers negotiate KCP (Go frp v0.70.1 defaults visitors to QUIC)
 - ✅ KCP parameters: window 128→1024, MTU 1400→1350 (matches Go frp)
 - ✅ QUIC: verified both sides use one bidirectional stream per logical channel
 - ✅ Client `/api/metrics`: Prometheus-format metrics endpoint (traffic_in/out, connection_counts, current_conns) — matches server `/metrics`

@@ -622,6 +622,7 @@ through the frps server to a remote STCP/XTCP proxy.
 | `disable_assisted_addrs` | `bool` | `false` | `disableAssistedAddrs` | Disable NAT traversal assisted address reporting (STUN-discovered mapped addresses shared between peers during XTCP hole punching). |
 | `use_encryption` | `bool` | `false` | `useEncryption` | Encrypt tunnel traffic with AES-128-CFB (key derived from `secret_key`). |
 | `use_compression` | `bool` | `false` | `useCompression` | Compress tunnel traffic with Snappy. |
+| `protocol` | `string` | `"kcp"` | `protocol` | XTCP P2P data-plane protocol. frp-rs implements KCP only, so the default is `"kcp"` even though Go frp v0.70.1 defaults visitors to `"quic"`. |
 | `keep_tunnel_open` | `bool` | `false` | `keepTunnelOpen` | When true, the XTCP visitor retries NAT hole punching instead of falling back to STCP after a connection ends. |
 | `max_retries_an_hour` | `i32` | `8` | `maxRetriesAnHour` | Maximum XTCP NAT hole punch retries per hour. |
 | `min_retry_interval` | `i64` | `30` | `minRetryInterval` | Minimum interval in seconds between XTCP retry attempts. |
