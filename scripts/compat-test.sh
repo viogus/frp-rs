@@ -948,6 +948,9 @@ write_frpc_config_xtcp_visitor() {
             printf 'bind_addr = "127.0.0.1"\nbind_port = %s\n' "$visitor_port"
             # No fallback_to — P2P must succeed for the test to pass.
             # STCP fallback would mask XTCP failures (compat matrix P1).
+            # Rust only supports KCP for the XTCP P2P tunnel; force it so
+            # Go frps advertises KCP to Go providers too.
+            printf 'protocol = "kcp"\n'
             if $has_enc; then printf 'use_encryption = true\n'; fi
             if $has_comp; then printf 'use_compression = true\n'; fi
         } > "$out"

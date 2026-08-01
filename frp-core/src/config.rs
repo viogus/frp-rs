@@ -1429,8 +1429,9 @@ pub struct VisitorConfig {
     /// Shared secret key — must match the STCP proxy's `sk`.
     #[serde(default, alias = "secretKey", alias = "sk")]
     pub secret_key: String,
-    /// Protocol for XTCP P2P connections: "kcp" or "quic". Default: "quic".
-    /// Go frp v0.70.1 compat.
+    /// Protocol for XTCP P2P connections: "kcp" or "quic".
+    /// The frp-rs XTCP data plane only implements KCP, so the default is "kcp"
+    /// even though Go frp v0.70.1 defaults XTCP visitors to "quic".
     #[serde(default = "default_xtcp_protocol", alias = "protocol")]
     pub protocol: String,
     /// Optional server user for auth matching.
@@ -1541,7 +1542,7 @@ fn default_min_retry_interval() -> i64 {
     90
 }
 fn default_xtcp_protocol() -> String {
-    "quic".into()
+    "kcp".into()
 }
 fn default_vnet_netmask() -> String {
     "255.255.255.0".to_string()
@@ -3286,6 +3287,12 @@ path = "./frpc_store.json"
             cfg.store.is_none(),
             "store defaults to None without [store]"
         );
+    }
+
+    #[test]
+    fn test_xtcp_visitor_defaults_to_kcp() {
+        let visitor = VisitorConfig::default();
+        assert_eq!(visitor.protocol, "kcp", "XTCP visitor must advertise KCP");
     }
 
     #[test]
