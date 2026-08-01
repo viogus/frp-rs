@@ -170,6 +170,18 @@ type = "unix_domain_socket"
 local_addr = "/var/run/docker.sock"
 ```
 
+Go frp's flat plugin format is also supported and is the recommended form for
+configs shared with Go frp:
+
+```toml
+[[proxies]]
+name = "docker_api"
+type = "tcp"
+remote_port = 9000
+plugin = "unix_domain_socket"
+plugin_local_addr = "/var/run/docker.sock"
+```
+
 ### Platform Support
 
 Unix only (Linux, macOS, BSD). Returns an error on Windows.

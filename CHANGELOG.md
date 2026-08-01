@@ -35,6 +35,9 @@ Second parallel audit pass focused on the staged 0.7.1 review-fix wave:
   payloads, STCP secrets, or V1 payload text.
 - **Config**: Go `[transport.tls]`, server `[transport] tcpMux`, and related
   camelCase keys are normalized; WebSocket raw frames allow V2 payloads.
+- **Client plugins**: Go-style flat plugin configs (`plugin = "unix_domain_socket"`
+  with `plugin_local_addr`, `plugin_http_user`, etc.) are normalized to the
+  nested plugin shape, fixing Docker socket and other Go frp plugin configs.
 - **Concurrency**: per-run_id lifecycle mutexes are reclaimed; ClientRegistry
   lock order is canonical; post-login AEAD failure cleanup is generation-safe.
 - **KCP**: login throttling uses the real peer address instead of a shared key.

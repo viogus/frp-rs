@@ -2047,6 +2047,44 @@ fn normalize_proxies(table: &mut toml::Table) {
                 }
             }
         }
+
+        // Normalize Go-style flat plugin fields:
+        //   plugin = "unix_domain_socket"
+        //   plugin_local_addr = "/var/run/docker.sock"
+        // into the nested `[proxies.plugin]` shape used by frp-rs.
+        if let Some(Value::String(plugin_type)) = proxy_table.get("plugin").cloned() {
+            proxy_table.remove("plugin");
+            let mut plugin_table = toml::Table::new();
+            plugin_table.insert("type".to_string(), Value::String(plugin_type));
+
+            let plugin_keys: Vec<String> = proxy_table
+                .keys()
+                .filter(|k| k.starts_with("plugin_") || k.starts_with("plugin"))
+                .cloned()
+                .collect();
+            for key in plugin_keys {
+                if let Some(v) = proxy_table.remove(&key) {
+                    let flat_key = match key.as_str() {
+                        "plugin_local_addr" | "pluginLocalAddr" => "local_addr",
+                        "plugin_local_path" | "pluginLocalPath" => "local_path",
+                        "plugin_http_user" | "pluginHttpUser" => "http_user",
+                        "plugin_http_password" | "pluginHttpPassword" => "http_password",
+                        "plugin_crt_path" | "pluginCrtPath" => "plugin_crt_path",
+                        "plugin_key_path" | "pluginKeyPath" => "plugin_key_path",
+                        other => other,
+                    };
+                    plugin_table.entry(flat_key.to_string()).or_insert(v);
+                }
+            }
+
+            if let Some(Value::Table(existing)) = proxy_table.get_mut("plugin") {
+                for (k, v) in plugin_table {
+                    existing.entry(k).or_insert(v);
+                }
+            } else {
+                proxy_table.insert("plugin".to_string(), Value::Table(plugin_table));
+            }
+        }
     }
 }
 
@@ -2771,6 +2809,52 @@ httpUser = "cdf"
         let plugin = cfg.proxies[0].plugin.as_ref().unwrap();
         assert_eq!(plugin.plugin_type, "http_proxy");
         assert_eq!(plugin.http_user, "cdf");
+    }
+
+    #[test]
+    fn test_go_flat_plugin_unix_domain_socket_toml() {
+        let toml_str = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "docker_api"
+type = "tcp"
+remotePort = 9000
+plugin = "unix_domain_socket"
+plugin_local_addr = "/var/run/docker.sock"
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+        let plugin = cfg.proxies[0]
+            .plugin
+            .as_ref()
+            .expect("Go-style flat plugin must be parsed");
+        assert_eq!(plugin.plugin_type, "unix_domain_socket");
+        assert_eq!(plugin.local_addr, "/var/run/docker.sock");
+    }
+
+    #[test]
+    fn test_go_flat_plugin_http_proxy_fields_toml() {
+        let toml_str = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "web_proxy"
+type = "tcp"
+remotePort = 9001
+plugin = "http_proxy"
+plugin_http_user = "alice"
+plugin_http_password = "secret"
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+        let plugin = cfg.proxies[0]
+            .plugin
+            .as_ref()
+            .expect("Go-style flat http_proxy plugin must be parsed");
+        assert_eq!(plugin.plugin_type, "http_proxy");
+        assert_eq!(plugin.http_user, "alice");
+        assert_eq!(plugin.http_password, "secret");
     }
 
     #[test]
