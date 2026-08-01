@@ -10,6 +10,7 @@ pub mod proxy;
 pub mod proxy_runtime;
 pub mod reload;
 pub mod service;
+pub mod store;
 pub(crate) mod util;
 pub mod visitor;
 pub mod work_conn;

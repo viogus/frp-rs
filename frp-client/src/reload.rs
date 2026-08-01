@@ -84,12 +84,8 @@ pub(crate) struct ReloadDelta {
 /// state updates so it can use the correct plugin bound addresses.
 pub(crate) async fn do_reload(
     proxy_info_map: &Arc<RwLock<HashMap<String, ProxyRuntimeInfo>>>,
-    config_path: &str,
-    strict: bool,
+    new_cfg: ClientConfig,
 ) -> Result<ReloadDelta, String> {
-    let new_cfg: ClientConfig = frp_core::config::load_client_config(config_path, strict)
-        .map_err(|e| format!("failed to load config: {e}"))?;
-
     // Diff old vs new proxy names
     let old_names: HashSet<String> = { proxy_info_map.read().await.keys().cloned().collect() };
     let new_names: HashSet<String> = new_cfg.proxies.iter().map(|p| p.name.clone()).collect();
@@ -113,20 +109,6 @@ pub(crate) async fn do_reload(
                 }
             }
         }
-    }
-
-    if strict && (!removed.is_empty() || !added.is_empty() || !changed.is_empty()) {
-        let mut parts: Vec<String> = Vec::new();
-        if !removed.is_empty() {
-            parts.push(format!("removed: {:?}", removed));
-        }
-        if !added.is_empty() {
-            parts.push(format!("added: {:?}", added));
-        }
-        if !changed.is_empty() {
-            parts.push(format!("changed: {:?}", changed));
-        }
-        return Err(format!("config changed — {}", parts.join("; ")));
     }
 
     if removed.is_empty() && added.is_empty() && changed.is_empty() {

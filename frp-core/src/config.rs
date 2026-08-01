@@ -847,6 +847,16 @@ pub struct FeatureConfig {
 // Client Configuration
 // ---------------------------------------------------------------
 
+/// File-backed store configuration ([store] section in frpc.toml).
+/// Go frp v0.70.1 compat: StoreConfig.path.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StoreConfig {
+    /// Path to the JSON file that persists dynamically managed proxies and
+    /// visitors. Empty disables the store.
+    #[serde(default)]
+    pub path: String,
+}
+
 /// Client-side authentication configuration ([auth] section in frpc.toml).
 /// Mirrors Go frp v0.69.1 AuthClientConfig.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -966,6 +976,12 @@ pub struct ClientConfig {
     /// Go frp compat: includes.
     #[serde(default)]
     pub includes: Vec<String>,
+    /// File-backed runtime config store. When path is set, proxies and
+    /// visitors managed through the store API are loaded from and persisted
+    /// to the JSON file, overlaying config-file entries with the same name.
+    /// Go frp v0.70.1 compat: [store] section.
+    #[serde(default, alias = "store")]
+    pub store: Option<StoreConfig>,
     #[serde(default = "default_true")]
     pub tls_enable: bool,
     #[serde(default)]
@@ -1055,6 +1071,7 @@ impl Default for ClientConfig {
             nat_hole_stun_server: default_nat_hole_stun_server(),
             start: Vec::new(),
             includes: Vec::new(),
+            store: None,
             tls_enable: true,
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
@@ -1126,6 +1143,42 @@ impl ClientConfig {
         if self.dial_server_timeout == 0 {
             self.dial_server_timeout = default_dial_server_timeout();
         }
+    }
+
+    /// Merge file-stored proxies/visitors over this config.
+    ///
+    /// Go frp v0.70.1 uses the store source as a higher-priority overlay:
+    /// store entries with the same name replace config-file entries, disabled
+    /// store entries are kept so they suppress the lower-priority entry, and
+    /// names present only in one source are carried through unchanged.
+    pub fn merge_store_items(
+        &self,
+        store_proxies: impl IntoIterator<Item = ProxyConfig>,
+        store_visitors: impl IntoIterator<Item = VisitorConfig>,
+    ) -> Self {
+        let mut merged = self.clone();
+        let mut proxy_map: std::collections::HashMap<String, ProxyConfig> = merged
+            .proxies
+            .into_iter()
+            .map(|p| (p.name.clone(), p))
+            .collect();
+        for p in store_proxies {
+            proxy_map.insert(p.name.clone(), p);
+        }
+        merged.proxies = proxy_map.into_values().collect();
+        merged.proxies.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let mut visitor_map: std::collections::HashMap<String, VisitorConfig> = merged
+            .visitors
+            .into_iter()
+            .map(|v| (v.name.clone(), v))
+            .collect();
+        for v in store_visitors {
+            visitor_map.insert(v.name.clone(), v);
+        }
+        merged.visitors = visitor_map.into_values().collect();
+        merged.visitors.sort_by(|a, b| a.name.cmp(&b.name));
+        merged
     }
 }
 
@@ -2806,6 +2859,7 @@ fn known_client_keys() -> std::collections::HashSet<&'static str> {
         "start",
         "includes",
         "include",
+        "store",
         "tls_enable",
         "tls_cert_file",
         "tls_key_file",
@@ -2963,6 +3017,85 @@ remote_port = 7001
         let cfg: ClientConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.proxies.len(), 1);
         assert_eq!(cfg.proxies[0].proxy_type, "tcp");
+    }
+
+    #[test]
+    fn test_parse_client_store_config() {
+        let toml_str = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+
+[store]
+path = "./frpc_store.json"
+"#;
+        let cfg: ClientConfig = load_client_config_from_str(toml_str).unwrap();
+        assert_eq!(
+            cfg.store.as_ref().unwrap().path,
+            "./frpc_store.json",
+            "[store] path should be parsed"
+        );
+    }
+
+    #[test]
+    fn test_parse_client_store_defaults_to_none() {
+        let cfg: ClientConfig = load_client_config_from_str("server_addr = '127.0.0.1'").unwrap();
+        assert!(
+            cfg.store.is_none(),
+            "store defaults to None without [store]"
+        );
+    }
+
+    #[test]
+    fn test_merge_store_items_overlays_by_name() {
+        let base = ClientConfig {
+            server_addr: "127.0.0.1".into(),
+            proxies: vec![
+                ProxyConfig {
+                    name: "shared".into(),
+                    proxy_type: "tcp".into(),
+                    local_port: 1000,
+                    ..Default::default()
+                },
+                ProxyConfig {
+                    name: "config-only".into(),
+                    proxy_type: "tcp".into(),
+                    local_port: 2000,
+                    ..Default::default()
+                },
+            ],
+            visitors: vec![VisitorConfig {
+                name: "shared-visitor".into(),
+                visitor_type: "stcp".into(),
+                bind_port: 3000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let store_proxies = vec![ProxyConfig {
+            name: "shared".into(),
+            proxy_type: "tcp".into(),
+            local_port: 4000,
+            enabled: false,
+            ..Default::default()
+        }];
+        let store_visitors = vec![VisitorConfig {
+            name: "store-visitor".into(),
+            visitor_type: "xtcp".into(),
+            bind_port: 5000,
+            ..Default::default()
+        }];
+
+        let merged = base.merge_store_items(store_proxies, store_visitors);
+        let shared = merged.proxies.iter().find(|p| p.name == "shared").unwrap();
+        assert_eq!(shared.local_port, 4000, "store entry overlays config entry");
+        assert!(
+            merged.proxies.iter().any(|p| p.name == "config-only"),
+            "config-only proxy is preserved"
+        );
+        assert!(
+            merged.visitors.iter().any(|v| v.name == "store-visitor"),
+            "store visitor is added"
+        );
     }
 
     #[test]

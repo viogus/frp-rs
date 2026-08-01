@@ -46,6 +46,7 @@ use crate::admin::AdminState;
 use crate::control::ControlConnection;
 use crate::plugin::{self, PluginContext, PluginHandle};
 use crate::proxy_runtime::{ProxyPhase, ProxyRuntimeInfo, ReloadRequest};
+use crate::store::{merge_client_config, StoreSource};
 use crate::util::opt_if_empty;
 use crate::work_conn::XtcpNotification;
 
@@ -94,8 +95,10 @@ async fn dispatch_plugin_start(
 
 /// The main frpc service.
 pub struct Service {
-    cfg: ClientConfig,
-    proxies: Arc<Vec<frp_core::config::ProxyConfig>>,
+    cfg: Arc<RwLock<ClientConfig>>,
+    proxies: Arc<RwLock<Vec<frp_core::config::ProxyConfig>>>,
+    /// Optional file-backed store shared with the admin API.
+    store_source: Option<Arc<StoreSource>>,
     auth_cfg: Arc<AuthConfig>,
     encryption_key: [u8; 16],
     /// Map proxy_name -> runtime info for looking up where to connect
@@ -164,10 +167,42 @@ impl Service {
 
     /// Create a new client Service with a custom unsafe features allowlist.
     pub async fn with_unsafe_features(
-        cfg: ClientConfig,
+        mut cfg: ClientConfig,
         config_file: Option<String>,
         unsafe_features: UnsafeFeatures,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Load the file-backed store when [store] path is set and overlay its
+        // proxies/visitors on the config file entries (Go frp v0.70.1 store
+        // source semantics).
+        let store_source = if let Some(ref store_cfg) = cfg.store {
+            if store_cfg.path.is_empty() {
+                None
+            } else {
+                Some(Arc::new(StoreSource::new(&store_cfg.path).map_err(
+                    |e| format!("failed to load store from {}: {e}", store_cfg.path),
+                )?))
+            }
+        } else {
+            None
+        };
+        if let Some(ref store) = store_source {
+            let merged = merge_client_config(&cfg, Some(store));
+            cfg.proxies = merged.proxies;
+            cfg.visitors = merged.visitors;
+            info!(
+                path = %store.path().display(),
+                proxies = %cfg.proxies.len(),
+                visitors = %cfg.visitors.len(),
+                "store enabled: {} proxies, {} visitors after merge",
+                cfg.proxies.len(),
+                cfg.visitors.len()
+            );
+        }
+        // Filter out disabled entries from the config source before running.
+        // Go frp source.Load() treats enabled=false as source-local filtering.
+        cfg.proxies.retain(|p| p.enabled);
+        cfg.visitors.retain(|v| v.enabled);
+
         // Determine auth method from [auth] section if present, otherwise token
         #[cfg(feature = "oidc")]
         let auth_method = if let Some(ref ac) = cfg.auth {
@@ -373,11 +408,12 @@ impl Service {
                 .collect(),
         ));
 
-        let proxies = Arc::new(cfg.proxies.clone());
+        let proxies = Arc::new(RwLock::new(cfg.proxies.clone()));
 
         Ok(Self {
-            cfg,
+            cfg: Arc::new(RwLock::new(cfg)),
             proxies,
+            store_source,
             auth_cfg: Arc::new(auth_cfg),
             encryption_key: enc_key,
             proxy_info_map,
@@ -504,65 +540,26 @@ impl Service {
         }
     }
 
-    #[instrument(skip(self), fields(server_addr = %self.cfg.server_addr, server_port = %self.cfg.server_port))]
+    #[instrument(skip(self))]
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let cfg_snapshot = self.cfg.read().await.clone();
         info!(
-            version = %frp_core::VERSION, server_addr = %self.cfg.server_addr, server_port = %self.cfg.server_port,
+            version = %frp_core::VERSION, server_addr = %cfg_snapshot.server_addr, server_port = %cfg_snapshot.server_port,
             "frpc (Rust) v{} connecting to {}:{}",
-            frp_core::VERSION, self.cfg.server_addr, self.cfg.server_port
+            frp_core::VERSION, cfg_snapshot.server_addr, cfg_snapshot.server_port
         );
 
-        let protocol: TransportProtocol = match self.cfg.transport_protocol.parse() {
+        let protocol: TransportProtocol = match cfg_snapshot.transport_protocol.parse() {
             Ok(p) => p,
             Err(_) => {
                 return Err(format!(
                     "unknown transport protocol '{}'. Valid transports: tcp, kcp, quic, websocket, wss",
-                    self.cfg.transport_protocol
+                    cfg_snapshot.transport_protocol
                 )
                 .into());
             }
         };
-        let pool_count = self.cfg.pool_count.max(0);
-        let proxies = Arc::clone(&self.proxies);
-
-        // Selective proxy start: if `start` is non-empty, only start proxies
-        // whose names are in the start list. Go frp compat.
-        let proxies: Vec<frp_core::config::ProxyConfig> = if self.cfg.start.is_empty() {
-            (*proxies).clone()
-        } else {
-            let start_set: std::collections::HashSet<&str> =
-                self.cfg.start.iter().map(|s| s.as_str()).collect();
-            let filtered: Vec<_> = proxies
-                .iter()
-                .filter(|p| start_set.contains(p.name.as_str()))
-                .cloned()
-                .collect();
-            info!(
-                active = %filtered.len(), total = %proxies.len(), start = ?self.cfg.start,
-                "Selective proxy start: {} of {} proxies active (start={:?})",
-                filtered.len(),
-                proxies.len(),
-                self.cfg.start,
-            );
-            filtered
-        };
-
-        // Filter out disabled proxies. Go frp compat: proxy.enabled.
-        let proxies: Vec<frp_core::config::ProxyConfig> =
-            proxies.into_iter().filter(|p| p.enabled).collect();
-        if proxies.len() < self.proxies.len() {
-            let disabled: Vec<&str> = self
-                .proxies
-                .iter()
-                .filter(|p| !p.enabled)
-                .map(|p| p.name.as_str())
-                .collect();
-            info!(disabled = ?disabled, "Disabled proxies (skipped): {:?}", disabled);
-        }
-
-        if proxies.is_empty() {
-            warn!("No proxies configured");
-        }
+        let pool_count = cfg_snapshot.pool_count.max(0);
 
         // Take the receiver from self (created in constructor, consumed once).
         let mut health_rx = self
@@ -577,7 +574,9 @@ impl Service {
         // Stored on self so try_reload() can cancel health checks for removed proxies.
         let health_cancels = self.health_cancels.clone();
 
-        self.spawn_health_checks(&proxies, &self.health_tx, &health_cancels)
+        let all_startup_proxies = self.proxies.read().await.clone();
+        let startup_proxies = filter_active_proxies(&cfg_snapshot, &all_startup_proxies);
+        self.spawn_health_checks(&startup_proxies, &self.health_tx, &health_cancels)
             .await;
 
         // Start admin HTTP server if configured
@@ -606,7 +605,7 @@ impl Service {
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         #[cfg(feature = "admin")]
-        self.spawn_admin_server(&_reload_tx, &_stop_tx);
+        self.spawn_admin_server(&_reload_tx, &_stop_tx).await;
 
         // Main session loop with reconnection.
         // Go frp dev two-phase fast-backoff:
@@ -627,40 +626,44 @@ impl Service {
         #[cfg(feature = "tcp-mux")]
         let mut prev_yamux: Option<std::sync::Arc<frp_core::mux::YamuxSession>> = None;
         loop {
+            let cfg_local = self.cfg.read().await.clone();
+            let all_proxies = self.proxies.read().await.clone();
+            let proxies = filter_active_proxies(&cfg_local, &all_proxies);
+
             // Go frp compat (d486018): drop previous yamux session before
             // creating a new control connection. This drops the sender channel,
             // causing the background yamux task to exit and close the TCP socket.
             #[cfg(feature = "tcp-mux")]
             drop(prev_yamux.take());
             let mut ctl = ControlConnection::new(
-                self.cfg.server_addr.clone(),
-                self.cfg.server_port,
+                cfg_local.server_addr.clone(),
+                cfg_local.server_port,
                 self.auth_cfg.clone(),
                 protocol.clone(),
                 pool_count,
-                self.cfg.user.clone(),
-                self.cfg.client_id.clone(),
-                self.cfg.tls_enable,
-                self.cfg.tls_server_name.clone(),
-                opt_if_empty!(self.cfg.tls_ca_file),
-                opt_if_empty!(self.cfg.tls_cert_file),
-                opt_if_empty!(self.cfg.tls_key_file),
-                opt_if_empty!(self.cfg.dns_server),
-                self.cfg.tcp_mux,
-                self.cfg.disable_custom_tls_first_byte,
-                self.cfg.dial_server_keepalive.max(0) as u64,
-                self.cfg.tcp_mux_keepalive_interval,
-                opt_if_empty!(self.cfg.connect_server_local_ip),
-                self.cfg.v2,
+                cfg_local.user.clone(),
+                cfg_local.client_id.clone(),
+                cfg_local.tls_enable,
+                cfg_local.tls_server_name.clone(),
+                opt_if_empty!(cfg_local.tls_ca_file),
+                opt_if_empty!(cfg_local.tls_cert_file),
+                opt_if_empty!(cfg_local.tls_key_file),
+                opt_if_empty!(cfg_local.dns_server),
+                cfg_local.tcp_mux,
+                cfg_local.disable_custom_tls_first_byte,
+                cfg_local.dial_server_keepalive.max(0) as u64,
+                cfg_local.tcp_mux_keepalive_interval,
+                opt_if_empty!(cfg_local.connect_server_local_ip),
+                cfg_local.v2,
                 self.oidc_client.clone(),
-                self.cfg.metas.clone(),
-                self.cfg.proxy_url.clone(),
+                cfg_local.metas.clone(),
+                cfg_local.proxy_url.clone(),
                 previous_run_id.clone(),
                 Some(ClientSpec {
                     client_type: Some("frpc".into()),
                     always_auth_pass: None,
                 }),
-                self.cfg.dial_server_timeout,
+                cfg_local.dial_server_timeout,
             );
 
             #[cfg(feature = "quic")]
@@ -686,7 +689,7 @@ impl Service {
                 Err(e) => {
                     consecutive_err_count += 1;
                     warn!(attempt = %consecutive_err_count, error = %e, "Login failed (attempt {}): {}", consecutive_err_count, e);
-                    if self.cfg.login_fail_exit && !did_login_once {
+                    if cfg_local.login_fail_exit && !did_login_once {
                         return Err(e.into());
                     }
                     let delay = if did_login_once {
@@ -721,7 +724,7 @@ impl Service {
             #[cfg(feature = "quic")]
             let quic_conn = quic_conn.map(std::sync::Arc::new);
             previous_run_id = run_id.clone();
-            let v2 = self.cfg.v2;
+            let v2 = cfg_local.v2;
             info!(run_id = %run_id, "Logged in. run_id: {}", run_id);
 
             let session_alive = Arc::new(AtomicBool::new(true));
@@ -841,7 +844,8 @@ impl Service {
             // Register STCP/XTCP visitors on the control connection.
             // Go frps v0.69.1 requires visitor registration before NatHoleVisitor
             // can be sent on the control connection (otherwise: "auth failed").
-            for v in &self.cfg.visitors {
+            let session_visitors = self.cfg.read().await.visitors.clone();
+            for v in &session_visitors {
                 if !v.enabled {
                     continue;
                 }
@@ -935,8 +939,7 @@ impl Service {
 
             // Spawn initial pool work connections
             let auth_token = self.auth_cfg.token.clone();
-            let client_scopes: Vec<String> = self
-                .cfg
+            let client_scopes: Vec<String> = cfg_local
                 .auth
                 .as_ref()
                 .map(|a| a.additional_auth_scopes.clone())
@@ -953,17 +956,17 @@ impl Service {
                     #[cfg(not(feature = "quic"))]
                     let quic_arg = ();
                     crate::work_conn::WorkConnConfig {
-                        server_addr: self.cfg.server_addr.clone(),
-                        server_port: self.cfg.server_port,
+                        server_addr: cfg_local.server_addr.clone(),
+                        server_port: cfg_local.server_port,
                         protocol: protocol.clone(),
                         run_id: run_id.clone(),
                         proxy_info_map: self.proxy_info_map.clone(),
                         enc_key: self.encryption_key,
                         pool_id: $pool_id,
                         auth_token: auth_token.clone(),
-                        tls_enable: self.cfg.tls_enable,
-                        tls_server_name: self.cfg.tls_server_name.clone(),
-                        tls_ca_file: opt_if_empty!(self.cfg.tls_ca_file),
+                        tls_enable: cfg_local.tls_enable,
+                        tls_server_name: cfg_local.tls_server_name.clone(),
+                        tls_ca_file: opt_if_empty!(cfg_local.tls_ca_file),
                         yamux: yamux.clone(),
                         quic_conn: quic_arg,
                         v2,
@@ -973,12 +976,12 @@ impl Service {
                         proxy_metrics: self.proxy_metrics.clone(),
                         client_auth_scopes: client_scopes.clone(),
                         server_auth_scopes: server_scopes.clone(),
-                        disable_custom_tls_first_byte: self.cfg.disable_custom_tls_first_byte,
-                        keepalive_secs: self.cfg.dial_server_keepalive.max(0) as u64,
-                        bind_addr: opt_if_empty!(self.cfg.connect_server_local_ip),
-                        proxy_url: self.cfg.proxy_url.clone(),
-                        user: self.cfg.user.clone(),
-                        dial_timeout_secs: self.cfg.dial_server_timeout.max(1) as u64,
+                        disable_custom_tls_first_byte: cfg_local.disable_custom_tls_first_byte,
+                        keepalive_secs: cfg_local.dial_server_keepalive.max(0) as u64,
+                        bind_addr: opt_if_empty!(cfg_local.connect_server_local_ip),
+                        proxy_url: cfg_local.proxy_url.clone(),
+                        user: cfg_local.user.clone(),
+                        dial_timeout_secs: cfg_local.dial_server_timeout.max(1) as u64,
                         xtcp_tx: xtcp_tx.clone(),
                         session_alive: session_alive.clone(),
                         spawned_counter: None,
@@ -1012,15 +1015,16 @@ impl Service {
             }
 
             // Spawn STCP/XTCP visitor listeners
-            for v in &self.cfg.visitors {
+            let session_visitors = self.cfg.read().await.visitors.clone();
+            for v in &session_visitors {
                 if !v.enabled {
                     continue;
                 }
                 if v.bind_port == 0 {
                     continue;
                 }
-                let sa = self.cfg.server_addr.clone();
-                let sp = self.cfg.server_port;
+                let sa = cfg_local.server_addr.clone();
+                let sp = cfg_local.server_port;
                 let pt = protocol.clone();
                 let server_name = v.server_name.clone();
                 let server_user = v.server_user.clone();
@@ -1029,9 +1033,9 @@ impl Service {
                 let use_enc = v.use_encryption;
                 let use_comp = v.use_compression;
                 let name = v.name.clone();
-                let tls_enable = self.cfg.tls_enable;
-                let tls_server_name = self.cfg.tls_server_name.clone();
-                let tls_ca_file = opt_if_empty!(self.cfg.tls_ca_file);
+                let tls_enable = cfg_local.tls_enable;
+                let tls_server_name = cfg_local.tls_server_name.clone();
+                let tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
                 let visitor_type = v.visitor_type.clone();
                 let fallback_timeout_ms = v.fallback_timeout_ms;
                 let keep_tunnel_open = v.keep_tunnel_open;
@@ -1041,7 +1045,7 @@ impl Service {
                 let fallback_to = v.fallback_to.clone();
                 let disable_assisted_addrs = v.disable_assisted_addrs;
                 let p2p_protocol = v.protocol.clone();
-                let user = self.cfg.user.clone();
+                let user = cfg_local.user.clone();
                 let rid = run_id.clone();
                 let vtx = self.visitor_tx.clone();
                 let shutdown = visitor_shutdown.clone();
@@ -1094,8 +1098,8 @@ impl Service {
                 String,
                 oneshot::Sender<Result<msg::NatHoleResp, String>>,
             > = std::collections::HashMap::new();
-            let mut ping_interval = if self.cfg.heartbeat_interval > 0 {
-                let secs = self.cfg.heartbeat_interval as u64;
+            let mut ping_interval = if cfg_local.heartbeat_interval > 0 {
+                let secs = cfg_local.heartbeat_interval as u64;
                 info!(interval = %secs, "Heartbeat interval: {}s", secs);
                 Some(tokio::time::interval(Duration::from_secs(secs)))
             } else {
@@ -1109,7 +1113,7 @@ impl Service {
             proxy_retry_interval.tick().await; // Skip first immediate tick
 
             let mut last_pong = Instant::now();
-            let hb_timeout = self.cfg.heartbeat_timeout;
+            let hb_timeout = cfg_local.heartbeat_timeout;
             let hb_timeout_dur = Duration::from_secs(hb_timeout.max(0) as u64);
 
             loop {
@@ -1606,32 +1610,36 @@ impl Service {
     /// Start the admin HTTP server if configured.
     /// Spawns as a background task; returns immediately.
     #[cfg(feature = "admin")]
-    fn spawn_admin_server(
+    async fn spawn_admin_server(
         &self,
         reload_tx: &mpsc::Sender<ReloadRequest>,
         stop_tx: &mpsc::Sender<()>,
     ) {
-        if self.cfg.web_server.port > 0 {
-            let admin_addr =
-                frp_core::format_socket_addr(&self.cfg.web_server.addr, self.cfg.web_server.port);
+        let cfg_snapshot = self.cfg.read().await.clone();
+        if cfg_snapshot.web_server.port > 0 {
+            let admin_addr = frp_core::format_socket_addr(
+                &cfg_snapshot.web_server.addr,
+                cfg_snapshot.web_server.port,
+            );
             let admin_state = AdminState {
                 proxy_metrics: self.proxy_metrics.clone(),
                 proxies: self.proxy_info_map.clone(),
                 reload_tx: reload_tx.clone(),
                 stop_tx: stop_tx.clone(),
                 config_path: self.config_file.clone(),
+                store: self.store_source.clone(),
             };
-            let admin_auth_user = self.cfg.web_server.user.clone();
-            let admin_auth_pwd = self.cfg.web_server.password.clone();
-            let admin_tls_cert = if self.cfg.web_server.tls_cert_file.is_empty() {
+            let admin_auth_user = cfg_snapshot.web_server.user.clone();
+            let admin_auth_pwd = cfg_snapshot.web_server.password.clone();
+            let admin_tls_cert = if cfg_snapshot.web_server.tls_cert_file.is_empty() {
                 None
             } else {
-                Some(self.cfg.web_server.tls_cert_file.clone())
+                Some(cfg_snapshot.web_server.tls_cert_file.clone())
             };
-            let admin_tls_key = if self.cfg.web_server.tls_key_file.is_empty() {
+            let admin_tls_key = if cfg_snapshot.web_server.tls_key_file.is_empty() {
                 None
             } else {
-                Some(self.cfg.web_server.tls_key_file.clone())
+                Some(cfg_snapshot.web_server.tls_key_file.clone())
             };
             tokio::spawn(async move {
                 if let Err(e) = crate::admin::run_admin_server(
@@ -1647,7 +1655,7 @@ impl Service {
                     tracing::error!(error = %e, "frpc admin server failed: {}", e);
                 }
             });
-            info!(addr = %self.cfg.web_server.addr, port = %self.cfg.web_server.port, "frpc admin server starting on {}:{}", self.cfg.web_server.addr, self.cfg.web_server.port);
+            info!(addr = %cfg_snapshot.web_server.addr, port = %cfg_snapshot.web_server.port, "frpc admin server starting on {}:{}", cfg_snapshot.web_server.addr, cfg_snapshot.web_server.port);
         }
     }
 
@@ -1909,7 +1917,7 @@ impl Service {
         let xtcp_sockets_clone = xtcp_sockets.clone();
         let hp_timeout = hole_punch_timeout;
         let resp_writer = writer.clone();
-        let resp_v2 = self.cfg.v2;
+        let resp_v2 = self.cfg.read().await.v2;
         tokio::spawn(async move {
             // Retrieve the STUN socket persisted by the control loop.
             let stun_socket = {
@@ -2080,13 +2088,14 @@ impl Service {
         plugin_cfg: &frp_core::config::PluginConfig,
     ) -> Option<PluginHandle> {
         let result = if plugin_cfg.plugin_type == "visitor_plugin" {
+            let current_cfg = self.cfg.read().await.clone();
             let ctx = PluginContext {
-                server_addr: self.cfg.server_addr.clone(),
-                server_port: self.cfg.server_port,
-                transport_protocol: self.cfg.transport_protocol.clone(),
-                tls_enable: self.cfg.tls_enable,
-                tls_server_name: self.cfg.tls_server_name.clone(),
-                tls_ca_file: opt_if_empty!(self.cfg.tls_ca_file),
+                server_addr: current_cfg.server_addr.clone(),
+                server_port: current_cfg.server_port,
+                transport_protocol: current_cfg.transport_protocol.clone(),
+                tls_enable: current_cfg.tls_enable,
+                tls_server_name: current_cfg.tls_server_name.clone(),
+                tls_ca_file: opt_if_empty!(current_cfg.tls_ca_file),
                 use_encryption: true,
                 use_compression: false,
                 token: self.auth_cfg.token.clone(),
@@ -2132,13 +2141,45 @@ impl Service {
         strict: bool,
         writer: &Arc<Mutex<WriteHalf>>,
     ) -> Result<String, String> {
-        let delta = crate::reload::do_reload(&self.proxy_info_map, config_path, strict).await?;
+        self.reload_from_sources(config_path, strict, writer).await
+    }
+
+    /// Reload the config file, merge the optional store overlay, and apply the
+    /// resulting proxy/visitor changes to the running service.
+    ///
+    /// Also refreshes the in-memory config/proxy snapshots so the next session
+    /// and admin API see the merged result.
+    pub async fn reload_from_sources(
+        &self,
+        config_path: &str,
+        strict: bool,
+        writer: &Arc<Mutex<WriteHalf>>,
+    ) -> Result<String, String> {
+        let mut new_cfg = frp_core::config::load_client_config(config_path, strict)
+            .map_err(|e| format!("failed to load config: {e}"))?;
+        if let Some(ref store) = self.store_source {
+            if let Err(e) = store.reload() {
+                tracing::warn!(error = %e, "store reload failed, using in-memory state");
+            }
+            new_cfg = merge_client_config(&new_cfg, Some(store));
+        }
+        // Source-local enabled filtering, then apply the start allowlist so the
+        // reload diff never registers store/config proxies outside `start`.
+        new_cfg.proxies.retain(|p| p.enabled);
+        new_cfg.visitors.retain(|v| v.enabled);
+        let active_proxies = filter_active_proxies(&new_cfg, &new_cfg.proxies);
+        new_cfg.proxies = active_proxies;
+
+        let delta = crate::reload::do_reload(&self.proxy_info_map, new_cfg).await?;
 
         if delta.removed.is_empty() && delta.added.is_empty() && delta.changed.is_empty() {
+            let merged = delta.new_config;
+            *self.cfg.write().await = merged;
+            *self.proxies.write().await = self.cfg.read().await.proxies.clone();
             return Ok(delta.summary);
         }
 
-        let v2 = self.cfg.v2;
+        let v2 = delta.new_config.v2;
 
         // Step 1: Cancel health checks and drop old PluginHandles for removed
         // and changed proxies. Health check tasks hold Arc<AtomicBool> cancel
@@ -2351,10 +2392,44 @@ impl Service {
             }
         }
 
+        // Step 7: Refresh the in-memory config/proxy snapshots so the next
+        // session, reconnect, and admin status endpoint use the merged config.
+        *self.cfg.write().await = delta.new_config;
+        *self.proxies.write().await = self.cfg.read().await.proxies.clone();
+
         let summary = changes.join("; ");
         tracing::info!(summary = %summary, "Config reload summary: {}", summary);
         Ok(format!("reload success: {summary}"))
     }
+}
+
+/// Apply the client `start` allowlist and `enabled` flag to a proxy list.
+/// Store-backed proxies go through the same filter as config-file proxies.
+pub(crate) fn filter_active_proxies(
+    cfg: &frp_core::config::ClientConfig,
+    proxies: &[frp_core::config::ProxyConfig],
+) -> Vec<frp_core::config::ProxyConfig> {
+    let mut active: Vec<frp_core::config::ProxyConfig> = if cfg.start.is_empty() {
+        proxies.to_vec()
+    } else {
+        let start_set: std::collections::HashSet<&str> =
+            cfg.start.iter().map(|s| s.as_str()).collect();
+        let filtered: Vec<_> = proxies
+            .iter()
+            .filter(|p| start_set.contains(p.name.as_str()))
+            .cloned()
+            .collect();
+        info!(
+            active = %filtered.len(), total = %proxies.len(), start = ?cfg.start,
+            "Selective proxy start: {} of {} proxies active (start={:?})",
+            filtered.len(),
+            proxies.len(),
+            cfg.start,
+        );
+        filtered
+    };
+    active.retain(|p| p.enabled);
+    active
 }
 
 /// Inject an OS-level route directing traffic for `subnet` through the
