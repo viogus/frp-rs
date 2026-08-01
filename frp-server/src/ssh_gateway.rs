@@ -871,7 +871,7 @@ mod tests {
             frp_core::auth::AuthConfig::with_token("test-token"),
             "127.0.0.1".into(),
             frp_core::encryption::derive_key("test-token"),
-            vec![(1, u16::MAX)],
+            vec![frp_core::config::PortsRange { start: 1, end: u16::MAX, single: 0 }],
             String::new(),
             true,
             30,

@@ -132,7 +132,7 @@ pub struct ControlTx {
 pub struct ReloadableState {
     pub auth_cfg: Arc<AuthConfig>,
     pub encryption_key: [u8; 16],
-    pub allow_ports: Arc<Vec<(u16, u16)>>,
+    pub allow_ports: Arc<Vec<frp_core::config::PortsRange>>,
     pub additional_auth_scopes: Vec<String>,
 }
 
@@ -347,8 +347,14 @@ impl RateLimiter {
     }
 }
 
+/// (proxy_name) → (port, is_udp, closed_at) for the 24h port reservation.
+pub type PortReservationMap =
+    std::collections::HashMap<String, (u16, bool, std::time::Instant)>;
+
 pub struct AppState {
     pub proxy_manager: Arc<ProxyManager>,
+    /// (proxy_name) → (port, is_udp, closed_at) for the 24h port reservation.
+    pub port_reservations: Arc<RwLock<PortReservationMap>>,
     /// Hot-reloadable config (auth, encryption, allow_ports).
     /// Uses std::sync::RwLock — blocking read has no async overhead.
     /// Writes only happen on SIGUSR1 reload (vanishingly rare).
@@ -482,7 +488,7 @@ impl AppState {
         auth_cfg: AuthConfig,
         proxy_bind_addr: String,
         encryption_key: [u8; 16],
-        allow_ports: Vec<(u16, u16)>,
+        allow_ports: Vec<frp_core::config::PortsRange>,
         sub_domain_host: String,
         tcp_mux: bool,
         tcp_mux_keepalive: i64,
@@ -514,6 +520,7 @@ impl AppState {
             })),
             used_ports: Arc::new(RwLock::new(std::collections::HashSet::new())),
             used_udp_ports: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            port_reservations: Arc::new(RwLock::new(PortReservationMap::new())),
             run_id_to_ctl_tx: Arc::new(RwLock::new(HashMap::new())),
             client_registry: Arc::new(ClientRegistry::new()),
             control_id_counter: AtomicU64::new(1),
@@ -720,7 +727,7 @@ mod tests {
             frp_core::auth::AuthConfig::with_token("test-token"),
             "127.0.0.1".into(),
             frp_core::encryption::derive_key("test-token"),
-            vec![(1, u16::MAX)],
+            vec![frp_core::config::PortsRange { start: 1, end: u16::MAX, single: 0 }],
             String::new(),
             true,
             30,

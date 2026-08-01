@@ -336,15 +336,24 @@ fn build_auth_config(
 /// Resolve the allow-ports ranges from a server config: explicit `allow_ports`
 /// spec if present, otherwise the `[allow_port_start, allow_port_end]` range.
 /// Shared by `Service::new()` and `Service::reload()`.
-fn resolve_allow_ports(cfg: &ServerConfig) -> Vec<(u16, u16)> {
+fn resolve_allow_ports(cfg: &ServerConfig) -> Vec<frp_core::config::PortsRange> {
     if !cfg.allow_ports.is_empty() {
-        frp_core::config::parse_allow_ports(&cfg.allow_ports)
+        // Invalid entries were already rejected by config validation.
+        frp_core::config::parse_allow_ports(&cfg.allow_ports).unwrap_or_default()
     } else if cfg.allow_port_start == 0 && cfg.allow_port_end == 0 {
         // Default: no restriction — allow all ports.
         // Go frp compat: when both limits are unset, any port is allowed.
-        vec![(1, 65535)]
+        vec![frp_core::config::PortsRange {
+            start: 1,
+            end: 65535,
+            single: 0,
+        }]
     } else {
-        vec![(cfg.allow_port_start, cfg.allow_port_end)]
+        vec![frp_core::config::PortsRange {
+            start: cfg.allow_port_start,
+            end: cfg.allow_port_end,
+            single: 0,
+        }]
     }
 }
 
