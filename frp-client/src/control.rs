@@ -517,7 +517,7 @@ impl ControlConnection {
         local_addr: &str,
         stream: &mut IoStream,
     ) -> Result<msg::NewProxyResp, frp_core::Error> {
-        let np = proxy::create_new_proxy_msg(p, local_addr);
+        let np = proxy::create_new_proxy_msg(p, local_addr, &self.user);
         debug!(
             name = %p.name,
             proxy_type = %p.proxy_type,

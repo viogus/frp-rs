@@ -247,7 +247,6 @@ pub(crate) struct WorkConnConfig {
     pub keepalive_secs: u64,
     pub bind_addr: Option<String>,
     pub proxy_url: String,
-    pub user: String,
     pub dial_timeout_secs: u64,
     pub xtcp_tx: mpsc::Sender<XtcpNotification>,
     pub session_alive: Arc<AtomicBool>,
@@ -728,7 +727,6 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             keepalive_secs,
             bind_addr,
             proxy_url,
-            user,
             dial_timeout_secs,
             xtcp_tx,
             session_alive,
@@ -873,22 +871,9 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) {
             Ok(FrpMessage::StartWorkConn(swc)) => {
                 let proxy_name = &swc.proxy_name;
                 debug!(label = %label, proxy_name = %proxy_name, "Work conn {} assigned to proxy '{}'", label, proxy_name);
-
-                // Strip `{user}.` prefix from proxy_name if configured.
-                // Go frp server prefixes proxy names with `{user}.` when
-                // the client has a non-empty user (multi-tenant support).
-                // The local proxy_info_map uses the bare proxy name (no prefix).
-                let proxy_name = if !user.is_empty() {
-                    let prefix = format!("{}.", user);
-                    if let Some(rest) = proxy_name.strip_prefix(&prefix) {
-                        debug!(label = %label, original = %swc.proxy_name, stripped = %rest, "Work conn {}: stripped user prefix from '{}' -> '{}'", label, swc.proxy_name, rest);
-                        rest.to_string()
-                    } else {
-                        proxy_name.to_string()
-                    }
-                } else {
-                    proxy_name.to_string()
-                };
+                // proxy_info_map uses wire names (with {user}. prefix) —
+                // look up directly without stripping.
+                let proxy_name = proxy_name.to_string();
 
                 // Look up the proxy runtime info
                 let info = {
@@ -1316,7 +1301,6 @@ mod tests {
             keepalive_secs: 0,
             bind_addr: None,
             proxy_url: String::new(),
-            user: String::new(),
             dial_timeout_secs: 1,
             xtcp_tx,
             session_alive,

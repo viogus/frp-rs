@@ -14,6 +14,16 @@ use frp_core::transport::IoStream;
 
 use crate::util::opt_if_empty;
 
+/// Build the wire-level proxy name matching Go frp's `naming.AddUserPrefix`.
+/// When `user` is non-empty, returns `{user}.{name}`; otherwise returns `name`.
+pub fn wire_proxy_name(user: &str, name: &str) -> String {
+    if user.is_empty() {
+        name.to_string()
+    } else {
+        format!("{user}.{name}")
+    }
+}
+
 /// Build a NewVisitorConn message for an STCP/XTCP visitor connection.
 /// sign_key = MD5(sk + timestamp) matching Go frp v0.69.1 behaviour.
 pub fn create_visitor_conn_msg(
@@ -59,10 +69,12 @@ pub fn create_visitor_conn_msg(
 }
 
 /// Creates the NewProxy message for registering a proxy with the server.
-/// All relevant fields from ProxyConfig are wired through (Go frp v0.69.1 compat).
-pub fn create_new_proxy_msg(p: &frp_core::config::ProxyConfig, local_addr: &str) -> FrpMessage {
+/// When `user` is non-empty, the proxy_name is prefixed as `{user}.{name}`
+/// matching Go frp's `naming.AddUserPrefix` (multi-tenant wire naming).
+pub fn create_new_proxy_msg(p: &frp_core::config::ProxyConfig, local_addr: &str, user: &str) -> FrpMessage {
+    let wire_name = if user.is_empty() { p.name.clone() } else { format!("{user}.{}", p.name) };
     let mut result = FrpMessage::NewProxy(Box::new(msg::NewProxy {
-        proxy_name: p.name.clone(),
+        proxy_name: wire_name,
         proxy_type: p.proxy_type.clone(),
         use_encryption: if p.use_encryption { Some(true) } else { None },
         use_compression: if p.use_compression { Some(true) } else { None },
@@ -452,6 +464,63 @@ mod tests {
             Ok(())
         }
     }
+
+    #[test]
+    fn test_create_new_proxy_msg_user_prefix() {
+        let cfg = frp_core::config::ProxyConfig {
+            name: "test-proxy".to_string(),
+            proxy_type: "tcp".to_string(),
+            local_ip: "127.0.0.1".to_string(),
+            local_port: 8080,
+            ..Default::default()
+        };
+        let msg = create_new_proxy_msg(&cfg, "127.0.0.1:8080", "alice");
+        match msg {
+            FrpMessage::NewProxy(np) => {
+                assert_eq!(np.proxy_name, "alice.test-proxy");
+            }
+            _ => panic!("expected NewProxy variant"),
+        }
+    }
+
+    #[test]
+    fn test_create_new_proxy_msg_empty_user() {
+        let cfg = frp_core::config::ProxyConfig {
+            name: "test-proxy".to_string(),
+            proxy_type: "tcp".to_string(),
+            local_ip: "127.0.0.1".to_string(),
+            local_port: 8080,
+            ..Default::default()
+        };
+        let msg = create_new_proxy_msg(&cfg, "127.0.0.1:8080", "");
+        match msg {
+            FrpMessage::NewProxy(np) => {
+                assert_eq!(np.proxy_name, "test-proxy");
+            }
+            _ => panic!("expected NewProxy variant"),
+        }
+    }
+
+    #[test]
+    fn test_create_new_proxy_msg_user_prefix_serialization() {
+        let cfg = frp_core::config::ProxyConfig {
+            name: "test".to_string(),
+            proxy_type: "tcp".to_string(),
+            local_ip: "127.0.0.1".to_string(),
+            local_port: 8080,
+            ..Default::default()
+        };
+        let msg = create_new_proxy_msg(&cfg, "127.0.0.1:8080", "alice");
+        match &msg {
+            FrpMessage::NewProxy(np) => {
+                assert_eq!(np.proxy_name, "alice.test");
+            }
+            _ => unreachable!(),
+        }
+        let wire = serde_json::to_string(&msg).unwrap();
+        assert!(wire.contains(r#""proxy_name":"alice.test""#));
+    }
+
 
     #[test]
     fn test_visitor_auth_debug_log_does_not_leak_secret_or_replay_proof() {

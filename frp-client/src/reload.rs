@@ -90,9 +90,19 @@ pub(crate) struct ReloadDelta {
 pub(crate) async fn do_reload(
     proxy_info_map: &Arc<RwLock<HashMap<String, ProxyRuntimeInfo>>>,
     new_cfg: ClientConfig,
+    user: &str,
 ) -> Result<ReloadDelta, String> {
     // Diff old vs new proxy names
-    let old_names: HashSet<String> = { proxy_info_map.read().await.keys().cloned().collect() };
+    let old_names: HashSet<String> = {
+        proxy_info_map.read().await.keys()
+            .map(|k| {
+                if user.is_empty() { k.clone() } else {
+                    let prefix = format!("{}.", user);
+                    k.strip_prefix(&prefix).unwrap_or(k).to_string()
+                }
+            })
+            .collect()
+    };
     let new_names: HashSet<String> = new_cfg.proxies.iter().map(|p| p.name.clone()).collect();
 
     let removed: Vec<String> = old_names.difference(&new_names).cloned().collect();
@@ -104,8 +114,9 @@ pub(crate) async fn do_reload(
     {
         let map = proxy_info_map.read().await;
         for name in &common {
+            let map_key = if user.is_empty() { (*name).clone() } else { format!("{}.{}", user, name) };
             if let (Some(old_info), Some(new_p)) = (
-                map.get(*name),
+                map.get(&map_key),
                 new_cfg.proxies.iter().find(|p| &p.name == *name),
             ) {
                 let new_snapshot = config_snapshot(new_p);

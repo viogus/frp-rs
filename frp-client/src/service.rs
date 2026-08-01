@@ -51,6 +51,7 @@ use frp_core::metrics::ProxyMetricsRegistry;
 use crate::admin::AdminState;
 use crate::control::ControlConnection;
 use crate::plugin::{self, PluginContext, PluginHandle};
+use crate::proxy::wire_proxy_name;
 use crate::proxy_runtime::{ProxyPhase, ProxyRuntimeInfo, ReloadRequest};
 use crate::store::{merge_client_config, StoreSource};
 use crate::util::opt_if_empty;
@@ -1004,7 +1005,6 @@ impl Service {
                         keepalive_secs: cfg_local.dial_server_keepalive.max(0) as u64,
                         bind_addr: opt_if_empty!(cfg_local.connect_server_local_ip),
                         proxy_url: cfg_local.proxy_url.clone(),
-                        user: cfg_local.user.clone(),
                         dial_timeout_secs: cfg_local.dial_server_timeout.max(1) as u64,
                         xtcp_tx: xtcp_tx.clone(),
                         session_alive: session_alive.clone(),
@@ -1413,8 +1413,11 @@ impl Service {
                                 .collect()
                         };
                         for (name, local_addr) in to_retry {
-                            if let Some(p) = proxies.iter().find(|p| p.name == name) {
-                                let new_proxy = crate::proxy::create_new_proxy_msg(p, &local_addr);
+                            let bare_name = if cfg_local.user.is_empty() { name.as_str() } else {
+                                name.strip_prefix(&format!("{}.", cfg_local.user)).unwrap_or(&name)
+                            };
+                            if let Some(p) = proxies.iter().find(|p| p.name == bare_name) {
+                                let new_proxy = crate::proxy::create_new_proxy_msg(p, &local_addr, &cfg_local.user);
                                 if let Err(e) = write_msg(&mut *writer.lock().await, &new_proxy, v2).await {
                                     warn!(proxy_name = %name, error = %e, "Proxy '{}' retry: write NewProxy failed: {}", name, e);
                                 } else {
@@ -1469,7 +1472,7 @@ impl Service {
                                             info.phase = ProxyPhase::WaitStart;
                                         }
                                     }
-                                    let new_proxy = crate::proxy::create_new_proxy_msg(&cfg, &local_addr);
+                                    let new_proxy = crate::proxy::create_new_proxy_msg(&cfg, &local_addr, &cfg_local.user);
                                     if let Err(e) = write_msg(&mut *writer.lock().await, &new_proxy, v2).await {
                                         warn!(proxy_name = %proxy_name, error = %e, "Failed to re-register proxy on health recovery: {}", e);
                                     } else {
@@ -1701,7 +1704,9 @@ impl Service {
         health_tx: &mpsc::Sender<HealthEvent>,
         health_cancels: &Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     ) {
+        let user = self.cfg.read().await.user.clone();
         for p in proxies {
+            let wn = wire_proxy_name(&user, &p.name);
             let hc_type = p.health_check_type.clone();
             if hc_type.is_empty() {
                 continue;
@@ -1714,10 +1719,10 @@ impl Service {
                 .proxy_info_map
                 .read()
                 .await
-                .get(&p.name)
+                .get(&wn)
                 .map(|info| info.local_addr.clone())
                 .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
-            let pn = p.name.clone();
+            let pn = wn.clone();
             let interval = std::time::Duration::from_secs(p.health_check_interval_seconds.max(10));
             let timeout = std::time::Duration::from_secs(p.health_check_timeout_seconds.max(3));
             let max_failed = p.health_check_max_failed.max(1);
@@ -2359,10 +2364,11 @@ impl Service {
         new_cfg.proxies = active_proxies;
         new_cfg.visitors = filter_active_visitors(&new_cfg, &new_cfg.visitors);
 
+        let user = new_cfg.user.clone();
         #[cfg(feature = "vnet")]
-        let mut delta = crate::reload::do_reload(&self.proxy_info_map, new_cfg).await?;
+        let mut delta = crate::reload::do_reload(&self.proxy_info_map, new_cfg, &user).await?;
         #[cfg(not(feature = "vnet"))]
-        let delta = crate::reload::do_reload(&self.proxy_info_map, new_cfg).await?;
+        let delta = crate::reload::do_reload(&self.proxy_info_map, new_cfg, &user).await?;
 
         // reload::config_snapshot omits vnet-only fields; extend the delta so
         // a subnet/IP/mask change still rebuilds the TUN during reload.
@@ -2493,11 +2499,13 @@ impl Service {
         let mut msgs: Vec<ReloadMsg> = Vec::new();
 
         // CloseProxy for removed proxies
+        let user = delta.new_config.user.clone();
         for name in &delta.removed {
+            let wn = wire_proxy_name(&user, name);
             msgs.push(ReloadMsg {
                 label: format!("send CloseProxy for '{name}'"),
                 msg: FrpMessage::CloseProxy(msg::CloseProxy {
-                    proxy_name: name.clone(),
+                    proxy_name: wn,
                 }),
             });
             changes.push(format!("proxy '{name}' removed"));
@@ -2506,6 +2514,7 @@ impl Service {
         // CloseProxy + NewProxy for changed proxies
         for name in &delta.changed {
             if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
+                let wn = wire_proxy_name(&user, name);
                 let local_addr = plugin_addrs
                     .get(name)
                     .cloned()
@@ -2513,12 +2522,12 @@ impl Service {
                 msgs.push(ReloadMsg {
                     label: format!("send CloseProxy for changed '{name}'"),
                     msg: FrpMessage::CloseProxy(msg::CloseProxy {
-                        proxy_name: name.clone(),
+                        proxy_name: wn,
                     }),
                 });
                 msgs.push(ReloadMsg {
                     label: format!("send NewProxy for changed '{name}'"),
-                    msg: crate::proxy::create_new_proxy_msg(p, &local_addr),
+                    msg: crate::proxy::create_new_proxy_msg(p, &local_addr, &user),
                 });
                 changes.push(format!("proxy '{name}' updated"));
             }
@@ -2533,7 +2542,7 @@ impl Service {
                     .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
                 msgs.push(ReloadMsg {
                     label: format!("send NewProxy for added '{name}'"),
-                    msg: crate::proxy::create_new_proxy_msg(p, &local_addr),
+                    msg: crate::proxy::create_new_proxy_msg(p, &local_addr, &user),
                 });
                 changes.push(format!("proxy '{name}' added"));
             }
