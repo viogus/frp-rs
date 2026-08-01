@@ -6,7 +6,6 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
 #[cfg(feature = "tls")]
-use crate::lock::RwLockExt;
 use crate::service::{AppState, InternalMsg};
 
 /// A route mapping: domain or location -> proxy entry.
@@ -611,7 +610,12 @@ pub async fn run_vhost_http_listener(
 }
 
 /// Run an HTTPS VHost listener on the given address.
-/// Performs TLS handshake, then extracts Host header and routes via InternalMsg.
+///
+/// Go frp compat (`pkg/util/vhost/https.go`): frps does NOT terminate TLS for
+/// HTTPS vhosts. It reads only the ClientHello SNI, routes by SNI, and
+/// forwards the original encrypted bytes (as pre_read) to the matching frpc
+/// HTTPS proxy — the TLS session stays end-to-end between the user and the
+/// backend.
 #[cfg(feature = "tls")]
 #[instrument(skip(state, shutdown_token), fields(addr = %addr))]
 pub async fn run_vhost_https_listener(
@@ -625,33 +629,58 @@ pub async fn run_vhost_https_listener(
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (stream, peer) = result?;
+                let (mut stream, peer) = result?;
                 frp_core::transport::set_nodelay(&stream);
                 let state = state.clone();
-                // Read the current TLS acceptor from shared state. Hot-reload
-                // swaps a new acceptor under write lock; read-lock is cheap.
-                let Some(acceptor) = state
-                    .tls_acceptor
-                    .read_ok()
-                    .clone()
-                else {
-                    tracing::error!("TLS acceptor not initialized");
-                    continue;
-                };
 
                 tokio::spawn(async move {
-                    let tls_stream = match acceptor.accept(stream).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!(peer = %peer, error = %e, "TLS handshake failed from {}: {}", peer, e);
-                            return;
-                        }
+                    let timeout_secs = state.vhost_http_timeout.max(1);
+                    // Read the TLS ClientHello (SNI lives in the first
+                    // record; 4096 bytes comfortably covers it).
+                    let mut buf = [0u8; 4096];
+                    let n = match tokio::time::timeout(
+                        std::time::Duration::from_secs(timeout_secs),
+                        read_client_hello_prefix(&mut stream, &mut buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(n)) if n > 0 => n,
+                        _ => return,
                     };
+                    let pre_read = buf[..n].to_vec();
 
-                    serve_vhost_request(tls_stream, peer, state, "HTTPS", |s| {
-                        frp_core::transport::IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(s)), peer)
-                    })
-                    .await;
+                    let Some(sni) = extract_sni_from_client_hello(&buf[..n]) else {
+                        warn!(peer = %peer, "HTTPS VHost: no SNI in ClientHello from {}", peer);
+                        return;
+                    };
+                    debug!(sni = %sni, peer = %peer, "HTTPS VHost SNI '{}' from {}", sni, peer);
+
+                    // Route by SNI (host), path "/" (Go https.go getByRoute).
+                    if let Some(route) = state
+                        .vhost_manager
+                        .lookup_combined(&sni, "/", "")
+                        .await
+                    {
+                        let internal_tx = {
+                            let map = state.run_id_to_ctl_tx.read().await;
+                            map.get(&route.run_id).cloned()
+                        };
+                        if let Some(ctl_tx) = internal_tx {
+                            let _ = ctl_tx
+                                .tx
+                                .try_send(InternalMsg::ProxyUserConn {
+                                    proxy_name: route.proxy_name.clone(),
+                                    // Passthrough: raw encrypted bytes, no TLS wrap.
+                                    user_conn: frp_core::transport::IoStream::Tcp(stream),
+                                    pre_read,
+                                })
+                                .ok();
+                        } else {
+                            warn!(sni = %sni, "HTTPS VHost route for '{}' found but control handler gone", sni);
+                        }
+                    } else {
+                        warn!(sni = %sni, peer = %peer, "No HTTPS VHost route for '{}' from {}", sni, peer);
+                    }
                 });
             }
             _ = shutdown_token.cancelled() => {
@@ -661,6 +690,44 @@ pub async fn run_vhost_https_listener(
         }
     }
     Ok(())
+}
+
+/// Read up to `buf.len()` bytes for the TLS ClientHello. Reads until we have
+/// the full ClientHello record (content type 0x16 + TLS record header), or
+/// the buffer is full, or EOF.
+async fn read_client_hello_prefix<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    use tokio::io::AsyncReadExt;
+    let n = stream.read(buf).await?;
+    if n == 0 {
+        return Ok(0);
+    }
+    // A ClientHello handshake record is: 0x16 | version(2) | len(2) | handshake...
+    // If the first record is a full ClientHello and we already have it all,
+    // stop reading (avoids blocking on a keep-alive connection).
+    let record_len = if n >= 5 && buf[0] == 0x16 {
+        (u16::from_be_bytes([buf[3], buf[4]]) as usize) + 5
+    } else {
+        0
+    };
+    if record_len > 0 && n >= record_len {
+        return Ok(n);
+    }
+    if record_len > 0 && record_len <= buf.len() {
+        let mut total = n;
+        while total < record_len {
+            let m = stream.read(&mut buf[total..record_len]).await?;
+            if m == 0 {
+                break;
+            }
+            total += m;
+        }
+        Ok(total)
+    } else {
+        Ok(n)
+    }
 }
 
 #[cfg(not(feature = "tls"))]
