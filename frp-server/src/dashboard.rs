@@ -157,13 +157,34 @@ struct DeleteProxiesBody {
 
 #[derive(Serialize)]
 struct ClientEntry {
+    /// Composite key `{user}.{clientID}` (Go ClientInfoResp.key).
+    key: String,
+    user: String,
+    #[serde(rename = "clientID", skip_serializing_if = "Option::is_none")]
+    client_id: Option<String>,
+    #[serde(rename = "runID")]
     run_id: String,
-    client_addr: Option<String>,
+    version: String,
+    #[serde(rename = "wireProtocol")]
+    wire_protocol: String,
+    hostname: String,
+    #[serde(rename = "clientIP")]
+    client_ip: String,
     online: bool,
-    login_time_secs: u64,
+    /// Go compat: first/last/disconnected timestamps as Unix seconds.
+    #[serde(rename = "firstConnectedAt")]
+    first_connected_at: u64,
+    #[serde(rename = "lastConnectedAt")]
+    last_connected_at: u64,
+    #[serde(rename = "disconnectedAt", skip_serializing_if = "Option::is_none")]
+    disconnected_at: Option<u64>,
+    /// Proxy count for online clients (0 for offline).
+    #[serde(rename = "proxyCount")]
     proxy_count: usize,
     proxies: Vec<String>,
+    #[serde(rename = "poolSize")]
     pool_size: i64,
+    #[serde(rename = "pendingRequests")]
     pending_requests: i64,
 }
 
@@ -418,19 +439,49 @@ async fn handle_proxy_by_name(
 }
 
 async fn handle_clients(State(state): State<Arc<AppState>>) -> Json<Vec<ClientEntry>> {
+    // Go compat: /api/clients lists the registry (online AND offline clients,
+    // with a pruning policy), not just the live control connections.
+    let registry = state.client_registry.list();
     let map = state.run_id_to_ctl_tx.read().await;
-    let mut clients = Vec::new();
-    for (run_id, ctl) in map.iter() {
-        let proxies = state.proxy_manager.list_client_proxy_names(run_id).await;
+    let mut clients = Vec::with_capacity(registry.len());
+    for info in registry {
+        let ctl = if info.run_id.is_empty() {
+            None
+        } else {
+            map.get(&info.run_id)
+        };
+        let (proxies, pool_size, pending) = match ctl {
+            Some(ctl) => {
+                let names = state.proxy_manager.list_client_proxy_names(&info.run_id).await;
+                (
+                    names,
+                    ctl.pool_stats.pool_size.load(Ordering::Relaxed),
+                    ctl.pool_stats.pending_requests.load(Ordering::Relaxed),
+                )
+            }
+            None => (Vec::new(), 0, 0),
+        };
         clients.push(ClientEntry {
-            run_id: run_id.clone(),
-            client_addr: ctl.client_addr.map(|a| a.to_string()),
-            online: true,
-            login_time_secs: ctl.login_time.elapsed().as_secs(),
+            key: info.key.clone(),
+            user: info.user.clone(),
+            client_id: if info.raw_client_id.is_empty() {
+                None
+            } else {
+                Some(info.raw_client_id.clone())
+            },
+            run_id: info.run_id.clone(),
+            version: info.version.clone(),
+            wire_protocol: info.wire_protocol.clone(),
+            hostname: info.hostname.clone(),
+            client_ip: info.ip.clone(),
+            online: info.online,
+            first_connected_at: info.first_connected_at_unix,
+            last_connected_at: info.last_connected_at_unix,
+            disconnected_at: info.disconnected_at_unix,
             proxy_count: proxies.len(),
             proxies,
-            pool_size: ctl.pool_stats.pool_size.load(Ordering::Relaxed),
-            pending_requests: ctl.pool_stats.pending_requests.load(Ordering::Relaxed),
+            pool_size,
+            pending_requests: pending,
         });
     }
     Json(clients)
@@ -481,6 +532,17 @@ async fn handle_client_detail(
 
 async fn handle_root() -> Html<String> {
     Html(include_str!("dashboard.html").replace("{version}", frp_core::VERSION))
+}
+
+/// Go compat: `/debug/pprof` index. frp-rs has no Go-style pprof endpoints;
+/// return a minimal page so tooling probing the route gets a sane response.
+async fn handle_pprof_index() -> Html<&'static str> {
+    Html("<html><body><h1>pprof</h1><p>frp-rs does not expose Go-style pprof endpoints.</p></body></html>")
+}
+
+/// Go compat: `/debug/pprof/*` placeholder (outside auth, like Go).
+async fn handle_pprof() -> (StatusCode, &'static str) {
+    (StatusCode::NOT_FOUND, "pprof profiles are not available in frp-rs")
 }
 
 #[derive(Deserialize)]
@@ -908,12 +970,20 @@ pub async fn run_dashboard(
     let metrics_route = apply_admin_auth(metrics_route, &auth_user, &auth_password);
 
     let mut app = Router::new()
-        .route("/", get(handle_root))
+        // Go compat (server.go:125-129): /healthz and /debug/pprof are
+        // OUTSIDE auth; / and /static are inside (api_router.go).
         .route("/healthz", get(handle_healthz))
+        .route("/debug/pprof", get(handle_pprof_index))
+        .route("/debug/pprof/{*path}", get(handle_pprof))
         .merge(api_routes);
     if enable_prometheus {
         app = app.merge(metrics_route);
     }
+    // Dashboard root (and any future /static assets) require auth, matching
+    // Go: the web UI is only reachable with the configured credentials.
+    let protected = Router::new().route("/", get(handle_root));
+    let protected = apply_admin_auth(protected, &auth_user, &auth_password);
+    app = app.merge(protected);
     // Spawn periodic traffic event broadcaster for WebSocket subscribers.
     // Clone state before it's moved into .with_state().
     let traffic_state = state.clone();

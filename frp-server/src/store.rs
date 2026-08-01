@@ -89,6 +89,14 @@ pub fn save_store(path: &Path, configs: &HashMap<String, ProxyConfig>) {
         return;
     }
 
+    // Go frp compat: the store file holds proxy credentials/addresses, so it
+    // must not be world-readable. Set 0600 on the temp file before rename.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+    }
+
     if let Err(e) = std::fs::rename(&tmp_path, path) {
         error!(from = %tmp_path.display(), to = %path.display(), error = %e,
             "failed to atomically rename store file");

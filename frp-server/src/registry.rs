@@ -33,6 +33,12 @@ pub struct ClientInfo {
     pub last_connected_at: Instant,
     /// When this client disconnected (None if currently online).
     pub disconnected_at: Option<Instant>,
+    /// Unix seconds of the first connection (Go dashboard compat).
+    pub first_connected_at_unix: u64,
+    /// Unix seconds of the last connection.
+    pub last_connected_at_unix: u64,
+    /// Unix seconds of the disconnection (None if online).
+    pub disconnected_at_unix: Option<u64>,
     /// Whether this client is currently online.
     pub online: bool,
     /// Monotonically increasing control generation ID for distinguishing
@@ -157,6 +163,9 @@ impl ClientRegistry {
             first_connected_at: now,
             last_connected_at: now,
             disconnected_at: None,
+            first_connected_at_unix: unix_now(),
+            last_connected_at_unix: unix_now(),
+            disconnected_at_unix: None,
             online: false,
             control_id: 0,
         });
@@ -213,6 +222,7 @@ impl ClientRegistry {
                     info.control_id = 0;
                     info.online = false;
                     info.disconnected_at = Some(Instant::now());
+                    info.disconnected_at_unix = Some(unix_now());
                 }
             }
         }
@@ -240,6 +250,13 @@ impl Default for ClientRegistry {
 /// Build a composite key from user and client identifier.
 ///
 /// Returns `{user}.{id}` when both are non-empty, or whichever is non-empty.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn compose_client_key(user: &str, id: &str) -> String {
     match (user.is_empty(), id.is_empty()) {
         (true, _) => id.to_string(),
@@ -358,6 +375,9 @@ mod tests {
             wire_protocol: "v1".into(),
             first_connected_at: Instant::now(),
             last_connected_at: Instant::now(),
+            first_connected_at_unix: 1,
+            last_connected_at_unix: 2,
+            disconnected_at_unix: None,
             disconnected_at: None,
             online: true,
             control_id: 0,

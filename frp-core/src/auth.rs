@@ -1128,15 +1128,10 @@ fn resolve_dynamic_token_inner(
     unsafe_features: Option<&crate::unsafe_features::UnsafeFeatures>,
 ) -> Result<String, String> {
     if let Some(path) = token.strip_prefix("file://") {
-        if unsafe_features
-            .is_some_and(|uf| !uf.is_enabled(crate::unsafe_features::TOKEN_SOURCE_FILE))
-        {
-            return Err(
-                "file:// token source blocked: TokenSourceFile not in UnsafeFeatures allowlist. \
-                 Set [common].unsafe_features = [\"TokenSourceFile\"] to enable."
-                    .into(),
-            );
-        }
+        // Go frp v0.70.1: only exec token sources require the unsafe-features
+        // gate (validation/client.go validateOIDCConfig + token.go); file
+        // sources are always allowed.
+        let _ = unsafe_features;
         match std::fs::read_to_string(path) {
             Ok(content) => Ok(content.lines().next().unwrap_or("").trim().to_string()),
             Err(e) => Err(format!(
@@ -1733,18 +1728,17 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_dynamic_token_file_blocked_when_not_allowed() {
-        // file:// must require TokenSourceFile in the UnsafeFeatures allowlist.
+    fn test_resolve_dynamic_token_file_allowed_without_unsafe() {
+        // Go frp v0.70.1: only exec token sources require the unsafe gate;
+        // file sources are always allowed.
         let dir = std::env::temp_dir();
         let path = dir.join(format!("frp-test-token-i3-{}.txt", std::process::id()));
-        std::fs::write(&path, "file-token-should-be-blocked\n").unwrap();
+        std::fs::write(&path, "file-token-allowed\n").unwrap();
         let url = format!("file://{}", path.display());
-        // Default UnsafeFeatures has TokenSourceFile DISABLED.
         let uf = crate::unsafe_features::UnsafeFeatures::default();
         let result = resolve_dynamic_token_checked(&url, &uf);
         std::fs::remove_file(&path).ok();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("TokenSourceFile"));
+        assert_eq!(result.unwrap(), "file-token-allowed");
     }
 
     #[test]
