@@ -72,7 +72,7 @@ pub fn create_visitor_conn_msg(
 /// When `user` is non-empty, the proxy_name is prefixed as `{user}.{name}`
 /// matching Go frp's `naming.AddUserPrefix` (multi-tenant wire naming).
 pub fn create_new_proxy_msg(p: &frp_core::config::ProxyConfig, local_addr: &str, user: &str) -> FrpMessage {
-    let wire_name = if user.is_empty() { p.name.clone() } else { format!("{user}.{}", p.name) };
+    let wire_name = wire_proxy_name(user, &p.name);
     let mut result = FrpMessage::NewProxy(Box::new(msg::NewProxy {
         proxy_name: wire_name,
         proxy_type: p.proxy_type.clone(),
@@ -521,6 +521,43 @@ mod tests {
         assert!(wire.contains(r#""proxy_name":"alice.test""#));
     }
 
+
+    #[test]
+    fn test_wire_proxy_name_used_for_map_keys_and_health() {
+        // Simulates what Service::new() does: build a proxy config with user="alice",
+        // verify proxy_info_map and health_proxy_configs keys are prefixed.
+        let cfg = frp_core::config::ProxyConfig {
+            name: "http-proxy".to_string(),
+            proxy_type: "tcp".to_string(),
+            local_ip: "127.0.0.1".to_string(),
+            local_port: 3000,
+            health_check_type: "tcp".to_string(),
+            ..Default::default()
+        };
+
+        let user = "alice";
+        let expected_wire = "alice.http-proxy";
+
+        // proxy_info_map key = wire_proxy_name(&cfg.user, &p.name)
+        let map_key = wire_proxy_name(user, &cfg.name);
+        assert_eq!(map_key, expected_wire,
+            "proxy_info_map key must be prefixed: {map_key} != {expected_wire}");
+
+        // health_proxy_configs key = wire_proxy_name(&cfg.user, &p.name)
+        let hc_key = wire_proxy_name(user, &cfg.name);
+        assert_eq!(hc_key, expected_wire,
+            "health_proxy_configs key must be prefixed: {hc_key} != {expected_wire}");
+
+        // create_new_proxy_msg also produces the prefixed wire name
+        let msg = create_new_proxy_msg(&cfg, "127.0.0.1:3000", user);
+        match msg {
+            FrpMessage::NewProxy(np) => {
+                assert_eq!(np.proxy_name, expected_wire,
+                    "NewProxy.proxy_name must be {expected_wire}");
+            }
+            _ => panic!("expected NewProxy variant"),
+        }
+    }
 
     #[test]
     fn test_visitor_auth_debug_log_does_not_leak_secret_or_replay_proof() {

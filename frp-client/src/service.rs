@@ -421,8 +421,9 @@ impl Service {
                 .map(|pl| pl.plugin_type.clone())
                 .unwrap_or_default();
             let snapshot = crate::reload::config_snapshot(p);
+            let wn = wire_proxy_name(&cfg.user, &p.name);
             map.insert(
-                p.name.clone(),
+                wn.clone(),
                 ProxyRuntimeInfo {
                     local_addr,
                     proxy_type: p.proxy_type.clone(),
@@ -473,7 +474,7 @@ impl Service {
             cfg.proxies
                 .iter()
                 .filter(|p| !p.health_check_type.is_empty())
-                .map(|p| (p.name.clone(), p.clone()))
+                .map(|p| (wire_proxy_name(&cfg.user, &p.name), p.clone()))
                 .collect(),
         ));
 
@@ -815,7 +816,7 @@ impl Service {
                     .proxy_info_map
                     .read()
                     .await
-                    .get(&p.name)
+                    .get(&wire_proxy_name(&cfg_local.user, &p.name))
                     .map(|info| info.local_addr.clone())
                     .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
                 match ctl
@@ -829,7 +830,7 @@ impl Service {
                         info!(proxy_name = %p.name, remote = %remote, "Proxy '{}' registered on remote port {}", p.name, remote);
                         // Update runtime info for admin API
                         let mut map = self.proxy_info_map.write().await;
-                        if let Some(info) = map.get_mut(&p.name) {
+                        if let Some(info) = map.get_mut(&wire_proxy_name(&cfg_local.user, &p.name)) {
                             info.remote_addr = remote;
                             info.err.clear();
                             info.phase = ProxyPhase::Running;
@@ -845,7 +846,7 @@ impl Service {
                     Err(e) => {
                         warn!(proxy_name = %p.name, error = %e, "Failed to register proxy '{}': {}", p.name, e);
                         let mut map = self.proxy_info_map.write().await;
-                        if let Some(info) = map.get_mut(&p.name) {
+                        if let Some(info) = map.get_mut(&wire_proxy_name(&cfg_local.user, &p.name)) {
                             info.err = e.to_string();
                             info.phase = ProxyPhase::StartErr(e.to_string());
                         }
@@ -2585,7 +2586,7 @@ impl Service {
         {
             let mut map = self.proxy_info_map.write().await;
             for name in &delta.removed {
-                map.remove(name);
+                map.remove(&wire_proxy_name(&user, name));
             }
             for name in delta.changed.iter().chain(delta.added.iter()) {
                 if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
@@ -2608,7 +2609,7 @@ impl Service {
                         err = format!("plugin '{}' failed to start", plugin_type);
                     }
                     map.insert(
-                        name.clone(),
+                        wire_proxy_name(&user, name),
                         ProxyRuntimeInfo {
                             local_addr,
                             proxy_type: p.proxy_type.clone(),
