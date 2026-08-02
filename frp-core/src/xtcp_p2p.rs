@@ -1247,7 +1247,7 @@ pub async fn punch_udp_hole_makehole_owned(
     } else if behavior
         .candidate_ports
         .as_ref()
-        .map_or(true, |v| v.is_empty())
+        .is_none_or(|v| v.is_empty())
     {
         detect_addrs.extend(candidates.iter().cloned());
     }
