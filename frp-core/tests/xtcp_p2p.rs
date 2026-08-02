@@ -386,8 +386,8 @@ async fn test_makehole_loopback_with_assisted_and_behavior() {
 
     let assisted_sender = vec!["192.0.2.1:40000".to_string()]; // TEST-NET, unroutable
     let (peer_a, peer_b) = tokio::join!(
-        xtcp_p2p::punch_udp_hole_makehole(
-            &a,
+        xtcp_p2p::punch_udp_hole_makehole_owned(
+            a,
             &candidate_b,
             &assisted_sender,
             &sender_behavior,
@@ -395,8 +395,8 @@ async fn test_makehole_loopback_with_assisted_and_behavior() {
             None,
             None,
         ),
-        xtcp_p2p::punch_udp_hole_makehole(
-            &b,
+        xtcp_p2p::punch_udp_hole_makehole_owned(
+            b,
             &candidate_a,
             &[],
             &receiver_behavior,
@@ -406,8 +406,8 @@ async fn test_makehole_loopback_with_assisted_and_behavior() {
         ),
     );
 
-    let peer_a = peer_a.expect("makehole side A");
-    let peer_b = peer_b.expect("makehole side B");
+    let peer_a = peer_a.expect("makehole side A").1;
+    let peer_b = peer_b.expect("makehole side B").1;
     assert_eq!(peer_a, addr_b, "A should see B's address");
     assert_eq!(peer_b, addr_a, "B should see A's address");
 }
@@ -436,8 +436,8 @@ async fn test_makehole_candidate_port_scanning() {
     };
 
     let (peer_a, peer_b) = tokio::join!(
-        xtcp_p2p::punch_udp_hole_makehole(
-            &a,
+        xtcp_p2p::punch_udp_hole_makehole_owned(
+            a,
             &candidate_b,
             &[],
             &sender_behavior,
@@ -445,8 +445,8 @@ async fn test_makehole_candidate_port_scanning() {
             None,
             None
         ),
-        xtcp_p2p::punch_udp_hole_makehole(
-            &b,
+        xtcp_p2p::punch_udp_hole_makehole_owned(
+            b,
             &candidate_a,
             &[],
             &receiver_behavior,
@@ -456,8 +456,8 @@ async fn test_makehole_candidate_port_scanning() {
         ),
     );
 
-    let peer_a = peer_a.expect("makehole scan side A");
-    let peer_b = peer_b.expect("makehole scan side B");
+    let peer_a = peer_a.expect("makehole scan side A").1;
+    let peer_b = peer_b.expect("makehole scan side B").1;
     assert_eq!(peer_a, addr_b);
     assert_eq!(peer_b, addr_a);
 }

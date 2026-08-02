@@ -4,6 +4,24 @@ All notable changes to frp-rs.
 
 ## Unreleased
 
+- **XTCP MakeHole executed on the provider side + Go v0.70.1 punch semantics**:
+  the provider previously called `xtcp_p2p_connect_yamux` with
+  `candidates=&[]`, `behavior=None`, and the peer addresses stuffed into
+  `assisted`, so the simplified punch always failed with "no candidate
+  addresses" and XTCP provider-side hole punching never actually ran. Both
+  provider paths (`handle_nat_hole_resp` and the legacy `handle_nat_hole_client`)
+  now pass `candidates`/`assisted`/`detect_behavior` per Go semantics.
+  `punch_udp_hole_makehole` in `frp-core/src/xtcp_p2p.rs` was aligned with Go
+  `pkg/nathole/nathole.go` MakeHole: the winning socket (the one the peer's
+  detect reply arrived on) is now returned and used for the KCP data plane
+  (`result.lConn` semantics); probe TTL is set for the detect phase and
+  restored afterwards (`ttl<=0` leaves it untouched); `send_random_ports`
+  probes that many distinct random ports in [1024, 65535] concurrently (15 ms
+  apart, Go `sendSidMessageToRandomPorts`) instead of a clamped 8-port window;
+  `candidate_ports` range scanning now sleeps 2 ms per port (Go
+  `sendSidMessageToRangePorts`); and NatHoleSid `nonce` is a random 0-19 '0'
+  string like Go (`strings.Repeat("0", rand.IntN(20))`).
+
 - **V2 post-handshake Login read timeout**: after a V2 ClientHello handshake,
   the read of the next frame (the Login message) is now bounded by the same
   10s `V2_HANDSHAKE_TIMEOUT` as the handshake itself, closing a gap where a

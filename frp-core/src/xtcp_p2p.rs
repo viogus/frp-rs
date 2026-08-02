@@ -28,39 +28,45 @@
 //! ensures compatibility with Go peers regardless of detect_behavior
 //! role assignment.
 //!
-//! ## Known limitation: Simplified hole-punch (not Go's 5-mode MakeHole state machine)
+//! ## Hole-punch paths
 //!
-//! Go frp v0.70.1 implements a full 5-mode state machine (`MakeHole`) in
-//! `/tmp/frp-source/pkg/nathole/nathole.go:192-288` that guides each peer
-//! through the specific hole-punch behavior selected by the analyzer:
+//! Two hole-punch paths exist:
 //!
-//! | Mode | Condition | Works? | Notes |
-//! |------|-----------|--------|-------|
-//! | 0 | Both EasyNAT | Yes | Simple "send + wait" suffices for this case |
-//! | 1 | One EasyNAT, one HardNAT | Partial | Simplified approach may work in some configurations |
-//! | 2 | Both HardNAT (port-restricted) | No | Requires port-range scanning (ports_range_number) + random ports |
-//! | 3 | Both HardNAT with listen randomization | No | Requires listen_random_ports on receiver side |
-//! | 4 | Both HardNAT symmetric mapping | No | Requires TTL-limited probes + port difference scanning |
+//! **Simplified punch (`punch_udp_hole`):** used when no server-provided
+//! `detect_behavior` is available (Rust↔Rust, legacy `NatHoleClient` path).
+//! Sends a single detect burst and waits for the first valid reply.
 //!
-//! **What works:** Mode 0 (both peers are EasyNAT). The simplified "send detect
-//! message, wait for response" approach handles this case well.
+//! **Go-compat MakeHole (`punch_udp_hole_makehole`):** used whenever the
+//! server sent a `detect_behavior` in `NatHoleResp`. This mirrors Go frp
+//! v0.70.1 `pkg/nathole/nathole.go` `MakeHole` and executes the 5-mode
+//! behavior parameters selected by the server analyzer:
 //!
-//! **What doesn't work:** Modes 2-4 (HardNAT scenarios where at least one peer
-//! has port-restricted or symmetric NAT). Go frp's MakeHole state machine uses
-//! `send_delay_ms` interval probing, `ports_range_number` candidate scanning,
-//! `listen_random_ports` on the receiver, and TTL-limited probes. Our
-//! implementation ignores most of these parameters.
+//! | Parameter | Executed | Notes |
+//! |-----------|----------|-------|
+//! | `role` (sender/receiver) | Yes | Sender waits `send_delay_ms`, probes assisted+candidate addrs; receiver optionally binds `listen_random_ports` extra sockets |
+//! | `ttl` | Yes | Applied to all probe packets for the probe phase, restored afterwards (Go defer semantics); ttl<=0 leaves the socket TTL untouched |
+//! | `send_delay_ms` | Yes | Sender sleeps before probing |
+//! | `candidate_ports` | Yes | Receiver scans each candidate IP's port range, 2 ms per port (Go `sendSidMessageToRangePorts`) |
+//! | `send_random_ports` | Yes | One concurrent task per socket probing that many distinct random ports in [1024, 65535], 15 ms apart (Go `sendSidMessageToRandomPorts`) |
+//! | `read_timeout_ms` | Yes | Used as the detect-wait timeout (Go `ReadTimeoutMs`) |
 //!
-//! **Status for v0.7.1:** This is a known limitation. The simplified approach
-//! works for EasyNAT↔EasyNAT (common when both peers are on standard home/cloud
-//! networks without symmetric NAT). HardNAT scenarios may fail — Go frp handles
-//! these correctly. Future releases should implement the full MakeHole state
-//! machine for complete compatibility.
+//! The winning socket — the one the peer's detect reply arrived on — is
+//! returned and used for the KCP data plane, matching Go's `result.lConn`
+//! semantics (a reply on an extra listener socket only has a working NAT
+//! mapping on that socket).
+//!
+//! **Known remaining differences from Go:** `slices.Compact` in Go only
+//! removes *adjacent* duplicates, we sort+dedup the detect-address set;
+//! the shared probe `transaction_id` in Go is a single value per MakeHole
+//! call while we generate one per packet (Go peers never validate it); and
+//! Go's TTL set/restore races under concurrent random-port probing while we
+//! keep a constant probe-phase TTL (cleaner, same observable behavior).
 
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -141,7 +147,9 @@ impl NatHoleDetectSid {
             transaction_id: uuid::Uuid::new_v4().to_string(),
             sid: sid.to_string(),
             response,
-            nonce: String::new(),
+            // Go v0.70.1 sets Nonce to a random string of 0-19 '0' chars
+            // (`strings.Repeat("0", rand.IntN(20))` in sendSidMessage).
+            nonce: "0".repeat(rand::random::<usize>() % 20),
         }
     }
 }
@@ -794,10 +802,13 @@ pub async fn xtcp_p2p_connect(
 ) -> Result<XtcpP2pStream, String> {
     // 1. Punch hole. With a server-provided DetectBehavior, use the full Go
     //    MakeHole state machine; otherwise the simplified punch.
-    let peer_addr = match behavior {
+    //    MakeHole returns the socket the peer's detect reply arrived on —
+    //    only that socket has a NAT mapping the peer can reach, so the KCP
+    //    data plane must run on it (Go `result.lConn` semantics).
+    let (win_socket, peer_addr) = match behavior {
         Some(b) => {
-            punch_udp_hole_makehole(
-                &socket,
+            punch_udp_hole_makehole_owned(
+                socket,
                 candidates,
                 assisted,
                 b,
@@ -807,7 +818,11 @@ pub async fn xtcp_p2p_connect(
             )
             .await?
         }
-        None => punch_udp_hole(&socket, candidates, hole_punch_timeout_ms, sid, key).await?,
+        None => {
+            let peer_addr =
+                punch_udp_hole(&socket, candidates, hole_punch_timeout_ms, sid, key).await?;
+            (socket, peer_addr)
+        }
     };
 
     tracing::info!(
@@ -820,7 +835,7 @@ pub async fn xtcp_p2p_connect(
     );
 
     // 2. Create KCP stream.
-    XtcpP2pStream::new(socket, peer_addr, conv, kcp_config)
+    XtcpP2pStream::new(win_socket, peer_addr, conv, kcp_config)
         .map_err(|e| format!("create P2P stream: {}", e))
 }
 
@@ -1086,14 +1101,16 @@ pub async fn xtcp_p2p_connect_yamux(
 // The simplified `punch_udp_hole` remains for Rust↔Rust/no-behavior callers.
 
 /// Send an encrypted NatHoleSid probe (or "frp" magic) from `socket` to `addr`.
+///
+/// TTL is managed by `punch_udp_hole_makehole`, which sets it once for the
+/// whole probe phase and restores the original value afterwards (Go
+/// `sendSidMessage` sets the TTL per packet with a deferred restore).
 async fn send_sid_probe(
     socket: &UdpSocket,
     addr: SocketAddr,
-    ttl: u8,
     sid: Option<&str>,
     key: Option<&[u8; 16]>,
 ) {
-    let _ = socket.set_ttl(ttl.max(1) as u32);
     match (sid, key) {
         (Some(sid_str), Some(enc_key)) => {
             let msg = NatHoleDetectSid::new(sid_str, false);
@@ -1112,11 +1129,17 @@ async fn send_sid_probe(
 }
 
 /// Wait for a NatHoleSid/magic detect message on any of `sockets`, returning
-/// the peer address. Mirrors Go `waitDetectMessage` + multi-socket select:
+/// the index of the socket that received the answer and the peer address.
+/// Mirrors Go `waitDetectMessage` + multi-socket select:
 /// - receiver: echoes a non-response probe back as `response:true`, then
 ///   returns the peer (Go nathole.go waitDetectMessage).
 /// - sender: only accepts `response:true` (or the Rust "frp" magic from a
 ///   candidate address).
+///
+/// The winning socket index is important: in Go the NAT mapping that the peer
+/// replies to is specific to the socket that received the probe, so the data
+/// plane must run on that exact socket (`result.lConn`), not on the original
+/// STUN socket.
 async fn wait_detect_on_any(
     sockets: &[&UdpSocket],
     peers: &[SocketAddr],
@@ -1124,7 +1147,7 @@ async fn wait_detect_on_any(
     timeout_ms: u64,
     sid: Option<&str>,
     key: Option<&[u8; 16]>,
-) -> Result<SocketAddr, String> {
+) -> Result<(usize, SocketAddr), String> {
     let mut buf = [0u8; 1024];
     let start = std::time::Instant::now();
     loop {
@@ -1134,7 +1157,7 @@ async fn wait_detect_on_any(
                 timeout_ms
             ));
         }
-        for s in sockets.iter() {
+        for (idx, s) in sockets.iter().enumerate() {
             let r =
                 tokio::time::timeout(std::time::Duration::from_millis(50), s.recv_from(&mut buf))
                     .await;
@@ -1145,7 +1168,7 @@ async fn wait_detect_on_any(
                         // Rust magic: only accept from a known candidate
                         // (a receiver's extra listener socket is not one).
                         if peers.contains(&peer) {
-                            return Ok(peer);
+                            return Ok((idx, peer));
                         }
                         continue;
                     }
@@ -1161,7 +1184,7 @@ async fn wait_detect_on_any(
                                         let _ = s.send_to(&encoded, peer).await;
                                     }
                                 }
-                                return Ok(peer);
+                                return Ok((idx, peer));
                             }
                             // Sender got a plain probe — keep waiting.
                         }
@@ -1174,24 +1197,38 @@ async fn wait_detect_on_any(
     }
 }
 
-/// Go `MakeHole` full-feature hole punch.
+/// Go `MakeHole` full-feature hole punch (owned socket variant).
 ///
-/// `socket` is the STUN socket (kept borrowed; extra listener sockets are
-/// created internally for `ListenRandomPorts`). `candidates` are the peer's
-/// STUN addresses, `assisted` its assisted addresses. Returns the peer
-/// address that answered the detect probe.
+/// `socket` is the STUN socket (owned; extra listener sockets are created
+/// internally for `ListenRandomPorts`). `candidates` are the peer's STUN
+/// addresses, `assisted` its assisted addresses.
+///
+/// Returns the socket that won the detect phase (the one the peer's detect
+/// reply arrived on) plus the peer address. This mirrors Go's `result.lConn`
+/// semantics: only the winning socket has a NAT mapping that the peer can
+/// reach, so the KCP data plane must run on it.
 #[allow(clippy::too_many_arguments)]
-pub async fn punch_udp_hole_makehole(
-    socket: &UdpSocket,
+pub async fn punch_udp_hole_makehole_owned(
+    socket: UdpSocket,
     candidates: &[String],
     assisted: &[String],
     behavior: &crate::msg::NatHoleDetectBehavior,
     timeout_ms: u64,
     sid: Option<&str>,
     key: Option<&[u8; 16]>,
-) -> Result<SocketAddr, String> {
+) -> Result<(UdpSocket, SocketAddr), String> {
     let role = behavior.role.as_deref().unwrap_or("sender");
-    let ttl = behavior.ttl.max(1) as u8;
+    let ttl = behavior.ttl;
+    // Go MakeHole: `timeout := 5 * time.Second; if ReadTimeoutMs > 0 {
+    // timeout = ReadTimeoutMs * ms }`. The server computes ReadTimeoutMs as
+    // (max(SendDelayMs)+5000 [+30000 if listen_random_ports]) minus the
+    // side's own send_delay, so it is normally positive; fall back to 5s
+    // when the server sent 0 or negative (Go keeps 5s in that case).
+    let timeout_ms = if timeout_ms > 0 {
+        timeout_ms
+    } else {
+        DEFAULT_HOLE_PUNCH_TIMEOUT_MS
+    };
 
     // Sender waits SendDelayMs before probing (Go MakeHole).
     if role == "sender" && behavior.send_delay_ms > 0 {
@@ -1202,7 +1239,7 @@ pub async fn punch_udp_hole_makehole(
     }
 
     // Detect address set: assisted + candidates (sender), or candidates when
-    // the receiver has no candidate ports to scan.
+    // the receiver has no candidate ports to scan (Go MakeHole).
     let mut detect_addrs: Vec<String> = Vec::new();
     if role == "sender" {
         detect_addrs.extend(assisted.iter().cloned());
@@ -1215,58 +1252,157 @@ pub async fn punch_udp_hole_makehole(
 
     let parsed: Vec<SocketAddr> = detect_addrs.iter().filter_map(|a| a.parse().ok()).collect();
 
-    // Extra receiver sockets (Go ListenRandomPorts).
-    let mut extra_sockets: Vec<tokio::net::UdpSocket> = Vec::new();
+    // All sockets: the STUN socket plus extra receiver listener sockets
+    // (Go ListenRandomPorts). Index 0 is always the STUN socket.
+    let mut all: Vec<Arc<UdpSocket>> = Vec::new();
+    all.push(Arc::new(socket));
+    let mut orig_ttls: Vec<Option<u32>> = vec![all[0].ttl().ok()];
+    // Go sets the probe TTL for the whole detect phase (defer-restored after
+    // each send); keep it constant here and restore at the end. ttl <= 0
+    // leaves the socket TTL untouched (Go `if ttl > 0`).
+    if ttl > 0 {
+        let _ = all[0].set_ttl(ttl as u32);
+    }
     if role == "receiver" && behavior.listen_random_ports > 0 {
         for _ in 0..behavior.listen_random_ports {
             if let Ok(s) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-                for addr in &parsed {
-                    send_sid_probe(&s, *addr, ttl, sid, key).await;
+                orig_ttls.push(s.ttl().ok());
+                if ttl > 0 {
+                    let _ = s.set_ttl(ttl as u32);
                 }
-                extra_sockets.push(s);
+                all.push(Arc::new(s));
             }
         }
     }
 
-    // Base socket probes.
+    // Base probes: every detect address from every socket (Go MakeHole
+    // `for detectAddr { for conn { sendSidMessage } }`).
     for addr in &parsed {
-        send_sid_probe(socket, *addr, ttl, sid, key).await;
+        for s in &all {
+            send_sid_probe(s, *addr, sid, key).await;
+        }
     }
 
-    // Candidate port range scanning (receiver side, Go CandidatePorts).
+    // Candidate port range scanning (Go sendSidMessageToRangePorts): probe
+    // each candidate IP's port range from every socket, 2 ms between ports.
     if let Some(ref ranges) = behavior.candidate_ports {
-        for cand in candidates {
-            let Ok(base) = cand.parse::<SocketAddr>() else {
-                continue;
-            };
-            for r in ranges {
-                for p in r.from.max(1)..=r.to.max(1) {
-                    let target = SocketAddr::new(base.ip(), p as u16);
-                    send_sid_probe(socket, target, ttl, sid, key).await;
+        for s in &all {
+            for cand in candidates {
+                let Ok(base) = cand.parse::<SocketAddr>() else {
+                    continue;
+                };
+                for r in ranges {
+                    for p in r.from.max(1)..=r.to.max(1) {
+                        let target = SocketAddr::new(base.ip(), p as u16);
+                        send_sid_probe(s, target, sid, key).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    }
                 }
             }
         }
     }
 
-    // SendRandomPorts: probe random ports on candidate addresses (Go sends
-    // up to N random ports around the candidate). We probe a bounded window.
-    if behavior.send_random_ports > 0 && !parsed.is_empty() {
-        let n = behavior.send_random_ports.clamp(1, 8) as u16;
-        for base in &parsed {
-            for _ in 0..n {
-                let p = base.port().saturating_add(rand::random::<u16>() % 2048);
-                let target = SocketAddr::new(base.ip(), p.max(1));
-                send_sid_probe(socket, target, ttl, sid, key).await;
-            }
+    // SendRandomPorts: one concurrent probing task per socket (Go spawns a
+    // goroutine per listen conn). Random ports in [1024, 65535], 15 ms apart.
+    // The tasks keep probing while we wait for the detect reply and are
+    // stopped once a reply arrives (Go cancels the shared context).
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut random_handles = Vec::new();
+    if behavior.send_random_ports > 0 {
+        let candidate_ips: Vec<SocketAddr> =
+            candidates.iter().filter_map(|a| a.parse().ok()).collect();
+        // Owned copies for the spawned tasks (spawn requires 'static).
+        let sid_owned = sid.map(|s| s.to_string());
+        let key_owned = key.copied();
+        for s in &all {
+            let s = s.clone();
+            let cancelled = cancelled.clone();
+            let cips = candidate_ips.clone();
+            let sid_task = sid_owned.clone();
+            let key_task = key_owned;
+            let n = behavior.send_random_ports as usize;
+            random_handles.push(tokio::spawn(async move {
+                send_random_ports_probe(
+                    &s,
+                    &cips,
+                    n,
+                    &cancelled,
+                    sid_task.as_deref(),
+                    key_task.as_ref(),
+                )
+                .await;
+            }));
         }
     }
 
-    // Wait for a detect response on the base socket or any extra socket.
-    // The source-address allowlist is the peer's candidate set (a receiver's
-    // extra listener sockets are not candidates and must be ignored).
+    // Wait for a detect response on any socket. The source-address allowlist
+    // is the peer's candidate set (a receiver's extra listener sockets are
+    // not candidates and must be ignored).
     let candidate_peers: Vec<SocketAddr> =
         candidates.iter().filter_map(|a| a.parse().ok()).collect();
-    let mut all: Vec<&UdpSocket> = vec![socket];
-    all.extend(extra_sockets.iter());
-    wait_detect_on_any(&all, &candidate_peers, role, timeout_ms, sid, key).await
+    let refs: Vec<&UdpSocket> = all.iter().map(|a| a.as_ref()).collect();
+    let detect_result =
+        wait_detect_on_any(&refs, &candidate_peers, role, timeout_ms, sid, key).await;
+
+    // Always stop the random-port probing tasks and restore the original TTL
+    // on the winning socket, mirroring Go's `defer cancel()` + `defer
+    // SetTTL(original)` — even when the detect wait failed.
+    cancelled.store(true, Ordering::Relaxed);
+    for h in random_handles {
+        let _ = h.await;
+    }
+    let (win_idx, peer_addr) = detect_result?;
+    if ttl > 0 {
+        if let Some(ot) = orig_ttls[win_idx] {
+            let _ = all[win_idx].set_ttl(ot);
+        }
+    }
+
+    // Extract the winning socket; the rest are dropped (Go closes the losers).
+    let win_socket = Arc::try_unwrap(all.swap_remove(win_idx))
+        .map_err(|_| "MakeHole: winning socket still referenced".to_string())?;
+    Ok((win_socket, peer_addr))
+}
+
+/// Go `sendSidMessageToRandomPorts`: probe `count` distinct random ports in
+/// [1024, 65535] on every candidate IP, pausing 15 ms between sends. Stops
+/// early once `cancelled` is set (Go ctx.Done).
+async fn send_random_ports_probe(
+    socket: &UdpSocket,
+    candidate_addrs: &[SocketAddr],
+    count: usize,
+    cancelled: &AtomicBool,
+    sid: Option<&str>,
+    key: Option<&[u8; 16]>,
+) {
+    let mut used: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    for _ in 0..count {
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+        let port = get_unused_random_port(&mut used);
+        if port == 0 {
+            continue;
+        }
+        for base in candidate_addrs {
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            let target = SocketAddr::new(base.ip(), port);
+            send_sid_probe(socket, target, sid, key).await;
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+    }
+}
+
+/// Go `getUnusedPort`: a random port in [1024, 65535] not yet used, retrying
+/// up to 10 times; returns 0 when none was found (caller skips the round).
+fn get_unused_random_port(used: &mut std::collections::HashSet<u16>) -> u16 {
+    for _ in 0..10 {
+        let port = 1024 + rand::random::<u16>() % 64511;
+        if used.insert(port) {
+            return port;
+        }
+    }
+    0
 }

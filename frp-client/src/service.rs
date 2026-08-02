@@ -2007,10 +2007,15 @@ impl Service {
                 Some(sid.as_str())
             };
 
+            // Legacy NatHoleClient path (no server detect_behavior): the
+            // simplified punch. candidate_addrs must be the visitor's mapped
+            // address (Go `mapped_addrs`); previously it was passed as
+            // candidates=&[]/assisted, which always failed with
+            // "no candidate addresses" — the provider never hole-punched.
             match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
                 socket,
-                &[],
                 &candidates,
+                &[],
                 None,
                 conv,
                 kcp_cfg,
@@ -2151,6 +2156,8 @@ impl Service {
             return;
         }
         let candidate_addrs = resp.candidate_addrs.unwrap_or_default();
+        let assisted_addrs = resp.assisted_addrs.unwrap_or_default();
+        let detect_behavior = resp.detect_behavior.clone();
         info!(proxy_name = %proxy_name, candidate_count = %candidate_addrs.len(), "XTCP provider '{}': received {} candidate addresses from server",
             proxy_name, candidate_addrs.len());
 
@@ -2248,11 +2255,17 @@ impl Service {
                 Some(sid_clone.as_str())
             };
             // Provider acts as yamux server: accepts the visitor's stream.
+            // Go v0.70.1 semantics: candidate_addrs = the peer's mapped addrs,
+            // assisted_addrs = the peer's assisted addrs, and the server's
+            // detect_behavior drives the MakeHole probe. (Previously these were
+            // passed as candidates=&[]/behavior=None, which made the simplified
+            // punch fail with "no candidate addresses" — the provider never
+            // actually hole-punched.)
             match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
                 socket,
-                &[],
                 &candidate_addrs,
-                None,
+                &assisted_addrs,
+                detect_behavior.as_ref(),
                 conv,
                 kcp_cfg,
                 hp_timeout,
