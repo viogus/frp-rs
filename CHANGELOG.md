@@ -4,6 +4,15 @@ All notable changes to frp-rs.
 
 ## Unreleased
 
+- **V2 post-handshake Login read timeout**: after a V2 ClientHello handshake,
+  the read of the next frame (the Login message) is now bounded by the same
+  10s `V2_HANDSHAKE_TIMEOUT` as the handshake itself, closing a gap where a
+  peer that completed ClientHello but never sent Login could pin a server
+  task / file descriptor forever. All server-side V2 accept paths (TCP,
+  TCP+yamux, TLS, WebSocket, KCP, KCP+yamux, QUIC) now align with Go frp
+  v0.70.1's single `connReadTimeout = 10s` deadline covering magic read +
+  ClientHello/ServerHello exchange + first message.
+
 - **Connection read timeout parity**: the new-connection read timeout now
   matches Go frp's compile-time `connReadTimeout = 10s` constant
   (`server/service.go`, not configurable). Removed the inner 5s timeout in

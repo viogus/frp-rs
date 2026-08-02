@@ -525,6 +525,29 @@ pub async fn v2_handshake_client(
 // Server-side handshake (operates on IoStream)
 // ---------------------------------------------------------------------------
 
+/// Read the first message frame after a ClientHello-based V2 handshake,
+/// bounded by the same `V2_HANDSHAKE_TIMEOUT` (10s) as the handshake itself.
+///
+/// `v2_handshake_server` returns `Ok((None, crypto_ctx))` after it processed a
+/// ClientHello; the caller must then read the next frame (the Login message)
+/// itself. This helper wraps that read in `V2_HANDSHAKE_TIMEOUT` so a peer that
+/// completes ClientHello but never sends Login cannot pin the task and file
+/// descriptor forever. This matches Go frp v0.70.1, which applies a single
+/// `connReadTimeout = 10s` read deadline covering magic + V2 ClientHello
+/// exchange + first message.
+///
+/// Returns the same tuple as `IoStream::read_raw_v2_frame`:
+/// `(frame_type, flags, payload_bytes)`.
+pub async fn read_first_frame_after_handshake(
+    stream: &mut IoStream,
+) -> Result<(u16, u16, Vec<u8>), crate::Error> {
+    tokio::time::timeout(V2_HANDSHAKE_TIMEOUT, stream.read_raw_v2_frame())
+        .await
+        .map_err(|_| {
+            crate::Error::Protocol("V2 handshake timeout waiting for first message".into())
+        })?
+}
+
 /// Handle V2 server handshake: read first frame, respond if ClientHello.
 ///
 /// Returns `Ok((None, Some(crypto_ctx)))` if ClientHello was handled with crypto,
@@ -532,6 +555,11 @@ pub async fn v2_handshake_client(
 /// `Ok((Some(payload), None))` if the first frame was already a Message (type=16).
 ///
 /// `payload` is the raw V2 message payload: [type_id: u16 BE][JSON bytes].
+///
+/// When the first frame was a ClientHello (return `Ok((None, _))`), the caller
+/// MUST use [`read_first_frame_after_handshake`] (not a bare
+/// `read_raw_v2_frame`) to read the next frame, so the read stays bounded by
+/// `V2_HANDSHAKE_TIMEOUT`.
 pub async fn v2_handshake_server(
     stream: &mut IoStream,
 ) -> Result<(Option<Vec<u8>>, Option<CryptoContext>), crate::Error> {

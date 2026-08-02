@@ -271,17 +271,19 @@ async fn v2_handshake_and_read(
 ) -> Option<(Vec<u8>, Option<frp_core::v2_handshake::CryptoContext>)> {
     let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(io).await {
         Ok((Some(p), crypto)) => (p, crypto),
-        Ok((None, crypto)) => match io.read_raw_v2_frame().await {
-            Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
-            Ok((ft, _, _)) => {
-                tracing::warn!(frame_type = ?ft, peer = ?addr, "{}: unexpected frame type {} after handshake", log_prefix, ft);
-                return None;
+        Ok((None, crypto)) => {
+            match frp_core::v2_handshake::read_first_frame_after_handshake(io).await {
+                Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
+                Ok((ft, _, _)) => {
+                    tracing::warn!(frame_type = ?ft, peer = ?addr, "{}: unexpected frame type {} after handshake", log_prefix, ft);
+                    return None;
+                }
+                Err(e) => {
+                    tracing::warn!(peer = ?addr, error = %e, "{}: failed to read message after handshake: {}", log_prefix, e);
+                    return None;
+                }
             }
-            Err(e) => {
-                tracing::warn!(peer = ?addr, error = %e, "{}: failed to read message after handshake: {}", log_prefix, e);
-                return None;
-            }
-        },
+        }
         Err(e) => {
             tracing::warn!(peer = ?addr, error = %e, "{} handshake error: {}", log_prefix, e);
             return None;
@@ -1000,7 +1002,7 @@ impl Service {
                                         let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ctl).await {
                                             Ok((Some(p), crypto)) => (p, crypto),
                                             Ok((None, crypto)) => {
-                                                match ctl.read_raw_v2_frame().await {
+                                                match frp_core::v2_handshake::read_first_frame_after_handshake(&mut ctl).await {
                                                     Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                     Ok((ft, _, _)) => {
                                                         tracing::warn!(frame_type = ?ft, "KCP V2: unexpected frame type {} after handshake", ft);
@@ -1094,7 +1096,7 @@ impl Service {
                                                                 let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
                                                                     Ok((Some(p), crypto)) => (p, crypto),
                                                                     Ok((None, crypto)) => {
-                                                                        match io.read_raw_v2_frame().await {
+                                                                        match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
                                                                             Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                                             Ok((ft, _, _)) => {
                                                                                 tracing::warn!(frame_type = ?ft, peer = %peer, "KCP TLS+yamux V2: unexpected frame type {}", ft);
@@ -1160,7 +1162,7 @@ impl Service {
                                                     let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ctl).await {
                                                         Ok((Some(p), crypto)) => (p, crypto),
                                                         Ok((None, crypto)) => {
-                                                            match ctl.read_raw_v2_frame().await {
+                                                            match frp_core::v2_handshake::read_first_frame_after_handshake(&mut ctl).await {
                                                                 Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                                 Ok((ft, _, _)) => {
                                                                     tracing::warn!(frame_type = ?ft, "KCP TLS V2: unexpected frame type {} after handshake", ft);
@@ -1301,7 +1303,7 @@ impl Service {
                                                         let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
                                                             Ok((Some(p), crypto)) => (p, crypto),
                                                             Ok((None, crypto)) => {
-                                                                match io.read_raw_v2_frame().await {
+                                                                match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
                                                                     Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                                     Ok((ft, _, _)) => {
                                                                         tracing::warn!(frame_type = ?ft, peer = %peer, "KCP yamux V2: unexpected frame type {}", ft);
@@ -2254,7 +2256,7 @@ impl Service {
                                                 let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ws).await {
                                                     Ok((Some(p), crypto)) => (p, crypto),
                                                     Ok((None, crypto)) => {
-                                                        match ws.read_raw_v2_frame().await {
+                                                        match frp_core::v2_handshake::read_first_frame_after_handshake(&mut ws).await {
                                                             Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                             Ok((ft, _, _)) => {
                                                                 warn!(frame_type = ?ft, addr = %addr, "WS+TLS V2: unexpected frame type {} from {}", ft, addr);
@@ -2299,7 +2301,7 @@ impl Service {
                                                             let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
                                                                 Ok((Some(p), crypto)) => (p, crypto),
                                                                 Ok((None, crypto)) => {
-                                                                    match io.read_raw_v2_frame().await {
+                                                                    match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
                                                                         Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                                         Ok((ft, _, _)) => {
                                                                             warn!(frame_type = ?ft, addr = %addr, "WS+TLS+yamux V2: unexpected frame type {} from {}", ft, addr);
@@ -2369,7 +2371,7 @@ impl Service {
                                                     Ok((None, crypto)) => {
                                                         // Read Login in plaintext. AEAD wrapping happens in
                                                         // handle_control after LoginResp (matching Go frp flow).
-                                                        match io.read_raw_v2_frame().await {
+                                                        match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
                                                             Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                             Ok((ft, _, _)) => {
                                                                 warn!(frame_type = ?ft, addr = %addr, "Unexpected frame type {} after V2 TLS+yamux handshake from {}", ft, addr);
@@ -2412,7 +2414,7 @@ impl Service {
                                         let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
                                             Ok((Some(p), crypto)) => (p, crypto),
                                             Ok((None, crypto)) => {
-                                                match io.read_raw_v2_frame().await {
+                                                match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
                                                     Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                     Ok((ft, _, _)) => {
                                                         tracing::warn!(frame_type = ?ft, addr = %addr, "TLS V2: unexpected frame type {} after handshake from {}", ft, addr);
@@ -2549,7 +2551,7 @@ impl Service {
                                                                 let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
                                                                     Ok((Some(p), crypto)) => (p, crypto),
                                                                     Ok((None, crypto)) => {
-                                                                        match io.read_raw_v2_frame().await {
+                                                                        match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
                                                                             Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                                             Ok((ft, _, _)) => {
                                                                                 warn!(frame_type = ?ft, addr = %addr, "WS+TLS+yamux V2: unexpected frame type {} from {}", ft, addr);
@@ -2592,7 +2594,7 @@ impl Service {
                                                         let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
                                                             Ok((Some(p), crypto)) => (p, crypto),
                                                             Ok((None, crypto)) => {
-                                                                match io.read_raw_v2_frame().await {
+                                                                match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
                                                                     Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                                     Ok((ft, _, _)) => {
                                                                         warn!(frame_type = ?ft, addr = %addr, "WS+TLS+V2: unexpected frame type {} from {}", ft, addr);
@@ -2650,7 +2652,7 @@ impl Service {
                                                         let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut io).await {
                                                             Ok((Some(p), crypto)) => (p, crypto),
                                                             Ok((None, crypto)) => {
-                                                                match io.read_raw_v2_frame().await {
+                                                                match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
                                                                     Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                                     Ok((ft, _, _)) => {
                                                                         warn!(frame_type = ?ft, addr = %addr, "WS+yamux V2: unexpected frame type {} from {}", ft, addr);
@@ -2685,7 +2687,7 @@ impl Service {
                                             let (msg_payload, crypto_ctx) = match frp_core::v2_handshake::v2_handshake_server(&mut ws).await {
                                                 Ok((Some(p), crypto)) => (p, crypto),
                                                 Ok((None, crypto)) => {
-                                                    match ws.read_raw_v2_frame().await {
+                                                    match frp_core::v2_handshake::read_first_frame_after_handshake(&mut ws).await {
                                                         Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                         Ok((ft, _, _)) => {
                                                             warn!(frame_type = ?ft, addr = %addr, "WS V2 (main): unexpected frame type {} after handshake from {}", ft, addr);
@@ -2763,7 +2765,7 @@ impl Service {
                                                 Ok((None, crypto)) => {
                                                     // Read Login in plaintext. AEAD wrapping happens in
                                                     // handle_control after LoginResp (matching Go frp flow).
-                                                    match io.read_raw_v2_frame().await {
+                                                    match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
                                                         Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                         Ok((ft, _, _)) => {
                                                             warn!(frame_type = ?ft, addr = %addr, "Unexpected frame type {} after V2 handshake from {}", ft, addr);
@@ -2797,7 +2799,7 @@ impl Service {
                                         Ok((None, crypto)) => {
                                             // Read Login in plaintext. AEAD wrapping happens in
                                             // handle_control after LoginResp (matching Go frp flow).
-                                            match io.read_raw_v2_frame().await {
+                                            match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
                                                 Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                 Ok((ft, _, _)) => {
                                                     warn!(frame_type = ?ft, addr = %addr, "Unexpected frame type {} after V2 handshake from {}", ft, addr);
@@ -2866,7 +2868,7 @@ impl Service {
                                                     Ok((None, crypto)) => {
                                                         // Read Login in plaintext. AEAD wrapping happens in
                                                         // handle_control after LoginResp (matching Go frp flow).
-                                                        match io.read_raw_v2_frame().await {
+                                                        match frp_core::v2_handshake::read_first_frame_after_handshake(&mut io).await {
                                                             Ok((frp_core::protocol::V2_FRAME_TYPE_MESSAGE, _, p)) => (p, crypto),
                                                             Ok((ft, _, _)) => {
                                                                 warn!(frame_type = ?ft, addr = %addr, "Unexpected frame type {} after V2 handshake from {}", ft, addr);
