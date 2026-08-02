@@ -383,7 +383,7 @@ pub struct SshSession {
     /// Data routing table for forwarded-tcpip channels: SSH client → bridge
     /// task read half.
     reverse_data_tx: Arc<
-        std::sync::Mutex<HashMap<russh::ChannelId, mpsc::UnboundedSender<Vec<u8>>>>,
+        std::sync::Mutex<HashMap<russh::ChannelId, mpsc::Sender<Vec<u8>>>>,
     >,
 }
 
@@ -825,9 +825,36 @@ impl Handler for SshSession {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         // Forwarded-tcpip channel data is routed to the bridge task's read
-        // half (data from the SSH client = local service response).
-        if let Some(tx) = self.reverse_data_tx.lock().unwrap().get(&channel) {
-            let _ = tx.send(data.to_vec());
+        // half (data from the SSH client = local service response). The
+        // bounded channel provides backpressure when the frps side reads
+        // slower than the SSH client sends (Go net.Pipe is blocking too).
+        // Clone the sender under the lock, then await the send outside it so
+        // the future stays Send.
+        let tx = self.reverse_data_tx.lock().unwrap().get(&channel).cloned();
+        if let Some(tx) = tx {
+            if tx.send(data.to_vec()).await.is_err() {
+                // Bridge task exited (channel closed) — drop the entry.
+                self.reverse_data_tx.lock().unwrap().remove(&channel);
+            }
+        }
+        Ok(())
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // The peer closed the forwarded-tcpip channel (local service exited).
+        // Drop the data sender so the bridge task's `data_rx.recv()` returns
+        // and the task (plus its duplex) exits — otherwise the bridge hangs
+        // forever holding the channel entry in the map.
+        if self.reverse_data_tx.lock().unwrap().remove(&channel).is_some() {
+            tracing::debug!(
+                run_id = %self.run_id,
+                channel = ?channel,
+                "SSH gateway: forwarded-tcpip channel closed, bridge task will exit"
+            );
         }
         Ok(())
     }
@@ -845,7 +872,7 @@ async fn handle_work_conn_requests(
     state: Arc<AppState>,
     reverse_forward: Arc<std::sync::Mutex<Option<(String, u32)>>>,
     reverse_data_tx: Arc<
-        std::sync::Mutex<HashMap<russh::ChannelId, mpsc::UnboundedSender<Vec<u8>>>>,
+        std::sync::Mutex<HashMap<russh::ChannelId, mpsc::Sender<Vec<u8>>>>,
     >,
 ) {
     while let Some(_req) = work_rx.recv().await {
@@ -879,7 +906,8 @@ async fn handle_work_conn_requests(
         let channel_id = channel.id();
 
         // Register the data route (SSH client → bridge read half).
-        let (data_tx, data_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // Bounded: backpressure via the SSH data callback above.
+        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
         reverse_data_tx.lock().unwrap().insert(channel_id, data_tx);
 
         // In-memory pipe: one end is the work conn, the other is bridged
@@ -929,7 +957,7 @@ async fn handle_work_conn_requests(
 /// - local service response → `data` callback → bridge write half → frps.
 async fn bridge_ssh_side(
     mut ssh_side: tokio::io::DuplexStream,
-    mut data_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut data_rx: mpsc::Receiver<Vec<u8>>,
     handle: russh::server::Handle,
     channel_id: russh::ChannelId,
 ) {

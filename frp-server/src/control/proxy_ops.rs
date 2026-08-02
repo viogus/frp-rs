@@ -402,12 +402,15 @@ pub(crate) async fn handle_new_proxy(
             // its previous port when still free (Go ports.Manager.Acquire).
             let mut found = None;
             {
-                let reservations = state.port_reservations.read().await;
+                let mut reservations = state.port_reservations.write().await;
+                // Lazy cleanup (Go cleanReservedPortsWorker): drop expired
+                // entries so the map does not grow without bound.
                 if let Some(&(res_port, true, reserved_at)) =
                     reservations.get(&np.proxy_name)
                 {
-                    if reserved_at.elapsed() < std::time::Duration::from_secs(24 * 3600)
-                        && !ports.contains(&res_port)
+                    if reserved_at.elapsed() >= std::time::Duration::from_secs(24 * 3600) {
+                        reservations.remove(&np.proxy_name);
+                    } else if !ports.contains(&res_port)
                         && is_udp_port_bindable(&state.proxy_bind_addr, res_port)
                     {
                         ports.insert(res_port);
@@ -449,12 +452,15 @@ pub(crate) async fn handle_new_proxy(
             // 24h reservation by proxy name (Go ports.Manager.Acquire).
             let mut allocated = None;
             {
-                let reservations = state.port_reservations.read().await;
+                let mut reservations = state.port_reservations.write().await;
+                // Lazy cleanup (Go cleanReservedPortsWorker): drop expired
+                // entries so the map does not grow without bound.
                 if let Some(&(res_port, false, reserved_at)) =
                     reservations.get(&np.proxy_name)
                 {
-                    if reserved_at.elapsed() < std::time::Duration::from_secs(24 * 3600)
-                        && !ports.contains(&res_port)
+                    if reserved_at.elapsed() >= std::time::Duration::from_secs(24 * 3600) {
+                        reservations.remove(&np.proxy_name);
+                    } else if !ports.contains(&res_port)
                         && crate::proxy::is_tcp_port_bindable(
                             &state.proxy_bind_addr,
                             res_port,
@@ -1167,9 +1173,23 @@ pub(crate) async fn unregister_control(
                         .count();
                     if count == 0 {
                         udp_ports.remove(&port);
+                        if port > 0 {
+                            state
+                                .port_reservations
+                                .write()
+                                .await
+                                .insert(p.name.clone(), (port, true, std::time::Instant::now()));
+                        }
                     }
                 } else {
                     udp_ports.remove(&port);
+                    if port > 0 {
+                        state
+                            .port_reservations
+                            .write()
+                            .await
+                            .insert(p.name.clone(), (port, true, std::time::Instant::now()));
+                    }
                 }
             }
         }

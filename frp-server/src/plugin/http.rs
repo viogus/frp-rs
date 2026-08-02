@@ -11,15 +11,16 @@ const PLUGIN_API_VERSION: &str = "0.1.0";
 
 /// Map Rust snake_case op names to the Go wire names (pkg/plugin/server/manager.go).
 /// Unknown ops pass through unchanged.
-fn go_op_name(op: &str) -> &'static str {
+fn go_op_name(op: &str) -> String {
     match op {
-        "login" => "Login",
-        "new_proxy" => "NewProxy",
-        "close_proxy" => "CloseProxy",
-        "ping" => "Ping",
-        "new_work_conn" => "NewWorkConn",
-        "new_user_conn" => "NewUserConn",
-        _ => "Login",
+        "login" => "Login".to_string(),
+        "new_proxy" => "NewProxy".to_string(),
+        "close_proxy" => "CloseProxy".to_string(),
+        "ping" => "Ping".to_string(),
+        "new_work_conn" => "NewWorkConn".to_string(),
+        "new_user_conn" => "NewUserConn".to_string(),
+        // Unknown ops pass through unchanged (call sites use a fixed set).
+        other => other.to_string(),
     }
 }
 
@@ -28,7 +29,7 @@ fn go_op_name(op: &str) -> &'static str {
 #[derive(Serialize)]
 struct PluginEvent {
     version: &'static str,
-    op: &'static str,
+    op: String,
     content: serde_json::Value,
 }
 
@@ -122,7 +123,7 @@ impl HttpPluginManager {
 
             let event = PluginEvent {
                 version: PLUGIN_API_VERSION,
-                op: go_op,
+                op: go_op.clone(),
                 content: content.clone(),
             };
             let timeout = Duration::from_secs(plugin.cfg.timeout.max(1));
@@ -201,7 +202,27 @@ impl HttpPluginManager {
                     ));
                 }
             };
-            let pr: PluginResponse = serde_json::from_str(&resp_text).unwrap_or_default();
+            // Fail closed on malformed plugin responses (Go handleMutableContent
+            // treats a JSON decode error as a plugin failure). A non-JSON body
+            // must not silently pass the operation through.
+            let pr: PluginResponse = match serde_json::from_str(&resp_text) {
+                Ok(pr) => pr,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin_name = %plugin.cfg.name,
+                        op = %op,
+                        error = %e,
+                        "Server plugin '{}' returned invalid JSON for op '{}': {}",
+                        plugin.cfg.name,
+                        op,
+                        e
+                    );
+                    return Err(format!(
+                        "send {op} request to plugin [{}] invalid response",
+                        plugin.cfg.name
+                    ));
+                }
+            };
 
             if pr.reject {
                 let reason = if pr.reject_reason.is_empty() {

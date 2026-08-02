@@ -24,6 +24,17 @@ impl russh::client::Handler for TestSshClient {
         Ok(true)
     }
 
+    async fn channel_close(
+        &mut self,
+        channel: russh::ChannelId,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        // Default accept; the open handler's copy_bidirectional ends when the
+        // local service closes, which shuts the channel.
+        let _ = channel;
+        Ok(())
+    }
+
     async fn server_channel_open_forwarded_tcpip(
         &mut self,
         channel: russh::Channel<russh::client::Msg>,

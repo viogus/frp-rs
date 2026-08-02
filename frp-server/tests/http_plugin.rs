@@ -9,12 +9,9 @@ use std::sync::Arc;
 
 use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
 use serde_json::json;
-use tokio::net::TcpStream;
 
-use common::{allocate_port, login_with_test_token, start_test_server, test_auth_cfg, TEST_TOKEN};
+use common::{allocate_port, login_with_test_token, start_test_server, test_auth_cfg};
 use frp_core::config::{HttpPluginConfig, ServerConfig};
-use frp_core::msg::FrpMessage;
-use frp_core::protocol::{read_msg_v1, write_msg_v1};
 
 /// Mock plugin state: captures the request shape and decides the response.
 #[derive(Default)]
@@ -23,6 +20,8 @@ struct MockPluginState {
     reject: bool,
     reject_reason: String,
     status_code: u16,
+    /// When true, respond with a non-JSON body (fail-closed check).
+    bad_json: bool,
 }
 
 type SharedState = Arc<MockPluginState>;
@@ -42,6 +41,12 @@ async fn mock_handler(
         return axum::response::Response::builder()
             .status(state.status_code)
             .body(axum::body::Body::from("boom"))
+            .unwrap();
+    }
+    if state.bad_json {
+        return axum::response::Response::builder()
+            .header("Content-Type", "text/plain")
+            .body(axum::body::Body::from("this is not json"))
             .unwrap();
     }
     if state.reject {
@@ -130,7 +135,7 @@ async fn test_plugin_reject_rejects_login() {
     let bind_port = cfg.bind_port;
     let (_handle, _) = start_test_server(cfg).await;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
-    let (mut conn, resp) = login_with_test_token(addr).await.expect("login returns a response");
+    let (conn, resp) = login_with_test_token(addr).await.expect("login returns a response");
     assert!(
         resp.error.as_deref().unwrap_or("").contains("denied by policy"),
         "login must be rejected with plugin reason, got: {:?}",
@@ -154,7 +159,7 @@ async fn test_plugin_unreachable_fails_closed() {
     let (_handle, _) = start_test_server(cfg).await;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
 
-    let (mut conn, resp) = login_with_test_token(addr).await.expect("login returns a response");
+    let (conn, resp) = login_with_test_token(addr).await.expect("login returns a response");
     assert!(
         resp.error.as_deref().unwrap_or("").contains("plugin"),
         "unreachable plugin must fail the login, got: {:?}",
@@ -182,7 +187,7 @@ async fn test_plugin_non_200_fails_closed() {
     let bind_port = cfg.bind_port;
     let (_handle, _) = start_test_server(cfg).await;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
-    let (mut conn, resp) = login_with_test_token(addr).await.expect("login returns a response");
+    let (conn, resp) = login_with_test_token(addr).await.expect("login returns a response");
     assert!(
         resp.error.as_deref().unwrap_or("").contains("error code"),
         "non-200 plugin response must fail the login, got: {:?}",
@@ -214,4 +219,33 @@ async fn test_plugin_ops_filtering() {
         state.captured.lock().unwrap().is_none(),
         "plugin subscribed to NewProxy must not be called for login"
     );
+}
+
+/// A malformed (non-JSON) plugin response fails closed — the operation must
+/// be rejected, not silently passed through (Go handleMutableContent parity).
+#[tokio::test]
+async fn test_plugin_invalid_json_fails_closed() {
+    let state = Arc::new(MockPluginState {
+        bad_json: true,
+        ..Default::default()
+    });
+    let port = start_mock_plugin(state.clone()).await;
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port: allocate_port(),
+        auth: test_auth_cfg(),
+        http_plugins: vec![plugin_cfg(port, vec!["login"], true)],
+        ..Default::default()
+    };
+    let bind_port = cfg.bind_port;
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
+    let (conn, resp) = login_with_test_token(addr).await.expect("login returns a response");
+    assert!(
+        resp.error.as_deref().unwrap_or("").contains("invalid response"),
+        "non-JSON plugin response must fail the login, got: {:?}",
+        resp.error
+    );
+    drop(conn);
 }

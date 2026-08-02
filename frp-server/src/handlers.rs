@@ -1002,6 +1002,10 @@ pub(crate) async fn run_new_work_conn_plugin(run_id: &str, state: &AppState) -> 
         .plugin_manager
         .notify("new_work_conn", nwc_content)
         .await
+        // Mutated content from plugins is intentionally not consumed here:
+        // frp-rs applies reject/approve but not content mutation (Go's
+        // handleMutableContent mutation path is not wired into the server
+        // lifecycle). Noted so the Ok(Some(..)) return is understood.
         .map(|_| ())
 }
 

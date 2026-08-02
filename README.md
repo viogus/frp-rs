@@ -93,6 +93,9 @@ but not literally 100% — see "Known limitations" below.
   profiles); `/healthz` and pprof are outside auth, matching Go.
 - **UDP bandwidth limiting**: Go v0.70.1's UDP forwarder has no limiter, so
   frp-rs intentionally applies none either (parity, not a gap).
+- **SSH gateway anonymity**: when no `authorized_keys` file is configured the
+  SSH tunnel gateway accepts anonymous connections (Go parity). Always set a
+  token and run frps behind a firewall, or configure `authorized_keys`.
 
 ### Why frp-rs?
 
