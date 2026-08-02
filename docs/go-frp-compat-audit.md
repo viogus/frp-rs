@@ -166,5 +166,5 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 | `enabled` per-proxy toggle | Disable individual proxies without removing config |
 | Selective `start` | Start only named proxies for testing/staging |
 | PROXY protocol v1+v2 | Both text and binary HAProxy PROXY protocol support |
-| SSH tunnel gateway | ✅ SSH proxy-registration commands; `ssh -R` reverse forwarding explicitly disabled in 0.7.1 |
+| SSH tunnel gateway | ✅ SSH proxy-registration commands; `ssh -R` reverse forwarding (tcpip-forward/forwarded-tcpip) since 0.7.1 parity pass |
 | Rust type safety | Memory safety, no data races, compile-time guarantees |

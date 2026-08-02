@@ -96,15 +96,16 @@ Every feature, fix, and test change follows three rules:
 | `cargo clippy` (default) | zero warnings |
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
-| `cargo test --workspace --all-features` | 620 passed, 2 ignored (36 suites) |
+| `cargo test --workspace --all-features` | 724 passed, 0 failed |
 | `cargo build --release` | passes (frps ~5.6MB, frpc ~5.4MB default; ~7.8MB/6.0MB all-features) |
-| `compat-test.sh` (Go frp v0.70.1) | 68 non-XTCP + 16 XTCP scenarios |
+| `compat-test.sh` (Go frp v0.70.1) | 66 run_test scenarios + 16 XTCP pairwise, all green in CI |
 | `unsafe` blocks | 6 in frp-core, 3+ in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
 | `hex` crate | removed — inline `hex_encode` in frp-core |
 | `let _ =` error discards | all commented (`vhost.rs`, `tcpmux.rs`) |
 | `exec://` token source | always blocked by `UnsafeFeatures::default()` |
 | Security audit | `cargo audit` + `cargo deny check` before release |
+| Go frp parity (2026-08-02) | 20-task pass merged (PR #221): OIDC/QUIC/KCP+TLS/WS/UDP/PROXY/plugin/client-management parity, `{single=N}` allowPorts + 24h reservations, HTTPS vhost SNI passthrough, fail-closed HTTP server plugins, **SSH gateway `ssh -R`** (tcpip-forward/forwarded-tcpip), dashboard offline clients/root auth/store 0600, XTCP **MakeHole** state machine, IPv6 vnet routing |
 
 Key perf optimizations (3 audit cycles):
 - Bridge: `compress_chunk`/`decompress_chunk` reuse buffers (zero alloc per iteration)
@@ -254,7 +255,7 @@ Flow: Visitor→Server(NatHoleVisitor) → Server→Provider(NatHoleSidOnWorkCon
 - **Integration tests**: KCP real-UDP-socket test (`frp-core/tests/kcp_integration.rs`), XTCP hole-punch e2e (`frp-server/tests/xtcp_hole_punch.rs`), plus 13+ server integration tests covering control handler, vhost, proxy registration, OIDC, reload, graceful drain.
 - **Stress tests**: `scripts/stress-test.sh` runs frps + frpc under load with connection churn, monitored via `scripts/frp-stress/`. Weekly CI run in `stress-test.yml`.
 - **Perf baselines** (4-axis program, host-specific JSONL committed under `scripts/frp-stress/baselines/`): `scripts/throughput-baseline.sh` (MB/s per cipher/transport config), `scripts/latency-baseline.sh` (steady-state RTT + connection-setup percentiles), `scripts/memory-baseline.sh` (idle-hold + churn footprint via the `mem-profile` counting allocator + `ps` RSS). Run manually before/after a data-plane change; not blocking CI gates. Gate rule: a change to one axis must not regress the others (>5% throughput/MB/s, or RTT p99).
-- **Cross-compat tests**: `scripts/compat-test.sh` — 68 non-XTCP tests + 16 XTCP pairwise scenarios against Go frp v0.70.1 (V2 included). Runs on every push via `compat.yml`; XTCP compat runs daily on VPS via `xtcp-compat.yml`.
+- **Cross-compat tests**: `scripts/compat-test.sh` — 66 run_test scenarios + 16 XTCP pairwise scenarios against Go frp v0.70.1 (V2 included). Runs on every push via `compat.yml`; XTCP compat runs daily on VPS via `xtcp-compat.yml`.
 - **Security audit**: Run `cargo audit` and `cargo deny check` before each release to catch known vulnerabilities and license issues in the dependency tree.
 
 ### Test Coverage Gaps
