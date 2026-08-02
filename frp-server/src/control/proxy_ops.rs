@@ -964,11 +964,24 @@ pub(crate) async fn handle_new_proxy(
                         group_name, e,
                     );
                 }
-            } else {
+            } else if np.proxy_type == "tcp" {
+                // Only TCP proxies bind a per-proxy listener. HTTP/HTTPS use
+                // the shared vhost listener, TCPMux the shared tcpmux
+                // listener, and STCP/XTCP have no remote port.
                 let handle = tokio::spawn(async move {
                     listen_and_proxy(bind_addr, port, pn, itx).await;
                 });
                 listener_handles.insert(np.proxy_name.clone(), handle);
+            } else {
+                info!(
+                    proxy_type = %np.proxy_type,
+                    proxy_name = %np.proxy_name,
+                    port = %port,
+                    "{} proxy '{}' registered (shared listener, port {})",
+                    np.proxy_type,
+                    np.proxy_name,
+                    port
+                );
             }
 
             info!(proxy_name = %np.proxy_name, port = %port, run_id = %run_id, "Proxy '{}' registered on port {} (run_id: {})", np.proxy_name, port, run_id);
