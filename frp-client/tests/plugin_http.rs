@@ -186,7 +186,7 @@ async fn test_https2https_accepts_self_signed_backend() {
         out.push_str(&format!("-----END {label}-----\n"));
         out
     };
-    std::fs::write(&cert_path, wrap_pem("CERTIFICATE", &cert.der())).unwrap();
+    std::fs::write(&cert_path, wrap_pem("CERTIFICATE", cert.der())).unwrap();
     std::fs::write(
         &key_path,
         wrap_pem("PRIVATE KEY", &key_pair.serialize_der()),

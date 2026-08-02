@@ -138,7 +138,7 @@ async fn socks5_requires_ip_target() {
         let mut buf = [0u8; 8];
         let n = tokio::time::timeout(std::time::Duration::from_millis(500), conn.read(&mut buf))
             .await
-            .unwrap_or_else(|_| Ok(0))
+            .unwrap_or(Ok(0))
             .unwrap();
         assert_eq!(n, 0, "socks5 must reject a hostname target before CONNECT");
     });

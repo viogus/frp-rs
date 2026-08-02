@@ -1531,11 +1531,11 @@ mod transport_tests {
         assert_eq!(plan.opts.dial_timeout_secs, 15);
         assert_eq!(plan.opts.keepalive_secs, 60);
         assert_eq!(plan.opts.bind_addr.as_deref(), Some("10.0.0.1"));
-        assert_eq!(plan.opts.disable_custom_tls_first_byte, true);
+        assert!(plan.opts.disable_custom_tls_first_byte);
         assert_eq!(plan.opts.tls_cert_file.as_deref(), Some("/path/cert.pem"));
         assert_eq!(plan.opts.tls_key_file.as_deref(), Some("/path/key.pem"));
-        assert_eq!(plan.opts.v2, true);
-        assert_eq!(plan.opts.tls_enable, true);
+        assert!(plan.opts.v2);
+        assert!(plan.opts.tls_enable);
         assert_eq!(plan.opts.tls_ca_file.as_deref(), Some("/etc/ca.pem"));
     }
 
@@ -1559,7 +1559,7 @@ mod transport_tests {
         // Proxy and other fields still flow through even without yamux
         assert_eq!(plan.opts.proxy_url.as_deref(), Some("socks5://proxy:1080"));
         assert_eq!(plan.opts.dial_timeout_secs, 15);
-        assert_eq!(plan.opts.v2, true);
+        assert!(plan.opts.v2);
     }
 
     /// Building a VisitorTransportConfig inline (the pattern used by
@@ -1596,9 +1596,9 @@ mod transport_tests {
         assert_eq!(plan.opts.dial_timeout_secs, 25);
         assert_eq!(plan.opts.keepalive_secs, 90);
         assert_eq!(plan.opts.bind_addr.as_deref(), Some("192.168.0.1"));
-        assert_eq!(plan.opts.disable_custom_tls_first_byte, false);
+        assert!(!plan.opts.disable_custom_tls_first_byte);
         assert_eq!(plan.opts.tls_cert_file.as_deref(), Some("/c.pem"));
         assert_eq!(plan.opts.tls_key_file.as_deref(), Some("/k.pem"));
-        assert_eq!(plan.opts.v2, false);
+        assert!(!plan.opts.v2);
     }
 }

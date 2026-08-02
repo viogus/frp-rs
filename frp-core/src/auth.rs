@@ -1304,8 +1304,8 @@ mod tests {
             let (tx, rx) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || {
                 // Plain HTTP: read request headers + body, respond 200 JSON.
-                for stream in listener.incoming() {
-                    let Ok(mut stream) = stream else { break };
+                // The capture server handles exactly one request.
+                if let Some(Ok(mut stream)) = listener.incoming().next() {
                     let mut buf = [0u8; 16384];
                     let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]);
@@ -1322,7 +1322,6 @@ mod tests {
                         &mut stream,
                         b"HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n{\"access_token\":\"tok-1\",\"expires_in\":3600}",
                     );
-                    break;
                 }
             });
             TokenEndpointCapture { _addr: addr, rx }
