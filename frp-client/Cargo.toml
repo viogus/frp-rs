@@ -9,6 +9,8 @@ frp-server = { path = "../frp-server" }
 tracing-subscriber.workspace = true
 md-5.workspace = true
 tower = "0.5"
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+tempfile = "3"
 
 [dependencies]
 frp-core = { path = "../frp-core", default-features = false }

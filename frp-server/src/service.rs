@@ -336,15 +336,24 @@ fn build_auth_config(
 /// Resolve the allow-ports ranges from a server config: explicit `allow_ports`
 /// spec if present, otherwise the `[allow_port_start, allow_port_end]` range.
 /// Shared by `Service::new()` and `Service::reload()`.
-fn resolve_allow_ports(cfg: &ServerConfig) -> Vec<(u16, u16)> {
+fn resolve_allow_ports(cfg: &ServerConfig) -> Vec<frp_core::config::PortsRange> {
     if !cfg.allow_ports.is_empty() {
-        frp_core::config::parse_allow_ports(&cfg.allow_ports)
+        // Invalid entries were already rejected by config validation.
+        frp_core::config::parse_allow_ports(&cfg.allow_ports).unwrap_or_default()
     } else if cfg.allow_port_start == 0 && cfg.allow_port_end == 0 {
         // Default: no restriction — allow all ports.
         // Go frp compat: when both limits are unset, any port is allowed.
-        vec![(1, 65535)]
+        vec![frp_core::config::PortsRange {
+            start: 1,
+            end: 65535,
+            single: 0,
+        }]
     } else {
-        vec![(cfg.allow_port_start, cfg.allow_port_end)]
+        vec![frp_core::config::PortsRange {
+            start: cfg.allow_port_start,
+            end: cfg.allow_port_end,
+            single: 0,
+        }]
     }
 }
 
@@ -808,9 +817,15 @@ impl Service {
             }
         }
 
-        // Start HTTP VHost listener if configured
+        // Start HTTP VHost listener if configured. Go frp binds vhost
+        // listeners on proxyBindAddr when set (pkg/server/service.go).
         if self.cfg.vhost_http_port > 0 {
-            let http_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.vhost_http_port);
+            let vhost_bind = if self.cfg.proxy_bind_addr.is_empty() {
+                &self.cfg.bind_addr
+            } else {
+                &self.cfg.proxy_bind_addr
+            };
+            let http_addr = format_socket_addr(vhost_bind, self.cfg.vhost_http_port);
             let http_state = self.state.clone();
             let http_shutdown = self.state.shutdown_token.clone();
             tokio::spawn(async move {
@@ -829,7 +844,12 @@ impl Service {
         // configured; the shared TLS acceptor auto-generates a server identity
         // when no cert/key files are set.
         if self.cfg.vhost_https_port > 0 {
-            let https_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.vhost_https_port);
+            let vhost_bind = if self.cfg.proxy_bind_addr.is_empty() {
+                &self.cfg.bind_addr
+            } else {
+                &self.cfg.proxy_bind_addr
+            };
+            let https_addr = format_socket_addr(vhost_bind, self.cfg.vhost_https_port);
             let https_addr2 = https_addr.clone();
             let https_state = self.state.clone();
             let https_shutdown = self.state.shutdown_token.clone();
@@ -846,8 +866,12 @@ impl Service {
 
         // Start TCPMux HTTP CONNECT listener if configured
         if self.cfg.tcpmux_httpconnect_port > 0 {
-            let tcpmux_addr =
-                format_socket_addr(&self.cfg.bind_addr, self.cfg.tcpmux_httpconnect_port);
+            let mux_bind = if self.cfg.proxy_bind_addr.is_empty() {
+                &self.cfg.bind_addr
+            } else {
+                &self.cfg.proxy_bind_addr
+            };
+            let tcpmux_addr = format_socket_addr(mux_bind, self.cfg.tcpmux_httpconnect_port);
             let tcpmux_state = self.state.clone();
             let tcpmux_shutdown = self.state.shutdown_token.clone();
             tokio::spawn(async move {

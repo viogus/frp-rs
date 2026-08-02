@@ -48,6 +48,7 @@ impl TcpMuxManager {
         run_id: &str,
         http_user: &str,
         http_pwd: &str,
+        _headers: &[(String, String)],
     ) {
         let route = TcpMuxRoute {
             proxy_name: proxy_name.to_string(),
@@ -215,17 +216,25 @@ pub async fn run_tcpmux_listener(
                 }
             }
 
-            // Send 200 Connection Established to the external client
-            if let Err(e) = stream
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .await
-            {
-                debug!(peer = %peer, error = %e, "TCPMux: failed to write 200 to {}: {}", peer, e);
-                return;
-            }
+            // Send 200 only in non-passthrough mode (Go frp compat:
+            // tcpmux/httpconnect.go sendConnectResponse).
+            let pre_read = if state.tcp_mux_passthrough {
+                // Passthrough: forward the full CONNECT request bytes
+                // to the backend so it sees the original HTTP request.
+                buf[..n].to_vec()
+            } else {
+                // Non-passthrough: send the 200 response.
+                if let Err(e) = stream
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                {
+                    debug!(peer = %peer, error = %e, "TCPMux: failed to write 200 to {}: {}", peer, e);
+                    return;
+                }
+                Vec::new()
+            };
 
             // Forward to the control handler for work connection bridging.
-            // No pre_read bytes — the CONNECT request is fully consumed.
             let internal_tx = {
                 let map = state.run_id_to_ctl_tx.read().await;
                 map.get(&route.run_id).cloned()
@@ -237,7 +246,7 @@ pub async fn run_tcpmux_listener(
                     .try_send(InternalMsg::ProxyUserConn {
                         proxy_name: route.proxy_name.clone(),
                         user_conn: frp_core::transport::IoStream::Tcp(stream),
-                        pre_read: Vec::new(),
+                        pre_read,
                     })
                     .ok();
             } else {
@@ -371,7 +380,7 @@ mod tests {
     async fn test_tcpmux_manager_register_lookup_unregister() {
         let mgr = TcpMuxManager::new();
 
-        mgr.register("p1", &["a.example.com".into()], "run-1", "", "")
+        mgr.register("p1", &["a.example.com".into()], "run-1", "", "", &[])
             .await;
 
         // Exact match
@@ -400,6 +409,7 @@ mod tests {
             "run-1",
             "",
             "",
+            &[],
         )
         .await;
 

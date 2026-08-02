@@ -50,6 +50,7 @@ mem-profile = ["frp-core/mem-profile"]
 profiling = ["frp-core/profiling"]
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 tempfile = "3"
 reqwest = { workspace = true, features = ["json"] }
 serde_json = { workspace = true }

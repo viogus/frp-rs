@@ -264,3 +264,141 @@ async fn test_tcpmux_proxy_auth() {
 
     drop(provider);
 }
+
+/// TCPMux passthrough (Go frp `tcpMuxPassthrough` compat).
+///
+/// When enabled, the server must NOT send the HTTP 200 response and must
+/// forward the full CONNECT request bytes to the backend, matching Go
+/// `pkg/util/tcpmux/httpconnect.go:73-82,122-125`.
+#[tokio::test]
+async fn test_tcpmux_passthrough() {
+    let bind_port = allocate_port();
+    let tcpmux_port = allocate_port();
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        bind_port,
+        tcpmux_httpconnect_port: tcpmux_port,
+        tcp_mux_passthrough: true,
+        auth: test_auth_cfg(),
+        ..Default::default()
+    };
+    let (_handle, _) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
+    let tcpmux_addr: SocketAddr = format!("127.0.0.1:{}", tcpmux_port).parse().unwrap();
+
+    // Provider logs in, registers tcpmux proxy, and pools a work conn.
+    let (mut provider, resp) = login_with_test_token(addr).await.expect("provider login");
+    let run_id = resp.run_id.expect("provider should get run_id");
+
+    let np = FrpMessage::NewProxy(Box::new(tcpmux_proxy(
+        "tcpmux-pass",
+        vec!["pass.example.com".into()],
+        "127.0.0.1:22",
+    )));
+    write_msg_v1(&mut provider, &np)
+        .await
+        .expect("send NewProxy");
+    match read_msg_v1(&mut provider).await.expect("read NewProxyResp") {
+        FrpMessage::NewProxyResp(ref resp) => {
+            assert!(
+                resp.error.is_none(),
+                "tcpmux registration should succeed: {:?}",
+                resp.error
+            );
+        }
+        other => panic!("expected NewProxyResp, got: {:?}", other.v1_type_byte()),
+    }
+
+    // Pooled work conn so the bridge can start immediately.
+    let mut work_conn = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("work conn connect");
+    write_msg_v1(
+        &mut work_conn,
+        &FrpMessage::NewWorkConn(frp_core::msg::NewWorkConn {
+            run_id: Some(run_id.clone()),
+            timestamp: None,
+            privilege_key: None,
+        }),
+    )
+    .await
+    .expect("send NewWorkConn");
+
+    // External client sends CONNECT to the tcpmux port.
+    let mut client = tokio::net::TcpStream::connect(tcpmux_addr)
+        .await
+        .expect("connect to tcpmux port");
+    client
+        .write_all(
+            b"CONNECT pass.example.com:22 HTTP/1.1\r\n\
+              Host: pass.example.com:22\r\n\
+              \r\n",
+        )
+        .await
+        .expect("send CONNECT");
+
+    // Server must NOT send the 200 — the request bytes are forwarded instead.
+    let mut response = [0u8; 256];
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        client.read(&mut response),
+    )
+    .await
+    {
+        Err(_) => {} // timeout: no 200 sent, as expected in passthrough mode
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => panic!(
+            "passthrough mode must not send HTTP 200, got: {}",
+            String::from_utf8_lossy(&response[..n])
+        ),
+        Ok(Err(e)) => panic!("client read error: {}", e),
+    }
+
+    // Backend side: StartWorkConn first, then the raw CONNECT request bytes.
+    match read_msg_v1(&mut work_conn)
+        .await
+        .expect("read StartWorkConn on work conn")
+    {
+        FrpMessage::StartWorkConn(swc) => {
+            assert_eq!(swc.proxy_name, "tcpmux-pass");
+            assert!(
+                swc.error.is_none(),
+                "StartWorkConn should not have error: {:?}",
+                swc.error
+            );
+        }
+        other => panic!("expected StartWorkConn, got: {:?}", other.v1_type_byte()),
+    }
+
+    let mut forwarded = Vec::new();
+    let mut chunk = [0u8; 512];
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let n = work_conn
+                .read(&mut chunk)
+                .await
+                .expect("read forwarded bytes");
+            if n == 0 {
+                break;
+            }
+            forwarded.extend_from_slice(&chunk[..n]);
+            if forwarded.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for forwarded CONNECT bytes");
+
+    let text = String::from_utf8_lossy(&forwarded);
+    assert!(
+        text.starts_with("CONNECT pass.example.com:22 HTTP/1.1"),
+        "backend should receive the full CONNECT request, got: {:?}",
+        text
+    );
+
+    println!("TCPMux passthrough verified: no 200 sent, CONNECT forwarded to backend");
+    drop(client);
+    drop(provider);
+}

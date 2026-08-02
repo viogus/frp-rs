@@ -5,8 +5,6 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
-#[cfg(feature = "tls")]
-use crate::lock::RwLockExt;
 use crate::service::{AppState, InternalMsg};
 
 /// A route mapping: domain or location -> proxy entry.
@@ -24,6 +22,9 @@ pub struct VhostRoute {
     /// Per-user routing: extract username from Authorization header and route
     /// to proxy `{route_by_http_user}.{username}` (Go frp compat).
     pub route_by_http_user: String,
+    /// Request headers to inject before forwarding (Go frp compat:
+    /// requestHeaders). Set semantics — override same-name headers.
+    pub headers: Vec<(String, String)>,
 }
 
 /// Borrowed match result — avoids cloning VhostRoute (especially the locations Vec)
@@ -37,6 +38,8 @@ pub struct VhostRouteMatch {
     pub http_user: String,
     pub http_pwd: String,
     pub route_by_http_user: String,
+    /// Request headers to inject before forwarding (Go frp requestHeaders).
+    pub headers: Vec<(String, String)>,
 }
 
 impl VhostRouteMatch {
@@ -48,6 +51,7 @@ impl VhostRouteMatch {
             http_user: route.http_user.clone(),
             http_pwd: route.http_pwd.clone(),
             route_by_http_user: route.route_by_http_user.clone(),
+            headers: route.headers.clone(),
         }
     }
 }
@@ -164,6 +168,7 @@ impl VhostManager {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn register(
         &self,
         proxy_name: &str,
@@ -174,6 +179,7 @@ impl VhostManager {
         http_user: &str,
         http_pwd: &str,
         route_by_http_user: &str,
+        headers: &[(String, String)],
     ) -> Result<(), RouterConfigConflict> {
         let route = VhostRoute {
             proxy_name: proxy_name.to_string(),
@@ -183,6 +189,7 @@ impl VhostManager {
             http_user: http_user.to_string(),
             http_pwd: http_pwd.to_string(),
             route_by_http_user: route_by_http_user.to_string(),
+            headers: headers.to_vec(),
         };
 
         let mut tables = self.inner.write().await;
@@ -543,6 +550,11 @@ async fn serve_vhost_request<S>(
             pre_read
         };
 
+        // Go frp compat (pkg/util/vhost/http.go reverse proxy): inject
+        // X-Forwarded-For (append to existing value) and requestHeaders
+        // (Set semantics) into the forwarded request head.
+        let pre_read = inject_vhost_request_headers(&pre_read, peer, &route.headers);
+
         let internal_tx = {
             let map = state.run_id_to_ctl_tx.read().await;
             map.get(&target_run_id).cloned()
@@ -611,7 +623,12 @@ pub async fn run_vhost_http_listener(
 }
 
 /// Run an HTTPS VHost listener on the given address.
-/// Performs TLS handshake, then extracts Host header and routes via InternalMsg.
+///
+/// Go frp compat (`pkg/util/vhost/https.go`): frps does NOT terminate TLS for
+/// HTTPS vhosts. It reads only the ClientHello SNI, routes by SNI, and
+/// forwards the original encrypted bytes (as pre_read) to the matching frpc
+/// HTTPS proxy — the TLS session stays end-to-end between the user and the
+/// backend.
 #[cfg(feature = "tls")]
 #[instrument(skip(state, shutdown_token), fields(addr = %addr))]
 pub async fn run_vhost_https_listener(
@@ -625,33 +642,58 @@ pub async fn run_vhost_https_listener(
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (stream, peer) = result?;
+                let (mut stream, peer) = result?;
                 frp_core::transport::set_nodelay(&stream);
                 let state = state.clone();
-                // Read the current TLS acceptor from shared state. Hot-reload
-                // swaps a new acceptor under write lock; read-lock is cheap.
-                let Some(acceptor) = state
-                    .tls_acceptor
-                    .read_ok()
-                    .clone()
-                else {
-                    tracing::error!("TLS acceptor not initialized");
-                    continue;
-                };
 
                 tokio::spawn(async move {
-                    let tls_stream = match acceptor.accept(stream).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!(peer = %peer, error = %e, "TLS handshake failed from {}: {}", peer, e);
-                            return;
-                        }
+                    let timeout_secs = state.vhost_http_timeout.max(1);
+                    // Read the TLS ClientHello (SNI lives in the first
+                    // record; 4096 bytes comfortably covers it).
+                    let mut buf = [0u8; 4096];
+                    let n = match tokio::time::timeout(
+                        std::time::Duration::from_secs(timeout_secs),
+                        read_client_hello_prefix(&mut stream, &mut buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(n)) if n > 0 => n,
+                        _ => return,
                     };
+                    let pre_read = buf[..n].to_vec();
 
-                    serve_vhost_request(tls_stream, peer, state, "HTTPS", |s| {
-                        frp_core::transport::IoStream::Tls(Box::new(tokio_rustls::TlsStream::Server(s)), peer)
-                    })
-                    .await;
+                    let Some(sni) = extract_sni_from_client_hello(&buf[..n]) else {
+                        warn!(peer = %peer, "HTTPS VHost: no SNI in ClientHello from {}", peer);
+                        return;
+                    };
+                    debug!(sni = %sni, peer = %peer, "HTTPS VHost SNI '{}' from {}", sni, peer);
+
+                    // Route by SNI (host), path "/" (Go https.go getByRoute).
+                    if let Some(route) = state
+                        .vhost_manager
+                        .lookup_combined(&sni, "/", "")
+                        .await
+                    {
+                        let internal_tx = {
+                            let map = state.run_id_to_ctl_tx.read().await;
+                            map.get(&route.run_id).cloned()
+                        };
+                        if let Some(ctl_tx) = internal_tx {
+                            let _ = ctl_tx
+                                .tx
+                                .try_send(InternalMsg::ProxyUserConn {
+                                    proxy_name: route.proxy_name.clone(),
+                                    // Passthrough: raw encrypted bytes, no TLS wrap.
+                                    user_conn: frp_core::transport::IoStream::Tcp(stream),
+                                    pre_read,
+                                })
+                                .ok();
+                        } else {
+                            warn!(sni = %sni, "HTTPS VHost route for '{}' found but control handler gone", sni);
+                        }
+                    } else {
+                        warn!(sni = %sni, peer = %peer, "No HTTPS VHost route for '{}' from {}", sni, peer);
+                    }
                 });
             }
             _ = shutdown_token.cancelled() => {
@@ -661,6 +703,44 @@ pub async fn run_vhost_https_listener(
         }
     }
     Ok(())
+}
+
+/// Read up to `buf.len()` bytes for the TLS ClientHello. Reads until we have
+/// the full ClientHello record (content type 0x16 + TLS record header), or
+/// the buffer is full, or EOF.
+async fn read_client_hello_prefix<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    use tokio::io::AsyncReadExt;
+    let n = stream.read(buf).await?;
+    if n == 0 {
+        return Ok(0);
+    }
+    // A ClientHello handshake record is: 0x16 | version(2) | len(2) | handshake...
+    // If the first record is a full ClientHello and we already have it all,
+    // stop reading (avoids blocking on a keep-alive connection).
+    let record_len = if n >= 5 && buf[0] == 0x16 {
+        (u16::from_be_bytes([buf[3], buf[4]]) as usize) + 5
+    } else {
+        0
+    };
+    if record_len > 0 && n >= record_len {
+        return Ok(n);
+    }
+    if record_len > 0 && record_len <= buf.len() {
+        let mut total = n;
+        while total < record_len {
+            let m = stream.read(&mut buf[total..record_len]).await?;
+            if m == 0 {
+                break;
+            }
+            total += m;
+        }
+        Ok(total)
+    } else {
+        Ok(n)
+    }
 }
 
 #[cfg(not(feature = "tls"))]
@@ -724,6 +804,87 @@ fn rewrite_host_header(data: &[u8], new_host: &str) -> Vec<u8> {
     result.extend_from_slice(new_header.as_bytes());
     result.extend_from_slice(&data[line_end..]);
     result
+}
+
+/// Inject `X-Forwarded-For` (append semantics, Go httputil.ReverseProxy) and
+/// configured requestHeaders (Set semantics, Go `req.Header.Set`) into the
+/// request head bytes. Only the header block up to `\r\n\r\n` is touched.
+fn inject_vhost_request_headers(
+    data: &[u8],
+    peer: std::net::SocketAddr,
+    request_headers: &[(String, String)],
+) -> Vec<u8> {
+    if request_headers.is_empty() {
+        return data.to_vec();
+    }
+    let header_end = data
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(data.len());
+    let head = &data[..header_end];
+    let tail = &data[header_end..];
+
+    // Collect header lines, dropping ones that request_headers will override
+    // (case-insensitive Set semantics) and X-Forwarded-For (re-emitted with
+    // the peer appended).
+    let mut lines: Vec<&[u8]> = Vec::new();
+    let mut existing_xff: Vec<u8> = Vec::new();
+    for line in head.split_inclusive(|&b| b == b'\n') {
+        let trimmed = line
+            .strip_suffix(b"\n")
+            .unwrap_or(line)
+            .strip_suffix(b"\r")
+            .unwrap_or_else(|| line.strip_suffix(b"\n").unwrap_or(line));
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = String::from_utf8_lossy(trimmed).to_lowercase();
+        let is_override = request_headers
+            .iter()
+            .any(|(k, _)| lower.starts_with(&format!("{}:", k.to_lowercase())));
+        if is_override {
+            continue;
+        }
+        if lower.starts_with("x-forwarded-for:") {
+            let value = match trimmed.iter().position(|&b| b == b':') {
+                Some(i) => &trimmed[i + 1..],
+                None => trimmed,
+            };
+            let value = value
+                .iter()
+                .position(|&b| b != b' ' && b != b'\t')
+                .map(|i| &value[i..])
+                .unwrap_or(value);
+            if !value.is_empty() {
+                existing_xff.extend_from_slice(value);
+                existing_xff.extend_from_slice(b", ");
+            }
+            continue;
+        }
+        lines.push(line);
+    }
+
+    let mut out = Vec::with_capacity(data.len() + 64 + request_headers.len() * 24);
+    for line in &lines {
+        out.extend_from_slice(line);
+    }
+    // X-Forwarded-For: append peer (Go ReverseProxy appends to prior value).
+    let mut xff = existing_xff;
+    xff.extend_from_slice(peer.ip().to_string().as_bytes());
+    out.extend_from_slice(b"X-Forwarded-For: ");
+    out.extend_from_slice(&xff);
+    out.extend_from_slice(b"\r\n");
+    // Configured request headers.
+    for (k, v) in request_headers {
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(tail);
+    out
 }
 
 /// Extract HTTP Basic Auth credentials from the Authorization header.

@@ -8,6 +8,7 @@ use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
 use frp_core::msg::{self, FrpMessage};
+use frp_core::mux::YamuxSession;
 #[cfg(feature = "vnet")]
 use frp_core::transport::IoStream;
 use frp_core::transport::{dial_server, DialOptions, TransportProtocol};
@@ -49,6 +50,18 @@ pub(crate) struct VisitorListenerConfig {
     pub user: String,
     /// Current session run_id for NewVisitorConn (Go frp compat).
     pub run_id: String,
+    // --- Transport options matching DialOptions / Go frp connector ---
+    pub tcp_mux: bool,
+    pub tcp_mux_keepalive_interval: i64,
+    pub proxy_url: Option<String>,
+    pub dns_server: Option<String>,
+    pub dial_timeout_secs: u64,
+    pub keepalive_secs: u64,
+    pub connect_bind_addr: Option<String>,
+    pub disable_custom_tls_first_byte: bool,
+    pub tls_cert_file: Option<String>,
+    pub tls_key_file: Option<String>,
+    pub v2: bool,
 }
 
 /// Configuration for a no-bind `virtual_net` visitor tunnel.
@@ -85,6 +98,92 @@ pub(crate) struct VirtualNetVisitorConfig {
     /// Graceful shutdown signal. When true, the tunnel exits and the route is
     /// unregistered.
     pub shutdown: Arc<AtomicBool>,
+    // --- Transport options matching DialOptions / Go frp connector ---
+    pub tcp_mux: bool,
+    pub tcp_mux_keepalive_interval: i64,
+    pub proxy_url: Option<String>,
+    pub dns_server: Option<String>,
+    pub dial_timeout_secs: u64,
+    pub keepalive_secs: u64,
+    pub connect_bind_addr: Option<String>,
+    pub disable_custom_tls_first_byte: bool,
+    pub tls_cert_file: Option<String>,
+    pub tls_key_file: Option<String>,
+    pub v2: bool,
+}
+
+// ── Visitor dial planning (pure, testable) ────────────────────────────
+
+/// Subset of visitor config fields that influence the dial and yamux
+/// decision. Kept as a standalone struct so the dial-planning logic
+/// can be exercised in unit tests without a running server.
+#[derive(Debug, Clone, PartialEq)]
+struct VisitorTransportConfig {
+    pub tcp_mux: bool,
+    pub tcp_mux_keepalive_interval: i64,
+    pub proxy_url: Option<String>,
+    pub dns_server: Option<String>,
+    pub dial_timeout_secs: u64,
+    pub keepalive_secs: u64,
+    pub connect_bind_addr: Option<String>,
+    pub disable_custom_tls_first_byte: bool,
+    pub tls_cert_file: Option<String>,
+    pub tls_key_file: Option<String>,
+    pub v2: bool,
+}
+
+impl VisitorTransportConfig {}
+
+/// Result of visitor dial planning: the DialOptions to pass to
+/// dial_server, together with an optional yamux keepalive interval.
+/// When `yamux_keepalive_secs` is `Some(n)`, the caller must wrap
+/// the raw stream in yamux via `wrap_client_mux(raw, n)`.
+#[derive(Debug)]
+struct VisitorDialPlan {
+    opts: DialOptions,
+    yamux_keepalive_secs: Option<i64>,
+}
+
+/// Build the DialOptions and yamux decision for a visitor→server
+/// connection.  Pure — no I/O, no spawn, no network.  The caller
+/// is responsible for calling `dial_server(&plan.opts)` and, when
+/// `plan.yamux_keepalive_secs` is `Some(n)`, wrapping the result
+/// with `crate::control::wrap_client_mux(raw_stream, n)`.
+fn plan_visitor_dial(
+    server_addr: &str,
+    server_port: u16,
+    protocol: &TransportProtocol,
+    tls_enable: bool,
+    tls_server_name: &str,
+    tls_ca_file: &Option<String>,
+    transport: &VisitorTransportConfig,
+) -> VisitorDialPlan {
+    let opts = DialOptions {
+        server_addr: server_addr.to_string(),
+        server_port,
+        protocol: protocol.clone(),
+        tls_enable,
+        tls_server_name: tls_server_name.to_string(),
+        tls_ca_file: tls_ca_file.clone(),
+        tls_cert_file: transport.tls_cert_file.clone(),
+        tls_key_file: transport.tls_key_file.clone(),
+        dns_server: transport.dns_server.clone(),
+        disable_custom_tls_first_byte: transport.disable_custom_tls_first_byte,
+        keepalive_secs: transport.keepalive_secs,
+        bind_addr: transport.connect_bind_addr.clone(),
+        proxy_url: transport.proxy_url.clone(),
+        dial_timeout_secs: transport.dial_timeout_secs,
+        v2: transport.v2,
+    };
+    let yamux_keepalive_secs = if transport.tcp_mux {
+        Some(transport.tcp_mux_keepalive_interval)
+    } else {
+        None
+    };
+    VisitorDialPlan {
+        opts,
+        yamux_keepalive_secs,
+    }
 }
 
 /// Run the packet loop over an established `virtual_net` visitor tunnel.
@@ -203,6 +302,17 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
         shutdown,
         user,
         run_id,
+        tcp_mux,
+        tcp_mux_keepalive_interval,
+        proxy_url,
+        dns_server,
+        dial_timeout_secs,
+        keepalive_secs,
+        connect_bind_addr,
+        disable_custom_tls_first_byte,
+        tls_cert_file,
+        tls_key_file,
+        v2,
     } = config;
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
@@ -243,18 +353,26 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                 let pp = p2p_protocol.clone();
                 let u = user.clone();
                 let rid = run_id.clone();
+                let transport = VisitorTransportConfig {
+                    tcp_mux,
+                    tcp_mux_keepalive_interval,
+                    proxy_url: proxy_url.clone(),
+                    dns_server: dns_server.clone(),
+                    dial_timeout_secs,
+                    keepalive_secs,
+                    connect_bind_addr: connect_bind_addr.clone(),
+                    disable_custom_tls_first_byte,
+                    tls_cert_file: tls_cert_file.clone(),
+                    tls_key_file: tls_key_file.clone(),
+                    v2,
+                };
 
                 tokio::spawn(async move {
                     // Dial options for STCP fallback (fresh connections only).
-                    let opts = DialOptions {
-                        server_addr: sa.clone(),
-                        server_port: sp,
-                        protocol: pt.clone(),
-                        tls_enable,
-                        tls_server_name: tls_sn,
-                        tls_ca_file: tls_ca,
-                        ..Default::default()
-                    };
+                    let plan =
+                        plan_visitor_dial(&sa, sp, &pt, tls_enable, &tls_sn, &tls_ca, &transport);
+                    let opts = plan.opts;
+                    let yamux_keepalive = plan.yamux_keepalive_secs;
 
                     if vt == "xtcp" {
                         // --- XTCP NAT hole punch via control connection ---
@@ -521,9 +639,13 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     .as_ref()
                                     .map(|db| db.read_timeout_ms.max(0) as u64)
                                     .unwrap_or(fallback_timeout_ms);
+                                let assisted = resp.assisted_addrs.clone().unwrap_or_default();
+                                let behavior = resp.detect_behavior.clone();
                                 match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
                                     socket,
                                     &candidates,
+                                    &assisted,
+                                    behavior.as_ref(),
                                     conv,
                                     kcp_cfg,
                                     hp_timeout,
@@ -598,12 +720,28 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         // "custom listener for [X] doesn't exist". This is expected — Go frp's
                         // XTCP fallback uses a separate STCP proxy+visitor, not the same proxy.
                         // Open a NEW connection for STCP relay
-                        let mut server_conn = match dial_server(&opts).await {
+                        let raw_stream = match dial_server(&opts).await {
                             Ok(io) => io,
                             Err(e) => {
                                 debug!(visitor_name = %visitor_name, error = %e, "Visitor '{}': STCP fallback dial failed: {}", visitor_name, e);
                                 return;
                             }
+                        };
+                        // Wrap in yamux when tcp_mux is enabled (Go frp compat).
+                        let mut _yamux_sess_fb: Option<YamuxSession> = None;
+                        let mut server_conn = if let Some(ka) = yamux_keepalive {
+                            match crate::control::wrap_client_mux(raw_stream, ka).await {
+                                Ok((io, session)) => {
+                                    _yamux_sess_fb = session;
+                                    io
+                                }
+                                Err(e) => {
+                                    warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': yamux wrap failed: {}", visitor_name, e);
+                                    return;
+                                }
+                            }
+                        } else {
+                            raw_stream
                         };
 
                         let stcp_proxy_name = if fb_to.is_empty() {
@@ -704,12 +842,28 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         // --- STCP relay path (TCP-based visitors) ---
                         // Handles: stcp, and sudp (TCP fallback until dedicated
                         // SUDP visitor is implemented).
-                        let mut server_conn = match dial_server(&opts).await {
+                        let raw_stream = match dial_server(&opts).await {
                             Ok(io) => io,
                             Err(e) => {
                                 warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': dial server failed: {}", visitor_name, e);
                                 return;
                             }
+                        };
+                        // Wrap in yamux when tcp_mux is enabled (Go frp compat).
+                        let mut _yamux_sess_stcp: Option<YamuxSession> = None;
+                        let mut server_conn = if let Some(ka) = yamux_keepalive {
+                            match crate::control::wrap_client_mux(raw_stream, ka).await {
+                                Ok((io, session)) => {
+                                    _yamux_sess_stcp = session;
+                                    io
+                                }
+                                Err(e) => {
+                                    warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': yamux wrap failed: {}", visitor_name, e);
+                                    return;
+                                }
+                            }
+                        } else {
+                            raw_stream
                         };
 
                         let nvc = crate::proxy::create_visitor_conn_msg(
@@ -821,6 +975,17 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         vnet_tun_tx,
         tun_subnets,
         shutdown,
+        tcp_mux,
+        tcp_mux_keepalive_interval,
+        proxy_url,
+        dns_server,
+        dial_timeout_secs,
+        keepalive_secs,
+        connect_bind_addr,
+        disable_custom_tls_first_byte,
+        tls_cert_file,
+        tls_key_file,
+        v2,
     } = config;
 
     'reconnect: loop {
@@ -828,17 +993,29 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
             return;
         }
 
-        let mut server_conn = match dial_server(&DialOptions {
-            server_addr: server_addr.clone(),
+        let transport = VisitorTransportConfig {
+            tcp_mux,
+            tcp_mux_keepalive_interval,
+            proxy_url: proxy_url.clone(),
+            dns_server: dns_server.clone(),
+            dial_timeout_secs,
+            keepalive_secs,
+            connect_bind_addr: connect_bind_addr.clone(),
+            disable_custom_tls_first_byte,
+            tls_cert_file: tls_cert_file.clone(),
+            tls_key_file: tls_key_file.clone(),
+            v2,
+        };
+        let plan = plan_visitor_dial(
+            &server_addr,
             server_port,
-            protocol: protocol.clone(),
+            &protocol,
             tls_enable,
-            tls_server_name: tls_server_name.clone(),
-            tls_ca_file: tls_ca_file.clone(),
-            ..Default::default()
-        })
-        .await
-        {
+            &tls_server_name,
+            &tls_ca_file,
+            &transport,
+        );
+        let raw_stream = match dial_server(&plan.opts).await {
             Ok(io) => io,
             Err(e) => {
                 warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': dial server failed: {}", name, e);
@@ -847,6 +1024,26 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
                 }
                 continue 'reconnect;
             }
+        };
+        // Wrap in yamux when tcp_mux is enabled (Go frp compat).
+        let yamux_keepalive = plan.yamux_keepalive_secs;
+        let mut _yamux_sess_vnet: Option<YamuxSession> = None;
+        let mut server_conn = if let Some(ka) = yamux_keepalive {
+            match crate::control::wrap_client_mux(raw_stream, ka).await {
+                Ok((io, session)) => {
+                    _yamux_sess_vnet = session;
+                    io
+                }
+                Err(e) => {
+                    warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': yamux wrap failed: {}", name, e);
+                    if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+                        return;
+                    }
+                    continue 'reconnect;
+                }
+            }
+        } else {
+            raw_stream
         };
 
         let nvc = crate::proxy::create_visitor_conn_msg(
@@ -1280,5 +1477,128 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(1), task)
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    fn make_transport() -> VisitorTransportConfig {
+        VisitorTransportConfig {
+            tcp_mux: true,
+            tcp_mux_keepalive_interval: 30,
+            proxy_url: Some("socks5://proxy:1080".into()),
+            dns_server: Some("8.8.8.8".into()),
+            dial_timeout_secs: 15,
+            keepalive_secs: 60,
+            connect_bind_addr: Some("10.0.0.1".into()),
+            disable_custom_tls_first_byte: true,
+            tls_cert_file: Some("/path/cert.pem".into()),
+            tls_key_file: Some("/path/key.pem".into()),
+            v2: true,
+        }
+    }
+
+    /// When tcp_mux=true, plan_visitor_dial sets yamux_keepalive_secs
+    /// to the configured keepalive interval and populates proxy_url
+    /// into the DialOptions.
+    #[test]
+    fn plan_with_tcp_mux_yields_yamux_and_proxy() {
+        let transport = make_transport();
+        let plan = plan_visitor_dial(
+            "frps.example.com",
+            7443,
+            &TransportProtocol::Tcp,
+            true,
+            "frps.example.com",
+            &Some("/etc/ca.pem".into()),
+            &transport,
+        );
+
+        // Yamux decision
+        assert_eq!(
+            plan.yamux_keepalive_secs,
+            Some(30),
+            "tcp_mux=true must request yamux wrapping with keepalive 30"
+        );
+
+        // Key transport fields in DialOptions
+        assert_eq!(plan.opts.server_addr, "frps.example.com");
+        assert_eq!(plan.opts.server_port, 7443);
+        assert_eq!(plan.opts.proxy_url.as_deref(), Some("socks5://proxy:1080"));
+        assert_eq!(plan.opts.dns_server.as_deref(), Some("8.8.8.8"));
+        assert_eq!(plan.opts.dial_timeout_secs, 15);
+        assert_eq!(plan.opts.keepalive_secs, 60);
+        assert_eq!(plan.opts.bind_addr.as_deref(), Some("10.0.0.1"));
+        assert!(plan.opts.disable_custom_tls_first_byte);
+        assert_eq!(plan.opts.tls_cert_file.as_deref(), Some("/path/cert.pem"));
+        assert_eq!(plan.opts.tls_key_file.as_deref(), Some("/path/key.pem"));
+        assert!(plan.opts.v2);
+        assert!(plan.opts.tls_enable);
+        assert_eq!(plan.opts.tls_ca_file.as_deref(), Some("/etc/ca.pem"));
+    }
+
+    /// When tcp_mux=false, plan_visitor_dial returns no yamux keepalive
+    /// and still propagates all other transport fields.
+    #[test]
+    fn plan_without_tcp_mux_omits_yamux() {
+        let mut transport = make_transport();
+        transport.tcp_mux = false;
+        let plan = plan_visitor_dial(
+            "frps.example.com",
+            7000,
+            &TransportProtocol::Tcp,
+            false,
+            "",
+            &None,
+            &transport,
+        );
+
+        assert_eq!(plan.yamux_keepalive_secs, None);
+        // Proxy and other fields still flow through even without yamux
+        assert_eq!(plan.opts.proxy_url.as_deref(), Some("socks5://proxy:1080"));
+        assert_eq!(plan.opts.dial_timeout_secs, 15);
+        assert!(plan.opts.v2);
+    }
+
+    /// Building a VisitorTransportConfig inline (the pattern used by
+    /// run_visitor_listener) and passing it to plan_visitor_dial preserves
+    /// all fields through to the DialOptions.
+    #[test]
+    fn inline_transport_to_dial_options_round_trip() {
+        let transport = VisitorTransportConfig {
+            tcp_mux: true,
+            tcp_mux_keepalive_interval: 45,
+            proxy_url: Some("http://p:8080".into()),
+            dns_server: Some("1.1.1.1".into()),
+            dial_timeout_secs: 25,
+            keepalive_secs: 90,
+            connect_bind_addr: Some("192.168.0.1".into()),
+            disable_custom_tls_first_byte: false,
+            tls_cert_file: Some("/c.pem".into()),
+            tls_key_file: Some("/k.pem".into()),
+            v2: false,
+        };
+        let plan = plan_visitor_dial(
+            "frps.example.com",
+            7443,
+            &TransportProtocol::Tcp,
+            false,
+            "",
+            &None,
+            &transport,
+        );
+
+        assert_eq!(plan.yamux_keepalive_secs, Some(45));
+        assert_eq!(plan.opts.proxy_url.as_deref(), Some("http://p:8080"));
+        assert_eq!(plan.opts.dns_server.as_deref(), Some("1.1.1.1"));
+        assert_eq!(plan.opts.dial_timeout_secs, 25);
+        assert_eq!(plan.opts.keepalive_secs, 90);
+        assert_eq!(plan.opts.bind_addr.as_deref(), Some("192.168.0.1"));
+        assert!(!plan.opts.disable_custom_tls_first_byte);
+        assert_eq!(plan.opts.tls_cert_file.as_deref(), Some("/c.pem"));
+        assert_eq!(plan.opts.tls_key_file.as_deref(), Some("/k.pem"));
+        assert!(!plan.opts.v2);
     }
 }

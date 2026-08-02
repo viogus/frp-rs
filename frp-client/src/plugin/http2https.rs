@@ -21,7 +21,7 @@ use tracing::debug;
 
 use frp_core::config::PluginConfig;
 #[cfg(feature = "tls")]
-use frp_core::transport::build_tls_connector;
+use frp_core::transport::build_tls_connector_skip_verify;
 
 #[cfg(feature = "tls")]
 use super::serve_plugin;
@@ -40,14 +40,17 @@ pub async fn start_http2https_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
         ));
     };
     let host_rewrite = cfg.host_header_rewrite.clone();
-    let tls_connector = build_tls_connector(None, None, None).map_err(|e| {
+    let request_headers = cfg.request_headers.clone();
+    // Go frp compat (http2https.go:45): the HTTPS backend is connected with
+    // InsecureSkipVerify — frp does not validate the backend certificate.
+    let tls_connector = build_tls_connector_skip_verify(None, None, None).map_err(|e| {
         frp_core::Error::Transport(format!("http2https plugin: TLS connector: {e}").into())
     })?;
     serve_plugin(
         "http2https",
-        (target_addr, host_rewrite, tls_connector),
-        |client, peer, (target, rewrite, connector)| async move {
-            if let Err(e) = handle_conn(client, &target, &rewrite, &connector).await {
+        (target_addr, host_rewrite, request_headers, tls_connector),
+        |client, peer, (target, rewrite, headers, connector)| async move {
+            if let Err(e) = handle_conn(client, &target, &rewrite, &headers, &connector).await {
                 debug!(%peer, error = %e, "http2https: {peer} error: {e}");
             }
         },
@@ -67,9 +70,12 @@ async fn handle_conn(
     mut client: TcpStream,
     target: &str,
     host_rewrite: &str,
+    request_headers: &std::collections::HashMap<String, String>,
     tls_connector: &tokio_rustls::TlsConnector,
 ) -> Result<(), String> {
-    let fwd = crate::plugin::read_request_and_build_forward(&mut client, host_rewrite).await?;
+    let fwd =
+        crate::plugin::read_request_and_build_forward(&mut client, host_rewrite, request_headers)
+            .await?;
 
     // Extract hostname from target for SNI
     let (host, port) = split_host_port(target);

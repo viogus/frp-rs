@@ -8,7 +8,11 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::time::{timeout, Duration};
 
-struct TestSshClient;
+struct TestSshClient {
+    /// `-R` local target address (e.g. "127.0.0.1:1234"). When set, server
+    /// `forwarded-tcpip` channels are bridged to that TCP service.
+    local_target: Option<String>,
+}
 
 impl russh::client::Handler for TestSshClient {
     type Error = russh::Error;
@@ -18,6 +22,40 @@ impl russh::client::Handler for TestSshClient {
         _server_public_key: &russh::keys::PublicKey,
     ) -> Result<bool, Self::Error> {
         Ok(true)
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: russh::ChannelId,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        // Default accept; the open handler's copy_bidirectional ends when the
+        // local service closes, which shuts the channel.
+        let _ = channel;
+        Ok(())
+    }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        _connected_address: &str,
+        _connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        // Bridge the forwarded-tcpip channel to the local -R target
+        // (the "local service" behind ssh -R). ChannelStream is a full
+        // AsyncRead+AsyncWrite pair — use copy_bidirectional.
+        if let Some(target) = self.local_target.clone() {
+            let mut stream = Box::pin(channel.into_stream());
+            tokio::spawn(async move {
+                if let Ok(mut local) = tokio::net::TcpStream::connect(&target).await {
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut local).await;
+                }
+            });
+        }
+        Ok(())
     }
 }
 
@@ -253,16 +291,50 @@ async fn test_ssh_gateway_starts_with_port_limit_config() {
     drop(ssh_stream);
 }
 
-/// Reverse forwarding (`-R` / `tcpip_forward`) is disabled for this release:
-/// the SSH server must reject the global request instead of allocating a port
-/// it never binds.
+/// Go-compatible `ssh -R`: the server accepts tcpip-forward, opens a
+/// forwarded-tcpip channel per work connection, and bridges data between the
+/// SSH client's local service and the frps proxy port.
 #[tokio::test]
-async fn test_ssh_gateway_rejects_reverse_forwarding() {
+async fn test_ssh_gateway_reverse_forwarding_roundtrip() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_test_writer()
+        .try_init();
     let ssh_port = allocate_port();
     let bind_port = allocate_port();
+    let remote_port = allocate_port(); // frps proxy port
+    let local_port = allocate_port(); // local echo service behind -R
 
     let cfg = ssh_test_config(ssh_port, bind_port);
     let (_handle, _port) = start_test_server(cfg).await;
+
+    // Local echo server (simulates the ssh -R host:hostport target).
+    let echo_listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{local_port}"))
+        .await
+        .unwrap();
+    let echo_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = echo_listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
 
     let addr: SocketAddr = format!("127.0.0.1:{}", ssh_port).parse().unwrap();
     let mut client = None;
@@ -270,7 +342,9 @@ async fn test_ssh_gateway_rejects_reverse_forwarding() {
         if let Ok(c) = russh::client::connect(
             Arc::new(russh::client::Config::default()),
             addr,
-            TestSshClient,
+            TestSshClient {
+                local_target: Some(format!("127.0.0.1:{local_port}")),
+            },
         )
         .await
         {
@@ -287,15 +361,57 @@ async fn test_ssh_gateway_rejects_reverse_forwarding() {
         .expect("password auth should succeed");
     assert!(auth.success(), "SSH password auth failed");
 
-    let result = client.tcpip_forward("127.0.0.1", 0).await;
-    assert!(
-        matches!(result, Err(russh::Error::RequestDenied)),
-        "reverse forwarding must be denied, got {:?}",
-        result
+    // ssh -R :remote_port:127.0.0.1:local_port
+    let fwd = client
+        .tcpip_forward("127.0.0.1", remote_port as u32)
+        .await
+        .expect("-R tcpip-forward must be accepted");
+    // SSH protocol: a specific-port request's success reply carries no port
+    // (russh returns 0); a 0 request would return the allocated port.
+    assert_eq!(
+        fwd, 0,
+        "-R request should be granted for the requested port"
+    );
+
+    // Register a tcp proxy through the SSH remote command.
+    let session = client
+        .channel_open_session()
+        .await
+        .expect("open session channel");
+    session
+        .exec(
+            true,
+            format!("tcp --proxy_name \"ssh-r-test\" --remote_port {remote_port}"),
+        )
+        .await
+        .expect("exec accepted");
+
+    // Connect through the frps proxy port and verify the echo round-trip.
+    let mut proxy_stream = None;
+    for _ in 0..50 {
+        if let Ok(s) = tokio::net::TcpStream::connect(format!("127.0.0.1:{remote_port}")).await {
+            proxy_stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut proxy_stream = proxy_stream.expect("frps proxy port should accept");
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    proxy_stream.write_all(b"ping-over-ssh-r").await.unwrap();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), proxy_stream.read(&mut buf))
+        .await
+        .expect("should receive echoed data")
+        .expect("echo read");
+    assert_eq!(
+        &buf[..n],
+        b"ping-over-ssh-r",
+        "data must round-trip through ssh -R"
     );
 
     client
         .disconnect(russh::Disconnect::ByApplication, "test complete", "")
         .await
         .ok();
+    echo_task.abort();
 }

@@ -61,8 +61,10 @@ pub const FRP_WEBSOCKET_PATH: &str = "/~!frp";
 /// Maximum WebSocket frame payload accepted by the raw decoder. The V2
 /// framing layer permits 64 KiB messages, so the transport must not clamp
 /// below that; the V1 10 KiB limit stays enforced by `protocol.rs`.
+/// +128 bytes covers the V2 AEAD overhead (AES-256-GCM tag + nonce) so an
+/// encrypted V2 frame at the payload cap is not rejected by the transport.
 #[cfg(feature = "websocket")]
-const MAX_WS_FRAME_PAYLOAD: u64 = crate::protocol::V2_MAX_FRAME_PAYLOAD as u64;
+const MAX_WS_FRAME_PAYLOAD: u64 = crate::protocol::V2_MAX_FRAME_PAYLOAD as u64 + 128;
 
 /// Transport protocol variant.
 #[derive(Debug, Clone, PartialEq)]
@@ -884,6 +886,56 @@ impl AsyncWrite for WsByteStream {
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
+/// Stream wrapper that serves a byte prefix before delegating to the
+/// underlying stream. Used by the WebSocket client upgrade path to feed
+/// leftover bytes (a WS frame that arrived in the same TCP segment as the
+/// HTTP 101 response) through the raw WS frame parser instead of exposing
+/// them as application bytes.
+#[cfg(feature = "websocket")]
+struct PrependStream {
+    prepend: Vec<u8>,
+    pos: usize,
+    inner: Box<dyn AsyncReadWrite>,
+}
+
+#[cfg(feature = "websocket")]
+impl AsyncRead for PrependStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.pos < self.prepend.len() {
+            let n = (self.prepend.len() - self.pos).min(buf.remaining());
+            buf.put_slice(&self.prepend[self.pos..self.pos + n]);
+            self.pos += n;
+            if self.pos >= self.prepend.len() {
+                self.prepend.clear();
+                self.pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl AsyncWrite for PrependStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// Unified stream type for TCP, TLS, KCP, and WebSocket.
 /// WebSocket variant wraps a WsByteStream adapter so all variants
 /// transparently support AsyncRead/AsyncWrite and V1 frame I/O.
@@ -1703,7 +1755,7 @@ impl Default for DialOptions {
 /// Sends a standard DNS A-record query over UDP. Handles name compression
 /// pointers in the response. IPv6 (AAAA) is not supported — the custom DNS
 /// server option is typically used with IPv4-only internal resolvers.
-async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<String, crate::Error> {
+pub async fn resolve_host_with_dns(host: &str, dns_server: &str) -> Result<String, crate::Error> {
     use std::net::SocketAddr;
     use std::str::FromStr;
     use tokio::net::UdpSocket;
@@ -1923,7 +1975,7 @@ async fn connect_via_proxy(
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::time::{timeout, Duration};
 
-    let (scheme, proxy_host, proxy_port) = parse_proxy_url(proxy_url)?;
+    let (scheme, auth, proxy_host, proxy_port) = parse_proxy_url(proxy_url)?;
     let proxy_addr = format!("{proxy_host}:{proxy_port}");
     let proxy_peer: std::net::SocketAddr = proxy_addr.parse().map_err(|e| {
         crate::Error::Transport(format!("invalid proxy address '{proxy_addr}': {e}").into())
@@ -1939,9 +1991,17 @@ async fn connect_via_proxy(
 
     match scheme {
         "http" | "https" => {
-            // HTTP CONNECT tunnel
+            // HTTP CONNECT tunnel. Go golib: proxy auth via Basic
+            // Authorization on the CONNECT request.
+            let auth_header = match auth {
+                Some((user, pass)) => format!(
+                    "Proxy-Authorization: Basic {}\r\n",
+                    base64_encode(format!("{user}:{pass}").as_bytes())
+                ),
+                None => String::new(),
+            };
             let connect_req = format!(
-                "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n\r\n"
+                "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n{auth_header}\r\n"
             );
             timeout(
                 Duration::from_secs(dial_timeout_secs),
@@ -2017,12 +2077,21 @@ async fn connect_via_proxy(
                 }
             }
         }
-        "socks5" => {
-            // SOCKS5 handshake
-            // 1. Auth negotiation: send [0x05, 0x01, 0x00] (SOCKS5, 1 method, no auth)
+        "socks5" | "socks5h" => {
+            // SOCKS5 handshake. Go golib semantics:
+            // - "socks5": target hostname resolved locally (must be an IP
+            //   by the time it reaches us); "socks5h": remote DNS — the
+            //   hostname is sent to the proxy via ATYP 0x03.
+            // - userinfo → RFC 1929 username/password auth (method 0x02).
+            let use_auth = auth.is_some();
+            let methods: &[u8] = if use_auth {
+                &[0x05, 0x02, 0x00, 0x02] // no-auth + user/pass
+            } else {
+                &[0x05, 0x01, 0x00] // no-auth only
+            };
             timeout(
                 Duration::from_secs(dial_timeout_secs),
-                stream.write_all(&[0x05, 0x01, 0x00]),
+                stream.write_all(methods),
             )
             .await
             .map_err(|_| crate::Error::Transport("SOCKS5 auth write timeout".into()))?
@@ -2038,29 +2107,81 @@ async fn connect_via_proxy(
             .map_err(|_| crate::Error::Transport("SOCKS5 auth read timeout".into()))?
             .map_err(|e| crate::Error::Transport(format!("SOCKS5 auth read: {e}").into()))?;
 
-            if auth_resp[0] != 0x05 || auth_resp[1] != 0x00 {
+            if auth_resp[0] != 0x05 {
                 return Err(crate::Error::Transport(
                     format!("SOCKS5 auth rejected: {:02x?}", auth_resp).into(),
                 ));
             }
 
-            // 3. Resolve target address and build connect request
-            let target_ip: std::net::IpAddr = target_host.parse().map_err(|_| {
-                crate::Error::Transport(
-                    format!("SOCKS5: cannot resolve hostname '{target_host}' — use IP").into(),
+            if auth_resp[1] == 0x02 {
+                // RFC 1929 username/password sub-negotiation.
+                let (user, pass) = auth.expect("method 0x02 requires userinfo");
+                let mut auth_msg = Vec::with_capacity(3 + user.len() + pass.len());
+                auth_msg.push(0x01);
+                auth_msg.push(user.len() as u8);
+                auth_msg.extend_from_slice(user.as_bytes());
+                auth_msg.push(pass.len() as u8);
+                auth_msg.extend_from_slice(pass.as_bytes());
+                timeout(
+                    Duration::from_secs(dial_timeout_secs),
+                    stream.write_all(&auth_msg),
                 )
-            })?;
-
-            let mut connect_req = Vec::with_capacity(10);
-            connect_req.extend_from_slice(&[0x05, 0x01, 0x00]); // SOCKS5, CONNECT, reserved
-            match target_ip {
-                std::net::IpAddr::V4(ip) => {
-                    connect_req.push(0x01); // IPv4
-                    connect_req.extend_from_slice(&ip.octets());
+                .await
+                .map_err(|_| crate::Error::Transport("SOCKS5 user/pass write timeout".into()))?
+                .map_err(|e| {
+                    crate::Error::Transport(format!("SOCKS5 user/pass write: {e}").into())
+                })?;
+                let mut auth_status = [0u8; 2];
+                timeout(
+                    Duration::from_secs(dial_timeout_secs),
+                    stream.read_exact(&mut auth_status),
+                )
+                .await
+                .map_err(|_| crate::Error::Transport("SOCKS5 user/pass read timeout".into()))?
+                .map_err(|e| {
+                    crate::Error::Transport(format!("SOCKS5 user/pass read: {e}").into())
+                })?;
+                if auth_status[0] != 0x01 || auth_status[1] != 0x00 {
+                    return Err(crate::Error::Transport(
+                        format!("SOCKS5 user/pass auth failed: {:02x?}", auth_status).into(),
+                    ));
                 }
-                std::net::IpAddr::V6(ip) => {
-                    connect_req.push(0x04); // IPv6
-                    connect_req.extend_from_slice(&ip.octets());
+            } else if auth_resp[1] != 0x00 {
+                return Err(crate::Error::Transport(
+                    format!("SOCKS5 auth rejected: method={}", auth_resp[1]).into(),
+                ));
+            }
+
+            // 3. Build the CONNECT request. socks5h sends the hostname as a
+            // domain (ATYP 0x03) so the proxy performs remote DNS; plain
+            // socks5 requires an IP (resolved locally).
+            let mut connect_req = Vec::with_capacity(10 + target_host.len());
+            connect_req.extend_from_slice(&[0x05, 0x01, 0x00]); // SOCKS5, CONNECT, reserved
+            if scheme == "socks5h" {
+                let domain = target_host.as_bytes();
+                if domain.is_empty() || domain.len() > 255 {
+                    return Err(crate::Error::Transport(
+                        "SOCKS5h: invalid domain length".into(),
+                    ));
+                }
+                connect_req.push(0x03); // domain
+                connect_req.push(domain.len() as u8);
+                connect_req.extend_from_slice(domain);
+            } else {
+                let target_ip: std::net::IpAddr = target_host.parse().map_err(|_| {
+                    crate::Error::Transport(
+                        format!("SOCKS5: cannot resolve hostname '{target_host}' — use socks5h or an IP").into(),
+                    )
+                })?;
+                match target_ip {
+                    std::net::IpAddr::V4(ip) => {
+                        connect_req.push(0x01); // IPv4
+                        connect_req.extend_from_slice(&ip.octets());
+                    }
+                    std::net::IpAddr::V6(ip) => {
+                        connect_req.push(0x04); // IPv6
+                        connect_req.extend_from_slice(&ip.octets());
+                    }
                 }
             }
             connect_req.extend_from_slice(&target_port.to_be_bytes());
@@ -2113,7 +2234,8 @@ async fn connect_via_proxy(
         }
         other => {
             return Err(crate::Error::Transport(
-                format!("unsupported proxy scheme: '{other}'. Supported: http, socks5").into(),
+                format!("unsupported proxy scheme: '{other}'. Supported: http, socks5, socks5h")
+                    .into(),
             ));
         }
     }
@@ -2124,13 +2246,30 @@ async fn connect_via_proxy(
     Ok(stream)
 }
 
-/// Parse a proxy URL into (scheme, host, port).
-fn parse_proxy_url(url: &str) -> Result<(&str, &str, u16), crate::Error> {
+/// Parse a proxy URL into (scheme, auth, host, port).
+///
+/// Supports `scheme://host:port` and `scheme://user:pass@host:port`
+/// (Go golib `ParseProxyURL` semantics). `auth` is `Some((user, pass))`
+/// when userinfo is present.
+#[allow(clippy::type_complexity)]
+fn parse_proxy_url(url: &str) -> Result<(&str, Option<(&str, &str)>, &str, u16), crate::Error> {
     let (scheme, rest) = url.split_once("://").ok_or_else(|| {
         crate::Error::Transport(format!("invalid proxy URL '{url}': missing scheme").into())
     })?;
 
-    let (host, port_str) = if let Some((h, p)) = rest.rsplit_once(':') {
+    // Optional userinfo: "user:pass@host:port" (golib ParseProxyURL).
+    let (auth, hostport) = match rest.rsplit_once('@') {
+        Some((userinfo, hostport)) if !userinfo.is_empty() && !hostport.is_empty() => {
+            let (user, pass) = match userinfo.split_once(':') {
+                Some((u, p)) => (u, p),
+                None => (userinfo, ""),
+            };
+            (Some((user, pass)), hostport)
+        }
+        _ => (None, rest),
+    };
+
+    let (host, port_str) = if let Some((h, p)) = hostport.rsplit_once(':') {
         (h, p)
     } else {
         return Err(crate::Error::Transport(
@@ -2148,7 +2287,7 @@ fn parse_proxy_url(url: &str) -> Result<(&str, &str, u16), crate::Error> {
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
 
-    Ok((scheme, host, port))
+    Ok((scheme, auth, host, port))
 }
 
 /// Connect to the server with the given options.
@@ -2194,7 +2333,50 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             let stream = crate::kcp::dial_kcp(&addr, crate::kcp::default_kcp_client_config())
                 .await
                 .map_err(|e| crate::Error::Transport(format!("KCP dial: {e}").into()))?;
-            return Ok(IoStream::Kcp(stream));
+            // KCP+TLS (Go frp compat): Go frpc wraps the KCP stream in TLS
+            // with the 0x17 head byte; the server accept path handles both
+            // 0x17-prefixed and raw ClientHello.
+            if opts.tls_enable {
+                #[cfg(not(feature = "tls"))]
+                {
+                    Err(crate::Error::Transport(
+                        "TLS support not compiled (enable the 'tls' feature)".into(),
+                    ))
+                }
+                #[cfg(feature = "tls")]
+                {
+                    let mut stream = stream;
+                    if !opts.disable_custom_tls_first_byte {
+                        stream.write_all(&[FRP_TLS_HEAD_BYTE]).await.map_err(|e| {
+                            crate::Error::Transport(format!("write TLS head byte: {e}").into())
+                        })?;
+                    }
+                    let connector = build_tls_connector_skip_verify(
+                        opts.tls_ca_file.as_deref(),
+                        opts.tls_cert_file.as_deref(),
+                        opts.tls_key_file.as_deref(),
+                    )?;
+                    let server_name = if !opts.tls_server_name.is_empty() {
+                        opts.tls_server_name.clone()
+                    } else {
+                        opts.server_addr.clone()
+                    };
+                    let server_name = rustls::pki_types::ServerName::try_from(server_name)
+                        .map_err(|e| {
+                            crate::Error::Transport(format!("invalid server name: {e}").into())
+                        })?;
+                    let peer_addr = peer;
+                    let tls = connector.connect(server_name, stream).await.map_err(|e| {
+                        crate::Error::Transport(format!("KCP TLS connect: {e}").into())
+                    })?;
+                    return Ok(IoStream::Tls(
+                        Box::new(tokio_rustls::TlsStream::Client(tls)),
+                        peer_addr,
+                    ));
+                }
+            } else {
+                return Ok(IoStream::Kcp(stream));
+            }
         }
         #[cfg(feature = "quic")]
         TransportProtocol::Quic => {
@@ -2220,9 +2402,16 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             // Empty string = direct connection
             connect_direct(&addr, peer, opts).await?
         } else {
+            // socks5h: the proxy resolves the hostname (remote DNS) — pass the
+            // original server_addr instead of the locally resolved IP.
+            let proxy_target = if proxy_url.starts_with("socks5h://") {
+                &opts.server_addr
+            } else {
+                &target_ip
+            };
             connect_via_proxy(
                 proxy_url,
-                &target_ip,
+                proxy_target,
                 opts.server_port,
                 opts.dial_timeout_secs,
             )
@@ -2412,10 +2601,8 @@ pub async fn detect_and_strip_magic(
 // consume_tls_head_byte removed — dead code. detect_and_strip_magic
 // consumes TLS magic upfront during connection classification.
 
-/// Accept a WebSocket upgrade on the server side.
-/// Returns an IoStream with a WsByteStream adapter already applied,
-/// so callers can use read_msg_v1/write_msg_v1 directly.
-#[cfg(feature = "websocket")]
+/// Base64 encode (RFC 4648). Shared by the WebSocket upgrade key and the
+/// HTTP proxy Basic auth header — kept outside the websocket feature gate.
 fn base64_encode(bytes: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -2848,11 +3035,20 @@ where
         crate::Error::Transport("WS raw connect: timeout waiting for 101 response".into())
     })??;
 
-    let mut ws = WsByteStream::from_raw(Box::new(stream), true);
-    if !leftover.is_empty() {
-        ws.read_buf = leftover;
-        ws.read_pos = 0;
-    }
+    let ws = if leftover.is_empty() {
+        WsByteStream::from_raw(Box::new(stream), true)
+    } else {
+        // Go frps may pipeline the first WS frame in the same TCP segment
+        // as the 101 response. Feed the leftover bytes through the raw WS
+        // frame parser (PrependStream) so frame headers are consumed and
+        // only the payload reaches the application.
+        let prepend = PrependStream {
+            prepend: leftover,
+            pos: 0,
+            inner: Box::new(stream),
+        };
+        WsByteStream::from_raw(Box::new(prepend), true)
+    };
     Ok(IoStream::WebSocket(ws))
 }
 
@@ -3462,6 +3658,70 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "websocket")]
+    fn ws_frame_cap_covers_v2_aead_overhead() {
+        // The transport frame cap must accept a full-size V2 frame plus the
+        // AEAD overhead (tag + nonce), not just the plaintext cap.
+        assert!(MAX_WS_FRAME_PAYLOAD >= crate::protocol::V2_MAX_FRAME_PAYLOAD as u64 + 128);
+    }
+
+    /// Go frps may send the first WS frame in the same TCP segment as the
+    /// HTTP 101 response. The client must parse the frame instead of
+    /// exposing frame bytes as application bytes.
+    #[tokio::test]
+    #[cfg(feature = "websocket")]
+    async fn ws_client_parses_pipelined_frame_after_upgrade() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, mut server) = tokio::io::duplex(8192);
+        let payload: &[u8] = b"hello-from-go-frps";
+        let mut frame = vec![0x82u8, payload.len() as u8]; // FIN + BINARY
+        frame.extend_from_slice(payload);
+
+        let server_task = tokio::spawn(async move {
+            // Consume the upgrade request up to the blank line.
+            let mut req = vec![0u8; 4096];
+            let mut total = 0usize;
+            loop {
+                let n = server.read(&mut req[total..]).await.expect("read request");
+                assert!(n > 0, "client closed before request completed");
+                total += n;
+                if req[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // 101 response + first WS frame in a single segment.
+            server
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\n\
+                      Upgrade: websocket\r\n\
+                      Connection: Upgrade\r\n\
+                      \r\n",
+                )
+                .await
+                .expect("write 101");
+            server
+                .write_all(&frame)
+                .await
+                .expect("write pipelined frame");
+        });
+
+        let mut io = connect_ws_raw(client, "example.com", 7000, FRP_WEBSOCKET_PATH, "http")
+            .await
+            .expect("ws upgrade");
+
+        let mut buf = [0u8; 64];
+        let n = io.read(&mut buf).await.expect("read ws payload");
+        assert_eq!(
+            &buf[..n],
+            payload,
+            "read must return the frame payload only, got: {:?}",
+            &buf[..n]
+        );
+        server_task.await.expect("server task");
+    }
+
+    #[test]
     #[cfg(feature = "tls")]
     fn test_build_tls_connector_with_platform_verifier() {
         let result = build_tls_connector(None, None, None);
@@ -3618,8 +3878,20 @@ mod tests {
         assert_eq!(n2, big.len());
         assert_eq!(&big_out[..n2], &big[..]);
 
-        // One byte over the V2 cap is rejected at the transport layer.
-        let huge = vec![0x6c; 64 * 1024 + 1];
+        // A V2 frame at the cap plus AEAD overhead (128 bytes) is accepted —
+        // the transport must not clamp encrypted V2 frames below the cap.
+        let aead_padded = vec![0x6c; 64 * 1024 + 128];
+        server_io
+            .write_all(&ws_binary_frame(&aead_padded))
+            .await
+            .unwrap();
+        let mut padded_out = vec![0u8; aead_padded.len()];
+        let n3 = ws.read(&mut padded_out).await.unwrap();
+        assert_eq!(n3, aead_padded.len());
+        assert_eq!(&padded_out[..n3], &aead_padded[..]);
+
+        // One byte over the cap + AEAD overhead is rejected at the transport.
+        let huge = vec![0x6c; 64 * 1024 + 129];
         server_io.write_all(&ws_binary_frame(&huge)).await.unwrap();
         let err = ws.read(&mut big_out).await.unwrap_err();
         assert!(

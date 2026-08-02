@@ -78,7 +78,11 @@ mod unregister_generation_tests {
             frp_core::auth::AuthConfig::with_token("test-token"),
             "127.0.0.1".into(),
             frp_core::encryption::derive_key("test-token"),
-            vec![(1, u16::MAX)],
+            vec![frp_core::config::PortsRange {
+                start: 1,
+                end: u16::MAX,
+                single: 0,
+            }],
             String::new(),
             true,
             30,
@@ -276,9 +280,13 @@ pub(crate) async fn handle_new_proxy(
         return;
     }
 
+    // Go frp compat: only TCP/UDP proxies consume ports. HTTP/HTTPS/TCPMux
+    // share the vhost/tcpmux listeners; STCP/XTCP have no remote port.
+    let consumes_port = matches!(np.proxy_type.as_str(), "tcp" | "udp" | "sudp");
+
     // Check per-client port limit (matching Go frp's GetUsedPortsNum logic).
     // Count actual used ports, not proxy names, and add 1 for this new proxy.
-    if state.max_ports_per_client > 0 {
+    if consumes_port && state.max_ports_per_client > 0 {
         let used = state
             .client_ports_used
             .read()
@@ -365,7 +373,11 @@ pub(crate) async fn handle_new_proxy(
     // Separate port managers for TCP and UDP (Go frp compat).
     // TCP port 8080 can coexist with UDP port 8080.
     let is_udp_type = np.proxy_type == "udp" || np.proxy_type == "sudp";
-    let allocated_port = if is_udp_type {
+    let allocated_port = if !consumes_port {
+        // http/https/tcpmux/stcp/xtcp: no allowPorts consumption. Keep the
+        // configured remote_port (usually 0) for display only.
+        Some(remote_port)
+    } else if is_udp_type {
         // UDP/SuDP port allocation: no TCP bind probe (UdpSocket::bind handles
         // OS-level validation later). Use dedicated used_udp_ports tracking
         // separate from TCP used_ports (Go frp compat).
@@ -390,42 +402,89 @@ pub(crate) async fn handle_new_proxy(
                 }
             }
         } else {
-            // Auto-assign: scan allow_ports ranges for first available UDP port
-            // with OS-level bind probe (Go frp compat).
-            let allow_ports = state.reloadable.read_ok().allow_ports.clone();
-            drop(ports); // Release write lock before re-acquiring
-            let mut ports = state.used_udp_ports.write().await;
+            // 24h reservation: re-registration with the same proxy name reuses
+            // its previous port when still free (Go ports.Manager.Acquire).
             let mut found = None;
-            for &(start, end) in allow_ports.iter() {
-                for p in start..=end {
-                    if !ports.contains(&p) && is_udp_port_bindable(&state.proxy_bind_addr, p) {
-                        ports.insert(p);
-                        found = Some(p);
-                        break;
+            {
+                let mut reservations = state.port_reservations.write().await;
+                // Lazy cleanup (Go cleanReservedPortsWorker): drop expired
+                // entries so the map does not grow without bound.
+                if let Some(&(res_port, true, reserved_at)) = reservations.get(&np.proxy_name) {
+                    if reserved_at.elapsed() >= std::time::Duration::from_secs(24 * 3600) {
+                        reservations.remove(&np.proxy_name);
+                    } else if !ports.contains(&res_port)
+                        && is_udp_port_bindable(&state.proxy_bind_addr, res_port)
+                    {
+                        ports.insert(res_port);
+                        found = Some(res_port);
                     }
-                }
-                if found.is_some() {
-                    break;
                 }
             }
             if found.is_none() {
-                tracing::warn!(
-                    ranges = ?allow_ports,
-                    "UDP port exhaustion: no available ports in configured allow_ports ranges",
-                );
+                // Auto-assign: scan allow_ports ranges for first available UDP
+                // port with OS-level bind probe (Go frp compat).
+                let allow_ports = state.reloadable.read_ok().allow_ports.clone();
+                drop(ports); // Release write lock before re-acquiring
+                let mut ports = state.used_udp_ports.write().await;
+                for r in allow_ports.iter() {
+                    for p in r.iter() {
+                        if !ports.contains(&p) && is_udp_port_bindable(&state.proxy_bind_addr, p) {
+                            ports.insert(p);
+                            found = Some(p);
+                            break;
+                        }
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                }
+                if found.is_none() {
+                    tracing::warn!(
+                        ranges = ?allow_ports,
+                        "UDP port exhaustion: no available ports in configured allow_ports ranges",
+                    );
+                }
             }
             found
         }
     } else {
-        // TCP-type proxy (tcp, http, https, tcpmux): use TCP port manager
-        // with OS-level bind probe.
+        // TCP-type proxy (tcp): use TCP port manager with OS-level bind probe.
         let mut ports = state.used_ports.write().await;
-        allocate_port_multi(
-            &mut ports,
-            remote_port,
-            &state.reloadable.read_ok().allow_ports,
-            &state.proxy_bind_addr,
-        )
+        if remote_port == 0 {
+            // 24h reservation by proxy name (Go ports.Manager.Acquire).
+            let mut allocated = None;
+            {
+                let mut reservations = state.port_reservations.write().await;
+                // Lazy cleanup (Go cleanReservedPortsWorker): drop expired
+                // entries so the map does not grow without bound.
+                if let Some(&(res_port, false, reserved_at)) = reservations.get(&np.proxy_name) {
+                    if reserved_at.elapsed() >= std::time::Duration::from_secs(24 * 3600) {
+                        reservations.remove(&np.proxy_name);
+                    } else if !ports.contains(&res_port)
+                        && crate::proxy::is_tcp_port_bindable(&state.proxy_bind_addr, res_port)
+                    {
+                        ports.insert(res_port);
+                        allocated = Some(res_port);
+                    }
+                }
+            }
+            if allocated.is_none() {
+                allocated = allocate_port_multi(
+                    &mut ports,
+                    0,
+                    &state.reloadable.read_ok().allow_ports,
+                    &state.proxy_bind_addr,
+                );
+            }
+            allocated
+        } else {
+            allocate_port_multi(
+                &mut ports,
+                remote_port,
+                &state.reloadable.read_ok().allow_ports,
+                &state.proxy_bind_addr,
+            )
+        }
     };
 
     match allocated_port {
@@ -569,6 +628,8 @@ pub(crate) async fn handle_new_proxy(
                 let http_user = np.http_user.as_deref().unwrap_or("");
                 let http_pwd = np.http_pwd.as_deref().unwrap_or("");
                 let rubu = np.route_by_http_user.as_deref().unwrap_or("");
+                let headers: Vec<(String, String)> =
+                    np.headers.clone().unwrap_or_default().into_iter().collect();
                 if let Err(conflict) = state
                     .vhost_manager
                     .register(
@@ -580,6 +641,7 @@ pub(crate) async fn handle_new_proxy(
                         http_user,
                         http_pwd,
                         rubu,
+                        &headers,
                     )
                     .await
                 {
@@ -636,6 +698,8 @@ pub(crate) async fn handle_new_proxy(
                 let http_user = np.http_user.as_deref().unwrap_or("");
                 let http_pwd = np.http_pwd.as_deref().unwrap_or("");
                 let rubu = np.route_by_http_user.as_deref().unwrap_or("");
+                let headers: Vec<(String, String)> =
+                    np.headers.clone().unwrap_or_default().into_iter().collect();
                 if let Err(conflict) = state
                     .vhost_manager
                     .register(
@@ -647,6 +711,7 @@ pub(crate) async fn handle_new_proxy(
                         http_user,
                         http_pwd,
                         rubu,
+                        &headers,
                     )
                     .await
                 {
@@ -705,7 +770,18 @@ pub(crate) async fn handle_new_proxy(
                 let http_pwd = np.http_pwd.as_deref().unwrap_or("");
                 state
                     .tcpmux_manager
-                    .register(&np.proxy_name, &domains, run_id, http_user, http_pwd)
+                    .register(
+                        &np.proxy_name,
+                        &domains,
+                        run_id,
+                        http_user,
+                        http_pwd,
+                        &np.headers
+                            .clone()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect::<Vec<(String, String)>>(),
+                    )
                     .await;
                 info!(
                     proxy_name = %np.proxy_name, domains = ?domains, "TCPMux routes registered for '{}': domains={:?}",
@@ -883,11 +959,24 @@ pub(crate) async fn handle_new_proxy(
                         group_name, e,
                     );
                 }
-            } else {
+            } else if np.proxy_type == "tcp" {
+                // Only TCP proxies bind a per-proxy listener. HTTP/HTTPS use
+                // the shared vhost listener, TCPMux the shared tcpmux
+                // listener, and STCP/XTCP have no remote port.
                 let handle = tokio::spawn(async move {
                     listen_and_proxy(bind_addr, port, pn, itx).await;
                 });
                 listener_handles.insert(np.proxy_name.clone(), handle);
+            } else {
+                info!(
+                    proxy_type = %np.proxy_type,
+                    proxy_name = %np.proxy_name,
+                    port = %port,
+                    "{} proxy '{}' registered (shared listener, port {})",
+                    np.proxy_type,
+                    np.proxy_name,
+                    port
+                );
             }
 
             info!(proxy_name = %np.proxy_name, port = %port, run_id = %run_id, "Proxy '{}' registered on port {} (run_id: {})", np.proxy_name, port, run_id);
@@ -1028,11 +1117,25 @@ pub(crate) async fn unregister_control(
                 let group_name = p.group.as_deref().unwrap_or("");
                 if state.proxy_manager.group_len(group_name).await <= 1 {
                     ports.remove(&port);
+                    if port > 0 {
+                        state
+                            .port_reservations
+                            .write()
+                            .await
+                            .insert(p.name.clone(), (port, false, std::time::Instant::now()));
+                    }
                     // Stop the shared group listener
                     state.tcp_group_ctl.remove_group(group_name).await;
                 }
             } else if p.proxy_type != "udp" && p.proxy_type != "sudp" {
                 ports.remove(&port);
+                if port > 0 {
+                    state
+                        .port_reservations
+                        .write()
+                        .await
+                        .insert(p.name.clone(), (port, false, std::time::Instant::now()));
+                }
             }
         }
         // Clean up STCP sk_index (indexed by proxy_name — exact match, no
@@ -1059,9 +1162,23 @@ pub(crate) async fn unregister_control(
                         .count();
                     if count == 0 {
                         udp_ports.remove(&port);
+                        if port > 0 {
+                            state
+                                .port_reservations
+                                .write()
+                                .await
+                                .insert(p.name.clone(), (port, true, std::time::Instant::now()));
+                        }
                     }
                 } else {
                     udp_ports.remove(&port);
+                    if port > 0 {
+                        state
+                            .port_reservations
+                            .write()
+                            .await
+                            .insert(p.name.clone(), (port, true, std::time::Instant::now()));
+                    }
                 }
             }
         }

@@ -32,10 +32,10 @@ mod visitor;
 
 pub(crate) use context::PluginContext;
 pub(crate) use http::start_http_proxy;
-pub(crate) use http2http::start_http2http_plugin;
-pub(crate) use http2https::start_http2https_plugin;
-pub(crate) use https2http::start_https2http_plugin;
-pub(crate) use https2https::start_https2https_plugin;
+pub use http2http::start_http2http_plugin;
+pub use http2https::start_http2https_plugin;
+pub use https2http::start_https2http_plugin;
+pub use https2https::start_https2https_plugin;
 pub(crate) use socks5::start_socks5_proxy;
 pub(crate) use static_file::start_static_file_proxy;
 pub(crate) use tls2raw::start_tls2raw_plugin;
@@ -180,11 +180,17 @@ pub(super) fn split_host_port(s: &str) -> (&str, u16) {
 
 /// Read an HTTP request head from `stream` (chunked until CRLFCRLF, 64 KiB cap),
 /// parse the request line, and build the forwarded HTTP/1.0 request string with
-/// optional Host rewrite. Shared by the http2http/http2https/https2http/https2https
-/// plugins; each then connects its own backend and writes the returned string.
+/// optional Host rewrite and injected request headers. Shared by the
+/// http2http/http2https/https2http/https2https plugins; each then connects its
+/// own backend and writes the returned string.
+///
+/// `request_headers` are injected via Set semantics (Go `req.Header.Set`:
+/// an existing header with the same name is replaced), matching Go
+/// `pkg/plugin/client/http_common.go rewriteHTTPPluginRequest`.
 pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unpin>(
     stream: &mut S,
     host_rewrite: &str,
+    request_headers: &std::collections::HashMap<String, String>,
 ) -> Result<String, String> {
     // Read HTTP headers in chunks until \r\n\r\n
     let mut buf = Vec::new();
@@ -244,12 +250,30 @@ pub(super) async fn read_request_and_build_forward<S: tokio::io::AsyncRead + Unp
         if hop_by_hop.iter().any(|h| lower.starts_with(h)) {
             continue;
         }
+        // Skip headers that request_headers will override (Go Header.Set).
+        if let Some((name, _)) = line.split_once(':') {
+            if request_headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case(name.trim()))
+            {
+                continue;
+            }
+        }
         if !host_rewrite.is_empty() && lower.starts_with("host:") {
             fwd.push_str(&format!("Host: {host_rewrite}\r\n"));
         } else {
             fwd.push_str(line);
             fwd.push_str("\r\n");
         }
+    }
+    // Inject configured request headers (Go rewriteHTTPPluginRequest).
+    // "host" is skipped: Go's req.Header.Set cannot set Host — it is
+    // controlled by hostHeaderRewrite (or the original request).
+    for (k, v) in request_headers {
+        if k.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        fwd.push_str(&format!("{k}: {v}\r\n"));
     }
     fwd.push_str("Connection: close\r\n\r\n");
 

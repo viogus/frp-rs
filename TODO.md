@@ -105,6 +105,34 @@ Reconciliation confirmed all of these landed after the doc's original scan:
 | Open — innovation | 0 (#51/#52 closed not-planned) |
 | Closed / declined | 5 (#51 gRPC, #52 WASM, #63 mirror, #66 lz4, 5.7 quinn-slim) |
 
-**Backlog fully empty.** 0 open issues, 0 parity gaps. Perf follow-ups resolved
-(5.6 shipped, 5.7 rejected on measurement); benches + docs done; observability
-polish (3.1/3.2) done. All innovation closes reviewed.
+**Backlog fully empty.** 0 open issues. Perf follow-ups resolved (5.6 shipped,
+5.7 rejected on measurement); benches + docs done; observability polish
+(3.1/3.2) done. All innovation closes reviewed.
+
+### Go frp v0.70.1 parity — closed (2026-08-02 parity pass)
+
+Closed in the `fix/go-parity-2026-08-02` branch:
+
+- Multi-tenant wire proxy names (`{user}.{proxy}`), visitor transport options,
+  `tls2raw` tunnel-side TLS termination, TCPMux passthrough.
+- OIDC client config (map `additionalEndpointParams`, `tokenSource`, audience
+  omission, timestamp preservation), QUIC client options + mTLS propagation,
+  WebSocket pipelined frames + AEAD-aware frame cap, KCP+TLS client.
+- HTTP bridge plugin requestHeaders + InsecureSkipVerify backends, UDP packet
+  size / PROXY header / v1 IPv6 family, proxy URL userinfo (HTTP Basic +
+  SOCKS5 RFC1929) + socks5h remote DNS, dnsServer scope, admin reload/config
+  endpoints + secret_key redaction, visitor reload.
+- Server: allowPorts `{single=N}` + invalid-entry validation, port accounting
+  (only tcp/udp consume), 24h per-name reservation, HTTPS vhost SNI
+  passthrough, Go HTTP server-plugin contract (fail-closed), vhost
+  X-Forwarded-For/requestHeaders + proxyBindAddr, SSH gateway `ssh -R`
+  (tcpip-forward/forwarded-tcpip), dashboard root auth / pprof / offline
+  clients / Go v1 client fields / store 0600 / file tokenSource.
+
+Remaining known gaps (documented, architectural):
+
+- HTTP vhost `responseHeaders`, 504 timeouts, h2c (byte-level forwarding vs
+  Go's HTTP reverse proxy).
+- HTTP plugin `enableHTTP2` (byte-level bridge).
+- XTCP MakeHole assisted probing / QUIC data plane polish and VirtualNet
+  isolation/routing reload (see plan `docs/superpowers/plans/2026-08-02-go-parity-all-fixes.md`).

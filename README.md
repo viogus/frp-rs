@@ -64,9 +64,10 @@ Client plugins: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `ht
 
 ### Go frp Compatibility Notes
 
-frp-rs targets protocol compatibility with Go frp v0.70.1. **100% feature parity.**
-The full Go frp v0.70.1 cross-compatibility suite runs in CI (including the
-XTCP pairwise matrix on VPS and V2 over the v0.70.1 pre-built binaries).
+frp-rs targets protocol compatibility with Go frp v0.70.1. The full Go frp
+v0.70.1 cross-compatibility suite runs in CI (including the XTCP pairwise
+matrix on VPS and V2 over the v0.70.1 pre-built binaries). Coverage is broad
+but not literally 100% — see "Known limitations" below.
 
 - **V1 wire protocol**: Fully compatible. All message types, authentication, encryption (AES-128-CFB),
   compression (Snappy) — wire-compatible with Go frp v0.70.1.
@@ -75,9 +76,26 @@ XTCP pairwise matrix on VPS and V2 over the v0.70.1 pre-built binaries).
 - **All transports**: TCP, WebSocket, TLS, KCP, QUIC — full interop verified.
 - **All 10 client plugins**: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `http2https`,
   `https2http`, `https2https`, `http2http`, `tls2raw`, `virtual_net`.
-- **XTCP**: Full cross-compat with Go frp (requires public internet for STUN/NAT probes).
+- **XTCP**: Cross-compat with Go frp (requires public internet for STUN/NAT probes).
   frp-rs XTCP visitors default to the KCP P2P data plane (Go frp defaults to
   QUIC) so Go providers negotiate KCP. See [full audit](docs/go-frp-compat-audit.md) for details.
+
+### Known limitations (as of frp-rs 0.7.1)
+
+- **HTTP vhost reverse-proxy semantics**: frps forwards HTTP vhost traffic at
+  the byte level (X-Forwarded-For and requestHeaders are injected, Host
+  rewriting works), but `responseHeaders`, per-request 504 timeouts, and
+  HTTP/2 (h2c) are not implemented — Go's `httputil.ReverseProxy` semantics
+  would require an HTTP-level proxy on the server side.
+- **HTTP plugin `enableHTTP2`**: parsed but not honored — the tunnel bridge is
+  byte-oriented; clients automatically fall back to HTTP/1.1.
+- **`pprof` endpoints**: `/debug/pprof/*` is a placeholder (no Go-style CPU
+  profiles); `/healthz` and pprof are outside auth, matching Go.
+- **UDP bandwidth limiting**: Go v0.70.1's UDP forwarder has no limiter, so
+  frp-rs intentionally applies none either (parity, not a gap).
+- **SSH gateway anonymity**: when no `authorized_keys` file is configured the
+  SSH tunnel gateway accepts anonymous connections (Go parity). Always set a
+  token and run frps behind a firewall, or configure `authorized_keys`.
 
 ### Why frp-rs?
 

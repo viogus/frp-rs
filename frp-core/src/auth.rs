@@ -722,6 +722,9 @@ mod oidc_impl {
         audience: String,
         scope: String,
         additional_params: Vec<(String, String)>,
+        /// Go frp v0.70.1 compat: auth.oidc.tokenSource — a dynamic source
+        /// for the access token. Mutually exclusive with all other fields.
+        token_source: Option<crate::config::ValueSource>,
         cached: tokio::sync::Mutex<Option<CachedOidcToken>>,
         /// Set to true when the token endpoint omits `expires_in`.
         /// When true, get_token() bypasses the cache and always fetches a fresh token.
@@ -745,10 +748,11 @@ mod oidc_impl {
             token_endpoint: Option<String>,
             scope: String,
             issuer: Option<String>,
-            additional_endpoint_params: &str,
+            additional_endpoint_params: &std::collections::HashMap<String, String>,
             tls_trusted_ca_file: Option<String>,
             tls_insecure_skip_verify: bool,
             proxy_url: Option<String>,
+            token_source: Option<crate::config::ValueSource>,
         ) -> Result<Self, String> {
             let mut client_builder =
                 reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
@@ -776,7 +780,11 @@ mod oidc_impl {
                 .build()
                 .map_err(|e| format!("OIDC client: failed to create HTTP client: {e}"))?;
 
-            let endpoint = if let Some(ep) = token_endpoint.filter(|s| !s.is_empty()) {
+            let endpoint = if token_source.is_some() {
+                // Go frp v0.70.1 compat: auth.oidc.tokenSource resolves the
+                // token dynamically; no token endpoint is needed.
+                String::new()
+            } else if let Some(ep) = token_endpoint.filter(|s| !s.is_empty()) {
                 ep
             } else if let Some(iss) = issuer.filter(|s| !s.is_empty()) {
                 let config_url = format!(
@@ -819,20 +827,10 @@ mod oidc_impl {
                 scope
             };
 
-            // Parse additional endpoint params: "key1=val1&key2=val2" → Vec of (key, val) pairs
+            // Parse additional endpoint params (Go: map[string]string).
             let additional_params: Vec<(String, String)> = additional_endpoint_params
-                .split('&')
-                .filter(|s| !s.is_empty())
-                .filter_map(|pair| {
-                    let mut parts = pair.splitn(2, '=');
-                    let key = parts.next().unwrap_or("").trim().to_string();
-                    let val = parts.next().unwrap_or("").trim().to_string();
-                    if key.is_empty() {
-                        None
-                    } else {
-                        Some((key, val))
-                    }
-                })
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
 
             Ok(Self {
@@ -842,6 +840,7 @@ mod oidc_impl {
                 audience,
                 scope,
                 additional_params,
+                token_source,
                 cached: tokio::sync::Mutex::new(None),
                 non_caching: std::sync::atomic::AtomicBool::new(false),
                 http,
@@ -854,8 +853,12 @@ mod oidc_impl {
                 ("client_id", self.client_id.as_str()),
                 ("client_secret", self.client_secret.as_str()),
                 ("scope", self.scope.as_str()),
-                ("audience", self.audience.as_str()),
             ];
+            // Go frp compat (oidc.go:137-139): omit the audience parameter
+            // when empty instead of sending an empty value.
+            if !self.audience.is_empty() {
+                params.push(("audience", self.audience.as_str()));
+            }
             let extra: Vec<(&str, &str)> = self
                 .additional_params
                 .iter()
@@ -921,7 +924,16 @@ mod oidc_impl {
         /// Get a valid access token — uses cached if not expired, fetches new otherwise.
         /// Automatically refreshes when token is within 60s of expiry.
         /// Falls back to non-caching (always fetch) when expires_in was omitted.
+        /// When a tokenSource is configured, resolves it instead (Go
+        /// OidcTokenSourceAuthProvider compat).
         async fn get_token(&self) -> Result<String, String> {
+            if let Some(ref source) = self.token_source {
+                // Go oidc.go:232-238: resolve the ValueSource for the token.
+                return source
+                    .resolve()
+                    .map_err(|e| format!("failed to resolve auth.oidc.tokenSource: {e}"));
+            }
+
             // Go frp compat: non-caching mode — always fetch a fresh token.
             if self.non_caching.load(std::sync::atomic::Ordering::Relaxed) {
                 let (token, _expires_in) = self.fetch_token().await?;
@@ -948,29 +960,30 @@ mod oidc_impl {
         }
 
         /// Set privilege_key on a Login message using an OIDC token.
+        /// Go frp compat: preserves the caller-provided timestamp
+        /// (Go oidc.go SetLogin only sets PrivilegeKey).
         pub async fn set_login(&self, login: &mut crate::msg::Login) -> Result<(), String> {
             let token = self.get_token().await?;
             login.privilege_key = Some(token);
-            login.timestamp = None;
             Ok(())
         }
 
         /// Set privilege_key on a Ping message using an OIDC token.
+        /// Go frp compat: preserves the caller-provided timestamp.
         pub async fn set_ping(&self, ping: &mut crate::msg::Ping) -> Result<(), String> {
             let token = self.get_token().await?;
             ping.privilege_key = Some(token);
-            ping.timestamp = None;
             Ok(())
         }
 
         /// Set privilege_key on a NewWorkConn message using an OIDC token.
+        /// Go frp compat: preserves the caller-provided timestamp.
         pub async fn set_new_work_conn(
             &self,
             nwc: &mut crate::msg::NewWorkConn,
         ) -> Result<(), String> {
             let token = self.get_token().await?;
             nwc.privilege_key = Some(token);
-            nwc.timestamp = None;
             Ok(())
         }
     }
@@ -1115,15 +1128,10 @@ fn resolve_dynamic_token_inner(
     unsafe_features: Option<&crate::unsafe_features::UnsafeFeatures>,
 ) -> Result<String, String> {
     if let Some(path) = token.strip_prefix("file://") {
-        if unsafe_features
-            .is_some_and(|uf| !uf.is_enabled(crate::unsafe_features::TOKEN_SOURCE_FILE))
-        {
-            return Err(
-                "file:// token source blocked: TokenSourceFile not in UnsafeFeatures allowlist. \
-                 Set [common].unsafe_features = [\"TokenSourceFile\"] to enable."
-                    .into(),
-            );
-        }
+        // Go frp v0.70.1: only exec token sources require the unsafe-features
+        // gate (validation/client.go validateOIDCConfig + token.go); file
+        // sources are always allowed.
+        let _ = unsafe_features;
         match std::fs::read_to_string(path) {
             Ok(content) => Ok(content.lines().next().unwrap_or("").trim().to_string()),
             Err(e) => Err(format!(
@@ -1278,6 +1286,177 @@ mod tests {
         let gen = generate_token(token, ts);
         assert!(verify_token(token, ts, &gen));
         assert!(!verify_token(token, ts + 1, &gen));
+    }
+
+    /// Local capture server for OIDC token-endpoint requests. Parses the
+    /// application/x-www-form-urlencoded body and exposes the form fields.
+    struct TokenEndpointCapture {
+        _addr: std::net::SocketAddr,
+        /// oneshot receiver receiving the form fields when the server
+        /// captures the token request.
+        rx: tokio::sync::oneshot::Receiver<std::collections::HashMap<String, String>>,
+    }
+
+    impl TokenEndpointCapture {
+        async fn start() -> TokenEndpointCapture {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                // Plain HTTP: read request headers + body, respond 200 JSON.
+                // The capture server handles exactly one request.
+                if let Some(Ok(mut stream)) = listener.incoming().next() {
+                    let mut buf = [0u8; 16384];
+                    let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let body = req.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                    let mut form = std::collections::HashMap::new();
+                    for pair in body.split('&').filter(|s| !s.is_empty()) {
+                        let mut it = pair.splitn(2, '=');
+                        let k = it.next().unwrap_or("").to_string();
+                        let v = it.next().unwrap_or("").to_string();
+                        form.insert(k, v);
+                    }
+                    let _ = tx.send(form);
+                    let _ = std::io::Write::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n{\"access_token\":\"tok-1\",\"expires_in\":3600}",
+                    );
+                }
+            });
+            TokenEndpointCapture { _addr: addr, rx }
+        }
+
+        async fn wait(self) -> std::collections::HashMap<String, String> {
+            self.rx.await.expect("token endpoint captured a request")
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "oidc")]
+    async fn test_oidc_client_omits_empty_audience_and_sends_additional_params() {
+        let capture = TokenEndpointCapture::start().await;
+        let endpoint = format!("http://{}/token", capture._addr);
+
+        let client = OidcClient::new(
+            "client-1".into(),
+            "secret".into(),
+            String::new(), // empty audience → must be omitted from the request
+            Some(endpoint),
+            "openid".into(),
+            None,
+            &std::collections::HashMap::from([
+                ("tenant".to_string(), "acme".to_string()),
+                ("region".to_string(), "eu".to_string()),
+            ]),
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("OidcClient::new");
+
+        let mut login: crate::msg::Login =
+            serde_json::from_str(r#"{"timestamp":1234567890}"#).expect("parse Login");
+        assert_eq!(login.timestamp, Some(1234567890));
+        client
+            .set_login(&mut login)
+            .await
+            .expect("set_login should fetch a token");
+
+        let form = capture.wait().await;
+        assert_eq!(
+            form.get("grant_type").map(String::as_str),
+            Some("client_credentials")
+        );
+        assert_eq!(form.get("client_id").map(String::as_str), Some("client-1"));
+        // Empty audience is omitted entirely (Go oidc.go:137-139).
+        assert!(
+            !form.contains_key("audience"),
+            "empty audience must be omitted: {form:?}"
+        );
+        // Additional endpoint params are sent as form fields.
+        assert_eq!(form.get("tenant").map(String::as_str), Some("acme"));
+        assert_eq!(form.get("region").map(String::as_str), Some("eu"));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "oidc")]
+    async fn test_oidc_client_preserves_timestamp_and_sends_audience_when_set() {
+        let capture = TokenEndpointCapture::start().await;
+        let endpoint = format!("http://{}/token", capture._addr);
+
+        let client = OidcClient::new(
+            "client-1".into(),
+            "secret".into(),
+            "api-prod".into(), // non-empty audience → sent
+            Some(endpoint),
+            "openid".into(),
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("OidcClient::new");
+
+        let mut login: crate::msg::Login =
+            serde_json::from_str(r#"{"timestamp":987654321}"#).expect("parse Login");
+        client
+            .set_login(&mut login)
+            .await
+            .expect("set_login should fetch a token");
+
+        // Go compat: set_login must NOT clear the caller-provided timestamp.
+        assert_eq!(login.timestamp, Some(987654321));
+
+        let form = capture.wait().await;
+        assert_eq!(form.get("audience").map(String::as_str), Some("api-prod"));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "oidc")]
+    async fn test_oidc_client_token_source_resolves_token() {
+        // Go frp v0.70.1 compat: auth.oidc.tokenSource resolves the token
+        // from a dynamic source instead of the client-credentials flow.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token_path = dir.path().join("oidc-token");
+        std::fs::write(&token_path, "source-token-123\n").expect("write token file");
+
+        let source = crate::config::ValueSource {
+            source_type: "file".into(),
+            file: Some(crate::config::FileSource {
+                path: token_path.to_str().unwrap().into(),
+            }),
+            exec: None,
+        };
+
+        // No token endpoint needed when a tokenSource is configured.
+        let client = OidcClient::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            None,
+            String::new(),
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            false,
+            None,
+            Some(source),
+        )
+        .await
+        .expect("OidcClient::new with tokenSource");
+
+        let mut login: crate::msg::Login = serde_json::from_str(r#"{}"#).expect("parse Login");
+        client
+            .set_login(&mut login)
+            .await
+            .expect("set_login should resolve the source");
+        assert_eq!(login.privilege_key.as_deref(), Some("source-token-123"));
     }
 
     #[test]
@@ -1549,18 +1728,17 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_dynamic_token_file_blocked_when_not_allowed() {
-        // file:// must require TokenSourceFile in the UnsafeFeatures allowlist.
+    fn test_resolve_dynamic_token_file_allowed_without_unsafe() {
+        // Go frp v0.70.1: only exec token sources require the unsafe gate;
+        // file sources are always allowed.
         let dir = std::env::temp_dir();
         let path = dir.join(format!("frp-test-token-i3-{}.txt", std::process::id()));
-        std::fs::write(&path, "file-token-should-be-blocked\n").unwrap();
+        std::fs::write(&path, "file-token-allowed\n").unwrap();
         let url = format!("file://{}", path.display());
-        // Default UnsafeFeatures has TokenSourceFile DISABLED.
         let uf = crate::unsafe_features::UnsafeFeatures::default();
         let result = resolve_dynamic_token_checked(&url, &uf);
         std::fs::remove_file(&path).ok();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("TokenSourceFile"));
+        assert_eq!(result.unwrap(), "file-token-allowed");
     }
 
     #[test]

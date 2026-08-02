@@ -780,17 +780,35 @@ impl AsyncWrite for XtcpP2pStream {
 ///
 /// `sid` and `key` enable Go-compat hole-punch (encrypted NatHoleSid
 /// exchange). When both are `None`, uses simple "frp" magic (Rust↔Rust).
+#[allow(clippy::too_many_arguments)]
 pub async fn xtcp_p2p_connect(
     socket: UdpSocket,
     candidates: &[String],
+    assisted: &[String],
+    behavior: Option<&crate::msg::NatHoleDetectBehavior>,
     conv: u32,
     kcp_config: KcpConfig,
     hole_punch_timeout_ms: u64,
     sid: Option<&str>,
     key: Option<&[u8; 16]>,
 ) -> Result<XtcpP2pStream, String> {
-    // 1. Punch hole.
-    let peer_addr = punch_udp_hole(&socket, candidates, hole_punch_timeout_ms, sid, key).await?;
+    // 1. Punch hole. With a server-provided DetectBehavior, use the full Go
+    //    MakeHole state machine; otherwise the simplified punch.
+    let peer_addr = match behavior {
+        Some(b) => {
+            punch_udp_hole_makehole(
+                &socket,
+                candidates,
+                assisted,
+                b,
+                hole_punch_timeout_ms,
+                sid,
+                key,
+            )
+            .await?
+        }
+        None => punch_udp_hole(&socket, candidates, hole_punch_timeout_ms, sid, key).await?,
+    };
 
     tracing::info!(
         peer = %peer_addr,
@@ -839,6 +857,8 @@ pub async fn xtcp_p2p_connect(
 pub async fn xtcp_p2p_connect_yamux(
     socket: UdpSocket,
     candidates: &[String],
+    assisted: &[String],
+    behavior: Option<&crate::msg::NatHoleDetectBehavior>,
     conv: u32,
     kcp_config: KcpConfig,
     hole_punch_timeout_ms: u64,
@@ -855,6 +875,8 @@ pub async fn xtcp_p2p_connect_yamux(
     let kcp_stream = xtcp_p2p_connect(
         socket,
         candidates,
+        assisted,
+        behavior,
         conv,
         kcp_config,
         hole_punch_timeout_ms,
@@ -1019,9 +1041,12 @@ pub async fn xtcp_p2p_connect_yamux(
 // --- Fallback when tcp-mux is disabled ---
 
 #[cfg(not(feature = "tcp-mux"))]
+#[allow(clippy::too_many_arguments)]
 pub async fn xtcp_p2p_connect_yamux(
     socket: UdpSocket,
     candidates: &[String],
+    assisted: &[String],
+    behavior: Option<&crate::msg::NatHoleDetectBehavior>,
     conv: u32,
     kcp_config: KcpConfig,
     hole_punch_timeout_ms: u64,
@@ -1037,6 +1062,8 @@ pub async fn xtcp_p2p_connect_yamux(
     xtcp_p2p_connect(
         socket,
         candidates,
+        assisted,
+        behavior,
         conv,
         kcp_config,
         hole_punch_timeout_ms,
@@ -1044,4 +1071,202 @@ pub async fn xtcp_p2p_connect_yamux(
         _key,
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Go MakeHole state machine (pkg/nathole/nathole.go MakeHole)
+// ---------------------------------------------------------------------------
+//
+// Full-feature hole punch matching Go frp v0.70.1:
+// - sender role: optional SendDelayMs wait, probes AssistedAddrs + CandidateAddrs
+// - receiver role: optional ListenRandomPorts extra sockets
+// - CandidatePorts range scanning on receiver side
+// - SendRandomPorts random-port probing
+// - TTL applied to probe packets
+// The simplified `punch_udp_hole` remains for Rust↔Rust/no-behavior callers.
+
+/// Send an encrypted NatHoleSid probe (or "frp" magic) from `socket` to `addr`.
+async fn send_sid_probe(
+    socket: &UdpSocket,
+    addr: SocketAddr,
+    ttl: u8,
+    sid: Option<&str>,
+    key: Option<&[u8; 16]>,
+) {
+    let _ = socket.set_ttl(ttl.max(1) as u32);
+    match (sid, key) {
+        (Some(sid_str), Some(enc_key)) => {
+            let msg = NatHoleDetectSid::new(sid_str, false);
+            if let Ok(encoded) = encode_detect_msg(&msg, enc_key) {
+                if let Err(e) = socket.send_to(&encoded, addr).await {
+                    tracing::debug!(%addr, error = %e, "XTCP MakeHole: sid probe send failed");
+                }
+            }
+        }
+        _ => {
+            if let Err(e) = socket.send_to(HOLE_PUNCH_MAGIC, addr).await {
+                tracing::debug!(%addr, error = %e, "XTCP MakeHole: magic probe send failed");
+            }
+        }
+    }
+}
+
+/// Wait for a NatHoleSid/magic detect message on any of `sockets`, returning
+/// the peer address. Mirrors Go `waitDetectMessage` + multi-socket select:
+/// - receiver: echoes a non-response probe back as `response:true`, then
+///   returns the peer (Go nathole.go waitDetectMessage).
+/// - sender: only accepts `response:true` (or the Rust "frp" magic from a
+///   candidate address).
+async fn wait_detect_on_any(
+    sockets: &[&UdpSocket],
+    peers: &[SocketAddr],
+    role: &str,
+    timeout_ms: u64,
+    sid: Option<&str>,
+    key: Option<&[u8; 16]>,
+) -> Result<SocketAddr, String> {
+    let mut buf = [0u8; 1024];
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed().as_millis() as u64 >= timeout_ms {
+            return Err(format!(
+                "wait detect message timeout after {}ms",
+                timeout_ms
+            ));
+        }
+        for s in sockets.iter() {
+            let r =
+                tokio::time::timeout(std::time::Duration::from_millis(50), s.recv_from(&mut buf))
+                    .await;
+            match r {
+                Ok(Ok((n, peer))) => {
+                    let data = &buf[..n];
+                    if data == HOLE_PUNCH_MAGIC {
+                        // Rust magic: only accept from a known candidate
+                        // (a receiver's extra listener socket is not one).
+                        if peers.contains(&peer) {
+                            return Ok(peer);
+                        }
+                        continue;
+                    }
+                    if let (Some(sid_str), Some(enc_key)) = (sid, key) {
+                        if let Ok(msg) = decode_detect_msg(data, enc_key) {
+                            if msg.sid == sid_str && (msg.response || role == "receiver") {
+                                // Receiver echoes the probe as a response
+                                // (Go waitDetectMessage), then returns.
+                                if role == "receiver" && !msg.response {
+                                    let mut echo = msg;
+                                    echo.response = true;
+                                    if let Ok(encoded) = encode_detect_msg(&echo, enc_key) {
+                                        let _ = s.send_to(&encoded, peer).await;
+                                    }
+                                }
+                                return Ok(peer);
+                            }
+                            // Sender got a plain probe — keep waiting.
+                        }
+                    }
+                }
+                Ok(Err(_)) => return Err("recv error during MakeHole detect".into()),
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+/// Go `MakeHole` full-feature hole punch.
+///
+/// `socket` is the STUN socket (kept borrowed; extra listener sockets are
+/// created internally for `ListenRandomPorts`). `candidates` are the peer's
+/// STUN addresses, `assisted` its assisted addresses. Returns the peer
+/// address that answered the detect probe.
+#[allow(clippy::too_many_arguments)]
+pub async fn punch_udp_hole_makehole(
+    socket: &UdpSocket,
+    candidates: &[String],
+    assisted: &[String],
+    behavior: &crate::msg::NatHoleDetectBehavior,
+    timeout_ms: u64,
+    sid: Option<&str>,
+    key: Option<&[u8; 16]>,
+) -> Result<SocketAddr, String> {
+    let role = behavior.role.as_deref().unwrap_or("sender");
+    let ttl = behavior.ttl.max(1) as u8;
+
+    // Sender waits SendDelayMs before probing (Go MakeHole).
+    if role == "sender" && behavior.send_delay_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(
+            behavior.send_delay_ms as u64,
+        ))
+        .await;
+    }
+
+    // Detect address set: assisted + candidates (sender), or candidates when
+    // the receiver has no candidate ports to scan.
+    let mut detect_addrs: Vec<String> = Vec::new();
+    if role == "sender" {
+        detect_addrs.extend(assisted.iter().cloned());
+        detect_addrs.extend(candidates.iter().cloned());
+    } else if behavior.candidate_ports.is_none() {
+        detect_addrs.extend(candidates.iter().cloned());
+    }
+    detect_addrs.sort();
+    detect_addrs.dedup();
+
+    let parsed: Vec<SocketAddr> = detect_addrs.iter().filter_map(|a| a.parse().ok()).collect();
+
+    // Extra receiver sockets (Go ListenRandomPorts).
+    let mut extra_sockets: Vec<tokio::net::UdpSocket> = Vec::new();
+    if role == "receiver" && behavior.listen_random_ports > 0 {
+        for _ in 0..behavior.listen_random_ports {
+            if let Ok(s) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                for addr in &parsed {
+                    send_sid_probe(&s, *addr, ttl, sid, key).await;
+                }
+                extra_sockets.push(s);
+            }
+        }
+    }
+
+    // Base socket probes.
+    for addr in &parsed {
+        send_sid_probe(socket, *addr, ttl, sid, key).await;
+    }
+
+    // Candidate port range scanning (receiver side, Go CandidatePorts).
+    if let Some(ref ranges) = behavior.candidate_ports {
+        for cand in candidates {
+            let Ok(base) = cand.parse::<SocketAddr>() else {
+                continue;
+            };
+            for r in ranges {
+                for p in r.from.max(1)..=r.to.max(1) {
+                    let target = SocketAddr::new(base.ip(), p as u16);
+                    send_sid_probe(socket, target, ttl, sid, key).await;
+                }
+            }
+        }
+    }
+
+    // SendRandomPorts: probe random ports on candidate addresses (Go sends
+    // up to N random ports around the candidate). We probe a bounded window.
+    if behavior.send_random_ports > 0 && !parsed.is_empty() {
+        let n = behavior.send_random_ports.clamp(1, 8) as u16;
+        for base in &parsed {
+            for _ in 0..n {
+                let p = base.port().saturating_add(rand::random::<u16>() % 2048);
+                let target = SocketAddr::new(base.ip(), p.max(1));
+                send_sid_probe(socket, target, ttl, sid, key).await;
+            }
+        }
+    }
+
+    // Wait for a detect response on the base socket or any extra socket.
+    // The source-address allowlist is the peer's candidate set (a receiver's
+    // extra listener sockets are not candidates and must be ignored).
+    let candidate_peers: Vec<SocketAddr> =
+        candidates.iter().filter_map(|a| a.parse().ok()).collect();
+    let mut all: Vec<&UdpSocket> = vec![socket];
+    all.extend(extra_sockets.iter());
+    wait_detect_on_any(&all, &candidate_peers, role, timeout_ms, sid, key).await
 }

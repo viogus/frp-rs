@@ -44,14 +44,15 @@ pub async fn start_https2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle,
         ));
     }
     let host_rewrite = cfg.host_header_rewrite.clone();
+    let request_headers = cfg.request_headers.clone();
     let tls_acceptor = build_tls_acceptor(&cfg.crt_file, &cfg.key_file, None)?;
     serve_plugin(
         "https2http",
-        (target_addr, host_rewrite, tls_acceptor),
-        |tcp, peer, (target, rewrite, acceptor)| async move {
+        (target_addr, host_rewrite, request_headers, tls_acceptor),
+        |tcp, peer, (target, rewrite, headers, acceptor)| async move {
             match acceptor.accept(tcp).await {
                 Ok(tls) => {
-                    if let Err(e) = handle_conn(tls, &target, &rewrite).await {
+                    if let Err(e) = handle_conn(tls, &target, &rewrite, &headers).await {
                         debug!(%peer, error = %e, "https2http: {peer} error: {e}");
                     }
                 }
@@ -74,8 +75,11 @@ async fn handle_conn(
     mut tls: tokio_rustls::server::TlsStream<TcpStream>,
     target: &str,
     host_rewrite: &str,
+    request_headers: &std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
-    let fwd = crate::plugin::read_request_and_build_forward(&mut tls, host_rewrite).await?;
+    let fwd =
+        crate::plugin::read_request_and_build_forward(&mut tls, host_rewrite, request_headers)
+            .await?;
 
     // Connect to plain HTTP backend
     let (host, port) = split_host_port(target);

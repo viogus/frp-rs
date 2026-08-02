@@ -14,6 +14,16 @@ use frp_core::transport::IoStream;
 
 use crate::util::opt_if_empty;
 
+/// Build the wire-level proxy name matching Go frp's `naming.AddUserPrefix`.
+/// When `user` is non-empty, returns `{user}.{name}`; otherwise returns `name`.
+pub fn wire_proxy_name(user: &str, name: &str) -> String {
+    if user.is_empty() {
+        name.to_string()
+    } else {
+        format!("{user}.{name}")
+    }
+}
+
 /// Build a NewVisitorConn message for an STCP/XTCP visitor connection.
 /// sign_key = MD5(sk + timestamp) matching Go frp v0.69.1 behaviour.
 pub fn create_visitor_conn_msg(
@@ -59,10 +69,16 @@ pub fn create_visitor_conn_msg(
 }
 
 /// Creates the NewProxy message for registering a proxy with the server.
-/// All relevant fields from ProxyConfig are wired through (Go frp v0.69.1 compat).
-pub fn create_new_proxy_msg(p: &frp_core::config::ProxyConfig, local_addr: &str) -> FrpMessage {
+/// When `user` is non-empty, the proxy_name is prefixed as `{user}.{name}`
+/// matching Go frp's `naming.AddUserPrefix` (multi-tenant wire naming).
+pub fn create_new_proxy_msg(
+    p: &frp_core::config::ProxyConfig,
+    local_addr: &str,
+    user: &str,
+) -> FrpMessage {
+    let wire_name = wire_proxy_name(user, &p.name);
     let mut result = FrpMessage::NewProxy(Box::new(msg::NewProxy {
-        proxy_name: p.name.clone(),
+        proxy_name: wire_name,
         proxy_type: p.proxy_type.clone(),
         use_encryption: if p.use_encryption { Some(true) } else { None },
         use_compression: if p.use_compression { Some(true) } else { None },
@@ -127,14 +143,52 @@ pub fn create_new_proxy_msg(p: &frp_core::config::ProxyConfig, local_addr: &str)
 /// Connects to a local service and returns the TCP stream.
 ///
 /// `addr` may be a hostname like `"localhost:8080"` or an IP literal.
+/// Resolves hostnames via the system resolver.
 pub async fn connect_local(addr: &str) -> Result<TcpStream, frp_core::Error> {
+    connect_local_with_dns(addr, None).await
+}
+
+/// Connects to a local service, resolving hostnames via `dns_server` when
+/// set (Go frp compat: `dnsServer` applies to local backend dials too).
+pub async fn connect_local_with_dns(
+    addr: &str,
+    dns_server: Option<&str>,
+) -> Result<TcpStream, frp_core::Error> {
     connect_local_with_resolver(
         addr,
         std::time::Duration::from_secs(5),
         |query| async move {
-            tokio::net::lookup_host(query)
-                .await
-                .map(|addresses| addresses.collect())
+            match dns_server.filter(|d| !d.is_empty()) {
+                Some(dns) => {
+                    // Split host:port, resolve host via the custom DNS server.
+                    let (host, port) = match query.rsplit_once(':') {
+                        Some((h, p)) => (h, p),
+                        None => (query.as_str(), ""),
+                    };
+                    if host.parse::<std::net::IpAddr>().is_ok() {
+                        tokio::net::lookup_host(query)
+                            .await
+                            .map(|addresses| addresses.collect())
+                    } else {
+                        match frp_core::transport::resolve_host_with_dns(host, dns).await {
+                            Ok(ip) => {
+                                let addr = if port.is_empty() {
+                                    ip
+                                } else {
+                                    format!("{ip}:{port}")
+                                };
+                                tokio::net::lookup_host(&addr)
+                                    .await
+                                    .map(|addresses| addresses.collect())
+                            }
+                            Err(e) => Err(std::io::Error::other(e.to_string())),
+                        }
+                    }
+                }
+                None => tokio::net::lookup_host(query)
+                    .await
+                    .map(|addresses| addresses.collect()),
+            }
         },
     )
     .await
@@ -450,6 +504,105 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[test]
+    fn test_create_new_proxy_msg_user_prefix() {
+        let cfg = frp_core::config::ProxyConfig {
+            name: "test-proxy".to_string(),
+            proxy_type: "tcp".to_string(),
+            local_ip: "127.0.0.1".to_string(),
+            local_port: 8080,
+            ..Default::default()
+        };
+        let msg = create_new_proxy_msg(&cfg, "127.0.0.1:8080", "alice");
+        match msg {
+            FrpMessage::NewProxy(np) => {
+                assert_eq!(np.proxy_name, "alice.test-proxy");
+            }
+            _ => panic!("expected NewProxy variant"),
+        }
+    }
+
+    #[test]
+    fn test_create_new_proxy_msg_empty_user() {
+        let cfg = frp_core::config::ProxyConfig {
+            name: "test-proxy".to_string(),
+            proxy_type: "tcp".to_string(),
+            local_ip: "127.0.0.1".to_string(),
+            local_port: 8080,
+            ..Default::default()
+        };
+        let msg = create_new_proxy_msg(&cfg, "127.0.0.1:8080", "");
+        match msg {
+            FrpMessage::NewProxy(np) => {
+                assert_eq!(np.proxy_name, "test-proxy");
+            }
+            _ => panic!("expected NewProxy variant"),
+        }
+    }
+
+    #[test]
+    fn test_create_new_proxy_msg_user_prefix_serialization() {
+        let cfg = frp_core::config::ProxyConfig {
+            name: "test".to_string(),
+            proxy_type: "tcp".to_string(),
+            local_ip: "127.0.0.1".to_string(),
+            local_port: 8080,
+            ..Default::default()
+        };
+        let msg = create_new_proxy_msg(&cfg, "127.0.0.1:8080", "alice");
+        match &msg {
+            FrpMessage::NewProxy(np) => {
+                assert_eq!(np.proxy_name, "alice.test");
+            }
+            _ => unreachable!(),
+        }
+        let wire = serde_json::to_string(&msg).unwrap();
+        assert!(wire.contains(r#""proxy_name":"alice.test""#));
+    }
+
+    #[test]
+    fn test_wire_proxy_name_used_for_map_keys_and_health() {
+        // Simulates what Service::new() does: build a proxy config with user="alice",
+        // verify proxy_info_map and health_proxy_configs keys are prefixed.
+        let cfg = frp_core::config::ProxyConfig {
+            name: "http-proxy".to_string(),
+            proxy_type: "tcp".to_string(),
+            local_ip: "127.0.0.1".to_string(),
+            local_port: 3000,
+            health_check_type: "tcp".to_string(),
+            ..Default::default()
+        };
+
+        let user = "alice";
+        let expected_wire = "alice.http-proxy";
+
+        // proxy_info_map key = wire_proxy_name(&cfg.user, &p.name)
+        let map_key = wire_proxy_name(user, &cfg.name);
+        assert_eq!(
+            map_key, expected_wire,
+            "proxy_info_map key must be prefixed: {map_key} != {expected_wire}"
+        );
+
+        // health_proxy_configs key = wire_proxy_name(&cfg.user, &p.name)
+        let hc_key = wire_proxy_name(user, &cfg.name);
+        assert_eq!(
+            hc_key, expected_wire,
+            "health_proxy_configs key must be prefixed: {hc_key} != {expected_wire}"
+        );
+
+        // create_new_proxy_msg also produces the prefixed wire name
+        let msg = create_new_proxy_msg(&cfg, "127.0.0.1:3000", user);
+        match msg {
+            FrpMessage::NewProxy(np) => {
+                assert_eq!(
+                    np.proxy_name, expected_wire,
+                    "NewProxy.proxy_name must be {expected_wire}"
+                );
+            }
+            _ => panic!("expected NewProxy variant"),
         }
     }
 

@@ -29,11 +29,12 @@ pub async fn start_http2http_plugin(cfg: &PluginConfig) -> Result<PluginHandle, 
         ));
     };
     let host_rewrite = cfg.host_header_rewrite.clone();
+    let request_headers = cfg.request_headers.clone();
     serve_plugin(
         "http2http",
-        (target_addr, host_rewrite),
-        |client, peer, (target, rewrite)| async move {
-            if let Err(e) = handle_conn(client, &target, &rewrite).await {
+        (target_addr, host_rewrite, request_headers),
+        |client, peer, (target, rewrite, headers)| async move {
+            if let Err(e) = handle_conn(client, &target, &rewrite, &headers).await {
                 debug!(%peer, error = %e, "http2http: {peer} error: {e}");
             }
         },
@@ -45,8 +46,11 @@ async fn handle_conn(
     mut client: TcpStream,
     target: &str,
     host_rewrite: &str,
+    request_headers: &std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
-    let fwd = crate::plugin::read_request_and_build_forward(&mut client, host_rewrite).await?;
+    let fwd =
+        crate::plugin::read_request_and_build_forward(&mut client, host_rewrite, request_headers)
+            .await?;
 
     // Connect to backend
     let mut remote = TcpStream::connect(target)

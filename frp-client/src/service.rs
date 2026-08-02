@@ -51,6 +51,7 @@ use frp_core::metrics::ProxyMetricsRegistry;
 use crate::admin::AdminState;
 use crate::control::ControlConnection;
 use crate::plugin::{self, PluginContext, PluginHandle};
+use crate::proxy::wire_proxy_name;
 use crate::proxy_runtime::{ProxyPhase, ProxyRuntimeInfo, ReloadRequest};
 use crate::store::{merge_client_config, StoreSource};
 use crate::util::opt_if_empty;
@@ -155,6 +156,9 @@ pub struct Service {
     visitor_tx: mpsc::Sender<VisitorRequest>,
     /// Receiver side of visitor channel — consumed by run().
     visitor_rx: std::sync::Mutex<Option<mpsc::Receiver<VisitorRequest>>>,
+    /// Set when a reload changed visitors; the session loop restarts so the
+    /// new visitor set is fully rebuilt (visitors are session-scoped).
+    visitor_reload_needed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Per-proxy health check cancel flags. Keyed by proxy name.
     /// Set to true on CloseProxy/CloseProxyResp; entry removed in try_reload.
     health_cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
@@ -311,6 +315,15 @@ impl Service {
                 .auth
                 .as_ref()
                 .ok_or("OIDC auth requires [auth] section in config")?;
+            // Go frp v0.70.1 compat: auth.oidc.tokenSource (dynamic token
+            // source, mutually exclusive with the client-credentials flow).
+            // The config validator enforces mutual exclusivity; exec sources
+            // additionally require the unsafe-features gate like auth.tokenSource.
+            let token_source = ac.oidc_token_source.clone();
+            if let Some(ref source) = token_source {
+                frp_core::auth::validate_token_source_unsafe(source, &unsafe_features)
+                    .map_err(std::io::Error::other)?;
+            }
             let client = OidcClient::new(
                 ac.oidc_client_id.clone(),
                 ac.oidc_client_secret.clone(),
@@ -322,6 +335,7 @@ impl Service {
                 Some(ac.oidc_tls_trusted_ca_file.clone()).filter(|s| !s.is_empty()),
                 ac.oidc_tls_insecure_skip_verify,
                 Some(ac.oidc_proxy_url.clone()).filter(|s| !s.is_empty()),
+                token_source,
             )
             .await
             .map_err(|e| format!("OIDC client init failed: {e}"))?;
@@ -389,6 +403,17 @@ impl Service {
                         use_compression: p.use_compression,
                         token: auth_cfg.token.clone(),
                         oidc_client: oidc_client.clone(),
+                        tcp_mux: cfg.tcp_mux,
+                        tcp_mux_keepalive_interval: cfg.tcp_mux_keepalive_interval,
+                        proxy_url: opt_if_empty!(cfg.proxy_url.clone()),
+                        dns_server: opt_if_empty!(cfg.dns_server.clone()),
+                        dial_timeout_secs: cfg.dial_server_timeout.max(1) as u64,
+                        keepalive_secs: cfg.dial_server_keepalive.max(0) as u64,
+                        connect_bind_addr: opt_if_empty!(cfg.connect_server_local_ip.clone()),
+                        disable_custom_tls_first_byte: cfg.disable_custom_tls_first_byte,
+                        tls_cert_file: opt_if_empty!(cfg.tls_cert_file.clone()),
+                        tls_key_file: opt_if_empty!(cfg.tls_key_file.clone()),
+                        v2: cfg.v2,
                     };
                     dispatch_plugin_start(plugin_cfg, Some(plugin_ctx)).await
                 } else {
@@ -420,8 +445,9 @@ impl Service {
                 .map(|pl| pl.plugin_type.clone())
                 .unwrap_or_default();
             let snapshot = crate::reload::config_snapshot(p);
+            let wn = wire_proxy_name(&cfg.user, &p.name);
             map.insert(
-                p.name.clone(),
+                wn.clone(),
                 ProxyRuntimeInfo {
                     local_addr,
                     proxy_type: p.proxy_type.clone(),
@@ -472,7 +498,7 @@ impl Service {
             cfg.proxies
                 .iter()
                 .filter(|p| !p.health_check_type.is_empty())
-                .map(|p| (p.name.clone(), p.clone()))
+                .map(|p| (wire_proxy_name(&cfg.user, &p.name), p.clone()))
                 .collect(),
         ));
 
@@ -497,6 +523,7 @@ impl Service {
             xtcp_rx: std::sync::Mutex::new(Some(xtcp_rx)),
             visitor_tx,
             visitor_rx: std::sync::Mutex::new(Some(visitor_rx)),
+            visitor_reload_needed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             health_cancels: Arc::new(Mutex::new(HashMap::new())),
             health_proxy_configs,
             health_tx,
@@ -738,6 +765,24 @@ impl Service {
                     always_auth_pass: None,
                 }),
                 cfg_local.dial_server_timeout,
+                #[cfg(feature = "quic")]
+                frp_core::quic::quic_params_from_option_values(
+                    cfg_local
+                        .quic_options
+                        .as_ref()
+                        .map(|q| q.keepalive_period)
+                        .unwrap_or(0),
+                    cfg_local
+                        .quic_options
+                        .as_ref()
+                        .map(|q| q.max_idle_timeout)
+                        .unwrap_or(0),
+                    cfg_local
+                        .quic_options
+                        .as_ref()
+                        .map(|q| q.max_incoming_streams)
+                        .unwrap_or(0),
+                ),
             );
 
             #[cfg(feature = "quic")]
@@ -814,7 +859,7 @@ impl Service {
                     .proxy_info_map
                     .read()
                     .await
-                    .get(&p.name)
+                    .get(&wire_proxy_name(&cfg_local.user, &p.name))
                     .map(|info| info.local_addr.clone())
                     .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
                 match ctl
@@ -828,7 +873,8 @@ impl Service {
                         info!(proxy_name = %p.name, remote = %remote, "Proxy '{}' registered on remote port {}", p.name, remote);
                         // Update runtime info for admin API
                         let mut map = self.proxy_info_map.write().await;
-                        if let Some(info) = map.get_mut(&p.name) {
+                        if let Some(info) = map.get_mut(&wire_proxy_name(&cfg_local.user, &p.name))
+                        {
                             info.remote_addr = remote;
                             info.err.clear();
                             info.phase = ProxyPhase::Running;
@@ -844,7 +890,8 @@ impl Service {
                     Err(e) => {
                         warn!(proxy_name = %p.name, error = %e, "Failed to register proxy '{}': {}", p.name, e);
                         let mut map = self.proxy_info_map.write().await;
-                        if let Some(info) = map.get_mut(&p.name) {
+                        if let Some(info) = map.get_mut(&wire_proxy_name(&cfg_local.user, &p.name))
+                        {
                             info.err = e.to_string();
                             info.phase = ProxyPhase::StartErr(e.to_string());
                         }
@@ -991,12 +1038,16 @@ impl Service {
                         tls_enable: cfg_local.tls_enable,
                         tls_server_name: cfg_local.tls_server_name.clone(),
                         tls_ca_file: opt_if_empty!(cfg_local.tls_ca_file),
+                        tls_cert_file: opt_if_empty!(cfg_local.tls_cert_file),
+                        tls_key_file: opt_if_empty!(cfg_local.tls_key_file),
+                        dns_server: opt_if_empty!(cfg_local.dns_server),
                         yamux: yamux.clone(),
                         quic_conn: quic_arg,
                         v2,
                         oidc_client: self.oidc_client.clone(),
                         udp_sockets: udp_sockets.clone(),
                         udp_enc_cfg: udp_enc_cfg.clone(),
+                        udp_packet_size: cfg_local.udp_packet_size.max(0) as usize,
                         proxy_metrics: self.proxy_metrics.clone(),
                         client_auth_scopes: client_scopes.clone(),
                         server_auth_scopes: server_scopes.clone(),
@@ -1004,7 +1055,6 @@ impl Service {
                         keepalive_secs: cfg_local.dial_server_keepalive.max(0) as u64,
                         bind_addr: opt_if_empty!(cfg_local.connect_server_local_ip),
                         proxy_url: cfg_local.proxy_url.clone(),
-                        user: cfg_local.user.clone(),
                         dial_timeout_secs: cfg_local.dial_server_timeout.max(1) as u64,
                         xtcp_tx: xtcp_tx.clone(),
                         session_alive: session_alive.clone(),
@@ -1071,6 +1121,18 @@ impl Service {
                             let tls_enable = cfg_local.tls_enable;
                             let tls_server_name = cfg_local.tls_server_name.clone();
                             let tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
+                            let transport_proxy_url = opt_if_empty!(cfg_local.proxy_url.clone());
+                            let transport_dns = opt_if_empty!(cfg_local.dns_server.clone());
+                            let transport_bind =
+                                opt_if_empty!(cfg_local.connect_server_local_ip.clone());
+                            let transport_tls_cert = opt_if_empty!(cfg_local.tls_cert_file.clone());
+                            let transport_tls_key = opt_if_empty!(cfg_local.tls_key_file.clone());
+                            let transport_tcp_mux = cfg_local.tcp_mux;
+                            let transport_tcp_mux_keepalive = cfg_local.tcp_mux_keepalive_interval;
+                            let transport_dial_timeout =
+                                cfg_local.dial_server_timeout.max(1) as u64;
+                            let transport_keepalive = cfg_local.dial_server_keepalive.max(0) as u64;
+                            let transport_nocustomtls = cfg_local.disable_custom_tls_first_byte;
                             let user = cfg_local.user.clone();
                             let rid = run_id.clone();
                             let controller = self.vnet_controller.clone();
@@ -1094,6 +1156,17 @@ impl Service {
                                         tls_ca_file,
                                         user,
                                         run_id: rid,
+                                        tcp_mux: transport_tcp_mux,
+                                        tcp_mux_keepalive_interval: transport_tcp_mux_keepalive,
+                                        proxy_url: transport_proxy_url.clone(),
+                                        dns_server: transport_dns.clone(),
+                                        dial_timeout_secs: transport_dial_timeout,
+                                        keepalive_secs: transport_keepalive,
+                                        connect_bind_addr: transport_bind.clone(),
+                                        disable_custom_tls_first_byte: transport_nocustomtls,
+                                        tls_cert_file: transport_tls_cert.clone(),
+                                        tls_key_file: transport_tls_key.clone(),
+                                        v2: cfg_local.v2,
                                         destination_cidr: adv.subnet,
                                         controller,
                                         vnet_tun_tx,
@@ -1121,6 +1194,16 @@ impl Service {
                 let tls_enable = cfg_local.tls_enable;
                 let tls_server_name = cfg_local.tls_server_name.clone();
                 let tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
+                let transport_proxy_url = opt_if_empty!(cfg_local.proxy_url.clone());
+                let transport_dns = opt_if_empty!(cfg_local.dns_server.clone());
+                let transport_bind = opt_if_empty!(cfg_local.connect_server_local_ip.clone());
+                let transport_tls_cert = opt_if_empty!(cfg_local.tls_cert_file.clone());
+                let transport_tls_key = opt_if_empty!(cfg_local.tls_key_file.clone());
+                let transport_tcp_mux = cfg_local.tcp_mux;
+                let transport_tcp_mux_keepalive = cfg_local.tcp_mux_keepalive_interval;
+                let transport_dial_timeout = cfg_local.dial_server_timeout.max(1) as u64;
+                let transport_keepalive = cfg_local.dial_server_keepalive.max(0) as u64;
+                let transport_nocustomtls = cfg_local.disable_custom_tls_first_byte;
                 let visitor_type = v.visitor_type.clone();
                 let fallback_timeout_ms = v.fallback_timeout_ms;
                 let keep_tunnel_open = v.keep_tunnel_open;
@@ -1162,6 +1245,17 @@ impl Service {
                         shutdown,
                         user,
                         run_id: rid,
+                        tcp_mux: transport_tcp_mux,
+                        tcp_mux_keepalive_interval: transport_tcp_mux_keepalive,
+                        proxy_url: transport_proxy_url.clone(),
+                        dns_server: transport_dns.clone(),
+                        dial_timeout_secs: transport_dial_timeout,
+                        keepalive_secs: transport_keepalive,
+                        connect_bind_addr: transport_bind.clone(),
+                        disable_custom_tls_first_byte: transport_nocustomtls,
+                        tls_cert_file: transport_tls_cert.clone(),
+                        tls_key_file: transport_tls_key.clone(),
+                        v2: cfg_local.v2,
                     })
                     .await;
                 });
@@ -1413,8 +1507,11 @@ impl Service {
                                 .collect()
                         };
                         for (name, local_addr) in to_retry {
-                            if let Some(p) = proxies.iter().find(|p| p.name == name) {
-                                let new_proxy = crate::proxy::create_new_proxy_msg(p, &local_addr);
+                            let bare_name = if cfg_local.user.is_empty() { name.as_str() } else {
+                                name.strip_prefix(&format!("{}.", cfg_local.user)).unwrap_or(&name)
+                            };
+                            if let Some(p) = proxies.iter().find(|p| p.name == bare_name) {
+                                let new_proxy = crate::proxy::create_new_proxy_msg(p, &local_addr, &cfg_local.user);
                                 if let Err(e) = write_msg(&mut *writer.lock().await, &new_proxy, v2).await {
                                     warn!(proxy_name = %name, error = %e, "Proxy '{}' retry: write NewProxy failed: {}", name, e);
                                 } else {
@@ -1469,7 +1566,7 @@ impl Service {
                                             info.phase = ProxyPhase::WaitStart;
                                         }
                                     }
-                                    let new_proxy = crate::proxy::create_new_proxy_msg(&cfg, &local_addr);
+                                    let new_proxy = crate::proxy::create_new_proxy_msg(&cfg, &local_addr, &cfg_local.user);
                                     if let Err(e) = write_msg(&mut *writer.lock().await, &new_proxy, v2).await {
                                         warn!(proxy_name = %proxy_name, error = %e, "Failed to re-register proxy on health recovery: {}", e);
                                     } else {
@@ -1487,6 +1584,14 @@ impl Service {
                             Some(path) => self.try_reload(path, req.strict, &writer).await,
                             None => Err("no config file path stored".into()),
                         };
+                        if result.is_ok()
+                            && self.visitor_reload_needed.swap(false, Ordering::AcqRel)
+                        {
+                            // Visitor changes require a clean session restart.
+                            tracing::info!("Visitor config changed — restarting session");
+                            let _ = req.reply.send(Ok("reload success: visitor changes applied on session restart".into()));
+                            break;
+                        }
                         let _ = req.reply.send(result);
                     }
 
@@ -1701,7 +1806,9 @@ impl Service {
         health_tx: &mpsc::Sender<HealthEvent>,
         health_cancels: &Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     ) {
+        let user = self.cfg.read().await.user.clone();
         for p in proxies {
+            let wn = wire_proxy_name(&user, &p.name);
             let hc_type = p.health_check_type.clone();
             if hc_type.is_empty() {
                 continue;
@@ -1714,10 +1821,10 @@ impl Service {
                 .proxy_info_map
                 .read()
                 .await
-                .get(&p.name)
+                .get(&wn)
                 .map(|info| info.local_addr.clone())
                 .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
-            let pn = p.name.clone();
+            let pn = wn.clone();
             let interval = std::time::Duration::from_secs(p.health_check_interval_seconds.max(10));
             let timeout = std::time::Duration::from_secs(p.health_check_timeout_seconds.max(3));
             let max_failed = p.health_check_max_failed.max(1);
@@ -1902,7 +2009,9 @@ impl Service {
 
             match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
                 socket,
+                &[],
                 &candidates,
+                None,
                 conv,
                 kcp_cfg,
                 5000,
@@ -2141,7 +2250,9 @@ impl Service {
             // Provider acts as yamux server: accepts the visitor's stream.
             match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
                 socket,
+                &[],
                 &candidate_addrs,
+                None,
                 conv,
                 kcp_cfg,
                 hp_timeout,
@@ -2288,6 +2399,17 @@ impl Service {
                 use_compression: false,
                 token: self.auth_cfg.token.clone(),
                 oidc_client: self.oidc_client.clone(),
+                tcp_mux: current_cfg.tcp_mux,
+                tcp_mux_keepalive_interval: current_cfg.tcp_mux_keepalive_interval,
+                proxy_url: opt_if_empty!(current_cfg.proxy_url.clone()),
+                dns_server: opt_if_empty!(current_cfg.dns_server.clone()),
+                dial_timeout_secs: current_cfg.dial_server_timeout.max(1) as u64,
+                keepalive_secs: current_cfg.dial_server_keepalive.max(0) as u64,
+                connect_bind_addr: opt_if_empty!(current_cfg.connect_server_local_ip.clone()),
+                disable_custom_tls_first_byte: current_cfg.disable_custom_tls_first_byte,
+                tls_cert_file: opt_if_empty!(current_cfg.tls_cert_file.clone()),
+                tls_key_file: opt_if_empty!(current_cfg.tls_key_file.clone()),
+                v2: current_cfg.v2,
             };
             dispatch_plugin_start(plugin_cfg, Some(ctx)).await
         } else {
@@ -2359,10 +2481,14 @@ impl Service {
         new_cfg.proxies = active_proxies;
         new_cfg.visitors = filter_active_visitors(&new_cfg, &new_cfg.visitors);
 
+        let user = new_cfg.user.clone();
+        let old_visitors = self.cfg.read().await.visitors.clone();
         #[cfg(feature = "vnet")]
-        let mut delta = crate::reload::do_reload(&self.proxy_info_map, new_cfg).await?;
+        let mut delta =
+            crate::reload::do_reload(&self.proxy_info_map, &old_visitors, new_cfg, &user).await?;
         #[cfg(not(feature = "vnet"))]
-        let delta = crate::reload::do_reload(&self.proxy_info_map, new_cfg).await?;
+        let delta =
+            crate::reload::do_reload(&self.proxy_info_map, &old_visitors, new_cfg, &user).await?;
 
         // reload::config_snapshot omits vnet-only fields; extend the delta so
         // a subnet/IP/mask change still rebuilds the TUN during reload.
@@ -2385,12 +2511,25 @@ impl Service {
             }
         }
 
-        if delta.removed.is_empty() && delta.added.is_empty() && delta.changed.is_empty() {
+        if delta.removed.is_empty()
+            && delta.added.is_empty()
+            && delta.changed.is_empty()
+            && delta.visitor_removed.is_empty()
+            && delta.visitor_added.is_empty()
+            && delta.visitor_changed.is_empty()
+        {
             let merged = delta.new_config;
             *self.cfg.write().await = merged;
             *self.proxies.write().await = self.cfg.read().await.proxies.clone();
             return Ok(delta.summary);
         }
+
+        // Visitor listeners are session-scoped; a visitor change requires a
+        // clean session restart so the new visitor set is fully rebuilt
+        // (Go frp's visitor_manager stop/start equivalent).
+        let visitor_changed = !delta.visitor_removed.is_empty()
+            || !delta.visitor_added.is_empty()
+            || !delta.visitor_changed.is_empty();
 
         let v2 = delta.new_config.v2;
 
@@ -2493,12 +2632,12 @@ impl Service {
         let mut msgs: Vec<ReloadMsg> = Vec::new();
 
         // CloseProxy for removed proxies
+        let user = delta.new_config.user.clone();
         for name in &delta.removed {
+            let wn = wire_proxy_name(&user, name);
             msgs.push(ReloadMsg {
                 label: format!("send CloseProxy for '{name}'"),
-                msg: FrpMessage::CloseProxy(msg::CloseProxy {
-                    proxy_name: name.clone(),
-                }),
+                msg: FrpMessage::CloseProxy(msg::CloseProxy { proxy_name: wn }),
             });
             changes.push(format!("proxy '{name}' removed"));
         }
@@ -2506,19 +2645,18 @@ impl Service {
         // CloseProxy + NewProxy for changed proxies
         for name in &delta.changed {
             if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
+                let wn = wire_proxy_name(&user, name);
                 let local_addr = plugin_addrs
                     .get(name)
                     .cloned()
                     .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
                 msgs.push(ReloadMsg {
                     label: format!("send CloseProxy for changed '{name}'"),
-                    msg: FrpMessage::CloseProxy(msg::CloseProxy {
-                        proxy_name: name.clone(),
-                    }),
+                    msg: FrpMessage::CloseProxy(msg::CloseProxy { proxy_name: wn }),
                 });
                 msgs.push(ReloadMsg {
                     label: format!("send NewProxy for changed '{name}'"),
-                    msg: crate::proxy::create_new_proxy_msg(p, &local_addr),
+                    msg: crate::proxy::create_new_proxy_msg(p, &local_addr, &user),
                 });
                 changes.push(format!("proxy '{name}' updated"));
             }
@@ -2533,7 +2671,7 @@ impl Service {
                     .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
                 msgs.push(ReloadMsg {
                     label: format!("send NewProxy for added '{name}'"),
-                    msg: crate::proxy::create_new_proxy_msg(p, &local_addr),
+                    msg: crate::proxy::create_new_proxy_msg(p, &local_addr, &user),
                 });
                 changes.push(format!("proxy '{name}' added"));
             }
@@ -2576,7 +2714,7 @@ impl Service {
         {
             let mut map = self.proxy_info_map.write().await;
             for name in &delta.removed {
-                map.remove(name);
+                map.remove(&wire_proxy_name(&user, name));
             }
             for name in delta.changed.iter().chain(delta.added.iter()) {
                 if let Some(p) = delta.new_config.proxies.iter().find(|p| &p.name == name) {
@@ -2599,7 +2737,7 @@ impl Service {
                         err = format!("plugin '{}' failed to start", plugin_type);
                     }
                     map.insert(
-                        name.clone(),
+                        wire_proxy_name(&user, name),
                         ProxyRuntimeInfo {
                             local_addr,
                             proxy_type: p.proxy_type.clone(),
@@ -2660,6 +2798,12 @@ impl Service {
         // session, reconnect, and admin status endpoint use the merged config.
         *self.cfg.write().await = delta.new_config;
         *self.proxies.write().await = self.cfg.read().await.proxies.clone();
+
+        if visitor_changed {
+            // Signal the session loop to restart so visitors are rebuilt.
+            self.visitor_reload_needed.store(true, Ordering::Release);
+            tracing::info!("Reload changed visitors — requesting session restart");
+        }
 
         let summary = changes.join("; ");
         tracing::info!(summary = %summary, "Config reload summary: {}", summary);

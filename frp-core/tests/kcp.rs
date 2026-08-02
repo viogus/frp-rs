@@ -56,3 +56,82 @@ async fn test_kcp_dial_send_recv() {
     assert_eq!(&buf[..n], b"hello from dialer");
     dial_handle.await.expect("dial task");
 }
+
+/// KCP+TLS round-trip: the client wraps the KCP stream in TLS with the
+/// 0x17 head byte (Go frp compat); the server strips the head byte and
+/// performs a TLS accept, exactly like frp-server/src/service.rs KCP TLS
+/// accept path. Verifies dial_server's KCP branch honors tls_enable.
+#[cfg(feature = "tls")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_kcp_tls_round_trip() {
+    use frp_core::transport::{dial_server, DialOptions, IoStream};
+    use tokio::io::AsyncReadExt;
+
+    // dial_server uses default_kcp_client_config (FEC 10,3); the listener
+    // must match or FEC-wrapped packets will be unparseable.
+    let config = KcpConfig {
+        data_shards: 10,
+        parity_shards: 3,
+        ..default_kcp_config()
+    };
+    let mut listener = KcpListener::bind("127.0.0.1:0", config.clone())
+        .await
+        .expect("bind");
+    let port = listener.local_addr().unwrap().port();
+
+    // Allow driver event loops to start.
+    sleep(Duration::from_millis(50)).await;
+
+    let server_cfg = frp_core::transport::generate_self_signed_tls_config()
+        .expect("generate self-signed TLS config");
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_cfg));
+
+    let server_handle = tokio::spawn(async move {
+        let mut kcp_stream = timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .expect("accept timeout")
+            .expect("accept");
+        // Strip the Go frp 0x17 head byte (service.rs KCP TLS accept path).
+        let mut first = [0u8; 1];
+        timeout(Duration::from_secs(10), kcp_stream.read_exact(&mut first))
+            .await
+            .expect("read head byte timeout")
+            .expect("read head byte");
+        assert_eq!(first[0], frp_core::transport::FRP_TLS_HEAD_BYTE);
+        let mut tls_stream = timeout(Duration::from_secs(10), acceptor.accept(kcp_stream))
+            .await
+            .expect("tls accept timeout")
+            .expect("tls accept");
+        let mut buf = vec![0u8; 1024];
+        let n = timeout(Duration::from_secs(10), tls_stream.read(&mut buf))
+            .await
+            .expect("tls read timeout")
+            .expect("tls read");
+        assert_eq!(&buf[..n], b"hello over kcp+tls");
+    });
+
+    let opts = DialOptions {
+        server_addr: "127.0.0.1".to_string(),
+        server_port: port,
+        protocol: frp_core::transport::TransportProtocol::Kcp,
+        tls_enable: true,
+        ..Default::default()
+    };
+    let io = timeout(Duration::from_secs(10), dial_server(&opts))
+        .await
+        .expect("dial timeout")
+        .expect("dial_server");
+    match io {
+        IoStream::Tls(mut tls_io, _peer) => {
+            use tokio::io::AsyncWriteExt;
+            tls_io
+                .write_all(b"hello over kcp+tls")
+                .await
+                .expect("tls write");
+            tls_io.flush().await.expect("tls flush");
+        }
+        _other => panic!("expected IoStream::Tls for KCP+TLS, got variant"),
+    }
+
+    server_handle.await.expect("server task");
+}

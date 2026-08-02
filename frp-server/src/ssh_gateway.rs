@@ -5,14 +5,17 @@
 //!
 //! The remote command string is parsed into a ProxyConfig.
 //!
-//! SSH reverse forwarding (`tcpip_forward` / `-R`) is disabled in this
-//! release: the port allocation/work-connection bridge was unsafe and
-//! non-functional, so `-R` requests are rejected explicitly.
+//! SSH reverse forwarding (`tcpip_forward` / `-R`) is supported: the port
+//! allocation/work-connection bridge opens `forwarded-tcpip` channels back to
+//! the SSH client, matching Go frp's ssh tunnel gateway (pkg/ssh/server.go,
+//! gateway.go). Go semantics: `tcpip-forward` is accepted without binding a
+//! port; the recorded address is used as the forwarded-tcpip channel payload.
 //!
 //! NOTE: russh 0.61 transitively depends on rsa 0.10.0-rc.18 which has a known
 //! timing sidechannel (RUSTSEC-2023-0071, Marvin Attack). Only affects the SSH
 //! gateway feature. Monitor upstream for fix.
 
+use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
@@ -23,8 +26,6 @@ use russh::server::{Auth, Handler, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use tokio::sync::mpsc;
 
-use crate::lock::RwLockExt;
-use crate::proxy::allocate_port_multi;
 use crate::service::AppState;
 use frp_core::auth::constant_time_eq;
 
@@ -271,54 +272,34 @@ impl VirtualControl {
             use tokio::io::AsyncWriteExt;
 
             const V1_HDR: usize = 9;
-            let mut buf = [0u8; 512];
-            let mut accumulated = Vec::new();
             let mut from_ssh = from_ssh;
 
             // ---- Phase 1: consume plaintext LoginResp from raw stream ----
-            loop {
-                match from_ssh.read(&mut buf).await {
-                    Ok(0) => return,
-                    Ok(n) => {
-                        accumulated.extend_from_slice(&buf[..n]);
-                        if accumulated.len() >= V1_HDR {
-                            let plen =
-                                u64::from_be_bytes(accumulated[1..V1_HDR].try_into().unwrap())
-                                    as usize;
-                            if plen > 65536 {
-                                return;
-                            }
-                            if accumulated.len() >= V1_HDR + plen {
-                                // Drop LoginResp; keep extra bytes (unlikely, see below)
-                                let extra = accumulated[V1_HDR + plen..].to_vec();
-                                accumulated = extra;
-                                break;
-                            }
-                        }
-                    }
-                    Err(_) => return,
-                }
+            // Use read_exact so NOTHING past LoginResp is consumed: the
+            // control handler may write an encrypted ReqWorkConn immediately
+            // after LoginResp (pool_count>0), and over-reading here would
+            // desync the CFB cipher state.
+            let mut header = [0u8; V1_HDR];
+            if from_ssh.read_exact(&mut header).await.is_err() {
+                return;
             }
-
-            // Extra bytes after LoginResp are encrypted data that was read
-            // ahead of the CipherStream. In practice unreachable:
-            // handle_control writes LoginResp synchronously then wraps in
-            // CipherStream — no other data is interleaved. Warn + discard.
-            if !accumulated.is_empty() {
-                tracing::warn!(
-                    extra_bytes = %accumulated.len(),
-                    "bridge: {} extra bytes after LoginResp, discarding",
-                    accumulated.len()
-                );
-                accumulated.clear();
+            let plen = u64::from_be_bytes(header[1..V1_HDR].try_into().unwrap()) as usize;
+            if plen > 65536 {
+                return;
             }
+            let mut payload = vec![0u8; plen];
+            if from_ssh.read_exact(&mut payload).await.is_err() {
+                return;
+            }
+            // LoginResp consumed exactly; any further bytes stay in the stream
+            // for the CipherStream phase. No extra-bytes warning is needed:
+            // with read_exact the stream position is exact by construction.
 
             // ---- Phase 2: wrap in CipherStream, split for concurrent r/w ----
             let _ = phase2_tx.send(());
             let encrypted = frp_core::cipher_stream::CipherStream::new(Box::new(from_ssh), enc_key);
             let (mut enc_reader, mut enc_writer) = tokio::io::split(encrypted);
             let read_work_tx = work_tx;
-            drop(accumulated); // free the LoginResp-phase buffer
 
             // Read task: decrypt V1 frames with canonical parser, intercept ReqWorkConn
             let read_task: tokio::task::JoinHandle<()> = tokio::spawn(async move {
@@ -395,6 +376,13 @@ pub struct SshSession {
     auth_complete_tx: tokio::sync::watch::Sender<bool>,
     authenticated_run_id: Arc<std::sync::Mutex<Option<String>>>,
     auth_deadline: tokio::time::Instant,
+    /// `tcpip_forward` request payload (bind_addr, port). Go semantics: the
+    /// address is recorded, not actually bound; it becomes the
+    /// forwarded-tcpip channel payload.
+    reverse_forward: Arc<std::sync::Mutex<Option<(String, u32)>>>,
+    /// Data routing table for forwarded-tcpip channels: SSH client → bridge
+    /// task read half.
+    reverse_data_tx: Arc<std::sync::Mutex<HashMap<russh::ChannelId, mpsc::Sender<Vec<u8>>>>>,
 }
 
 impl Drop for SshSession {
@@ -426,6 +414,8 @@ impl SshSession {
             auth_complete_tx,
             authenticated_run_id,
             auth_deadline,
+            reverse_forward: Arc::new(std::sync::Mutex::new(None)),
+            reverse_data_tx: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -587,6 +577,20 @@ impl Handler for SshSession {
         }
     }
 
+    async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
+        // Go compat (gateway.go:74): NoClientAuth when no authorized_keys
+        // file is configured. With an empty key list there is nothing to
+        // verify, so anonymous SSH is accepted like Go.
+        if self.authorized_keys.is_empty() {
+            Ok(Auth::Accept)
+        } else {
+            Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            })
+        }
+    }
+
     async fn auth_succeeded(&mut self, session: &mut Session) -> Result<(), Self::Error> {
         if !self.begin_authentication() {
             return Err(anyhow!("SSH authentication expired or already completed"));
@@ -639,14 +643,24 @@ impl Handler for SshSession {
         *self.authenticated_run_id.lock().unwrap() = Some(self.run_id.clone());
         tracing::info!(run_id = %self.run_id, "SSH session {} authenticated", self.run_id);
 
-        // Spawn a background task that drains work-connection requests.
-        // Reverse forwarding is disabled, so there is no SSH reverse tunnel
-        // to bridge; the receiver is drained so the control handler never
-        // blocks on the bounded channel.
+        // Spawn the work-connection bridge: ReqWorkConn signals open a
+        // forwarded-tcpip channel back to the SSH client and hand the
+        // channel's pipe end to the control layer as a work conn.
         let run_id = self.run_id.clone();
-
+        let ssh_handle = self.ssh_handle.clone().expect("ssh handle set after auth");
+        let state = self.state.clone();
+        let reverse_forward = self.reverse_forward.clone();
+        let reverse_data_tx = self.reverse_data_tx.clone();
         tokio::spawn(async move {
-            handle_work_conn_requests(work_conn_rx, run_id).await;
+            handle_work_conn_requests(
+                work_conn_rx,
+                run_id,
+                ssh_handle,
+                state,
+                reverse_forward,
+                reverse_data_tx,
+            )
+            .await;
         });
 
         Ok(())
@@ -698,17 +712,10 @@ impl Handler for SshSession {
             }
         }
 
-        // Register the proxy: build NewProxy V1 frame, send to control handler
-        let allocated = {
-            let state = self.state.clone();
-            let mut used = state.used_ports.write().await;
-            // Re-allocate the actual proxy remote_port (not the SSH listen port)
-            let ranges = state.reloadable.read_ok().allow_ports.clone();
-            allocate_port_multi(&mut used, args.remote_port, &ranges, &state.proxy_bind_addr)
-                .ok_or_else(|| anyhow!("no port available for remote_port {}", args.remote_port))?
-        };
-
-        let v1_frame = build_v1_frame_from_args(&args, allocated)?;
+        // Register the proxy: build NewProxy V1 frame, send to control handler.
+        // Port allocation happens inside handle_new_proxy (single owner of
+        // used_ports) — pre-allocating here would double-book the port.
+        let v1_frame = build_v1_frame_from_args(&args, args.remote_port)?;
 
         self.frame_tx
             .as_ref()
@@ -722,12 +729,12 @@ impl Handler for SshSession {
         tracing::info!(
             proxy_name = %proxy_name,
             proxy_type = %args.proxy_type,
-            remote_port = %allocated,
+            remote_port = %args.remote_port,
             run_id = %self.run_id,
             "SSH gateway: registered proxy '{}' type={} remote_port={} (run_id={})",
             proxy_name,
             args.proxy_type,
-            allocated,
+            args.remote_port,
             self.run_id
         );
 
@@ -739,16 +746,22 @@ impl Handler for SshSession {
     async fn tcpip_forward(
         &mut self,
         address: &str,
-        _port: &mut u32,
+        port: &mut u32,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        tracing::warn!(
+        // Go semantics (pkg/ssh/server.go): accept and record the address;
+        // no port is actually bound — it is used as the forwarded-tcpip
+        // channel payload when a work connection is opened.
+        tracing::info!(
             run_id = %self.run_id,
             address = %address,
-            "SSH -R reverse forwarding is disabled in this release; rejecting tcpip_forward for {}",
-            address
+            port = %*port,
+            "SSH -R tcpip-forward requested for {}:{}",
+            address,
+            port
         );
-        Ok(false)
+        *self.reverse_forward.lock().unwrap() = Some((address.to_string(), *port));
+        Ok(true)
     }
 
     // ── Environment / PTY ────────────────────────────────────
@@ -784,11 +797,12 @@ impl Handler for SshSession {
         _origin_port: u32,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        // Reverse forwarding is disabled; reject any forwarded-tcpip channels
-        // a client may still attempt to open.
+        // Server-opened reverse channels do not pass through this callback
+        // (it only handles client-initiated forwarded-tcpip, a non-standard
+        // pattern). Reject client-initiated ones.
         tracing::debug!(
             run_id = %self.run_id,
-            "SSH gateway {}: rejecting forwarded-tcpip channel (reverse forwarding disabled)",
+            "SSH gateway {}: rejecting client-initiated forwarded-tcpip channel",
             self.run_id
         );
         Ok(false)
@@ -811,32 +825,189 @@ impl Handler for SshSession {
 
     async fn data(
         &mut self,
-        _channel: ChannelId,
-        _data: &[u8],
+        channel: ChannelId,
+        data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Channels are bridged transparently by the work-connection
-        // bridge. No handler-side processing needed.
+        // Forwarded-tcpip channel data is routed to the bridge task's read
+        // half (data from the SSH client = local service response). The
+        // bounded channel provides backpressure when the frps side reads
+        // slower than the SSH client sends (Go net.Pipe is blocking too).
+        // Clone the sender under the lock, then await the send outside it so
+        // the future stays Send.
+        let tx = self.reverse_data_tx.lock().unwrap().get(&channel).cloned();
+        if let Some(tx) = tx {
+            if tx.send(data.to_vec()).await.is_err() {
+                // Bridge task exited (channel closed) — drop the entry.
+                self.reverse_data_tx.lock().unwrap().remove(&channel);
+            }
+        }
+        Ok(())
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // The peer closed the forwarded-tcpip channel (local service exited).
+        // Drop the data sender so the bridge task's `data_rx.recv()` returns
+        // and the task (plus its duplex) exits — otherwise the bridge hangs
+        // forever holding the channel entry in the map.
+        if self
+            .reverse_data_tx
+            .lock()
+            .unwrap()
+            .remove(&channel)
+            .is_some()
+        {
+            tracing::debug!(
+                run_id = %self.run_id,
+                channel = ?channel,
+                "SSH gateway: forwarded-tcpip channel closed, bridge task will exit"
+            );
+        }
         Ok(())
     }
 }
 
 /// Background task: receives WorkConnRequest signals from VirtualControl
-/// (which intercepted ReqWorkConn from the control handler).
-///
-/// Reverse forwarding is disabled in this release, so there is no SSH
-/// reverse tunnel to bridge work connections through. The receiver is still
-/// drained so the control handler never blocks on the bounded channel.
-async fn handle_work_conn_requests(mut work_rx: mpsc::Receiver<WorkConnRequest>, run_id: String) {
+/// (which intercepted ReqWorkConn from the control handler). For each request,
+/// opens a `forwarded-tcpip` channel back to the SSH client (Go frp's
+/// virtual-client pipeConnector semantics), hands the pipe's work side to the
+/// control layer as a work conn, and bridges the SSH channel with the pipe.
+async fn handle_work_conn_requests(
+    mut work_rx: mpsc::Receiver<WorkConnRequest>,
+    run_id: String,
+    handle: russh::server::Handle,
+    state: Arc<AppState>,
+    reverse_forward: Arc<std::sync::Mutex<Option<(String, u32)>>>,
+    reverse_data_tx: Arc<std::sync::Mutex<HashMap<russh::ChannelId, mpsc::Sender<Vec<u8>>>>>,
+) {
     while let Some(_req) = work_rx.recv().await {
-        tracing::warn!(
-            run_id = %run_id,
-            "SSH gateway {}: dropping WorkConnRequest because SSH reverse forwarding is disabled",
-            run_id
-        );
+        let Some((addr, port)) = reverse_forward.lock().unwrap().clone() else {
+            tracing::warn!(
+                run_id = %run_id,
+                "SSH work conn requested but no -R tcpip-forward registered; dropping"
+            );
+            continue;
+        };
+
+        // Open the forwarded-tcpip channel (server-initiated). The payload
+        // carries the recorded -R address (Go server.go semantics).
+        let channel = match handle
+            .channel_open_forwarded_tcpip(&addr, port, &addr, port)
+            .await
+        {
+            Ok(ch) => ch,
+            Err(e) => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    error = %e,
+                    "SSH: failed to open forwarded-tcpip channel for {}:{}: {}",
+                    addr,
+                    port,
+                    e
+                );
+                continue;
+            }
+        };
+        let channel_id = channel.id();
+
+        // Register the data route (SSH client → bridge read half).
+        // Bounded: backpressure via the SSH data callback above.
+        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
+        reverse_data_tx.lock().unwrap().insert(channel_id, data_tx);
+
+        // In-memory pipe: one end is the work conn, the other is bridged
+        // with the SSH channel (Go virtual client net.Pipe).
+        let (work_side, ssh_side) = tokio::io::duplex(64 * 1024);
+
+        let ctl_tx = {
+            let map = state.run_id_to_ctl_tx.read().await;
+            map.get(&run_id).map(|c| c.tx.clone())
+        };
+        let Some(tx) = ctl_tx else {
+            tracing::warn!(run_id = %run_id, "SSH: control handler gone; dropping work conn");
+            let _ = handle.close(channel_id).await;
+            reverse_data_tx.lock().unwrap().remove(&channel_id);
+            continue;
+        };
+        let work_io = frp_core::transport::IoStream::SshChannel(Box::new(work_side));
+        if tx
+            .send(crate::service::InternalMsg::NewWorkConn(work_io))
+            .await
+            .is_err()
+        {
+            tracing::debug!(run_id = %run_id, "SSH: control gone while delivering work conn");
+            let _ = handle.close(channel_id).await;
+            reverse_data_tx.lock().unwrap().remove(&channel_id);
+            continue;
+        }
+
+        let reg = reverse_data_tx.clone();
+        let handle2 = handle.clone();
+        tokio::spawn(async move {
+            bridge_ssh_side(ssh_side, data_rx, handle2.clone(), channel_id).await;
+            let _ = handle2.close(channel_id).await;
+            reg.lock().unwrap().remove(&channel_id);
+        });
     }
 
     tracing::debug!(run_id = %run_id, "SSH session {} work-connection handler exiting", run_id);
+}
+
+/// Bridge the duplex SSH side with the SSH forwarded-tcpip channel.
+///
+/// The control layer first writes a V1 StartWorkConn frame on the pipe; that
+/// frame must be consumed here (Go's virtual client consumes it in memory,
+/// never sending it to the SSH client). Afterwards bytes flow both ways:
+/// - frps user connection → SSH client → local service (via `handle.data`),
+/// - local service response → `data` callback → bridge write half → frps.
+async fn bridge_ssh_side(
+    mut ssh_side: tokio::io::DuplexStream,
+    mut data_rx: mpsc::Receiver<Vec<u8>>,
+    handle: russh::server::Handle,
+    channel_id: russh::ChannelId,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Consume the StartWorkConn V1 frame (type byte + 8-byte BE length + payload).
+    let mut header = [0u8; frp_core::protocol::V1_HEADER_LEN];
+    if ssh_side.read_exact(&mut header).await.is_err() {
+        return;
+    }
+    let len = u64::from_be_bytes(header[1..9].try_into().unwrap());
+    if len <= frp_core::protocol::V1_MAX_MSG_LENGTH as u64 {
+        let mut payload = vec![0u8; len as usize];
+        if ssh_side.read_exact(&mut payload).await.is_err() {
+            return;
+        }
+    }
+
+    let (mut ssh_read, mut ssh_write) = tokio::io::split(ssh_side);
+    // frps user connection → SSH client (→ local service).
+    let writer = tokio::spawn(async move {
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            let n = match ssh_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if handle.data(channel_id, buf[..n].to_vec()).await.is_err() {
+                break;
+            }
+        }
+        let _ = handle.eof(channel_id).await;
+    });
+    // Local service response (SSH client data) → frps user connection.
+    while let Some(data) = data_rx.recv().await {
+        if ssh_write.write_all(&data).await.is_err() {
+            break;
+        }
+    }
+    let _ = ssh_write.shutdown().await;
+    let _ = writer.await;
 }
 
 /// Clean up a disconnected SSH session: remove all registered proxies.
@@ -871,7 +1042,11 @@ mod tests {
             frp_core::auth::AuthConfig::with_token("test-token"),
             "127.0.0.1".into(),
             frp_core::encryption::derive_key("test-token"),
-            vec![(1, u16::MAX)],
+            vec![frp_core::config::PortsRange {
+                start: 1,
+                end: u16::MAX,
+                single: 0,
+            }],
             String::new(),
             true,
             30,

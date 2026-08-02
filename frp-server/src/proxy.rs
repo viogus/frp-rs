@@ -488,7 +488,7 @@ pub struct ProxyEntry {
 pub fn allocate_port_multi(
     used_ports: &mut std::collections::HashSet<u16>,
     port: u16,
-    ranges: &[(u16, u16)],
+    ranges: &[frp_core::config::PortsRange],
     bind_addr: &str,
 ) -> Option<u16> {
     let bind_addr = if bind_addr.is_empty() {
@@ -506,11 +506,7 @@ pub fn allocate_port_multi(
         // freePorts which is populated from allowPorts ranges). Without this
         // check, a client could bypass the port restriction by specifying a
         // port outside the configured ranges.
-        if !ranges.is_empty()
-            && !ranges
-                .iter()
-                .any(|(start, end)| port >= *start && port <= *end)
-        {
+        if !ranges.is_empty() && !ranges.iter().any(|r| r.contains(port)) {
             tracing::debug!(
                 port = %port,
                 ranges = ?ranges,
@@ -524,8 +520,8 @@ pub fn allocate_port_multi(
         }
         return None;
     }
-    for &(start, end) in ranges {
-        for p in start..=end {
+    for r in ranges {
+        for p in r.iter() {
             if used_ports.contains(&p) {
                 continue;
             }
@@ -545,6 +541,10 @@ pub fn allocate_port_multi(
 /// Check whether a port is available at the OS level by attempting a TCP bind.
 /// Immediately drops the listener if successful (just a probe).
 /// Matches Go frp's `Manager.isPortAvailable` behavior.
+pub fn is_tcp_port_bindable(bind_addr: &str, port: u16) -> bool {
+    is_port_bindable(bind_addr, port)
+}
+
 fn is_port_bindable(bind_addr: &str, port: u16) -> bool {
     let addr = frp_core::format_socket_addr(bind_addr, port);
     match std::net::TcpListener::bind(&addr) {
@@ -586,7 +586,11 @@ mod tests {
         // An explicit port outside the configured allow_ports ranges must be rejected
         // (Go frp compat: Manager.Acquire checks freePorts which is populated from allowPorts).
         let mut used = std::collections::HashSet::new();
-        let ranges = [(10000, 20000)];
+        let ranges = [frp_core::config::PortsRange {
+            start: 10000,
+            end: 20000,
+            single: 0,
+        }];
         assert_eq!(
             allocate_port_multi(&mut used, 8080, &ranges, "127.0.0.1"),
             None,
@@ -598,7 +602,18 @@ mod tests {
     fn test_allocate_port_multi_explicit_in_ranges() {
         // An explicit port within a configured allow_ports range must be accepted
         let mut used = std::collections::HashSet::new();
-        let ranges = [(10000, 20000), (30000, 40000)];
+        let ranges = [
+            frp_core::config::PortsRange {
+                start: 10000,
+                end: 20000,
+                single: 0,
+            },
+            frp_core::config::PortsRange {
+                start: 30000,
+                end: 40000,
+                single: 0,
+            },
+        ];
         let result = allocate_port_multi(&mut used, 35000, &ranges, "127.0.0.1");
         assert_eq!(
             result,
@@ -650,7 +665,11 @@ mod tests {
         let mut used = std::collections::HashSet::new();
         // Pre-fill one port in the range
         used.insert(62002);
-        let ranges = [(62001, 62005)];
+        let ranges = [frp_core::config::PortsRange {
+            start: 62001,
+            end: 62005,
+            single: 0,
+        }];
         // Should skip 62001 (bindable), then 62002 (in set), then
         // find 62003 (bindable).
         let result = allocate_port_multi(&mut used, 0, &ranges, "127.0.0.1");
@@ -674,7 +693,16 @@ mod tests {
     fn test_allocate_port_multi_explicit_port_zero() {
         // port=0 should scan ranges, not allocate port 0
         let mut used = std::collections::HashSet::new();
-        let result = allocate_port_multi(&mut used, 0, &[(51990, 51990)], "127.0.0.1");
+        let result = allocate_port_multi(
+            &mut used,
+            0,
+            &[frp_core::config::PortsRange {
+                start: 51990,
+                end: 51990,
+                single: 0,
+            }],
+            "127.0.0.1",
+        );
         assert_eq!(result, Some(51990), "explicit port 0 should scan ranges");
     }
 

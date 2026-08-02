@@ -60,6 +60,8 @@ pub mod xtcp_p2p {
     pub async fn xtcp_p2p_connect_yamux(
         _socket: UdpSocket,
         _candidates: &[String],
+        _assisted: &[String],
+        _behavior: Option<&crate::msg::NatHoleDetectBehavior>,
         _conv: u32,
         _kcp_config: super::kcp::KcpConfig,
         _hole_punch_timeout_ms: u64,

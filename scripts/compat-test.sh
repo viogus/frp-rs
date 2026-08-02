@@ -459,6 +459,59 @@ else:
 ' 2>&1
 }
 
+# HTTPS-vhost TLS echo server: terminates TLS locally (the backend behind an
+# https proxy is a plain HTTP service reached AFTER frpc's TLS termination —
+# Go frp semantics: frps/frpc pass TLS bytes through; the local service is
+# whatever the user points at, and the compat test uses a TLS-terminating
+# echo so the HTTPS proxy flow is exercised end to end.
+start_tls_echo_server() {
+    local port="$1"
+    local body_prefix="${2:-https-ok}"
+    SE_TLS_PORT="$port" SE_TLS_PREFIX="$body_prefix" SE_CERT="$CERT_DIR/server.crt" SE_KEY="$CERT_DIR/server.key" python3 -c '
+import os, socket, ssl
+port = int(os.environ["SE_TLS_PORT"])
+prefix = os.environ["SE_TLS_PREFIX"]
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(5)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(os.environ["SE_CERT"], os.environ["SE_KEY"])
+while True:
+    try:
+        raw, _ = s.accept()
+        conn = ctx.wrap_socket(raw, server_side=True)
+        data = b""
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            if b"\r\n\r\n" in data:
+                hdr_end = data.index(b"\r\n\r\n") + 4
+                hdrs = data[:hdr_end].decode("utf-8", errors="ignore").lower()
+                cl = 0
+                for line in hdrs.split("\r\n"):
+                    if line.startswith("content-length:"):
+                        try:
+                            cl = int(line.split(":")[1].strip())
+                        except: pass
+                if len(data) - hdr_end >= cl:
+                    break
+        body = prefix.encode() + (data.split(b"\r\n\r\n", 1)[-1] if b"\r\n\r\n" in data else b"")
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+        conn.close()
+    except Exception:
+        # Non-TLS probes (e.g. wait_for_port nc -z) fail the handshake;
+        # keep serving rather than exiting.
+        try:
+            conn.close()
+        except Exception:
+            pass
+' &
+    track_pid $!
+}
+
 send_https_test() {
     local vhost_port="$1"
     local host="$2"
@@ -4062,10 +4115,11 @@ test_g2r_https() {
 
     mkdir -p "$TEST_DIR/$name"
 
-    # Start simple HTTP echo server (HTTPS proxy terminates TLS, backend is plain HTTP)
-    start_http_echo_server "$echo_port" "https-ok:"
+    # TLS-terminating echo server (Go frp semantics: frps/frpc pass TLS bytes
+    # through; the local service terminates TLS).
+    start_tls_echo_server "$echo_port" "https-ok:"
     wait_for_port 127.0.0.1 "$echo_port" 3 || {
-        fail_test "$name" "HTTP echo server did not start"
+        fail_test "$name" "TLS echo server did not start"
         return
     }
 

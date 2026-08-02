@@ -51,7 +51,7 @@ fn propose_mux_for_transport(tcp_mux: bool, protocol: &TransportProtocol) -> boo
 
 /// Wrap an established client transport stream in yamux (matching Go frp
 /// v0.70.1, which wraps the connector result for every non-QUIC transport).
-async fn wrap_client_mux(
+pub(crate) async fn wrap_client_mux(
     raw_stream: IoStream,
     keepalive_interval: i64,
 ) -> Result<(IoStream, Option<YamuxSession>), frp_core::Error> {
@@ -127,6 +127,10 @@ pub struct ControlConnection {
     /// Timeout in seconds for dialing the frp server.
     /// Go frp compat: dialServerTimeout. Default: 10.
     dial_server_timeout: i64,
+    /// QUIC transport parameters (keepalive / idle timeout / max streams).
+    /// Go frp compat: [transport.quic].
+    #[cfg(feature = "quic")]
+    quic_params: frp_core::quic::QuicTransportParams,
 }
 
 impl ControlConnection {
@@ -157,6 +161,7 @@ impl ControlConnection {
         previous_run_id: String,
         client_spec: Option<ClientSpec>,
         dial_server_timeout: i64,
+        #[cfg(feature = "quic")] quic_params: frp_core::quic::QuicTransportParams,
     ) -> Self {
         Self {
             server_addr,
@@ -185,6 +190,8 @@ impl ControlConnection {
             proxy_url,
             client_spec,
             dial_server_timeout,
+            #[cfg(feature = "quic")]
+            quic_params,
         }
     }
 
@@ -233,9 +240,16 @@ impl ControlConnection {
                     &self.server_addr
                 };
                 let ca_file = self.tls_ca_file.as_deref();
-                let (stream, qc) = frp_core::quic::dial_quic(&addr, server_name, ca_file)
-                    .await
-                    .map_err(|e| frp_core::Error::Transport(format!("QUIC dial: {e}").into()))?;
+                let (stream, qc) = frp_core::quic::dial_quic_with_params(
+                    &addr,
+                    server_name,
+                    ca_file,
+                    self.tls_cert_file.as_deref(),
+                    self.tls_key_file.as_deref(),
+                    self.quic_params.clone(),
+                )
+                .await
+                .map_err(|e| frp_core::Error::Transport(format!("QUIC dial: {e}").into()))?;
                 (IoStream::Quic(stream), None, Some(qc))
             } else {
                 let raw_stream = dial_server(&opts).await?;
@@ -517,7 +531,7 @@ impl ControlConnection {
         local_addr: &str,
         stream: &mut IoStream,
     ) -> Result<msg::NewProxyResp, frp_core::Error> {
-        let np = proxy::create_new_proxy_msg(p, local_addr);
+        let np = proxy::create_new_proxy_msg(p, local_addr, &self.user);
         debug!(
             name = %p.name,
             proxy_type = %p.proxy_type,

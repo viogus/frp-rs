@@ -259,43 +259,121 @@ pub fn parse_bandwidth_limit(s: &str) -> Option<u64> {
     Some((num * mult as f64) as u64)
 }
 
-/// Parse a comma-separated port range string into a list of (start, end) pairs.
-/// e.g. "10000-20000,30000-40000" → [(10000, 20000), (30000, 40000)]
-/// Returns empty vec if the string is empty.
-pub fn parse_allow_ports(s: &str) -> Vec<(u16, u16)> {
-    if s.trim().is_empty() {
-        return vec![];
+/// A single allow-ports entry: a range, or `{single=N}` (Go frp
+/// `types.PortsRange`). When `single > 0`, only that exact port is allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortsRange {
+    pub start: u16,
+    pub end: u16,
+    pub single: u16,
+}
+
+impl PortsRange {
+    /// Whether `port` falls inside this entry.
+    pub fn contains(&self, port: u16) -> bool {
+        if self.single > 0 {
+            self.single == port
+        } else {
+            port >= self.start && port <= self.end
+        }
     }
-    s.split(',')
-        .filter_map(|part| {
-            let part = part.trim();
-            if part.is_empty() {
-                return None;
+
+    /// Iterate the ports covered by this entry (single → one port).
+    pub fn iter(&self) -> impl Iterator<Item = u16> {
+        if self.single > 0 {
+            let s = self.single;
+            s..=s
+        } else {
+            self.start..=self.end
+        }
+    }
+}
+
+/// Parse a comma-separated port range string into a list of [`PortsRange`].
+///
+/// Supports Go frp v0.70.1 syntax: `"10000-20000,30000,{single=40000}"`.
+/// Returns an empty vec when the string is empty; **invalid entries are an
+/// error** (Go's config validation rejects them rather than silently
+/// disabling the restriction).
+pub fn parse_allow_ports(s: &str) -> Result<Vec<PortsRange>, String> {
+    if s.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        // {single=N} form.
+        if let Some(inner) = part.strip_prefix('{').and_then(|p| p.strip_suffix('}')) {
+            let single = inner
+                .strip_prefix("single=")
+                .and_then(|v| v.trim().parse::<u16>().ok())
+                .ok_or_else(|| format!("invalid allow_ports entry '{part}'"))?;
+            out.push(PortsRange {
+                start: single,
+                end: single,
+                single,
+            });
+            continue;
+        }
+        if let Some((a, b)) = part.split_once('-') {
+            let start: u16 = a
+                .trim()
+                .parse()
+                .map_err(|_| format!("invalid allow_ports entry '{part}'"))?;
+            let end: u16 = b
+                .trim()
+                .parse()
+                .map_err(|_| format!("invalid allow_ports entry '{part}'"))?;
+            if start == 0 || end == 0 {
+                return Err(format!(
+                    "invalid allow_ports entry '{part}': port 0 is not allowed"
+                ));
             }
-            if let Some((a, b)) = part.split_once('-') {
-                let start: u16 = a.trim().parse().ok()?;
-                let end: u16 = b.trim().parse().ok()?;
-                if start <= end {
-                    Some((start, end))
-                } else {
-                    Some((end, start)) // swap inverted ranges
-                }
+            let (start, end) = if start <= end {
+                (start, end)
             } else {
-                // Single port: treat as start=end
-                let p: u16 = part.parse().ok()?;
-                Some((p, p))
+                (end, start)
+            };
+            out.push(PortsRange {
+                start,
+                end,
+                single: 0,
+            });
+        } else {
+            // Single port: treat as start=end.
+            let p: u16 = part
+                .parse()
+                .map_err(|_| format!("invalid allow_ports entry '{part}'"))?;
+            if p == 0 {
+                return Err(format!(
+                    "invalid allow_ports entry '{part}': port 0 is not allowed"
+                ));
             }
-        })
-        .collect()
+            out.push(PortsRange {
+                start: p,
+                end: p,
+                single: 0,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Compute the total number of ports across all ranges.
-pub fn count_ports(ranges: &[(u16, u16)]) -> u16 {
+pub fn count_ports(ranges: &[PortsRange]) -> u16 {
     ranges
         .iter()
-        .fold(0u32, |acc, (s, e)| {
-            acc.saturating_add(e.saturating_sub(*s) as u32 + 1)
+        .map(|r| {
+            if r.single > 0 {
+                1u32
+            } else {
+                r.end.saturating_sub(r.start) as u32 + 1
+            }
         })
+        .fold(0u32, |acc, n| acc.saturating_add(n))
         .min(u16::MAX as u32) as u16
 }
 
@@ -965,9 +1043,15 @@ pub struct AuthClientConfig {
     pub oidc_scope: String,
     #[serde(default, alias = "oidcIssuer")]
     pub oidc_issuer: String,
-    /// Extra params for token endpoint.
+    /// Extra params for token endpoint. Go frp v0.70.1 compat:
+    /// AuthOIDCClientConfig.AdditionalEndpointParams (map[string]string).
     #[serde(default, alias = "additionalEndpointParams")]
-    pub additional_endpoint_params: String,
+    pub additional_endpoint_params: std::collections::HashMap<String, String>,
+    /// Dynamic source for the OIDC token. Mutually exclusive with every
+    /// other field of `[auth.oidc]`. Go frp v0.70.1 compat: tokenSource
+    /// (normalized from the `[auth.oidc]` sub-table).
+    #[serde(default)]
+    pub oidc_token_source: Option<ValueSource>,
     /// Path to a custom CA certificate PEM file for OIDC provider TLS.
     /// Go frp compat: tls_trusted_ca_file.
     #[serde(default, alias = "tls_trusted_ca_file")]
@@ -1014,7 +1098,8 @@ impl Default for AuthClientConfig {
             oidc_token_endpoint: String::new(),
             oidc_scope: String::new(),
             oidc_issuer: String::new(),
-            additional_endpoint_params: String::new(),
+            additional_endpoint_params: std::collections::HashMap::new(),
+            oidc_token_source: None,
             oidc_tls_trusted_ca_file: String::new(),
             oidc_tls_insecure_skip_verify: false,
             oidc_proxy_url: String::new(),
@@ -1416,7 +1501,7 @@ pub struct ProxyConfig {
 
 /// STCP/XTCP visitor configuration — used by frpc to expose a local port
 /// that tunnels traffic to a remote STCP/XTCP proxy through the frps server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VisitorConfig {
     /// Name for this visitor (used in logs).
     #[serde(default)]
@@ -1518,7 +1603,7 @@ impl Default for VisitorConfig {
 /// Only `type = "virtual_net"` (with `destinationIP`) is supported by frp-rs
 /// today. The remaining fields are accepted for the STCP/XTCP `visitor_plugin`
 /// extension used by older frp-rs configs.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct VisitorPluginConfig {
     #[serde(rename = "type", default)]
     pub plugin_type: String,
@@ -1739,8 +1824,82 @@ pub fn validate_auth_token_source(
     Ok(())
 }
 
+/// Go frp v0.70.1 compat: `validation.ValidateOIDCClientCredentialsConfig`
+/// (`/tmp/frp-src-0.70.1/pkg/config/v1/validation/oidc.go`) plus the
+/// `tokenSource` mutual-exclusivity check from `validateOIDCConfig`
+/// (`client.go:84-94`).
+fn validate_oidc_client_config(auth: &AuthClientConfig) -> Result<(), String> {
+    // auth.oidc.tokenSource is mutually exclusive with every other field
+    // of auth.oidc (Go client.go:89-94).
+    if let Some(source) = &auth.oidc_token_source {
+        if !auth.oidc_client_id.is_empty()
+            || !auth.oidc_client_secret.is_empty()
+            || !auth.oidc_audience.is_empty()
+            || !auth.oidc_scope.is_empty()
+            || !auth.oidc_token_endpoint.is_empty()
+            || !auth.additional_endpoint_params.is_empty()
+            || !auth.oidc_tls_trusted_ca_file.is_empty()
+            || auth.oidc_tls_insecure_skip_verify
+            || !auth.oidc_proxy_url.is_empty()
+        {
+            return Err(
+                "cannot specify both auth.oidc.tokenSource and any other field of auth.oidc".into(),
+            );
+        }
+        return source
+            .validate()
+            .map_err(|e| format!("invalid auth.oidc.tokenSource: {e}"));
+    }
+
+    // Client-credentials validation only applies to the OIDC method.
+    if auth.method != "oidc" {
+        return Ok(());
+    }
+
+    if auth.oidc_client_id.is_empty() {
+        return Err("auth.oidc.clientID is required".into());
+    }
+    if auth.oidc_token_endpoint.is_empty() && auth.oidc_issuer.is_empty() {
+        return Err(
+            "auth.oidc.tokenEndpointURL is required (or auth.oidc.issuer for discovery)".into(),
+        );
+    }
+    if !auth.oidc_token_endpoint.is_empty() {
+        let ep = &auth.oidc_token_endpoint;
+        let rest = if let Some(r) = ep.strip_prefix("https://") {
+            r
+        } else if let Some(r) = ep.strip_prefix("http://") {
+            r
+        } else {
+            return Err("auth.oidc.tokenEndpointURL must use http or https".into());
+        };
+        let host = rest.split('/').next().unwrap_or("");
+        if host.is_empty() {
+            return Err("auth.oidc.tokenEndpointURL must be an absolute http or https URL".into());
+        }
+    }
+    if auth.additional_endpoint_params.contains_key("scope") {
+        return Err(
+            "auth.oidc.additionalEndpointParams.scope is not allowed; use auth.oidc.scope instead"
+                .into(),
+        );
+    }
+    if !auth.oidc_audience.is_empty() && auth.additional_endpoint_params.contains_key("audience") {
+        return Err(
+            "cannot specify both auth.oidc.audience and auth.oidc.additionalEndpointParams.audience"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_server_config(cfg: &ServerConfig) -> Result<(), String> {
     validate_auth_token_source(&cfg.auth.token, &cfg.auth.token_source)?;
+    // Go frp compat: invalid allow_ports entries are config errors, not a
+    // silent disable of the restriction (validation/PortsRange).
+    if !cfg.allow_ports.trim().is_empty() {
+        parse_allow_ports(&cfg.allow_ports).map_err(|e| format!("server config: {e}"))?;
+    }
     // ServerConfig has no inline proxy definitions — proxies are registered
     // by clients at runtime. No proxy-level validation to do here.
     Ok(())
@@ -1756,6 +1915,7 @@ fn validate_client_config(cfg: &ClientConfig) -> Result<(), String> {
             cfg.token.as_str()
         };
         validate_auth_token_source(token, &auth.token_source)?;
+        validate_oidc_client_config(auth)?;
     }
     if (!cfg.virtual_net.address.is_empty()
         || cfg.visitors.iter().any(is_virtual_net_visitor)
@@ -2284,6 +2444,7 @@ fn normalize_client_config(value: &mut toml::Value) {
                         "trustedCaFile" => "oidc_tls_trusted_ca_file",
                         "insecureSkipVerify" => "oidc_tls_insecure_skip_verify",
                         "proxyURL" => "oidc_proxy_url",
+                        "tokenSource" => "oidc_token_source",
                         "additionalAuthScopes" => "additional_auth_scopes",
                         other => other,
                     };
@@ -3156,6 +3317,8 @@ fn known_client_keys() -> std::collections::HashSet<&'static str> {
         "oidc_scope",
         "oidc_issuer",
         "oidc_proxy_url",
+        "additional_endpoint_params",
+        "oidc_token_source",
     ])
 }
 
@@ -3934,34 +4097,137 @@ enabled = false
     #[test]
     fn test_parse_allow_ports() {
         // Empty → empty
-        assert!(parse_allow_ports("").is_empty());
+        assert!(parse_allow_ports("").unwrap().is_empty());
         // Single range
-        assert_eq!(parse_allow_ports("10000-20000"), vec![(10000, 20000)]);
+        assert_eq!(
+            parse_allow_ports("10000-20000").unwrap(),
+            vec![PortsRange {
+                start: 10000,
+                end: 20000,
+                single: 0
+            }]
+        );
         // Multiple ranges
         assert_eq!(
-            parse_allow_ports("10000-20000,30000-40000"),
-            vec![(10000, 20000), (30000, 40000)]
+            parse_allow_ports("10000-20000,30000-40000").unwrap(),
+            vec![
+                PortsRange {
+                    start: 10000,
+                    end: 20000,
+                    single: 0
+                },
+                PortsRange {
+                    start: 30000,
+                    end: 40000,
+                    single: 0
+                },
+            ]
         );
         // With spaces
         assert_eq!(
-            parse_allow_ports("10000-20000, 30000-40000"),
-            vec![(10000, 20000), (30000, 40000)]
+            parse_allow_ports("10000-20000, 30000-40000").unwrap(),
+            vec![
+                PortsRange {
+                    start: 10000,
+                    end: 20000,
+                    single: 0
+                },
+                PortsRange {
+                    start: 30000,
+                    end: 40000,
+                    single: 0
+                },
+            ]
         );
         // Inverted range swapped
-        assert_eq!(parse_allow_ports("20000-10000"), vec![(10000, 20000)]);
+        assert_eq!(
+            parse_allow_ports("20000-10000").unwrap(),
+            vec![PortsRange {
+                start: 10000,
+                end: 20000,
+                single: 0
+            }]
+        );
         // Single port
-        assert_eq!(parse_allow_ports("8080"), vec![(8080, 8080)]);
+        assert_eq!(
+            parse_allow_ports("8080").unwrap(),
+            vec![PortsRange {
+                start: 8080,
+                end: 8080,
+                single: 0
+            }]
+        );
+        // Go `{single=N}` form
+        assert_eq!(
+            parse_allow_ports("{single=40000}").unwrap(),
+            vec![PortsRange {
+                start: 40000,
+                end: 40000,
+                single: 40000
+            }]
+        );
+        assert!(parse_allow_ports("1000-2000,{single=8080}").unwrap()[1].contains(8080));
+        assert!(!parse_allow_ports("1000-2000,{single=8080}").unwrap()[1].contains(8081));
         // Mixed
         assert_eq!(
-            parse_allow_ports("1000-2000,8080,30000-40000"),
-            vec![(1000, 2000), (8080, 8080), (30000, 40000)]
+            parse_allow_ports("1000-2000,8080,30000-40000").unwrap(),
+            vec![
+                PortsRange {
+                    start: 1000,
+                    end: 2000,
+                    single: 0
+                },
+                PortsRange {
+                    start: 8080,
+                    end: 8080,
+                    single: 0
+                },
+                PortsRange {
+                    start: 30000,
+                    end: 40000,
+                    single: 0
+                },
+            ]
         );
+        // Invalid entries are config errors (Go validation behavior).
+        assert!(parse_allow_ports("not-a-port").is_err());
+        assert!(parse_allow_ports("99999").is_err()); // > u16::MAX
+        assert!(parse_allow_ports("{single=oops}").is_err());
     }
 
     #[test]
     fn test_count_ports() {
-        assert_eq!(count_ports(&[(10000, 10009)]), 10);
-        assert_eq!(count_ports(&[(10000, 10009), (20000, 20004)]), 15);
+        assert_eq!(
+            count_ports(&[PortsRange {
+                start: 10000,
+                end: 10009,
+                single: 0
+            }]),
+            10
+        );
+        assert_eq!(
+            count_ports(&[
+                PortsRange {
+                    start: 10000,
+                    end: 10009,
+                    single: 0
+                },
+                PortsRange {
+                    start: 20000,
+                    end: 20004,
+                    single: 0
+                },
+            ]),
+            15
+        );
+        assert_eq!(
+            count_ports(&[PortsRange {
+                start: 1,
+                end: 1,
+                single: 8080
+            }]),
+            1
+        );
         assert_eq!(count_ports(&[]), 0);
     }
 
@@ -3991,32 +4257,82 @@ remote_port = 7001
     #[test]
     fn test_parse_allow_ports_edge_cases() {
         // Empty string
-        let result = parse_allow_ports("");
-        assert!(result.is_empty());
-
-        // Garbage input
-        let result = parse_allow_ports("not-a-port");
-        assert!(result.is_empty());
+        assert!(parse_allow_ports("").unwrap().is_empty());
 
         // Single port
-        let result = parse_allow_ports("8080");
-        assert_eq!(result, vec![(8080, 8080)]);
+        let r = parse_allow_ports("8080").unwrap();
+        assert_eq!(
+            r,
+            vec![PortsRange {
+                start: 8080,
+                end: 8080,
+                single: 0
+            }]
+        );
 
-        // Two single ports (parsed individually)
-        let result = parse_allow_ports("9000,8000");
-        assert_eq!(result, vec![(9000, 9000), (8000, 8000)]);
+        // Two single ports
+        let r = parse_allow_ports("9000,8000").unwrap();
+        assert_eq!(
+            r,
+            vec![
+                PortsRange {
+                    start: 9000,
+                    end: 9000,
+                    single: 0
+                },
+                PortsRange {
+                    start: 8000,
+                    end: 8000,
+                    single: 0
+                },
+            ]
+        );
 
         // Mixed ranges and single ports
-        let result = parse_allow_ports("1000-2000,3000,5000-6000");
-        assert_eq!(result, vec![(1000, 2000), (3000, 3000), (5000, 6000)]);
+        let r = parse_allow_ports("1000-2000,3000,5000-6000").unwrap();
+        assert_eq!(
+            r,
+            vec![
+                PortsRange {
+                    start: 1000,
+                    end: 2000,
+                    single: 0
+                },
+                PortsRange {
+                    start: 3000,
+                    end: 3000,
+                    single: 0
+                },
+                PortsRange {
+                    start: 5000,
+                    end: 6000,
+                    single: 0
+                },
+            ]
+        );
 
         // Whitespace handling
-        let result = parse_allow_ports(" 1000 , 2000-3000 ");
-        assert_eq!(result, vec![(1000, 1000), (2000, 3000)]);
+        let r = parse_allow_ports(" 1000 , 2000-3000 ").unwrap();
+        assert_eq!(
+            r,
+            vec![
+                PortsRange {
+                    start: 1000,
+                    end: 1000,
+                    single: 0
+                },
+                PortsRange {
+                    start: 2000,
+                    end: 3000,
+                    single: 0
+                },
+            ]
+        );
 
-        // Out of range values filtered (returns empty vec via None from parse)
-        let result = parse_allow_ports("99999"); // > u16::MAX
-        assert!(result.is_empty());
+        // Garbage and out-of-range entries are errors (Go validation).
+        assert!(parse_allow_ports("not-a-port").is_err());
+        assert!(parse_allow_ports("99999").is_err()); // > u16::MAX
+        assert!(parse_allow_ports("0").is_err());
     }
 
     #[test]
@@ -4511,6 +4827,137 @@ enabel = true
             .to_string();
         assert!(error.contains("protcol"));
         assert!(error.contains("enabel"));
+    }
+
+    #[test]
+    fn test_oidc_additional_endpoint_params_map() {
+        // Go frp v0.70.1: AuthOIDCClientConfig.AdditionalEndpointParams is a
+        // map[string]string — TOML table must parse into a HashMap, not a
+        // "k=v&k=v" string.
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            auth_method = "oidc"
+            [auth]
+            method = "oidc"
+            [auth.oidc]
+            clientID = "client-1"
+            tokenEndpointURL = "https://idp.example.com/token"
+            additionalEndpointParams = { tenant = "acme", region = "eu" }
+        "#;
+        let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+        let auth = cfg.auth.expect("auth section");
+        assert_eq!(
+            auth.additional_endpoint_params
+                .get("tenant")
+                .map(String::as_str),
+            Some("acme")
+        );
+        assert_eq!(
+            auth.additional_endpoint_params
+                .get("region")
+                .map(String::as_str),
+            Some("eu")
+        );
+    }
+
+    #[test]
+    fn test_oidc_token_source_parsed_from_subtable() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            auth_method = "oidc"
+            [auth]
+            method = "oidc"
+            [auth.oidc]
+            tokenSource = { type = "file", file = { path = "/tmp/oidc-token" } }
+        "#;
+        let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
+        let auth = cfg.auth.expect("auth section");
+        let source = auth
+            .oidc_token_source
+            .expect("oidc.tokenSource should parse");
+        assert_eq!(source.source_type, "file");
+        assert_eq!(
+            source.file.as_ref().map(|f| f.path.as_str()),
+            Some("/tmp/oidc-token")
+        );
+    }
+
+    #[test]
+    fn test_oidc_token_source_mutually_exclusive_with_other_fields() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            auth_method = "oidc"
+            [auth]
+            method = "oidc"
+            [auth.oidc]
+            clientID = "client-1"
+            tokenSource = { type = "file", file = { path = "/tmp/tok" } }
+        "#;
+        let err = super::load_client_config_from_str(toml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot specify both auth.oidc.tokenSource"),
+            "expected mutual-exclusivity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_oidc_requires_client_id_and_token_endpoint() {
+        // Missing clientID
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            auth_method = "oidc"
+            [auth]
+            method = "oidc"
+            [auth.oidc]
+            tokenEndpointURL = "https://idp.example.com/token"
+        "#;
+        let err = super::load_client_config_from_str(toml)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("clientID is required"), "got: {err}");
+
+        // Missing token endpoint (and no issuer for discovery)
+        let toml2 = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            auth_method = "oidc"
+            [auth]
+            method = "oidc"
+            [auth.oidc]
+            clientID = "client-1"
+        "#;
+        let err2 = super::load_client_config_from_str(toml2)
+            .unwrap_err()
+            .to_string();
+        assert!(err2.contains("tokenEndpointURL is required"), "got: {err2}");
+    }
+
+    #[test]
+    fn test_oidc_additional_endpoint_params_scope_rejected() {
+        let toml = r#"
+            server_addr = "127.0.0.1"
+            server_port = 7000
+            auth_method = "oidc"
+            [auth]
+            method = "oidc"
+            [auth.oidc]
+            clientID = "client-1"
+            tokenEndpointURL = "https://idp.example.com/token"
+            additionalEndpointParams = { scope = "openid" }
+        "#;
+        let err = super::load_client_config_from_str(toml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("additionalEndpointParams.scope is not allowed"),
+            "got: {err}"
+        );
     }
 
     #[test]
