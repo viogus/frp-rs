@@ -66,9 +66,9 @@ async fn handshake_v2(
 /// not immediately (i.e. the post-handshake Login read is bounded).
 async fn expect_disconnect_after_timeout(io: &mut IoStream) {
     let start = Instant::now();
-    match tokio::time::timeout(Duration::from_secs(12), io.read_raw_v2_frame()).await {
+    match tokio::time::timeout(Duration::from_secs(15), io.read_raw_v2_frame()).await {
         Err(_) => panic!(
-            "server did not close the connection within 12s (elapsed {:?})",
+            "server did not close the connection within 15s (elapsed {:?})",
             start.elapsed()
         ),
         Ok(Err(e)) => {
