@@ -2,6 +2,17 @@
 
 All notable changes to frp-rs.
 
+## Unreleased
+
+- **Connection read timeout parity**: the new-connection read timeout now
+  matches Go frp's compile-time `connReadTimeout = 10s` constant
+  (`server/service.go`, not configurable). Removed the inner 5s timeout in
+  `detect_and_strip_magic` so the caller's 10s wrapper governs; raised the V2
+  handshake read timeout from 5s to 10s; aligned the TLS SNI peek and the
+  TLS-encrypted WebSocket first-byte peek to 10s. Corrected the
+  `detect_and_strip_magic` doc comment that wrongly claimed Go frp exposes
+  `connReadTimeout` as configurable `ServerConfig.Transport.connReadTimeout`.
+
 ## v0.7.1 — Go frp v0.70.1 Source-Level Compatibility Audit
 
 Full-source audit of Go frp v0.70.1 (fatedier/frp) against frp-rs. 106 findings

@@ -2065,9 +2065,12 @@ impl Service {
                                 // Read ClientHello bytes (up to 4KB) from inner stream.
                                 // The inner stream is positioned at byte 7 of the original
                                 // connection. Combine with pre_read_bytes for full ClientHello.
+                                // 10s timeout matches Go frp's connReadTimeout, which
+                                // CheckAndEnableTLSServerConnWithTimeout applies during
+                                // TLS detection (server/service.go constant, 10s).
                                 let mut sni_buf = vec![0u8; 4096];
                                 let sni_peek_n = match tokio::time::timeout(
-                                    std::time::Duration::from_secs(5),
+                                    std::time::Duration::from_secs(10),
                                     inner_stream.read(&mut sni_buf),
                                 ).await {
                                     Ok(Ok(n)) if n >= 43 => n,
@@ -2185,10 +2188,14 @@ impl Service {
                                 // health checks, scanners, and other non-frp HTTP
                                 // clients that connect to the frps TLS port.
                                 // Two-phase WebSocket detection.
+                                // Peek reads the first bytes of the post-TLS byte
+                                // stream (i.e. the first message); Go frp reads this
+                                // under its connReadTimeout = 10s deadline, so use
+                                // the same value instead of a shorter hardcoded one.
                                 let mut ws_peek = vec![0u8; 4];
                                 #[cfg(feature = "websocket")]
                                 let got_http = match tokio::time::timeout(
-                                    std::time::Duration::from_secs(5),
+                                    std::time::Duration::from_secs(10),
                                     io.read_exact(&mut ws_peek[..4]),
                                 ).await {
                                     Ok(Ok(n)) if n >= 4 => &ws_peek[..4] == b"GET ",
@@ -2196,7 +2203,7 @@ impl Service {
                                 };
                                 #[cfg(not(feature = "websocket"))]
                                 let _ = tokio::time::timeout(
-                                    std::time::Duration::from_secs(5),
+                                    std::time::Duration::from_secs(10),
                                     io.read_exact(&mut ws_peek[..4]),
                                 ).await;
 

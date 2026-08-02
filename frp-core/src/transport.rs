@@ -2551,36 +2551,23 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
 /// If no match, wraps consumed bytes in `IoStream::PreRead` and classifies
 /// by the first byte. Downstream handlers receive the exact same byte stream.
 ///
-/// ## Hardcoded timeout
+/// ## Read timeout
 ///
-/// The connection-read timeout is hardcoded to **5 seconds**. Go frp v0.70.1
-/// makes this configurable via `ServerConfig.Transport.connReadTimeout`.
-/// If a configurable timeout is needed, add a `conn_read_timeout: Duration`
-/// parameter to this function and thread it through from the server config.
+/// No timeout is applied inside this function: the caller wraps the call with
+/// the connection-read timeout so the value stays in one place. frp-server
+/// applies 10s, matching the compile-time `connReadTimeout = 10 * time.Second`
+/// constant in Go frp v0.70.1 `server/service.go`. That constant is **not**
+/// configurable — there is no `ServerConfig.Transport.connReadTimeout` field.
 pub async fn detect_and_strip_magic(
     mut stream: tokio::net::TcpStream,
 ) -> Result<(ConnectionType, IoStream), crate::Error> {
     use tokio::io::AsyncReadExt;
 
     let mut magic_buf = [0u8; 7];
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        // TODO: make this configurable via ServerConfig (Go frp v0.70.1 compat: connReadTimeout)
-        stream.read_exact(&mut magic_buf),
-    )
-    .await
-    {
-        Ok(Ok(_n)) => {}
-        Ok(Err(e)) => {
-            return Err(crate::Error::Transport(
-                format!("read connection magic: {e}").into(),
-            ));
-        }
-        Err(_) => {
-            return Err(crate::Error::Transport(
-                "timeout reading connection magic".into(),
-            ));
-        }
+    if let Err(e) = stream.read_exact(&mut magic_buf).await {
+        return Err(crate::Error::Transport(
+            format!("read connection magic: {e}").into(),
+        ));
     }
 
     if magic_buf == crate::protocol::V2_MAGIC_BYTES {

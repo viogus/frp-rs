@@ -24,8 +24,13 @@ use crate::protocol::{
 };
 use crate::transport::IoStream;
 
-/// Timeout for V2 handshake reads (matching Go frp connReadTimeout).
-const V2_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Timeout for V2 handshake reads.
+///
+/// Aligned with the compile-time `connReadTimeout = 10 * time.Second` constant
+/// in Go frp v0.70.1 `server/service.go` (not configurable). Go applies this
+/// deadline to reading the wire magic and the first message, which includes
+/// the V2 ClientHello / ServerHello exchange.
+const V2_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Crypto random size in bytes (matching Go frp CryptoRandomSize = 32).
 const CRYPTO_RANDOM_SIZE: usize = 32;
