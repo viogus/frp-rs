@@ -328,9 +328,15 @@ pub fn parse_allow_ports(s: &str) -> Result<Vec<PortsRange>, String> {
                 .parse()
                 .map_err(|_| format!("invalid allow_ports entry '{part}'"))?;
             if start == 0 || end == 0 {
-                return Err(format!("invalid allow_ports entry '{part}': port 0 is not allowed"));
+                return Err(format!(
+                    "invalid allow_ports entry '{part}': port 0 is not allowed"
+                ));
             }
-            let (start, end) = if start <= end { (start, end) } else { (end, start) };
+            let (start, end) = if start <= end {
+                (start, end)
+            } else {
+                (end, start)
+            };
             out.push(PortsRange {
                 start,
                 end,
@@ -342,7 +348,9 @@ pub fn parse_allow_ports(s: &str) -> Result<Vec<PortsRange>, String> {
                 .parse()
                 .map_err(|_| format!("invalid allow_ports entry '{part}'"))?;
             if p == 0 {
-                return Err(format!("invalid allow_ports entry '{part}': port 0 is not allowed"));
+                return Err(format!(
+                    "invalid allow_ports entry '{part}': port 0 is not allowed"
+                ));
             }
             out.push(PortsRange {
                 start: p,
@@ -1835,8 +1843,7 @@ fn validate_oidc_client_config(auth: &AuthClientConfig) -> Result<(), String> {
             || !auth.oidc_proxy_url.is_empty()
         {
             return Err(
-                "cannot specify both auth.oidc.tokenSource and any other field of auth.oidc"
-                    .into(),
+                "cannot specify both auth.oidc.tokenSource and any other field of auth.oidc".into(),
             );
         }
         return source
@@ -1891,8 +1898,7 @@ fn validate_server_config(cfg: &ServerConfig) -> Result<(), String> {
     // Go frp compat: invalid allow_ports entries are config errors, not a
     // silent disable of the restriction (validation/PortsRange).
     if !cfg.allow_ports.trim().is_empty() {
-        parse_allow_ports(&cfg.allow_ports)
-            .map_err(|e| format!("server config: {e}"))?;
+        parse_allow_ports(&cfg.allow_ports).map_err(|e| format!("server config: {e}"))?;
     }
     // ServerConfig has no inline proxy definitions — proxies are registered
     // by clients at runtime. No proxy-level validation to do here.
@@ -4095,38 +4101,70 @@ enabled = false
         // Single range
         assert_eq!(
             parse_allow_ports("10000-20000").unwrap(),
-            vec![PortsRange { start: 10000, end: 20000, single: 0 }]
+            vec![PortsRange {
+                start: 10000,
+                end: 20000,
+                single: 0
+            }]
         );
         // Multiple ranges
         assert_eq!(
             parse_allow_ports("10000-20000,30000-40000").unwrap(),
             vec![
-                PortsRange { start: 10000, end: 20000, single: 0 },
-                PortsRange { start: 30000, end: 40000, single: 0 },
+                PortsRange {
+                    start: 10000,
+                    end: 20000,
+                    single: 0
+                },
+                PortsRange {
+                    start: 30000,
+                    end: 40000,
+                    single: 0
+                },
             ]
         );
         // With spaces
         assert_eq!(
             parse_allow_ports("10000-20000, 30000-40000").unwrap(),
             vec![
-                PortsRange { start: 10000, end: 20000, single: 0 },
-                PortsRange { start: 30000, end: 40000, single: 0 },
+                PortsRange {
+                    start: 10000,
+                    end: 20000,
+                    single: 0
+                },
+                PortsRange {
+                    start: 30000,
+                    end: 40000,
+                    single: 0
+                },
             ]
         );
         // Inverted range swapped
         assert_eq!(
             parse_allow_ports("20000-10000").unwrap(),
-            vec![PortsRange { start: 10000, end: 20000, single: 0 }]
+            vec![PortsRange {
+                start: 10000,
+                end: 20000,
+                single: 0
+            }]
         );
         // Single port
         assert_eq!(
             parse_allow_ports("8080").unwrap(),
-            vec![PortsRange { start: 8080, end: 8080, single: 0 }]
+            vec![PortsRange {
+                start: 8080,
+                end: 8080,
+                single: 0
+            }]
         );
         // Go `{single=N}` form
         assert_eq!(
             parse_allow_ports("{single=40000}").unwrap(),
-            vec![PortsRange { start: 40000, end: 40000, single: 40000 }]
+            vec![PortsRange {
+                start: 40000,
+                end: 40000,
+                single: 40000
+            }]
         );
         assert!(parse_allow_ports("1000-2000,{single=8080}").unwrap()[1].contains(8080));
         assert!(!parse_allow_ports("1000-2000,{single=8080}").unwrap()[1].contains(8081));
@@ -4134,9 +4172,21 @@ enabled = false
         assert_eq!(
             parse_allow_ports("1000-2000,8080,30000-40000").unwrap(),
             vec![
-                PortsRange { start: 1000, end: 2000, single: 0 },
-                PortsRange { start: 8080, end: 8080, single: 0 },
-                PortsRange { start: 30000, end: 40000, single: 0 },
+                PortsRange {
+                    start: 1000,
+                    end: 2000,
+                    single: 0
+                },
+                PortsRange {
+                    start: 8080,
+                    end: 8080,
+                    single: 0
+                },
+                PortsRange {
+                    start: 30000,
+                    end: 40000,
+                    single: 0
+                },
             ]
         );
         // Invalid entries are config errors (Go validation behavior).
@@ -4148,18 +4198,34 @@ enabled = false
     #[test]
     fn test_count_ports() {
         assert_eq!(
-            count_ports(&[PortsRange { start: 10000, end: 10009, single: 0 }]),
+            count_ports(&[PortsRange {
+                start: 10000,
+                end: 10009,
+                single: 0
+            }]),
             10
         );
         assert_eq!(
             count_ports(&[
-                PortsRange { start: 10000, end: 10009, single: 0 },
-                PortsRange { start: 20000, end: 20004, single: 0 },
+                PortsRange {
+                    start: 10000,
+                    end: 10009,
+                    single: 0
+                },
+                PortsRange {
+                    start: 20000,
+                    end: 20004,
+                    single: 0
+                },
             ]),
             15
         );
         assert_eq!(
-            count_ports(&[PortsRange { start: 1, end: 1, single: 8080 }]),
+            count_ports(&[PortsRange {
+                start: 1,
+                end: 1,
+                single: 8080
+            }]),
             1
         );
         assert_eq!(count_ports(&[]), 0);
@@ -4195,15 +4261,30 @@ remote_port = 7001
 
         // Single port
         let r = parse_allow_ports("8080").unwrap();
-        assert_eq!(r, vec![PortsRange { start: 8080, end: 8080, single: 0 }]);
+        assert_eq!(
+            r,
+            vec![PortsRange {
+                start: 8080,
+                end: 8080,
+                single: 0
+            }]
+        );
 
         // Two single ports
         let r = parse_allow_ports("9000,8000").unwrap();
         assert_eq!(
             r,
             vec![
-                PortsRange { start: 9000, end: 9000, single: 0 },
-                PortsRange { start: 8000, end: 8000, single: 0 },
+                PortsRange {
+                    start: 9000,
+                    end: 9000,
+                    single: 0
+                },
+                PortsRange {
+                    start: 8000,
+                    end: 8000,
+                    single: 0
+                },
             ]
         );
 
@@ -4212,9 +4293,21 @@ remote_port = 7001
         assert_eq!(
             r,
             vec![
-                PortsRange { start: 1000, end: 2000, single: 0 },
-                PortsRange { start: 3000, end: 3000, single: 0 },
-                PortsRange { start: 5000, end: 6000, single: 0 },
+                PortsRange {
+                    start: 1000,
+                    end: 2000,
+                    single: 0
+                },
+                PortsRange {
+                    start: 3000,
+                    end: 3000,
+                    single: 0
+                },
+                PortsRange {
+                    start: 5000,
+                    end: 6000,
+                    single: 0
+                },
             ]
         );
 
@@ -4223,8 +4316,16 @@ remote_port = 7001
         assert_eq!(
             r,
             vec![
-                PortsRange { start: 1000, end: 1000, single: 0 },
-                PortsRange { start: 2000, end: 3000, single: 0 },
+                PortsRange {
+                    start: 1000,
+                    end: 1000,
+                    single: 0
+                },
+                PortsRange {
+                    start: 2000,
+                    end: 3000,
+                    single: 0
+                },
             ]
         );
 
@@ -4746,8 +4847,18 @@ enabel = true
         "#;
         let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
         let auth = cfg.auth.expect("auth section");
-        assert_eq!(auth.additional_endpoint_params.get("tenant").map(String::as_str), Some("acme"));
-        assert_eq!(auth.additional_endpoint_params.get("region").map(String::as_str), Some("eu"));
+        assert_eq!(
+            auth.additional_endpoint_params
+                .get("tenant")
+                .map(String::as_str),
+            Some("acme")
+        );
+        assert_eq!(
+            auth.additional_endpoint_params
+                .get("region")
+                .map(String::as_str),
+            Some("eu")
+        );
     }
 
     #[test]
@@ -4763,9 +4874,14 @@ enabel = true
         "#;
         let cfg: super::ClientConfig = super::load_client_config_from_str(toml).unwrap();
         let auth = cfg.auth.expect("auth section");
-        let source = auth.oidc_token_source.expect("oidc.tokenSource should parse");
+        let source = auth
+            .oidc_token_source
+            .expect("oidc.tokenSource should parse");
         assert_eq!(source.source_type, "file");
-        assert_eq!(source.file.as_ref().map(|f| f.path.as_str()), Some("/tmp/oidc-token"));
+        assert_eq!(
+            source.file.as_ref().map(|f| f.path.as_str()),
+            Some("/tmp/oidc-token")
+        );
     }
 
     #[test]
@@ -4780,7 +4896,9 @@ enabel = true
             clientID = "client-1"
             tokenSource = { type = "file", file = { path = "/tmp/tok" } }
         "#;
-        let err = super::load_client_config_from_str(toml).unwrap_err().to_string();
+        let err = super::load_client_config_from_str(toml)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("cannot specify both auth.oidc.tokenSource"),
             "expected mutual-exclusivity error, got: {err}"
@@ -4799,7 +4917,9 @@ enabel = true
             [auth.oidc]
             tokenEndpointURL = "https://idp.example.com/token"
         "#;
-        let err = super::load_client_config_from_str(toml).unwrap_err().to_string();
+        let err = super::load_client_config_from_str(toml)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("clientID is required"), "got: {err}");
 
         // Missing token endpoint (and no issuer for discovery)
@@ -4812,7 +4932,9 @@ enabel = true
             [auth.oidc]
             clientID = "client-1"
         "#;
-        let err2 = super::load_client_config_from_str(toml2).unwrap_err().to_string();
+        let err2 = super::load_client_config_from_str(toml2)
+            .unwrap_err()
+            .to_string();
         assert!(err2.contains("tokenEndpointURL is required"), "got: {err2}");
     }
 
@@ -4829,7 +4951,9 @@ enabel = true
             tokenEndpointURL = "https://idp.example.com/token"
             additionalEndpointParams = { scope = "openid" }
         "#;
-        let err = super::load_client_config_from_str(toml).unwrap_err().to_string();
+        let err = super::load_client_config_from_str(toml)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("additionalEndpointParams.scope is not allowed"),
             "got: {err}"

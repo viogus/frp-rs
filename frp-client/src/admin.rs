@@ -565,19 +565,10 @@ pub async fn run_admin_server(
         .route("/api/status", get(handle_status))
         .route("/api/metrics", get(handle_metrics))
         // Go frp compat: GET /api/reload (Go uses GET; keep POST too).
-        .route(
-            "/api/reload",
-            get(handle_reload).post(handle_reload),
-        )
+        .route("/api/reload", get(handle_reload).post(handle_reload))
         .route("/api/stop", axum::routing::post(handle_stop))
-        .route(
-            "/api/proxy/{name}/config",
-            get(handle_get_proxy_config),
-        )
-        .route(
-            "/api/visitor/{name}/config",
-            get(handle_get_visitor_config),
-        )
+        .route("/api/proxy/{name}/config", get(handle_get_proxy_config))
+        .route("/api/visitor/{name}/config", get(handle_get_visitor_config))
         .route(
             "/api/config",
             get(handle_get_config)

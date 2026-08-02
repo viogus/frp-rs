@@ -161,8 +161,7 @@ impl ControlConnection {
         previous_run_id: String,
         client_spec: Option<ClientSpec>,
         dial_server_timeout: i64,
-        #[cfg(feature = "quic")]
-        quic_params: frp_core::quic::QuicTransportParams,
+        #[cfg(feature = "quic")] quic_params: frp_core::quic::QuicTransportParams,
     ) -> Self {
         Self {
             server_addr,

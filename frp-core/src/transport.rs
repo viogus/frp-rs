@@ -2234,7 +2234,8 @@ async fn connect_via_proxy(
         }
         other => {
             return Err(crate::Error::Transport(
-                format!("unsupported proxy scheme: '{other}'. Supported: http, socks5, socks5h").into(),
+                format!("unsupported proxy scheme: '{other}'. Supported: http, socks5, socks5h")
+                    .into(),
             ));
         }
     }
@@ -2365,12 +2366,9 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                             crate::Error::Transport(format!("invalid server name: {e}").into())
                         })?;
                     let peer_addr = peer;
-                    let tls = connector
-                        .connect(server_name, stream)
-                        .await
-                        .map_err(|e| {
-                            crate::Error::Transport(format!("KCP TLS connect: {e}").into())
-                        })?;
+                    let tls = connector.connect(server_name, stream).await.map_err(|e| {
+                        crate::Error::Transport(format!("KCP TLS connect: {e}").into())
+                    })?;
                     return Ok(IoStream::Tls(
                         Box::new(tokio_rustls::TlsStream::Client(tls)),
                         peer_addr,
@@ -3702,7 +3700,10 @@ mod tests {
                 )
                 .await
                 .expect("write 101");
-            server.write_all(&frame).await.expect("write pipelined frame");
+            server
+                .write_all(&frame)
+                .await
+                .expect("write pipelined frame");
         });
 
         let mut io = connect_ws_raw(client, "example.com", 7000, FRP_WEBSOCKET_PATH, "http")
@@ -3712,7 +3713,8 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = io.read(&mut buf).await.expect("read ws payload");
         assert_eq!(
-            &buf[..n], payload,
+            &buf[..n],
+            payload,
             "read must return the frame payload only, got: {:?}",
             &buf[..n]
         );

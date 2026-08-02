@@ -1129,14 +1129,15 @@ async fn wait_detect_on_any(
     let start = std::time::Instant::now();
     loop {
         if start.elapsed().as_millis() as u64 >= timeout_ms {
-            return Err(format!("wait detect message timeout after {}ms", timeout_ms));
+            return Err(format!(
+                "wait detect message timeout after {}ms",
+                timeout_ms
+            ));
         }
         for s in sockets.iter() {
-            let r = tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                s.recv_from(&mut buf),
-            )
-            .await;
+            let r =
+                tokio::time::timeout(std::time::Duration::from_millis(50), s.recv_from(&mut buf))
+                    .await;
             match r {
                 Ok(Ok((n, peer))) => {
                     let data = &buf[..n];

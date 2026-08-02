@@ -25,8 +25,8 @@ fn client_hello_with_sni(host: &str) -> Vec<u8> {
     let sni_ext_list_len: u16 = sni_ext_data_len; // just one ServerName
     let sni_ext_len: u16 = 2 + sni_ext_list_len; // list_len + list
     let extensions_len: u16 = 4 + sni_ext_len; // ext_type + ext_len + ext_data
-    // ClientHello body: version(2) + random(32) + sid_len(1) + sid(0)
-    //   + cs_len(2) + cs_data(2) + cm_len(1) + cm_data(1) + ext_len(2) + ext_data
+                                               // ClientHello body: version(2) + random(32) + sid_len(1) + sid(0)
+                                               //   + cs_len(2) + cs_data(2) + cm_len(1) + cm_data(1) + ext_len(2) + ext_data
     let ch_body_len: u16 = 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + extensions_len;
     let hs_len: u32 = ch_body_len as u32;
     // record = hs_type(1) + hs_len(3) + ch_body
@@ -125,9 +125,7 @@ async fn test_https_vhost_sni_passthrough() {
     };
     let (_handle, _) = start_test_server(cfg).await;
     let addr: SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
-    let https_addr: SocketAddr = format!("127.0.0.1:{}", vhost_https_port)
-        .parse()
-        .unwrap();
+    let https_addr: SocketAddr = format!("127.0.0.1:{}", vhost_https_port).parse().unwrap();
 
     // Provider logs in and registers an HTTPS proxy for example.com.
     let (mut provider, resp) = login_with_test_token(addr).await.expect("provider login");
@@ -195,7 +193,10 @@ async fn test_https_vhost_sni_passthrough() {
     let mut chunk = [0u8; 512];
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            let n = work_conn.read(&mut chunk).await.expect("read forwarded bytes");
+            let n = work_conn
+                .read(&mut chunk)
+                .await
+                .expect("read forwarded bytes");
             if n == 0 {
                 break;
             }

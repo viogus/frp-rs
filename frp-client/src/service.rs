@@ -767,9 +767,21 @@ impl Service {
                 cfg_local.dial_server_timeout,
                 #[cfg(feature = "quic")]
                 frp_core::quic::quic_params_from_option_values(
-                    cfg_local.quic_options.as_ref().map(|q| q.keepalive_period).unwrap_or(0),
-                    cfg_local.quic_options.as_ref().map(|q| q.max_idle_timeout).unwrap_or(0),
-                    cfg_local.quic_options.as_ref().map(|q| q.max_incoming_streams).unwrap_or(0),
+                    cfg_local
+                        .quic_options
+                        .as_ref()
+                        .map(|q| q.keepalive_period)
+                        .unwrap_or(0),
+                    cfg_local
+                        .quic_options
+                        .as_ref()
+                        .map(|q| q.max_idle_timeout)
+                        .unwrap_or(0),
+                    cfg_local
+                        .quic_options
+                        .as_ref()
+                        .map(|q| q.max_incoming_streams)
+                        .unwrap_or(0),
                 ),
             );
 
@@ -861,7 +873,8 @@ impl Service {
                         info!(proxy_name = %p.name, remote = %remote, "Proxy '{}' registered on remote port {}", p.name, remote);
                         // Update runtime info for admin API
                         let mut map = self.proxy_info_map.write().await;
-                        if let Some(info) = map.get_mut(&wire_proxy_name(&cfg_local.user, &p.name)) {
+                        if let Some(info) = map.get_mut(&wire_proxy_name(&cfg_local.user, &p.name))
+                        {
                             info.remote_addr = remote;
                             info.err.clear();
                             info.phase = ProxyPhase::Running;
@@ -877,7 +890,8 @@ impl Service {
                     Err(e) => {
                         warn!(proxy_name = %p.name, error = %e, "Failed to register proxy '{}': {}", p.name, e);
                         let mut map = self.proxy_info_map.write().await;
-                        if let Some(info) = map.get_mut(&wire_proxy_name(&cfg_local.user, &p.name)) {
+                        if let Some(info) = map.get_mut(&wire_proxy_name(&cfg_local.user, &p.name))
+                        {
                             info.err = e.to_string();
                             info.phase = ProxyPhase::StartErr(e.to_string());
                         }
@@ -1109,12 +1123,14 @@ impl Service {
                             let tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
                             let transport_proxy_url = opt_if_empty!(cfg_local.proxy_url.clone());
                             let transport_dns = opt_if_empty!(cfg_local.dns_server.clone());
-                            let transport_bind = opt_if_empty!(cfg_local.connect_server_local_ip.clone());
+                            let transport_bind =
+                                opt_if_empty!(cfg_local.connect_server_local_ip.clone());
                             let transport_tls_cert = opt_if_empty!(cfg_local.tls_cert_file.clone());
                             let transport_tls_key = opt_if_empty!(cfg_local.tls_key_file.clone());
                             let transport_tcp_mux = cfg_local.tcp_mux;
                             let transport_tcp_mux_keepalive = cfg_local.tcp_mux_keepalive_interval;
-                            let transport_dial_timeout = cfg_local.dial_server_timeout.max(1) as u64;
+                            let transport_dial_timeout =
+                                cfg_local.dial_server_timeout.max(1) as u64;
                             let transport_keepalive = cfg_local.dial_server_keepalive.max(0) as u64;
                             let transport_nocustomtls = cfg_local.disable_custom_tls_first_byte;
                             let user = cfg_local.user.clone();
@@ -2468,9 +2484,11 @@ impl Service {
         let user = new_cfg.user.clone();
         let old_visitors = self.cfg.read().await.visitors.clone();
         #[cfg(feature = "vnet")]
-        let mut delta = crate::reload::do_reload(&self.proxy_info_map, &old_visitors, new_cfg, &user).await?;
+        let mut delta =
+            crate::reload::do_reload(&self.proxy_info_map, &old_visitors, new_cfg, &user).await?;
         #[cfg(not(feature = "vnet"))]
-        let delta = crate::reload::do_reload(&self.proxy_info_map, &old_visitors, new_cfg, &user).await?;
+        let delta =
+            crate::reload::do_reload(&self.proxy_info_map, &old_visitors, new_cfg, &user).await?;
 
         // reload::config_snapshot omits vnet-only fields; extend the delta so
         // a subnet/IP/mask change still rebuilds the TUN during reload.
@@ -2619,9 +2637,7 @@ impl Service {
             let wn = wire_proxy_name(&user, name);
             msgs.push(ReloadMsg {
                 label: format!("send CloseProxy for '{name}'"),
-                msg: FrpMessage::CloseProxy(msg::CloseProxy {
-                    proxy_name: wn,
-                }),
+                msg: FrpMessage::CloseProxy(msg::CloseProxy { proxy_name: wn }),
             });
             changes.push(format!("proxy '{name}' removed"));
         }
@@ -2636,9 +2652,7 @@ impl Service {
                     .unwrap_or_else(|| format!("{}:{}", p.local_ip, p.local_port));
                 msgs.push(ReloadMsg {
                     label: format!("send CloseProxy for changed '{name}'"),
-                    msg: FrpMessage::CloseProxy(msg::CloseProxy {
-                        proxy_name: wn,
-                    }),
+                    msg: FrpMessage::CloseProxy(msg::CloseProxy { proxy_name: wn }),
                 });
                 msgs.push(ReloadMsg {
                     label: format!("send NewProxy for changed '{name}'"),

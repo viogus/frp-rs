@@ -113,7 +113,9 @@ async fn socks5h_sends_domain_and_supports_user_pass_auth() {
 
     let mut dial_opts = opts(format!("socks5h://user:pass@{proxy_addr}"), 7000);
     dial_opts.server_addr = "127.0.0.1".to_string();
-    let mut io = dial_server(&dial_opts).await.expect("dial via socks5h proxy");
+    let mut io = dial_server(&dial_opts)
+        .await
+        .expect("dial via socks5h proxy");
     io.write_all(b"tunnel-ok").await.unwrap();
     let mut resp = vec![0u8; 64];
     let n = io.read(&mut resp).await.unwrap();
@@ -145,7 +147,9 @@ async fn socks5_requires_ip_target() {
     // proxy branch requires an IP and must fail.
     let mut dial_opts = opts(format!("socks5://{proxy_addr}"), 7000);
     dial_opts.server_addr = "localhost".to_string();
-    let err = dial_server(&dial_opts).await.expect_err("socks5 hostname must fail");
+    let err = dial_server(&dial_opts)
+        .await
+        .expect_err("socks5 hostname must fail");
     assert!(
         err.to_string().contains("socks5h"),
         "unexpected error: {err}"

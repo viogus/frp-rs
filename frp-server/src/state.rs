@@ -348,8 +348,7 @@ impl RateLimiter {
 }
 
 /// (proxy_name) → (port, is_udp, closed_at) for the 24h port reservation.
-pub type PortReservationMap =
-    std::collections::HashMap<String, (u16, bool, std::time::Instant)>;
+pub type PortReservationMap = std::collections::HashMap<String, (u16, bool, std::time::Instant)>;
 
 pub struct AppState {
     pub proxy_manager: Arc<ProxyManager>,
@@ -727,7 +726,11 @@ mod tests {
             frp_core::auth::AuthConfig::with_token("test-token"),
             "127.0.0.1".into(),
             frp_core::encryption::derive_key("test-token"),
-            vec![frp_core::config::PortsRange { start: 1, end: u16::MAX, single: 0 }],
+            vec![frp_core::config::PortsRange {
+                start: 1,
+                end: u16::MAX,
+                single: 0,
+            }],
             String::new(),
             true,
             30,

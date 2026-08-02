@@ -58,58 +58,62 @@ pub async fn start_tls2raw_plugin(cfg: &PluginConfig) -> Result<PluginHandle, fr
         "tls2raw plugin: TLS termination → raw TCP at {target_addr}");
 
     let state = (target_addr, tls_acceptor, proxy_protocol_version);
-    serve_plugin("tls2raw", state, |mut tunnel_stream, _peer, (target, acceptor, proxy_proto_ver)| async move {
-        // 1. Read PROXY protocol header from tunnel stream BEFORE TLS handshake
-        //    (Go frp: connInfo.ProxyProtocolHeader is pre-read by work_conn).
-        let proxy_header = match proxy_proto_ver.as_str() {
-            "v1" => match read_proxy_header_v1(&mut tunnel_stream).await {
-                Ok(h) => h,
+    serve_plugin(
+        "tls2raw",
+        state,
+        |mut tunnel_stream, _peer, (target, acceptor, proxy_proto_ver)| async move {
+            // 1. Read PROXY protocol header from tunnel stream BEFORE TLS handshake
+            //    (Go frp: connInfo.ProxyProtocolHeader is pre-read by work_conn).
+            let proxy_header = match proxy_proto_ver.as_str() {
+                "v1" => match read_proxy_header_v1(&mut tunnel_stream).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!(%target, ?e, "tls2raw: failed to read PROXY v1 header: {e}");
+                        return;
+                    }
+                },
+                "v2" => match read_proxy_header_v2(&mut tunnel_stream).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!(%target, ?e, "tls2raw: failed to read PROXY v2 header: {e}");
+                        return;
+                    }
+                },
+                _ => Vec::new(),
+            };
+
+            // 2. Perform TLS handshake on the tunnel side (Go: tls.Server).
+            let mut tls_stream = match acceptor.accept(tunnel_stream).await {
+                Ok(tls) => tls,
                 Err(e) => {
-                    warn!(%target, ?e, "tls2raw: failed to read PROXY v1 header: {e}");
+                    warn!(%target, ?e, "tls2raw: TLS handshake failed: {e}");
                     return;
                 }
-            },
-            "v2" => match read_proxy_header_v2(&mut tunnel_stream).await {
-                Ok(h) => h,
+            };
+
+            // 3. Connect to local raw TCP service.
+            let mut raw_conn = match TcpStream::connect(&target).await {
+                Ok(c) => c,
                 Err(e) => {
-                    warn!(%target, ?e, "tls2raw: failed to read PROXY v2 header: {e}");
+                    warn!(%target, ?e, "tls2raw: TCP connect to {target} failed: {e}");
                     return;
                 }
-            },
-            _ => Vec::new(),
-        };
+            };
+            frp_core::transport::set_nodelay(&raw_conn);
 
-        // 2. Perform TLS handshake on the tunnel side (Go: tls.Server).
-        let mut tls_stream = match acceptor.accept(tunnel_stream).await {
-            Ok(tls) => tls,
-            Err(e) => {
-                warn!(%target, ?e, "tls2raw: TLS handshake failed: {e}");
-                return;
+            // 4. Write PROXY protocol header to raw TCP before bridging
+            //    (Go: connInfo.ProxyProtocolHeader.WriteTo(rawConn)).
+            if !proxy_header.is_empty() {
+                if let Err(e) = raw_conn.write_all(&proxy_header).await {
+                    warn!(%target, ?e, "tls2raw: failed to write PROXY header: {e}");
+                    return;
+                }
             }
-        };
 
-        // 3. Connect to local raw TCP service.
-        let mut raw_conn = match TcpStream::connect(&target).await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(%target, ?e, "tls2raw: TCP connect to {target} failed: {e}");
-                return;
-            }
-        };
-        frp_core::transport::set_nodelay(&raw_conn);
-
-        // 4. Write PROXY protocol header to raw TCP before bridging
-        //    (Go: connInfo.ProxyProtocolHeader.WriteTo(rawConn)).
-        if !proxy_header.is_empty() {
-            if let Err(e) = raw_conn.write_all(&proxy_header).await {
-                warn!(%target, ?e, "tls2raw: failed to write PROXY header: {e}");
-                return;
-            }
-        }
-
-        // 5. Bridge TLS (tunnel) ↔ raw TCP (local).
-        let _ = tokio::io::copy_bidirectional(&mut tls_stream, &mut raw_conn).await;
-    })
+            // 5. Bridge TLS (tunnel) ↔ raw TCP (local).
+            let _ = tokio::io::copy_bidirectional(&mut tls_stream, &mut raw_conn).await;
+        },
+    )
     .await
 }
 

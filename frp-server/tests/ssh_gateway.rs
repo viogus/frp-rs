@@ -298,8 +298,7 @@ async fn test_ssh_gateway_starts_with_port_limit_config() {
 async fn test_ssh_gateway_reverse_forwarding_roundtrip() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_test_writer()
         .try_init();
@@ -369,7 +368,10 @@ async fn test_ssh_gateway_reverse_forwarding_roundtrip() {
         .expect("-R tcpip-forward must be accepted");
     // SSH protocol: a specific-port request's success reply carries no port
     // (russh returns 0); a 0 request would return the allocated port.
-    assert_eq!(fwd, 0, "-R request should be granted for the requested port");
+    assert_eq!(
+        fwd, 0,
+        "-R request should be granted for the requested port"
+    );
 
     // Register a tcp proxy through the SSH remote command.
     let session = client
@@ -402,7 +404,8 @@ async fn test_ssh_gateway_reverse_forwarding_roundtrip() {
         .expect("should receive echoed data")
         .expect("echo read");
     assert_eq!(
-        &buf[..n], b"ping-over-ssh-r",
+        &buf[..n],
+        b"ping-over-ssh-r",
         "data must round-trip through ssh -R"
     );
 

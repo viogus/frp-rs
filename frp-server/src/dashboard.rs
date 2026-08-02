@@ -452,7 +452,10 @@ async fn handle_clients(State(state): State<Arc<AppState>>) -> Json<Vec<ClientEn
         };
         let (proxies, pool_size, pending) = match ctl {
             Some(ctl) => {
-                let names = state.proxy_manager.list_client_proxy_names(&info.run_id).await;
+                let names = state
+                    .proxy_manager
+                    .list_client_proxy_names(&info.run_id)
+                    .await;
                 (
                     names,
                     ctl.pool_stats.pool_size.load(Ordering::Relaxed),
@@ -542,7 +545,10 @@ async fn handle_pprof_index() -> Html<&'static str> {
 
 /// Go compat: `/debug/pprof/*` placeholder (outside auth, like Go).
 async fn handle_pprof() -> (StatusCode, &'static str) {
-    (StatusCode::NOT_FOUND, "pprof profiles are not available in frp-rs")
+    (
+        StatusCode::NOT_FOUND,
+        "pprof profiles are not available in frp-rs",
+    )
 }
 
 #[derive(Deserialize)]

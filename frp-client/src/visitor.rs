@@ -8,10 +8,10 @@ use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
 use frp_core::msg::{self, FrpMessage};
+use frp_core::mux::YamuxSession;
 #[cfg(feature = "vnet")]
 use frp_core::transport::IoStream;
 use frp_core::transport::{dial_server, DialOptions, TransportProtocol};
-use frp_core::mux::YamuxSession;
 
 #[cfg(feature = "vnet")]
 type VnetTunTxMap = Arc<tokio::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
@@ -112,7 +112,6 @@ pub(crate) struct VirtualNetVisitorConfig {
     pub v2: bool,
 }
 
-
 // ── Visitor dial planning (pure, testable) ────────────────────────────
 
 /// Subset of visitor config fields that influence the dial and yamux
@@ -133,8 +132,7 @@ struct VisitorTransportConfig {
     pub v2: bool,
 }
 
-impl VisitorTransportConfig {
-}
+impl VisitorTransportConfig {}
 
 /// Result of visitor dial planning: the DialOptions to pass to
 /// dial_server, together with an optional yamux keepalive interval.
@@ -187,7 +185,6 @@ fn plan_visitor_dial(
         yamux_keepalive_secs,
     }
 }
-
 
 /// Run the packet loop over an established `virtual_net` visitor tunnel.
 ///
@@ -372,9 +369,8 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
 
                 tokio::spawn(async move {
                     // Dial options for STCP fallback (fresh connections only).
-                    let plan = plan_visitor_dial(
-                        &sa, sp, &pt, tls_enable, &tls_sn, &tls_ca, &transport,
-                    );
+                    let plan =
+                        plan_visitor_dial(&sa, sp, &pt, tls_enable, &tls_sn, &tls_ca, &transport);
                     let opts = plan.opts;
                     let yamux_keepalive = plan.yamux_keepalive_secs;
 
@@ -643,10 +639,7 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     .as_ref()
                                     .map(|db| db.read_timeout_ms.max(0) as u64)
                                     .unwrap_or(fallback_timeout_ms);
-                                let assisted = resp
-                                    .assisted_addrs
-                                    .clone()
-                                    .unwrap_or_default();
+                                let assisted = resp.assisted_addrs.clone().unwrap_or_default();
                                 let behavior = resp.detect_behavior.clone();
                                 match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
                                     socket,
@@ -738,7 +731,10 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         let mut _yamux_sess_fb: Option<YamuxSession> = None;
                         let mut server_conn = if let Some(ka) = yamux_keepalive {
                             match crate::control::wrap_client_mux(raw_stream, ka).await {
-                                Ok((io, session)) => { _yamux_sess_fb = session; io }
+                                Ok((io, session)) => {
+                                    _yamux_sess_fb = session;
+                                    io
+                                }
                                 Err(e) => {
                                     warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': yamux wrap failed: {}", visitor_name, e);
                                     return;
@@ -857,7 +853,10 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                         let mut _yamux_sess_stcp: Option<YamuxSession> = None;
                         let mut server_conn = if let Some(ka) = yamux_keepalive {
                             match crate::control::wrap_client_mux(raw_stream, ka).await {
-                                Ok((io, session)) => { _yamux_sess_stcp = session; io }
+                                Ok((io, session)) => {
+                                    _yamux_sess_stcp = session;
+                                    io
+                                }
                                 Err(e) => {
                                     warn!(visitor_name = %visitor_name, error = %e, "Visitor '{}': yamux wrap failed: {}", visitor_name, e);
                                     return;
@@ -1008,12 +1007,15 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
             v2,
         };
         let plan = plan_visitor_dial(
-            &server_addr, server_port, &protocol,
-            tls_enable, &tls_server_name, &tls_ca_file, &transport,
+            &server_addr,
+            server_port,
+            &protocol,
+            tls_enable,
+            &tls_server_name,
+            &tls_ca_file,
+            &transport,
         );
-        let raw_stream = match dial_server(&plan.opts)
-        .await
-        {
+        let raw_stream = match dial_server(&plan.opts).await {
             Ok(io) => io,
             Err(e) => {
                 warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': dial server failed: {}", name, e);
@@ -1028,7 +1030,10 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         let mut _yamux_sess_vnet: Option<YamuxSession> = None;
         let mut server_conn = if let Some(ka) = yamux_keepalive {
             match crate::control::wrap_client_mux(raw_stream, ka).await {
-                Ok((io, session)) => { _yamux_sess_vnet = session; io }
+                Ok((io, session)) => {
+                    _yamux_sess_vnet = session;
+                    io
+                }
                 Err(e) => {
                     warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': yamux wrap failed: {}", name, e);
                     if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {

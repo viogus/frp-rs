@@ -66,8 +66,8 @@ pub async fn start_https2https_plugin(cfg: &PluginConfig) -> Result<PluginHandle
         |tcp, peer, (target, rewrite, headers, acceptor, connector)| async move {
             match acceptor.accept(tcp).await {
                 Ok(client_tls) => {
-                    if let Err(e) = handle_conn(client_tls, &target, &rewrite, &headers, &connector)
-                        .await
+                    if let Err(e) =
+                        handle_conn(client_tls, &target, &rewrite, &headers, &connector).await
                     {
                         debug!(%peer, error = %e, "https2https: {peer} error: {e}");
                     }

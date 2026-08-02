@@ -62,7 +62,9 @@ async fn mock_handler(
 }
 
 async fn start_mock_plugin(state: SharedState) -> u16 {
-    let app = Router::new().route("/handler", post(mock_handler)).with_state(state);
+    let app = Router::new()
+        .route("/handler", post(mock_handler))
+        .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -98,10 +100,17 @@ async fn test_plugin_login_wire_format_and_success() {
     let bind_port = cfg.bind_port;
     let (_handle, _) = start_test_server(cfg).await;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
-    let (_provider, resp) = login_with_test_token(addr).await.expect("login should succeed");
+    let (_provider, resp) = login_with_test_token(addr)
+        .await
+        .expect("login should succeed");
     assert!(resp.error.is_none(), "login rejected: {:?}", resp.error);
 
-    let captured = state.captured.lock().unwrap().clone().expect("plugin called");
+    let captured = state
+        .captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("plugin called");
     let query = captured["query"].as_str().unwrap_or("");
     assert!(
         query.contains("version=0.1.0") && query.contains("op=Login"),
@@ -111,7 +120,10 @@ async fn test_plugin_login_wire_format_and_success() {
         captured["reqid"].as_str().is_some_and(|r| !r.is_empty()),
         "X-Frp-Reqid header must be set"
     );
-    assert_eq!(captured["body"]["op"], "Login", "body op must be Go-style uppercase");
+    assert_eq!(
+        captured["body"]["op"], "Login",
+        "body op must be Go-style uppercase"
+    );
     assert_eq!(captured["body"]["version"], "0.1.0");
 }
 
@@ -135,9 +147,14 @@ async fn test_plugin_reject_rejects_login() {
     let bind_port = cfg.bind_port;
     let (_handle, _) = start_test_server(cfg).await;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
-    let (conn, resp) = login_with_test_token(addr).await.expect("login returns a response");
+    let (conn, resp) = login_with_test_token(addr)
+        .await
+        .expect("login returns a response");
     assert!(
-        resp.error.as_deref().unwrap_or("").contains("denied by policy"),
+        resp.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("denied by policy"),
         "login must be rejected with plugin reason, got: {:?}",
         resp.error
     );
@@ -159,7 +176,9 @@ async fn test_plugin_unreachable_fails_closed() {
     let (_handle, _) = start_test_server(cfg).await;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
 
-    let (conn, resp) = login_with_test_token(addr).await.expect("login returns a response");
+    let (conn, resp) = login_with_test_token(addr)
+        .await
+        .expect("login returns a response");
     assert!(
         resp.error.as_deref().unwrap_or("").contains("plugin"),
         "unreachable plugin must fail the login, got: {:?}",
@@ -187,7 +206,9 @@ async fn test_plugin_non_200_fails_closed() {
     let bind_port = cfg.bind_port;
     let (_handle, _) = start_test_server(cfg).await;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
-    let (conn, resp) = login_with_test_token(addr).await.expect("login returns a response");
+    let (conn, resp) = login_with_test_token(addr)
+        .await
+        .expect("login returns a response");
     assert!(
         resp.error.as_deref().unwrap_or("").contains("error code"),
         "non-200 plugin response must fail the login, got: {:?}",
@@ -241,9 +262,14 @@ async fn test_plugin_invalid_json_fails_closed() {
     let bind_port = cfg.bind_port;
     let (_handle, _) = start_test_server(cfg).await;
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
-    let (conn, resp) = login_with_test_token(addr).await.expect("login returns a response");
+    let (conn, resp) = login_with_test_token(addr)
+        .await
+        .expect("login returns a response");
     assert!(
-        resp.error.as_deref().unwrap_or("").contains("invalid response"),
+        resp.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("invalid response"),
         "non-JSON plugin response must fail the login, got: {:?}",
         resp.error
     );

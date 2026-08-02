@@ -506,9 +506,7 @@ pub fn allocate_port_multi(
         // freePorts which is populated from allowPorts ranges). Without this
         // check, a client could bypass the port restriction by specifying a
         // port outside the configured ranges.
-        if !ranges.is_empty()
-            && !ranges.iter().any(|r| r.contains(port))
-        {
+        if !ranges.is_empty() && !ranges.iter().any(|r| r.contains(port)) {
             tracing::debug!(
                 port = %port,
                 ranges = ?ranges,
@@ -588,7 +586,11 @@ mod tests {
         // An explicit port outside the configured allow_ports ranges must be rejected
         // (Go frp compat: Manager.Acquire checks freePorts which is populated from allowPorts).
         let mut used = std::collections::HashSet::new();
-        let ranges = [frp_core::config::PortsRange { start: 10000, end: 20000, single: 0 }];
+        let ranges = [frp_core::config::PortsRange {
+            start: 10000,
+            end: 20000,
+            single: 0,
+        }];
         assert_eq!(
             allocate_port_multi(&mut used, 8080, &ranges, "127.0.0.1"),
             None,
@@ -601,8 +603,16 @@ mod tests {
         // An explicit port within a configured allow_ports range must be accepted
         let mut used = std::collections::HashSet::new();
         let ranges = [
-            frp_core::config::PortsRange { start: 10000, end: 20000, single: 0 },
-            frp_core::config::PortsRange { start: 30000, end: 40000, single: 0 },
+            frp_core::config::PortsRange {
+                start: 10000,
+                end: 20000,
+                single: 0,
+            },
+            frp_core::config::PortsRange {
+                start: 30000,
+                end: 40000,
+                single: 0,
+            },
         ];
         let result = allocate_port_multi(&mut used, 35000, &ranges, "127.0.0.1");
         assert_eq!(
@@ -655,7 +665,11 @@ mod tests {
         let mut used = std::collections::HashSet::new();
         // Pre-fill one port in the range
         used.insert(62002);
-        let ranges = [frp_core::config::PortsRange { start: 62001, end: 62005, single: 0 }];
+        let ranges = [frp_core::config::PortsRange {
+            start: 62001,
+            end: 62005,
+            single: 0,
+        }];
         // Should skip 62001 (bindable), then 62002 (in set), then
         // find 62003 (bindable).
         let result = allocate_port_multi(&mut used, 0, &ranges, "127.0.0.1");
@@ -679,7 +693,16 @@ mod tests {
     fn test_allocate_port_multi_explicit_port_zero() {
         // port=0 should scan ranges, not allocate port 0
         let mut used = std::collections::HashSet::new();
-        let result = allocate_port_multi(&mut used, 0, &[frp_core::config::PortsRange { start: 51990, end: 51990, single: 0 }], "127.0.0.1");
+        let result = allocate_port_multi(
+            &mut used,
+            0,
+            &[frp_core::config::PortsRange {
+                start: 51990,
+                end: 51990,
+                single: 0,
+            }],
+            "127.0.0.1",
+        );
         assert_eq!(result, Some(51990), "explicit port 0 should scan ranges");
     }
 

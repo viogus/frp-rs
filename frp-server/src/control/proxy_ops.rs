@@ -78,7 +78,11 @@ mod unregister_generation_tests {
             frp_core::auth::AuthConfig::with_token("test-token"),
             "127.0.0.1".into(),
             frp_core::encryption::derive_key("test-token"),
-            vec![frp_core::config::PortsRange { start: 1, end: u16::MAX, single: 0 }],
+            vec![frp_core::config::PortsRange {
+                start: 1,
+                end: u16::MAX,
+                single: 0,
+            }],
             String::new(),
             true,
             30,
@@ -405,9 +409,7 @@ pub(crate) async fn handle_new_proxy(
                 let mut reservations = state.port_reservations.write().await;
                 // Lazy cleanup (Go cleanReservedPortsWorker): drop expired
                 // entries so the map does not grow without bound.
-                if let Some(&(res_port, true, reserved_at)) =
-                    reservations.get(&np.proxy_name)
-                {
+                if let Some(&(res_port, true, reserved_at)) = reservations.get(&np.proxy_name) {
                     if reserved_at.elapsed() >= std::time::Duration::from_secs(24 * 3600) {
                         reservations.remove(&np.proxy_name);
                     } else if !ports.contains(&res_port)
@@ -455,16 +457,11 @@ pub(crate) async fn handle_new_proxy(
                 let mut reservations = state.port_reservations.write().await;
                 // Lazy cleanup (Go cleanReservedPortsWorker): drop expired
                 // entries so the map does not grow without bound.
-                if let Some(&(res_port, false, reserved_at)) =
-                    reservations.get(&np.proxy_name)
-                {
+                if let Some(&(res_port, false, reserved_at)) = reservations.get(&np.proxy_name) {
                     if reserved_at.elapsed() >= std::time::Duration::from_secs(24 * 3600) {
                         reservations.remove(&np.proxy_name);
                     } else if !ports.contains(&res_port)
-                        && crate::proxy::is_tcp_port_bindable(
-                            &state.proxy_bind_addr,
-                            res_port,
-                        )
+                        && crate::proxy::is_tcp_port_bindable(&state.proxy_bind_addr, res_port)
                     {
                         ports.insert(res_port);
                         allocated = Some(res_port);
@@ -631,12 +628,8 @@ pub(crate) async fn handle_new_proxy(
                 let http_user = np.http_user.as_deref().unwrap_or("");
                 let http_pwd = np.http_pwd.as_deref().unwrap_or("");
                 let rubu = np.route_by_http_user.as_deref().unwrap_or("");
-                let headers: Vec<(String, String)> = np
-                    .headers
-                    .clone()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect();
+                let headers: Vec<(String, String)> =
+                    np.headers.clone().unwrap_or_default().into_iter().collect();
                 if let Err(conflict) = state
                     .vhost_manager
                     .register(
@@ -705,12 +698,8 @@ pub(crate) async fn handle_new_proxy(
                 let http_user = np.http_user.as_deref().unwrap_or("");
                 let http_pwd = np.http_pwd.as_deref().unwrap_or("");
                 let rubu = np.route_by_http_user.as_deref().unwrap_or("");
-                let headers: Vec<(String, String)> = np
-                    .headers
-                    .clone()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect();
+                let headers: Vec<(String, String)> =
+                    np.headers.clone().unwrap_or_default().into_iter().collect();
                 if let Err(conflict) = state
                     .vhost_manager
                     .register(

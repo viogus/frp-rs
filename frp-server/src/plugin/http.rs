@@ -141,7 +141,10 @@ impl HttpPluginManager {
 
             // Go http.go do(): POST {url}?version=0.1.0&op=Login with X-Frp-Reqid.
             let reqid = uuid::Uuid::new_v4().to_string();
-            let url = format!("{}?version={}&op={}", plugin.cfg.url, PLUGIN_API_VERSION, go_op);
+            let url = format!(
+                "{}?version={}&op={}",
+                plugin.cfg.url, PLUGIN_API_VERSION, go_op
+            );
             let result = tokio::time::timeout(
                 timeout,
                 plugin
@@ -163,7 +166,10 @@ impl HttpPluginManager {
                         plugin.cfg.name, op, e
                     );
                     // Fail closed: plugin unreachable ⇒ reject the operation.
-                    return Err(format!("send {op} request to plugin [{}] error", plugin.cfg.name));
+                    return Err(format!(
+                        "send {op} request to plugin [{}] error",
+                        plugin.cfg.name
+                    ));
                 }
                 Err(_) => {
                     tracing::warn!(

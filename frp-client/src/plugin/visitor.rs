@@ -6,9 +6,9 @@ use tracing::{debug, warn};
 use frp_core::auth::{AuthConfig, AuthMethod};
 use frp_core::config::PluginConfig;
 use frp_core::msg::{self, FrpMessage};
+use frp_core::mux::YamuxSession;
 use frp_core::protocol::{read_msg_v1, write_msg_v1};
 use frp_core::transport::{self, DialOptions, TransportProtocol};
-use frp_core::mux::YamuxSession;
 use frp_core::VERSION;
 
 use super::{PluginContext, PluginHandle};
@@ -215,8 +215,11 @@ async fn handle_visitor_conn(
     let mut _yamux_sess: Option<YamuxSession> = None;
     let mut server_stream = if tcp_mux {
         match crate::control::wrap_client_mux(raw_stream, tcp_mux_keepalive_interval).await {
-            Ok((io, session)) => { _yamux_sess = session; io }
-            Err(e) => return Err(format!("yamux wrap: {e}"))
+            Ok((io, session)) => {
+                _yamux_sess = session;
+                io
+            }
+            Err(e) => return Err(format!("yamux wrap: {e}")),
         }
     } else {
         raw_stream

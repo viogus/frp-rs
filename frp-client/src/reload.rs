@@ -100,9 +100,14 @@ pub(crate) async fn do_reload(
 ) -> Result<ReloadDelta, String> {
     // Diff old vs new proxy names
     let old_names: HashSet<String> = {
-        proxy_info_map.read().await.keys()
+        proxy_info_map
+            .read()
+            .await
+            .keys()
             .map(|k| {
-                if user.is_empty() { k.clone() } else {
+                if user.is_empty() {
+                    k.clone()
+                } else {
                     let prefix = format!("{}.", user);
                     k.strip_prefix(&prefix).unwrap_or(k).to_string()
                 }
@@ -120,7 +125,11 @@ pub(crate) async fn do_reload(
     {
         let map = proxy_info_map.read().await;
         for name in &common {
-            let map_key = if user.is_empty() { (*name).clone() } else { format!("{}.{}", user, name) };
+            let map_key = if user.is_empty() {
+                (*name).clone()
+            } else {
+                format!("{}.{}", user, name)
+            };
             if let (Some(old_info), Some(new_p)) = (
                 map.get(&map_key),
                 new_cfg.proxies.iter().find(|p| &p.name == *name),
@@ -134,17 +143,23 @@ pub(crate) async fn do_reload(
     }
 
     // Diff visitors (Go frp compat: reload also applies visitor changes).
-    let old_visitor_names: HashSet<String> =
-        old_visitors.iter().map(|v| v.name.clone()).collect();
+    let old_visitor_names: HashSet<String> = old_visitors.iter().map(|v| v.name.clone()).collect();
     let new_visitor_names: HashSet<String> =
         new_cfg.visitors.iter().map(|v| v.name.clone()).collect();
-    let visitor_removed: Vec<String> =
-        old_visitor_names.difference(&new_visitor_names).cloned().collect();
-    let visitor_added: Vec<String> =
-        new_visitor_names.difference(&old_visitor_names).cloned().collect();
+    let visitor_removed: Vec<String> = old_visitor_names
+        .difference(&new_visitor_names)
+        .cloned()
+        .collect();
+    let visitor_added: Vec<String> = new_visitor_names
+        .difference(&old_visitor_names)
+        .cloned()
+        .collect();
 
-    if removed.is_empty() && added.is_empty() && changed.is_empty()
-        && visitor_removed.is_empty() && visitor_added.is_empty()
+    if removed.is_empty()
+        && added.is_empty()
+        && changed.is_empty()
+        && visitor_removed.is_empty()
+        && visitor_added.is_empty()
     {
         return Ok(ReloadDelta {
             summary: "reload success: no changes detected".into(),
@@ -162,7 +177,11 @@ pub(crate) async fn do_reload(
     let visitor_changed: Vec<String> = new_cfg
         .visitors
         .iter()
-        .filter(|v| old_visitors.iter().any(|old| old.name == v.name && *old != **v))
+        .filter(|v| {
+            old_visitors
+                .iter()
+                .any(|old| old.name == v.name && *old != **v)
+        })
         .map(|v| v.name.clone())
         .collect();
 
@@ -191,4 +210,3 @@ pub(crate) async fn do_reload(
         new_config: new_cfg,
     })
 }
-

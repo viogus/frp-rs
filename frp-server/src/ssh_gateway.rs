@@ -15,9 +15,9 @@
 //! timing sidechannel (RUSTSEC-2023-0071, Marvin Attack). Only affects the SSH
 //! gateway feature. Monitor upstream for fix.
 
+use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -382,9 +382,7 @@ pub struct SshSession {
     reverse_forward: Arc<std::sync::Mutex<Option<(String, u32)>>>,
     /// Data routing table for forwarded-tcpip channels: SSH client → bridge
     /// task read half.
-    reverse_data_tx: Arc<
-        std::sync::Mutex<HashMap<russh::ChannelId, mpsc::Sender<Vec<u8>>>>,
-    >,
+    reverse_data_tx: Arc<std::sync::Mutex<HashMap<russh::ChannelId, mpsc::Sender<Vec<u8>>>>>,
 }
 
 impl Drop for SshSession {
@@ -654,8 +652,15 @@ impl Handler for SshSession {
         let reverse_forward = self.reverse_forward.clone();
         let reverse_data_tx = self.reverse_data_tx.clone();
         tokio::spawn(async move {
-            handle_work_conn_requests(work_conn_rx, run_id, ssh_handle, state, reverse_forward, reverse_data_tx)
-                .await;
+            handle_work_conn_requests(
+                work_conn_rx,
+                run_id,
+                ssh_handle,
+                state,
+                reverse_forward,
+                reverse_data_tx,
+            )
+            .await;
         });
 
         Ok(())
@@ -849,7 +854,13 @@ impl Handler for SshSession {
         // Drop the data sender so the bridge task's `data_rx.recv()` returns
         // and the task (plus its duplex) exits — otherwise the bridge hangs
         // forever holding the channel entry in the map.
-        if self.reverse_data_tx.lock().unwrap().remove(&channel).is_some() {
+        if self
+            .reverse_data_tx
+            .lock()
+            .unwrap()
+            .remove(&channel)
+            .is_some()
+        {
             tracing::debug!(
                 run_id = %self.run_id,
                 channel = ?channel,
@@ -871,9 +882,7 @@ async fn handle_work_conn_requests(
     handle: russh::server::Handle,
     state: Arc<AppState>,
     reverse_forward: Arc<std::sync::Mutex<Option<(String, u32)>>>,
-    reverse_data_tx: Arc<
-        std::sync::Mutex<HashMap<russh::ChannelId, mpsc::Sender<Vec<u8>>>>,
-    >,
+    reverse_data_tx: Arc<std::sync::Mutex<HashMap<russh::ChannelId, mpsc::Sender<Vec<u8>>>>>,
 ) {
     while let Some(_req) = work_rx.recv().await {
         let Some((addr, port)) = reverse_forward.lock().unwrap().clone() else {
@@ -1033,7 +1042,11 @@ mod tests {
             frp_core::auth::AuthConfig::with_token("test-token"),
             "127.0.0.1".into(),
             frp_core::encryption::derive_key("test-token"),
-            vec![frp_core::config::PortsRange { start: 1, end: u16::MAX, single: 0 }],
+            vec![frp_core::config::PortsRange {
+                start: 1,
+                end: u16::MAX,
+                single: 0,
+            }],
             String::new(),
             true,
             30,

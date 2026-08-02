@@ -188,7 +188,9 @@ async fn test_dashboard_pprof_outside_auth() {
     let dashboard_port = common::allocate_port();
     let frps = FrpsHandle::start(&base_config(bind_port, dashboard_port)).await;
 
-    let resp = reqwest::get(frps.dashboard_url("/debug/pprof")).await.unwrap();
+    let resp = reqwest::get(frps.dashboard_url("/debug/pprof"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200, "pprof index is outside auth");
 }
 
@@ -208,7 +210,8 @@ async fn test_dashboard_offline_clients_listed() {
         .unwrap()
         .as_secs() as i64;
     let key = frp_core::auth::generate_token("test-token", ts);
-    let mut io = frp_core::transport::IoStream::Tcp(tokio::net::TcpStream::connect(addr).await.unwrap());
+    let mut io =
+        frp_core::transport::IoStream::Tcp(tokio::net::TcpStream::connect(addr).await.unwrap());
     let login = frp_core::msg::FrpMessage::Login(Box::new(frp_core::msg::Login {
         version: Some("0.69.1".into()),
         hostname: Some("offline-test".into()),
@@ -224,7 +227,9 @@ async fn test_dashboard_offline_clients_listed() {
         client_spec: None,
         multiplexer: None,
     }));
-    frp_core::protocol::write_msg_v1(&mut io, &login).await.unwrap();
+    frp_core::protocol::write_msg_v1(&mut io, &login)
+        .await
+        .unwrap();
     match frp_core::protocol::read_msg_v1(&mut io).await {
         Ok(frp_core::msg::FrpMessage::LoginResp(r)) => {
             assert!(r.error.is_none(), "login rejected: {:?}", r.error);
@@ -251,7 +256,8 @@ async fn test_dashboard_offline_clients_listed() {
     let json: serde_json::Value = resp.json().await.unwrap();
     let arr = json.as_array().expect("clients array");
     assert!(
-        arr.iter().any(|c| c["clientID"] == "offline-client-1" && c["online"] == false),
+        arr.iter()
+            .any(|c| c["clientID"] == "offline-client-1" && c["online"] == false),
         "offline client must remain listed with online=false, got: {json}"
     );
 }

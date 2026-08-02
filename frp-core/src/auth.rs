@@ -1309,11 +1309,7 @@ mod tests {
                     let mut buf = [0u8; 16384];
                     let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]);
-                    let body = req
-                        .split("\r\n\r\n")
-                        .nth(1)
-                        .unwrap_or("")
-                        .to_string();
+                    let body = req.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
                     let mut form = std::collections::HashMap::new();
                     for pair in body.split('&').filter(|s| !s.is_empty()) {
                         let mut it = pair.splitn(2, '=');
@@ -1371,10 +1367,16 @@ mod tests {
             .expect("set_login should fetch a token");
 
         let form = capture.wait().await;
-        assert_eq!(form.get("grant_type").map(String::as_str), Some("client_credentials"));
+        assert_eq!(
+            form.get("grant_type").map(String::as_str),
+            Some("client_credentials")
+        );
         assert_eq!(form.get("client_id").map(String::as_str), Some("client-1"));
         // Empty audience is omitted entirely (Go oidc.go:137-139).
-        assert!(!form.contains_key("audience"), "empty audience must be omitted: {form:?}");
+        assert!(
+            !form.contains_key("audience"),
+            "empty audience must be omitted: {form:?}"
+        );
         // Additional endpoint params are sent as form fields.
         assert_eq!(form.get("tenant").map(String::as_str), Some("acme"));
         assert_eq!(form.get("region").map(String::as_str), Some("eu"));
@@ -1450,8 +1452,7 @@ mod tests {
         .await
         .expect("OidcClient::new with tokenSource");
 
-        let mut login: crate::msg::Login =
-            serde_json::from_str(r#"{}"#).expect("parse Login");
+        let mut login: crate::msg::Login = serde_json::from_str(r#"{}"#).expect("parse Login");
         client
             .set_login(&mut login)
             .await

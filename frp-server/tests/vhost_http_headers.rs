@@ -82,7 +82,9 @@ async fn test_vhost_http_injects_xff_and_request_headers() {
             ("X-Override".to_string(), "new".to_string()),
         ])),
     )));
-    write_msg_v1(&mut provider, &np).await.expect("send NewProxy");
+    write_msg_v1(&mut provider, &np)
+        .await
+        .expect("send NewProxy");
     match read_msg_v1(&mut provider).await.expect("NewProxyResp") {
         FrpMessage::NewProxyResp(ref r) => {
             assert!(r.error.is_none(), "registration failed: {:?}", r.error);
@@ -91,7 +93,9 @@ async fn test_vhost_http_injects_xff_and_request_headers() {
     }
 
     // Pool a work conn.
-    let mut work_conn = tokio::net::TcpStream::connect(addr).await.expect("work conn");
+    let mut work_conn = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("work conn");
     write_msg_v1(
         &mut work_conn,
         &FrpMessage::NewWorkConn(msg::NewWorkConn {
@@ -104,7 +108,9 @@ async fn test_vhost_http_injects_xff_and_request_headers() {
     .expect("send NewWorkConn");
 
     // Client sends a request with a same-name header to be overridden.
-    let mut client = tokio::net::TcpStream::connect(vhost_addr).await.expect("vhost connect");
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
     client
         .write_all(
             b"GET /test HTTP/1.1\r\n\

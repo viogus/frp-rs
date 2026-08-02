@@ -71,7 +71,11 @@ pub fn create_visitor_conn_msg(
 /// Creates the NewProxy message for registering a proxy with the server.
 /// When `user` is non-empty, the proxy_name is prefixed as `{user}.{name}`
 /// matching Go frp's `naming.AddUserPrefix` (multi-tenant wire naming).
-pub fn create_new_proxy_msg(p: &frp_core::config::ProxyConfig, local_addr: &str, user: &str) -> FrpMessage {
+pub fn create_new_proxy_msg(
+    p: &frp_core::config::ProxyConfig,
+    local_addr: &str,
+    user: &str,
+) -> FrpMessage {
     let wire_name = wire_proxy_name(user, &p.name);
     let mut result = FrpMessage::NewProxy(Box::new(msg::NewProxy {
         proxy_name: wire_name,
@@ -559,7 +563,6 @@ mod tests {
         assert!(wire.contains(r#""proxy_name":"alice.test""#));
     }
 
-
     #[test]
     fn test_wire_proxy_name_used_for_map_keys_and_health() {
         // Simulates what Service::new() does: build a proxy config with user="alice",
@@ -578,20 +581,26 @@ mod tests {
 
         // proxy_info_map key = wire_proxy_name(&cfg.user, &p.name)
         let map_key = wire_proxy_name(user, &cfg.name);
-        assert_eq!(map_key, expected_wire,
-            "proxy_info_map key must be prefixed: {map_key} != {expected_wire}");
+        assert_eq!(
+            map_key, expected_wire,
+            "proxy_info_map key must be prefixed: {map_key} != {expected_wire}"
+        );
 
         // health_proxy_configs key = wire_proxy_name(&cfg.user, &p.name)
         let hc_key = wire_proxy_name(user, &cfg.name);
-        assert_eq!(hc_key, expected_wire,
-            "health_proxy_configs key must be prefixed: {hc_key} != {expected_wire}");
+        assert_eq!(
+            hc_key, expected_wire,
+            "health_proxy_configs key must be prefixed: {hc_key} != {expected_wire}"
+        );
 
         // create_new_proxy_msg also produces the prefixed wire name
         let msg = create_new_proxy_msg(&cfg, "127.0.0.1:3000", user);
         match msg {
             FrpMessage::NewProxy(np) => {
-                assert_eq!(np.proxy_name, expected_wire,
-                    "NewProxy.proxy_name must be {expected_wire}");
+                assert_eq!(
+                    np.proxy_name, expected_wire,
+                    "NewProxy.proxy_name must be {expected_wire}"
+                );
             }
             _ => panic!("expected NewProxy variant"),
         }

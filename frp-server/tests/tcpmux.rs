@@ -375,7 +375,10 @@ async fn test_tcpmux_passthrough() {
     let mut chunk = [0u8; 512];
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            let n = work_conn.read(&mut chunk).await.expect("read forwarded bytes");
+            let n = work_conn
+                .read(&mut chunk)
+                .await
+                .expect("read forwarded bytes");
             if n == 0 {
                 break;
             }

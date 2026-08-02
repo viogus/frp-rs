@@ -25,10 +25,7 @@ fn plugin_cfg(plugin_type: &str, local_addr: String) -> PluginConfig {
 
 /// Start a plaintext HTTP backend that captures the first request head and
 /// replies 200 with a small body.
-async fn start_capture_backend() -> (
-    std::net::SocketAddr,
-    tokio::sync::oneshot::Receiver<String>,
-) {
+async fn start_capture_backend() -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -176,8 +173,7 @@ async fn test_https2https_accepts_self_signed_backend() {
     // Generate a self-signed cert/key with rcgen (dev-dependency) and
     // write them as PEM (DER + base64 wrapping; rcgen 0.13 has no pem()).
     let key_pair = rcgen::KeyPair::generate().expect("keypair");
-    let params =
-        rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("cert params");
+    let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("cert params");
     let cert = params.self_signed(&key_pair).expect("self-signed cert");
     use data_encoding::BASE64;
     let wrap_pem = |label: &str, der: &[u8]| -> String {

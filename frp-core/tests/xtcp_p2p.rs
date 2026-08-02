@@ -61,8 +61,28 @@ async fn test_xtcp_p2p_connect_roundtrip() {
 
     // Both sides: punch hole + create KCP stream.
     let (stream_a, stream_b) = tokio::join!(
-        xtcp_p2p::xtcp_p2p_connect(a, &candidate_b, &[], None, conv, kcp_config.clone(), 3000, None, None),
-        xtcp_p2p::xtcp_p2p_connect(b, &candidate_a, &[], None, conv, kcp_config.clone(), 3000, None, None),
+        xtcp_p2p::xtcp_p2p_connect(
+            a,
+            &candidate_b,
+            &[],
+            None,
+            conv,
+            kcp_config.clone(),
+            3000,
+            None,
+            None
+        ),
+        xtcp_p2p::xtcp_p2p_connect(
+            b,
+            &candidate_a,
+            &[],
+            None,
+            conv,
+            kcp_config.clone(),
+            3000,
+            None,
+            None
+        ),
     );
 
     let mut stream_a = stream_a.expect("side A connect");
@@ -154,8 +174,28 @@ async fn test_xtcp_p2p_multiple_roundtrips() {
     };
 
     let (stream_a, stream_b) = tokio::join!(
-        xtcp_p2p::xtcp_p2p_connect(a, &candidate_b, &[], None, conv, kcp_config.clone(), 3000, None, None),
-        xtcp_p2p::xtcp_p2p_connect(b, &candidate_a, &[], None, conv, kcp_config.clone(), 3000, None, None),
+        xtcp_p2p::xtcp_p2p_connect(
+            a,
+            &candidate_b,
+            &[],
+            None,
+            conv,
+            kcp_config.clone(),
+            3000,
+            None,
+            None
+        ),
+        xtcp_p2p::xtcp_p2p_connect(
+            b,
+            &candidate_a,
+            &[],
+            None,
+            conv,
+            kcp_config.clone(),
+            3000,
+            None,
+            None
+        ),
     );
 
     let mut stream_a = stream_a.expect("side A connect");
@@ -396,8 +436,24 @@ async fn test_makehole_candidate_port_scanning() {
     };
 
     let (peer_a, peer_b) = tokio::join!(
-        xtcp_p2p::punch_udp_hole_makehole(&a, &candidate_b, &[], &sender_behavior, 3000, None, None),
-        xtcp_p2p::punch_udp_hole_makehole(&b, &candidate_a, &[], &receiver_behavior, 3000, None, None),
+        xtcp_p2p::punch_udp_hole_makehole(
+            &a,
+            &candidate_b,
+            &[],
+            &sender_behavior,
+            3000,
+            None,
+            None
+        ),
+        xtcp_p2p::punch_udp_hole_makehole(
+            &b,
+            &candidate_a,
+            &[],
+            &receiver_behavior,
+            3000,
+            None,
+            None
+        ),
     );
 
     let peer_a = peer_a.expect("makehole scan side A");

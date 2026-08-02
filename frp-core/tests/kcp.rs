@@ -126,7 +126,10 @@ async fn test_kcp_tls_round_trip() {
     match io {
         IoStream::Tls(mut tls_io, _peer) => {
             use tokio::io::AsyncWriteExt;
-            tls_io.write_all(b"hello over kcp+tls").await.expect("tls write");
+            tls_io
+                .write_all(b"hello over kcp+tls")
+                .await
+                .expect("tls write");
             tls_io.flush().await.expect("tls flush");
         }
         other => panic!("expected IoStream::Tls for KCP+TLS, got variant"),
