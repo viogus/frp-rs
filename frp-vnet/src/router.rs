@@ -422,4 +422,36 @@ mod tests {
         rt.insert("c", "10.0.0.0/24").unwrap();
         assert!(rt.insert("d", "2001:db8::/24").is_ok());
     }
+
+    #[test]
+    fn test_ipv6_routes_isolated_per_vnet() {
+        let mut rt = RouteTable::new();
+        rt.insert("vnet-a", "2001:db8::/64").unwrap();
+        rt.insert("vnet-b", "2001:db9::/64").unwrap();
+        // Same-family, different vnet → isolated.
+        assert_eq!(
+            rt.lookup(&"2001:db8::1".parse().unwrap()),
+            Some("vnet-a")
+        );
+        assert_eq!(
+            rt.lookup(&"2001:db9::1".parse().unwrap()),
+            Some("vnet-b")
+        );
+        // Outside both vnets → no route.
+        assert_eq!(rt.lookup(&"2001:dba::1".parse().unwrap()), None);
+        // IPv4 and IPv6 routes coexist without cross-talk.
+        rt.insert("vnet-a", "10.0.0.0/8").unwrap();
+        assert_eq!(
+            rt.lookup(&IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1))),
+            Some("vnet-a")
+        );
+        assert_eq!(rt.lookup(&"2001:db8::2".parse().unwrap()), Some("vnet-a"));
+        // Removing one vnet does not affect the other.
+        rt.remove("vnet-b");
+        assert_eq!(rt.lookup(&"2001:db9::1".parse().unwrap()), None);
+        assert_eq!(
+            rt.lookup(&"2001:db8::1".parse().unwrap()),
+            Some("vnet-a")
+        );
+    }
 }

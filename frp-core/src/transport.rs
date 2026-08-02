@@ -2603,10 +2603,8 @@ pub async fn detect_and_strip_magic(
 // consume_tls_head_byte removed — dead code. detect_and_strip_magic
 // consumes TLS magic upfront during connection classification.
 
-/// Accept a WebSocket upgrade on the server side.
-/// Returns an IoStream with a WsByteStream adapter already applied,
-/// so callers can use read_msg_v1/write_msg_v1 directly.
-#[cfg(feature = "websocket")]
+/// Base64 encode (RFC 4648). Shared by the WebSocket upgrade key and the
+/// HTTP proxy Basic auth header — kept outside the websocket feature gate.
 fn base64_encode(bytes: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
