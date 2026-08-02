@@ -11,7 +11,7 @@ All notable changes to frp-rs.
   addresses" and XTCP provider-side hole punching never actually ran. Both
   provider paths (`handle_nat_hole_resp` and the legacy `handle_nat_hole_client`)
   now pass `candidates`/`assisted`/`detect_behavior` per Go semantics.
-  `punch_udp_hole_makehole` in `frp-core/src/xtcp_p2p.rs` was aligned with Go
+  `punch_udp_hole_makehole_owned` in `frp-core/src/xtcp_p2p.rs` was aligned with Go
   `pkg/nathole/nathole.go` MakeHole: the winning socket (the one the peer's
   detect reply arrived on) is now returned and used for the KCP data plane
   (`result.lConn` semantics); probe TTL is set for the detect phase and

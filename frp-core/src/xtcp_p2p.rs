@@ -1244,7 +1244,11 @@ pub async fn punch_udp_hole_makehole_owned(
     if role == "sender" {
         detect_addrs.extend(assisted.iter().cloned());
         detect_addrs.extend(candidates.iter().cloned());
-    } else if behavior.candidate_ports.is_none() {
+    } else if behavior
+        .candidate_ports
+        .as_ref()
+        .map_or(true, |v| v.is_empty())
+    {
         detect_addrs.extend(candidates.iter().cloned());
     }
     detect_addrs.sort();
@@ -1398,8 +1402,9 @@ async fn send_random_ports_probe(
 /// Go `getUnusedPort`: a random port in [1024, 65535] not yet used, retrying
 /// up to 10 times; returns 0 when none was found (caller skips the round).
 fn get_unused_random_port(used: &mut std::collections::HashSet<u16>) -> u16 {
+    let mut rng = rand::thread_rng();
     for _ in 0..10 {
-        let port = 1024 + rand::random::<u16>() % 64511;
+        let port = rand::Rng::gen_range(&mut rng, 1024..=65534);
         if used.insert(port) {
             return port;
         }
