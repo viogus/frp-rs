@@ -1137,9 +1137,11 @@ dependencies = [
  "frp-vnet",
  "md-5",
  "rand 0.8.6",
+ "rcgen",
  "rustls",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
@@ -1229,6 +1231,7 @@ dependencies = [
  "tokio-tungstenite 0.24.0",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
