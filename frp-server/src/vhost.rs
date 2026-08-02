@@ -5,7 +5,6 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
-#[cfg(feature = "tls")]
 use crate::service::{AppState, InternalMsg};
 
 /// A route mapping: domain or location -> proxy entry.
