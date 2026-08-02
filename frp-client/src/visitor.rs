@@ -643,9 +643,16 @@ pub(crate) async fn run_visitor_listener(config: VisitorListenerConfig) {
                                     .as_ref()
                                     .map(|db| db.read_timeout_ms.max(0) as u64)
                                     .unwrap_or(fallback_timeout_ms);
+                                let assisted = resp
+                                    .assisted_addrs
+                                    .clone()
+                                    .unwrap_or_default();
+                                let behavior = resp.detect_behavior.clone();
                                 match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
                                     socket,
                                     &candidates,
+                                    &assisted,
+                                    behavior.as_ref(),
                                     conv,
                                     kcp_cfg,
                                     hp_timeout,

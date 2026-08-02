@@ -1993,7 +1993,9 @@ impl Service {
 
             match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
                 socket,
+                &[],
                 &candidates,
+                None,
                 conv,
                 kcp_cfg,
                 5000,
@@ -2232,7 +2234,9 @@ impl Service {
             // Provider acts as yamux server: accepts the visitor's stream.
             match frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
                 socket,
+                &[],
                 &candidate_addrs,
+                None,
                 conv,
                 kcp_cfg,
                 hp_timeout,

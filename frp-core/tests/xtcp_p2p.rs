@@ -61,8 +61,8 @@ async fn test_xtcp_p2p_connect_roundtrip() {
 
     // Both sides: punch hole + create KCP stream.
     let (stream_a, stream_b) = tokio::join!(
-        xtcp_p2p::xtcp_p2p_connect(a, &candidate_b, conv, kcp_config.clone(), 3000, None, None),
-        xtcp_p2p::xtcp_p2p_connect(b, &candidate_a, conv, kcp_config.clone(), 3000, None, None),
+        xtcp_p2p::xtcp_p2p_connect(a, &candidate_b, &[], None, conv, kcp_config.clone(), 3000, None, None),
+        xtcp_p2p::xtcp_p2p_connect(b, &candidate_a, &[], None, conv, kcp_config.clone(), 3000, None, None),
     );
 
     let mut stream_a = stream_a.expect("side A connect");
@@ -154,8 +154,8 @@ async fn test_xtcp_p2p_multiple_roundtrips() {
     };
 
     let (stream_a, stream_b) = tokio::join!(
-        xtcp_p2p::xtcp_p2p_connect(a, &candidate_b, conv, kcp_config.clone(), 3000, None, None),
-        xtcp_p2p::xtcp_p2p_connect(b, &candidate_a, conv, kcp_config.clone(), 3000, None, None),
+        xtcp_p2p::xtcp_p2p_connect(a, &candidate_b, &[], None, conv, kcp_config.clone(), 3000, None, None),
+        xtcp_p2p::xtcp_p2p_connect(b, &candidate_a, &[], None, conv, kcp_config.clone(), 3000, None, None),
     );
 
     let mut stream_a = stream_a.expect("side A connect");
@@ -236,6 +236,8 @@ async fn test_xtcp_p2p_yamux_roundtrip() {
         frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
             b,
             &can_a_for_spawn,
+            &[],
+            None,
             conv,
             cfg_for_spawn,
             5000,
@@ -250,6 +252,8 @@ async fn test_xtcp_p2p_yamux_roundtrip() {
     let mut stream_a = frp_core::xtcp_p2p::xtcp_p2p_connect_yamux(
         a,
         &candidate_b,
+        &[],
+        None,
         conv,
         kcp_config.clone(),
         5000,
@@ -310,4 +314,94 @@ async fn test_xtcp_p2p_yamux_roundtrip() {
     .unwrap()
     .expect("A read");
     assert_eq!(&buf, reply, "A should receive B's reply");
+}
+
+/// Go MakeHole state machine on loopback: sender probes assisted+candidate
+/// addresses, receiver listens with extra sockets; both use the "frp" magic
+/// (no sid/key) and must connect.
+#[tokio::test]
+async fn test_makehole_loopback_with_assisted_and_behavior() {
+    let (a, b, addr_a, addr_b) = bind_pair().await;
+
+    let candidate_a = vec![addr_a.to_string()];
+    let candidate_b = vec![addr_b.to_string()];
+
+    // Sender probes assisted addresses too (an unroutable one is fine — the
+    // real candidate still works). Receiver uses extra listener sockets.
+    let sender_behavior = frp_core::msg::NatHoleDetectBehavior {
+        mode: 0,
+        role: Some("sender".into()),
+        ttl: 64,
+        send_delay_ms: 20,
+        read_timeout_ms: 3000,
+        send_random_ports: 0,
+        listen_random_ports: 0,
+        candidate_ports: None,
+    };
+    let receiver_behavior = frp_core::msg::NatHoleDetectBehavior {
+        role: Some("receiver".into()),
+        listen_random_ports: 2,
+        ..sender_behavior.clone()
+    };
+
+    let assisted_sender = vec!["192.0.2.1:40000".to_string()]; // TEST-NET, unroutable
+    let (peer_a, peer_b) = tokio::join!(
+        xtcp_p2p::punch_udp_hole_makehole(
+            &a,
+            &candidate_b,
+            &assisted_sender,
+            &sender_behavior,
+            3000,
+            None,
+            None,
+        ),
+        xtcp_p2p::punch_udp_hole_makehole(
+            &b,
+            &candidate_a,
+            &[],
+            &receiver_behavior,
+            3000,
+            None,
+            None,
+        ),
+    );
+
+    let peer_a = peer_a.expect("makehole side A");
+    let peer_b = peer_b.expect("makehole side B");
+    assert_eq!(peer_a, addr_b, "A should see B's address");
+    assert_eq!(peer_b, addr_a, "B should see A's address");
+}
+
+/// Go MakeHole receiver-side candidate port range scanning: the receiver
+/// probes the sender's port range, the sender answers on its real port.
+#[tokio::test]
+async fn test_makehole_candidate_port_scanning() {
+    let (a, b, addr_a, addr_b) = bind_pair().await;
+
+    let candidate_a = vec![addr_a.to_string()];
+    let candidate_b = vec![addr_b.to_string()];
+
+    // Receiver (side B) scans a range around A's port.
+    let receiver_behavior = frp_core::msg::NatHoleDetectBehavior {
+        role: Some("receiver".into()),
+        candidate_ports: Some(vec![frp_core::msg::PortsRange {
+            from: addr_a.port() as i32,
+            to: addr_a.port() as i32,
+        }]),
+        ..Default::default()
+    };
+    let sender_behavior = frp_core::msg::NatHoleDetectBehavior {
+        role: Some("sender".into()),
+        ..Default::default()
+    };
+
+    let (peer_a, peer_b) = tokio::join!(
+        xtcp_p2p::punch_udp_hole_makehole(&a, &candidate_b, &[], &sender_behavior, 3000, None, None),
+        xtcp_p2p::punch_udp_hole_makehole(&b, &candidate_a, &[], &receiver_behavior, 3000, None, None),
+    );
+
+    let peer_a = peer_a.expect("makehole scan side A");
+    let peer_b = peer_b.expect("makehole scan side B");
+    assert_eq!(peer_a, addr_b);
+    assert_eq!(peer_b, addr_a);
 }
