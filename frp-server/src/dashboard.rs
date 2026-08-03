@@ -922,6 +922,1084 @@ async fn add_security_headers(req: axum::extract::Request, next: Next) -> axum::
     response
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Dashboard API v2 — Go frp v0.70.0 parity.
+//
+// Routes (registered in `run_dashboard`):
+//   GET  /api/v2/system/info
+//   POST /api/v2/system/prune
+//   GET  /api/v2/users
+//   GET  /api/v2/clients
+//   GET  /api/v2/clients/{key}
+//   GET  /api/v2/proxies
+//   GET  /api/v2/proxies/{name}
+//   GET  /api/v2/proxies/{name}/traffic
+//
+// Field names, pagination, filtering, sorting and prune semantics follow
+// Go frp v0.70.0 `server/http/controller_v2.go` + `server/http/model/v2.go`.
+//
+// NOTE: a pre-existing `dashboard_v2.rs` module carries an earlier, less
+// accurate v2 implementation. It is out of this task's write scope, so this
+// in-place module is the authoritative v2 implementation; the old module is
+// left untouched (see final report for cleanup suggestion).
+mod v2 {
+    use super::*;
+    use axum::routing::post;
+    use std::time::SystemTime;
+
+    const DEFAULT_PAGE: u32 = 1;
+    const DEFAULT_PAGE_SIZE: u32 = 50;
+    const MAX_PAGE_SIZE: u32 = 200;
+    const TRAFFIC_DAYS: usize = 7;
+
+    const VALID_TYPES: &[&str] = &[
+        "tcp", "udp", "http", "https", "tcpmux", "stcp", "xtcp", "sudp",
+    ];
+
+    // ── Response models ──
+
+    #[derive(Serialize)]
+    struct PageResp<T: Serialize> {
+        total: usize,
+        page: u32,
+        #[serde(rename = "pageSize")]
+        page_size: u32,
+        items: Vec<T>,
+    }
+
+    #[derive(Serialize)]
+    struct V2Error {
+        error: String,
+    }
+
+    fn err(s: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<V2Error>) {
+        (s, Json(V2Error { error: msg.into() }))
+    }
+
+    /// Go `model.V2SystemInfoConfigResp`.
+    #[derive(Serialize)]
+    struct SystemInfoConfig {
+        #[serde(rename = "bindPort")]
+        bind_port: u16,
+        #[serde(rename = "vhostHTTPPort")]
+        vhost_http_port: u16,
+        #[serde(rename = "vhostHTTPSPort")]
+        vhost_https_port: u16,
+        #[serde(rename = "tcpmuxHTTPConnectPort")]
+        tcpmux_httpconnect_port: u16,
+        #[cfg(feature = "kcp")]
+        #[serde(rename = "kcpBindPort")]
+        kcp_bind_port: u16,
+        #[cfg(feature = "quic")]
+        #[serde(rename = "quicBindPort")]
+        quic_bind_port: u16,
+        #[serde(rename = "subdomainHost")]
+        subdomain_host: String,
+        #[serde(rename = "maxPoolCount")]
+        max_pool_count: i64,
+        #[serde(rename = "maxPortsPerClient")]
+        max_ports_per_client: i64,
+        #[serde(rename = "heartbeatTimeout")]
+        heartbeat_timeout: i64,
+        #[serde(rename = "allowPortsStr")]
+        allow_ports_str: String,
+        #[serde(rename = "tlsForce")]
+        tls_force: bool,
+    }
+
+    /// Go `model.V2SystemInfoStatusResp`.
+    #[derive(Serialize)]
+    struct SystemInfoStatus {
+        #[serde(rename = "totalTrafficIn")]
+        total_traffic_in: i64,
+        #[serde(rename = "totalTrafficOut")]
+        total_traffic_out: i64,
+        #[serde(rename = "curConns")]
+        cur_conns: i64,
+        #[serde(rename = "clientCounts")]
+        client_counts: i64,
+        #[serde(rename = "proxyTypeCount")]
+        proxy_type_counts: HashMap<String, i64>,
+    }
+
+    /// Go `model.V2SystemInfoResp`.
+    #[derive(Serialize)]
+    struct SystemInfoResp {
+        version: String,
+        config: SystemInfoConfig,
+        status: SystemInfoStatus,
+    }
+
+    /// Go `model.V2SystemPruneResp`.
+    #[derive(Serialize)]
+    struct SystemPruneResp {
+        #[serde(rename = "type")]
+        prune_type: String,
+        cleared: usize,
+        total: usize,
+    }
+
+    /// Go `model.V2UserResp`.
+    #[derive(Serialize)]
+    struct UserResp {
+        user: String,
+        #[serde(rename = "clientCount")]
+        client_count: usize,
+        #[serde(rename = "proxyCount")]
+        proxy_count: usize,
+    }
+
+    /// Go `model.ClientInfoResp` (used for both client list and detail).
+    #[derive(Serialize)]
+    struct ClientEntry {
+        key: String,
+        user: String,
+        #[serde(rename = "clientID")]
+        client_id: String,
+        #[serde(rename = "runID")]
+        run_id: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        version: String,
+        #[serde(rename = "wireProtocol", skip_serializing_if = "String::is_empty")]
+        wire_protocol: String,
+        hostname: String,
+        #[serde(rename = "clientIP", skip_serializing_if = "String::is_empty")]
+        client_ip: String,
+        #[serde(rename = "firstConnectedAt")]
+        first_connected_at: i64,
+        #[serde(rename = "lastConnectedAt")]
+        last_connected_at: i64,
+        #[serde(rename = "disconnectedAt", skip_serializing_if = "is_zero")]
+        disconnected_at: i64,
+        online: bool,
+    }
+
+    impl ClientEntry {
+        /// Go `buildClientInfoResp`.
+        fn from_info(info: &crate::registry::ClientInfo) -> Self {
+            Self {
+                key: info.key.clone(),
+                user: info.user.clone(),
+                client_id: info.client_id().to_string(),
+                run_id: info.run_id.clone(),
+                version: info.version.clone(),
+                wire_protocol: info.wire_protocol.clone(),
+                hostname: info.hostname.clone(),
+                client_ip: info.ip.clone(),
+                first_connected_at: info.first_connected_at_unix as i64,
+                last_connected_at: info.last_connected_at_unix as i64,
+                disconnected_at: info.disconnected_at_unix.unwrap_or(0) as i64,
+                online: info.online,
+            }
+        }
+    }
+
+    /// Go `model.V2ClientDetailResp`: flattened ClientInfoResp + status.
+    #[derive(Serialize)]
+    struct ClientDetailResp {
+        #[serde(flatten)]
+        info: ClientEntry,
+        status: ClientStatus,
+    }
+
+    /// Go `model.V2ClientStatusResp`.
+    #[derive(Serialize)]
+    struct ClientStatus {
+        phase: String,
+        #[serde(rename = "curConns")]
+        cur_conns: i64,
+        #[serde(rename = "proxyCount")]
+        proxy_count: i64,
+    }
+
+    /// Go `model.V2ProxyResp`.
+    #[derive(Serialize)]
+    struct ProxyResp {
+        name: String,
+        user: String,
+        #[serde(rename = "clientID")]
+        client_id: String,
+        spec: ProxySpec,
+        status: ProxyStatus,
+    }
+
+    /// Go `model.V2ProxySpec`.
+    #[derive(Serialize, Default)]
+    struct ProxySpec {
+        #[serde(rename = "type")]
+        proxy_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tcp: Option<TcpUdpSpec>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        udp: Option<TcpUdpSpec>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        http: Option<HttpSpec>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        https: Option<HttpsSpec>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tcpmux: Option<TcpMuxSpec>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stcp: Option<BaseOnlySpec>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sudp: Option<BaseOnlySpec>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        xtcp: Option<BaseOnlySpec>,
+    }
+
+    /// Go `model.V2ProxyBaseSpec`. `transport` is always present; `loadBalancer`
+    /// always present (empty group allowed) to match Go's non-omitempty fields.
+    /// `annotations`/`metadatas` are omitted because frp-rs `ProxyInfo` has no
+    /// corresponding data.
+    #[derive(Serialize)]
+    struct ProxyBaseSpec {
+        transport: Option<ProxyTransport>,
+        #[serde(rename = "loadBalancer")]
+        load_balancer: Option<LoadBalancer>,
+    }
+
+    /// Go `model.V2ProxyTransportSpec`.
+    #[derive(Serialize)]
+    struct ProxyTransport {
+        #[serde(rename = "useEncryption")]
+        use_encryption: bool,
+        #[serde(rename = "useCompression")]
+        use_compression: bool,
+        #[serde(rename = "bandwidthLimit")]
+        bandwidth_limit: String,
+        #[serde(rename = "bandwidthLimitMode")]
+        bandwidth_limit_mode: String,
+    }
+
+    /// Go `model.V2ProxyLoadBalancerSpec`.
+    #[derive(Serialize)]
+    struct LoadBalancer {
+        group: String,
+    }
+
+    /// Go `model.V2TCPProxySpec` / `V2UDPProxySpec`.
+    #[derive(Serialize)]
+    struct TcpUdpSpec {
+        #[serde(flatten)]
+        base: ProxyBaseSpec,
+        #[serde(rename = "remotePort", skip_serializing_if = "Option::is_none")]
+        remote_port: Option<u16>,
+    }
+
+    /// Go `model.V2HTTPProxySpec`.
+    #[derive(Serialize)]
+    struct HttpSpec {
+        #[serde(flatten)]
+        base: ProxyBaseSpec,
+        #[serde(rename = "customDomains", skip_serializing_if = "Vec::is_empty")]
+        custom_domains: Vec<String>,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        subdomain: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        locations: Vec<String>,
+        #[serde(rename = "hostHeaderRewrite", skip_serializing_if = "String::is_empty")]
+        host_header_rewrite: String,
+    }
+
+    /// Go `model.V2HTTPSProxySpec`.
+    #[derive(Serialize)]
+    struct HttpsSpec {
+        #[serde(flatten)]
+        base: ProxyBaseSpec,
+        #[serde(rename = "customDomains", skip_serializing_if = "Vec::is_empty")]
+        custom_domains: Vec<String>,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        subdomain: String,
+    }
+
+    /// Go `model.V2TCPMuxProxySpec`.
+    #[derive(Serialize)]
+    struct TcpMuxSpec {
+        #[serde(flatten)]
+        base: ProxyBaseSpec,
+        #[serde(rename = "customDomains", skip_serializing_if = "Vec::is_empty")]
+        custom_domains: Vec<String>,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        subdomain: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        multiplexer: String,
+        #[serde(rename = "routeByHTTPUser", skip_serializing_if = "String::is_empty")]
+        route_by_http_user: String,
+    }
+
+    /// Go `model.V2STCPProxySpec` / `V2SUDPProxySpec` / `V2XTCPProxySpec`.
+    #[derive(Serialize)]
+    struct BaseOnlySpec {
+        #[serde(flatten)]
+        base: ProxyBaseSpec,
+    }
+
+    /// Go `model.V2ProxyStatusResp`.
+    #[derive(Serialize)]
+    struct ProxyStatus {
+        phase: String,
+        #[serde(rename = "todayTrafficIn")]
+        today_traffic_in: u64,
+        #[serde(rename = "todayTrafficOut")]
+        today_traffic_out: u64,
+        #[serde(rename = "curConns")]
+        cur_conns: i64,
+        #[serde(rename = "lastStartAt", skip_serializing_if = "is_zero")]
+        last_start_at: i64,
+        #[serde(rename = "lastCloseAt", skip_serializing_if = "is_zero")]
+        last_close_at: i64,
+    }
+
+    /// Go `model.V2ProxyTrafficResp`.
+    #[derive(Serialize)]
+    struct ProxyTrafficResp {
+        name: String,
+        unit: String,
+        granularity: String,
+        history: Vec<TrafficPoint>,
+    }
+
+    /// Go `model.V2ProxyTrafficPointResp`.
+    #[derive(Serialize)]
+    struct TrafficPoint {
+        date: String,
+        #[serde(rename = "trafficIn")]
+        traffic_in: i64,
+        #[serde(rename = "trafficOut")]
+        traffic_out: i64,
+    }
+
+    fn is_zero(v: &i64) -> bool {
+        *v == 0
+    }
+
+    // ── Query params ──
+
+    #[derive(Deserialize, Default)]
+    struct UserQuery {
+        page: Option<u32>,
+        #[serde(rename = "pageSize")]
+        page_size: Option<u32>,
+        q: Option<String>,
+    }
+
+    #[derive(Deserialize, Default)]
+    struct ClientQuery {
+        page: Option<u32>,
+        #[serde(rename = "pageSize")]
+        page_size: Option<u32>,
+        status: Option<String>,
+        user: Option<String>,
+        #[serde(rename = "clientID")]
+        client_id: Option<String>,
+        #[serde(rename = "runID")]
+        run_id: Option<String>,
+        q: Option<String>,
+    }
+
+    #[derive(Deserialize, Default)]
+    struct ProxyQuery {
+        page: Option<u32>,
+        #[serde(rename = "pageSize")]
+        page_size: Option<u32>,
+        status: Option<String>,
+        #[serde(rename = "type")]
+        proxy_type: Option<String>,
+        user: Option<String>,
+        #[serde(rename = "clientID")]
+        client_id: Option<String>,
+        q: Option<String>,
+    }
+
+    #[derive(Deserialize, Default)]
+    struct PruneQuery {
+        #[serde(rename = "type")]
+        prune_type: Option<String>,
+    }
+
+    // ── Pagination / filtering helpers ──
+
+    /// Go `parseV2PageParams` / `parseV2PositiveInt`.
+    fn parse_page(
+        p: Option<u32>,
+        ps: Option<u32>,
+    ) -> Result<(u32, u32), (StatusCode, Json<V2Error>)> {
+        let page = match p {
+            Some(v) if v >= 1 => v,
+            Some(_) => {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "page must be a positive integer",
+                ));
+            }
+            None => DEFAULT_PAGE,
+        };
+        let size = match ps {
+            Some(v) if v >= 1 => v,
+            Some(_) => {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "pageSize must be a positive integer",
+                ));
+            }
+            None => DEFAULT_PAGE_SIZE,
+        };
+        if size > MAX_PAGE_SIZE {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("pageSize must be between 1 and {MAX_PAGE_SIZE}"),
+            ));
+        }
+        Ok((page, size))
+    }
+
+    /// Go `buildV2PageResp` / `paginateV2Items`.
+    fn paginate<T: Serialize>(mut items: Vec<T>, page: u32, page_size: u32) -> PageResp<T> {
+        let total = items.len();
+        let start = ((page as usize).saturating_sub(1)).saturating_mul(page_size as usize);
+        let items = if start >= total {
+            Vec::new()
+        } else {
+            let end = (start + page_size as usize).min(total);
+            items.drain(start..end).collect()
+        };
+        PageResp {
+            total,
+            page,
+            page_size,
+            items,
+        }
+    }
+
+    /// Go `matchV2StatusFilter`.
+    fn match_status(online: bool, filter: &str) -> bool {
+        match filter {
+            "" | "all" => true,
+            "online" => online,
+            "offline" => !online,
+            _ => true,
+        }
+    }
+
+    /// Case-insensitive substring search over a set of values (Go `containsV2Query`).
+    fn contains_query(q: &str, values: &[String]) -> bool {
+        let q = q.to_lowercase();
+        values.iter().any(|v| v.to_lowercase().contains(&q))
+    }
+
+    fn validate_type(t: &str) -> Result<(), (StatusCode, Json<V2Error>)> {
+        if t.is_empty() || VALID_TYPES.contains(&t) {
+            Ok(())
+        } else {
+            Err(err(
+                StatusCode::BAD_REQUEST,
+                "type must be one of tcp, udp, http, https, tcpmux, stcp, xtcp, sudp",
+            ))
+        }
+    }
+
+    fn validate_status(s: &str) -> Result<(), (StatusCode, Json<V2Error>)> {
+        match s {
+            "" | "all" | "online" | "offline" => Ok(()),
+            _ => Err(err(
+                StatusCode::BAD_REQUEST,
+                "status must be one of all, online, offline",
+            )),
+        }
+    }
+
+    /// Percent-decode a URL-encoded path segment (Go `decodeV2PathParam`).
+    fn percent_decode_path(s: &str) -> Result<String, (StatusCode, Json<V2Error>)> {
+        let mut out = String::with_capacity(s.len());
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'%' if i + 2 < bytes.len() => {
+                    let hi = hex_nibble(bytes[i + 1]);
+                    let lo = hex_nibble(bytes[i + 2]);
+                    if let (Some(h), Some(l)) = (hi, lo) {
+                        out.push((h << 4 | l) as char);
+                        i += 3;
+                    } else {
+                        return Err(err(StatusCode::BAD_REQUEST, "invalid percent-encoding"));
+                    }
+                }
+                b'+' => {
+                    out.push(' ');
+                    i += 1;
+                }
+                b => {
+                    out.push(b as char);
+                    i += 1;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn hex_nibble(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            _ => None,
+        }
+    }
+
+    /// Format a Unix timestamp (seconds) as YYYY-MM-DD.
+    /// Civil-from-days algorithm (http://howardhinnant.github.io/date_algorithms.html).
+    fn format_date_ymd(ts_secs: i64) -> String {
+        if ts_secs <= 0 {
+            return String::new();
+        }
+        let days = ts_secs / 86400;
+        let z = days + 719468;
+        let era = if z >= 0 { z } else { z - 146096 } / 146097;
+        let doe = (z - era * 146097) as u32; // [0, 146096]
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = (yoe as i64) + (era * 400);
+        let doy = doe as i64 - (365 * yoe as i64 + yoe as i64 / 4 - yoe as i64 / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        format!("{:04}-{:02}-{:02}", y, m, d)
+    }
+
+    /// Go `buildV2ProxyBaseSpec` (transport always present, loadBalancer always
+    /// present — Go has no `omitempty` on those).
+    fn proxy_base_spec(info: &crate::proxy::ProxyInfo) -> ProxyBaseSpec {
+        ProxyBaseSpec {
+            transport: Some(ProxyTransport {
+                use_encryption: info.use_encryption,
+                use_compression: info.use_compression,
+                bandwidth_limit: info.bandwidth_limit.clone(),
+                bandwidth_limit_mode: info.bandwidth_limit_mode.clone(),
+            }),
+            load_balancer: Some(LoadBalancer {
+                group: info.group.clone().unwrap_or_default(),
+            }),
+        }
+    }
+
+    /// Go `buildV2ProxySpec`.
+    fn proxy_spec(info: &crate::proxy::ProxyInfo) -> ProxySpec {
+        match info.proxy_type.as_str() {
+            "tcp" => ProxySpec {
+                proxy_type: "tcp".into(),
+                tcp: Some(TcpUdpSpec {
+                    base: proxy_base_spec(info),
+                    remote_port: info.remote_port,
+                }),
+                ..Default::default()
+            },
+            "udp" => ProxySpec {
+                proxy_type: "udp".into(),
+                udp: Some(TcpUdpSpec {
+                    base: proxy_base_spec(info),
+                    remote_port: info.remote_port,
+                }),
+                ..Default::default()
+            },
+            "http" => ProxySpec {
+                proxy_type: "http".into(),
+                http: Some(HttpSpec {
+                    base: proxy_base_spec(info),
+                    custom_domains: info.custom_domains.clone(),
+                    subdomain: String::new(),
+                    locations: Vec::new(),
+                    host_header_rewrite: String::new(),
+                }),
+                ..Default::default()
+            },
+            "https" => ProxySpec {
+                proxy_type: "https".into(),
+                https: Some(HttpsSpec {
+                    base: proxy_base_spec(info),
+                    custom_domains: info.custom_domains.clone(),
+                    subdomain: String::new(),
+                }),
+                ..Default::default()
+            },
+            "tcpmux" => ProxySpec {
+                proxy_type: "tcpmux".into(),
+                tcpmux: Some(TcpMuxSpec {
+                    base: proxy_base_spec(info),
+                    custom_domains: info.custom_domains.clone(),
+                    subdomain: String::new(),
+                    multiplexer: info.multiplexer.clone(),
+                    route_by_http_user: info.route_by_http_user.clone(),
+                }),
+                ..Default::default()
+            },
+            "stcp" => ProxySpec {
+                proxy_type: "stcp".into(),
+                stcp: Some(BaseOnlySpec {
+                    base: proxy_base_spec(info),
+                }),
+                ..Default::default()
+            },
+            "sudp" => ProxySpec {
+                proxy_type: "sudp".into(),
+                sudp: Some(BaseOnlySpec {
+                    base: proxy_base_spec(info),
+                }),
+                ..Default::default()
+            },
+            "xtcp" => ProxySpec {
+                proxy_type: "xtcp".into(),
+                xtcp: Some(BaseOnlySpec {
+                    base: proxy_base_spec(info),
+                }),
+                ..Default::default()
+            },
+            other => ProxySpec {
+                proxy_type: other.to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    // ── Handlers ──
+
+    /// GET /api/v2/system/info — Go `APIV2SystemInfo`.
+    async fn handle_system_info(State(state): State<Arc<AppState>>) -> Json<SystemInfoResp> {
+        let snap = &state.server_config_snapshot;
+        let ctl_map = state.run_id_to_ctl_tx.read().await;
+        let client_counts = ctl_map.len() as i64;
+        drop(ctl_map);
+
+        let proxies = state.proxy_manager.list().await;
+        let mut proxy_type_counts: HashMap<String, i64> = HashMap::new();
+        let mut total_traffic_in: i64 = 0;
+        let mut total_traffic_out: i64 = 0;
+        let mut cur_conns: i64 = 0;
+        for p in &proxies {
+            *proxy_type_counts.entry(p.proxy_type.clone()).or_insert(0) += 1;
+            if let Some(m) = state.proxy_metrics.get(&p.name).await {
+                let (tin, tout) = m.daily.snapshot();
+                // Go ServerStats: TotalTrafficIn/Out are TodayCount().
+                total_traffic_in += tin[0] as i64;
+                total_traffic_out += tout[0] as i64;
+                cur_conns += m.snapshot().current_conns;
+            }
+        }
+
+        let config = SystemInfoConfig {
+            bind_port: snap.bind_port,
+            vhost_http_port: snap.vhost_http_port,
+            vhost_https_port: snap.vhost_https_port,
+            tcpmux_httpconnect_port: snap.tcpmux_httpconnect_port,
+            #[cfg(feature = "kcp")]
+            kcp_bind_port: snap.kcp_bind_port,
+            #[cfg(feature = "quic")]
+            quic_bind_port: snap.quic_bind_port,
+            subdomain_host: snap.subdomain_host.clone(),
+            max_pool_count: snap.max_pool_count,
+            max_ports_per_client: snap.max_ports_per_client,
+            heartbeat_timeout: snap.heartbeat_timeout,
+            allow_ports_str: snap.allow_ports_str.clone(),
+            tls_force: snap.tls_force,
+        };
+
+        Json(SystemInfoResp {
+            version: frp_core::VERSION.to_string(),
+            config,
+            status: SystemInfoStatus {
+                total_traffic_in,
+                total_traffic_out,
+                cur_conns,
+                client_counts,
+                proxy_type_counts,
+            },
+        })
+    }
+
+    /// POST /api/v2/system/prune — Go `APIV2SystemPrune`.
+    async fn handle_system_prune(
+        State(state): State<Arc<AppState>>,
+        Query(q): Query<PruneQuery>,
+    ) -> Result<Json<SystemPruneResp>, (StatusCode, Json<V2Error>)> {
+        let prune_type = q.prune_type.clone().unwrap_or_default();
+        if prune_type.is_empty() {
+            return Err(err(StatusCode::BAD_REQUEST, "type is required"));
+        }
+        if prune_type != "offline_proxies" {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "type must be one of offline_proxies",
+            ));
+        }
+        let (cleared, total) = prune_offline_stats(&state).await;
+        Ok(Json(SystemPruneResp {
+            prune_type,
+            cleared,
+            total,
+        }))
+    }
+
+    /// GET /api/v2/users — Go `APIV2UserList`.
+    async fn handle_users(
+        State(state): State<Arc<AppState>>,
+        Query(q): Query<UserQuery>,
+    ) -> Result<Json<PageResp<UserResp>>, (StatusCode, Json<V2Error>)> {
+        let (page, size) = parse_page(q.page, q.page_size)?;
+
+        // Go: iterate client registry (online AND offline) for clientCount,
+        // then proxy stats for proxyCount.
+        let registry = state.client_registry.list();
+        let proxies = state.proxy_manager.list().await;
+        let mut user_map: HashMap<String, UserResp> = HashMap::new();
+        for info in &registry {
+            let user = info.user.clone();
+            let e = user_map.entry(user.clone()).or_insert_with(|| UserResp {
+                user: user.clone(),
+                client_count: 0,
+                proxy_count: 0,
+            });
+            e.client_count += 1;
+        }
+        for p in &proxies {
+            let user = p.user.clone();
+            let e = user_map.entry(user.clone()).or_insert_with(|| UserResp {
+                user: user.clone(),
+                client_count: 0,
+                proxy_count: 0,
+            });
+            e.proxy_count += 1;
+        }
+
+        let mut items: Vec<UserResp> = user_map.into_values().collect();
+        items.sort_by(|a, b| a.user.cmp(&b.user));
+        if let Some(ref search) = q.q {
+            let s = search.to_lowercase();
+            items.retain(|u| u.user.to_lowercase().contains(&s));
+        }
+        Ok(Json(paginate(items, page, size)))
+    }
+
+    /// GET /api/v2/clients — Go `APIV2ClientList`.
+    async fn handle_clients(
+        State(state): State<Arc<AppState>>,
+        Query(q): Query<ClientQuery>,
+    ) -> Result<Json<PageResp<ClientEntry>>, (StatusCode, Json<V2Error>)> {
+        let (page, size) = parse_page(q.page, q.page_size)?;
+        validate_status(q.status.as_deref().unwrap_or(""))?;
+
+        let mut items = Vec::new();
+        for info in state.client_registry.list() {
+            if let Some(ref u) = q.user {
+                if !u.is_empty() && info.user != u.as_str() {
+                    continue;
+                }
+            }
+            if let Some(ref cid) = q.client_id {
+                if !cid.is_empty() && info.client_id() != cid.as_str() {
+                    continue;
+                }
+            }
+            if let Some(ref rid) = q.run_id {
+                if !rid.is_empty() && info.run_id != rid.as_str() {
+                    continue;
+                }
+            }
+            if !match_status(info.online, q.status.as_deref().unwrap_or("")) {
+                continue;
+            }
+            let entry = ClientEntry::from_info(&info);
+            if let Some(ref search) = q.q {
+                let hay = [
+                    entry.key.clone(),
+                    entry.user.clone(),
+                    entry.client_id.clone(),
+                    entry.run_id.clone(),
+                    entry.version.clone(),
+                    entry.wire_protocol.clone(),
+                    entry.hostname.clone(),
+                    entry.client_ip.clone(),
+                ];
+                if !contains_query(search, &hay) {
+                    continue;
+                }
+            }
+            items.push(entry);
+        }
+
+        // Go: sort by (User, ClientID, Key).
+        items.sort_by(|a, b| {
+            a.user
+                .cmp(&b.user)
+                .then_with(|| a.client_id.cmp(&b.client_id))
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        Ok(Json(paginate(items, page, size)))
+    }
+
+    /// GET /api/v2/clients/{key} — Go `APIV2ClientDetail`.
+    async fn handle_client_detail(
+        State(state): State<Arc<AppState>>,
+        Path(key): Path<String>,
+    ) -> Result<Json<ClientDetailResp>, (StatusCode, Json<V2Error>)> {
+        let key = percent_decode_path(&key)?;
+
+        // Go looks up by composite key `{user}.{clientID}`. As a frp-rs
+        // compatibility extension we also accept a bare run_id.
+        let info = state
+            .client_registry
+            .get_by_key(&key)
+            .or_else(|| {
+                state
+                    .client_registry
+                    .list()
+                    .into_iter()
+                    .find(|i| i.run_id == key)
+            })
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("client {key} not found")))?;
+
+        let (cur_conns, proxy_count) = if info.online && !info.run_id.is_empty() {
+            let proxies = state.proxy_manager.list_client(&info.run_id).await;
+            let mut cur_conns = 0i64;
+            for p in &proxies {
+                if let Some(m) = state.proxy_metrics.get(&p.name).await {
+                    cur_conns += m.snapshot().current_conns;
+                }
+            }
+            (cur_conns, proxies.len() as i64)
+        } else {
+            // Offline clients: frp-rs removes a client's proxies and their
+            // stats on disconnect (data-model difference vs Go, which keeps
+            // residual stats until pruning), so counts are 0.
+            (0, 0)
+        };
+
+        Ok(Json(ClientDetailResp {
+            info: ClientEntry::from_info(&info),
+            status: ClientStatus {
+                phase: if info.online { "online" } else { "offline" }.into(),
+                cur_conns,
+                proxy_count,
+            },
+        }))
+    }
+
+    /// GET /api/v2/proxies — Go `APIV2ProxyList`.
+    async fn handle_proxies(
+        State(state): State<Arc<AppState>>,
+        Query(q): Query<ProxyQuery>,
+    ) -> Result<Json<PageResp<ProxyResp>>, (StatusCode, Json<V2Error>)> {
+        let (page, size) = parse_page(q.page, q.page_size)?;
+        validate_status(q.status.as_deref().unwrap_or(""))?;
+        validate_type(q.proxy_type.as_deref().unwrap_or(""))?;
+
+        let all = state.proxy_manager.list().await;
+        let ctl_map = state.run_id_to_ctl_tx.read().await;
+        let mut items = Vec::new();
+        for p in &all {
+            if let Some(ref pt) = q.proxy_type {
+                if p.proxy_type != pt.as_str() {
+                    continue;
+                }
+            }
+            let online = ctl_map.contains_key(&p.run_id);
+            if !match_status(online, q.status.as_deref().unwrap_or("")) {
+                continue;
+            }
+            if let Some(ref u) = q.user {
+                if !u.is_empty() && p.user != u.as_str() {
+                    continue;
+                }
+            }
+            if let Some(ref cid) = q.client_id {
+                if !cid.is_empty() && p.run_id != cid.as_str() {
+                    continue;
+                }
+            }
+
+            let spec = proxy_spec(p);
+            let (today_in, today_out, cur_conns) = state
+                .proxy_metrics
+                .get(&p.name)
+                .await
+                .map(|m| {
+                    let s = m.snapshot();
+                    let (tin, tout) = m.daily.snapshot();
+                    (tin[0], tout[0], s.current_conns)
+                })
+                .unwrap_or((0, 0, 0));
+
+            let resp = ProxyResp {
+                name: p.name.clone(),
+                user: p.user.clone(),
+                client_id: p.run_id.clone(),
+                spec,
+                status: ProxyStatus {
+                    phase: if online { "online" } else { "offline" }.into(),
+                    today_traffic_in: today_in,
+                    today_traffic_out: today_out,
+                    cur_conns,
+                    last_start_at: 0,
+                    last_close_at: 0,
+                },
+            };
+
+            // Go matchV2ProxyQuery: name, type, user, clientID, state, plus
+            // remotePort (tcp/udp) and customDomains/subdomain (http/https/tcpmux).
+            if let Some(ref search) = q.q {
+                let mut hay = vec![
+                    resp.name.clone(),
+                    resp.spec.proxy_type.clone(),
+                    resp.user.clone(),
+                    resp.client_id.clone(),
+                    resp.status.phase.clone(),
+                ];
+                hay.extend(p.custom_domains.iter().cloned());
+                if let Some(port) = p.remote_port {
+                    hay.push(port.to_string());
+                }
+                if !contains_query(search, &hay) {
+                    continue;
+                }
+            }
+
+            items.push(resp);
+        }
+        drop(ctl_map);
+
+        // Go: sort by (Spec.Type, Name).
+        items.sort_by(|a, b| {
+            a.spec
+                .proxy_type
+                .cmp(&b.spec.proxy_type)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Ok(Json(paginate(items, page, size)))
+    }
+
+    /// GET /api/v2/proxies/{name} — Go `APIV2ProxyDetail`.
+    async fn handle_proxy_detail(
+        State(state): State<Arc<AppState>>,
+        Path(name): Path<String>,
+    ) -> Result<Json<ProxyResp>, (StatusCode, Json<V2Error>)> {
+        let name = percent_decode_path(&name)?;
+
+        let p = state
+            .proxy_manager
+            .get(&name)
+            .await
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, "no proxy info found"))?;
+
+        let online = state.run_id_to_ctl_tx.read().await.contains_key(&p.run_id);
+        let (today_in, today_out, cur_conns) = state
+            .proxy_metrics
+            .get(&p.name)
+            .await
+            .map(|m| {
+                let s = m.snapshot();
+                let (tin, tout) = m.daily.snapshot();
+                (tin[0], tout[0], s.current_conns)
+            })
+            .unwrap_or((0, 0, 0));
+
+        Ok(Json(ProxyResp {
+            name: p.name.clone(),
+            user: p.user.clone(),
+            client_id: p.run_id.clone(),
+            spec: proxy_spec(&p),
+            status: ProxyStatus {
+                phase: if online { "online" } else { "offline" }.into(),
+                today_traffic_in: today_in,
+                today_traffic_out: today_out,
+                cur_conns,
+                last_start_at: 0,
+                last_close_at: 0,
+            },
+        }))
+    }
+
+    /// GET /api/v2/proxies/{name}/traffic — Go `APIV2ProxyTraffic`.
+    async fn handle_proxy_traffic(
+        State(state): State<Arc<AppState>>,
+        Path(name): Path<String>,
+    ) -> Result<Json<ProxyTrafficResp>, (StatusCode, Json<V2Error>)> {
+        let name = percent_decode_path(&name)?;
+
+        let p = state
+            .proxy_manager
+            .get(&name)
+            .await
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, "no proxy info found"))?;
+
+        let history = if let Some(m) = state.proxy_metrics.get(&p.name).await {
+            let (tin, tout) = m.daily.snapshot();
+            let today_secs = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            // Go buildV2ProxyTrafficResp: iterate age from oldest (6) to today
+            // (0), so history is oldest → newest.
+            (0..TRAFFIC_DAYS)
+                .map(|i| {
+                    let age = (TRAFFIC_DAYS - 1 - i) as i64;
+                    TrafficPoint {
+                        date: format_date_ymd(today_secs - age * 86400),
+                        traffic_in: tin[age as usize] as i64,
+                        traffic_out: tout[age as usize] as i64,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        Ok(Json(ProxyTrafficResp {
+            name: p.name.clone(),
+            unit: "bytes".into(),
+            granularity: "day".into(),
+            history,
+        }))
+    }
+
+    // ── Prune (shared with the periodic background task) ──
+
+    /// Prune statistics for offline proxies.
+    ///
+    /// Go frp v0.70.0 `mem.StatsCollector.PruneOfflineProxies()` clears the
+    /// *stats records* of proxies that are currently offline; it does not
+    /// touch live proxy registrations. frp-rs removes a proxy's metrics when
+    /// it closes, so this is a defensive sweep of any residual stats for
+    /// proxies whose client is no longer connected.
+    ///
+    /// Returns `(cleared, total)` mirroring Go's response shape.
+    pub(super) async fn prune_offline_stats(state: &Arc<AppState>) -> (usize, usize) {
+        let all = state.proxy_manager.list().await;
+        let total = all.len();
+        let ctl_map = state.run_id_to_ctl_tx.read().await;
+        let mut cleared = 0usize;
+        for p in &all {
+            if !ctl_map.contains_key(&p.run_id) {
+                state.proxy_metrics.remove(&p.name).await;
+                cleared += 1;
+            }
+        }
+        (cleared, total)
+    }
+
+    // ── Route registration ──
+
+    /// Register v2 API routes (Go frp v0.70.0 compat).
+    pub(super) fn v2_routes() -> Router<Arc<AppState>> {
+        Router::new()
+            .route("/api/v2/system/info", get(handle_system_info))
+            .route("/api/v2/system/prune", post(handle_system_prune))
+            .route("/api/v2/users", get(handle_users))
+            .route("/api/v2/clients", get(handle_clients))
+            .route("/api/v2/clients/{key}", get(handle_client_detail))
+            .route("/api/v2/proxies", get(handle_proxies))
+            .route("/api/v2/proxies/{name}", get(handle_proxy_detail))
+            .route("/api/v2/proxies/{name}/traffic", get(handle_proxy_traffic))
+    }
+}
+
 // --- Dashboard runner ---
 
 pub async fn run_dashboard(
@@ -955,7 +2033,7 @@ pub async fn run_dashboard(
         .route("/api/store/proxy/{name}", delete(handle_store_proxy_delete))
         .route("/api/events", get(handle_events))
         // v2 API (Go frp v0.70.0 compat): paginated, filterable, searchable endpoints
-        .merge(crate::dashboard_v2::v2_routes());
+        .merge(v2::v2_routes());
 
     let api_routes = apply_admin_auth(api_routes, &auth_user, &auth_password);
 
@@ -995,6 +2073,26 @@ pub async fn run_dashboard(
     let traffic_state = state.clone();
     tokio::spawn(async move {
         run_traffic_events(traffic_state).await;
+    });
+
+    // Background task: periodically prune stats for offline proxies.
+    // Go frp v0.70.0 runs this sweep every 12h
+    // (server/metrics/mem/server.go runUntil → clearUselessInfo(7*24h)).
+    let prune_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(12 * 3600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let (cleared, total) = v2::prune_offline_stats(&prune_state).await;
+            if cleared > 0 {
+                tracing::debug!(
+                    cleared = cleared,
+                    total = total,
+                    "Dashboard: pruned stats for offline proxies"
+                );
+            }
+        }
     });
 
     // Apply security headers middleware (P2-2). Uses axum::middleware::from_fn

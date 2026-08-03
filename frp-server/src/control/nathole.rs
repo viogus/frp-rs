@@ -1271,6 +1271,7 @@ mod vnet_route_tests {
         let ctl = ControlState {
             shutting_down: false,
             shutdown_done: None,
+            udp_cancel: tokio_util::sync::CancellationToken::new(),
             work_pool: VecDeque::new(),
             pending_requests: VecDeque::new(),
             pending_udp: VecDeque::new(),

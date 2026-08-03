@@ -216,6 +216,7 @@ async fn run_udp_work_conn(
     local_addr: Option<msg::UdpAddr>,
     v2: bool,
     udp_packet_size: usize,
+    cancel: tokio_util::sync::CancellationToken,
 ) {
     // write_msg_v2_nof skips the flush syscall. That is only safe for a raw
     // TcpStream: TLS/mux/WS-wrapped streams buffer internally and would leave
@@ -227,11 +228,13 @@ async fn run_udp_work_conn(
     let sock_reader = sock.clone();
     let reader_name = proxy_name.clone();
     let mut reader_cancel = cancel_rx.clone();
+    let cancel_reader = cancel.clone();
     let reader = async move {
         debug!(proxy_name = %reader_name, "UDP work conn reader task started for '{}'", reader_name);
         loop {
             let result = tokio::select! {
                 biased;
+                _ = cancel_reader.cancelled() => break,
                 changed = reader_cancel.changed() => {
                     if changed.is_err() || *reader_cancel.borrow() { break; }
                     continue;
@@ -265,12 +268,14 @@ async fn run_udp_work_conn(
 
     let writer_name = proxy_name.clone();
     let mut writer_cancel = cancel_rx;
+    let cancel_writer = cancel;
     let writer = async move {
         debug!(proxy_name = %writer_name, "UDP work conn writer task started for '{}'", writer_name);
         let mut buf = vec![0u8; udp_packet_size];
         loop {
             let received = tokio::select! {
                 biased;
+                _ = cancel_writer.cancelled() => break,
                 changed = writer_cancel.changed() => {
                     if changed.is_err() || *writer_cancel.borrow() { break; }
                     continue;
@@ -349,6 +354,7 @@ pub(crate) async fn assign_udp_work_conn(
     local_addr: Option<msg::UdpAddr>,
     v2: bool,
     udp_packet_size: usize,
+    cancel: tokio_util::sync::CancellationToken,
 ) {
     let mut work_conn = work_conn;
     let sock = match udp_sockets.get(proxy_name) {
@@ -359,6 +365,13 @@ pub(crate) async fn assign_udp_work_conn(
         }
     };
     let proxy_name = proxy_name.to_string();
+
+    // Control is shutting down (supersession / disconnect) — do not start a
+    // bridge that would immediately be cancelled anyway.
+    if cancel.is_cancelled() {
+        debug!(proxy_name = %proxy_name, "Control is shutting down, not starting UDP bridge for '{}'", proxy_name);
+        return;
+    }
 
     // Send StartWorkConn to tell the client which proxy to associate
     let swc = FrpMessage::StartWorkConn(Box::new(msg::StartWorkConn {
@@ -392,6 +405,7 @@ pub(crate) async fn assign_udp_work_conn(
         local_addr,
         v2,
         udp_packet_size,
+        cancel,
     ));
 }
 
@@ -419,8 +433,7 @@ async fn relay_plain_fast_inner(
         (IoStream::Tcp(user), IoStream::Tcp(work)) => {
             match frp_core::splice::bridge_splice(user, work).await {
                 Ok((a, b)) => {
-                    metrics.bytes_in.fetch_add(a, Ordering::Relaxed);
-                    metrics.bytes_out.fetch_add(b, Ordering::Relaxed);
+                    metrics.record_traffic(a, b);
                 }
                 Err(e) => {
                     tracing::debug!(error = %e, "splice bridge closed: {}", e);
@@ -430,8 +443,7 @@ async fn relay_plain_fast_inner(
         (mut user_conn, mut work_conn) => {
             match tokio::io::copy_bidirectional(&mut user_conn, &mut work_conn).await {
                 Ok((a, b)) => {
-                    metrics.bytes_in.fetch_add(a, Ordering::Relaxed);
-                    metrics.bytes_out.fetch_add(b, Ordering::Relaxed);
+                    metrics.record_traffic(a, b);
                 }
                 Err(e) => {
                     tracing::debug!(error = %e, "plain fast-path bridge closed: {}", e);
@@ -450,8 +462,7 @@ async fn relay_plain_fast_inner(
 ) {
     match tokio::io::copy_bidirectional(&mut user_conn, &mut work_conn).await {
         Ok((a, b)) => {
-            metrics.bytes_in.fetch_add(a, Ordering::Relaxed);
-            metrics.bytes_out.fetch_add(b, Ordering::Relaxed);
+            metrics.record_traffic(a, b);
         }
         Err(e) => {
             tracing::debug!(error = %e, "plain fast-path bridge closed: {}", e);
@@ -839,8 +850,7 @@ pub(crate) async fn assign_work_to_proxy(
                 let mut user_conn = req.user_conn;
                 match tokio::io::copy_bidirectional(&mut user_conn, &mut work_conn).await {
                     Ok((a, b)) => {
-                        metrics.bytes_in.fetch_add(a, Ordering::Relaxed);
-                        metrics.bytes_out.fetch_add(b, Ordering::Relaxed);
+                        metrics.record_traffic(a, b);
                     }
                     Err(e) => {
                         debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
@@ -982,6 +992,7 @@ mod tests {
             None,
             false,
             1500,
+            tokio_util::sync::CancellationToken::new(),
         ));
         drop(peer);
 
@@ -1016,6 +1027,7 @@ mod tests {
             None,
             false,
             1500,
+            tokio_util::sync::CancellationToken::new(),
         ));
         sender.send_to(b"force-write", socket_addr).await.unwrap();
 
@@ -1044,6 +1056,7 @@ mod tests {
             Some(local_addr.clone()),
             false,
             1500,
+            tokio_util::sync::CancellationToken::new(),
         ));
 
         peer.write_v1_frame(&FrpMessage::UDPPacket(msg::UDPPacket {
@@ -1085,6 +1098,38 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), bridge)
             .await
             .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_bridge_cancel_terminates_half_open_work_conn() {
+        // Half-open work conn: keep the peer side open but never send, so the
+        // reader blocks on read_msg_v1 (no EOF) and the writer blocks on
+        // recv_from. Before the cancellation fix this bridge task hung
+        // forever, leaking the work conn fd + socket + task memory after
+        // control supersession/disconnect (Go frp v0.70.1 fix parity).
+        let (work, _peer) = tcp_pair().await;
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let bridge_cancel = cancel.clone();
+
+        let bridge = tokio::spawn(run_udp_work_conn(
+            IoStream::Tcp(work),
+            socket,
+            "udp-test".to_string(),
+            None,
+            false,
+            1500,
+            bridge_cancel,
+        ));
+
+        // Let both bridge tasks reach their blocking points.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), bridge)
+            .await
+            .expect("cancel must terminate the half-open UDP bridge task")
             .unwrap();
     }
 }
