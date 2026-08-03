@@ -134,9 +134,13 @@ Remaining known gaps (documented, architectural):
 - HTTP vhost `responseHeaders`, 504 timeouts, h2c (byte-level forwarding vs
   Go's HTTP reverse proxy).
 - HTTP plugin `enableHTTP2` (byte-level bridge).
-- XTCP **data plane**: hole-punching/coordination is complete (16/16 XTCP
-  pairwise compat, 2026-08); Rust uses KCP+yamux for the P2P stream while Go
-  frp v0.70.1 negotiates quic or kcp via the `protocol` field — the QUIC
-  data-plane variant for Go↔Rust XTCP is not implemented. Plus VirtualNet
-  isolation/routing reload (see plan
+- XTCP **data plane**: hole-punching/coordination is complete (17/17 XTCP
+  pairwise compat incl. the QUIC data plane, 2026-08). Rust supports both
+  KCP+yamux and QUIC for the P2P stream, selected by the `protocol` field
+  (Rust visitor `protocol="quic"` ↔ Go provider works). Known limitation: a
+  **Go** visitor with the default `protocol="quic"` cannot talk to a Rust
+  provider — Go frp v0.70.1 sends `"ip:port"` as the QUIC SNI (Go 1.25
+  `hostnameInSNI` no longer strips the port), which rustls rejects; rewriting
+  the ClientHello would break the TLS 1.3 transcript. Such a Go visitor must
+  set `protocol = "kcp"`. Plus VirtualNet isolation/routing reload (see plan
   `docs/superpowers/plans/2026-08-02-go-parity-all-fixes.md`).

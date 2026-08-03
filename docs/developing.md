@@ -227,7 +227,28 @@ Two paths for visitor connections:
 
 **STCP fallback**: if hole punch fails (e.g., both sides behind symmetric NAT), the visitor falls back to an STCP proxy specified by the `fallback_to` config field.
 
-**XTCP P2P encryption**: after hole punch, the P2P stream (KCP-over-UDP + yamux, running on the socket that received the peer's detect reply) is bridged to the local service with `bridge_encrypted` when `use_encryption=true` and `sk` is non-empty. The key is derived via `PBKDF2-SHA1(sk, salt="frp", iter=64, keylen=16)` -- using the proxy's SecretKey (not the auth token). Probe packets (NatHoleSid) use the same derivation; without a secret key, Rust↔Rust probes use the `"frp"` magic. Both sides derive the same key from the shared SecretKey.
+**XTCP P2P data plane**: after the hole punch, the P2P stream runs on the
+socket that received the peer's detect reply (Go `result.lConn` semantics —
+only that socket has a working NAT mapping). Two transports are supported,
+selected by the `protocol` field (visitor decides; Go visitors default to
+`"quic"`):
+- **KCP + yamux** (`protocol="kcp"`, default): the punched UDP socket runs
+  KCP (`XtcpP2pStream`) with yamux on top.
+- **QUIC** (`protocol="quic"`): the punched socket is handed directly to
+  quinn (`xtcp_p2p_connect_quic` — no yamux, QUIC multiplexes streams
+  itself), self-signed TLS + InsecureSkipVerify, ALPN `frp`. The visitor is
+  the QUIC client, the provider the QUIC server. Requires the `quic` feature
+  (default ON). Known limitation: a **Go** visitor with `protocol="quic"`
+  cannot talk to a Rust provider — Go frp v0.70.1 sends `"ip:port"` as the
+  QUIC SNI, which rustls rejects; set `protocol = "kcp"` on the Go visitor.
+
+**XTCP P2P encryption**: after hole punch, the P2P stream is bridged to the
+local service with `bridge_encrypted` when `use_encryption=true` and `sk` is
+non-empty. The key is derived via `PBKDF2-SHA1(sk, salt="frp", iter=64,
+keylen=16)` -- using the proxy's SecretKey (not the auth token). Probe
+packets (NatHoleSid) use the same derivation; without a secret key, Rust↔Rust
+probes use the `"frp"` magic. Both sides derive the same key from the shared
+SecretKey.
 
 **Module structure** (`frp-server/src/nathole/`):
 - `mod.rs` -- module root, `NAT_HOLE_TIMEOUT = 10s`
@@ -393,26 +414,33 @@ cargo clippy                 # Lint
 
 ### Binary Variants
 
-Three size tiers via feature flags:
+Four size tiers via feature flags. QUIC and SSH are default; dashboard is opt-in:
 
 ```bash
-# Full (all features, ~4.8MB frps, ~3.7MB frpc)
+# Default (SSH + QUIC included; no dashboard; keeps TLS, KCP, WS, compression)
 cargo build --release -p frps -p frpc
+# → frps (~5.0MB), frpc (~4.5MB)
 
-# Tiny (no QUIC/KCP/WS/SSH/OIDC/dashboard; keeps TLS, ~2.7MB/~2.3MB)
+# Full (all features; dashboard is the only opt-in on top of default)
+cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
+# → frps (~5.3MB), frpc (~4.5MB)
+
+# Tiny (no QUIC/KCP/WS/SSH/OIDC/dashboard/compression; keeps TLS)
 cargo build --release -p frps -p frpc --no-default-features --features tiny
+# → frps-tiny (~3.2MB), frpc-tiny (~2.7MB)
 
-# Micro (core only: no TLS, compression, chacha20, HTTP proxy, tcp-mux, ~1.6MB/~1.7MB)
+# Micro (core only: no TLS, compression, chacha20, HTTP proxy, tcp-mux)
 cargo build --release -p frps -p frpc --no-default-features --features micro
+# → frps-micro (~1.9MB), frpc-micro (~2.0MB)
 ```
 
-The binaries are named `frps`/`frpc` (full), `frps-tiny`/`frpc-tiny`, and `frps-micro`/`frpc-micro` respectively.
+The binaries are named `frps`/`frpc` (default/full), `frps-tiny`/`frpc-tiny`, and `frps-micro`/`frpc-micro` respectively.
 
 ### Feature Flags
 
 | Feature | Crate | What it removes |
 |---------|-------|-----------------|
-| `quic` | frp-core | QUIC transport (quinn, ~1MB) |
+| `quic` | frp-core | QUIC transport (quinn) — **default ON** (was opt-in) |
 | `kcp` | frp-core | KCP transport (kcp) |
 | `websocket` | frp-core/server | WebSocket transport (tokio-tungstenite) |
 | `oidc` | frp-core | OIDC auth (jsonwebtoken, reqwest) |
@@ -424,7 +452,7 @@ The binaries are named `frps`/`frpc` (full), `frps-tiny`/`frpc-tiny`, and `frps-
 | `http-proxy` | frp-server | HTTP proxy plugin (reqwest) |
 | `tcp-mux` | frp-core/server/client | yamux stream multiplexing (~80KB) |
 
-All features default ON. `quic` implies `tls`. `oidc` implies `reqwest`. `ssh` implies `rand`.
+All features default ON except `dashboard` (opt-in). `quic` implies `tls`. `oidc` implies `reqwest`. `ssh` implies `rand`.
 
 ### Release Profile
 
