@@ -4,6 +4,29 @@ All notable changes to frp-rs.
 
 ## Unreleased
 
+- **HTTP vhost 504 Gateway Timeout (Go v0.70.1 compat)**: when the backend
+  (work conn) produces no response headers within `vhost_http_timeout`
+  (Go `VhostHTTPTimeout`, default 60s), the byte-level bridge now writes
+  `HTTP/1.1 504 Gateway Timeout` and closes — matching Go's
+  `httputil.ReverseProxy.ResponseHeaderTimeout`. Covered by
+  `tests/vhost_http_timeout.rs`.
+
+- **HTTP vhost h2c (HTTP/2 cleartext) support (Go v0.70.1 compat)**: the HTTP
+  vhost listener detects the HTTP/2 prior-knowledge preface
+  (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`) and decodes the connection with the
+  `h2` crate (tokio's official HTTP/2 implementation; Go uses net/http's
+  built-in h2c). Each stream is routed through the shared
+  `resolve_vhost_request` (domain/wildcard/path + httpUser lookup, Basic
+  Auth, host_header_rewrite, X-Forwarded-For/requestHeaders injection),
+  forwarded to the provider as plain HTTP/1.1 (`Host` from `:authority`,
+  unknown-length bodies chunked-framed — Go http.Transport behavior), and
+  the backend HTTP/1.1 response (status line + headers + chunked decoding)
+  is re-encoded as HTTP/2 frames — including `504 Gateway Timeout` on
+  `vhost_http_timeout`, 404/401/502 errors, and a custom 404 page. HTTP/1.1
+  clients keep the existing byte-level path unchanged. Covered by
+  `tests/vhost_h2c.rs` (GET forward, chunked backend, POST body,
+  unmapped-host 404).
+
 - **Binary profile audit**: fixed two `tiny`/`micro` build regressions — the
   `detect_behavior` field on `InternalMsg::WriteNatHoleResp` referenced
   `msg::NatHoleDetectBehavior` behind a vnet-gated import (`frp-server/src/

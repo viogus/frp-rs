@@ -131,8 +131,12 @@ Closed in the `fix/go-parity-2026-08-02` branch:
 
 Remaining known gaps (documented, architectural):
 
-- HTTP vhost `responseHeaders`, 504 timeouts, h2c (byte-level forwarding vs
-  Go's HTTP reverse proxy).
+- HTTP vhost `responseHeaders`, 504 timeouts, h2c — **implemented**:
+  responseHeaders via the server-side `ResponseHeaderInjector` bridge,
+  per-request 504s via `vhost_http_timeout` on the response-header read
+  (byte-level and h2c), and h2c via `h2`-crate decoding on the vhost port
+  (routed like HTTP/1.1, forwarded to providers as HTTP/1.1, responses
+  re-encoded as HTTP/2).
 - HTTP plugin `enableHTTP2` (byte-level bridge).
 - XTCP **data plane**: hole-punching/coordination is complete (17/17 XTCP
   pairwise compat incl. the QUIC data plane, 2026-08). Rust supports both

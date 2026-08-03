@@ -1210,10 +1210,13 @@ version = "0.7.1"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
+ "bytes",
  "criterion",
  "data-encoding",
  "frp-core",
  "frp-vnet",
+ "h2",
+ "http",
  "jsonwebtoken",
  "md-5",
  "prometheus",

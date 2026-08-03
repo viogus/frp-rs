@@ -88,9 +88,11 @@ but not literally 100% — see "Known limitations" below.
 
 - **HTTP vhost reverse-proxy semantics**: frps forwards HTTP vhost traffic at
   the byte level (X-Forwarded-For and requestHeaders are injected, Host
-  rewriting works), but `responseHeaders`, per-request 504 timeouts, and
-  HTTP/2 (h2c) are not implemented — Go's `httputil.ReverseProxy` semantics
-  would require an HTTP-level proxy on the server side.
+  rewriting works). `responseHeaders` (ResponseHeaderInjector), per-request
+  `vhost_http_timeout` 504s, and HTTP/2 cleartext (h2c) are implemented: h2c
+  clients are decoded with the `h2` crate, forwarded to providers as plain
+  HTTP/1.1, and backend HTTP/1.1 responses (including chunked bodies) are
+  re-encoded as HTTP/2 — matching Go's `httputil.ReverseProxy` semantics.
 - **HTTP plugin `enableHTTP2`**: parsed but not honored — the tunnel bridge is
   byte-oriented; clients automatically fall back to HTTP/1.1.
 - **`pprof` endpoints**: `/debug/pprof/*` is a placeholder (no Go-style CPU

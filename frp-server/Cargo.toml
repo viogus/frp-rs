@@ -5,8 +5,15 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+bytes = { workspace = true }
 frp-core = { path = "../frp-core", default-features = false }
 frp-vnet = { workspace = true, optional = true }
+# h2c HTTP vhost support: the byte-level bridge cannot decode HTTP/2 frames; h2
+# is the tokio-official HTTP/2 implementation (Go uses net/http's h2c; Rust has
+# no std HTTP/2). No existing dep fits (axum/hyper are dashboard-only and
+# opt-in).
+h2 = { workspace = true }
+http = { workspace = true }
 russh = { workspace = true, optional = true }
 # NOTE: russh → ssh-cipher → aes-gcm 0.11.0-rc.4 is a pre-release. Only used for
 # SSH feature. Monitor upstream for stable release.
@@ -56,6 +63,7 @@ reqwest = { workspace = true, features = ["json"] }
 serde_json = { workspace = true }
 axum = { workspace = true }
 jsonwebtoken = { workspace = true }
+bytes = { workspace = true }
 criterion.workspace = true
 
 [[bench]]

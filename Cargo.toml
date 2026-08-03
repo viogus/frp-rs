@@ -43,6 +43,9 @@ prometheus = "0.14"
 yamux = "0.14"
 russh = { version = "0.61", default-features = false, features = ["ring", "rsa"] }
 tokio-util = { version = "0.7", features = ["compat"] }
+h2 = "0.4"
+http = "1"
+bytes = "1"
 kcp = "0.6"
 quinn = "0.11"
 

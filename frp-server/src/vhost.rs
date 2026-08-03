@@ -7,6 +7,10 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::service::{AppState, InternalMsg};
 
+/// HTTP/2 cleartext (h2c) vhost handling — see `vhost_h2c.rs`.
+#[path = "vhost_h2c.rs"]
+mod vhost_h2c;
+
 /// A route mapping: domain or location -> proxy entry.
 #[derive(Debug, Clone)]
 pub struct VhostRoute {
@@ -470,6 +474,31 @@ async fn serve_vhost_request<S>(
 
     let pre_read = buf[..n].to_vec();
     let request_text = String::from_utf8_lossy(&buf[..n]);
+
+    // HTTP/2 prior-knowledge preface (h2c): binary frames, no text Host
+    // header. The listener's single read may return a partial preface (TCP
+    // can deliver fewer bytes), so a prefix match is completed before
+    // dispatching to the h2 server path (Go's bufio-based h2 server waits
+    // for all 24 preface bytes). `H2_PREFACE.starts_with(&pre_read)` covers
+    // the short-prefix case; `pre_read.starts_with(H2_PREFACE)` the case
+    // where frames arrived together with the preface.
+    if vhost_h2c::H2_PREFACE.starts_with(&pre_read) || pre_read.starts_with(vhost_h2c::H2_PREFACE) {
+        let mut prefix_len = n;
+        while prefix_len < vhost_h2c::H2_PREFACE.len() {
+            let m = match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                stream.read(&mut buf[prefix_len..vhost_h2c::H2_PREFACE.len()]),
+            )
+            .await
+            {
+                Ok(Ok(m)) if m > 0 => m,
+                _ => return,
+            };
+            prefix_len += m;
+        }
+        return vhost_h2c::serve_h2c_request(stream, buf[..prefix_len].to_vec(), state, peer).await;
+    }
+
     let host = match extract_host_header(&request_text) {
         Some(h) => h.to_string(),
         None => {
@@ -489,99 +518,165 @@ async fn serve_vhost_request<S>(
 
     debug!(host = %host, path = %path, peer = %peer, http_user = %http_user, "{} VHost request for '{}' path '{}' from {}", scheme, host, path, peer);
 
-    if let Some(route) = state
-        .vhost_manager
-        .lookup_combined(&host, path, http_user)
-        .await
+    match resolve_vhost_request(
+        &state,
+        &host,
+        path,
+        http_auth.as_ref(),
+        pre_read,
+        peer,
+        scheme,
+    )
+    .await
     {
-        // HTTP Basic Auth check (Go frp compat)
-        if !route.http_user.is_empty() {
-            let auth_ok = http_auth
-                .as_ref()
-                .map(|(u, p)| {
-                    crate::constant_time_eq_str(u, &route.http_user)
-                        && crate::constant_time_eq_str(p, &route.http_pwd)
-                })
-                .unwrap_or(false);
-            if !auth_ok {
-                let _ = stream.write_all(
-                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"frp\"\r\n\r\n"
-                ).await;
-                return;
+        Ok(forward) => {
+            let internal_tx = {
+                let map = state.run_id_to_ctl_tx.read().await;
+                map.get(&forward.run_id).cloned()
+            };
+            if let Some(ctl_tx) = internal_tx {
+                let _ = ctl_tx
+                    .tx
+                    .try_send(InternalMsg::ProxyUserConn {
+                        proxy_name: forward.proxy_name,
+                        user_conn: wrap(stream),
+                        pre_read: forward.request_head,
+                    })
+                    .ok();
+            } else {
+                warn!(host = %host, path = %path, "{} VHost route for '{}' path '{}' found but control handler gone", scheme, host, path);
+                write_http_error(&mut stream, "HTTP/1.1 502 Bad Gateway", "").await;
             }
         }
+        Err(VhostResolveError::Unauthorized) => {
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"frp\"\r\n\r\n",
+                )
+                .await;
+        }
+        Err(VhostResolveError::NotFound) => {
+            write_http_error(
+                &mut stream,
+                "HTTP/1.1 404 Not Found",
+                &state.custom_404_page,
+            )
+            .await;
+        }
+    }
+}
 
-        // Per-user routing (Go frp compat): when route_by_http_user is set,
-        // extract the Basic Auth username and look up proxy
-        // `{route_by_http_user}.{username}` in the proxy manager.
-        let (target_proxy_name, target_run_id) = if !route.route_by_http_user.is_empty() {
-            if let Some((username, _password)) = &http_auth {
-                let user_proxy = format!("{}.{}", route.route_by_http_user, username);
-                debug!(
-                    host = %host, route_by_http_user = %route.route_by_http_user,
-                    username = %username, user_proxy = %user_proxy,
-                    "{} VHost: trying user-based routing to '{}'", scheme, user_proxy
-                );
-                if let Some(user_info) = state.proxy_manager.get(&user_proxy).await {
-                    (user_proxy, user_info.run_id.clone())
-                } else {
-                    // User-specific proxy not found — fall through to
-                    // the route's own proxy (matching Go frp behavior
-                    // when the target proxy doesn't exist).
-                    debug!(
-                        user_proxy = %user_proxy,
-                        "{} VHost: user-based proxy '{}' not found, falling back to '{}'",
-                        scheme, user_proxy, route.proxy_name
-                    );
-                    (route.proxy_name.clone(), route.run_id.clone())
-                }
+/// Result of resolving a vhost request: target proxy/run_id plus the
+/// forwarded HTTP/1.1 request head (Host rewritten and requestHeaders /
+/// X-Forwarded-For injected).
+pub(crate) struct VhostForward {
+    pub proxy_name: String,
+    pub run_id: String,
+    pub request_head: Vec<u8>,
+}
+
+/// Rejection reasons that map to a client-visible HTTP error.
+#[derive(Debug)]
+pub(crate) enum VhostResolveError {
+    /// No route matched → 404.
+    NotFound,
+    /// HTTP Basic Auth failed → 401.
+    Unauthorized,
+}
+
+/// Shared routing + header rewriting for HTTP/1.1 and h2c vhost requests.
+///
+/// Extracted from `serve_vhost_request`: looks up the route (domain/wildcard/
+/// path + httpUser), enforces Basic Auth, applies per-user routing
+/// (`route_by_http_user`), then rewrites the Host header and injects
+/// X-Forwarded-For / requestHeaders into the forwarded head. The caller
+/// renders rejection (404/401) or success (ProxyUserConn dispatch) in its own
+/// protocol (HTTP/1.1 text vs HTTP/2 frames).
+pub(crate) async fn resolve_vhost_request(
+    state: &AppState,
+    host: &str,
+    path: &str,
+    http_auth: Option<&(String, String)>,
+    request_head: Vec<u8>,
+    peer: std::net::SocketAddr,
+    scheme: &str,
+) -> Result<VhostForward, VhostResolveError> {
+    let http_user = http_auth
+        .as_ref()
+        .map(|(u, _)| u.as_str())
+        .unwrap_or_default();
+
+    let Some(route) = state
+        .vhost_manager
+        .lookup_combined(host, path, http_user)
+        .await
+    else {
+        warn!(host = %host, path = %path, peer = %peer, "No {} VHost route for '{}' path '{}' from {}", scheme, host, path, peer);
+        return Err(VhostResolveError::NotFound);
+    };
+
+    // HTTP Basic Auth check (Go frp compat)
+    if !route.http_user.is_empty() {
+        let auth_ok = http_auth
+            .map(|(u, p)| {
+                crate::constant_time_eq_str(u, &route.http_user)
+                    && crate::constant_time_eq_str(p, &route.http_pwd)
+            })
+            .unwrap_or(false);
+        if !auth_ok {
+            return Err(VhostResolveError::Unauthorized);
+        }
+    }
+
+    // Per-user routing (Go frp compat): when route_by_http_user is set,
+    // extract the Basic Auth username and look up proxy
+    // `{route_by_http_user}.{username}` in the proxy manager.
+    let (target_proxy_name, target_run_id) = if !route.route_by_http_user.is_empty() {
+        if let Some((username, _password)) = http_auth {
+            let user_proxy = format!("{}.{}", route.route_by_http_user, username);
+            debug!(
+                host = %host, route_by_http_user = %route.route_by_http_user,
+                username = %username, user_proxy = %user_proxy,
+                "{} VHost: trying user-based routing to '{}'", scheme, user_proxy
+            );
+            if let Some(user_info) = state.proxy_manager.get(&user_proxy).await {
+                (user_proxy, user_info.run_id.clone())
             } else {
-                // No Authorization header — fall through to route's proxy.
+                // User-specific proxy not found — fall through to
+                // the route's own proxy (matching Go frp behavior
+                // when the target proxy doesn't exist).
+                debug!(
+                    user_proxy = %user_proxy,
+                    "{} VHost: user-based proxy '{}' not found, falling back to '{}'",
+                    scheme, user_proxy, route.proxy_name
+                );
                 (route.proxy_name.clone(), route.run_id.clone())
             }
         } else {
+            // No Authorization header — fall through to route's proxy.
             (route.proxy_name.clone(), route.run_id.clone())
-        };
-
-        // Apply host_header_rewrite if configured
-        let pre_read = if !route.host_header_rewrite.is_empty() {
-            rewrite_host_header(&pre_read, &route.host_header_rewrite)
-        } else {
-            pre_read
-        };
-
-        // Go frp compat (pkg/util/vhost/http.go reverse proxy): inject
-        // X-Forwarded-For (append to existing value) and requestHeaders
-        // (Set semantics) into the forwarded request head.
-        let pre_read = inject_vhost_request_headers(&pre_read, peer, &route.headers);
-
-        let internal_tx = {
-            let map = state.run_id_to_ctl_tx.read().await;
-            map.get(&target_run_id).cloned()
-        };
-
-        if let Some(ctl_tx) = internal_tx {
-            let _ = ctl_tx
-                .tx
-                .try_send(InternalMsg::ProxyUserConn {
-                    proxy_name: target_proxy_name,
-                    user_conn: wrap(stream),
-                    pre_read,
-                })
-                .ok();
-        } else {
-            warn!(host = %host, path = %path, "{} VHost route for '{}' path '{}' found but control handler gone", scheme, host, path);
-            write_http_error(&mut stream, "HTTP/1.1 502 Bad Gateway", "").await;
         }
     } else {
-        warn!(host = %host, path = %path, peer = %peer, "No {} VHost route for '{}' path '{}' from {}", scheme, host, path, peer);
-        write_http_error(
-            &mut stream,
-            "HTTP/1.1 404 Not Found",
-            &state.custom_404_page,
-        )
-        .await;
-    }
+        (route.proxy_name.clone(), route.run_id.clone())
+    };
+
+    // Apply host_header_rewrite if configured
+    let request_head = if !route.host_header_rewrite.is_empty() {
+        rewrite_host_header(&request_head, &route.host_header_rewrite)
+    } else {
+        request_head
+    };
+
+    // Go frp compat (pkg/util/vhost/http.go reverse proxy): inject
+    // X-Forwarded-For (append to existing value) and requestHeaders
+    // (Set semantics) into the forwarded request head.
+    let request_head = inject_vhost_request_headers(&request_head, peer, &route.headers);
+
+    Ok(VhostForward {
+        proxy_name: target_proxy_name,
+        run_id: target_run_id,
+        request_head,
+    })
 }
 
 /// Run an HTTP VHost listener on the given address.
