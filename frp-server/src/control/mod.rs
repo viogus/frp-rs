@@ -55,6 +55,10 @@ pub(crate) struct ControlState {
     /// Signaled after cleanup completes so the new control generation
     /// (same run_id) can proceed past its handoff barrier.
     pub shutdown_done: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Cancelled by cleanup (supersession / control disconnect) so UDP
+    /// bridge tasks spawned by `assign_udp_work_conn` terminate instead of
+    /// hanging forever on a half-open work conn (Go frp v0.70.1 fix parity).
+    pub udp_cancel: tokio_util::sync::CancellationToken,
     pub work_pool: VecDeque<pool::PoolEntry>,
     pub pending_requests: VecDeque<pool::PendingRequest>,
     pub pending_udp: VecDeque<(String, Instant)>,

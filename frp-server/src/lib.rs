@@ -22,6 +22,3 @@ pub mod tcpmux;
 pub mod vhost;
 
 pub(crate) use frp_core::auth::constant_time_eq_str;
-
-#[cfg(feature = "dashboard")]
-pub mod dashboard_v2;

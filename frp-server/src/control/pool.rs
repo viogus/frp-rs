@@ -247,6 +247,7 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
                 local_addr,
                 ctx.v2,
                 ctx.state.udp_packet_size,
+                ctl.udp_cancel.clone(),
             )
             .await;
         } else {

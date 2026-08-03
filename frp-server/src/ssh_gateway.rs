@@ -57,6 +57,9 @@ struct ParsedProxyArgs {
 ///   "tcp --proxy_name \"web\" --remote_port 9090"
 ///   "http --proxy_name \"blog\" --custom_domains \"a,b\""
 fn parse_ssh_args(cmd: &str) -> Result<ParsedProxyArgs, String> {
+    if cmd.trim().is_empty() {
+        return Err("missing proxy type".into());
+    }
     let parts = shell_split(cmd);
     if parts.is_empty() {
         return Err("missing proxy type".into());
@@ -96,90 +99,44 @@ fn parse_ssh_args(cmd: &str) -> Result<ParsedProxyArgs, String> {
     let mut i = 1;
     while i < parts.len() {
         match parts[i].as_str() {
-            "--proxy_name" => {
-                i += 1;
-                args.proxy_name = parts.get(i).cloned().unwrap_or_default();
-            }
+            "--proxy_name" => args.proxy_name = take_value(&parts, &mut i),
             "--remote_port" => {
-                i += 1;
-                args.remote_port = parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+                args.remote_port = take_value(&parts, &mut i).parse().ok().unwrap_or(0);
             }
-            "--local_ip" => {
-                i += 1;
-                args.local_ip = parts.get(i).cloned().unwrap_or_default();
-            }
+            "--local_ip" => args.local_ip = take_value(&parts, &mut i),
             "--local_port" => {
-                i += 1;
-                args.local_port = parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+                args.local_port = take_value(&parts, &mut i).parse().ok().unwrap_or(0);
             }
             "--custom_domains" | "--custom_domain" => {
-                i += 1;
-                args.custom_domains = parts
-                    .get(i)
-                    .map(|s| s.split(',').map(|d| d.trim().to_string()).collect())
-                    .unwrap_or_default();
+                args.custom_domains = take_value(&parts, &mut i)
+                    .split(',')
+                    .filter(|d| !d.is_empty())
+                    .map(|d| d.trim().to_string())
+                    .collect();
             }
-            "--subdomain" => {
-                i += 1;
-                args.subdomain = parts.get(i).cloned().unwrap_or_default();
-            }
-            "--sk" => {
-                i += 1;
-                args.sk = parts.get(i).cloned().unwrap_or_default();
-            }
-            "--multiplexer" => {
-                i += 1;
-                args.multiplexer = parts.get(i).cloned().unwrap_or_default();
-            }
+            "--subdomain" => args.subdomain = take_value(&parts, &mut i),
+            "--sk" => args.sk = take_value(&parts, &mut i),
+            "--multiplexer" => args.multiplexer = take_value(&parts, &mut i),
             "--use_encryption" => {
-                i += 1;
-                args.use_encryption = parts
-                    .get(i)
-                    .map(|s| s == "true" || s == "1")
-                    .unwrap_or(false);
+                args.use_encryption = matches!(take_value(&parts, &mut i).as_str(), "true" | "1");
             }
             "--use_compression" => {
-                i += 1;
-                args.use_compression = parts
-                    .get(i)
-                    .map(|s| s == "true" || s == "1")
-                    .unwrap_or(false);
+                args.use_compression = matches!(take_value(&parts, &mut i).as_str(), "true" | "1");
             }
-            "--group" => {
-                i += 1;
-                args.group = parts.get(i).cloned().unwrap_or_default();
-            }
-            "--group_key" => {
-                i += 1;
-                args.group_key = parts.get(i).cloned().unwrap_or_default();
-            }
-            "--http_user" => {
-                i += 1;
-                args.http_user = parts.get(i).cloned().unwrap_or_default();
-            }
-            "--http_pwd" => {
-                i += 1;
-                args.http_pwd = parts.get(i).cloned().unwrap_or_default();
-            }
-            "--host_header_rewrite" => {
-                i += 1;
-                args.host_header_rewrite = parts.get(i).cloned().unwrap_or_default();
-            }
+            "--group" => args.group = take_value(&parts, &mut i),
+            "--group_key" => args.group_key = take_value(&parts, &mut i),
+            "--http_user" => args.http_user = take_value(&parts, &mut i),
+            "--http_pwd" => args.http_pwd = take_value(&parts, &mut i),
+            "--host_header_rewrite" => args.host_header_rewrite = take_value(&parts, &mut i),
             "--locations" => {
-                i += 1;
-                args.locations = parts
-                    .get(i)
-                    .map(|s| s.split(',').map(|d| d.trim().to_string()).collect())
-                    .unwrap_or_default();
+                args.locations = take_value(&parts, &mut i)
+                    .split(',')
+                    .filter(|d| !d.is_empty())
+                    .map(|d| d.trim().to_string())
+                    .collect();
             }
-            "--bandwidth_limit" => {
-                i += 1;
-                args.bandwidth_limit = parts.get(i).cloned().unwrap_or_default();
-            }
-            "--bandwidth_limit_mode" => {
-                i += 1;
-                args.bandwidth_limit_mode = parts.get(i).cloned().unwrap_or_default();
-            }
+            "--bandwidth_limit" => args.bandwidth_limit = take_value(&parts, &mut i),
+            "--bandwidth_limit_mode" => args.bandwidth_limit_mode = take_value(&parts, &mut i),
             other => {
                 // Skip unknown flags or positional args after type
                 if !other.starts_with("--") {
@@ -191,6 +148,23 @@ fn parse_ssh_args(cmd: &str) -> Result<ParsedProxyArgs, String> {
     }
 
     Ok(args)
+}
+
+/// Take the value for a value-taking flag. The caller's `i` points at the
+/// flag token itself; the value, if present, sits at `i + 1`. A truncated flag
+/// (no value, or the next token is another `--flag`) yields an empty value and
+/// leaves `i` unchanged, so the loop's trailing `i += 1` advances to the next
+/// token and the following flag is parsed normally on the next iteration.
+fn take_value(parts: &[String], i: &mut usize) -> String {
+    match parts.get(*i + 1) {
+        Some(v) if !v.starts_with("--") => {
+            // Consumed: advance `i` to the value token; the loop's trailing
+            // `i += 1` then skips past it to the next token.
+            *i += 1;
+            v.clone()
+        }
+        _ => String::new(),
+    }
 }
 
 const VALID_PROXY_TYPES: &[&str] = &["tcp", "http", "https", "stcp", "tcpmux"];
@@ -1475,6 +1449,119 @@ mod tests {
                 "secret leaked into exec_request log summary: {summary}"
             );
         }
+    }
+
+    // ── Malformed exec input hardening (Go frp v0.70.1: SSH gateway panic fix) ──
+    // Go frp v0.70.1 fixed a panic when handling malformed exec requests
+    // (pkg/ssh gateway indexing into an empty fields() slice). frp-rs parses
+    // the SSH remote command in parse_ssh_args; every case below must be
+    // tolerated without panicking (no unwrap, no index out of bounds) and
+    // either rejected with an error or defaulted as documented.
+
+    #[test]
+    fn test_parse_ssh_args_truncated_flags_no_panic() {
+        // Flag at end of command with no value.
+        let args = parse_ssh_args("tcp --proxy_name web --sk").unwrap();
+        assert_eq!(args.proxy_type, "tcp");
+        assert_eq!(args.proxy_name, "web");
+        assert!(args.sk.is_empty());
+
+        // A run of value-requiring flags with no values at all.
+        let args = parse_ssh_args("tcp --sk --group_key --http_pwd --remote_port").unwrap();
+        assert_eq!(args.remote_port, 0);
+        assert!(args.sk.is_empty());
+        assert!(args.group_key.is_empty());
+        assert!(args.http_pwd.is_empty());
+
+        // Flag immediately after the type, nothing else.
+        let args = parse_ssh_args("tcp --proxy_name").unwrap();
+        assert!(args.proxy_name.is_empty());
+    }
+
+    #[test]
+    fn test_parse_ssh_args_invalid_ports_no_panic() {
+        for bad in [
+            "abc",
+            "-1",
+            "65536",
+            "999999999",
+            "3.14",
+            "0x10",
+            "12a34",
+            "18446744073709551616", // overflows u64, let alone u16
+        ] {
+            let cmd = format!("tcp --proxy_name web --remote_port {bad}");
+            let args = parse_ssh_args(&cmd).unwrap();
+            assert_eq!(
+                args.remote_port, 0,
+                "invalid port value {bad:?} must default to 0 without panicking"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_ssh_args_invalid_local_port_no_panic() {
+        let args = parse_ssh_args("tcp --proxy_name web --local_port not-a-port").unwrap();
+        assert_eq!(args.local_port, 0);
+    }
+
+    #[test]
+    fn test_parse_ssh_args_empty_or_blank_command_is_error() {
+        for cmd in ["", "   ", "\t", " \n "] {
+            let err = parse_ssh_args(cmd).unwrap_err();
+            assert!(
+                err.contains("missing proxy type"),
+                "cmd {cmd:?} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_ssh_args_unterminated_quote_no_panic() {
+        // Unterminated double quote: shell_split keeps the remainder as one
+        // token and the parse loop skips the unknown positional.
+        let args = parse_ssh_args(r#"tcp --proxy_name "web --remote_port 9090"#).unwrap();
+        assert_eq!(args.proxy_type, "tcp");
+        assert_eq!(args.remote_port, 0);
+    }
+
+    #[test]
+    fn test_parse_ssh_args_excessive_whitespace_no_panic() {
+        let args =
+            parse_ssh_args("   tcp      --proxy_name    web     --remote_port       9090   ")
+                .unwrap();
+        assert_eq!(args.proxy_type, "tcp");
+        assert_eq!(args.proxy_name, "web");
+        assert_eq!(args.remote_port, 9090);
+    }
+
+    #[test]
+    fn test_parse_ssh_args_very_long_argument_no_panic() {
+        let long = "x".repeat(1_000_000);
+        let cmd = format!("tcp --proxy_name {long} --remote_port 9090");
+        let args = parse_ssh_args(&cmd).unwrap();
+        assert_eq!(args.proxy_name.len(), 1_000_000);
+        assert_eq!(args.remote_port, 9090);
+    }
+
+    #[test]
+    fn test_parse_ssh_args_unknown_flag_skipped_no_panic() {
+        let args =
+            parse_ssh_args("tcp --bogus_flag value --proxy_name web --remote_port 9090").unwrap();
+        assert_eq!(args.proxy_name, "web");
+        assert_eq!(args.remote_port, 9090);
+    }
+
+    #[test]
+    fn test_parse_ssh_args_truncated_boolean_and_list_flags() {
+        let args = parse_ssh_args(
+            "http --proxy_name blog --use_encryption --custom_domains --locations --group",
+        )
+        .unwrap();
+        assert!(!args.use_encryption);
+        assert!(args.custom_domains.is_empty());
+        assert!(args.locations.is_empty());
+        assert!(args.group.is_empty());
     }
 }
 

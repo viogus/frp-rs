@@ -182,6 +182,10 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
     // Drop cached UDP encryption/compression flags for this proxy so a later
     // re-registration with different flags picks up the new values.
     ctl.udp_proxy_flags.remove(&cp.proxy_name);
+    // Drop this proxy's UDP socket from ctl (Go frp closeUDP parity). The
+    // bridge task may still hold a clone via its spawned Arc; the socket is
+    // fully closed once that task exits.
+    ctl.udp_sockets.remove(&cp.proxy_name);
     info!(proxy_name = %cp.proxy_name, "Proxy closed: {}", cp.proxy_name);
     // Emit WebSocket event for dashboard subscribers
     #[cfg(feature = "dashboard")]
@@ -348,6 +352,14 @@ pub(crate) async fn cleanup<W: AsyncWriteExt + Unpin>(
     for (_, handle) in ctl.listener_handles.drain() {
         handle.abort();
     }
+    // Cancel UDP bridge tasks: they hold a clone of the proxy's UdpSocket and
+    // block on the work conn read / socket recv. On supersession or disconnect
+    // the work conn can stay half-open forever, so without this they'd hang
+    // and keep the socket + task memory alive (Go frp v0.70.1 fix parity).
+    // Dropping the sockets from ctl releases this control's Arc; the bridge
+    // task's Arc is released when it observes the cancellation and exits.
+    ctl.udp_cancel.cancel();
+    ctl.udp_sockets.clear();
     // Emit ProxyDown for all proxies owned by this client (before removing them)
     #[cfg(feature = "dashboard")]
     {
