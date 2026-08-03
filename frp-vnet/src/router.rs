@@ -1,11 +1,20 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-/// A CIDR routing table mapping subnet strings to target proxy names.
-/// Supports longest-prefix-match lookup for IP → proxy_name routing.
+/// A CIDR routing table mapping subnet strings to target proxy names,
+/// partitioned by virtual net.
+///
+/// Isolation semantics (design spec `2026-06-30-virtual-net-design.md`):
+/// different virtual nets have isolated routing tables — the same subnet may
+/// coexist in two vnets, and lookups are scoped to a single vnet. Within one
+/// vnet, two different proxies may not own overlapping subnets with the same
+/// prefix length (ambiguous routing); shorter/longer-prefix overlaps are
+/// resolved by longest-prefix match.
 #[derive(Debug, Clone, Default)]
 pub struct RouteTable {
-    /// Sorted by prefix length descending (longest first) for lookup priority.
-    routes: Vec<(Net, String)>,
+    /// vnet → routes, each sorted by prefix length descending (longest first)
+    /// for lookup priority.
+    routes: HashMap<String, Vec<(Net, String)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,16 +142,22 @@ impl Ipv4Net {
 
 impl RouteTable {
     pub fn new() -> Self {
-        Self { routes: Vec::new() }
+        Self {
+            routes: HashMap::new(),
+        }
     }
 
-    /// Insert or update a route. Returns Err if subnet conflicts with an existing route
-    /// from a different proxy.
-    pub fn insert(&mut self, name: &str, cidr: &str) -> anyhow::Result<()> {
+    /// Insert or update a route within `vnet`. Returns Err if the subnet
+    /// conflicts with an existing route from a different proxy in the same
+    /// virtual net. Routes in different virtual nets never conflict.
+    pub fn insert(&mut self, vnet: &str, name: &str, cidr: &str) -> anyhow::Result<()> {
         let net = Net::parse(cidr).ok_or_else(|| anyhow::anyhow!("invalid CIDR: {}", cidr))?;
 
-        // Check for subnet conflict (overlapping with different proxy)
-        for (existing, existing_name) in &self.routes {
+        let routes = self.routes.entry(vnet.to_string()).or_default();
+
+        // Check for subnet conflict (overlapping with a different proxy in the
+        // same virtual net).
+        for (existing, existing_name) in routes.iter() {
             if existing_name != name {
                 if existing.family() != net.family() {
                     continue;
@@ -166,12 +181,13 @@ impl RouteTable {
                 // Different-length overlaps are resolved by longest-prefix-match.
                 if overlaps && existing.prefix_len() == net.prefix_len() {
                     return Err(anyhow::anyhow!(
-                        "subnet {} (for {}) conflicts with existing {} (for {}): same prefix length",
-                        net, name, existing, existing_name
+                        "subnet {} (for {}) conflicts with existing {} (for {}) in virtual net {}: same prefix length",
+                        net, name, existing, existing_name, vnet
                     ));
                 }
                 if overlaps {
                     tracing::warn!(
+                        vnet,
                         subnet = %net,
                         proxy = name,
                         existing = %existing,
@@ -184,31 +200,40 @@ impl RouteTable {
 
         // Remove the previous route for this proxy in the same address family.
         // A proxy may own one IPv4 route and one IPv6 route concurrently.
-        self.routes.retain(|(existing, existing_name)| {
+        routes.retain(|(existing, existing_name)| {
             existing_name != name || existing.family() != net.family()
         });
 
         // Maintain sorted-by-prefix-length-descending order via binary search + insert.
         // O(n) per insertion (shift) vs O(n log n) for full sort.
-        let pos = self
-            .routes
+        let pos = routes
             .binary_search_by_key(&std::cmp::Reverse(net.prefix_len()), |item| {
                 std::cmp::Reverse(item.0.prefix_len())
             })
             .unwrap_or_else(|e| e);
-        self.routes.insert(pos, (net, name.to_string()));
+        routes.insert(pos, (net, name.to_string()));
 
         Ok(())
     }
 
-    /// Remove all routes for a proxy.
-    pub fn remove(&mut self, name: &str) {
-        self.routes.retain(|(_, n)| n != name);
+    /// Remove all routes for a proxy within `vnet`. Routes owned by the same
+    /// proxy in other virtual nets are untouched.
+    pub fn remove(&mut self, vnet: &str, name: &str) {
+        let mut empty_vnet = false;
+        if let Some(routes) = self.routes.get_mut(vnet) {
+            routes.retain(|(_, n)| n != name);
+            empty_vnet = routes.is_empty();
+        }
+        if empty_vnet {
+            self.routes.remove(vnet);
+        }
     }
 
-    /// Look up the target proxy name for an IP address. Returns None if no route matches.
-    pub fn lookup(&self, ip: &IpAddr) -> Option<&str> {
-        for (net, name) in &self.routes {
+    /// Look up the target proxy name for an IP address within `vnet`. Returns
+    /// None if no route in that virtual net matches.
+    pub fn lookup(&self, vnet: &str, ip: &IpAddr) -> Option<&str> {
+        let routes = self.routes.get(vnet)?;
+        for (net, name) in routes {
             if net.contains(ip) {
                 return Some(name.as_str());
             }
@@ -216,22 +241,24 @@ impl RouteTable {
         None
     }
 
-    /// Return all route entries as (cidr, proxy_name) pairs.
-    pub fn list(&self) -> Vec<(String, String)> {
+    /// Return all route entries in `vnet` as (cidr, proxy_name) pairs.
+    pub fn list(&self, vnet: &str) -> Vec<(String, String)> {
         self.routes
-            .iter()
+            .get(vnet)
+            .into_iter()
+            .flatten()
             .map(|(net, name)| (net.to_string(), name.clone()))
             .collect()
     }
 
-    /// Return number of routes.
+    /// Return number of routes across all virtual nets.
     pub fn len(&self) -> usize {
-        self.routes.len()
+        self.routes.values().map(Vec::len).sum()
     }
 
     /// Check if routing table is empty.
     pub fn is_empty(&self) -> bool {
-        self.routes.is_empty()
+        self.routes.values().all(Vec::is_empty)
     }
 }
 
@@ -310,27 +337,27 @@ mod tests {
     #[test]
     fn test_simple_insert_lookup() {
         let mut rt = RouteTable::new();
-        rt.insert("vnet-a", "10.0.0.0/24").unwrap();
+        rt.insert("", "vnet-a", "10.0.0.0/24").unwrap();
         assert_eq!(
-            rt.lookup(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
+            rt.lookup("", &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
             Some("vnet-a")
         );
-        assert_eq!(rt.lookup(&IpAddr::V4(Ipv4Addr::new(10, 0, 1, 0))), None);
+        assert_eq!(rt.lookup("", &IpAddr::V4(Ipv4Addr::new(10, 0, 1, 0))), None);
     }
 
     #[test]
     fn test_longest_prefix_match() {
         let mut rt = RouteTable::new();
-        rt.insert("wide", "10.0.0.0/16").unwrap();
-        rt.insert("narrow", "10.0.1.0/24").unwrap();
+        rt.insert("net", "wide", "10.0.0.0/16").unwrap();
+        rt.insert("net", "narrow", "10.0.1.0/24").unwrap();
         // 10.0.1.5 matches both, but /24 is longer
         assert_eq!(
-            rt.lookup(&IpAddr::V4(Ipv4Addr::new(10, 0, 1, 5))),
+            rt.lookup("net", &IpAddr::V4(Ipv4Addr::new(10, 0, 1, 5))),
             Some("narrow")
         );
         // 10.0.2.5 only matches /16
         assert_eq!(
-            rt.lookup(&IpAddr::V4(Ipv4Addr::new(10, 0, 2, 5))),
+            rt.lookup("net", &IpAddr::V4(Ipv4Addr::new(10, 0, 2, 5))),
             Some("wide")
         );
     }
@@ -338,29 +365,32 @@ mod tests {
     #[test]
     fn test_subnet_conflict_rejected() {
         let mut rt = RouteTable::new();
-        rt.insert("a", "10.0.0.0/24").unwrap();
+        rt.insert("net", "a", "10.0.0.0/24").unwrap();
         // Same subnet, different proxy name, same prefix length → conflict
-        assert!(rt.insert("b", "10.0.0.0/24").is_err());
+        assert!(rt.insert("net", "b", "10.0.0.0/24").is_err());
     }
 
     #[test]
     fn test_same_name_overlap_allowed() {
         let mut rt = RouteTable::new();
-        rt.insert("a", "10.0.0.0/16").unwrap();
+        rt.insert("net", "a", "10.0.0.0/16").unwrap();
         // Same name replaces its own route
-        rt.insert("a", "10.0.0.0/24").unwrap();
+        rt.insert("net", "a", "10.0.0.0/24").unwrap();
         assert_eq!(rt.len(), 1);
     }
 
     #[test]
     fn test_remove() {
         let mut rt = RouteTable::new();
-        rt.insert("a", "10.0.0.0/24").unwrap();
-        rt.insert("b", "10.0.1.0/24").unwrap();
-        rt.remove("a");
-        assert_eq!(rt.lookup(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))), None);
+        rt.insert("net", "a", "10.0.0.0/24").unwrap();
+        rt.insert("net", "b", "10.0.1.0/24").unwrap();
+        rt.remove("net", "a");
         assert_eq!(
-            rt.lookup(&IpAddr::V4(Ipv4Addr::new(10, 0, 1, 5))),
+            rt.lookup("net", &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
+            None
+        );
+        assert_eq!(
+            rt.lookup("net", &IpAddr::V4(Ipv4Addr::new(10, 0, 1, 5))),
             Some("b")
         );
     }
@@ -368,8 +398,8 @@ mod tests {
     #[test]
     fn test_list() {
         let mut rt = RouteTable::new();
-        rt.insert("a", "10.0.0.0/24").unwrap();
-        let list = rt.list();
+        rt.insert("net", "a", "10.0.0.0/24").unwrap();
+        let list = rt.list("net");
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].0, "10.0.0.0/24");
         assert_eq!(list[0].1, "a");
@@ -378,71 +408,98 @@ mod tests {
     #[test]
     fn test_ipv6_lookup_and_longest_prefix_match() {
         let mut rt = RouteTable::new();
-        rt.insert("wide", "2001:db8::/32").unwrap();
-        rt.insert("narrow", "2001:db8:0:1::/64").unwrap();
+        rt.insert("net", "wide", "2001:db8::/32").unwrap();
+        rt.insert("net", "narrow", "2001:db8:0:1::/64").unwrap();
 
         let narrow: std::net::IpAddr = "2001:db8:0:1::5".parse().unwrap();
         let wide: std::net::IpAddr = "2001:db8:0:2::5".parse().unwrap();
         let outside: std::net::IpAddr = "2001:db9::1".parse().unwrap();
 
-        assert_eq!(rt.lookup(&narrow), Some("narrow"));
-        assert_eq!(rt.lookup(&wide), Some("wide"));
-        assert_eq!(rt.lookup(&outside), None);
+        assert_eq!(rt.lookup("net", &narrow), Some("narrow"));
+        assert_eq!(rt.lookup("net", &wide), Some("wide"));
+        assert_eq!(rt.lookup("net", &outside), None);
     }
 
     #[test]
     fn test_ipv4_and_ipv6_routes_coexist() {
         let mut rt = RouteTable::new();
-        rt.insert("a", "10.0.0.0/24").unwrap();
-        rt.insert("a", "2001:db8::/64").unwrap();
+        rt.insert("net", "a", "10.0.0.0/24").unwrap();
+        rt.insert("net", "a", "2001:db8::/64").unwrap();
 
         assert_eq!(rt.len(), 2);
         assert_eq!(
-            rt.lookup(&"10.0.0.5".parse::<std::net::IpAddr>().unwrap()),
+            rt.lookup("net", &"10.0.0.5".parse::<std::net::IpAddr>().unwrap()),
             Some("a")
         );
         assert_eq!(
-            rt.lookup(&"2001:db8::5".parse::<std::net::IpAddr>().unwrap()),
+            rt.lookup("net", &"2001:db8::5".parse::<std::net::IpAddr>().unwrap()),
             Some("a")
         );
 
-        rt.remove("a");
+        rt.remove("net", "a");
         assert_eq!(rt.len(), 0);
     }
 
     #[test]
     fn test_ipv6_conflict_only_rejects_same_family_and_prefix() {
         let mut rt = RouteTable::new();
-        rt.insert("a", "2001:db8::/64").unwrap();
+        rt.insert("net", "a", "2001:db8::/64").unwrap();
         // Same family + same prefix length is ambiguous.
-        assert!(rt.insert("b", "2001:db8::/64").is_err());
+        assert!(rt.insert("net", "b", "2001:db8::/64").is_err());
         // Different prefix length is resolved by longest-prefix-match.
-        rt.insert("b", "2001:db8::/32").unwrap();
+        rt.insert("net", "b", "2001:db8::/32").unwrap();
         // Different family with the same prefix length is not a conflict.
-        rt.insert("c", "10.0.0.0/24").unwrap();
-        assert!(rt.insert("d", "2001:db8::/24").is_ok());
+        rt.insert("net", "c", "10.0.0.0/24").unwrap();
+        assert!(rt.insert("net", "d", "2001:db8::/24").is_ok());
     }
 
     #[test]
-    fn test_ipv6_routes_isolated_per_vnet() {
+    fn test_same_subnet_different_vnets_coexist() {
         let mut rt = RouteTable::new();
-        rt.insert("vnet-a", "2001:db8::/64").unwrap();
-        rt.insert("vnet-b", "2001:db9::/64").unwrap();
-        // Same-family, different vnet → isolated.
-        assert_eq!(rt.lookup(&"2001:db8::1".parse().unwrap()), Some("vnet-a"));
-        assert_eq!(rt.lookup(&"2001:db9::1".parse().unwrap()), Some("vnet-b"));
-        // Outside both vnets → no route.
-        assert_eq!(rt.lookup(&"2001:dba::1".parse().unwrap()), None);
-        // IPv4 and IPv6 routes coexist without cross-talk.
-        rt.insert("vnet-a", "10.0.0.0/8").unwrap();
+        rt.insert("vnet-a", "a", "10.0.0.0/24").unwrap();
+        // The same subnet in a different virtual net is allowed (isolation).
+        rt.insert("vnet-b", "b", "10.0.0.0/24").unwrap();
+        assert_eq!(rt.len(), 2);
+        // Lookup is scoped per vnet: same IP resolves per-vnet.
         assert_eq!(
-            rt.lookup(&IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1))),
-            Some("vnet-a")
+            rt.lookup("vnet-a", &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
+            Some("a")
         );
-        assert_eq!(rt.lookup(&"2001:db8::2".parse().unwrap()), Some("vnet-a"));
-        // Removing one vnet does not affect the other.
-        rt.remove("vnet-b");
-        assert_eq!(rt.lookup(&"2001:db9::1".parse().unwrap()), None);
-        assert_eq!(rt.lookup(&"2001:db8::1".parse().unwrap()), Some("vnet-a"));
+        assert_eq!(
+            rt.lookup("vnet-b", &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
+            Some("b")
+        );
+        // A third vnet with no routes resolves nothing.
+        assert_eq!(
+            rt.lookup("vnet-c", &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
+            None
+        );
+    }
+
+    #[test]
+    fn test_conflict_only_within_same_vnet() {
+        let mut rt = RouteTable::new();
+        rt.insert("vnet-a", "a", "10.0.0.0/24").unwrap();
+        // The same subnet in another vnet does not conflict.
+        assert!(rt.insert("vnet-b", "b", "10.0.0.0/24").is_ok());
+        // But within vnet-a a second owner of the same subnet is rejected.
+        assert!(rt.insert("vnet-a", "c", "10.0.0.0/24").is_err());
+    }
+
+    #[test]
+    fn test_remove_is_vnet_scoped() {
+        let mut rt = RouteTable::new();
+        rt.insert("vnet-a", "a", "10.0.0.0/24").unwrap();
+        rt.insert("vnet-b", "b", "10.0.0.0/24").unwrap();
+        rt.remove("vnet-a", "a");
+        assert_eq!(
+            rt.lookup("vnet-b", &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
+            Some("b"),
+            "removing a route in vnet-a must not affect vnet-b"
+        );
+        assert_eq!(
+            rt.lookup("vnet-a", &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
+            None
+        );
     }
 }

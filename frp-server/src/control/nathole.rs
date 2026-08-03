@@ -903,6 +903,20 @@ pub(crate) async fn handle_vnet_packet(
     _writer: &mut (impl AsyncWriteExt + Unpin),
     pkt: msg::VnetPacket,
 ) {
+    // Isolation: the packet's source run_id must be in the target route's
+    // virtual net, otherwise drop it (different virtual nets are isolated).
+    if !ctx
+        .state
+        .vnet_packet_source_allowed(&ctx.run_id, &pkt.proxy_name)
+        .await
+    {
+        debug!(
+            run_id = %ctx.run_id,
+            proxy_name = %pkt.proxy_name,
+            "vnet packet dropped: source run_id is not in the target route's virtual net"
+        );
+        return;
+    }
     let target_run_id =
         if let Some(target_info) = ctx.state.proxy_manager.get(&pkt.proxy_name).await {
             if target_info.run_id == ctx.run_id {
@@ -915,9 +929,12 @@ pub(crate) async fn handle_vnet_packet(
         } else {
             // Not a proxy: resolve virtual_net visitor routes advertised over the
             // control connection (visitor name → advertising client) and deliver
-            // the packet back to that client's control connection.
+            // the packet back to that client's control connection. The
+            // resolution is scoped to virtual nets the source participates in,
+            // so it agrees with the isolation check above — a same-named
+            // visitor in a different vnet is never chosen.
             let routes = ctx.state.vnet_routes.read().await;
-            vnet_visitor_route_target_run_id(&routes, &pkt.proxy_name)
+            vnet_visitor_route_target_run_id(&routes, &ctx.run_id, &pkt.proxy_name)
         };
     if let Some(target_run_id) = target_run_id {
         if let Some(ctl_tx) = ctx.state.run_id_to_ctl_tx.read().await.get(&target_run_id) {
@@ -938,13 +955,24 @@ pub(crate) async fn handle_vnet_route_remove(
     rem: msg::VnetRouteRemove,
 ) {
     let vn = rem.virtual_net.clone().unwrap_or_default();
-    {
+    let removed = {
         let mut routes = ctx.state.vnet_routes.write().await;
         // Only the run_id that advertised the route may remove it. A stale or
         // replayed remove from an older control must not clobber a newer one.
+        let existed = routes.iter().any(|((vn_k, _), (run_id, name))| {
+            run_id == &ctx.run_id && vn_k == &vn && name == &rem.proxy_name
+        });
         routes.retain(|(vn_k, _), (run_id, name)| {
             !(run_id == &ctx.run_id && vn_k == &vn && name == &rem.proxy_name)
         });
+        existed
+    };
+    if !removed {
+        debug!(
+            proxy_name = %rem.proxy_name,
+            "vnet route remove ignored: no matching route for this run_id"
+        );
+        return;
     }
     info!(proxy_name = %rem.proxy_name, "vnet route removed: {}", rem.proxy_name);
     ctx.state
@@ -953,16 +981,27 @@ pub(crate) async fn handle_vnet_route_remove(
 }
 
 /// Resolve the run_id that advertised `proxy_name` as a virtual_net visitor
-/// route. Returns `None` when the name is not a known visitor route.
+/// route reachable from `source_run_id`. Returns `None` when no such route
+/// exists. The candidate route must live in a virtual net the source
+/// participates in (the source owns at least one route in that vnet) — this
+/// mirrors `vnet_packet_source_allowed` so the isolation check and the actual
+/// target resolution can never disagree. Same-named visitors in other virtual
+/// nets are invisible to the source.
 #[cfg(feature = "vnet")]
 fn vnet_visitor_route_target_run_id(
     routes: &std::collections::HashMap<(String, String), (String, String)>,
+    source_run_id: &str,
     proxy_name: &str,
 ) -> Option<String> {
     routes
-        .values()
-        .find(|(_, name)| name == proxy_name)
-        .map(|(run_id, _)| run_id.clone())
+        .iter()
+        .find(|((vn, _), (_, name))| {
+            name == proxy_name
+                && routes
+                    .iter()
+                    .any(|((vn2, _), (rid2, _))| vn2 == vn && rid2 == source_run_id)
+        })
+        .map(|(_, (run_id, _))| run_id.clone())
 }
 
 #[cfg(test)]
@@ -1029,18 +1068,58 @@ mod identity_binding_tests {
             ("run-b".to_string(), "vnet-proxy-b".to_string()),
         );
 
+        // The source owns a route in the default vnet, so same-vnet visitors
+        // resolve; the target route itself counts as the source's membership.
         assert_eq!(
-            super::vnet_visitor_route_target_run_id(&routes, "vnet-visitor"),
+            super::vnet_visitor_route_target_run_id(&routes, "run-a", "vnet-visitor"),
             Some("run-a".to_string())
         );
         // Route advertisements from regular vnet proxies also appear in the
         // table; proxy_manager remains the primary resolver for those names.
         assert_eq!(
-            super::vnet_visitor_route_target_run_id(&routes, "vnet-proxy-b"),
+            super::vnet_visitor_route_target_run_id(&routes, "run-b", "vnet-proxy-b"),
             Some("run-b".to_string())
         );
+        // A source with no route in the visitor's vnet cannot resolve it.
         assert_eq!(
-            super::vnet_visitor_route_target_run_id(&routes, "missing"),
+            super::vnet_visitor_route_target_run_id(&routes, "run-z", "vnet-visitor"),
+            None
+        );
+        assert_eq!(
+            super::vnet_visitor_route_target_run_id(&routes, "run-a", "missing"),
+            None
+        );
+    }
+
+    #[cfg(feature = "vnet")]
+    #[test]
+    fn vnet_visitor_route_same_name_other_vnet_not_resolved() {
+        use std::collections::HashMap;
+
+        let mut routes = HashMap::new();
+        // Same visitor name in two virtual nets, advertised by two run_ids.
+        routes.insert(
+            ("vnet-a".to_string(), "10.0.0.1/32".to_string()),
+            ("run-a".to_string(), "visitor".to_string()),
+        );
+        routes.insert(
+            ("vnet-b".to_string(), "10.0.0.1/32".to_string()),
+            ("run-b".to_string(), "visitor".to_string()),
+        );
+        // run-c participates only in vnet-a.
+        routes.insert(
+            ("vnet-a".to_string(), "10.99.0.0/24".to_string()),
+            ("run-c".to_string(), "peer-c".to_string()),
+        );
+
+        // run-c must resolve the vnet-a visitor (run-a), never the vnet-b one.
+        assert_eq!(
+            super::vnet_visitor_route_target_run_id(&routes, "run-c", "visitor"),
+            Some("run-a".to_string())
+        );
+        // A client with no route in either vnet cannot resolve it at all.
+        assert_eq!(
+            super::vnet_visitor_route_target_run_id(&routes, "run-z", "visitor"),
             None
         );
     }
@@ -1053,7 +1132,7 @@ mod vnet_route_tests {
     use std::time::Instant as StdInstant;
 
     use tokio::sync::mpsc;
-    use tokio::time::Instant;
+    use tokio::time::{Duration, Instant};
 
     use frp_core::msg::{self, FrpMessage};
     use frp_core::protocol::read_msg_v1;
@@ -1167,6 +1246,17 @@ mod vnet_route_tests {
             virtual_net: Some("vnet-a".to_string()),
         };
 
+        // Pre-seed run-b with a vnet-a route so the broadcast filter (which
+        // only forwards to controls that have a route in the same virtual
+        // net) considers run-b a peer; otherwise peer_rx would block forever.
+        {
+            let mut routes = state.vnet_routes.write().await;
+            routes.insert(
+                ("vnet-a".to_string(), "10.0.0.0/24".to_string()),
+                ("run-b".to_string(), "peer-b".to_string()),
+            );
+        }
+
         super::handle_vnet_route_advertise(&ctx, &mut ctl, &mut tokio::io::sink(), adv.clone())
             .await;
 
@@ -1177,8 +1267,8 @@ mod vnet_route_tests {
         );
         drop(routes);
 
-        match peer_rx.recv().await {
-            Some(InternalMsg::VnetRouteAdvertiseForward { msg }) => {
+        match tokio::time::timeout(Duration::from_secs(5), peer_rx.recv()).await {
+            Ok(Some(InternalMsg::VnetRouteAdvertiseForward { msg })) => {
                 assert_advertise_eq(&msg, &adv);
             }
             other => panic!("expected forwarded advertise, got {:?}", other),
@@ -1231,8 +1321,8 @@ mod vnet_route_tests {
         );
         drop(routes);
 
-        match peer_rx.recv().await {
-            Some(InternalMsg::VnetRouteRemoveForward { msg }) => {
+        match tokio::time::timeout(Duration::from_secs(5), peer_rx.recv()).await {
+            Ok(Some(InternalMsg::VnetRouteRemoveForward { msg })) => {
                 assert_remove_eq(&msg, &rem);
             }
             other => panic!("expected forwarded remove, got {:?}", other),

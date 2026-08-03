@@ -4,6 +4,17 @@ All notable changes to frp-rs.
 
 ## Unreleased
 
+- **VirtualNet full reload cleanup + isolation enforcement**: removing or
+  updating a vnet proxy now removes its OS routes and sends `VnetRouteRemove`
+  to the server; the server scopes `VnetRouteAdvertise`/`VnetRouteRemove`
+  broadcasts to controls on the same virtual net, broadcasts route removals on
+  proxy close, and drops `VnetPacket`s whose source run_id is not in the target
+  route's virtual net; clients ignore route advertisements for virtual nets
+  they do not participate in. `frp-vnet::router::RouteTable` is partitioned per
+  virtual net — the same subnet may coexist in different vnets and lookups are
+  vnet-scoped — with isolation/broadcast/close/packet tests in `frp-vnet` and
+  `frp-server`.
+
 - **HTTP vhost 504 Gateway Timeout (Go v0.70.1 compat)**: when the backend
   (work conn) produces no response headers within `vhost_http_timeout`
   (Go `VhostHTTPTimeout`, default 60s), the byte-level bridge now writes

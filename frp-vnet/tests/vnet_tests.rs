@@ -5,41 +5,85 @@ use std::net::{IpAddr, Ipv4Addr};
 fn test_route_table_integration() {
     let mut rt = RouteTable::new();
 
-    // Register two clients
-    rt.insert("client-a", "10.0.0.0/24").unwrap();
-    rt.insert("client-b", "10.0.1.0/24").unwrap();
+    // Register two clients in the default virtual net
+    rt.insert("", "client-a", "10.0.0.0/24").unwrap();
+    rt.insert("", "client-b", "10.0.1.0/24").unwrap();
 
     // Packets for client-a's subnet
     assert_eq!(
-        rt.lookup(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42))),
+        rt.lookup("", &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42))),
         Some("client-a")
     );
     // Packets for client-b's subnet
     assert_eq!(
-        rt.lookup(&IpAddr::V4(Ipv4Addr::new(10, 0, 1, 99))),
+        rt.lookup("", &IpAddr::V4(Ipv4Addr::new(10, 0, 1, 99))),
         Some("client-b")
     );
     // Packets for unknown subnet
-    assert_eq!(rt.lookup(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))), None);
+    assert_eq!(
+        rt.lookup("", &IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
+        None
+    );
 }
 
 #[test]
 fn test_route_conflict_rejected() {
     let mut rt = RouteTable::new();
-    rt.insert("a", "10.0.0.0/16").unwrap();
-    // Same prefix length conflicts
-    assert!(rt.insert("b", "10.0.0.0/16").is_err());
+    rt.insert("corp-net", "a", "10.0.0.0/16").unwrap();
+    // Same prefix length conflicts within the same virtual net
+    assert!(rt.insert("corp-net", "b", "10.0.0.0/16").is_err());
     // Different prefix length is allowed (resolved by longest-prefix-match)
-    assert!(rt.insert("b", "10.0.0.0/24").is_ok());
+    assert!(rt.insert("corp-net", "b", "10.0.0.0/24").is_ok());
 }
 
 #[test]
 fn test_remove_and_reinsert() {
     let mut rt = RouteTable::new();
-    rt.insert("a", "10.0.0.0/24").unwrap();
-    rt.remove("a");
+    rt.insert("net", "a", "10.0.0.0/24").unwrap();
+    rt.remove("net", "a");
     // Now another client can use overlapping range
-    assert!(rt.insert("b", "10.0.0.0/16").is_ok());
+    assert!(rt.insert("net", "b", "10.0.0.0/16").is_ok());
+}
+
+#[test]
+fn test_same_subnet_different_vnets_coexist() {
+    let mut rt = RouteTable::new();
+    // Two virtual nets may own the same subnet — full isolation.
+    rt.insert("corp-net", "a", "10.0.0.0/24").unwrap();
+    rt.insert("lab-net", "b", "10.0.0.0/24").unwrap();
+    assert_eq!(rt.len(), 2);
+    assert_eq!(
+        rt.lookup("corp-net", &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
+        Some("a")
+    );
+    assert_eq!(
+        rt.lookup("lab-net", &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
+        Some("b")
+    );
+    // A vnet with no routes resolves nothing.
+    assert_eq!(
+        rt.lookup("empty-net", &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
+        None
+    );
+    // Removing one vnet's route leaves the other intact.
+    rt.remove("corp-net", "a");
+    assert_eq!(
+        rt.lookup("lab-net", &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
+        Some("b")
+    );
+}
+
+#[test]
+fn test_vnet_isolation_lookup_never_crosses_vnets() {
+    let mut rt = RouteTable::new();
+    rt.insert("vnet-a", "pa", "172.16.0.0/16").unwrap();
+    rt.insert("vnet-b", "pb", "172.16.0.0/16").unwrap();
+    // Same IP resolves to a different proxy depending on the vnet.
+    let ip = IpAddr::V4(Ipv4Addr::new(172, 16, 5, 5));
+    assert_eq!(rt.lookup("vnet-a", &ip), Some("pa"));
+    assert_eq!(rt.lookup("vnet-b", &ip), Some("pb"));
+    // No cross-talk: lookups outside any registered vnet return None.
+    assert_eq!(rt.lookup("vnet-c", &ip), None);
 }
 
 #[test]

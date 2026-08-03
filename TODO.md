@@ -146,5 +146,14 @@ Remaining known gaps (documented, architectural):
   provider — Go frp v0.70.1 sends `"ip:port"` as the QUIC SNI (Go 1.25
   `hostnameInSNI` no longer strips the port), which rustls rejects; rewriting
   the ClientHello would break the TLS 1.3 transcript. Such a Go visitor must
-  set `protocol = "kcp"`. Plus VirtualNet isolation/routing reload (see plan
-  `docs/superpowers/plans/2026-08-02-go-parity-all-fixes.md`).
+  set `protocol = "kcp"`. (See plan
+  `docs/superpowers/plans/2026-08-02-go-parity-all-fixes.md`.)
+- VirtualNet isolation/routing reload — **implemented**: `RouteTable` is now
+  partitioned per virtual net (same subnet may coexist in different vnets,
+  lookups are vnet-scoped); removing/updating a vnet proxy cleans its OS routes
+  and sends `VnetRouteRemove`; the server scopes `VnetRouteAdvertise`/`VnetRouteRemove`
+  broadcasts to same-vnet controls, broadcasts removals on proxy close, and
+  drops `VnetPacket`s whose source run_id is not in the target route's virtual
+  net; clients ignore advertisements for virtual nets they do not participate
+  in. (See plan
+  `docs/superpowers/plans/2026-08-02-go-parity-all-fixes.md`.)
