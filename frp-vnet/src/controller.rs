@@ -6,10 +6,10 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, RwLock};
 
 use data_encoding::BASE64;
 
@@ -73,7 +73,7 @@ impl VnetController {
     pub async fn run(
         &self,
         mut tun: Box<dyn TunDevice>,
-        ctl_writer: Arc<Mutex<frp_core::transport::WriteHalf>>,
+        ctl_writer: Arc<tokio::sync::Mutex<frp_core::transport::WriteHalf>>,
         mut tun_packet_rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<()> {
         let mtu = tun.mtu() as usize;
@@ -103,7 +103,7 @@ impl VnetController {
                         // destination matches a source IP learned from a
                         // virtual_net plugin work connection is returned on
                         // that connection instead of the control channel.
-                        if let Some(server_tx) = self.client.server_conn_sender(&dst_ip).await {
+                        if let Some(server_tx) = self.client.server_conn_sender(&dst_ip) {
                             match server_tx.try_send(packet.to_vec()) {
                                 Ok(()) => continue,
                                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -115,7 +115,7 @@ impl VnetController {
                                     continue;
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    self.client.unregister_server_conn(&dst_ip).await;
+                                    self.client.unregister_server_conn(&dst_ip);
                                 }
                             }
                         }
@@ -221,7 +221,7 @@ impl ClientVnetController {
         self.routes.write().await.insert("", name, cidr)?;
         self.visitor_txs
             .lock()
-            .await
+            .unwrap()
             .insert(name.to_string(), packet_tx);
         tracing::info!(visitor_name = %name, cidr = %cidr, "virtual_net visitor route registered");
         Ok(())
@@ -230,34 +230,35 @@ impl ClientVnetController {
     /// Remove a `virtual_net` visitor route and its delivery channel.
     pub async fn unregister_visitor_route(&self, name: &str) {
         self.routes.write().await.remove("", name);
-        self.visitor_txs.lock().await.remove(name);
+        self.visitor_txs.lock().unwrap().remove(name);
         tracing::info!(visitor_name = %name, "virtual_net visitor route removed");
     }
 
     /// Deliver an inbound packet to a visitor tunnel.
     ///
-    /// Returns `true` when the visitor route exists (including when the
-    /// bounded channel is full and the packet is dropped), and `false` when
-    /// no visitor is registered for `name` or its channel is closed.
-    pub async fn deliver_visitor_packet(&self, name: &str, packet: Vec<u8>) -> bool {
-        let mut txs = self.visitor_txs.lock().await;
+    /// Returns `Ok(())` when the visitor route exists (including when the
+    /// bounded channel is full and the packet is dropped), and `Err(packet)`
+    /// when no visitor is registered for `name` or its channel is closed — the
+    /// caller then handles the packet itself (e.g. via a TUN delivery channel).
+    pub fn deliver_visitor_packet(&self, name: &str, packet: Vec<u8>) -> Result<(), Vec<u8>> {
+        let mut txs = self.visitor_txs.lock().unwrap();
         let Some(tx) = txs.get(name) else {
-            return false;
+            return Err(packet);
         };
         match tx.try_send(packet) {
-            Ok(()) => true,
+            Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(packet)) => {
                 tracing::warn!(
                     visitor_name = %name,
                     "virtual_net visitor packet queue full; dropping packet"
                 );
                 drop(packet);
-                true
+                Ok(())
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(mpsc::error::TrySendError::Closed(packet)) => {
                 // The visitor task is gone; remove the stale registration.
                 txs.remove(name);
-                false
+                Err(packet)
             }
         }
     }
@@ -265,25 +266,25 @@ impl ClientVnetController {
     /// Register a provider-side work connection for packets whose destination
     /// IP equals `src_ip` (the remote host's source IP learned from the
     /// tunnel). Mirrors Go frp `serverRouter.registerSrcIP`.
-    pub async fn register_server_conn(&self, src_ip: IpAddr, packet_tx: mpsc::Sender<Vec<u8>>) {
-        self.server_conns.lock().await.insert(src_ip, packet_tx);
+    pub fn register_server_conn(&self, src_ip: IpAddr, packet_tx: mpsc::Sender<Vec<u8>>) {
+        self.server_conns.lock().unwrap().insert(src_ip, packet_tx);
         tracing::debug!(%src_ip, "vnet server conn registered");
     }
 
     /// Remove a provider-side work connection mapping.
-    pub async fn unregister_server_conn(&self, src_ip: &IpAddr) {
-        self.server_conns.lock().await.remove(src_ip);
+    pub fn unregister_server_conn(&self, src_ip: &IpAddr) {
+        self.server_conns.lock().unwrap().remove(src_ip);
         tracing::debug!(%src_ip, "vnet server conn unregistered");
     }
 
     /// Remove a provider-side work connection mapping only when it still
     /// refers to `packet_tx`, so a newer connection is never clobbered.
-    pub async fn unregister_server_conn_if_matches(
+    pub fn unregister_server_conn_if_matches(
         &self,
         src_ip: &IpAddr,
         packet_tx: &mpsc::Sender<Vec<u8>>,
     ) {
-        let mut conns = self.server_conns.lock().await;
+        let mut conns = self.server_conns.lock().unwrap();
         if conns
             .get(src_ip)
             .is_some_and(|tx| tx.same_channel(packet_tx))
@@ -293,38 +294,32 @@ impl ClientVnetController {
     }
 
     /// Return the work-conn channel registered for `dst_ip`, if any.
-    pub async fn server_conn_sender(&self, dst_ip: &IpAddr) -> Option<mpsc::Sender<Vec<u8>>> {
-        self.server_conns.lock().await.get(dst_ip).cloned()
+    pub fn server_conn_sender(&self, dst_ip: &IpAddr) -> Option<mpsc::Sender<Vec<u8>>> {
+        self.server_conns.lock().unwrap().get(dst_ip).cloned()
     }
 
     /// IPv4-only convenience wrapper for [`Self::register_server_conn`].
-    pub async fn register_server_conn_v4(
-        &self,
-        src_ip: Ipv4Addr,
-        packet_tx: mpsc::Sender<Vec<u8>>,
-    ) {
-        self.register_server_conn(IpAddr::V4(src_ip), packet_tx)
-            .await;
+    pub fn register_server_conn_v4(&self, src_ip: Ipv4Addr, packet_tx: mpsc::Sender<Vec<u8>>) {
+        self.register_server_conn(IpAddr::V4(src_ip), packet_tx);
     }
 
     /// IPv4-only convenience wrapper for [`Self::unregister_server_conn`].
-    pub async fn unregister_server_conn_v4(&self, src_ip: &Ipv4Addr) {
-        self.unregister_server_conn(&IpAddr::V4(*src_ip)).await;
+    pub fn unregister_server_conn_v4(&self, src_ip: &Ipv4Addr) {
+        self.unregister_server_conn(&IpAddr::V4(*src_ip));
     }
 
     /// IPv4-only convenience wrapper for [`Self::unregister_server_conn_if_matches`].
-    pub async fn unregister_server_conn_if_matches_v4(
+    pub fn unregister_server_conn_if_matches_v4(
         &self,
         src_ip: &Ipv4Addr,
         packet_tx: &mpsc::Sender<Vec<u8>>,
     ) {
-        self.unregister_server_conn_if_matches(&IpAddr::V4(*src_ip), packet_tx)
-            .await;
+        self.unregister_server_conn_if_matches(&IpAddr::V4(*src_ip), packet_tx);
     }
 
     /// IPv4-only convenience wrapper for [`Self::server_conn_sender`].
-    pub async fn server_conn_sender_v4(&self, dst_ip: &Ipv4Addr) -> Option<mpsc::Sender<Vec<u8>>> {
-        self.server_conn_sender(&IpAddr::V4(*dst_ip)).await
+    pub fn server_conn_sender_v4(&self, dst_ip: &Ipv4Addr) -> Option<mpsc::Sender<Vec<u8>>> {
+        self.server_conn_sender(&IpAddr::V4(*dst_ip))
     }
 }
 
@@ -429,26 +424,25 @@ mod tests {
             .unwrap();
 
         let packet = vec![0x45, 0x00, 0x00, 0x14, 0x01, 0x02];
-        assert!(
-            ctrl.deliver_visitor_packet("vnet-visitor", packet.clone())
-                .await
-        );
+        assert!(ctrl
+            .deliver_visitor_packet("vnet-visitor", packet.clone())
+            .is_ok());
         assert_eq!(rx.recv().await, Some(packet));
     }
 
     #[tokio::test]
     async fn deliver_to_unregistered_or_closed_visitor_fails() {
         let ctrl = ClientVnetController::new();
-        assert!(!ctrl.deliver_visitor_packet("missing", vec![0x45]).await);
+        assert!(ctrl.deliver_visitor_packet("missing", vec![0x45]).is_err());
 
         let (tx, rx) = mpsc::channel(16);
         ctrl.register_visitor_route("gone", "10.0.0.1/32", tx)
             .await
             .unwrap();
         drop(rx);
-        assert!(!ctrl.deliver_visitor_packet("gone", vec![0x45]).await);
+        assert!(ctrl.deliver_visitor_packet("gone", vec![0x45]).is_err());
         // The stale registration is removed after the closed channel is detected.
-        assert!(!ctrl.deliver_visitor_packet("gone", vec![0x45]).await);
+        assert!(ctrl.deliver_visitor_packet("gone", vec![0x45]).is_err());
     }
 
     #[tokio::test]
@@ -457,18 +451,17 @@ mod tests {
         let src = IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1));
         let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
         let tx_clone = tx.clone();
-        ctrl.register_server_conn(src, tx).await;
-        assert!(ctrl.server_conn_sender(&src).await.is_some());
+        ctrl.register_server_conn(src, tx);
+        assert!(ctrl.server_conn_sender(&src).is_some());
 
         drop(rx);
         let (new_tx, _new_rx) = mpsc::channel::<Vec<u8>>(16);
         // A different connection must not unregister the current mapping.
-        ctrl.unregister_server_conn_if_matches(&src, &new_tx).await;
-        assert!(ctrl.server_conn_sender(&src).await.is_some());
+        ctrl.unregister_server_conn_if_matches(&src, &new_tx);
+        assert!(ctrl.server_conn_sender(&src).is_some());
         // The original connection's channel is gone; matching cleanup removes it.
-        ctrl.unregister_server_conn_if_matches(&src, &tx_clone)
-            .await;
-        assert!(ctrl.server_conn_sender(&src).await.is_none());
+        ctrl.unregister_server_conn_if_matches(&src, &tx_clone);
+        assert!(ctrl.server_conn_sender(&src).is_none());
     }
 
     #[tokio::test]
@@ -477,16 +470,15 @@ mod tests {
         let src: IpAddr = "2001:db8::1".parse().unwrap();
         let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
         let tx_clone = tx.clone();
-        ctrl.register_server_conn(src, tx).await;
-        assert!(ctrl.server_conn_sender(&src).await.is_some());
+        ctrl.register_server_conn(src, tx);
+        assert!(ctrl.server_conn_sender(&src).is_some());
 
         drop(rx);
         let (new_tx, _new_rx) = mpsc::channel::<Vec<u8>>(16);
-        ctrl.unregister_server_conn_if_matches(&src, &new_tx).await;
-        assert!(ctrl.server_conn_sender(&src).await.is_some());
-        ctrl.unregister_server_conn_if_matches(&src, &tx_clone)
-            .await;
-        assert!(ctrl.server_conn_sender(&src).await.is_none());
+        ctrl.unregister_server_conn_if_matches(&src, &new_tx);
+        assert!(ctrl.server_conn_sender(&src).is_some());
+        ctrl.unregister_server_conn_if_matches(&src, &tx_clone);
+        assert!(ctrl.server_conn_sender(&src).is_none());
     }
 
     fn ipv6_packet(src: Ipv6Addr, dst: Ipv6Addr) -> Vec<u8> {
@@ -502,16 +494,16 @@ mod tests {
         let client = Arc::new(ClientVnetController::new());
         let (work_tx, mut work_rx) = mpsc::channel::<Vec<u8>>(16);
         let remote_ip = IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1));
-        client.register_server_conn(remote_ip, work_tx).await;
+        client.register_server_conn(remote_ip, work_tx);
 
         let (tun_stream, mut tun_peer) = tokio::io::duplex(4096);
         let tun = Box::new(FakeTun { inner: tun_stream });
         let ctl_stream: Box<dyn frp_core::transport::AsyncReadWrite> =
             Box::new(tokio::io::duplex(4096).0);
         let (_, ctl_w) = tokio::io::split(ctl_stream);
-        let writer = Arc::new(Mutex::new(frp_core::transport::WriteHalf::SshChannel(
-            ctl_w,
-        )));
+        let writer = Arc::new(tokio::sync::Mutex::new(
+            frp_core::transport::WriteHalf::SshChannel(ctl_w),
+        ));
         let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
         let ctrl = VnetController::new(
             "plugin-proxy".to_string(),
@@ -547,16 +539,16 @@ mod tests {
         let client = Arc::new(ClientVnetController::new());
         let (work_tx, mut work_rx) = mpsc::channel::<Vec<u8>>(16);
         let remote_ip: IpAddr = "2001:db8::1".parse().unwrap();
-        client.register_server_conn(remote_ip, work_tx).await;
+        client.register_server_conn(remote_ip, work_tx);
 
         let (tun_stream, mut tun_peer) = tokio::io::duplex(4096);
         let tun = Box::new(FakeTun { inner: tun_stream });
         let ctl_stream: Box<dyn frp_core::transport::AsyncReadWrite> =
             Box::new(tokio::io::duplex(4096).0);
         let (_, ctl_w) = tokio::io::split(ctl_stream);
-        let writer = Arc::new(Mutex::new(frp_core::transport::WriteHalf::SshChannel(
-            ctl_w,
-        )));
+        let writer = Arc::new(tokio::sync::Mutex::new(
+            frp_core::transport::WriteHalf::SshChannel(ctl_w),
+        ));
         let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
         let ctrl = VnetController::new(
             "plugin-proxy".to_string(),
@@ -598,9 +590,9 @@ mod tests {
             Box::new(ctl_writer_raw);
         let (mut ctl_peer, _) = tokio::io::split(ctl_peer_stream);
         let (_, ctl_w) = tokio::io::split(ctl_writer_stream);
-        let writer = Arc::new(Mutex::new(frp_core::transport::WriteHalf::SshChannel(
-            ctl_w,
-        )));
+        let writer = Arc::new(tokio::sync::Mutex::new(
+            frp_core::transport::WriteHalf::SshChannel(ctl_w),
+        ));
         let (tun_packet_tx, tun_packet_rx) = mpsc::channel::<Vec<u8>>(16);
         let ctrl = VnetController::new(
             "plugin-proxy".to_string(),

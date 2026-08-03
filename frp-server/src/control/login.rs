@@ -796,6 +796,7 @@ pub(crate) async fn authenticate(
             listener_handles,
             udp_sockets,
             udp_local_to_proxy,
+            udp_proxy_flags: std::collections::HashMap::new(),
             last_ping,
         },
         internal_tx,

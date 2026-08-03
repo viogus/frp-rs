@@ -12,50 +12,55 @@ use crate::service::{AppState, InternalMsg};
 mod vhost_h2c;
 
 /// A route mapping: domain or location -> proxy entry.
+///
+/// String fields are `Arc<str>` (refcounted) so that per-request route
+/// matching can hand out clones without allocating: `VhostRouteMatch` bumps
+/// the refcount instead of copying every `String`.
 #[derive(Debug, Clone)]
 pub struct VhostRoute {
-    pub proxy_name: String,
-    pub run_id: String,
+    pub proxy_name: Arc<str>,
+    pub run_id: Arc<str>,
     /// Location prefixes for this proxy (empty = host-only routing).
     pub locations: Vec<String>,
     /// Rewrite Host header to this value before forwarding (Go frp compat).
-    pub host_header_rewrite: String,
+    pub host_header_rewrite: Arc<str>,
     /// HTTP Basic Auth credentials (empty = no auth).
-    pub http_user: String,
-    pub http_pwd: String,
+    pub http_user: Arc<str>,
+    pub http_pwd: Arc<str>,
     /// Per-user routing: extract username from Authorization header and route
     /// to proxy `{route_by_http_user}.{username}` (Go frp compat).
-    pub route_by_http_user: String,
+    pub route_by_http_user: Arc<str>,
     /// Request headers to inject before forwarding (Go frp compat:
     /// requestHeaders). Set semantics — override same-name headers.
-    pub headers: Vec<(String, String)>,
+    pub headers: Arc<Vec<(String, String)>>,
 }
 
 /// Borrowed match result — avoids cloning VhostRoute (especially the locations Vec)
-/// on every HTTP request. Fields are owned Strings because the caller holds them
-/// across await points after the RwLock read guard is dropped.
+/// on every HTTP request. Fields are owned `Arc<str>` because the caller holds them
+/// across await points after the RwLock read guard is dropped; cloning the match is
+/// an O(1) refcount bump per field rather than a String allocation.
 #[derive(Debug, Clone)]
 pub struct VhostRouteMatch {
-    pub proxy_name: String,
-    pub run_id: String,
-    pub host_header_rewrite: String,
-    pub http_user: String,
-    pub http_pwd: String,
-    pub route_by_http_user: String,
+    pub proxy_name: Arc<str>,
+    pub run_id: Arc<str>,
+    pub host_header_rewrite: Arc<str>,
+    pub http_user: Arc<str>,
+    pub http_pwd: Arc<str>,
+    pub route_by_http_user: Arc<str>,
     /// Request headers to inject before forwarding (Go frp requestHeaders).
-    pub headers: Vec<(String, String)>,
+    pub headers: Arc<Vec<(String, String)>>,
 }
 
 impl VhostRouteMatch {
     fn from_route(route: &VhostRoute) -> Self {
         Self {
-            proxy_name: route.proxy_name.clone(),
-            run_id: route.run_id.clone(),
-            host_header_rewrite: route.host_header_rewrite.clone(),
-            http_user: route.http_user.clone(),
-            http_pwd: route.http_pwd.clone(),
-            route_by_http_user: route.route_by_http_user.clone(),
-            headers: route.headers.clone(),
+            proxy_name: Arc::clone(&route.proxy_name),
+            run_id: Arc::clone(&route.run_id),
+            host_header_rewrite: Arc::clone(&route.host_header_rewrite),
+            http_user: Arc::clone(&route.http_user),
+            http_pwd: Arc::clone(&route.http_pwd),
+            route_by_http_user: Arc::clone(&route.route_by_http_user),
+            headers: Arc::clone(&route.headers),
         }
     }
 }
@@ -186,14 +191,14 @@ impl VhostManager {
         headers: &[(String, String)],
     ) -> Result<(), RouterConfigConflict> {
         let route = VhostRoute {
-            proxy_name: proxy_name.to_string(),
-            run_id: run_id.to_string(),
+            proxy_name: proxy_name.into(),
+            run_id: run_id.into(),
             locations: locations.to_vec(),
-            host_header_rewrite: host_header_rewrite.to_string(),
-            http_user: http_user.to_string(),
-            http_pwd: http_pwd.to_string(),
-            route_by_http_user: route_by_http_user.to_string(),
-            headers: headers.to_vec(),
+            host_header_rewrite: host_header_rewrite.into(),
+            http_user: http_user.into(),
+            http_pwd: http_pwd.into(),
+            route_by_http_user: route_by_http_user.into(),
+            headers: Arc::new(headers.to_vec()),
         };
 
         let mut tables = self.inner.write().await;
@@ -211,7 +216,7 @@ impl VhostManager {
                             return Err(RouterConfigConflict {
                                 domain: domain.clone(),
                                 route_by_http_user: route_by_http_user.to_string(),
-                                existing_proxy: vr.proxy_name.clone(),
+                                existing_proxy: vr.proxy_name.to_string(),
                                 incoming_proxy: proxy_name.to_string(),
                             });
                         }
@@ -284,7 +289,7 @@ impl VhostManager {
                     if let Some(vrs) = user_map.get_mut(rubu) {
                         // Remove ONLY the VhostRoute with this proxy_name, keeping
                         // other routes for the same (domain, rubu) pair.
-                        vrs.retain(|r| r.proxy_name != proxy_name);
+                        vrs.retain(|r| r.proxy_name.as_ref() != proxy_name);
                         if vrs.is_empty() {
                             user_map.remove(rubu);
                         }
@@ -299,7 +304,7 @@ impl VhostManager {
             for (loc, rubu) in &entries {
                 if let Some(user_map) = tables.location_routes.get_mut(loc) {
                     if let Some(vrs) = user_map.get_mut(rubu) {
-                        vrs.retain(|r| r.proxy_name != proxy_name);
+                        vrs.retain(|r| r.proxy_name.as_ref() != proxy_name);
                         if vrs.is_empty() {
                             user_map.remove(rubu);
                         }
@@ -549,7 +554,12 @@ async fn handle_http1_request<S>(
         pre_read.extend_from_slice(&buf[..m]);
     }
 
-    let request_text = String::from_utf8_lossy(&pre_read).into_owned();
+    // Parse the head text once, borrowing from the pre-read bytes (no full
+    // copy — `into_owned()` would duplicate up to 4096 bytes per request).
+    // `host`/`path` must still be owned Strings: `pre_read` is moved by
+    // value into `resolve_vhost_request` below, so we cannot keep references
+    // into it across that call.
+    let request_text = String::from_utf8_lossy(&pre_read);
     let host = match extract_host_header(&request_text) {
         Some(h) => h.to_string(),
         None => {
@@ -557,7 +567,7 @@ async fn handle_http1_request<S>(
             return;
         }
     };
-    let path = extract_path(&request_text).unwrap_or("/");
+    let path = extract_path(&request_text).unwrap_or("/").to_string();
 
     // Parse Basic Auth once — reused for route matching, auth check,
     // and per-user routing (Go frp compat: getByRoute(host, path, username)).
@@ -572,7 +582,7 @@ async fn handle_http1_request<S>(
     match resolve_vhost_request(
         &state,
         &host,
-        path,
+        &path,
         http_auth.as_ref(),
         pre_read,
         peer,
@@ -701,19 +711,19 @@ pub(crate) async fn resolve_vhost_request(
                     "{} VHost: user-based proxy '{}' not found, falling back to '{}'",
                     scheme, user_proxy, route.proxy_name
                 );
-                (route.proxy_name.clone(), route.run_id.clone())
+                (route.proxy_name.to_string(), route.run_id.to_string())
             }
         } else {
             // No Authorization header — fall through to route's proxy.
-            (route.proxy_name.clone(), route.run_id.clone())
+            (route.proxy_name.to_string(), route.run_id.to_string())
         }
     } else {
-        (route.proxy_name.clone(), route.run_id.clone())
+        (route.proxy_name.to_string(), route.run_id.to_string())
     };
 
     // Apply host_header_rewrite if configured
     let request_head = if !route.host_header_rewrite.is_empty() {
-        rewrite_host_header(&request_head, &route.host_header_rewrite)
+        rewrite_host_header(request_head, &route.host_header_rewrite)
     } else {
         request_head
     };
@@ -721,7 +731,7 @@ pub(crate) async fn resolve_vhost_request(
     // Go frp compat (pkg/util/vhost/http.go reverse proxy): inject
     // X-Forwarded-For (append to existing value) and requestHeaders
     // (Set semantics) into the forwarded request head.
-    let request_head = inject_vhost_request_headers(&request_head, peer, &route.headers);
+    let request_head = inject_vhost_request_headers(request_head, peer, route.headers.as_slice());
 
     Ok(VhostForward {
         proxy_name: target_proxy_name,
@@ -822,13 +832,13 @@ pub async fn run_vhost_https_listener(
                     {
                         let internal_tx = {
                             let map = state.run_id_to_ctl_tx.read().await;
-                            map.get(&route.run_id).cloned()
+                            map.get(route.run_id.as_ref()).cloned()
                         };
                         if let Some(ctl_tx) = internal_tx {
                             let _ = ctl_tx
                                 .tx
                                 .try_send(InternalMsg::ProxyUserConn {
-                                    proxy_name: route.proxy_name.clone(),
+                                    proxy_name: route.proxy_name.to_string(),
                                     // Passthrough: raw encrypted bytes, no TLS wrap.
                                     user_conn: frp_core::transport::IoStream::Tcp(stream),
                                     pre_read,
@@ -911,8 +921,9 @@ fn extract_path(request: &str) -> Option<&str> {
 /// Rewrite the Host header in an HTTP request's raw bytes.
 /// Finds the first `Host:` or `host:` line and replaces it with the given value.
 /// Byte-oriented to avoid mangling non-UTF-8 request data.
-/// Returns a new Vec<u8> with the rewritten header.
-fn rewrite_host_header(data: &[u8], new_host: &str) -> Vec<u8> {
+/// Returns a new Vec<u8> with the rewritten header. When no Host header is
+/// present, the input is returned unchanged (ownership transferred, no copy).
+fn rewrite_host_header(data: Vec<u8>, new_host: &str) -> Vec<u8> {
     // Search for \r\nHost: anywhere in the request data, plus first-line Host:
     let host_pos = {
         // First check if Host: is the very first header (no leading \r\n)
@@ -930,7 +941,7 @@ fn rewrite_host_header(data: &[u8], new_host: &str) -> Vec<u8> {
     };
 
     let Some(host_start) = host_pos else {
-        return data.to_vec();
+        return data;
     };
 
     // Find end of the Host header line
@@ -956,13 +967,15 @@ fn rewrite_host_header(data: &[u8], new_host: &str) -> Vec<u8> {
 /// Inject `X-Forwarded-For` (append semantics, Go httputil.ReverseProxy) and
 /// configured requestHeaders (Set semantics, Go `req.Header.Set`) into the
 /// request head bytes. Only the header block up to `\r\n\r\n` is touched.
+/// When no request headers are configured, the input is returned unchanged
+/// (ownership transferred, no copy).
 fn inject_vhost_request_headers(
-    data: &[u8],
+    data: Vec<u8>,
     peer: std::net::SocketAddr,
     request_headers: &[(String, String)],
 ) -> Vec<u8> {
     if request_headers.is_empty() {
-        return data.to_vec();
+        return data;
     }
     let header_end = data
         .windows(4)

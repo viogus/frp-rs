@@ -63,6 +63,10 @@ pub(crate) struct ControlState {
     pub listener_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
     pub udp_sockets: std::collections::HashMap<String, std::sync::Arc<tokio::net::UdpSocket>>,
     pub udp_local_to_proxy: std::collections::HashMap<String, String>,
+    /// Cached (use_encryption, use_compression) per UDP proxy, so the hot
+    /// per-packet path avoids an async `proxy_manager.get()`. Removed on
+    /// proxy close / control cleanup.
+    pub udp_proxy_flags: std::collections::HashMap<String, (bool, bool)>,
     pub last_ping: Instant,
 }
 

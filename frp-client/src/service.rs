@@ -39,7 +39,7 @@ use frp_core::unsafe_features::UnsafeFeatures;
 #[cfg(feature = "vnet")]
 type VnetTunMap = Arc<Mutex<HashMap<String, Option<Box<dyn frp_vnet::tun::TunDevice>>>>>;
 #[cfg(feature = "vnet")]
-type VnetTunTxMap = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
+type VnetTunTxMap = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
 #[cfg(feature = "vnet")]
 type VnetTunCancelMap = Arc<Mutex<HashMap<String, watch::Sender<bool>>>>;
 use frp_core::encryption;
@@ -128,7 +128,7 @@ async fn dispatch_plugin_start(
 /// The main frpc service.
 pub struct Service {
     cfg: Arc<RwLock<ClientConfig>>,
-    proxies: Arc<RwLock<Vec<frp_core::config::ProxyConfig>>>,
+    proxies: Arc<RwLock<Arc<Vec<frp_core::config::ProxyConfig>>>>,
     /// Optional file-backed store shared with the admin API.
     store_source: Option<Arc<StoreSource>>,
     auth_cfg: Arc<AuthConfig>,
@@ -185,7 +185,7 @@ pub struct Service {
     /// Per-proxy TX channels for forwarding received VnetPackets to TUN devices.
     /// Keyed by proxy name.
     #[cfg(feature = "vnet")]
-    vnet_tun_tx: Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>>>,
+    vnet_tun_tx: Arc<std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>>>,
     /// Per-proxy cancellation senders for running vnet controllers.
     #[cfg(feature = "vnet")]
     vnet_tun_cancels: VnetTunCancelMap,
@@ -489,7 +489,7 @@ impl Service {
         #[cfg(feature = "vnet")]
         let vnet_controller = Arc::new(frp_vnet::controller::ClientVnetController::new());
         #[cfg(feature = "vnet")]
-        let vnet_tun_tx = Arc::new(Mutex::new(HashMap::new()));
+        let vnet_tun_tx = Arc::new(std::sync::Mutex::new(HashMap::new()));
         #[cfg(feature = "vnet")]
         let vnet_tun_cancels = Arc::new(Mutex::new(HashMap::new()));
         #[cfg(feature = "vnet")]
@@ -507,7 +507,7 @@ impl Service {
                 .collect(),
         ));
 
-        let proxies = Arc::new(RwLock::new(cfg.proxies.clone()));
+        let proxies = Arc::new(RwLock::new(Arc::new(cfg.proxies.clone())));
 
         Ok(Self {
             cfg: Arc::new(RwLock::new(cfg)),
@@ -680,7 +680,7 @@ impl Service {
         // Stored on self so try_reload() can cancel health checks for removed proxies.
         let health_cancels = self.health_cancels.clone();
 
-        let all_startup_proxies = self.proxies.read().await.clone();
+        let all_startup_proxies = Arc::clone(&*self.proxies.read().await);
         let startup_proxies = filter_active_proxies(&cfg_snapshot, &all_startup_proxies);
         self.spawn_health_checks(&startup_proxies, &self.health_tx, &health_cancels)
             .await;
@@ -733,7 +733,7 @@ impl Service {
         let mut prev_yamux: Option<std::sync::Arc<frp_core::mux::YamuxSession>> = None;
         loop {
             let cfg_local = self.cfg.read().await.clone();
-            let all_proxies = self.proxies.read().await.clone();
+            let all_proxies = Arc::clone(&*self.proxies.read().await);
             let proxies = filter_active_proxies(&cfg_local, &all_proxies);
 
             // Go frp compat (d486018): drop previous yamux session before
@@ -1428,19 +1428,23 @@ impl Service {
                                     Ok(packet) => {
                                         // Virtual_net visitors first: deliver into
                                         // the visitor's STCP/XTCP tunnel. TUN-backed
-                                        // vnet proxies fall back to their TUN channel.
-                                        let delivered = self
+                                        // vnet proxies fall back to their TUN channel
+                                        // only when no visitor consumed the packet
+                                        // (Err returns the packet untouched).
+                                        match self
                                             .vnet_controller
-                                            .deliver_visitor_packet(&vpkt.proxy_name, packet.clone())
-                                            .await;
-                                        if !delivered {
-                                            let txs = self.vnet_tun_tx.lock().await;
-                                            if let Some(tx) = txs.get(&vpkt.proxy_name) {
-                                                if tx.try_send(packet).is_err() {
-                                                    warn!(proxy_name = %vpkt.proxy_name, "vnet TUN channel closed");
+                                            .deliver_visitor_packet(&vpkt.proxy_name, packet)
+                                        {
+                                            Ok(()) => {}
+                                            Err(packet) => {
+                                                let txs = self.vnet_tun_tx.lock().unwrap();
+                                                if let Some(tx) = txs.get(&vpkt.proxy_name) {
+                                                    if tx.try_send(packet).is_err() {
+                                                        warn!(proxy_name = %vpkt.proxy_name, "vnet TUN channel closed");
+                                                    }
+                                                } else {
+                                                    debug!(proxy_name = %vpkt.proxy_name, "vnet packet dropped: no visitor or TUN target");
                                                 }
-                                            } else {
-                                                debug!(proxy_name = %vpkt.proxy_name, "vnet packet dropped: no visitor or TUN target");
                                             }
                                         }
                                     }
@@ -2603,7 +2607,7 @@ impl Service {
         #[cfg(feature = "vnet")]
         {
             let old_cfg = self.cfg.read().await.clone();
-            let old_proxies = self.proxies.read().await.clone();
+            let old_proxies = Arc::clone(&*self.proxies.read().await);
             for p in &delta.new_config.proxies {
                 let old = old_proxies.iter().find(|old| old.name == p.name);
                 let vnet_field_changed =
@@ -2628,7 +2632,7 @@ impl Service {
         {
             let merged = delta.new_config;
             *self.cfg.write().await = merged;
-            *self.proxies.write().await = self.cfg.read().await.proxies.clone();
+            *self.proxies.write().await = Arc::new(self.cfg.read().await.proxies.clone());
             return Ok(delta.summary);
         }
 
@@ -2921,7 +2925,7 @@ impl Service {
         // Step 7: Refresh the in-memory config/proxy snapshots so the next
         // session, reconnect, and admin status endpoint use the merged config.
         *self.cfg.write().await = delta.new_config;
-        *self.proxies.write().await = self.cfg.read().await.proxies.clone();
+        *self.proxies.write().await = Arc::new(self.cfg.read().await.proxies.clone());
 
         if visitor_changed {
             // Signal the session loop to restart so visitors are rebuilt.
@@ -3069,7 +3073,7 @@ async fn spawn_vnet_tun_controller(
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(256);
     vnet_tun_tx
         .lock()
-        .await
+        .unwrap()
         .insert(proxy_name.to_string(), tun_tx);
     let (cancel_tx, mut cancel_rx) = watch::channel(false);
     vnet_tun_cancels
@@ -3151,7 +3155,7 @@ async fn remove_vnet_tun(
         let _ = cancel.send(true);
     }
     vnet_tuns.lock().await.remove(proxy_name);
-    vnet_tun_tx.lock().await.remove(proxy_name);
+    vnet_tun_tx.lock().unwrap().remove(proxy_name);
     let tun_name = vnet_tun_names.lock().await.remove(proxy_name);
     // Remove the OS route for the local TUN subnet (the kernel also cleans it
     // up on TUN teardown, but explicit removal keeps add/remove symmetric).
@@ -3754,7 +3758,7 @@ mod tests {
     #[tokio::test]
     async fn register_and_remove_vnet_tun_updates_all_maps() {
         let tuns: VnetTunMap = Arc::new(Mutex::new(HashMap::new()));
-        let tx: VnetTunTxMap = Arc::new(Mutex::new(HashMap::new()));
+        let tx: VnetTunTxMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let cancels: VnetTunCancelMap = Arc::new(Mutex::new(HashMap::new()));
         let names = Arc::new(Mutex::new(HashMap::new()));
         let subnets = Arc::new(Mutex::new(HashMap::new()));
@@ -3808,7 +3812,7 @@ mod tests {
         )
         .await;
         assert!(tuns.lock().await.is_empty());
-        assert!(tx.lock().await.is_empty());
+        assert!(tx.lock().unwrap().is_empty());
         assert!(cancels.lock().await.is_empty());
         assert!(names.lock().await.is_empty());
         assert!(subnets.lock().await.is_empty());
@@ -3819,7 +3823,7 @@ mod tests {
     #[tokio::test]
     async fn reload_tun_controller_rebuilds_delivery_channel() {
         let tuns: VnetTunMap = Arc::new(Mutex::new(HashMap::new()));
-        let tx_map: VnetTunTxMap = Arc::new(Mutex::new(HashMap::new()));
+        let tx_map: VnetTunTxMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let cancels: VnetTunCancelMap = Arc::new(Mutex::new(HashMap::new()));
         let names = Arc::new(Mutex::new(HashMap::new()));
         let subnets = Arc::new(Mutex::new(HashMap::new()));
@@ -3861,7 +3865,7 @@ mod tests {
         .expect("first controller should spawn");
         let old_tx = tx_map
             .lock()
-            .await
+            .unwrap()
             .get("vnet-a")
             .cloned()
             .expect("first delivery channel");
@@ -3880,7 +3884,7 @@ mod tests {
             "corp-net",
         )
         .await;
-        assert!(tx_map.lock().await.is_empty());
+        assert!(tx_map.lock().unwrap().is_empty());
 
         let (tun, _) = fake_tun();
         register_vnet_tun(
@@ -3910,7 +3914,7 @@ mod tests {
         .expect("second controller should spawn");
         let new_tx = tx_map
             .lock()
-            .await
+            .unwrap()
             .get("vnet-a")
             .cloned()
             .expect("rebuilt delivery channel");
@@ -3939,7 +3943,7 @@ mod tests {
     #[tokio::test]
     async fn remove_vnet_tun_sends_vnet_route_remove_and_cleans_maps() {
         let tuns: VnetTunMap = Arc::new(Mutex::new(HashMap::new()));
-        let tx: VnetTunTxMap = Arc::new(Mutex::new(HashMap::new()));
+        let tx: VnetTunTxMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let cancels: VnetTunCancelMap = Arc::new(Mutex::new(HashMap::new()));
         let names = Arc::new(Mutex::new(HashMap::new()));
         let subnets = Arc::new(Mutex::new(HashMap::new()));
@@ -3973,7 +3977,9 @@ mod tests {
             ("192.168.0.0/24".into(), "tun0".into(), "corp-net".into()),
         );
         tuns.lock().await.insert("vnet-a".into(), None);
-        tx.lock().await.insert("vnet-a".into(), mpsc::channel(4).0);
+        tx.lock()
+            .unwrap()
+            .insert("vnet-a".into(), mpsc::channel(4).0);
         cancels
             .lock()
             .await
@@ -3995,7 +4001,7 @@ mod tests {
         .await;
 
         assert!(tuns.lock().await.is_empty());
-        assert!(tx.lock().await.is_empty());
+        assert!(tx.lock().unwrap().is_empty());
         assert!(cancels.lock().await.is_empty());
         assert!(names.lock().await.is_empty());
         assert!(subnets.lock().await.is_empty());
