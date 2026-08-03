@@ -20,6 +20,8 @@ struct Claims {
     iss: String,
     exp: usize,
     iat: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jti: Option<String>,
 }
 
 struct MockOidcState {
@@ -117,6 +119,12 @@ impl MockOidcProvider {
     /// Generate a valid JWT signed with the provider's HS256 key.
     /// Includes iss, aud, sub, iat, exp claims matching the provider config.
     pub fn generate_token(&self, subject: &str) -> String {
+        self.generate_token_with_jti(subject, None)
+    }
+
+    /// Generate a valid JWT with an explicit jti claim (replay-protection
+    /// tests need to control the jti independently of the subject).
+    pub fn generate_token_with_jti(&self, subject: &str, jti: Option<&str>) -> String {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -128,6 +136,7 @@ impl MockOidcProvider {
             iss: self.issuer.clone(),
             exp: now + 3600,
             iat: now,
+            jti: jti.map(|s| s.to_string()),
         };
 
         let header = Header {

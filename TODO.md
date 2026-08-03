@@ -131,6 +131,12 @@ Closed in the `fix/go-parity-2026-08-02` branch:
 
 Remaining known gaps (documented, architectural):
 
+- OIDC JWT jti replay protection — **implemented**: `OidcVerifier::check_replay`
+  tracks seen `jti` claims on login; same jti + same subject allowed (frpc
+  reuses the cached token on reconnect), different subject rejected. Tokens
+  without `jti` pass (documented limitation). Cache TTL = exp + 60s leeway
+  (capped 24h; fixed 1h without exp), lazy-pruned. frp-rs enhancement — Go
+  frp v0.70.1 has no jti check.
 - HTTP vhost `responseHeaders`, 504 timeouts, h2c — **implemented**:
   responseHeaders via the server-side `ResponseHeaderInjector` bridge,
   per-request 504s via `vhost_http_timeout` on the response-header read

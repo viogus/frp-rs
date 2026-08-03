@@ -205,3 +205,90 @@ async fn test_oidc_rust_client_to_go_server() {
         );
     }
 }
+
+// ---------------------------------------------------------------
+// Test: jti replay protection — same subject reconnect allowed
+// ---------------------------------------------------------------
+
+/// frpc caches its OIDC token and legitimately re-sends it on reconnect
+/// (same jti, same subject). The server must allow this.
+#[tokio::test]
+async fn test_oidc_jti_same_subject_reconnect_allowed() {
+    let oidc_port = allocate_port();
+    let bind_port = allocate_port();
+
+    let oidc = MockOidcProvider::start(oidc_port).await;
+    let token = oidc.generate_token_with_jti("test-user", Some("jti-reconnect"));
+
+    let frps = FrpsHandle::start(&oidc_config(bind_port, oidc_port)).await;
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
+
+    // First login: valid token with jti.
+    let (stream1, resp1) = raw_login(addr, Some(token.clone()), None, "")
+        .await
+        .expect("first login should succeed");
+    assert!(resp1.error.is_none(), "Login error: {:?}", resp1.error);
+    assert!(resp1.run_id.is_some());
+    drop(stream1);
+
+    // Reconnect with the same token (same jti, same subject): allowed.
+    let (stream2, resp2) = raw_login(addr, Some(token), None, "")
+        .await
+        .expect("reconnect login should succeed");
+    assert!(
+        resp2.error.is_none(),
+        "Reconnect rejected: {:?}",
+        resp2.error
+    );
+    drop(stream2);
+
+    drop(frps);
+    drop(oidc);
+}
+
+// ---------------------------------------------------------------
+// Test: jti replay protection — different subject rejected
+// ---------------------------------------------------------------
+
+/// The same jti claim presented under a different subject is a cross-identity
+/// replay: the second login must be rejected.
+#[tokio::test]
+async fn test_oidc_jti_different_subject_rejected() {
+    let oidc_port = allocate_port();
+    let bind_port = allocate_port();
+
+    let oidc = MockOidcProvider::start(oidc_port).await;
+    let token_alice = oidc.generate_token_with_jti("alice", Some("jti-shared"));
+
+    let frps = FrpsHandle::start(&oidc_config(bind_port, oidc_port)).await;
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", bind_port).parse().unwrap();
+
+    // First login as alice.
+    let (stream1, resp1) = raw_login(addr, Some(token_alice.clone()), None, "")
+        .await
+        .expect("alice login should succeed");
+    assert!(resp1.error.is_none());
+    drop(stream1);
+
+    // Second login: same jti but a different subject (mallory) — replay.
+    // The mock signs a fresh token, but the jti collides with alice's.
+    let token_mallory = oidc.generate_token_with_jti("mallory", Some("jti-shared"));
+    let result2 = raw_login(addr, Some(token_mallory), None, "").await;
+    match result2 {
+        Ok((_stream, resp2)) => {
+            assert!(
+                resp2.error.is_some(),
+                "different-subject jti reuse must be rejected, got {:?}",
+                resp2
+            );
+        }
+        Err(_) => {
+            // Connection dropped is acceptable — the login was rejected.
+        }
+    }
+
+    drop(frps);
+    drop(oidc);
+}
