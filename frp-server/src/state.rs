@@ -92,8 +92,8 @@ pub enum InternalMsg {
     /// Forward a vnet IP packet to a target client's control handler.
     #[cfg(feature = "vnet")]
     VnetPacketForward {
-        proxy_name: String,
-        data: String, // base64-encoded IP packet
+        proxy_name: Arc<str>,
+        data: Arc<str>, // base64-encoded IP packet
     },
     /// Forward a vnet route advertisement to a peer client's control handler.
     #[cfg(feature = "vnet")]
@@ -786,12 +786,17 @@ impl AppState {
         // net in which both the source has a route and the target route lives.
         // (A multi-homed proxy may be reached by members of any of its vnets;
         // a `find`-then-verify would depend on HashMap iteration order.)
-        routes.iter().any(|((vn, _), (_, name))| {
-            name == proxy_name
-                && routes
-                    .iter()
-                    .any(|((vn2, _), (rid2, _))| vn2 == vn && rid2 == run_id)
-        })
+        // Single-pass variant for the per-packet hot path: collect the virtual
+        // nets the source participates in, then verify the target route lives
+        // in one of them — O(n) instead of the previous O(n²) nested scan.
+        let source_vnets: std::collections::HashSet<&String> = routes
+            .iter()
+            .filter(|(_, (rid, _))| rid == run_id)
+            .map(|((vn, _), _)| vn)
+            .collect();
+        routes
+            .iter()
+            .any(|((vn, _), (_, name))| name == proxy_name && source_vnets.contains(vn))
     }
 }
 

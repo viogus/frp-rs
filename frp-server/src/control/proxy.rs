@@ -47,20 +47,36 @@ pub(crate) async fn handle_udp_packet<W: AsyncWriteExt + Unpin>(
                 .insert(local_addr_str.clone(), pn.clone());
         }
     }
-    // Decrypt/decompress if the proxy requires it
-    let mut payload = up.content.clone();
+    // Decrypt/decompress if the proxy requires it. Move the content in (no
+    // clone); decrypt/decompress replace it with a fresh Vec when they succeed.
+    let orig_len = up.content.len();
+    let mut payload = up.content;
     if let Some(ref pn) = proxy_name {
-        if let Some(proxy_info) = ctx.state.proxy_manager.get(pn.as_str()).await {
-            if proxy_info.use_encryption {
-                if let Ok(decrypted) = encryption::decrypt(&payload, &ctx.reloadable.encryption_key)
-                {
-                    payload = decrypted;
+        // Cached flags (per-control, ControlState) avoid a per-packet
+        // proxy_manager.get() (async RwLock). Never hold the cache lock
+        // across an .await: probe, then fill on miss.
+        let cached = ctl.udp_proxy_flags.get(pn.as_str()).copied();
+        let flags = match cached {
+            Some(f) => f,
+            None => match ctx.state.proxy_manager.get(pn.as_str()).await {
+                Some(info) => {
+                    let f = (info.use_encryption, info.use_compression);
+                    ctl.udp_proxy_flags.insert(pn.clone(), f);
+                    f
                 }
+                // Proxy not (yet) registered: don't cache, so a later packet
+                // after registration picks up the real flags.
+                None => (false, false),
+            },
+        };
+        if flags.0 {
+            if let Ok(decrypted) = encryption::decrypt(&payload, &ctx.reloadable.encryption_key) {
+                payload = decrypted;
             }
-            if proxy_info.use_compression {
-                if let Ok(decompressed) = encryption::decompress(&payload) {
-                    payload = decompressed;
-                }
+        }
+        if flags.1 {
+            if let Ok(decompressed) = encryption::decompress(&payload) {
+                payload = decompressed;
             }
         }
     }
@@ -78,7 +94,10 @@ pub(crate) async fn handle_udp_packet<W: AsyncWriteExt + Unpin>(
             });
         }
     } else {
-        warn!(byte_count = %up.content.len(), "No UDP socket for proxy, dropping {} bytes", up.content.len());
+        warn!(
+            byte_count = orig_len,
+            "No UDP socket for proxy, dropping {} bytes", orig_len
+        );
     }
     Ok(())
 }
@@ -160,6 +179,9 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
         handle.abort();
     }
     ctx.state.proxy_manager.remove(&cp.proxy_name).await;
+    // Drop cached UDP encryption/compression flags for this proxy so a later
+    // re-registration with different flags picks up the new values.
+    ctl.udp_proxy_flags.remove(&cp.proxy_name);
     info!(proxy_name = %cp.proxy_name, "Proxy closed: {}", cp.proxy_name);
     // Emit WebSocket event for dashboard subscribers
     #[cfg(feature = "dashboard")]
@@ -355,6 +377,7 @@ pub(crate) async fn cleanup<W: AsyncWriteExt + Unpin>(
     // which in supersession would delete the new handler's proxies.
     for name in &proxy_names {
         ctx.state.proxy_manager.remove(name).await;
+        ctl.udp_proxy_flags.remove(name);
     }
     info!(run_id = %ctx.run_id, "Control connection {} removed", ctx.run_id);
 }

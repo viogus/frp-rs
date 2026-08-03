@@ -181,6 +181,25 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
     }
 }
 
+/// Write a V2 message without flushing the writer.
+///
+/// `frp_core::protocol::write_msg_v2_inner` is `pub(crate)` and not reachable
+/// from frp-server, so this composes the same frame from public APIs:
+/// type_id (2 BE bytes) + JSON, framed via `write_v2_frame_raw` (write_all only,
+/// no flush). The UDP work conn write half is a raw TcpStream with TCP_NODELAY,
+/// so the per-packet flush in `write_msg_v2` is a redundant syscall.
+async fn write_msg_v2_nof<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    msg: &FrpMessage,
+) -> Result<(), frp_core::Error> {
+    use frp_core::protocol::{write_v2_frame_raw, V2_FRAME_TYPE_MESSAGE};
+    let type_id = msg.v2_type_id();
+    let mut payload = Vec::with_capacity(2 + 512);
+    payload.extend_from_slice(&type_id.to_be_bytes());
+    serde_json::to_writer(&mut payload, msg)?;
+    write_v2_frame_raw(writer, V2_FRAME_TYPE_MESSAGE, 0, &payload).await
+}
+
 async fn run_udp_work_conn(
     work_conn: IoStream,
     sock: Arc<tokio::net::UdpSocket>,
@@ -189,6 +208,10 @@ async fn run_udp_work_conn(
     v2: bool,
     udp_packet_size: usize,
 ) {
+    // write_msg_v2_nof skips the flush syscall. That is only safe for a raw
+    // TcpStream: TLS/mux/WS-wrapped streams buffer internally and would leave
+    // frames in flight without flush.
+    let no_flush = matches!(work_conn, IoStream::Tcp(_));
     let (mut w_r, mut w_w) = work_conn.into_split().unwrap();
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
@@ -236,6 +259,11 @@ async fn run_udp_work_conn(
     let writer = async move {
         debug!(proxy_name = %writer_name, "UDP work conn writer task started for '{}'", writer_name);
         let mut buf = vec![0u8; udp_packet_size];
+        // Reusable content buffer: filled from `buf` then moved into the
+        // message via mem::take (client work_conn.rs pattern). The UDPPacket
+        // owns its Vec, so a fresh allocation per packet is unavoidable, but
+        // this keeps the fill/move path identical for a future encrypt path.
+        let mut content = Vec::with_capacity(udp_packet_size);
         loop {
             let received = tokio::select! {
                 biased;
@@ -247,8 +275,10 @@ async fn run_udp_work_conn(
             };
             match received {
                 Ok((n, src)) => {
+                    content.clear();
+                    content.extend_from_slice(&buf[..n]);
                     let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
-                        content: buf[..n].to_vec(),
+                        content: std::mem::take(&mut content),
                         local_addr: local_addr.clone(),
                         remote_addr: Some(msg::UdpAddr {
                             ip: src.ip().to_string(),
@@ -257,7 +287,11 @@ async fn run_udp_work_conn(
                         }),
                     });
                     let result = if v2 {
-                        write_msg_v2(&mut w_w, &pkt).await
+                        if no_flush {
+                            write_msg_v2_nof(&mut w_w, &pkt).await
+                        } else {
+                            write_msg_v2(&mut w_w, &pkt).await
+                        }
                     } else {
                         write_msg_v1(&mut w_w, &pkt).await
                     };

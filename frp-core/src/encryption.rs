@@ -94,6 +94,60 @@ pub fn compress_into(data: &[u8], buf: &mut Vec<u8>) -> Result<(), String> {
     Ok(())
 }
 
+/// Reusable Snappy stream compressor for high-throughput data-plane paths.
+///
+/// The wrapped [`snap::write::FrameEncoder`] is created once for the
+/// connection lifetime and reused across chunks, eliminating the ~128 KiB
+/// allocation (64 KiB source buffer + 64 KiB destination scratch) the encoder
+/// pays on every construction.
+///
+/// Wire format: the 10-byte `sNaPpY` stream identifier is emitted only by the
+/// first compressed chunk; subsequent chunks are plain Snappy data frames.
+/// This is valid Snappy stream framing — the identifier may legally appear
+/// once, at stream start — and is byte-compatible with both the per-chunk
+/// [`compress_into`] output (which repeats the identifier on every chunk) and
+/// Go frp's `snappy.Writer` output. Streaming decoders such as
+/// [`SnappyDecompressor`] and Go's `snappy.Reader` accept either form.
+#[cfg(feature = "compression")]
+pub struct SnappyCompressor {
+    encoder: snap::write::FrameEncoder<Vec<u8>>,
+}
+
+#[cfg(feature = "compression")]
+impl Default for SnappyCompressor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "compression")]
+impl SnappyCompressor {
+    pub fn new() -> Self {
+        Self {
+            encoder: snap::write::FrameEncoder::new(Vec::new()),
+        }
+    }
+
+    /// Compress `data`, replacing the contents of `out` with the framed
+    /// output.
+    ///
+    /// The encoder's internal sink is swapped with the caller's `out`
+    /// allocation, so both buffers keep their capacity and steady-state
+    /// compression performs no heap allocation per chunk.
+    pub fn compress(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
+        use std::io::Write;
+        self.encoder.get_mut().clear();
+        self.encoder
+            .write_all(data)
+            .map_err(|e| format!("snappy compress: {e}"))?;
+        self.encoder
+            .flush()
+            .map_err(|e| format!("snappy flush: {e}"))?;
+        std::mem::swap(out, self.encoder.get_mut());
+        Ok(())
+    }
+}
+
 #[cfg(not(feature = "compression"))]
 pub fn compress(_data: &[u8]) -> Result<Vec<u8>, String> {
     Err("compression not compiled".into())
@@ -102,6 +156,19 @@ pub fn compress(_data: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(not(feature = "compression"))]
 pub fn compress_into(_data: &[u8], _buf: &mut Vec<u8>) -> Result<(), String> {
     Err("compression not compiled".into())
+}
+
+#[cfg(not(feature = "compression"))]
+pub struct SnappyCompressor;
+
+#[cfg(not(feature = "compression"))]
+impl SnappyCompressor {
+    pub fn new() -> Self {
+        Self
+    }
+    pub fn compress(&mut self, _data: &[u8], _out: &mut Vec<u8>) -> Result<(), String> {
+        Err("compression not compiled".into())
+    }
 }
 
 /// Decompress Snappy-compressed data.
@@ -206,6 +273,27 @@ impl SnappyDecompressor {
         data: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<SnappyFeedStatus, String> {
+        out.clear();
+        self.feed_into_step_core(data, out)
+    }
+
+    /// Append variant of [`feed_into_progress`]: decoded output is appended to
+    /// `out` instead of replacing its contents. Callers that batch many frames
+    /// into one buffer (e.g. the work→user bridge) can feed repeatedly into
+    /// the same `out` without a per-frame memcpy through a scratch buffer.
+    pub fn feed_into_append_progress(
+        &mut self,
+        data: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<SnappyFeedStatus, String> {
+        self.feed_into_step_core(data, out)
+    }
+
+    fn feed_into_step_core(
+        &mut self,
+        data: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<SnappyFeedStatus, String> {
         self.feed_into_step(data, out)?;
         let has_more_complete = self.has_complete_frame();
         Ok(SnappyFeedStatus {
@@ -219,7 +307,9 @@ impl SnappyDecompressor {
         const MAX_SNAPPY_PENDING: usize = 16 * 1024 * 1024;
         const MAX_FRAMES_PER_CALL: usize = 1024;
 
-        out.clear();
+        // Note: `out` is *not* cleared here. Callers decide replace vs append
+        // semantics: feed_into_progress clears before calling, while
+        // feed_into_append_progress appends into the caller's buffer.
         if self.offset > 0 && !data.is_empty() {
             self.buf.drain(..self.offset);
             self.offset = 0;
@@ -432,6 +522,13 @@ impl SnappyDecompressor {
     ) -> Result<SnappyFeedStatus, String> {
         Err("compression not compiled".into())
     }
+    pub fn feed_into_append_progress(
+        &mut self,
+        _data: &[u8],
+        _out: &mut Vec<u8>,
+    ) -> Result<SnappyFeedStatus, String> {
+        Err("compression not compiled".into())
+    }
     #[allow(dead_code)] // stub: only called when the compression feature is on
     pub(crate) fn has_pending(&self) -> bool {
         false
@@ -479,6 +576,112 @@ mod tests {
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
         assert!(compressed.len() < data.len());
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn snappy_compressor_reuses_encoder_and_roundtrips_across_chunks() {
+        let mut comp = SnappyCompressor::new();
+        let mut out = Vec::new();
+        let mut stream = Vec::new();
+
+        comp.compress(b"first-chunk-data", &mut out).unwrap();
+        assert!(
+            out.starts_with(&[0xff, 0x06, 0x00, 0x00, b's', b'N', b'a', b'P', b'p', b'Y']),
+            "first chunk must carry the stream identifier"
+        );
+        stream.extend_from_slice(&out);
+
+        comp.compress(b"second-chunk-data", &mut out).unwrap();
+        assert!(
+            !out.starts_with(&[0xff, 0x06, 0x00, 0x00, b's', b'N', b'a', b'P', b'p', b'Y']),
+            "later chunks must not repeat the stream identifier"
+        );
+        stream.extend_from_slice(&out);
+
+        comp.compress(b"third-chunk-data", &mut out).unwrap();
+        stream.extend_from_slice(&out);
+
+        // The concatenated stream must decompress across chunk boundaries.
+        let mut dec = SnappyDecompressor::new();
+        let mut reconstructed = Vec::new();
+        for fragment in stream.chunks(7) {
+            reconstructed.extend_from_slice(&dec.feed(fragment).unwrap());
+        }
+        loop {
+            let chunk = dec.feed(&[]).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            reconstructed.extend_from_slice(&chunk);
+        }
+        assert_eq!(
+            reconstructed,
+            b"first-chunk-datasecond-chunk-datathird-chunk-data"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn mixed_legacy_and_reused_encoder_stream_decompresses() {
+        // Legacy per-chunk compress_into repeats the stream identifier on
+        // every chunk; the reused SnappyCompressor emits it only once. Both
+        // output styles must be decodable as one continuous stream. Note
+        // compress_into/compress replace their output buffer, so each chunk
+        // is compressed into its own buffer and accumulated into the stream.
+        let mut legacy = Vec::new();
+        for data in [&b"legacy-chunk"[..], &b"legacy-chunk-2"[..]] {
+            let mut chunk_buf = Vec::new();
+            compress_into(data, &mut chunk_buf).unwrap();
+            legacy.extend_from_slice(&chunk_buf);
+        }
+
+        let mut comp = SnappyCompressor::new();
+        let mut reused = Vec::new();
+        for data in [&b"reused-chunk"[..], &b"reused-chunk-2"[..]] {
+            let mut chunk_buf = Vec::new();
+            comp.compress(data, &mut chunk_buf).unwrap();
+            reused.extend_from_slice(&chunk_buf);
+        }
+
+        let mut stream = legacy;
+        stream.extend_from_slice(&reused);
+
+        let mut dec = SnappyDecompressor::new();
+        let mut reconstructed = Vec::new();
+        for fragment in stream.chunks(11) {
+            reconstructed.extend_from_slice(&dec.feed(fragment).unwrap());
+        }
+        loop {
+            let chunk = dec.feed(&[]).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            reconstructed.extend_from_slice(&chunk);
+        }
+        assert_eq!(
+            reconstructed,
+            b"legacy-chunklegacy-chunk-2reused-chunkreused-chunk-2"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "compression")]
+    fn feed_into_append_progress_batches_frames_into_one_buffer() {
+        let mut dec = SnappyDecompressor::new();
+        let mut out = Vec::new();
+
+        let c1 = compress(b"frame-one").unwrap();
+        let c2 = compress(b"frame-two").unwrap();
+        let c3 = compress(b"frame-three").unwrap();
+
+        // Each chunk is an independent framed stream; the append variant must
+        // accumulate all decoded frames in a single buffer without clearing.
+        dec.feed_into_append_progress(&c1, &mut out).unwrap();
+        dec.feed_into_append_progress(&c2, &mut out).unwrap();
+        dec.feed_into_append_progress(&c3, &mut out).unwrap();
+
+        assert_eq!(out, b"frame-oneframe-twoframe-three");
     }
 
     #[test]

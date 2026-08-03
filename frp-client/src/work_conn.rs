@@ -264,7 +264,7 @@ pub(crate) struct WorkConnConfig {
     #[cfg(feature = "vnet")]
     pub vnet_controller: Arc<frp_vnet::controller::ClientVnetController>,
     #[cfg(feature = "vnet")]
-    pub vnet_tun_tx: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+    pub vnet_tun_tx: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
 }
 
 /// Bundled parameters for work connection transport acquisition.
@@ -598,13 +598,13 @@ async fn run_virtual_net_plugin_work_conn(
     work: IoStream,
     proxy_name: String,
     vnet_controller: Arc<frp_vnet::controller::ClientVnetController>,
-    vnet_tun_tx: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+    vnet_tun_tx: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
     use_encryption: bool,
     use_compression: bool,
     enc_key: [u8; 16],
 ) {
     let tun_tx = {
-        let txs = vnet_tun_tx.lock().await;
+        let txs = vnet_tun_tx.lock().unwrap();
         txs.get(&proxy_name).cloned()
     };
     let Some(tun_tx) = tun_tx else {
@@ -658,11 +658,13 @@ async fn run_virtual_net_plugin_work_conn(
                         Ok(Some(packet)) => {
                             // Learn the remote host's source IP so return
                             // packets can be routed back on this connection.
+                            // The mapping is effectively per-connection, so
+                            // register only the first time an IP is seen.
                             if let Some(src_ip) = frp_vnet::router::packet_src_ip(&packet) {
-                                reader_ctrl
-                                    .register_server_conn(src_ip, reader_rtx.clone())
-                                    .await;
-                                registered_ips.push(src_ip);
+                                if !registered_ips.contains(&src_ip) {
+                                    reader_ctrl.register_server_conn(src_ip, reader_rtx.clone());
+                                    registered_ips.push(src_ip);
+                                }
                             }
                             if let Err(e) = reader_tun.try_send(packet) {
                                 match e {
@@ -690,9 +692,7 @@ async fn run_virtual_net_plugin_work_conn(
             }
         }
         for src_ip in &registered_ips {
-            reader_ctrl
-                .unregister_server_conn_if_matches(src_ip, &reader_rtx)
-                .await;
+            reader_ctrl.unregister_server_conn_if_matches(src_ip, &reader_rtx);
         }
     };
 
@@ -1379,7 +1379,7 @@ mod tests {
             #[cfg(feature = "vnet")]
             vnet_controller: Arc::new(frp_vnet::controller::ClientVnetController::new()),
             #[cfg(feature = "vnet")]
-            vnet_tun_tx: Arc::new(Mutex::new(HashMap::new())),
+            vnet_tun_tx: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -1565,11 +1565,11 @@ mod tests {
         use tokio::io::AsyncWriteExt;
 
         let controller = Arc::new(frp_vnet::controller::ClientVnetController::new());
-        let tun_txs = Arc::new(Mutex::new(HashMap::new()));
+        let tun_txs = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(16);
         tun_txs
             .lock()
-            .await
+            .unwrap()
             .insert("vnet-proxy".to_string(), tun_tx);
 
         let (work, mut peer) = tokio::io::duplex(4096);
@@ -1596,7 +1596,6 @@ mod tests {
         let src = std::net::IpAddr::V4(Ipv4Addr::new(100, 86, 0, 1));
         let return_tx = controller
             .server_conn_sender(&src)
-            .await
             .expect("remote source IP must be registered for return traffic");
         return_tx.try_send(inbound.clone()).unwrap();
         let mut buf = vec![0u8; framed.len()];
@@ -1612,7 +1611,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(controller.server_conn_sender(&src).await.is_none());
+        assert!(controller.server_conn_sender(&src).is_none());
     }
 
     #[cfg(feature = "vnet")]
@@ -1623,11 +1622,11 @@ mod tests {
 
         let key = frp_core::encryption::derive_key("vnet-test-secret");
         let controller = Arc::new(frp_vnet::controller::ClientVnetController::new());
-        let tun_txs = Arc::new(Mutex::new(HashMap::new()));
+        let tun_txs = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(16);
         tun_txs
             .lock()
-            .await
+            .unwrap()
             .insert("vnet-proxy".to_string(), tun_tx);
 
         let (work, mut peer) = tokio::io::duplex(8192);
@@ -1658,7 +1657,6 @@ mod tests {
         let src: IpAddr = "2001:db8::2".parse().unwrap();
         let return_tx = controller
             .server_conn_sender(&src)
-            .await
             .expect("IPv6 source must be registered for return traffic");
         return_tx.try_send(inbound.clone()).unwrap();
 
@@ -1674,7 +1672,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(controller.server_conn_sender(&src).await.is_none());
+        assert!(controller.server_conn_sender(&src).is_none());
     }
 
     #[cfg(all(feature = "vnet", feature = "compression"))]

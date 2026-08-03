@@ -5,6 +5,7 @@
 //! NatHoleReport, NatHoleVisitor, NewVisitorConn) plus VNet route management.
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
 use tokio::time::{Duration, Instant};
@@ -145,10 +146,13 @@ pub(crate) async fn handle_vnet_packet_forward<W: AsyncWriteExt + Unpin>(
     ctx: &ControlContext,
     _ctl: &mut ControlState,
     writer: &mut W,
-    proxy_name: String,
-    data: String,
+    proxy_name: Arc<str>,
+    data: Arc<str>,
 ) {
-    let pkt = FrpMessage::VnetPacket(msg::VnetPacket { proxy_name, data });
+    let pkt = FrpMessage::VnetPacket(msg::VnetPacket {
+        proxy_name: proxy_name.to_string(),
+        data: data.to_string(),
+    });
     if let Err(e) = write_ctl_msg(writer, &pkt, ctx.v2).await {
         warn!(error = %e, "Failed to forward VnetPacket: {}", e);
     }
@@ -917,31 +921,43 @@ pub(crate) async fn handle_vnet_packet(
         );
         return;
     }
-    let target_run_id =
-        if let Some(target_info) = ctx.state.proxy_manager.get(&pkt.proxy_name).await {
-            if target_info.run_id == ctx.run_id {
-                // Same client and it owns a registered proxy: the client handles
-                // the packet locally and does not need a control-conn echo.
-                None
-            } else {
-                Some(target_info.run_id.clone())
+    // Look up the target control connection and forward the packet.
+    //
+    // Proxy path: `proxy_manager.get` returns an `Arc<ProxyInfo>` whose run_id
+    // we borrow directly (no String clone) to index `run_id_to_ctl_tx`. If the
+    // same client owns a registered proxy it handles the packet locally and
+    // does not need a control-conn echo. Visitor path: not a proxy, so resolve
+    // virtual_net visitor routes advertised over the control connection
+    // (visitor name → advertising client) and deliver the packet back to that
+    // client's control connection. The resolution is scoped to virtual nets
+    // the source participates in, so it agrees with the isolation check above
+    // — a same-named visitor in a different vnet is never chosen.
+    if let Some(target_info) = ctx.state.proxy_manager.get(&pkt.proxy_name).await {
+        if target_info.run_id != ctx.run_id {
+            if let Some(ctl_tx) = ctx
+                .state
+                .run_id_to_ctl_tx
+                .read()
+                .await
+                .get(&target_info.run_id)
+            {
+                let _ = ctl_tx.tx.try_send(InternalMsg::VnetPacketForward {
+                    proxy_name: Arc::from(pkt.proxy_name.as_str()),
+                    data: Arc::from(pkt.data.as_str()),
+                });
             }
-        } else {
-            // Not a proxy: resolve virtual_net visitor routes advertised over the
-            // control connection (visitor name → advertising client) and deliver
-            // the packet back to that client's control connection. The
-            // resolution is scoped to virtual nets the source participates in,
-            // so it agrees with the isolation check above — a same-named
-            // visitor in a different vnet is never chosen.
-            let routes = ctx.state.vnet_routes.read().await;
+        }
+    } else {
+        let routes = ctx.state.vnet_routes.read().await;
+        if let Some(target_run_id) =
             vnet_visitor_route_target_run_id(&routes, &ctx.run_id, &pkt.proxy_name)
-        };
-    if let Some(target_run_id) = target_run_id {
-        if let Some(ctl_tx) = ctx.state.run_id_to_ctl_tx.read().await.get(&target_run_id) {
-            let _ = ctl_tx.tx.try_send(InternalMsg::VnetPacketForward {
-                proxy_name: pkt.proxy_name.clone(),
-                data: pkt.data.clone(),
-            });
+        {
+            if let Some(ctl_tx) = ctx.state.run_id_to_ctl_tx.read().await.get(&target_run_id) {
+                let _ = ctl_tx.tx.try_send(InternalMsg::VnetPacketForward {
+                    proxy_name: Arc::from(pkt.proxy_name.as_str()),
+                    data: Arc::from(pkt.data.as_str()),
+                });
+            }
         }
     }
 }
@@ -1262,6 +1278,7 @@ mod vnet_route_tests {
             listener_handles: HashMap::new(),
             udp_sockets: HashMap::new(),
             udp_local_to_proxy: HashMap::new(),
+            udp_proxy_flags: HashMap::new(),
             last_ping: Instant::now(),
         };
         (ctx, ctl)

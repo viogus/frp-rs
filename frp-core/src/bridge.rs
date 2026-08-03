@@ -41,12 +41,20 @@ macro_rules! trace_hex {
 /// Compress a plaintext chunk into a reusable buffer, or return a reference
 /// to the original data when compression is disabled.
 ///
+/// Uses a connection-lifetime [`encryption::SnappyCompressor`] so the
+/// ~128 KiB `FrameEncoder` allocation is paid once instead of once per chunk.
+///
 /// Returns `None` on compression failure — the caller should break its loop.
 /// On success returns `Some(true)` (compressed into buf) or `Some(false)` (passthrough).
 #[inline]
-fn compress_chunk_into(payload: &[u8], use_compression: bool, buf: &mut Vec<u8>) -> Option<bool> {
+fn compress_chunk_into(
+    compressor: &mut Option<encryption::SnappyCompressor>,
+    payload: &[u8],
+    use_compression: bool,
+    buf: &mut Vec<u8>,
+) -> Option<bool> {
     if use_compression {
-        encryption::compress_into(payload, buf).ok()?;
+        compressor.as_mut()?.compress(payload, buf).ok()?;
         Some(true)
     } else {
         Some(false)
@@ -72,27 +80,53 @@ fn make_decompressor(use_compression: bool) -> Option<encryption::SnappyDecompre
     }
 }
 
-/// Feed a chunk through the decompressor into a reusable buffer.
-/// Returns `None` on decompress error — the caller should break its loop.
+/// Build a reusable Snappy compressor when compression is enabled and the
+/// `compression` feature is present; otherwise `None` (plaintext passthrough).
 #[inline]
-fn decompress_chunk_into<'a>(
+fn make_compressor(use_compression: bool) -> Option<encryption::SnappyCompressor> {
+    #[cfg(feature = "compression")]
+    {
+        if use_compression {
+            Some(encryption::SnappyCompressor::new())
+        } else {
+            None
+        }
+    }
+    #[cfg(not(feature = "compression"))]
+    {
+        let _ = use_compression;
+        None
+    }
+}
+
+/// Feed a chunk through the decompressor, appending decoded output to `buf`.
+/// Returns the number of bytes appended, or `None` on decompress error.
+///
+/// Unlike a slice-returning variant, this does not borrow `buf`, so callers
+/// can keep feeding frames into the same accumulation buffer and avoid a
+/// per-frame memcpy through a scratch buffer. When no decompressor is
+/// configured, `data` is appended unchanged (plaintext passthrough).
+#[inline]
+fn decompress_chunk_append_into(
     dec: &mut Option<encryption::SnappyDecompressor>,
-    data: &'a [u8],
-    buf: &'a mut Vec<u8>,
-) -> Option<&'a [u8]> {
+    data: &[u8],
+    buf: &mut Vec<u8>,
+) -> Option<usize> {
     match dec {
         Some(d) => {
-            d.feed_into_progress(data, buf)
+            let before = buf.len();
+            d.feed_into_append_progress(data, buf)
                 .inspect_err(|_e| {
                     #[cfg(feature = "compression")]
                     tracing::warn!(error = %_e, "snappy decompress error in bridge: {}", _e);
                 })
                 .ok()?;
-            // SnappyDecompressor validates each declared chunk and decoded
-            // size before allocation and enforces a fixed per-feed ceiling.
-            Some(buf.as_slice())
+            Some(buf.len() - before)
         }
-        None => Some(data),
+        None => {
+            buf.extend_from_slice(data);
+            Some(data.len())
+        }
     }
 }
 
@@ -166,6 +200,7 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
     let mut buf = PoolGuard::acquire();
     let cap = buf.as_mut_slice().len();
     let mut comp_buf = Vec::new();
+    let mut compressor = make_compressor(use_compression);
     loop {
         let n = match user_r.read(buf.as_mut_slice()).await {
             Ok(0) => break,
@@ -183,7 +218,9 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
         };
 
         if use_compression {
-            if compress_chunk_into(&buf.raw_buf()[..n], true, &mut comp_buf).is_none() {
+            if compress_chunk_into(&mut compressor, &buf.raw_buf()[..n], true, &mut comp_buf)
+                .is_none()
+            {
                 tracing::warn!("bridge user_to_work: compression failed");
                 break;
             }
@@ -194,7 +231,8 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
                 tracing::debug!(error = %e, "bridge user_to_work: write error (compressed)");
                 break;
             }
-            // comp_buf is cleared on next compress_chunk_into call
+            // comp_buf is swapped with the compressor's internal sink on the
+            // next compress call, so its capacity is retained across chunks.
         } else {
             let slice = &mut buf.as_mut_slice()[..n];
             if let Some(ref mut lim) = write_limiter {
@@ -242,7 +280,6 @@ async fn bridge_work_to_user(
 ) {
     let mut buf = PoolGuard::acquire();
     let cap = buf.as_mut_slice().len();
-    let mut decomp_buf = Vec::new();
     let mut batch_buf = Vec::new();
     let mut decompressor = make_decompressor(use_compression);
     let mut header_timeout = header_timeout;
@@ -277,38 +314,42 @@ async fn bridge_work_to_user(
 
         let mut compressed_input = &buf.raw_buf()[..n];
         loop {
-            let plaintext =
-                match decompress_chunk_into(&mut decompressor, compressed_input, &mut decomp_buf) {
-                    Some(p) => p,
+            if decompressor.is_some() {
+                // Compressed path: decode directly into the batch buffer,
+                // eliminating the per-frame scratch memcpy. `added` counts
+                // the bytes produced by this feed for limiter/metrics.
+                let added = match decompress_chunk_append_into(
+                    &mut decompressor,
+                    compressed_input,
+                    &mut batch_buf,
+                ) {
+                    Some(a) => a,
                     None => {
                         tracing::warn!("bridge work_to_user: decompression failed");
                         break 'read_loop;
                     }
                 };
-            compressed_input = &[];
-            if plaintext.is_empty() {
-                if decompressor
-                    .as_ref()
-                    .is_some_and(encryption::SnappyDecompressor::has_complete_frame)
-                {
-                    // Metadata-only batches are deliberately bounded inside
-                    // feed_into_progress; yield before draining the next batch.
-                    tokio::task::yield_now().await;
-                    continue;
+                compressed_input = &[];
+                if added == 0 {
+                    if decompressor
+                        .as_ref()
+                        .is_some_and(encryption::SnappyDecompressor::has_complete_frame)
+                    {
+                        // Metadata-only batches are deliberately bounded inside
+                        // feed_into_progress; yield before draining the next batch.
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    break;
                 }
-                break;
-            }
 
-            // Apply read bandwidth limit before writing to user
-            if let Some(ref mut lim) = read_limiter {
-                lim.consume(plaintext.len()).await;
-            }
-            if let Some(ref m) = metrics {
-                m.bytes_out
-                    .fetch_add(plaintext.len() as u64, Ordering::Relaxed);
-            }
-            if decompressor.is_some() {
-                batch_buf.extend_from_slice(plaintext);
+                // Apply read bandwidth limit before writing to user
+                if let Some(ref mut lim) = read_limiter {
+                    lim.consume(added).await;
+                }
+                if let Some(ref m) = metrics {
+                    m.bytes_out.fetch_add(added as u64, Ordering::Relaxed);
+                }
                 if batch_buf.len() >= MAX_WORK_TO_USER_BATCH {
                     if let Err(e) = user_w.write_all(&batch_buf).await {
                         tracing::debug!(error = %e, "bridge work_to_user: write error (batch)");
@@ -321,6 +362,16 @@ async fn bridge_work_to_user(
                     batch_buf.clear();
                 }
             } else {
+                // Plaintext passthrough: write immediately, flushing on short
+                // reads for interactive latency.
+                let plaintext = compressed_input;
+                if let Some(ref mut lim) = read_limiter {
+                    lim.consume(plaintext.len()).await;
+                }
+                if let Some(ref m) = metrics {
+                    m.bytes_out
+                        .fetch_add(plaintext.len() as u64, Ordering::Relaxed);
+                }
                 if let Err(e) = user_w.write_all(plaintext).await {
                     tracing::debug!(error = %e, "bridge work_to_user: write error");
                     break 'read_loop;
@@ -331,6 +382,7 @@ async fn bridge_work_to_user(
                         break 'read_loop;
                     }
                 }
+                break;
             }
         }
         if !batch_buf.is_empty() {
@@ -1024,20 +1076,23 @@ mod tests {
     #[test]
     fn test_compress_chunk_identity_when_disabled() {
         let mut buf = Vec::new();
-        let compressed = compress_chunk_into(b"hello", false, &mut buf).unwrap();
+        let mut compressor = make_compressor(false);
+        let compressed = compress_chunk_into(&mut compressor, b"hello", false, &mut buf).unwrap();
         assert!(!compressed); // false = passthrough (no compression)
     }
 
     #[test]
+    #[cfg(feature = "compression")]
     fn test_compress_decompress_roundtrip() {
         let original = b"AAAA".repeat(64);
         let mut comp_buf = Vec::new();
-        compress_chunk_into(&original, true, &mut comp_buf).expect("compress ok");
+        let mut compressor = make_compressor(true);
+        compress_chunk_into(&mut compressor, &original, true, &mut comp_buf).expect("compress ok");
         let mut dec = make_decompressor(true);
         let mut decomp_buf = Vec::new();
-        let out =
-            decompress_chunk_into(&mut dec, &comp_buf, &mut decomp_buf).expect("decompress ok");
-        assert_eq!(out, original);
+        let added = decompress_chunk_append_into(&mut dec, &comp_buf, &mut decomp_buf)
+            .expect("decompress ok");
+        assert_eq!(&decomp_buf[..added], original);
     }
 
     #[test]
@@ -1045,21 +1100,23 @@ mod tests {
     fn decompress_chunk_accepts_legal_one_megabyte_multi_chunk_read() {
         let original = vec![0x42; 1024 * 1024];
         let mut comp_buf = Vec::new();
-        compress_chunk_into(&original, true, &mut comp_buf).expect("compress ok");
+        let mut compressor = make_compressor(true);
+        compress_chunk_into(&mut compressor, &original, true, &mut comp_buf).expect("compress ok");
         let mut dec = make_decompressor(true);
         let mut decomp_buf = Vec::new();
 
         let mut output = Vec::new();
         let mut input = comp_buf.as_slice();
         loop {
-            let out = decompress_chunk_into(&mut dec, input, &mut decomp_buf)
+            let before = decomp_buf.len();
+            let added = decompress_chunk_append_into(&mut dec, input, &mut decomp_buf)
                 .expect("legal multi-chunk read must decompress");
             input = &[];
-            if out.is_empty() {
+            if added == 0 {
                 break;
             }
-            assert!(out.len() <= 128 * 1024);
-            output.extend_from_slice(out);
+            assert!(added <= 128 * 1024);
+            output.extend_from_slice(&decomp_buf[before..before + added]);
         }
         assert_eq!(output, original);
     }
@@ -1120,8 +1177,8 @@ mod tests {
     fn test_decompress_chunk_identity_when_none() {
         let mut dec: Option<encryption::SnappyDecompressor> = None;
         let mut buf = Vec::new();
-        let out = decompress_chunk_into(&mut dec, b"raw", &mut buf).unwrap();
-        assert_eq!(out, b"raw");
+        let added = decompress_chunk_append_into(&mut dec, b"raw", &mut buf).unwrap();
+        assert_eq!(&buf[..added], b"raw");
     }
 
     /// Rate-limited plain bridge: bidirectional data flow with high limit.

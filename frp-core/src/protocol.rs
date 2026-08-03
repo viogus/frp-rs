@@ -368,21 +368,12 @@ pub async fn write_v2_frame_raw<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// Read a raw V2 frame. Returns (frame_type, flags, payload).
-/// This is the Go wire.Conn.ReadFrame format.
-///
-/// Frame type bytes: V2 uses wire-level constants from Go frp's
-/// `pkg/proto/wire/wire.go`:
-///   - `1` — ClientHello
-///   - `2` — ServerHello
-///   - `16` — Message (data-carrying frame)
-///
-/// Go-compatible peers recognize only these three types. Unknown types
-/// are rejected. (V1 type bytes 7 (CloseProxyResp) and 8 (Error) are
-/// Rust-only extensions and do NOT apply to the V2 frame path.)
-pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
+/// Read a V2 frame header (8 bytes) and validate its flags and payload length.
+/// Shared by [`read_v2_frame_raw`] (owned payload) and [`read_msg_v2`] (which
+/// deserializes directly from the buffer pool, avoiding a `to_vec` copy).
+async fn read_v2_frame_header<R: AsyncReadExt + Unpin>(
     reader: &mut R,
-) -> Result<(u16, u16, Vec<u8>), crate::Error> {
+) -> Result<(u16, u16, usize), crate::Error> {
     let mut header = [0u8; V2_FRAME_HEADER_LEN];
     reader
         .read_exact(&mut header)
@@ -413,6 +404,26 @@ pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
             format!("V2 frame payload too large: {payload_len}").into(),
         ));
     }
+
+    Ok((frame_type, flags, payload_len))
+}
+
+/// Read a raw V2 frame. Returns (frame_type, flags, payload).
+/// This is the Go wire.Conn.ReadFrame format.
+///
+/// Frame type bytes: V2 uses wire-level constants from Go frp's
+/// `pkg/proto/wire/wire.go`:
+///   - `1` — ClientHello
+///   - `2` — ServerHello
+///   - `16` — Message (data-carrying frame)
+///
+/// Go-compatible peers recognize only these three types. Unknown types
+/// are rejected. (V1 type bytes 7 (CloseProxyResp) and 8 (Error) are
+/// Rust-only extensions and do NOT apply to the V2 frame path.)
+pub async fn read_v2_frame_raw<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> Result<(u16, u16, Vec<u8>), crate::Error> {
+    let (frame_type, flags, payload_len) = read_v2_frame_header(reader).await?;
 
     // Use global buffer pool for small payloads (<= BUFFER_SIZE, 32 KiB
     // by default), matching the V1 read path in read_msg_v1.  Larger
@@ -506,7 +517,7 @@ pub async fn write_msg_v2<W: AsyncWriteExt + Unpin>(
 pub async fn read_msg_v2<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> Result<FrpMessage, crate::Error> {
-    let (frame_type, _flags, payload) = read_v2_frame_raw(reader).await?;
+    let (frame_type, _flags, payload_len) = read_v2_frame_header(reader).await?;
     if frame_type != V2_FRAME_TYPE_MESSAGE {
         return Err(crate::Error::Protocol(
             format!(
@@ -516,13 +527,34 @@ pub async fn read_msg_v2<R: AsyncReadExt + Unpin>(
             .into(),
         ));
     }
-    if payload.len() < 2 {
+    if payload_len < 2 {
         return Err(crate::Error::Protocol(
             "V2 message payload too short".into(),
         ));
     }
-    let type_id = u16::from_be_bytes([payload[0], payload[1]]);
-    deserialize_v2(type_id, &payload[2..])
+
+    // Deserialize directly from the pooled buffer for small payloads,
+    // matching the V1 read path — no intermediate `to_vec` copy.  Larger
+    // payloads fall back to a direct heap allocation.
+    let pool_size = *crate::buffer_pool::BUFFER_SIZE;
+    if payload_len <= pool_size {
+        let mut guard = crate::buffer_pool::PoolGuard::acquire();
+        reader
+            .read_exact(&mut guard.as_mut_slice()[..payload_len])
+            .await
+            .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
+        let payload = &guard.raw_buf()[..payload_len];
+        let type_id = u16::from_be_bytes([payload[0], payload[1]]);
+        deserialize_v2(type_id, &payload[2..])
+    } else {
+        let mut payload = vec![0u8; payload_len];
+        reader
+            .read_exact(&mut payload)
+            .await
+            .map_err(|e| crate::Error::Protocol(format!("read V2 payload: {e}").into()))?;
+        let type_id = u16::from_be_bytes([payload[0], payload[1]]);
+        deserialize_v2(type_id, &payload[2..])
+    }
 }
 
 /// Protocol-aware message read: dispatches to V1 or V2 framing based on the `v2` flag.

@@ -14,7 +14,7 @@ use frp_core::transport::IoStream;
 use frp_core::transport::{dial_server, DialOptions, TransportProtocol};
 
 #[cfg(feature = "vnet")]
-type VnetTunTxMap = Arc<tokio::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
+type VnetTunTxMap = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
 
 /// Configuration for an STCP/XTCP visitor listener.
 pub(crate) struct VisitorListenerConfig {
@@ -1198,8 +1198,10 @@ async fn deliver_tunnel_ingress(
     vnet_tun_tx: &VnetTunTxMap,
     tun_subnets: &Arc<tokio::sync::Mutex<HashMap<String, String>>>,
 ) -> bool {
-    let txs = vnet_tun_tx.lock().await;
+    // Take the tokio lock first so the std Mutex guard never spans an await
+    // point (the guarded section below is fully synchronous).
     let subnets = tun_subnets.lock().await;
+    let txs = vnet_tun_tx.lock().unwrap();
     let dst = frp_vnet::router::packet_dst_ip(&packet);
     let mut delivered = false;
     for (proxy, tx) in txs.iter() {
@@ -1385,11 +1387,11 @@ mod tests {
 
     #[tokio::test]
     async fn tunnel_ingress_delivers_to_local_tun_channels() {
-        let txs: VnetTunTxMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let txs: VnetTunTxMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let subnets: Arc<tokio::sync::Mutex<HashMap<String, String>>> =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(16);
-        txs.lock().await.insert("tun-proxy".to_string(), tx);
+        txs.lock().unwrap().insert("tun-proxy".to_string(), tx);
         subnets
             .lock()
             .await
@@ -1402,7 +1404,9 @@ mod tests {
         assert_eq!(rx.recv().await, Some(vec![0x45]));
 
         let (closed_tx, closed_rx) = mpsc::channel::<Vec<u8>>(16);
-        txs.lock().await.insert("gone-tun".to_string(), closed_tx);
+        txs.lock()
+            .unwrap()
+            .insert("gone-tun".to_string(), closed_tx);
         subnets
             .lock()
             .await
@@ -1413,7 +1417,7 @@ mod tests {
             "an open channel still counts as delivered"
         );
 
-        let empty: VnetTunTxMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let empty: VnetTunTxMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let empty_subnets: Arc<tokio::sync::Mutex<HashMap<String, String>>> =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         assert!(
@@ -1424,13 +1428,13 @@ mod tests {
 
     #[tokio::test]
     async fn tunnel_ingress_directs_by_ip_family_subnet() {
-        let txs: VnetTunTxMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let txs: VnetTunTxMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let subnets: Arc<tokio::sync::Mutex<HashMap<String, String>>> =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let (tx4, mut rx4) = mpsc::channel::<Vec<u8>>(16);
         let (tx6, mut rx6) = mpsc::channel::<Vec<u8>>(16);
-        txs.lock().await.insert("tun-v4".to_string(), tx4);
-        txs.lock().await.insert("tun-v6".to_string(), tx6);
+        txs.lock().unwrap().insert("tun-v4".to_string(), tx4);
+        txs.lock().unwrap().insert("tun-v6".to_string(), tx6);
         subnets
             .lock()
             .await
@@ -1475,12 +1479,12 @@ mod tests {
         let key = frp_core::encryption::derive_key("visitor-secret");
         let (server, mut peer) = tokio::io::duplex(8192);
         let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(16);
-        let txs: VnetTunTxMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let txs: VnetTunTxMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let subnets: Arc<tokio::sync::Mutex<HashMap<String, String>>> =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(16);
         let shutdown = Arc::new(AtomicBool::new(false));
-        txs.lock().await.insert("tun-v4".to_string(), tun_tx);
+        txs.lock().unwrap().insert("tun-v4".to_string(), tun_tx);
         subnets
             .lock()
             .await

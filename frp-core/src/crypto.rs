@@ -587,20 +587,22 @@ impl AsyncWrite for AeadStream {
                 .extend_from_slice(&this.write.stream_nonce);
             this.write.aad_buf.extend_from_slice(&header);
 
-            // Build pending directly: stream_nonce || frame_header || plaintext,
-            // then encrypt_suffix encrypts the plaintext portion in place and
-            // appends the tag — no intermediate plaintext.to_vec() allocation.
-            let total_len =
-                this.write.stream_nonce.len() + AEAD_FRAME_HEADER_SIZE + plaintext.len() + overhead;
-            let mut pending = Vec::with_capacity(total_len);
-            pending.extend_from_slice(&this.write.stream_nonce);
-            pending.extend_from_slice(&header);
-            pending.extend_from_slice(plaintext);
+            // Build pending directly in the reused buffer:
+            // stream_nonce || frame_header || plaintext, then encrypt_suffix
+            // encrypts the plaintext portion in place and appends the tag —
+            // no intermediate plaintext.to_vec() allocation and no per-message
+            // `Vec::with_capacity` (capacity is retained across frames).
+            this.write.pending.clear();
+            this.write
+                .pending
+                .extend_from_slice(&this.write.stream_nonce);
+            this.write.pending.extend_from_slice(&header);
+            this.write.pending.extend_from_slice(plaintext);
 
             if let Err(e) = this.write.cipher.encrypt_suffix(
                 &this.write.nonce,
                 plaintext.len(),
-                &mut pending,
+                &mut this.write.pending,
                 &this.write.aad_buf,
             ) {
                 let io_err = io::Error::other(e);
@@ -615,7 +617,6 @@ impl AsyncWrite for AeadStream {
             this.write.header_sent = true;
             tracing::debug!(frame = %this.write.frame_count, pending_len = %this.write.pending.len(), "[AEAD-WRITE] frame={} encrypted, pending_len={}", this.write.frame_count, this.write.pending.len());
 
-            this.write.pending = pending;
             this.write.pending_pos = 0;
         } else {
             let overhead = this.algorithm.overhead();
@@ -629,18 +630,18 @@ impl AsyncWrite for AeadStream {
                 .extend_from_slice(&this.write.stream_nonce);
             this.write.aad_buf.extend_from_slice(&header);
 
-            // Build pending directly: frame_header || plaintext,
-            // then encrypt_suffix encrypts the plaintext portion in place and
-            // appends the tag — no intermediate plaintext.to_vec() allocation.
-            let mut pending =
-                Vec::with_capacity(AEAD_FRAME_HEADER_SIZE + plaintext.len() + overhead);
-            pending.extend_from_slice(&header);
-            pending.extend_from_slice(plaintext);
+            // Build pending directly in the reused buffer: frame_header ||
+            // plaintext, then encrypt_suffix encrypts the plaintext portion in
+            // place and appends the tag — no intermediate plaintext.to_vec()
+            // allocation and no per-message `Vec::with_capacity`.
+            this.write.pending.clear();
+            this.write.pending.extend_from_slice(&header);
+            this.write.pending.extend_from_slice(plaintext);
 
             if let Err(e) = this.write.cipher.encrypt_suffix(
                 &this.write.nonce,
                 plaintext.len(),
-                &mut pending,
+                &mut this.write.pending,
                 &this.write.aad_buf,
             ) {
                 let io_err = io::Error::other(e);
@@ -653,7 +654,6 @@ impl AsyncWrite for AeadStream {
             }
             this.write.frame_count += 1;
 
-            this.write.pending = pending;
             this.write.pending_pos = 0;
         }
 
