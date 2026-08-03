@@ -3657,7 +3657,6 @@ test_xtcp_go_frps_go_prov_rust_vis() { run_xtcp_test "xtcp-go-frps-go-prov-rust-
 test_xtcp_go_frps_rust_prov_go_vis() { run_xtcp_test "xtcp-go-frps-rust-prov-go-vis" go rust go "kcp"; }
 test_xtcp_rust_frps_go_prov_rust_vis() { run_xtcp_test "xtcp-rust-frps-go-prov-rust-vis" rust go rust ""; }
 test_xtcp_rust_frps_rust_prov_go_vis() { run_xtcp_test "xtcp-rust-frps-rust-prov-go-vis" rust rust go "kcp"; }
-test_xtcp_rust_frps_rust_prov_go_vis_quic() { run_xtcp_test "xtcp-rust-frps-rust-prov-go-vis-quic" rust rust go "quic"; }
 test_xtcp_go_frps_go_prov_rust_vis_quic() { run_xtcp_test "xtcp-go-frps-go-prov-rust-vis-quic" go go rust "quic"; }
 
 # ── XTCP encrypted variants ──
@@ -4635,8 +4634,9 @@ if ${XTCP_ONLY:-false} || [[ "${RUN_XTCP:-0}" == "1" ]]; then
         "test_xtcp_go_frps_rust_prov_go_vis"
         "test_xtcp_rust_frps_go_prov_rust_vis"
         "test_xtcp_rust_frps_rust_prov_go_vis"
-        # QUIC data plane
-        "test_xtcp_rust_frps_rust_prov_go_vis_quic"
+        # QUIC data plane (Rust visitor → Go provider; the reverse direction
+        # is blocked by Go frp v0.70.1 sending "ip:port" as the QUIC SNI,
+        # which rustls rejects — see CHANGELOG)
         "test_xtcp_go_frps_go_prov_rust_vis_quic"
         # Encrypted
         "test_xtcp_g2g_enc"

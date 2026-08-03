@@ -17,7 +17,15 @@ All notable changes to frp-rs.
   `p2p_protocol == "quic"`) and the provider (`handle_nat_hole_resp` dispatch
   on `resp.protocol == "quic"`) select it; when the `quic` feature is
   disabled they warn + fail instead of silently falling back to KCP. Covered
-  by `test_quic_roundtrip_loopback`.
+  by `test_quic_roundtrip_loopback` and the `xtcp-go-frps-go-prov-rust-vis-quic`
+  compat scenario (Rust visitor → Go provider).
+  **Known limitation**: the reverse direction (Go visitor with the default
+  `protocol = "quic"` → Rust provider) does not work — Go frp v0.70.1's
+  `hostnameInSNI` (Go 1.25) no longer strips the port, so the QUIC ClientHello
+  carries an SNI of `"ip:port"` (`raddr.String()`), which rustls rejects
+  (`ServerNameMustContainOneHostName`); rewriting the ClientHello would break
+  the TLS 1.3 handshake transcript. A Go visitor targeting a Rust provider
+  must set `protocol = "kcp"` (the compat matrix's kcp scenarios cover this).
 
 - **XTCP MakeHole executed on the provider side + Go v0.70.1 punch semantics**:
   the provider previously called `xtcp_p2p_connect_yamux` with
