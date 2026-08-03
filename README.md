@@ -109,7 +109,7 @@ but not literally 100% — see "Known limitations" below.
 
 **Four build sizes via feature flags.** Trim unused protocols and features to match your deployment:
 
-- **default**: Core transports (TCP, WS, TLS, KCP), OIDC auth, compression, XChaCha20 V2 encryption, HTTP proxy, TCP mux, and the SSH gateway. QUIC and dashboard are opt-in.
+- **default**: Core transports (TCP, WS, TLS, KCP, QUIC), OIDC auth, compression, XChaCha20 V2 encryption, HTTP proxy, TCP mux, and the SSH gateway. Dashboard is opt-in.
 - **full** (`--features "ssh,quic,dashboard"`): All transports + SSH gateway + dashboard/metrics.
 - **`tiny`**: Drops QUIC, KCP, WebSocket, SSH, OIDC, dashboard, and compression. Keeps TLS, HTTP proxy, TCP mux. Ideal for edge devices.
 - **`micro`**: Core only — no TLS, no compression, no chacha20, no HTTP proxy, no TCP mux. Minimal attack surface and footprint.
@@ -138,7 +138,7 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 
 | 版本 | 体积 (frps/frpc) | 保留能力 | 适用场景 |
 |------|-----------------|---------|---------|
-| **default** | ~5.2MB / ~5.4MB | TCP/WS/TLS/KCP、OIDC、压缩、XChaCha20、HTTP 代理、TCP mux | 通用部署 |
+| **default** | ~5.0MB / ~4.5MB | TCP/WS/TLS/KCP/QUIC、OIDC、压缩、XChaCha20、HTTP 代理、TCP mux | 通用部署 |
 | **full** | ~7.8MB / ~6.0MB | 全部传输层 + SSH + dashboard（需 `--features "ssh,quic,dashboard"`） | 全功能部署 |
 | **tiny** | ~4.4MB / ~3.8MB | 去掉 QUIC/KCP/WebSocket/SSH/OIDC/dashboard，保留 TLS/压缩/TCP mux | 边缘设备、嵌入式 |
 | **micro** | ~2.6MB / ~2.7MB | 仅核心 TCP 代理，无 TLS/压缩/HTTP 代理/TCP mux | 极小镜像、安全敏感 |
@@ -197,11 +197,11 @@ The binaries land at `target/release/frps` and `target/release/frpc`.
 
 ### Binary Variants
 
-Four size tiers (see [Why frp-rs?](#why-frp-rs) for sizes). SSH is enabled by
-default; QUIC and dashboard are opt-in:
+Four size tiers (see [Why frp-rs?](#why-frp-rs) for sizes). SSH and QUIC are
+enabled by default; dashboard is opt-in:
 
 ```bash
-# Default — core transports + SSH, no QUIC/dashboard (~5.6 MB frps, ~5.4 MB frpc)
+# Default — core transports + SSH + QUIC, no dashboard (~5.0 MB frps, ~4.5 MB frpc)
 cargo build --release -p frps -p frpc
 
 # Full — all features (~7.8 MB frps, ~6.0 MB frpc)
@@ -214,8 +214,8 @@ cargo build --release -p frps -p frpc --no-default-features --features tiny
 cargo build --release -p frps -p frpc --no-default-features --features micro
 ```
 
-Individual feature flags let you cherry-pick (QUIC and dashboard are opt-in;
-SSH and the rest are default ON):
+Individual feature flags let you cherry-pick (dashboard is opt-in; QUIC, SSH
+and the rest are default ON):
 
 | Feature | Adds |
 |---------|------|

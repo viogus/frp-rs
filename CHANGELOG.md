@@ -4,6 +4,14 @@ All notable changes to frp-rs.
 
 ## Unreleased
 
+- **QUIC transport is now default ON**: the `quic` feature joined the default
+  feature set of `frp-core`, `frp-client` and `frp-server`, so a plain
+  `cargo build --release -p frps -p frpc` includes the QUIC transport and the
+  XTCP QUIC data plane (frps ~5.0MB, frpc ~4.5MB). Dashboard remains opt-in;
+  `--no-default-features --features tiny/micro` builds are unchanged (no
+  QUIC). This also removes the "protocol=quic requires the quic feature"
+  failure path from the default build — `"quic"` now just works.
+
 - **XTCP QUIC data plane (Go v0.70.1 `protocol=quic` compat)**: `resp.protocol`
   is now honored — `"quic"` runs the hole-punched UDP socket straight into
   quinn (`quic_dial_on_socket` / `quic_accept_on_socket` in

@@ -31,14 +31,14 @@ FRPS_BIN=/path/to/frps FRPC_BIN=/path/to/frpc cargo test --workspace --all-featu
 
 ### Binary Variants
 
-Four size tiers via feature flags. QUIC and dashboard are opt-in (not in defaults); SSH is default:
+Four size tiers via feature flags. QUIC and SSH are default; dashboard is opt-in:
 
 ```bash
-# Default (SSH included; no QUIC/dashboard; keeps TLS, KCP, WS, compression)
+# Default (SSH + QUIC included; no dashboard; keeps TLS, KCP, WS, compression)
 cargo build --release -p frps -p frpc
-# → frps (~5.6MB), frpc (~5.4MB)
+# → frps (~5.0MB), frpc (~4.5MB)
 
-# Full (all features; add opt-in flags)
+# Full (all features; dashboard is the only opt-in on top of default)
 cargo build --release -p frps -p frpc --features "ssh,quic,dashboard"
 # → frps (~7.8MB), frpc (~6.0MB)
 
@@ -54,7 +54,7 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 Feature flags across crates:
 | Feature | Crate | Removes |
 |---------|-------|---------|
-| `quic` | frp-core | QUIC transport (quinn, ~1MB) |
+| `quic` | frp-core | QUIC transport (quinn) — **default ON** (was opt-in) |
 | `kcp` | frp-core | KCP transport (kcp) |
 | `websocket` | frp-core/server | WebSocket transport (tokio-tungstenite) |
 | `oidc` | frp-core | OIDC auth (jsonwebtoken, reqwest) |
@@ -97,7 +97,7 @@ Every feature, fix, and test change follows three rules:
 | `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings |
 | `cargo fmt --all -- --check` | zero diffs |
 | `cargo test --workspace --all-features` | 724 passed, 0 failed |
-| `cargo build --release` | passes (frps ~5.6MB, frpc ~5.4MB default; ~7.8MB/6.0MB all-features) |
+| `cargo build --release` | passes (frps ~5.0MB, frpc ~4.5MB default; ~7.8MB/6.0MB all-features) |
 | `compat-test.sh` (Go frp v0.70.1) | 66 run_test scenarios + 16 XTCP pairwise, all green in CI |
 | `unsafe` blocks | 6 in frp-core, 3+ in frp-vnet (all with `// SAFETY:` comment) |
 | `#[instrument]` spans removed | bridge hot path (conditional logging instead) |
